@@ -33,7 +33,7 @@
 | 最低 macOS | 15+，Apple Silicon only | M0 |
 | UI 语言 | 英文 UI，中文文档 | M0 |
 | Hero demo 仓库 | 自建 `fixtures/tiny-webapp` | M1 前 |
-| Apple Developer 账号/公证 | 有则 v0.1 公证；没有则 ad-hoc | M5 |
+| Apple Developer 账号/公证 | 有则 v0.1 公证；没有则 ad-hoc | M4 |
 | CLI 范围 | `run/status/attach/diff/logs` | M3 |
 | 遥测 | 默认关闭，永不默认开启 | M0 |
 | 插件许可边界 | 独立进程/IPC；v0.3 前定 | v0.3 |

@@ -59,7 +59,7 @@ VerlinPark 把“多 Agent 协作”当成一个 **操作系统问题** 来解�
 - **验证**：Verifier 独立跑测试/审查，有一票否决权。
 - **集成**：merge queue + 集成分支 + 冲突处理；人最终批准 land。
 - **观测**：append-only event log；完整 trace、成本账本、回放、导出。
-- **开放**：MCP 工具、ACP 外部 Agent、CLI、本地模型、GPL-3.0。
+- **开放**：MCP 工具、ACP 外部 Agent、CLI、本地模型、GPL-3.0（MCP/ACP 从 v0.2 开始）。
 
 ### 1.3 设计原则
 
