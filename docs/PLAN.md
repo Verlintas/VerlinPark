@@ -1111,7 +1111,7 @@ approval.requested / approval.resolved
   - `blocked`：`sudo`, `rm -rf /`, `curl | sh`, 写 `~/.ssh`, 改系统配置, force push。
 - **Approval**：UI 显示命令、cwd、影响范围、风险等级；支持“本次允许/本任务允许/本会话允许/永远拒绝”。
 - **Per-role defaults**：Builder 可写 worktree；Verifier 只读；Integrator 可 merge；Lead 不写代码。
-- **Network**：默认允许只读 HTTP？v0.1 默认“每次询问”，可按域名 allowlist；本地模型 endpoint 除外。
+- **Network**：默认每次询问；可按域名 allowlist；本地模型 endpoint 除外。
 - **Env**：工具进程只拿到白名单 env；API key 不注入 shell；需要时通过临时文件/环境变量注入，并审计。
 - **Secrets**：Keychain；trace 中脱敏；artifact 扫描；用户可一键清除。
 
@@ -1257,7 +1257,7 @@ M5 的 MCP/ACP/本地模型属于 v0.2，不阻塞 M4 的 v0.1 核心。
 ### 13.2 分发
 
 - 直接分发：签名 + notarize 的 DMG。
-- Homebrew cask（v0.1 可选，v0.2 必做）。
+- Homebrew cask（v0.1 起尽量提供，v0.2 必做）。
 - 自动更新：Sparkle（v0.2）。
 - **Mac App Store：不做**。GPL-3.0 与 Apple 当前条款/DRM 冲突；如未来要做，需要双许可或例外，另立 ADR。
 

@@ -807,7 +807,7 @@ pub fn classify(cmd: &str) -> CommandClass;
 - **NeedsApproval**：写文件、装依赖、跑测试、git commit、网络请求、构建、格式化。
 - **Blocked（默认）**：`sudo`, `rm -rf /`, `curl | sh`, `wget | sh`, 写 `~/.ssh`, `chmod 777 /`, `launchctl`, `defaults write` 系统域, `git push --force` 到保护分支。
 - 解析用 shell AST（`tree-sitter-bash` 或 `shell-words` + 启发式）；不能只靠字符串包含。
-- 命令通过 `/bin/zsh -lc` 执行？使用用户 shell，但 `cwd` 限制；环境白名单；`PATH` 记录。
+- 命令通过用户默认 shell（zsh）执行；`cwd` 限制；环境白名单；记录 shell/PATH。
 - 所有命令记录原文、cwd、exit code、duration；输出大 → artifact。
 - 超时默认 10 分钟（可配置）；交互式命令不支持（需要 PTY 的用 terminal 工具）。
 - 进程组 kill：`setsid`/`setpgid`；取消时 `kill(-pgid, SIGTERM)`，宽限后 `SIGKILL`。
