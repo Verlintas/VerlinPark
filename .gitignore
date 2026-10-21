@@ -1,0 +1,103 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.diskdb
+
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+timeline.xctimeline
+playground.xcworkspace
+
+# Generated Xcode project (XcodeGen)
+apps/macos/*.xcodeproj/
+apps/macos/*.xcworkspace/
+
+# SwiftPM
+.build/
+.swiftpm/
+Packages/
+# Commit Package.resolved for reproducible app builds.
+!Package.resolved
+
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Node / docs site
+node_modules/
+.pnpm-store/
+.yarn/
+.next/
+.turbo/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+secrets/
+*.secret
+# Public SSH keys are fine; private keys are not.
+!**/*.pub
+
+# VerlinPark local data
+.verlinpark/
+*.vpdb
+*.vpdb-shm
+*.vpdb-wal
+*.vpdb-journal
+artifacts/
+logs/
+*.log
+
+# Agent / editor state
+.opencode/
+.claude/
+.idea/
+.vscode/
+
+# Test and build outputs
+/tmp/
+.tmp/
+*.dmg
+*.zip
+*.app
+!**/Fixtures/*.app
+
+# Generated protocol code
+**/Generated/
+*.generated.swift
+*.generated.rs
