@@ -4,7 +4,7 @@
 
 VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets them collaborate through typed messages and shared artifacts, and makes every plan, tool call, diff, token, and permission decision inspectable and replayable.
 
-> **Status: pre-alpha / design phase.** This repository currently contains the research, architecture, and development plan. There is no runnable app yet.
+> **Status: M0 walking skeleton.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. The agent loop, worktrees, and multi-agent scheduling land in M1/M2.
 
 ---
 
@@ -104,6 +104,30 @@ v0.1 is not a full IDE, not a model hub, and not a document workspace. See [docs
 - [Architecture](docs/ARCHITECTURE.md) — runtime, protocol, data model, security
 - [Research](docs/RESEARCH.md) — competitive analysis and sources
 - [Decisions](docs/DECISIONS.md) — locked architectural decisions (ADRs)
+- [Progress](docs/PROGRESS.md) — what actually works today
+
+## Build and run (M0)
+
+Requirements: macOS 15+, Xcode 27+, Rust stable, [XcodeGen](https://github.com/yonaskolb/XcodeGen), [`just`](https://github.com/casey/just).
+
+```bash
+just bootstrap
+just test
+just run
+```
+
+`just run` builds `verlinpadd` and the SwiftUI app, then opens it. The app launches the daemon on demand from `target/debug/verlinpadd` (debug builds). To run the daemon separately:
+
+```bash
+just daemon
+just cli ping
+just cli project-add /path/to/repo --name demo
+just cli session-new <project-id> "Add team invitations"
+just cli events <session-id>
+```
+
+Local state lives in `~/Library/Application Support/VerlinPark/`. The daemon binds to `127.0.0.1` with a random port and a per-run token in a `0600` discovery file. It does not expose a remote API.
+
 
 ## Principles
 
@@ -155,7 +179,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于设计阶段，仓库里是研究、架构和开发计划。详见 [docs/PLAN.md](docs/PLAN.md)。
+当前处于 **M0 walking skeleton**：daemon、CLI、SQLite 事件日志、Provider 适配和 SwiftUI 外壳已经跑通；Agent loop、worktree 和多 Agent 调度在 M1/M2。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 ## 许可
 

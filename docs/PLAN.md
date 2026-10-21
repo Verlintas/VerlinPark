@@ -3,7 +3,8 @@
 > 版本：0.1（Draft）  
 > 日期：2026-10-21  
 > 负责人：Verlintas  
-> 状态：方向已确认，等待第一轮实现  
+> 状态：M0 walking skeleton 已跑通，M1 待开始  
+> 实现进度：[PROGRESS.md](PROGRESS.md)  
 > 许可：GPL-3.0-only
 
 ---
@@ -1150,7 +1151,7 @@ approval.requested / approval.resolved
 
 | 里程碑 | 周 | 交付 | 退出标准 |
 |---|---|---|---|
-| **M0 Foundation** | 1-2 | Monorepo、CI、Rust workspace、daemon hello、SwiftUI shell、SQLite/event log、provider streaming spike | `vp ping` 通；App 能打开项目；事件流可见 |
+| **M0 Foundation** | 1-2 | Monorepo、CI、Rust workspace、daemon hello、SwiftUI shell、SQLite/event log、provider streaming spike | `vp ping` 通；App 能打开项目；事件流可见 ✅ |
 | **M1 Single Agent** | 3-6 | Agent loop、10 工具、权限代理、context compaction、checkpoint、终端、diff、trace、成本 | 单 Agent 在 fixture repo 修一个 failing test；可回滚；重启恢复 |
 | **M2 Departments** | 7-11 | 三层 org、Plan 校验、DAG 调度、mailbox、artifact、worktree per task、Verifier gate、merge queue、Park Map | 3 部门/3 并行 Builder/完整 Verifier+Integrator 闭环；无写冲突；可合并 |
 | **M3 Control Plane** | 12-14 | 手动 org/model/budget 编辑器、Session wizard、审批队列、通知、暂停/恢复/取消、CLI、trace export、效率报告 | 用户不改文件即可配置自定义三层组织；CLI 可驱动会话；v0.1 功能冻结 |

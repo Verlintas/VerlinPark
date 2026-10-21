@@ -1,0 +1,12 @@
+[package]
+name = "vp-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }

@@ -16,18 +16,16 @@ VerlinPark is currently in the **design phase**. The most useful contributions r
 - Security and permission changes need a threat-model note.
 - No vendor lock-in: new providers/tools should fit the adapter/registry model.
 
-## Development setup (planned)
+## Development setup
 
-The first milestone will add a `justfile` and a build guide. Expected toolchain:
+Requirements:
 
 - macOS 15+ on Apple silicon
 - Xcode 27+ / Swift 6.4+
-- Rust stable (`rust-toolchain.toml`)
+- Rust stable (`cargo`, `rustfmt`, `clippy`)
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 - [`just`](https://github.com/casey/just)
 - Git
-
-Planned commands:
 
 ```bash
 just bootstrap
@@ -35,6 +33,8 @@ just build
 just test
 just run
 ```
+
+The generated `apps/macos/VerlinPark.xcodeproj` is intentionally gitignored; run `xcodegen generate` (or `just build`) to recreate it.
 
 ## Architecture decisions
 

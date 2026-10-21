@@ -1,0 +1,54 @@
+name: VerlinPark
+options:
+  bundleIdPrefix: com.verlintas
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: NO
+    ENABLE_HARDENED_RUNTIME: NO
+    DEVELOPMENT_TEAM: ""
+    CLANG_ENABLE_MODULES: YES
+targets:
+  VerlinPark:
+    type: application
+    platform: macOS
+    sources:
+      - path: VerlinPark
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.verlintas.VerlinPark
+        PRODUCT_NAME: VerlinPark
+        INFOPLIST_FILE: VerlinPark/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        ENABLE_PREVIEWS: YES
+    dependencies: []
+  VerlinParkTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: VerlinParkTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.verlintas.VerlinParkTests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: VerlinPark
+schemes:
+  VerlinPark:
+    build:
+      targets:
+        VerlinPark: all
+    test:
+      targets:
+        - VerlinParkTests
