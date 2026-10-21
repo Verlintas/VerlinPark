@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as Base64Engine;
 use clap::Parser;
+use fs2::FileExt;
 use rand::RngCore;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -63,6 +64,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let data_dir = args.data_dir.clone().unwrap_or_else(paths::data_dir);
     paths::ensure_private_dir(&data_dir)?;
+    let _lock_file = acquire_instance_lock(&data_dir)?;
 
     let store = Store::open(&data_dir)?;
     let engine = Engine::new(store);
@@ -442,6 +444,27 @@ fn generate_token() -> String {
 
 fn discovery_path(data_dir: &Path) -> PathBuf {
     data_dir.join("run").join("daemon.json")
+}
+
+fn acquire_instance_lock(data_dir: &Path) -> Result<std::fs::File> {
+    let run_dir = data_dir.join("run");
+    paths::ensure_private_dir(&run_dir)?;
+    let path = run_dir.join("daemon.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    paths::ensure_private_file(&path)?;
+    file.try_lock_exclusive().map_err(|_| {
+        anyhow::anyhow!(
+            "another verlinpadd is already running for {}",
+            data_dir.display()
+        )
+    })?;
+    Ok(file)
 }
 
 fn write_discovery(data_dir: &Path, discovery: &Discovery) -> Result<()> {
