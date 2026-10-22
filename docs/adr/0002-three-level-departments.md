@@ -1,7 +1,8 @@
 # ADR-0002: 三层部门制
 
-- 状态：Accepted
+- 状态：Superseded by ADR-0011
 - 日期：2026-10-21
+- 备注：2026-10-23 新版设计改为四层 Leader → Manager → Worker → Labour，并引入预算门控自动扩编。本文保留作为历史记录。
 
 ## 背景
 

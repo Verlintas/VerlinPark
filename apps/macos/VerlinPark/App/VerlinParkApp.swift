@@ -3,19 +3,29 @@ import SwiftUI
 @main
 struct VerlinParkApp: App {
     @State private var model = AppModel()
+    @State private var brand = BrandStore()
+    @State private var memory = MemoryMonitor()
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
                 .environment(model)
+                .environment(brand)
+                .environment(memory)
                 .task {
+                    memory.start()
                     await model.start()
                 }
         }
-        .defaultSize(width: 1240, height: 820)
-        .windowToolbarStyle(.unified)
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1320, height: 860)
         .commands {
             CommandGroup(after: .newItem) {
+                Button("Chat with Aviiya") {
+                    model.selectResident()
+                }
+                .keyboardShortcut("1", modifiers: [.command])
+
                 Button("Add Project…") {
                     Task { await model.addProject() }
                 }
@@ -30,6 +40,7 @@ struct VerlinParkApp: App {
 
         Settings {
             SettingsView()
+                .environment(brand)
                 .environment(model)
         }
     }

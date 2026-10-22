@@ -1,9 +1,26 @@
 # VerlinPark 进度
 
-> 最后更新：2026-10-21  
-> 当前里程碑：M0（walking skeleton）已完成，M1 待开始
+> 最后更新：2026-10-23  
+> 当前里程碑：M0.5（Glass UI + 品牌 + 四层设计预览）已完成，M1 待开始
 
 ---
+
+## M0.5 完成情况
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| Glass Park 三栏 | ✅ | Rail（品牌/项目/Manage Dash/Settings/内存）· Stage（对话/会话）· Studio（Collab/Preview） |
+| 毛玻璃 | ✅ | 隐藏 titlebar、behind-window blur、material 面板、深色优先 |
+| 可配置品牌 | ✅ | displayName + 预设；solid / gradient / flag；持久化 |
+| 国家旗 | ✅ | FlagKit v2.5.0，248 个国家/地区（MIT） |
+| Pride 旗 | ✅ | 15 面自绘旗：Rainbow/Progress/Trans/Bi/Lesbian/NB/Pan/Ace/Aro/Genderfluid/Genderqueer/Intersex/Agender/Demi/Poly |
+| 四层组织预览 | ✅ | Leader / Managers 3–5 / Workers 2–10 / Labour 3–40；auto-recruit / auto-hire 占位 |
+| Computer Lease 展示 | ✅ | 明确“只串行 GUI/浏览器”，shell/worktree 并行 |
+| Org Preset | ✅ | 本地保存扩编上限、自动扩编开关、预算冻结线（runtime 在 M2） |
+| Manage Dash | ✅ | 项目/会话/事件、Agent 概览、Computer、内存、品牌、Resident |
+| 真实内存 | ✅ | app + daemon RSS，2s 刷新 |
+| Aviiya 外置 | ✅ | 不做本地人格/记忆/聊天；resident 入口为 NovaBAIC bridge 占位 |
+| 测试 | ✅ | Rust 8 + Swift 品牌/JSON 测试；`xcodebuild test` 通过 |
 
 ## M0 完成情况
 
@@ -34,21 +51,23 @@
 ## 当前限制（M1 要解决）
 
 - 没有 Agent loop、工具、权限、上下文、trace 的 Agent 语义；事件目前只有 `session.created`。
-- 没有 worktree、任务 DAG、部门/Agent 组织。
+- 没有四层组织的 runtime、Capacity Controller、Computer Lease 实现；右侧是设计预览。
 - 没有 Provider 设置 UI / Keychain；模型配置尚未落地。
-- 没有终端、diff、Park Map。
+- 没有终端、diff、真实 Collab 节点。
+- Aviiya 是外部 NovaBAIC bridge 占位，当前不可聊天，也不应在 VerlinPark 内实现人格/记忆。
 - 没有签名/公证；App 是 unsigned debug build。
 - 没有公网/远程能力，也不应该有。
 
 ## M1 下一步
 
-1. 定义 `Agent` / `Task` / `Department` domain 与状态机。
-2. 实现单 Agent loop（Provider → tool calls → final）。
+1. 定义 `Agent` / `Task` / `Manager` / `Worker` / `Labour` domain 与状态机。
+2. 实现 Leader 单 Agent loop（Provider → tool calls → final）。
 3. 核心工具：read/list/glob/grep/apply_patch/write/shell/git/test。
 4. 权限代理（allow/ask/deny；路径 jail；命令分类）。
 5. 事件：`agent.*`、`llm.*`、`tool.*`、`approval.*`。
-6. UI：Agent 对话、工具调用卡片、审批队列、trace 时间线。
+6. UI：Leader 对话、工具调用卡片、审批队列、真实 Collab 节点。
 7. 单 Agent 在 fixture repo 修一个 failing test；可回滚、可恢复。
+8. 为 NovaBAIC Aviiya 定义桥接协议（只定义接口，不实现人格/记忆）。
 
 ## 如何运行
 

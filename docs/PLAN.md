@@ -3,8 +3,9 @@
 > 版本：0.1（Draft）  
 > 日期：2026-10-21  
 > 负责人：Verlintas  
-> 状态：M0 walking skeleton 已跑通，M1 待开始  
+> 状态：M0 walking skeleton + M0.5 Glass UI 已跑通，M1 待开始  
 > 实现进度：[PROGRESS.md](PROGRESS.md)  
+> 2026-10-23 设计修订：组织改为四层（Leader → Manager → Worker → Labour），UI 改为 Glass Park，Computer Lease 只串行 GUI/浏览器，Aviiya 外置到 NovaBAIC。详见 ADR-0011 ~ ADR-0014；本文旧的三层/旧 UI 章节仍保留，后续合并。  
 > 许可：GPL-3.0-only
 
 ---
@@ -13,7 +14,7 @@
 
 VerlinPark 是一个 **macOS 原生的 Agent 开发区（ADE）**，核心不是“更好的聊天框”，而是一个 **可审计、可回放、可合并的多 Agent Runtime**。
 
-它把每个任务放进独立的 Git worktree，用三层部门制组织 Agent，用结构化消息和共享工件协作，用代码验证计划、调度 DAG、强制预算、审查 diff、维护合并队列。UI 是 SwiftUI/AppKit，核心是 Rust daemon，二者通过本地 JSON-RPC 通信；所有状态事件化，App 关闭后会话继续运行。
+它把每个任务放进独立的 Git worktree，用四层组织（Leader → Manager → Worker → Labour）编排 Agent，用结构化消息和共享工件协作，用代码验证计划、调度 DAG、强制预算、审查 diff、维护合并队列。UI 是 SwiftUI/AppKit，核心是 Rust daemon，二者通过本地 JSON-RPC 通信；所有状态事件化，App 关闭后会话继续运行。
 
 **已锁定的方向：**
 
@@ -22,12 +23,12 @@ VerlinPark 是一个 **macOS 原生的 Agent 开发区（ADE）**，核心不是
 | 产品重心 | 自研 Harness 优先 |
 | 技术栈 | SwiftUI/AppKit + Rust Core |
 | 模型策略 | 云端 API 优先，本地 OpenAI-compatible 端点；MLX 后置 |
-| Agent 组织 | 三层部门制（Lead → Department Lead → Worker） |
+| Agent 组织 | 四层组织（Leader → Manager → Worker → Labour） |
 | Agent 交流 | 分层 + 受限点对点；typed message + artifact |
 | 代码隔离 | 每任务 worktree + 集成分支 + merge queue |
 | 效率控制 | 全手动配置模型与预算；运行时只做硬性执行与告警 |
 | 仓库 | Public + GPL-3.0-only |
-| 首版演示 | 多 Agent 三层协作完成一个跨模块 feature |
+| 首版演示 | 多 Agent 四层协作完成一个跨模块 feature |
 
 **一句话定位：**
 
@@ -53,7 +54,7 @@ VerlinPark 是一个 **macOS 原生的 Agent 开发区（ADE）**，核心不是
 
 VerlinPark 把“多 Agent 协作”当成一个 **操作系统问题** 来解决：
 
-- **组织**：三层部门制，角色、职责、权限、模型、预算都是显式配置。
+- **组织**：四层组织（Leader → Manager → Worker → Labour），角色、职责、权限、模型、预算都是显式配置；扩编受预算门控。
 - **隔离**：每任务一个 worktree 和 branch；写作用域在计划阶段就声明。
 - **通信**：typed message + artifact reference；不转发完整聊天记录。
 - **调度**：DAG + 并发上限 + 写锁 + 预算 + 超时 + 取消传播。
@@ -129,7 +130,7 @@ Anthropic 在 2025 年的多 Agent 研究系统复盘中给出几个关键数据
 **结论：**
 
 1. 不能做“自由 swarm / 群聊”。要做 **代码强制的组织结构**。
-2. 三层部门制必须有 **硬边界**：最大深度、最大 fan-out、最大并发、写作用域、预算、超时。
+2. 四层组织必须有 **硬边界**：最大深度、最大 fan-out、最大并发、写作用域、预算、超时。
 3. Agent 的自由度放在 **任务内部**；组织边界由 runtime 管。
 4. 大产物走 artifact，不进消息。
 5. 并行只用于真正独立的任务；有依赖就串行。
@@ -216,6 +217,10 @@ flowchart TD
 ---
 
 ## 5. 多 Agent 组织设计
+
+> **2026-10-23 修订：本节旧的“三层部门制”已被 ADR-0011 取代。**  
+> 当前设计是四层：Leader（1）→ Manager（3–5）→ Worker（2–10）→ Labour（3–40），预算门控自动扩编。  
+> 下面的三层细节保留作历史对照；实现以 ADR-0011 和 `docs/ARCHITECTURE.md` 为准。
 
 这是 VerlinPark 的核心，也是与普通 Agent 产品最大的差异。
 
@@ -565,7 +570,7 @@ main
 9. API Builder 修复，重新提交；Verifier 通过。
 10. Integrator 依次 rebase/merge 到 integration 分支，跑全量 e2e；发现一个快照冲突，生成 conflict artifact，通知 UI Builder 修复。
 11. 全部通过；Lead 汇总变更、风险、测试结果、成本。
-12. 用户在 Park Map 看完整过程，在 Diff 视图逐 hunk review，批准 land；VerlinPark 合并到目标分支或开 PR。
+12. 用户在 Collab 看完整过程，在 Diff 视图逐 hunk review，批准 land；VerlinPark 合并到目标分支或开 PR。
 
 ---
 
@@ -573,13 +578,13 @@ main
 
 ### 6.1 v0.1 — “Department”
 
-**目标：** 证明三层 Agent 组织可以在真实仓库上完成一个跨模块 feature，并且全过程可审计、可合并。
+**目标：** 证明四层 Agent 组织可以在真实仓库上完成一个跨模块 feature，并且全过程可审计、可合并。
 
 **必须有：**
 
 - macOS 原生 App（SwiftUI + AppKit），一个主窗口。
 - Project / Session 管理；打开本地仓库。
-- 三层组织模板（Lead / Dept Lead / Worker），默认 `Feature Crew`。
+- 四层组织模板（Leader / Manager / Worker / Labour），默认 `Feature Crew`；预算门控自动扩编。
 - 角色：Lead、Dept Lead、Scout、Builder、Verifier、Integrator。
 - 结构化 Plan + Runtime 校验。
 - Task DAG 调度器；并发/写锁/预算/超时/取消。
@@ -588,7 +593,7 @@ main
 - 核心工具：read/list/glob/grep/apply_patch/write/shell/git/test/ask_user/message/task。
 - Provider：OpenAI-compatible（含 LM Studio/Ollama/llama.cpp）+ Anthropic。
 - 手动模型/预算配置；Keychain 存密钥。
-- 终端（SwiftTerm）、diff 视图、Park Map、Trace、成本面板、审批队列。
+- 终端（SwiftTerm）、diff 视图、Collab 组织图、Trace、成本面板、审批队列。
 - 事件日志、会话恢复、trace 导出。
 - CLI：`vp run/status/attach/diff/logs`。
 - 签名 + notarize 的 DMG；Homebrew cask（可选）。
@@ -604,7 +609,7 @@ main
 
 **退出标准：**
 
-- 在 demo 仓库上，3 个部门、3 个并行 Builder、完整 Verifier/Integrator 闭环完成一个 feature。
+- 在 demo 仓库上，四层组织、3 个并行 Worker、完整 Verifier/Integrator 闭环完成一个 feature。
 - 无写冲突；所有合并经过 Verifier + Integrator。
 - 每个 LLM 请求、工具调用、消息、diff 都能在 UI 找到。
 - 预算 100% 硬停；超预算不继续调用。
@@ -1007,6 +1012,10 @@ approval.requested / approval.resolved
 
 ## 9. UX / UI
 
+> **2026-10-23 修订：本节旧的 IDE 三栏 / Park Map 已被 ADR-0013 取代。**  
+> 当前 UI 是 **Glass Park**：左 Rail（品牌/项目/Manage Dash/Settings/内存）、中 Stage（Leader/Aviiya 对话）、右 Studio（Collab/Preview）。  
+> 下面的旧布局保留作历史对照；实现以 ADR-0013 和 `apps/macos` 为准。
+
 ### 9.1 主窗口
 
 ```text
@@ -1152,9 +1161,10 @@ approval.requested / approval.resolved
 | 里程碑 | 周 | 交付 | 退出标准 |
 |---|---|---|---|
 | **M0 Foundation** | 1-2 | Monorepo、CI、Rust workspace、daemon hello、SwiftUI shell、SQLite/event log、provider streaming spike | `vp ping` 通；App 能打开项目；事件流可见 ✅ |
-| **M1 Single Agent** | 3-6 | Agent loop、10 工具、权限代理、context compaction、checkpoint、终端、diff、trace、成本 | 单 Agent 在 fixture repo 修一个 failing test；可回滚；重启恢复 |
-| **M2 Departments** | 7-11 | 三层 org、Plan 校验、DAG 调度、mailbox、artifact、worktree per task、Verifier gate、merge queue、Park Map | 3 部门/3 并行 Builder/完整 Verifier+Integrator 闭环；无写冲突；可合并 |
-| **M3 Control Plane** | 12-14 | 手动 org/model/budget 编辑器、Session wizard、审批队列、通知、暂停/恢复/取消、CLI、trace export、效率报告 | 用户不改文件即可配置自定义三层组织；CLI 可驱动会话；v0.1 功能冻结 |
+| **M0.5 Glass UI** | 2-3 | Three-column Glass Park shell、BrandStore/BrandMark、248 country flags + 15 pride flags、Collab/Preview、Manage Dash、memory monitor、Aviiya external placeholder | App 可运行；品牌名/风格/旗帜持久化；项目/会话/事件可用 ✅ |
+| **M1 Single Agent** | 4-6 | Leader 对话 + agent loop、10 工具、权限代理、context compaction、checkpoint、终端、diff、trace、成本 | 单 Agent 在 fixture repo 修一个 failing test；可回滚；重启恢复 |
+| **M2 Four-tier Org** | 7-11 | 四层 org、Plan 校验、DAG 调度、mailbox、artifact、worktree per task、Verifier gate、merge queue、Collab 图 | 四层组织/预算门控扩编/完整 Verifier+Integrator 闭环；无写冲突；可合并 |
+| **M3 Control Plane** | 12-14 | 手动 org/model/budget 编辑器、Session wizard、审批队列、通知、暂停/恢复/取消、CLI、trace export、效率报告 | 用户不改文件即可配置四层组织；CLI 可驱动会话；v0.1 功能冻结 |
 | **M4 Release v0.1.0** | 15-17 | hardening、性能、签名/notarize、DMG、Homebrew、docs、benchmark | 干净 Mac 上安装/运行；onboarding < 5 分钟；崩溃率达标；v0.1.0 |
 | **M5 Open Bench v0.2** | 18-22 | MCP client、skills/hooks、本地 provider 向导、ACP client、插件 API 草案 | 接 1 个 MCP server + 1 个外部 Agent；本地模型跑通任务；v0.2.0-alpha |
 
@@ -1202,7 +1212,7 @@ M5 的 MCP/ACP/本地模型属于 v0.2，不阻塞 M4 的 v0.1 核心。
 - **协议契约测试**：JSON Schema → Swift 类型；请求/响应快照。
 - **Swift 单元/UI 测试**：CoreClient、视图模型、关键交互；XCTest。
 - **端到端**：启动 daemon → 创建 session → mock model 执行 → 合并 → 断言事件。
-- **性能测试**：启动、10k 文件仓库、1000 条 trace、Park Map 渲染。
+- **性能测试**：启动、10k 文件仓库、1000 条 trace、Collab 图渲染。
 - **Agent 评估**：5-10 个真实任务；成功/成本/时间/人工评分； nightly。
 
 ### 12.2 Mock Provider
@@ -1237,7 +1247,7 @@ M5 的 MCP/ACP/本地模型属于 v0.2，不阻塞 M4 的 v0.1 核心。
 |---|---|
 | 冷启动到可交互 | < 3s |
 | 打开 10k 文件仓库 | < 2s |
-| Park Map 100 节点 | 60fps |
+| Collab 图 100 节点 | 60fps |
 | Trace 10k 事件滚动 | 60fps（虚拟化） |
 | 空闲内存（app + daemon） | < 350MB |
 | 单次工具调用开销 | < 50ms（不含命令本身） |
@@ -1338,7 +1348,11 @@ M5 的 MCP/ACP/本地模型属于 v0.2，不阻塞 M4 的 v0.1 核心。
 见 [DECISIONS.md](DECISIONS.md)。关键 ADR：
 
 - ADR-0001：SwiftUI + Rust Core
-- ADR-0002：三层部门制
+- ADR-0002：三层部门制（Superseded by ADR-0011）
+- ADR-0011：四层组织 + 预算门控自动扩编
+- ADR-0012：Computer Lease 只串行 GUI/浏览器
+- ADR-0013：Glass Park UI + 可配置品牌
+- ADR-0014：Aviiya 是 NovaBAIC 外部常驻 Agent
 - ADR-0003：手动模型/预算配置
 - ADR-0004：每任务 worktree + 集成分支
 - ADR-0005：typed message + artifact
@@ -1351,7 +1365,10 @@ M5 的 MCP/ACP/本地模型属于 v0.2，不阻塞 M4 的 v0.1 核心。
 ## 附录 B：v0.1 验收清单
 
 - [ ] 打开本地 Git 仓库，检测分支/语言/测试命令
-- [ ] 创建 session，选择三层组织模板
+- [ ] 创建 session，选择四层组织模板
+- [ ] Leader / Manager / Worker / Labour 四层可见
+- [ ] 预算门控自动扩编生效
+- [ ] Computer Lease 只串行 GUI/浏览器
 - [ ] 为每个角色手动选模型；设置 session/department/task 预算
 - [ ] Lead 生成结构化计划；runtime 校验并展示
 - [ ] 3 个 Builder 在独立 worktree 并行实现
@@ -1360,7 +1377,7 @@ M5 的 MCP/ACP/本地模型属于 v0.2，不阻塞 M4 的 v0.1 核心。
 - [ ] Builder 修复后通过
 - [ ] Integrator 合并到 integration 分支
 - [ ] 冲突场景可复现并解决
-- [ ] Park Map 实时显示 Agent/Task/消息
+- [ ] Collab 图实时显示 Agent/Task/消息
 - [ ] Trace 可查每次 LLM/工具/审批
 - [ ] 成本面板 per agent/task/session
 - [ ] 预算 100% 硬停

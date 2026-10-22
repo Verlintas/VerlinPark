@@ -4,7 +4,7 @@
 
 VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets them collaborate through typed messages and shared artifacts, and makes every plan, tool call, diff, token, and permission decision inspectable and replayable.
 
-> **Status: M0 walking skeleton.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. The agent loop, worktrees, and multi-agent scheduling land in M1/M2.
+> **Status: M0.5 Glass UI.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. The new Glass Park UI, configurable brand mark, country/pride flags, Collab/Preview, and Manage Dash are in place. The agent runtime and four-tier scheduler land in M1/M2.
 
 ---
 
@@ -26,21 +26,18 @@ It is not a chat window bolted onto an editor. It is a native control plane for 
 
 ### 1. Park — a workspace for agent teams
 
-Every task gets a Git worktree and a branch. Every department gets an objective. Every agent gets a role, a model, a budget, and a permission policy.
+Every task gets a Git worktree and a branch. Every manager owns a workstream. Every agent gets a role, a model, a budget, and a permission policy.
 
-The default organization is a three-level department structure:
+The default organization is a four-tier structure:
 
 ```text
-Lead
-├── Discovery department
-│   └── Scouts (read-only research)
-├── Implementation department
-│   └── Builders (isolated worktrees)
-├── Quality department
-│   └── Verifiers (tests and review)
-└── Release department
-    └── Integrator (merge queue)
+Leader (1)
+├── Managers (3–5)        discuss, produce outlines, assign work
+│   ├── Workers (2–10)    decompose tasks, own worktrees, hire Labour
+│   │   └── Labour (3–40) write code, run subtasks
 ```
+
+Auto-expansion is budget-gated: start with a minimal team, grow only when the task queue and budget justify it, and freeze at 80% of the session budget.
 
 Plans are proposed by the Lead, validated by code, and executed by a DAG scheduler. Agents can talk to each other, but only through typed messages and artifact references — not by forwarding entire chat histories.
 
@@ -60,11 +57,17 @@ The UI can reconstruct a session, replay it, export it, and show exactly why a c
 ### 3. Open Bench — native, local-first, and extensible
 
 - Native SwiftUI/AppKit UI, not a web app in a shell.
+- Glass Park shell: project rail, chat stage, Collab/Preview studio, Manage Dash.
+- Configurable wordmark: solid, gradient, or a country/pride flag; 248 countries and 15 pride flags.
 - A Rust core daemon that can run headless and be driven by a CLI.
 - Cloud APIs first; any OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp) works as a local provider.
 - Embedded MLX runtime planned for a later milestone.
 - MCP for tools, ACP for external agents, skills and hooks for project-specific behavior.
 - GPL-3.0, open protocols, no vendor lock-in.
+
+> **Aviiya is external.** The resident assistant surface is reserved for a future
+> [NovaBAIC](https://github.com/Verlintas/NovaBAIC) bridge. VerlinPark does not implement a
+> local Aviiya persona or memory.
 
 ## Architecture at a glance
 
@@ -89,7 +92,7 @@ The daemon owns sessions and keeps running when the app closes. The SwiftUI app 
 The first demo is a complete multi-agent feature delivery on a benchmark repository:
 
 1. Open a repository and create a session with a goal.
-2. Pick a three-level org template. Assign models and budgets manually.
+2. Pick a four-tier org template. Assign models and budgets manually.
 3. The Lead produces a plan; the runtime validates the DAG, write scopes, fan-out, and budgets.
 4. Departments execute tasks in parallel, each Builder in its own worktree.
 5. Scouts produce context packets; Verifiers run tests and review; the Integrator merges into an integration branch.
@@ -105,6 +108,7 @@ v0.1 is not a full IDE, not a model hub, and not a document workspace. See [docs
 - [Research](docs/RESEARCH.md) — competitive analysis and sources
 - [Decisions](docs/DECISIONS.md) — locked architectural decisions (ADRs)
 - [Progress](docs/PROGRESS.md) — what actually works today
+- [Third-party notices](THIRD_PARTY_NOTICES.md) — bundled FlagKit assets (MIT)
 
 ## Build and run (M0)
 
@@ -179,7 +183,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M0 walking skeleton**：daemon、CLI、SQLite 事件日志、Provider 适配和 SwiftUI 外壳已经跑通；Agent loop、worktree 和多 Agent 调度在 M1/M2。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+当前处于 **M0.5 Glass UI**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 国家旗 + 15 Pride 旗、Collab/Preview、Manage Dash 已经跑通；Agent loop、四层组织和多 Agent 调度在 M1/M2。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 ## 许可
 

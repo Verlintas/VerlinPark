@@ -11,7 +11,13 @@ final class AppModel {
         case failed(String)
     }
 
+    enum WorkspaceMode: Equatable {
+        case resident
+        case project
+    }
+
     var connection: ConnectionState = .idle
+    var mode: WorkspaceMode = .resident
     var projects: [Project] = []
     var sessions: [Session] = []
     var events: [Event] = []
@@ -67,6 +73,14 @@ final class AppModel {
     }
 
     func selectProject(_ id: String?) {
+        guard let id else {
+            selectedProjectID = nil
+            selectedSessionID = nil
+            events = []
+            mode = .resident
+            return
+        }
+        mode = .project
         guard selectedProjectID != id else { return }
         selectedProjectID = id
         selectedSessionID = nil
@@ -74,8 +88,13 @@ final class AppModel {
         Task { await loadSessions() }
     }
 
+    func selectResident() {
+        mode = .resident
+    }
+
     func selectSession(_ id: String?) {
         guard selectedSessionID != id else { return }
+        mode = .project
         selectedSessionID = id
         Task { await loadEvents() }
     }
@@ -102,6 +121,7 @@ final class AppModel {
             selectedProjectID = project.id
             selectedSessionID = nil
             events = []
+            mode = .project
             await loadSessions()
         } catch {
             handle(error)
@@ -122,6 +142,7 @@ final class AppModel {
             let session = try await core.createSession(projectID: projectID, goal: trimmed)
             sessions = try await core.listSessions(projectID: projectID)
             selectedSessionID = session.id
+            mode = .project
             events = try await core.listEvents(sessionID: session.id)
         } catch {
             handle(error)

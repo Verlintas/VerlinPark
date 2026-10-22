@@ -166,7 +166,7 @@ actor CoreClient {
                 do {
                     try await socket.send(.string(text))
                 } catch {
-                    await self.failRequest(id, error)
+                    self.failRequest(id, error)
                 }
             }
         }

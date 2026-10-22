@@ -1,8 +1,9 @@
 # VerlinPark 技术架构
 
-> 版本：0.1（Draft）  
-> 日期：2026-10-21  
-> 关联：[PLAN.md](PLAN.md)、[DECISIONS.md](DECISIONS.md)
+> 版本：0.2（Draft）  
+> 日期：2026-10-23  
+> 关联：[PLAN.md](PLAN.md)、[DECISIONS.md](DECISIONS.md)  
+> 2026-10-23 修订：组织改为四层（Leader → Manager → Worker → Labour），Computer Lease 只串行 GUI/浏览器，UI 改为 Glass Park，Aviiya 外置到 NovaBAIC。旧的三层/旧 UI 章节视为历史设计；以 ADR-0011 ~ ADR-0014 为准。
 
 ---
 

@@ -11,7 +11,7 @@ This file is for coding agents working in this repository. Read it before changi
 
 ## Current milestone
 
-**M0 walking skeleton.** The daemon, SQLite/event log, CLI, provider SSE adapters, and a native SwiftUI shell exist. The agent loop, worktrees, and multi-agent scheduler are **not** implemented yet. Do not pretend they are.
+**M0.5 Glass UI.** The daemon, SQLite/event log, CLI, provider SSE adapters, and the Glass Park SwiftUI shell exist. The four-tier agent org, capacity controller, computer lease, and agent loop are **not** implemented yet. Do not pretend they are.
 
 ## Invariants
 
@@ -22,6 +22,9 @@ This file is for coding agents working in this repository. Read it before changi
 5. Do not log API keys or full secrets. Keychain is for secrets.
 6. Keep the JSON-RPC protocol backward compatible within major version 1.
 7. Prefer deterministic Rust for scheduling/permissions/merge; LLM only inside a task.
+8. The project org is four tiers: Leader → Manager → Worker → Labour. Auto-expansion is budget-gated and hard-capped.
+9. `ComputerLease` serializes GUI/browser only; shell and worktree writes remain parallel.
+10. Aviiya is an external NovaBAIC resident agent. Do not implement a local Aviiya persona, memory, or chat runtime; only the bridge interface.
 
 ## Commands
 
