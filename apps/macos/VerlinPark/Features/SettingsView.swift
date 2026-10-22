@@ -124,6 +124,10 @@ struct BrandSettingsView: View {
                                 Text("Countries & regions · Pride collection")
                                     .font(.system(size: 9, design: .monospaced))
                                     .foregroundStyle(.secondary)
+                                if let source = brand.config.flag.sourceURL {
+                                    Link("Wikimedia Commons source", destination: source)
+                                        .font(.system(size: 9))
+                                }
                             }
                             Spacer()
                             Button("Choose…") {
@@ -271,7 +275,7 @@ struct FlagPickerView: View {
                 .padding(.vertical, 4)
             }
 
-            Text("Country flags: FlagKit (MIT) · Pride flags: Yellow-Dog-Man/PrideFlags (CC0)")
+            Text("Country flags: FlagKit (MIT) · Pride flags: Wikimedia Commons (see THIRD_PARTY_NOTICES)")
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(.tertiary)
         }

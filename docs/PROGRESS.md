@@ -13,7 +13,7 @@
 | 毛玻璃 | ✅ | 隐藏 titlebar、behind-window blur、material 面板、深色优先 |
 | 可配置品牌 | ✅ | displayName + 预设；solid / gradient / flag；持久化 |
 | 国家旗 | ✅ | FlagKit v2.5.0，248 个国家/地区（MIT） |
-| Pride 旗 | ✅ | 20 面 CC0 资产：Rainbow/Progress/Intersex-Inclusive Progress/Trans/Bi/Lesbian/NB/Pan/Ace/Aro/Aroace/Genderfluid/Genderqueer/Intersex/Agender/Demi/Poly/Sapphic/Queer/Two-Spirit |
+| Pride 旗 | ✅ | 20 面 Wikimedia Commons 标准资产：Rainbow/Progress/Intersex-Inclusive Progress/Trans/Bi/Lesbian/NB/Pan/Ace/Aro/Aroace/Genderfluid/Genderqueer/Intersex/Agender/Demi/Poly/Sapphic/Queer/Two-Spirit |
 | 四层组织预览 | ✅ | Leader / Managers 3–5 / Workers 2–10 / Labour 3–40；auto-recruit / auto-hire 占位 |
 | Computer Lease 展示 | ✅ | 明确“只串行 GUI/浏览器”，shell/worktree 并行 |
 | Org Preset | ✅ | 本地保存扩编上限、自动扩编开关、预算冻结线（runtime 在 M2） |

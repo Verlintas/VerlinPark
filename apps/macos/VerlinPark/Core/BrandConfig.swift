@@ -30,6 +30,11 @@ enum BrandStyle: String, Codable, CaseIterable, Identifiable {
 enum FlagSelection: Codable, Hashable {
     case country(String)
     case pride(PrideFlag)
+
+    var sourceURL: URL? {
+        guard case let .pride(flag) = self else { return nil }
+        return flag.sourceURL
+    }
 }
 
 struct BrandConfig: Codable, Equatable {

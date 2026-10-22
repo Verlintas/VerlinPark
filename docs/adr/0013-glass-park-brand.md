@@ -13,7 +13,7 @@
 - 视觉：隐藏 titlebar、behind-window blur、thin material、细边框、深色优先；内容区保持较高不透明度。
 - 品牌：`BrandConfig` 支持 displayName、solid/gradient/flag；提供 VerlinPark/Base/Home/Office/Studio/Lab 预设。
 - 国旗：使用 FlagKit（MIT）的 248 个 ISO 国家/地区旗帜资源。
-- Pride：20 面 CC0 PNG 资产（`Yellow-Dog-Man/PrideFlags`），包括 Rainbow、Progress、Intersex-Inclusive Progress、Trans、Bi、Lesbian、Nonbinary、Pan、Ace、Aro、Aroace、Genderfluid、Genderqueer、Intersex、Agender、Demi、Poly、Sapphic、Queer、Two-Spirit。
+- Pride：20 面 Wikimedia Commons 标准旗帜 PNG，包括 Rainbow、Progress、Intersex-Inclusive Progress、Trans、Bi、Lesbian、Nonbinary、Pan、Ace、Aro、Aroace、Genderfluid、Genderqueer、Intersex、Agender、Demi、Poly、Sapphic、Queer、Two-Spirit。每面旗的作者/许可见 `docs/PRIDE_FLAGS.md`。
 - `.app` bundle 名保持 `VerlinPark`；品牌名只影响窗口标题、About、wordmark 和设置。
 - 尊重 Reduce Transparency / Increase Contrast；不为动画牺牲可读性。
 
@@ -26,5 +26,5 @@
 ## 后果
 
 - SwiftUI 外壳基本重写；需要 `BrandStore`、`BrandMark`、FlagPicker。
-- 需要 FlagKit 的 MIT 归属说明。
+- 需要 FlagKit（MIT）和 Wikimedia Commons 旗帜的逐文件归属说明。
 - 未来若支持整包重命名，需要单独的构建/包装方案，不能用运行时字符串改 Dock 名。

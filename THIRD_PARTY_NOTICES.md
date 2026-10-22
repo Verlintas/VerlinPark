@@ -15,12 +15,14 @@ The full MIT license text is included at
 
 ## Pride flags
 
-- Source: https://github.com/Yellow-Dog-Man/PrideFlags
-- License: CC0 1.0 Universal
-- Usage: 1024px pride flag PNGs in `apps/macos/VerlinPark/Resources/PrideFlags`
-- Copyright: dedicated to the public domain by the project authors
+- Source: Wikimedia Commons
+- Usage: 20 pride flag PNGs in `apps/macos/VerlinPark/Resources/PrideFlags`
+- Per-file source links, authors, and licenses: [docs/PRIDE_FLAGS.md](docs/PRIDE_FLAGS.md)
 
-The full CC0 text is included at
-`apps/macos/VerlinPark/Resources/PrideFlags-LICENSE`.
+Most files are Public Domain or CC0. `Sapphic` and `Two-Spirit` are
+CC BY-SA 4.0 and remain under that license; attribution is recorded in the
+per-file table. `Gay Pride Flag.svg` is listed by Wikimedia Commons as
+“Copyrighted free use”; see its file page for the exact permission.
 
-The country/region flags remain from FlagKit (MIT), described above.
+The flag PNGs are Wikimedia thumbnails, renamed for the app. No pride flag
+artwork was hand-drawn by VerlinPark.

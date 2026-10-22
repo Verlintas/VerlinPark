@@ -109,6 +109,7 @@ v0.1 is not a full IDE, not a model hub, and not a document workspace. See [docs
 - [Decisions](docs/DECISIONS.md) — locked architectural decisions (ADRs)
 - [Progress](docs/PROGRESS.md) — what actually works today
 - [Third-party notices](THIRD_PARTY_NOTICES.md) — bundled FlagKit assets (MIT)
+- [Pride flag sources](docs/PRIDE_FLAGS.md) — Wikimedia Commons file/author/license table
 
 ## Build and run (M0)
 

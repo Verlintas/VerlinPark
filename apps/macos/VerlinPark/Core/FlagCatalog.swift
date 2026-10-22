@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// CC0 pride flag artwork from Yellow-Dog-Man/PrideFlags.
-/// `rawValue` is persisted in brand settings; do not rename cases.
+/// Pride flag artwork from Wikimedia Commons.
+/// Per-file attribution and licenses: `docs/PRIDE_FLAGS.md`.
 enum PrideFlag: String, Codable, CaseIterable, Identifiable, Hashable {
     case rainbow
     case progress
@@ -56,9 +56,9 @@ enum PrideFlag: String, Codable, CaseIterable, Identifiable, Hashable {
 
     var assetName: String {
         switch self {
-        case .rainbow: "PrideFlag_Traditional"
+        case .rainbow: "PrideFlag_rainbow"
         case .progress: "PrideFlag_Progress"
-        case .intersexProgress: "PrideFlag_Intersex-InclusiveProgress"
+        case .intersexProgress: "PrideFlag_intersexProgress"
         case .transgender: "PrideFlag_Transgender"
         case .bisexual: "PrideFlag_Bisexual"
         case .lesbian: "PrideFlag_Lesbian"
@@ -77,6 +77,38 @@ enum PrideFlag: String, Codable, CaseIterable, Identifiable, Hashable {
         case .queer: "PrideFlag_Queer"
         case .twoSpirit: "PrideFlag_TwoSpirit"
         }
+    }
+
+    var sourceTitle: String {
+        switch self {
+        case .rainbow: "Gay Pride Flag.svg"
+        case .progress: "LGBTQ+ rainbow flag Quasar \"Progress\" variant.svg"
+        case .intersexProgress: "Intersex-inclusive pride flag.svg"
+        case .transgender: "Transgender Pride flag.svg"
+        case .bisexual: "Bisexual Pride Flag.svg"
+        case .lesbian: "Lesbian Pride Flag 2019.svg"
+        case .nonbinary: "Non-binary Pride Flag.png"
+        case .pansexual: "Pansexual Pride Flag (3-2 aspect ratio).svg"
+        case .asexual: "Asexual Pride Flag.svg"
+        case .aromantic: "Aromantic Pride Flag.svg"
+        case .aroace: "Aroace flag.svg"
+        case .genderfluid: "Genderfluid Flag (Square).png"
+        case .genderqueer: "Genderqueer Pride Flag.svg"
+        case .intersex: "Intersex Pride Flag.svg"
+        case .agender: "Agender pride flag.svg"
+        case .demisexual: "Demisexual Pride Flag.svg"
+        case .polyamory: "Polyamory flag with infinity heart.svg"
+        case .sapphic: "Sapphic pride flag.svg"
+        case .queer: "Queer pride flag.svg"
+        case .twoSpirit: "Two-Spirit Flag.svg"
+        }
+    }
+
+    var sourceURL: URL? {
+        let encoded = sourceTitle.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? sourceTitle
+        return URL(string: "https://commons.wikimedia.org/wiki/File:\(encoded)")
     }
 
     var image: NSImage? {

@@ -46,7 +46,9 @@ final class BrandConfigTests: XCTestCase {
 
     func testFlagAssetsAreBundled() {
         XCTAssertNotNil(NSImage(named: "US"))
-        XCTAssertNotNil(PrideFlag.progress.image)
-        XCTAssertNotNil(PrideFlag.intersexProgress.image)
+        for flag in PrideFlag.allCases {
+            XCTAssertNotNil(flag.image, "missing pride flag asset: \(flag.assetName)")
+            XCTAssertNotNil(flag.sourceURL)
+        }
     }
 }
