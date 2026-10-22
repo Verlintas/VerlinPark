@@ -15,6 +15,12 @@ The full MIT license text is included at
 
 ## Pride flags
 
-The pride flag artwork in `FlagCatalog.swift` is drawn from standard public flag
-designs using SwiftUI shapes and color values. No third-party image assets are
-bundled for these flags.
+- Source: https://github.com/Yellow-Dog-Man/PrideFlags
+- License: CC0 1.0 Universal
+- Usage: 1024px pride flag PNGs in `apps/macos/VerlinPark/Resources/PrideFlags`
+- Copyright: dedicated to the public domain by the project authors
+
+The full CC0 text is included at
+`apps/macos/VerlinPark/Resources/PrideFlags-LICENSE`.
+
+The country/region flags remain from FlagKit (MIT), described above.

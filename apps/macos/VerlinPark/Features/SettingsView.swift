@@ -270,6 +270,10 @@ struct FlagPickerView: View {
                 }
                 .padding(.vertical, 4)
             }
+
+            Text("Country flags: FlagKit (MIT) · Pride flags: Yellow-Dog-Man/PrideFlags (CC0)")
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
         }
         .padding(22)
         .frame(width: 720, height: 560)

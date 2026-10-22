@@ -1,3 +1,4 @@
+import AppKit
 @testable import VerlinPark
 import XCTest
 
@@ -41,5 +42,11 @@ final class BrandConfigTests: XCTestCase {
         let bridge = UnavailableResidentAgent()
         XCTAssertEqual(bridge.displayName, "Aviiya")
         XCTAssertEqual(bridge.status, .unavailable)
+    }
+
+    func testFlagAssetsAreBundled() {
+        XCTAssertNotNil(NSImage(named: "US"))
+        XCTAssertNotNil(PrideFlag.progress.image)
+        XCTAssertNotNil(PrideFlag.intersexProgress.image)
     }
 }

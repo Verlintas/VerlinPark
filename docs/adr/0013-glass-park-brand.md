@@ -13,7 +13,7 @@
 - 视觉：隐藏 titlebar、behind-window blur、thin material、细边框、深色优先；内容区保持较高不透明度。
 - 品牌：`BrandConfig` 支持 displayName、solid/gradient/flag；提供 VerlinPark/Base/Home/Office/Studio/Lab 预设。
 - 国旗：使用 FlagKit（MIT）的 248 个 ISO 国家/地区旗帜资源。
-- Pride：SwiftUI 自绘 15 面旗（Rainbow、Progress、Trans、Bi、Lesbian、Nonbinary、Pan、Ace、Aro、Genderfluid、Genderqueer、Intersex、Agender、Demi、Poly）。
+- Pride：20 面 CC0 PNG 资产（`Yellow-Dog-Man/PrideFlags`），包括 Rainbow、Progress、Intersex-Inclusive Progress、Trans、Bi、Lesbian、Nonbinary、Pan、Ace、Aro、Aroace、Genderfluid、Genderqueer、Intersex、Agender、Demi、Poly、Sapphic、Queer、Two-Spirit。
 - `.app` bundle 名保持 `VerlinPark`；品牌名只影响窗口标题、About、wordmark 和设置。
 - 尊重 Reduce Transparency / Increase Contrast；不为动画牺牲可读性。
 
