@@ -36,15 +36,17 @@ struct BrandMark: View {
     var maxWidth: CGFloat = 220
 
     var body: some View {
+        let metrics = wordmarkMetrics
         ZStack(alignment: .leading) {
             Text(config.effectiveName)
-                .font(.system(size: fontSize, weight: .bold, design: .rounded))
+                .font(.system(size: metrics.fontSize, weight: .bold, design: .rounded))
                 .lineLimit(1)
-                .minimumScaleFactor(0.42)
+                .minimumScaleFactor(0.9)
+                .frame(width: metrics.width, alignment: .leading)
                 .opacity(0)
 
             GeometryReader { proxy in
-                let band = flagBand(for: proxy.size)
+                let band = flagBand(for: proxy.size, fontSize: metrics.fontSize)
                 fill
                     .frame(
                         width: proxy.size.width,
@@ -53,9 +55,9 @@ struct BrandMark: View {
                     .offset(y: config.style == .flag ? band.top : 0)
                     .mask {
                         Text(config.effectiveName)
-                            .font(.system(size: fontSize, weight: .bold, design: .rounded))
+                            .font(.system(size: metrics.fontSize, weight: .bold, design: .rounded))
                             .lineLimit(1)
-                            .minimumScaleFactor(0.42)
+                            .minimumScaleFactor(0.9)
                             .frame(
                                 width: proxy.size.width,
                                 height: proxy.size.height,
@@ -65,9 +67,8 @@ struct BrandMark: View {
                     .shadow(color: .black.opacity(0.38), radius: 2, y: 1)
             }
         }
-        .frame(maxWidth: maxWidth, alignment: .leading)
-        .frame(height: fontSize * 1.2, alignment: .leading)
-        .padding(.vertical, fontSize * 0.08)
+        .frame(width: metrics.width, height: metrics.fontSize * 1.2, alignment: .leading)
+        .padding(.vertical, metrics.fontSize * 0.08)
         .accessibilityLabel("\(config.effectiveName) brand")
     }
 
@@ -90,14 +91,34 @@ struct BrandMark: View {
         }
     }
 
-    /// Vertical band occupied by uppercase glyphs (cap height above the
-    /// baseline). Aligning the flag to this band shows the full flag through
-    /// the letters instead of only the middle stripes.
+    private struct WordmarkMetrics {
+        let fontSize: CGFloat
+        let width: CGFloat
+    }
+
+    private var wordmarkMetrics: WordmarkMetrics {
+        let name = config.effectiveName
+        let base = NSFont.systemFont(ofSize: fontSize, weight: .bold)
+        let baseWidth = (name as NSString).size(withAttributes: [.font: base]).width
+        let scale = baseWidth > maxWidth ? maxWidth / baseWidth : 1
+        let size = max(1, fontSize * scale)
+        let descriptor = NSFont.systemFont(ofSize: size, weight: .bold)
+            .fontDescriptor
+            .withDesign(.rounded)
+        let font = descriptor.flatMap { NSFont(descriptor: $0, size: size) }
+            ?? NSFont.systemFont(ofSize: size, weight: .bold)
+        let width = (name as NSString).size(withAttributes: [.font: font]).width
+        return WordmarkMetrics(
+            fontSize: size,
+            width: min(maxWidth, max(1, width + 2))
+        )
+    }
+
     /// Vertical band occupied by the visible glyphs. Using the ascender (not
     /// just cap height) keeps lowercase ascenders such as l/k filled; using the
     /// baseline (or descender when needed) maps the bottom flag stripe to the
     /// bottom of the letters.
-    private func flagBand(for size: CGSize) -> (height: CGFloat, top: CGFloat) {
+    private func flagBand(for size: CGSize, fontSize: CGFloat) -> (height: CGFloat, top: CGFloat) {
         let font = NSFont.systemFont(ofSize: fontSize, weight: .bold)
         let lineHeight = font.ascender - font.descender + font.leading
         let extra = max(0, (size.height - lineHeight) / 2)

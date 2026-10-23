@@ -119,6 +119,38 @@ enum PrideFlag: String, Codable, CaseIterable, Identifiable, Hashable {
     }
 }
 
+enum FlagFillMode: Equatable {
+    /// Stretch the flag to the glyph band. Best for pure stripe flags.
+    case stretch
+    /// Preserve the flag's aspect ratio and crop to the glyph band.
+    case cover
+}
+
+extension PrideFlag {
+    var fillMode: FlagFillMode {
+        switch self {
+        case .rainbow, .transgender, .bisexual, .lesbian, .nonbinary,
+             .pansexual, .asexual, .aromantic, .aroace, .genderfluid,
+             .genderqueer, .agender, .queer:
+            .stretch
+        case .progress, .intersexProgress, .intersex, .demisexual,
+             .polyamory, .sapphic, .twoSpirit:
+            .cover
+        }
+    }
+}
+
+extension FlagSelection {
+    var fillMode: FlagFillMode {
+        switch self {
+        case .region:
+            .cover
+        case let .pride(flag):
+            flag.fillMode
+        }
+    }
+}
+
 struct FlagOption: Identifiable, Hashable {
     let id: String
     let title: String
@@ -171,28 +203,35 @@ struct PrideFlagImage: View {
     }
 }
 
-/// Stretches a flag to fill its frame without preserving aspect ratio. Used for
-/// the knockout wordmark so all flag colors show through the glyphs instead of
-/// a single cropped horizontal band.
+/// Fills the glyph band with a flag. Stripe flags are stretched; patterned
+/// flags preserve their aspect ratio and are cropped to the band so emblems are
+/// not distorted.
 struct FlagFill: View {
     let selection: FlagSelection
 
     var body: some View {
+        if let image {
+            switch selection.fillMode {
+            case .stretch:
+                Image(nsImage: image)
+                    .resizable()
+            case .cover:
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .clipped()
+            }
+        } else {
+            Color.gray.opacity(0.35)
+        }
+    }
+
+    private var image: NSImage? {
         switch selection {
         case let .region(code):
-            if let image = NSImage(named: code) {
-                Image(nsImage: image)
-                    .resizable()
-            } else {
-                Color.gray.opacity(0.35)
-            }
+            NSImage(named: code)
         case let .pride(flag):
-            if let image = flag.image {
-                Image(nsImage: image)
-                    .resizable()
-            } else {
-                Color.gray.opacity(0.35)
-            }
+            flag.image
         }
     }
 }

@@ -133,6 +133,9 @@ struct BrandSettingsView: View {
                             Button("Choose…") {
                                 showingFlagPicker = true
                             }
+                            Text("Stripe flags stretch; patterned flags preserve aspect and crop.")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
                         }
                     }
                 }
