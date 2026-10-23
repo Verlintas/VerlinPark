@@ -30,10 +30,44 @@ struct GlassBackground: View {
     }
 }
 
-struct BrandBackground: View {
+struct BrandMark: View {
     let config: BrandConfig
+    var fontSize: CGFloat = 26
+    var maxWidth: CGFloat = 220
 
     var body: some View {
+        ZStack(alignment: .leading) {
+            Text(config.effectiveName)
+                .font(.system(size: fontSize, weight: .bold, design: .rounded))
+                .lineLimit(1)
+                .minimumScaleFactor(0.42)
+                .opacity(0)
+
+            GeometryReader { proxy in
+                fill
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .mask {
+                        Text(config.effectiveName)
+                            .font(.system(size: fontSize, weight: .bold, design: .rounded))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.42)
+                            .frame(
+                                width: proxy.size.width,
+                                height: proxy.size.height,
+                                alignment: .leading
+                            )
+                    }
+                    .shadow(color: .black.opacity(0.38), radius: 2, y: 1)
+            }
+        }
+        .frame(maxWidth: maxWidth, alignment: .leading)
+        .frame(height: fontSize * 1.2, alignment: .leading)
+        .padding(.vertical, fontSize * 0.08)
+        .accessibilityLabel("\(config.effectiveName) brand")
+    }
+
+    @ViewBuilder
+    private var fill: some View {
         switch config.style {
         case .solid:
             Color(hex: config.solidHex)
@@ -47,15 +81,7 @@ struct BrandBackground: View {
                 endPoint: gradientPoints.end
             )
         case .flag:
-            ZStack {
-                FlagSwatch(selection: config.flag)
-                Color.black.opacity(0.26)
-                LinearGradient(
-                    colors: [.clear, .black.opacity(0.28)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            }
+            FlagFill(selection: config.flag)
         }
     }
 
@@ -67,31 +93,6 @@ struct BrandBackground: View {
             UnitPoint(x: 0.5 - dx, y: 0.5 - dy),
             UnitPoint(x: 0.5 + dx, y: 0.5 + dy)
         )
-    }
-}
-
-struct BrandMark: View {
-    let config: BrandConfig
-    var fontSize: CGFloat = 23
-
-    var body: some View {
-        Text(config.effectiveName)
-            .font(.system(size: fontSize, weight: .semibold, design: .rounded))
-            .foregroundStyle(config.prefersDarkText ? Color.black.opacity(0.82) : Color.white)
-            .lineLimit(1)
-            .minimumScaleFactor(0.55)
-            .padding(.horizontal, fontSize * 0.58)
-            .padding(.vertical, fontSize * 0.34)
-            .background {
-                BrandBackground(config: config)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: fontSize * 0.54, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: fontSize * 0.54, style: .continuous)
-                    .strokeBorder(.white.opacity(0.2), lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.28), radius: 14, y: 7)
-            .accessibilityLabel("\(config.effectiveName) brand")
     }
 }
 

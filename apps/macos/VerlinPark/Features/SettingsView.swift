@@ -36,7 +36,7 @@ struct BrandSettingsView: View {
                         Text("Brand")
                             .font(.system(size: 22, weight: .semibold, design: .rounded))
                         Text(
-                            "The wordmark in the top-left. The .app bundle stays VerlinPark for signing and updates."
+                            "The knockout wordmark in the top-left. The .app bundle stays VerlinPark for signing and updates."
                         )
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)

@@ -171,6 +171,32 @@ struct PrideFlagImage: View {
     }
 }
 
+/// Stretches a flag to fill its frame without preserving aspect ratio. Used for
+/// the knockout wordmark so all flag colors show through the glyphs instead of
+/// a single cropped horizontal band.
+struct FlagFill: View {
+    let selection: FlagSelection
+
+    var body: some View {
+        switch selection {
+        case let .country(code):
+            if let image = NSImage(named: code) {
+                Image(nsImage: image)
+                    .resizable()
+            } else {
+                Color.gray.opacity(0.35)
+            }
+        case let .pride(flag):
+            if let image = flag.image {
+                Image(nsImage: image)
+                    .resizable()
+            } else {
+                Color.gray.opacity(0.35)
+            }
+        }
+    }
+}
+
 struct FlagSwatch: View {
     let selection: FlagSelection
 

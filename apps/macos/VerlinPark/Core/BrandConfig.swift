@@ -59,21 +59,6 @@ struct BrandConfig: Codable, Equatable {
         let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "VerlinPark" : trimmed
     }
-
-    /// White text on flags and dark brand colors; black text on very light
-    /// solid/gradient backgrounds.
-    var prefersDarkText: Bool {
-        switch style {
-        case .flag:
-            return false
-        case .solid:
-            return Color(hex: solidHex).relativeLuminance > 0.58
-        case .gradient:
-            let start = Color(hex: gradientStartHex).relativeLuminance
-            let end = Color(hex: gradientEndHex).relativeLuminance
-            return (start + end) / 2 > 0.58
-        }
-    }
 }
 
 @MainActor

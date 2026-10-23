@@ -10,7 +10,7 @@ struct RailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            BrandMark(config: brand.config, fontSize: 22)
+            BrandMark(config: brand.config, fontSize: 28)
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
                 .padding(.bottom, 18)

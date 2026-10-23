@@ -58,7 +58,7 @@ The UI can reconstruct a session, replay it, export it, and show exactly why a c
 
 - Native SwiftUI/AppKit UI, not a web app in a shell.
 - Glass Park shell: project rail, chat stage, Collab/Preview studio, Manage Dash.
-- Configurable wordmark: solid, gradient, or a country/pride flag; 248 countries and 20 pride flags.
+- Knockout wordmark: solid, gradient, or a country/pride flag showing through the letters; 248 countries and 20 pride flags.
 - A Rust core daemon that can run headless and be driven by a CLI.
 - Cloud APIs first; any OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp) works as a local provider.
 - Embedded MLX runtime planned for a later milestone.
