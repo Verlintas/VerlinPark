@@ -13,7 +13,7 @@
 - 视觉：隐藏 titlebar、behind-window blur、thin material、细边框、深色优先；内容区保持较高不透明度。
 - 品牌：`BrandConfig` 支持 displayName、solid/gradient/flag；提供 VerlinPark/Base/Home/Office/Studio/Lab 预设。
 - 左上角是 **knockout wordmark**：文字本身作为遮罩，纯色/渐变/旗帜从字形里透出来；不再画大方块底板。
-- 国旗：使用 FlagKit（MIT）的 248 个 ISO 国家/地区旗帜资源。
+- 地区旗：使用 FlagKit（MIT）的 248 个 ISO 3166-1 地区旗帜资源（含国家与地区）。
 - Pride：20 面 Wikimedia Commons 标准旗帜 PNG，包括 Rainbow、Progress、Intersex-Inclusive Progress、Trans、Bi、Lesbian、Nonbinary、Pan、Ace、Aro、Aroace、Genderfluid、Genderqueer、Intersex、Agender、Demi、Poly、Sapphic、Queer、Two-Spirit。每面旗的作者/许可见 `docs/PRIDE_FLAGS.md`。
 - `.app` bundle 名保持 `VerlinPark`；品牌名只影响窗口标题、About、wordmark 和设置。
 - 尊重 Reduce Transparency / Increase Contrast；不为动画牺牲可读性。

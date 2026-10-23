@@ -27,13 +27,59 @@ enum BrandStyle: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-enum FlagSelection: Codable, Hashable {
-    case country(String)
+enum FlagSelection: Hashable {
+    case region(String)
     case pride(PrideFlag)
 
     var sourceURL: URL? {
         guard case let .pride(flag) = self else { return nil }
         return flag.sourceURL
+    }
+}
+
+extension FlagSelection: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case region
+        case country
+        case pride
+    }
+
+    private enum PayloadKeys: String, CodingKey {
+        case _0
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.region) {
+            let payload = try container.nestedContainer(keyedBy: PayloadKeys.self, forKey: .region)
+            self = try .region(payload.decode(String.self, forKey: ._0))
+        } else if container.contains(.country) {
+            // Legacy brand configs used `country`; migrate transparently.
+            let payload = try container.nestedContainer(keyedBy: PayloadKeys.self, forKey: .country)
+            self = try .region(payload.decode(String.self, forKey: ._0))
+        } else if container.contains(.pride) {
+            let payload = try container.nestedContainer(keyedBy: PayloadKeys.self, forKey: .pride)
+            self = try .pride(payload.decode(PrideFlag.self, forKey: ._0))
+        } else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Unknown flag selection"
+                )
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .region(code):
+            var payload = container.nestedContainer(keyedBy: PayloadKeys.self, forKey: .region)
+            try payload.encode(code, forKey: ._0)
+        case let .pride(flag):
+            var payload = container.nestedContainer(keyedBy: PayloadKeys.self, forKey: .pride)
+            try payload.encode(flag, forKey: ._0)
+        }
     }
 }
 

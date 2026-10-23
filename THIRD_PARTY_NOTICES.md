@@ -7,7 +7,7 @@ VerlinPark includes the following third-party assets and software.
 - Source: https://github.com/madebybowtie/FlagKit
 - Version: v2.5.0
 - License: MIT
-- Usage: country and region flag images in `apps/macos/VerlinPark/Resources/FlagKit.xcassets`
+- Usage: region flag images in `apps/macos/VerlinPark/Resources/FlagKit.xcassets`
 - Copyright: Copyright © 2017 Bowtie
 
 The full MIT license text is included at

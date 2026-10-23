@@ -134,15 +134,15 @@ enum FlagCatalog {
         )
     }
 
-    static let countries: [FlagOption] = Locale.Region.isoRegions
+    static let regions: [FlagOption] = Locale.Region.isoRegions
         .compactMap { region in
             let code = region.identifier
             guard NSImage(named: code) != nil else { return nil }
             let name = Locale.current.localizedString(forRegionCode: code) ?? code
             return FlagOption(
-                id: "country:\(code)",
+                id: "region:\(code)",
                 title: "\(name) · \(code)",
-                selection: .country(code)
+                selection: .region(code)
             )
         }
         .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
@@ -179,7 +179,7 @@ struct FlagFill: View {
 
     var body: some View {
         switch selection {
-        case let .country(code):
+        case let .region(code):
             if let image = NSImage(named: code) {
                 Image(nsImage: image)
                     .resizable()
@@ -202,7 +202,7 @@ struct FlagSwatch: View {
 
     var body: some View {
         switch selection {
-        case let .country(code):
+        case let .region(code):
             if let image = NSImage(named: code) {
                 Image(nsImage: image)
                     .resizable()

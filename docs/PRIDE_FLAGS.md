@@ -1,6 +1,6 @@
 # Pride flag sources
 
-All pride flag assets are from Wikimedia Commons. Country/region flags are from FlagKit (see [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES.md)).
+All pride flag assets are from Wikimedia Commons. Region flags are from FlagKit (see [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES.md)).
 
 | Flag | Wikimedia Commons file | Author / credit | License |
 |---|---|---|---|

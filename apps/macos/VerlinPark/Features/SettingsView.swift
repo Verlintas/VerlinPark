@@ -121,7 +121,7 @@ struct BrandSettingsView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(flagTitle)
                                     .font(.system(size: 11, weight: .medium))
-                                Text("Countries & regions · Pride collection")
+                                Text("Regions · Pride collection")
                                     .font(.system(size: 9, design: .monospaced))
                                     .foregroundStyle(.secondary)
                                 if let source = brand.config.flag.sourceURL {
@@ -162,7 +162,7 @@ struct BrandSettingsView: View {
 
     private var flagTitle: String {
         switch brand.config.flag {
-        case let .country(code):
+        case let .region(code):
             Locale.current.localizedString(forRegionCode: code) ?? code
         case let .pride(flag):
             flag.title
@@ -185,7 +185,7 @@ struct FlagPickerView: View {
     @Environment(\.dismiss) private var dismiss
 
     enum Category: String, CaseIterable, Identifiable {
-        case countries
+        case regions
         case pride
         var id: String {
             rawValue
@@ -193,17 +193,17 @@ struct FlagPickerView: View {
 
         var title: String {
             switch self {
-            case .countries: "Countries"
+            case .regions: "Regions"
             case .pride: "Pride"
             }
         }
     }
 
-    @State private var category: Category = .countries
+    @State private var category: Category = .regions
     @State private var search = ""
 
     private var options: [FlagOption] {
-        let source = category == .countries ? FlagCatalog.countries : FlagCatalog.pride
+        let source = category == .regions ? FlagCatalog.regions : FlagCatalog.pride
         return FlagCatalog.search(search, in: source)
     }
 
@@ -214,7 +214,7 @@ struct FlagPickerView: View {
                     Text("Choose a flag")
                         .font(.title2.weight(.semibold))
                     Text(
-                        "\(FlagCatalog.countries.count) countries & regions · \(FlagCatalog.pride.count) pride flags"
+                        "\(FlagCatalog.regions.count) regions · \(FlagCatalog.pride.count) pride flags"
                     )
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
@@ -275,7 +275,7 @@ struct FlagPickerView: View {
                 .padding(.vertical, 4)
             }
 
-            Text("Country flags: FlagKit (MIT) · Pride flags: Wikimedia Commons (see THIRD_PARTY_NOTICES)")
+            Text("Region flags: FlagKit (MIT) · Pride flags: Wikimedia Commons (see THIRD_PARTY_NOTICES)")
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(.tertiary)
         }
@@ -286,7 +286,7 @@ struct FlagPickerView: View {
 
     private func isSelected(_ option: FlagOption) -> Bool {
         switch (selection, option.selection) {
-        case let (.country(a), .country(b)): a == b
+        case let (.region(a), .region(b)): a == b
         case let (.pride(a), .pride(b)): a == b
         default: false
         }

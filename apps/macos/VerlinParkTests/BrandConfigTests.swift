@@ -32,6 +32,21 @@ final class BrandConfigTests: XCTestCase {
         XCTAssertEqual(decoded, config)
     }
 
+    func testRegionFlagSelectionMigratesLegacyCountryKey() throws {
+        let legacy = #"{"country":{"_0":"TW"}}"#
+        let decoded = try JSONDecoder().decode(FlagSelection.self, from: Data(legacy.utf8))
+        XCTAssertEqual(decoded, .region("TW"))
+
+        let encoded = try JSONEncoder().encode(decoded)
+        let text = String(decoding: encoded, as: UTF8.self)
+        XCTAssertTrue(text.contains("region"))
+        XCTAssertFalse(text.contains("country"))
+    }
+
+    func testRegionsCatalogIsNonEmpty() {
+        XCTAssertGreaterThan(FlagCatalog.regions.count, 200)
+    }
+
     func testPrideCatalogIsComplete() {
         XCTAssertEqual(FlagCatalog.pride.count, PrideFlag.allCases.count)
         XCTAssertGreaterThanOrEqual(FlagCatalog.pride.count, 12)

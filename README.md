@@ -4,7 +4,7 @@
 
 VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets them collaborate through typed messages and shared artifacts, and makes every plan, tool call, diff, token, and permission decision inspectable and replayable.
 
-> **Status: M0.5 Glass UI.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. The new Glass Park UI, configurable brand mark, country/pride flags, Collab/Preview, and Manage Dash are in place. The agent runtime and four-tier scheduler land in M1/M2.
+> **Status: M0.5 Glass UI.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. The new Glass Park UI, configurable brand mark, region/pride flags, Collab/Preview, and Manage Dash are in place. The agent runtime and four-tier scheduler land in M1/M2.
 
 ---
 
@@ -58,7 +58,7 @@ The UI can reconstruct a session, replay it, export it, and show exactly why a c
 
 - Native SwiftUI/AppKit UI, not a web app in a shell.
 - Glass Park shell: project rail, chat stage, Collab/Preview studio, Manage Dash.
-- Knockout wordmark: solid, gradient, or a country/pride flag showing through the letters; 248 countries and 20 pride flags.
+- Knockout wordmark: solid, gradient, or a region/pride flag showing through the letters; 248 regions and 20 pride flags.
 - A Rust core daemon that can run headless and be driven by a CLI.
 - Cloud APIs first; any OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp) works as a local provider.
 - Embedded MLX runtime planned for a later milestone.
@@ -184,7 +184,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M0.5 Glass UI**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 国家旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；Agent loop、四层组织和多 Agent 调度在 M1/M2。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+当前处于 **M0.5 Glass UI**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；Agent loop、四层组织和多 Agent 调度在 M1/M2。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 ## 许可
 
