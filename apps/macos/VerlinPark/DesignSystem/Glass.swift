@@ -93,12 +93,21 @@ struct BrandMark: View {
     /// Vertical band occupied by uppercase glyphs (cap height above the
     /// baseline). Aligning the flag to this band shows the full flag through
     /// the letters instead of only the middle stripes.
+    /// Vertical band occupied by the visible glyphs. Using the ascender (not
+    /// just cap height) keeps lowercase ascenders such as l/k filled; using the
+    /// baseline (or descender when needed) maps the bottom flag stripe to the
+    /// bottom of the letters.
     private func flagBand(for size: CGSize) -> (height: CGFloat, top: CGFloat) {
         let font = NSFont.systemFont(ofSize: fontSize, weight: .bold)
         let lineHeight = font.ascender - font.descender + font.leading
         let extra = max(0, (size.height - lineHeight) / 2)
         let baseline = font.ascender + extra
-        return (font.capHeight, baseline - font.capHeight)
+        let hasDescender = config.effectiveName.rangeOfCharacter(
+            from: CharacterSet(charactersIn: "gjpqy")
+        ) != nil
+        let bottom = hasDescender ? baseline - font.descender : baseline
+        let top = baseline - font.ascender
+        return (max(1, bottom - top), top)
     }
 
     private var gradientPoints: (start: UnitPoint, end: UnitPoint) {
