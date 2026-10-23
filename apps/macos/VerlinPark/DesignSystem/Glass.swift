@@ -44,8 +44,13 @@ struct BrandMark: View {
                 .opacity(0)
 
             GeometryReader { proxy in
+                let band = flagBand(for: proxy.size)
                 fill
-                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .frame(
+                        width: proxy.size.width,
+                        height: config.style == .flag ? band.height : proxy.size.height
+                    )
+                    .offset(y: config.style == .flag ? band.top : 0)
                     .mask {
                         Text(config.effectiveName)
                             .font(.system(size: fontSize, weight: .bold, design: .rounded))
@@ -83,6 +88,17 @@ struct BrandMark: View {
         case .flag:
             FlagFill(selection: config.flag)
         }
+    }
+
+    /// Vertical band occupied by uppercase glyphs (cap height above the
+    /// baseline). Aligning the flag to this band shows the full flag through
+    /// the letters instead of only the middle stripes.
+    private func flagBand(for size: CGSize) -> (height: CGFloat, top: CGFloat) {
+        let font = NSFont.systemFont(ofSize: fontSize, weight: .bold)
+        let lineHeight = font.ascender - font.descender + font.leading
+        let extra = max(0, (size.height - lineHeight) / 2)
+        let baseline = font.ascender + extra
+        return (font.capHeight, baseline - font.capHeight)
     }
 
     private var gradientPoints: (start: UnitPoint, end: UnitPoint) {
