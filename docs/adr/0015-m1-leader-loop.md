@@ -44,9 +44,9 @@ approval, and result has to be an event that a client can replay.
 - A daemon restart does not resume an in-flight run or pending approval waiter.
   Persisted messages and approvals remain inspectable; automatic resume is a
   later milestone.
-- Agents write directly in the project root until per-task worktrees land. This
-  is acceptable only while one Leader runs; it must change before parallel
-  Workers or Labour are enabled.
+- Session worktrees landed in ADR-0016; the Leader writes on its session branch,
+  not in the project root. Per-task worktrees for Managers/Workers/Labour are
+  still future work.
 - There is no token budget enforcement or context compaction yet. The turn limit
   is the only hard stop.
 - The deny-list is deliberately conservative and incomplete; the real permission

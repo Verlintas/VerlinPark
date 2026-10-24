@@ -248,9 +248,14 @@ async fn run_agent(
     prompt: &str,
 ) -> Result<()> {
     let store = engine.store().clone();
-    let (session, project) = load_session_project(store.clone(), session_id).await?;
+    let (_, project) = load_session_project(store.clone(), session_id).await?;
+    let session = engine.ensure_session_worktree(session_id).await?;
+    let worktree = session
+        .worktree
+        .clone()
+        .ok_or_else(|| anyhow!("session has no worktree"))?;
     let context = ToolContext {
-        root: std::path::PathBuf::from(&project.root),
+        root: std::path::PathBuf::from(&worktree),
     };
 
     engine
@@ -262,12 +267,14 @@ async fn run_agent(
                 "prompt": prompt,
                 "model": config.model,
                 "provider": config.provider_name,
+                "worktree": session.worktree,
+                "branch": session.branch,
             }),
         )
         .await?;
 
     let mut conversation = load_conversation(&engine, session_id).await?;
-    let system = system_prompt(&project, &session);
+    let system = system_prompt(&project, &session, &worktree);
     let tools = config.tools.schemas();
 
     for turn in 0..config.max_turns {
@@ -515,16 +522,22 @@ async fn wait_for_approval(receiver: oneshot::Receiver<bool>) -> ApprovalOutcome
     }
 }
 
-fn system_prompt(project: &Project, session: &Session) -> String {
+fn system_prompt(project: &Project, session: &Session, worktree: &str) -> String {
     format!(
-        "You are VerlinPark's Leader agent for the project '{}' at {}. \
+        "You are VerlinPark's Leader agent for the project '{}'. \
          The session goal is: {}. \
-         Work directly in the project root. Use read_file/list_dir/grep to inspect code. \
+         Work only inside your session worktree at {}. \
+         The original project root {} is read-only for you; never write there. \
+         The worktree is on branch {}. Use read_file/list_dir/grep to inspect code. \
          Use write_file only when needed and shell for tests/builds. \
          Write and shell calls require user approval, so explain what you are doing briefly. \
          Prefer small, verifiable steps. When done, summarize the changes and test results. \
          Do not claim success without evidence.",
-        project.name, project.root, session.goal
+        project.name,
+        session.goal,
+        worktree,
+        project.root,
+        session.branch.as_deref().unwrap_or("(detached)")
     )
 }
 
@@ -542,6 +555,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::collections::VecDeque;
+    use std::path::Path;
+    use std::process::Command;
     use tempfile::TempDir;
     use vp_providers::{EventStream, ProviderError};
     use vp_store::Store;
@@ -575,6 +590,7 @@ mod tests {
         let project_dir = dir.path().join("repo");
         std::fs::create_dir_all(&project_dir).unwrap();
         std::fs::write(project_dir.join("README.md"), "hello from test\n").unwrap();
+        init_repo(&project_dir);
         let project = engine
             .store()
             .add_project(project_dir.to_str().unwrap(), Some("repo"))
@@ -639,6 +655,24 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("model is required"));
+    }
+
+    fn init_repo(path: &Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
     }
 
     #[tokio::test]

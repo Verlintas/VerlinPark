@@ -10,8 +10,9 @@
 | 项 | 状态 | 说明 |
 |---|---|---|
 | Leader loop | ✅ | `session.create` / `session.prompt` 启动；加载历史消息 → 流式 Provider → 顺序工具 → 最终回答；最大轮数硬停 |
+| Session worktree | ✅ | 每个 session 自动创建链接 worktree + `verlinpark/<session-id>` 分支；Agent 只能写 worktree；旧 session 首次运行时自动补建 |
 | Provider 工具调用 | ✅ | OpenAI-compatible 按 index 重组流式 `tool_calls`；Anthropic `tool_use` + `input_json_delta` + `tool_result` 映射 |
-| 只读工具 | ✅ | `read_file` / `list_dir` / `grep`；项目根路径 jail；输出 40k 截断 |
+| 只读工具 | ✅ | `read_file` / `list_dir` / `grep`；worktree 路径 jail；输出 40k 截断 |
 | 副作用工具 | ✅ | `write_file` / `shell`；必须审批；Shell 120s 默认/900s 上限，拒绝已知危险模式 |
 | 审批队列 | ✅ | SQLite `approvals` + `approval.requested/resolved` 事件；UI 卡片 Approve/Deny；CLI `approve/deny`；10 分钟超时视为拒绝 |
 | Agent 事件 | ✅ | `agent.started/message_delta/message/turn_finished/failed/unavailable`、`tool.started/finished`、`agent.usage` |
@@ -19,12 +20,12 @@
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 17 个：工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
-| 手工 E2E | ✅ | mock SSE：configure → session → read_file → approval → write_file → final；App 内同样走通 |
+| 测试 | ✅ | Rust 20 个：worktree 创建/非 Git 拒绝、旧库迁移、工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
+| 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；项目根保持干净；App 内同样走通 |
 
 **M1 尚未完成：**
 
-- 每任务 worktree / 分支 / merge queue；当前单 Leader 直接写项目根，多 Agent 前必须替换。
+- 多 Agent 的 per-task worktree / integration 分支 / merge queue；当前只有 session 级 Leader worktree。
 - 完整权限代理（角色/命令分类/路径策略/预算）；当前只有路径 jail + 写/Shell 审批 + 简单拒绝列表。
 - Token/成本预算硬停、上下文压缩、运行恢复、取消/暂停。
 - 只读工具并行、MCP/ACP、diff 视图、终端、真实 Collab 节点。

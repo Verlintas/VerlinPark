@@ -16,6 +16,10 @@ pub struct Session {
     pub project_id: String,
     pub goal: String,
     pub status: String,
+    #[serde(default)]
+    pub worktree: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
     pub created_at: String,
 }
 

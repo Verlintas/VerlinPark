@@ -466,9 +466,10 @@ loop {
 
 ## 7. Agent Runtime
 
-> **实现状态（M1）：** 当前实现是单 Leader、顺序工具、写/Shell 审批的子集：
-> `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`。四层 Actor、并行只读工具、
-> 预算、压缩和恢复仍是设计目标。见 [ADR-0015](adr/0015-m1-leader-loop.md)。
+> **实现状态（M1）：** 当前实现是单 Leader、顺序工具、写/Shell 审批、session worktree 的子集：
+> `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`、`crates/vp-core/src/worktree.rs`。
+> 四层 Actor、并行只读工具、预算、压缩和恢复仍是设计目标。
+> 见 [ADR-0015](adr/0015-m1-leader-loop.md) 与 [ADR-0016](adr/0016-session-worktree.md)。
 
 ### 7.1 Actor 命令
 
@@ -653,12 +654,14 @@ Department Lead ◀──▶ Department Lead (explicit allow)
 ~/Library/Application Support/VerlinPark/worktrees/
   <project_id>/
     <session_id>/
-      integration/
-      <task_id>/
+      leader/          # M1：单 Leader
+      integration/     # 规划中
+      <task_id>/       # 规划中
 ```
 
 - 不放仓库内部，避免被搜索/提交。
 - 每个 worktree 对应一个 branch。
+- M1 的 Leader 分支是 `verlinpark/<full-session-id>`；不使用 8 位前缀，因为 UUIDv7 前缀会碰撞。
 - session 结束后可配置保留/删除；默认保留 7 天。
 
 ### 9.2 分支命名

@@ -321,11 +321,13 @@ final class AppModel {
                 projectId: old.projectId,
                 goal: old.goal,
                 status: status,
+                worktree: old.worktree,
+                branch: old.branch,
                 createdAt: old.createdAt
             )
         }
 
-        if event.type == "session.created" {
+        if event.type == "session.created" || event.type == "session.worktree" {
             Task { await self.loadSessions() }
         }
     }

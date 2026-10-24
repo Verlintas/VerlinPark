@@ -3,21 +3,25 @@
 //! M1 adds the Leader agent loop, tool registry, approvals, and event stream.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use tokio::sync::{broadcast, oneshot};
+use uuid::Uuid;
 use vp_protocol::types::{Approval, Event, Project, Session, StoredMessage};
 use vp_store::Store;
 
 pub mod agent;
 pub mod tools;
+pub mod worktree;
 
 #[derive(Clone)]
 pub struct Engine {
     store: Store,
     events: broadcast::Sender<Event>,
     approval_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    git_lock: Arc<Mutex<()>>,
 }
 
 impl Engine {
@@ -27,6 +31,7 @@ impl Engine {
             store,
             events,
             approval_waiters: Arc::new(Mutex::new(HashMap::new())),
+            git_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -50,15 +55,140 @@ impl Engine {
 
     pub async fn create_session(&self, project_id: String, goal: String) -> Result<Session> {
         let store = self.store.clone();
-        let session =
-            tokio::task::spawn_blocking(move || store.create_session(&project_id, &goal)).await??;
+        let project_id_for_load = project_id.clone();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id_for_load))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+
+        let session_id = Uuid::now_v7().to_string();
+        let session_id_for_worktree = session_id.clone();
+        let project_id_for_worktree = project.id.clone();
+        let root = PathBuf::from(&project.root);
+        let data_dir = self.store.data_dir().to_path_buf();
+        let git_lock = self.git_lock.clone();
+        let worktree = tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            worktree::create(
+                &root,
+                &data_dir,
+                &project_id_for_worktree,
+                &session_id_for_worktree,
+            )
+        })
+        .await??;
+
+        let store = self.store.clone();
+        let worktree_path = worktree.path.to_string_lossy().to_string();
+        let branch = worktree.branch.clone();
+        let session = tokio::task::spawn_blocking({
+            let session_id = session_id.clone();
+            let project_id = project.id.clone();
+            let goal = goal.clone();
+            let worktree_path = worktree_path.clone();
+            let branch = branch.clone();
+            move || {
+                store.create_session_with_worktree(
+                    &session_id,
+                    &project_id,
+                    &goal,
+                    &worktree_path,
+                    &branch,
+                )
+            }
+        })
+        .await;
+
+        let session = match session {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => {
+                worktree::remove(
+                    &PathBuf::from(&project.root),
+                    &worktree.path,
+                    &worktree.branch,
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                worktree::remove(
+                    &PathBuf::from(&project.root),
+                    &worktree.path,
+                    &worktree.branch,
+                );
+                return Err(error.into());
+            }
+        };
+
         let payload = serde_json::json!({
             "goal": session.goal,
             "project_id": session.project_id,
+            "worktree": session.worktree,
+            "branch": session.branch,
         });
         let _ = self
             .append_event(&session.id, "session.created", payload)
             .await?;
+        Ok(session)
+    }
+
+    pub async fn ensure_session_worktree(&self, session_id: &str) -> Result<Session> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (session, project) = tokio::task::spawn_blocking(move || {
+            let session = store
+                .get_session(&id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+            let project = store
+                .get_project(&session.project_id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+            Ok::<_, anyhow::Error>((session, project))
+        })
+        .await??;
+
+        if let Some(path) = &session.worktree
+            && Path::new(path).join(".git").is_file()
+        {
+            return Ok(session);
+        }
+
+        let data_dir = self.store.data_dir().to_path_buf();
+        let root = PathBuf::from(&project.root);
+        let project_id = project.id.clone();
+        let session_id = session.id.clone();
+        let git_lock = self.git_lock.clone();
+        let info = tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            worktree::create(&root, &data_dir, &project_id, &session_id)
+        })
+        .await??;
+
+        let worktree_path = info.path.to_string_lossy().to_string();
+        let store = self.store.clone();
+        let id = session.id.clone();
+        let branch = info.branch.clone();
+        let worktree_for_store = worktree_path.clone();
+        tokio::task::spawn_blocking(move || {
+            store.set_session_worktree(&id, &worktree_for_store, &branch)
+        })
+        .await??;
+
+        let session = Session {
+            worktree: Some(worktree_path),
+            branch: Some(info.branch),
+            ..session
+        };
+        self.append_event(
+            &session.id,
+            "session.worktree",
+            serde_json::json!({
+                "worktree": session.worktree,
+                "branch": session.branch,
+            }),
+        )
+        .await?;
         Ok(session)
     }
 
@@ -215,12 +345,33 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::TempDir;
+
+    fn init_repo(path: &Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
 
     #[tokio::test]
     async fn creates_session_and_broadcasts_event() {
         let data = TempDir::new().unwrap();
         let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
         let store = Store::open(data.path()).unwrap();
         let engine = Engine::new(store);
         let mut rx = engine.subscribe();
@@ -235,6 +386,8 @@ mod tests {
             .create_session(project.id, "ship it".into())
             .await
             .unwrap();
+        assert!(session.worktree.is_some());
+        assert!(session.branch.is_some());
         let event = rx.recv().await.unwrap();
         assert_eq!(event.session_id, session.id);
         assert_eq!(event.kind, "session.created");

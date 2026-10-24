@@ -21,6 +21,8 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
     let projectId: String
     let goal: String
     let status: String
+    let worktree: String?
+    let branch: String?
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -28,6 +30,8 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         case projectId = "project_id"
         case goal
         case status
+        case worktree
+        case branch
         case createdAt = "created_at"
     }
 }

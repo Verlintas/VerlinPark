@@ -280,10 +280,17 @@ struct SessionChatView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(session.goal)
                         .font(.system(size: 21, weight: .semibold))
-                    Text("session \(session.id)")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .textSelection(.enabled)
+                    HStack(spacing: 8) {
+                        Text("session \(session.id)")
+                        if let branch = session.branch {
+                            Text("·")
+                            Image(systemName: "arrow.triangle.branch")
+                            Text(branch)
+                        }
+                    }
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
                 }
                 Spacer()
                 StatusPill(status: session.status)

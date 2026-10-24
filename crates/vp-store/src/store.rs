@@ -49,6 +49,8 @@ impl Store {
                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 goal       TEXT NOT NULL,
                 status     TEXT NOT NULL,
+                worktree   TEXT,
+                branch     TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -102,6 +104,8 @@ impl Store {
                 ON approvals(session_id, created_at);
             "#,
         )?;
+        ensure_column(&conn, "sessions", "worktree", "TEXT")?;
+        ensure_column(&conn, "sessions", "branch", "TEXT")?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -212,6 +216,34 @@ impl Store {
     }
 
     pub fn create_session(&self, project_id: &str, goal: &str) -> Result<Session> {
+        self.insert_session(Uuid::now_v7().to_string(), project_id, goal, None, None)
+    }
+
+    pub fn create_session_with_worktree(
+        &self,
+        id: &str,
+        project_id: &str,
+        goal: &str,
+        worktree: &str,
+        branch: &str,
+    ) -> Result<Session> {
+        self.insert_session(
+            id.to_string(),
+            project_id,
+            goal,
+            Some(worktree.to_string()),
+            Some(branch.to_string()),
+        )
+    }
+
+    fn insert_session(
+        &self,
+        id: String,
+        project_id: &str,
+        goal: &str,
+        worktree: Option<String>,
+        branch: Option<String>,
+    ) -> Result<Session> {
         if self.get_project(project_id)?.is_none() {
             return Err(anyhow!("project not found: {project_id}"));
         }
@@ -220,25 +252,43 @@ impl Store {
             return Err(anyhow!("session goal must not be empty"));
         }
         let session = Session {
-            id: Uuid::now_v7().to_string(),
+            id,
             project_id: project_id.to_string(),
             goal: goal.to_string(),
             status: "draft".to_string(),
+            worktree,
+            branch,
             created_at: now_rfc3339(),
         };
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO sessions (id, project_id, goal, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO sessions (id, project_id, goal, status, worktree, branch, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session.id,
                 session.project_id,
                 session.goal,
                 session.status,
+                session.worktree,
+                session.branch,
                 session.created_at
             ],
         )?;
         Ok(session)
+    }
+
+    pub fn set_session_worktree(
+        &self,
+        session_id: &str,
+        worktree: &str,
+        branch: &str,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sessions SET worktree = ?1, branch = ?2 WHERE id = ?3",
+            params![worktree, branch, session_id],
+        )?;
+        Ok(())
     }
 
     pub fn list_sessions(&self, project_id: Option<&str>) -> Result<Vec<Session>> {
@@ -247,35 +297,19 @@ impl Store {
         match project_id {
             Some(project_id) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, created_at
+                    "SELECT id, project_id, goal, status, worktree, branch, created_at
                      FROM sessions WHERE project_id = ?1
                      ORDER BY created_at DESC",
                 )?;
-                let rows = stmt.query_map(params![project_id], |row| {
-                    Ok(Session {
-                        id: row.get(0)?,
-                        project_id: row.get(1)?,
-                        goal: row.get(2)?,
-                        status: row.get(3)?,
-                        created_at: row.get(4)?,
-                    })
-                })?;
+                let rows = stmt.query_map(params![project_id], map_session)?;
                 sessions.extend(rows.collect::<Result<Vec<_>, _>>()?);
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, created_at
+                    "SELECT id, project_id, goal, status, worktree, branch, created_at
                      FROM sessions ORDER BY created_at DESC",
                 )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok(Session {
-                        id: row.get(0)?,
-                        project_id: row.get(1)?,
-                        goal: row.get(2)?,
-                        status: row.get(3)?,
-                        created_at: row.get(4)?,
-                    })
-                })?;
+                let rows = stmt.query_map([], map_session)?;
                 sessions.extend(rows.collect::<Result<Vec<_>, _>>()?);
             }
         }
@@ -285,17 +319,10 @@ impl Store {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, project_id, goal, status, created_at FROM sessions WHERE id = ?1",
+            "SELECT id, project_id, goal, status, worktree, branch, created_at
+             FROM sessions WHERE id = ?1",
             params![id],
-            |row| {
-                Ok(Session {
-                    id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    goal: row.get(2)?,
-                    status: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
-            },
+            map_session,
         )
         .optional()
         .map_err(Into::into)
@@ -572,6 +599,31 @@ impl Store {
     }
 }
 
+fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        goal: row.get(2)?,
+        status: row.get(3)?,
+        worktree: row.get(4)?,
+        branch: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let exists = names.filter_map(Result::ok).any(|name| name == column);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn detect_default_branch(root: &Path) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -661,6 +713,38 @@ mod tests {
             .join("events.jsonl");
         let mirror = std::fs::read_to_string(path).unwrap();
         assert_eq!(mirror.lines().count(), 2);
+    }
+
+    #[test]
+    fn migrates_legacy_sessions_table_with_worktree_columns() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        {
+            let conn = Connection::open(data.path().join("verlinpark.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "legacy").unwrap();
+        assert!(session.worktree.is_none());
+        assert!(session.branch.is_none());
+        store
+            .set_session_worktree(&session.id, "/tmp/worktree", "verlinpark/test")
+            .unwrap();
+        let loaded = store.get_session(&session.id).unwrap().unwrap();
+        assert_eq!(loaded.worktree.as_deref(), Some("/tmp/worktree"));
+        assert_eq!(loaded.branch.as_deref(), Some("verlinpark/test"));
     }
 
     #[test]
