@@ -209,3 +209,17 @@ pub struct SessionDiff {
     pub status: String,
     pub patch: String,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitSessionParams {
+    pub session_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCommit {
+    pub session_id: String,
+    pub commit: String,
+    pub message: String,
+    pub summary: String,
+}

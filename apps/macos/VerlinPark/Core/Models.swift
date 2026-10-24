@@ -192,3 +192,17 @@ struct SessionDiff: Codable, Sendable {
         status.isEmpty && patch.isEmpty
     }
 }
+
+struct SessionCommit: Codable, Sendable {
+    let sessionId: String
+    let commit: String
+    let message: String
+    let summary: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case commit
+        case message
+        case summary
+    }
+}

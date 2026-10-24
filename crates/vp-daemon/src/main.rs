@@ -22,11 +22,11 @@ use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
-    AddProjectParams, ApprovalListResult, AuthParams, AuthResult, ConfigureAgentParams,
-    CreateSessionParams, EventListResult, ListApprovalsParams, ListEventsParams,
-    ListSessionsParams, PingResult, ProjectListResult, PromptParams, PromptResult,
-    ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams, SessionListResult,
-    SubscribeParams,
+    AddProjectParams, ApprovalListResult, AuthParams, AuthResult, CommitSessionParams,
+    ConfigureAgentParams, CreateSessionParams, EventListResult, ListApprovalsParams,
+    ListEventsParams, ListSessionsParams, PingResult, ProjectListResult, PromptParams,
+    PromptResult, ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams,
+    SessionListResult, SubscribeParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -72,6 +72,13 @@ async fn main() -> Result<()> {
 
     let store = Store::open(&data_dir)?;
     let engine = Engine::new(store);
+    let recovered = engine.recover_interrupted_sessions().await?;
+    if recovered > 0 {
+        tracing::warn!(
+            sessions = recovered,
+            "marked sessions interrupted by the previous daemon as failed"
+        );
+    }
     let agent = AgentService::from_env(engine.clone());
     let token = generate_token();
     let started_at = now_rfc3339();
@@ -392,6 +399,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "agent.info" => RpcResponse::success(id, state.agent.info()),
+        "session.commit" => match parse_params::<CommitSessionParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .commit_session(&params.session_id, &params.message)
+                .await
+            {
+                Ok(commit) => RpcResponse::success(id, commit),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "session.diff" => match parse_params::<SessionDiffParams>(request.params) {
             Ok(params) => match state.engine.session_diff(&params.session_id).await {
                 Ok(diff) => RpcResponse::success(id, diff),

@@ -46,6 +46,18 @@ struct RootView: View {
                 window.isMovableByWindowBackground = true
             }
         }
+        .overlay(alignment: .top) {
+            if let error = model.lastError {
+                ErrorBanner(message: error) {
+                    model.clearError()
+                }
+                .frame(maxWidth: 620)
+                .padding(.top, 40)
+                .padding(.horizontal, 24)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(2)
+            }
+        }
         .onChange(of: brand.config.displayName) { _, _ in
             NSApp.mainWindow?.title = brand.config.effectiveName
         }

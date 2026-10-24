@@ -15,20 +15,23 @@
 | 只读工具 | ✅ | `read_file` / `list_dir` / `grep`；worktree 路径 jail；输出 40k 截断 |
 | 副作用工具 | ✅ | `write_file` / `shell`；必须审批；Shell 120s 默认/900s 上限，拒绝已知危险模式 |
 | 审批队列 | ✅ | SQLite `approvals` + `approval.requested/resolved` 事件；UI 卡片 Approve/Deny；CLI `approve/deny`；10 分钟超时视为拒绝 |
+| 崩溃恢复 | ✅ | daemon 启动时把遗留 `running` session 标为 failed、pending approval 标为 denied，并补事件；不会假装运行还在继续 |
+| 错误反馈 | ✅ | App 顶部 ErrorBanner 显示 daemon/项目/会话错误，可关闭 |
 | Agent 事件 | ✅ | `agent.started/message_delta/message/turn_finished/failed/unavailable`、`tool.started/finished`、`agent.usage` |
 | 对话 UI | ✅ | 用户/Leader 气泡、流式光标、工具卡片、错误卡片、审批卡片、会话状态与模型标识 |
 | Diff 审阅 | ✅ | `session.diff` RPC；Preview → Changes 显示 status + 彩色 patch；CLI `vp diff`；200k 上限 |
+| Worktree commit | ✅ | Preview → Commit；`session.commit` 在 worktree 内 `git add -A` + commit；`session.committed` 事件；CLI `vp commit`；不做自动提交 |
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 20 个：worktree 创建/非 Git 拒绝、旧库迁移、工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
+| 测试 | ✅ | Rust 23 个：worktree 创建/非 Git 拒绝、旧库迁移、中断恢复、显式 commit、工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M1 尚未完成：**
 
-- 多 Agent 的 per-task worktree / integration 分支 / merge queue；当前只有 session 级 Leader worktree。
+- 多 Agent 的 per-task worktree / integration 分支 / merge queue；当前只有 session 级 Leader worktree 和手动 commit。
 - 完整权限代理（角色/命令分类/路径策略/预算）；当前只有路径 jail + 写/Shell 审批 + 简单拒绝列表。
-- Token/成本预算硬停、上下文压缩、运行恢复、取消/暂停。
+- 预算硬停、上下文压缩、真正的运行恢复/取消/暂停（当前只能把中断的 run 标记为 failed）。
 - 只读工具并行、MCP/ACP、逐 hunk review、终端、真实 Collab 节点。
 - 四层组织 runtime、Capacity Controller、真实 Computer Lease。
 - Anthropic 工具调用只做了 mock 测试，尚无真实账号 live 验证。

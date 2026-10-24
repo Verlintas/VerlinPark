@@ -51,6 +51,12 @@ enum Command {
     },
     /// Send a follow-up prompt to the session Leader.
     Prompt { session: String, content: String },
+    /// Commit the session worktree.
+    Commit {
+        session: String,
+        #[arg(short, long)]
+        message: String,
+    },
     /// Show the session worktree diff.
     Diff { session: String },
     /// List approvals, optionally scoped to a session.
@@ -124,6 +130,14 @@ async fn main() -> Result<()> {
                 &discovery,
                 "session.prompt",
                 json!({"session_id": session, "content": content}),
+            )
+            .await?
+        }
+        Command::Commit { session, message } => {
+            rpc(
+                &discovery,
+                "session.commit",
+                json!({"session_id": session, "message": message}),
             )
             .await?
         }
@@ -233,6 +247,16 @@ fn print_human(value: &Value) {
                 session["goal"].as_str().unwrap_or("?"),
                 session["status"].as_str().unwrap_or("?")
             );
+        }
+        return;
+    }
+    if let Some(commit) = value.get("commit").and_then(Value::as_str) {
+        println!("committed {commit}");
+        if let Some(message) = value.get("message").and_then(Value::as_str) {
+            println!("  {message}");
+        }
+        if let Some(summary) = value.get("summary").and_then(Value::as_str) {
+            println!("{summary}");
         }
         return;
     }

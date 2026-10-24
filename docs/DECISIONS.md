@@ -26,6 +26,7 @@
 | [0014](adr/0014-external-aviiya.md) | Aviiya 是 NovaBAIC 外部常驻 Agent | Accepted | 集成边界 |
 | [0015](adr/0015-m1-leader-loop.md) | M1 单 Leader loop、审批与 Provider 配置 | Accepted | Agent runtime/安全/UI |
 | [0016](adr/0016-session-worktree.md) | 每个 session 一个 Git worktree | Accepted | 隔离/Git/工具路径 |
+| [0017](adr/0017-session-commit.md) | 从 Review 显式提交 worktree | Accepted | 审阅/Git/UX |
 
 ---
 

@@ -423,6 +423,8 @@ struct ExternalResidentPanel: View {
 struct PreviewPanelView: View {
     @Environment(AppModel.self) private var model
     @State private var mode: PreviewMode = .changes
+    @State private var showingCommit = false
+    @State private var commitMessage = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -448,6 +450,23 @@ struct PreviewPanelView: View {
                 await model.loadDiff()
             }
         }
+        .alert("Commit worktree", isPresented: $showingCommit) {
+            TextField("Message", text: $commitMessage)
+            Button("Commit") {
+                let message = commitMessage
+                commitMessage = ""
+                Task { await model.commitSession(message: message) }
+            }
+            Button("Cancel", role: .cancel) {
+                commitMessage = ""
+            }
+        } message: {
+            Text("Stages all changes in this session worktree and commits them on its branch.")
+        }
+    }
+
+    private var canCommit: Bool {
+        model.sessionDiff.map { !$0.isEmpty } ?? false
     }
 
     private func header(_ session: Session) -> some View {
@@ -460,6 +479,15 @@ struct PreviewPanelView: View {
                         .lineLimit(1)
                 }
                 Spacer()
+                if mode == .changes, canCommit {
+                    Button("Commit") {
+                        commitMessage = session.goal
+                        showingCommit = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(model.commitBusy)
+                }
                 Button {
                     Task { await model.loadDiff() }
                 } label: {
@@ -515,12 +543,27 @@ struct PreviewPanelView: View {
                             .textSelection(.enabled)
                     }
 
+                    if let commit = model.lastCommit {
+                        Label(
+                            "Committed \(commit.commit) · \(commit.message)",
+                            systemImage: "checkmark.seal.fill"
+                        )
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.green)
+                    }
+
                     if !diff.patch.isEmpty {
                         DiffLines(text: diff.patch)
                     }
                 }
                 .padding(12)
             }
+        } else if let commit = model.lastCommit {
+            StudioEmptyView(
+                icon: "checkmark.seal",
+                title: "Committed \(commit.commit)",
+                detail: "\(commit.message) · the worktree is clean."
+            )
         } else {
             StudioEmptyView(
                 icon: "checkmark.circle",

@@ -566,6 +566,19 @@ impl Store {
         .map_err(Into::into)
     }
 
+    pub fn interrupt_running_sessions(&self) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT id FROM sessions WHERE status = 'running'")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        conn.execute(
+            "UPDATE sessions SET status = 'failed' WHERE status = 'running'",
+            [],
+        )?;
+        Ok(ids)
+    }
+
     pub fn list_approvals(&self, session_id: Option<&str>) -> Result<Vec<Approval>> {
         let conn = self.lock()?;
         let sql = match session_id {
@@ -713,6 +726,23 @@ mod tests {
             .join("events.jsonl");
         let mirror = std::fs::read_to_string(path).unwrap();
         assert_eq!(mirror.lines().count(), 2);
+    }
+
+    #[test]
+    fn interrupts_running_sessions_on_recovery() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "run").unwrap();
+        store.update_session_status(&session.id, "running").unwrap();
+        let interrupted = store.interrupt_running_sessions().unwrap();
+        assert_eq!(interrupted, vec![session.id.clone()]);
+        assert_eq!(
+            store.get_session(&session.id).unwrap().unwrap().status,
+            "failed"
+        );
+        assert!(store.interrupt_running_sessions().unwrap().is_empty());
     }
 
     #[test]

@@ -141,6 +141,15 @@ actor CoreClient {
             .events
     }
 
+    func commitSession(sessionID: String, message: String) async throws -> SessionCommit {
+        let params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "message": .string(message),
+        ]
+        return try await request(method: "session.commit", params: params)
+            .decode(SessionCommit.self)
+    }
+
     func sessionDiff(sessionID: String) async throws -> SessionDiff {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.diff", params: params)

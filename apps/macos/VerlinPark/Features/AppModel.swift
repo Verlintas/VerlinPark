@@ -30,6 +30,8 @@ final class AppModel {
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
+    var lastCommit: SessionCommit?
+    var commitBusy = false
     var providerKind =
         UserDefaults.standard.string(forKey: "provider.kind") ?? "openai-compatible"
     var providerBaseURL =
@@ -94,6 +96,7 @@ final class AppModel {
             selectedSessionID = nil
             events = []
             sessionDiff = nil
+            lastCommit = nil
             mode = .resident
             return
         }
@@ -103,6 +106,7 @@ final class AppModel {
         selectedSessionID = nil
         events = []
         sessionDiff = nil
+        lastCommit = nil
         Task { await loadSessions() }
     }
 
@@ -116,6 +120,7 @@ final class AppModel {
         selectedSessionID = id
         streamingText = ""
         sessionDiff = nil
+        lastCommit = nil
         Task {
             await loadEvents()
             await loadDiff()
@@ -168,6 +173,7 @@ final class AppModel {
             mode = .project
             events = try await core.listEvents(sessionID: session.id)
             sessionDiff = try? await core.sessionDiff(sessionID: session.id)
+            lastCommit = nil
         } catch {
             handle(error)
         }
@@ -243,6 +249,23 @@ final class AppModel {
             )
         } catch {
             providerStatus = error.localizedDescription
+        }
+    }
+
+    func commitSession(message: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            lastError = "Enter a commit message."
+            return
+        }
+        commitBusy = true
+        defer { commitBusy = false }
+        do {
+            lastCommit = try await core.commitSession(sessionID: sessionID, message: trimmed)
+            await loadDiff()
+        } catch {
+            handle(error)
         }
     }
 

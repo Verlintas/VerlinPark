@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
-use vp_protocol::types::{Approval, Event, Project, Session, SessionDiff, StoredMessage};
+use vp_protocol::types::{
+    Approval, Event, Project, Session, SessionCommit, SessionDiff, StoredMessage,
+};
 use vp_store::Store;
 
 pub mod agent;
@@ -195,6 +197,115 @@ impl Engine {
     pub async fn list_sessions(&self, project_id: Option<String>) -> Result<Vec<Session>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.list_sessions(project_id.as_deref())).await?
+    }
+
+    pub async fn recover_interrupted_sessions(&self) -> Result<usize> {
+        let store = self.store.clone();
+        let (sessions, approvals) = tokio::task::spawn_blocking(move || {
+            let sessions = store.interrupt_running_sessions()?;
+            let pending = store
+                .list_approvals(None)?
+                .into_iter()
+                .filter(|approval| approval.status == "pending")
+                .collect::<Vec<_>>();
+            let mut denied = Vec::new();
+            for approval in pending {
+                if let Some(approval) = store.resolve_approval(&approval.id, false)? {
+                    denied.push(approval);
+                }
+            }
+            Ok::<_, anyhow::Error>((sessions, denied))
+        })
+        .await??;
+
+        for session_id in &sessions {
+            let _ = self
+                .append_event(
+                    session_id,
+                    "session.updated",
+                    serde_json::json!({"status": "failed"}),
+                )
+                .await;
+            let _ = self
+                .append_event(
+                    session_id,
+                    "agent.failed",
+                    serde_json::json!({
+                        "error": "The daemon restarted while this run was active."
+                    }),
+                )
+                .await;
+        }
+        for approval in &approvals {
+            let _ = self
+                .append_event(
+                    &approval.session_id,
+                    "approval.resolved",
+                    serde_json::json!({
+                        "approval_id": approval.id,
+                        "approved": false,
+                    }),
+                )
+                .await;
+        }
+        Ok(sessions.len())
+    }
+
+    pub async fn commit_session(&self, session_id: &str, message: &str) -> Result<SessionCommit> {
+        let message = message.trim().to_string();
+        if message.is_empty() {
+            return Err(anyhow::anyhow!("commit message is required"));
+        }
+        let session = self.ensure_session_worktree(session_id).await?;
+        let worktree = session
+            .worktree
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?;
+        let session_id = session.id.clone();
+        let worktree = PathBuf::from(worktree);
+        let message_for_git = message.clone();
+        let (commit, summary) = tokio::task::spawn_blocking(move || {
+            git_output(&worktree, &["add", "-A"])?;
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&worktree)
+                .args(["commit", "-m", &message_for_git])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .context("running git commit")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if stderr.contains("nothing to commit") || stdout.contains("nothing to commit") {
+                    anyhow::bail!("no changes to commit");
+                }
+                anyhow::bail!("git commit failed: {stderr}");
+            }
+            let commit = git_output(&worktree, &["rev-parse", "--short", "HEAD"])?;
+            let summary = git_output(
+                &worktree,
+                &["show", "--stat", "--oneline", "--no-color", "-1"],
+            )?;
+            Ok::<_, anyhow::Error>((commit, summary))
+        })
+        .await??;
+
+        self.append_event(
+            &session_id,
+            "session.committed",
+            serde_json::json!({
+                "commit": commit,
+                "message": message,
+            }),
+        )
+        .await?;
+
+        Ok(SessionCommit {
+            session_id,
+            commit,
+            message,
+            summary,
+        })
     }
 
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
@@ -423,6 +534,93 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+    }
+
+    #[tokio::test]
+    async fn commits_worktree_changes_once() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("demo".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "commit".into())
+            .await
+            .unwrap();
+        let worktree = session.worktree.clone().unwrap();
+        std::fs::write(Path::new(&worktree).join("README.md"), "committed\n").unwrap();
+
+        let commit = engine
+            .commit_session(&session.id, "update readme")
+            .await
+            .unwrap();
+        assert_eq!(commit.commit.len(), 7);
+        assert_eq!(commit.message, "update readme");
+        assert!(
+            engine
+                .session_diff(&session.id)
+                .await
+                .unwrap()
+                .patch
+                .is_empty()
+        );
+
+        let error = engine
+            .commit_session(&session.id, "again")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no changes"));
+        let events = engine.list_events(session.id, 0, 100).await.unwrap();
+        assert!(events.iter().any(|event| event.kind == "session.committed"));
+    }
+
+    #[tokio::test]
+    async fn recovers_interrupted_sessions_and_pending_approvals() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("demo".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "run".into())
+            .await
+            .unwrap();
+        engine
+            .update_session_status(&session.id, "running")
+            .await
+            .unwrap();
+        let (approval, _receiver) = engine
+            .request_approval(&session.id, "call-1", "write_file", serde_json::json!({}))
+            .await
+            .unwrap();
+        let recovered = engine.recover_interrupted_sessions().await.unwrap();
+        assert_eq!(recovered, 1);
+        let sessions = engine
+            .list_sessions(Some(session.project_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "failed");
+        let approvals = engine
+            .list_approvals(Some(session.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(approvals[0].status, "denied");
+        let events = engine.list_events(session.id, 0, 100).await.unwrap();
+        assert!(events.iter().any(|event| event.kind == "agent.failed"));
+        assert!(events.iter().any(|event| event.kind == "approval.resolved"
+            && event.payload["approval_id"] == approval.id));
     }
 
     #[tokio::test]
