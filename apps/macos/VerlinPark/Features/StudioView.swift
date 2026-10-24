@@ -424,6 +424,7 @@ struct PreviewPanelView: View {
     @Environment(AppModel.self) private var model
     @State private var mode: PreviewMode = .changes
     @State private var showingCommit = false
+    @State private var showingDiscard = false
     @State private var commitMessage = ""
 
     var body: some View {
@@ -463,6 +464,19 @@ struct PreviewPanelView: View {
         } message: {
             Text("Stages all changes in this session worktree and commits them on its branch.")
         }
+        .confirmationDialog(
+            "Discard uncommitted changes?",
+            isPresented: $showingDiscard
+        ) {
+            Button("Discard changes", role: .destructive) {
+                Task { await model.discardChanges() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "This resets tracked files and removes untracked files in the session worktree. Commits are kept."
+            )
+        }
     }
 
     private var canCommit: Bool {
@@ -480,6 +494,15 @@ struct PreviewPanelView: View {
                 }
                 Spacer()
                 if mode == .changes, canCommit {
+                    Button {
+                        showingDiscard = true
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Discard uncommitted changes")
+                    .disabled(model.commitBusy)
                     Button("Commit") {
                         commitMessage = session.goal
                         showingCommit = true

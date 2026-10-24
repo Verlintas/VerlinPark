@@ -62,6 +62,7 @@ impl ToolRegistry {
                 Arc::new(ReadFile),
                 Arc::new(ListDir),
                 Arc::new(Grep),
+                Arc::new(EditFile),
                 Arc::new(WriteFile),
                 Arc::new(Shell),
             ],
@@ -87,6 +88,7 @@ impl ToolRegistry {
 struct ReadFile;
 struct ListDir;
 struct Grep;
+struct EditFile;
 struct WriteFile;
 struct Shell;
 
@@ -256,6 +258,77 @@ impl AgentTool for Grep {
             }
         }
         Ok(ToolOutput::ok(truncate(matches.join("\n"))))
+    }
+}
+
+#[async_trait]
+impl AgentTool for EditFile {
+    fn name(&self) -> &'static str {
+        "edit_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Replace an exact string in an existing UTF-8 file. Requires approval."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path relative to the worktree root"},
+                "old_string": {"type": "string", "description": "Exact text to replace"},
+                "new_string": {"type": "string", "description": "Replacement text"},
+                "replace_all": {"type": "boolean", "description": "Replace every match; default false"}
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
+        let path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("path is required"))?;
+        let old_string = input
+            .get("old_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("old_string is required"))?;
+        let new_string = input
+            .get("new_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("new_string is required"))?;
+        let replace_all = input
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if old_string.is_empty() {
+            return Ok(ToolOutput::error("old_string must not be empty"));
+        }
+        let path = safe_existing_path(&context.root, path)?;
+        let content = tokio::fs::read_to_string(&path).await?;
+        let matches = content.matches(old_string).count();
+        if matches == 0 {
+            return Ok(ToolOutput::error("old_string was not found"));
+        }
+        if matches > 1 && !replace_all {
+            return Ok(ToolOutput::error(format!(
+                "old_string matched {matches} times; provide more context or set replace_all"
+            )));
+        }
+        let replaced = if replace_all {
+            content.replace(old_string, new_string)
+        } else {
+            content.replacen(old_string, new_string, 1)
+        };
+        tokio::fs::write(&path, replaced).await?;
+        Ok(ToolOutput::ok(format!(
+            "replaced {matches} occurrence(s) in {}",
+            path.display()
+        )))
     }
 }
 
@@ -516,8 +589,51 @@ mod tests {
         assert!(escape.is_err());
     }
 
+    #[tokio::test]
+    async fn edits_files_with_exact_unique_matches() {
+        let (_dir, context) = ctx();
+        let edited = EditFile
+            .execute(
+                &context,
+                json!({"path": "hello.txt", "old_string": "world", "new_string": "park"}),
+            )
+            .await
+            .unwrap();
+        assert!(!edited.is_error);
+        let content = std::fs::read_to_string(context.root.join("hello.txt")).unwrap();
+        assert_eq!(content, "hello\npark\n");
+
+        std::fs::write(context.root.join("dup.txt"), "same same\n").unwrap();
+        let ambiguous = EditFile
+            .execute(
+                &context,
+                json!({"path": "dup.txt", "old_string": "same", "new_string": "x"}),
+            )
+            .await
+            .unwrap();
+        assert!(ambiguous.is_error);
+        let replaced = EditFile
+            .execute(
+                &context,
+                json!({
+                    "path": "dup.txt",
+                    "old_string": "same",
+                    "new_string": "x",
+                    "replace_all": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!replaced.is_error);
+        assert_eq!(
+            std::fs::read_to_string(context.root.join("dup.txt")).unwrap(),
+            "x x\n"
+        );
+    }
+
     #[test]
     fn write_and_shell_require_approval() {
+        assert!(EditFile.requires_approval());
         assert!(WriteFile.requires_approval());
         assert!(Shell.requires_approval());
         assert!(!ReadFile.requires_approval());

@@ -23,10 +23,10 @@ use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
     AddProjectParams, ApprovalListResult, AuthParams, AuthResult, CommitSessionParams,
-    ConfigureAgentParams, CreateSessionParams, EventListResult, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, PingResult, ProjectListResult, PromptParams,
-    PromptResult, ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams,
-    SessionListResult, SubscribeParams,
+    ConfigureAgentParams, CreateSessionParams, DiscardSessionParams, EventListResult,
+    ListApprovalsParams, ListEventsParams, ListSessionsParams, PingResult, ProjectListResult,
+    PromptParams, PromptResult, ResolveApprovalParams, ResolveApprovalResult, ServerInfo,
+    SessionDiffParams, SessionListResult, SubscribeParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -399,6 +399,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "agent.info" => RpcResponse::success(id, state.agent.info()),
+        "session.discard" => match parse_params::<DiscardSessionParams>(request.params) {
+            Ok(params) => match state.engine.discard_session(&params.session_id).await {
+                Ok(()) => RpcResponse::success(id, json!({"discarded": true})),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "session.commit" => match parse_params::<CommitSessionParams>(request.params) {
             Ok(params) => match state
                 .engine

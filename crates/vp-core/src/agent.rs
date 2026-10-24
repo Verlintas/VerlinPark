@@ -529,8 +529,9 @@ fn system_prompt(project: &Project, session: &Session, worktree: &str) -> String
          Work only inside your session worktree at {}. \
          The original project root {} is read-only for you; never write there. \
          The worktree is on branch {}. Use read_file/list_dir/grep to inspect code. \
-         Use write_file only when needed and shell for tests/builds. \
-         Write and shell calls require user approval, so explain what you are doing briefly. \
+         Use edit_file for focused changes and write_file for new or fully rewritten files. \
+         Use shell for tests/builds. Write, edit, and shell calls require user approval, \
+         so explain what you are doing briefly. \
          Prefer small, verifiable steps. When done, summarize the changes and test results. \
          Do not claim success without evidence.",
         project.name,

@@ -13,7 +13,7 @@
 | Session worktree | ✅ | 每个 session 自动创建链接 worktree + `verlinpark/<session-id>` 分支；Agent 只能写 worktree；旧 session 首次运行时自动补建 |
 | Provider 工具调用 | ✅ | OpenAI-compatible 按 index 重组流式 `tool_calls`；Anthropic `tool_use` + `input_json_delta` + `tool_result` 映射 |
 | 只读工具 | ✅ | `read_file` / `list_dir` / `grep`；worktree 路径 jail；输出 40k 截断 |
-| 副作用工具 | ✅ | `write_file` / `shell`；必须审批；Shell 120s 默认/900s 上限，拒绝已知危险模式 |
+| 副作用工具 | ✅ | `edit_file` / `write_file` / `shell`；必须审批；Shell 120s 默认/900s 上限，拒绝已知危险模式 |
 | 审批队列 | ✅ | SQLite `approvals` + `approval.requested/resolved` 事件；UI 卡片 Approve/Deny；CLI `approve/deny`；10 分钟超时视为拒绝 |
 | 崩溃恢复 | ✅ | daemon 启动时把遗留 `running` session 标为 failed、pending approval 标为 denied，并补事件；不会假装运行还在继续 |
 | 错误反馈 | ✅ | App 顶部 ErrorBanner 显示 daemon/项目/会话错误，可关闭 |
@@ -21,10 +21,11 @@
 | 对话 UI | ✅ | 用户/Leader 气泡、流式光标、工具卡片、错误卡片、审批卡片、会话状态与模型标识 |
 | Diff 审阅 | ✅ | `session.diff` RPC；Preview → Changes 显示 status + 彩色 patch；CLI `vp diff`；200k 上限 |
 | Worktree commit | ✅ | Preview → Commit；`session.commit` 在 worktree 内 `git add -A` + commit；`session.committed` 事件；CLI `vp commit`；不做自动提交 |
+| 撤销改动 | ✅ | Preview → 垃圾桶；`session.discard` 在 worktree 内 reset --hard + clean -fd（保留 commit）；CLI `vp discard`；二次确认 |
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 23 个：worktree 创建/非 Git 拒绝、旧库迁移、中断恢复、显式 commit、工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
+| 测试 | ✅ | Rust 25 个：worktree 创建/非 Git 拒绝、旧库迁移、中断恢复、显式 commit/discard、精确 edit_file、工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M1 尚未完成：**

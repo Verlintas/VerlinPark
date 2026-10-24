@@ -223,3 +223,8 @@ pub struct SessionCommit {
     pub message: String,
     pub summary: String,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscardSessionParams {
+    pub session_id: String,
+}

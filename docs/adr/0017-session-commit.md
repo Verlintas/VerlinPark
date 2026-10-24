@@ -24,6 +24,9 @@ review step.
 5. No push, merge, rebase, or branch deletion in this milestone. Landing remains
    a manual Git operation until the merge queue exists.
 6. The UI reloads the diff after commit and shows the committed hash.
+7. A separate **Discard** action runs `git reset --hard HEAD` + `git clean -fd` in
+   the worktree after confirmation. It removes uncommitted changes only; commits
+   are kept.
 
 ## Consequences
 

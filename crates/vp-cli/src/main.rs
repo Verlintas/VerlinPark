@@ -51,6 +51,8 @@ enum Command {
     },
     /// Send a follow-up prompt to the session Leader.
     Prompt { session: String, content: String },
+    /// Discard uncommitted changes in the session worktree.
+    Discard { session: String },
     /// Commit the session worktree.
     Commit {
         session: String,
@@ -130,6 +132,14 @@ async fn main() -> Result<()> {
                 &discovery,
                 "session.prompt",
                 json!({"session_id": session, "content": content}),
+            )
+            .await?
+        }
+        Command::Discard { session } => {
+            rpc(
+                &discovery,
+                "session.discard",
+                json!({"session_id": session}),
             )
             .await?
         }
@@ -248,6 +258,10 @@ fn print_human(value: &Value) {
                 session["status"].as_str().unwrap_or("?")
             );
         }
+        return;
+    }
+    if value.get("discarded").and_then(Value::as_bool) == Some(true) {
+        println!("discarded uncommitted changes.");
         return;
     }
     if let Some(commit) = value.get("commit").and_then(Value::as_str) {

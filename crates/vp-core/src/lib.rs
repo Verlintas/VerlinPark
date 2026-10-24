@@ -251,6 +251,24 @@ impl Engine {
         Ok(sessions.len())
     }
 
+    pub async fn discard_session(&self, session_id: &str) -> Result<()> {
+        let session = self.ensure_session_worktree(session_id).await?;
+        let worktree = session
+            .worktree
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?;
+        let worktree = PathBuf::from(worktree);
+        tokio::task::spawn_blocking(move || {
+            git_output(&worktree, &["reset", "--hard", "HEAD"])?;
+            git_output(&worktree, &["clean", "-fd"])?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        self.append_event(&session.id, "session.discarded", serde_json::json!({}))
+            .await?;
+        Ok(())
+    }
+
     pub async fn commit_session(&self, session_id: &str, message: &str) -> Result<SessionCommit> {
         let message = message.trim().to_string();
         if message.is_empty() {
@@ -534,6 +552,45 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+    }
+
+    #[tokio::test]
+    async fn discards_uncommitted_worktree_changes() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("demo".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "discard".into())
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        std::fs::write(worktree.join("README.md"), "dirty\n").unwrap();
+        std::fs::write(worktree.join("scratch.txt"), "untracked\n").unwrap();
+
+        engine.discard_session(&session.id).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("README.md")).unwrap(),
+            "hello\n"
+        );
+        assert!(!worktree.join("scratch.txt").exists());
+        assert!(
+            engine
+                .session_diff(&session.id)
+                .await
+                .unwrap()
+                .patch
+                .is_empty()
+        );
+        let events = engine.list_events(session.id, 0, 100).await.unwrap();
+        assert!(events.iter().any(|event| event.kind == "session.discarded"));
     }
 
     #[tokio::test]

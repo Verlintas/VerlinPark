@@ -141,6 +141,11 @@ actor CoreClient {
             .events
     }
 
+    func discardSession(sessionID: String) async throws {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        _ = try await request(method: "session.discard", params: params)
+    }
+
     func commitSession(sessionID: String, message: String) async throws -> SessionCommit {
         let params: [String: JSONValue] = [
             "session_id": .string(sessionID),

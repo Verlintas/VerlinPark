@@ -269,6 +269,19 @@ final class AppModel {
         }
     }
 
+    func discardChanges() async {
+        guard let sessionID = selectedSessionID else { return }
+        commitBusy = true
+        defer { commitBusy = false }
+        do {
+            try await core.discardSession(sessionID: sessionID)
+            lastCommit = nil
+            await loadDiff()
+        } catch {
+            handle(error)
+        }
+    }
+
     func loadDiff() async {
         guard let sessionID = selectedSessionID else {
             sessionDiff = nil
