@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
-use vp_protocol::types::{Approval, Event, Project, Session, StoredMessage};
+use vp_protocol::types::{Approval, Event, Project, Session, SessionDiff, StoredMessage};
 use vp_store::Store;
 
 pub mod agent;
@@ -197,6 +197,44 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.list_sessions(project_id.as_deref())).await?
     }
 
+    pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
+        let session = self.ensure_session_worktree(session_id).await?;
+        let worktree = session
+            .worktree
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?;
+        let branch = session.branch.clone().unwrap_or_default();
+        let session_id = session.id.clone();
+        let worktree_for_git = PathBuf::from(&worktree);
+        let (status, patch) = tokio::task::spawn_blocking(move || {
+            let status = git_output(&worktree_for_git, &["status", "--short"])?;
+            let stat = git_output(&worktree_for_git, &["diff", "--stat"])?;
+            let diff = git_output(&worktree_for_git, &["diff", "--no-color"])?;
+            let mut patch = String::new();
+            if !stat.is_empty() {
+                patch.push_str(&stat);
+                patch.push('\n');
+            }
+            if !diff.is_empty() {
+                patch.push_str(&diff);
+            }
+            const MAX_DIFF: usize = 200_000;
+            if patch.len() > MAX_DIFF {
+                patch.truncate(MAX_DIFF);
+                patch.push_str("\n… diff truncated");
+            }
+            Ok::<_, anyhow::Error>((status, patch))
+        })
+        .await??;
+        Ok(SessionDiff {
+            session_id,
+            branch,
+            worktree,
+            status,
+            patch,
+        })
+    }
+
     pub async fn list_events(
         &self,
         session_id: String,
@@ -342,6 +380,26 @@ impl Engine {
     }
 }
 
+fn git_output(root: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .context("running git")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +449,12 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert_eq!(event.session_id, session.id);
         assert_eq!(event.kind, "session.created");
+        let worktree = session.worktree.clone().unwrap();
+        std::fs::write(Path::new(&worktree).join("README.md"), "changed\n").unwrap();
+        let diff = engine.session_diff(&session.id).await.unwrap();
+        assert!(diff.patch.contains("-hello"));
+        assert!(diff.patch.contains("+changed"));
+
         let events = engine.list_events(session.id, 0, 10).await.unwrap();
         assert_eq!(events.len(), 1);
     }

@@ -51,6 +51,8 @@ enum Command {
     },
     /// Send a follow-up prompt to the session Leader.
     Prompt { session: String, content: String },
+    /// Show the session worktree diff.
+    Diff { session: String },
     /// List approvals, optionally scoped to a session.
     Approvals {
         #[arg(long)]
@@ -124,6 +126,9 @@ async fn main() -> Result<()> {
                 json!({"session_id": session, "content": content}),
             )
             .await?
+        }
+        Command::Diff { session } => {
+            rpc(&discovery, "session.diff", json!({"session_id": session})).await?
         }
         Command::Approvals { session } => {
             rpc(&discovery, "approval.list", json!({"session_id": session})).await?
@@ -228,6 +233,21 @@ fn print_human(value: &Value) {
                 session["goal"].as_str().unwrap_or("?"),
                 session["status"].as_str().unwrap_or("?")
             );
+        }
+        return;
+    }
+    if value.get("patch").is_some() {
+        if let Some(status) = value.get("status").and_then(Value::as_str)
+            && !status.is_empty()
+        {
+            println!("{status}\n");
+        }
+        if let Some(patch) = value.get("patch").and_then(Value::as_str) {
+            if patch.is_empty() {
+                println!("No changes.");
+            } else {
+                println!("{patch}");
+            }
         }
         return;
     }

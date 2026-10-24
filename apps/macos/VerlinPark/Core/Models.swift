@@ -172,3 +172,23 @@ struct PromptResult: Codable, Sendable {
 struct ResolveApprovalResult: Codable, Sendable {
     let resolved: Bool
 }
+
+struct SessionDiff: Codable, Sendable {
+    let sessionId: String
+    let branch: String
+    let worktree: String
+    let status: String
+    let patch: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case branch
+        case worktree
+        case status
+        case patch
+    }
+
+    var isEmpty: Bool {
+        status.isEmpty && patch.isEmpty
+    }
+}

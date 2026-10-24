@@ -4,7 +4,7 @@
 
 VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets them collaborate through typed messages and shared artifacts, and makes every plan, tool call, diff, token, and permission decision inspectable and replayable.
 
-> **Status: M1 Leader runtime (in progress).** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A single Leader can stream responses, work on its own Git worktree, inspect a repository, call tools, and ask for approval before writes or shell commands. The four-tier scheduler, per-task worktrees, budgets, and the full permission broker are still ahead.
+> **Status: M1 Leader runtime (in progress).** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A single Leader can stream responses, work on its own Git worktree, inspect a repository, call tools, ask for approval before writes or shell commands, and show a live diff for review. The four-tier scheduler, per-task worktrees, budgets, and the full permission broker are still ahead.
 
 ---
 
@@ -132,6 +132,7 @@ just cli project-add /path/to/repo --name demo
 just cli session-new <project-id> "Add team invitations"
 just cli events <session-id>
 just cli prompt <session-id> "Now add tests"
+just cli diff <session-id>
 just cli approvals
 just cli approve <approval-id>
 ```
@@ -189,7 +190,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M1 Leader runtime**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；单 Leader 在独立 Git worktree 中工作，可以流式对话、读取仓库、调用工具，并在写入/Shell 前请求审批。四层组织、多 Agent 调度、worktree 隔离和预算硬停仍在后续里程碑。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+当前处于 **M1 Leader runtime**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；单 Leader 在独立 Git worktree 中工作，可以流式对话、读取仓库、调用工具、在写入/Shell 前请求审批，并在 Preview 中查看 worktree diff。四层组织、多 Agent 调度、worktree 隔离和预算硬停仍在后续里程碑。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 ## 许可
 

@@ -17,18 +17,19 @@
 | 审批队列 | ✅ | SQLite `approvals` + `approval.requested/resolved` 事件；UI 卡片 Approve/Deny；CLI `approve/deny`；10 分钟超时视为拒绝 |
 | Agent 事件 | ✅ | `agent.started/message_delta/message/turn_finished/failed/unavailable`、`tool.started/finished`、`agent.usage` |
 | 对话 UI | ✅ | 用户/Leader 气泡、流式光标、工具卡片、错误卡片、审批卡片、会话状态与模型标识 |
+| Diff 审阅 | ✅ | `session.diff` RPC；Preview → Changes 显示 status + 彩色 patch；CLI `vp diff`；200k 上限 |
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
 | 测试 | ✅ | Rust 20 个：worktree 创建/非 Git 拒绝、旧库迁移、工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
-| 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；项目根保持干净；App 内同样走通 |
+| 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M1 尚未完成：**
 
 - 多 Agent 的 per-task worktree / integration 分支 / merge queue；当前只有 session 级 Leader worktree。
 - 完整权限代理（角色/命令分类/路径策略/预算）；当前只有路径 jail + 写/Shell 审批 + 简单拒绝列表。
 - Token/成本预算硬停、上下文压缩、运行恢复、取消/暂停。
-- 只读工具并行、MCP/ACP、diff 视图、终端、真实 Collab 节点。
+- 只读工具并行、MCP/ACP、逐 hunk review、终端、真实 Collab 节点。
 - 四层组织 runtime、Capacity Controller、真实 Computer Lease。
 - Anthropic 工具调用只做了 mock 测试，尚无真实账号 live 验证。
 

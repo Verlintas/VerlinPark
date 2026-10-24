@@ -141,6 +141,12 @@ actor CoreClient {
             .events
     }
 
+    func sessionDiff(sessionID: String) async throws -> SessionDiff {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.diff", params: params)
+            .decode(SessionDiff.self)
+    }
+
     func prompt(sessionID: String, content: String) async throws {
         let params: [String: JSONValue] = [
             "session_id": .string(sessionID),

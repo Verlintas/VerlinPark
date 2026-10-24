@@ -195,3 +195,17 @@ pub struct ConfigureAgentParams {
     #[serde(default)]
     pub max_tokens: Option<u32>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionDiffParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDiff {
+    pub session_id: String,
+    pub branch: String,
+    pub worktree: String,
+    pub status: String,
+    pub patch: String,
+}

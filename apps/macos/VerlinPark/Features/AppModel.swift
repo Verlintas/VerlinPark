@@ -27,6 +27,9 @@ final class AppModel {
     var lastError: String?
     var agentInfo: AgentInfo?
     var streamingText = ""
+    var sessionDiff: SessionDiff?
+    var diffLoading = false
+    var diffError: String?
     var providerKind =
         UserDefaults.standard.string(forKey: "provider.kind") ?? "openai-compatible"
     var providerBaseURL =
@@ -90,6 +93,7 @@ final class AppModel {
             selectedProjectID = nil
             selectedSessionID = nil
             events = []
+            sessionDiff = nil
             mode = .resident
             return
         }
@@ -98,6 +102,7 @@ final class AppModel {
         selectedProjectID = id
         selectedSessionID = nil
         events = []
+        sessionDiff = nil
         Task { await loadSessions() }
     }
 
@@ -110,7 +115,11 @@ final class AppModel {
         mode = .project
         selectedSessionID = id
         streamingText = ""
-        Task { await loadEvents() }
+        sessionDiff = nil
+        Task {
+            await loadEvents()
+            await loadDiff()
+        }
     }
 
     func addProject() async {
@@ -158,6 +167,7 @@ final class AppModel {
             selectedSessionID = session.id
             mode = .project
             events = try await core.listEvents(sessionID: session.id)
+            sessionDiff = try? await core.sessionDiff(sessionID: session.id)
         } catch {
             handle(error)
         }
@@ -236,6 +246,26 @@ final class AppModel {
         }
     }
 
+    func loadDiff() async {
+        guard let sessionID = selectedSessionID else {
+            sessionDiff = nil
+            return
+        }
+        diffLoading = true
+        defer { diffLoading = false }
+        do {
+            let diff = try await core.sessionDiff(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                sessionDiff = diff
+                diffError = nil
+            }
+        } catch {
+            if sessionID == selectedSessionID {
+                diffError = error.localizedDescription
+            }
+        }
+    }
+
     func clearError() {
         lastError = nil
     }
@@ -258,6 +288,7 @@ final class AppModel {
                 selectedSessionID = sessions.first?.id
             }
             await loadEvents()
+            await loadDiff()
         } catch {
             handle(error)
         }
@@ -329,6 +360,12 @@ final class AppModel {
 
         if event.type == "session.created" || event.type == "session.worktree" {
             Task { await self.loadSessions() }
+        }
+
+        if event.sessionId == selectedSessionID,
+           ["tool.finished", "agent.turn_finished", "session.worktree"].contains(event.type)
+        {
+            Task { await self.loadDiff() }
         }
     }
 

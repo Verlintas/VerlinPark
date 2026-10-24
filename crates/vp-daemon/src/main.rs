@@ -25,7 +25,8 @@ use vp_protocol::types::{
     AddProjectParams, ApprovalListResult, AuthParams, AuthResult, ConfigureAgentParams,
     CreateSessionParams, EventListResult, ListApprovalsParams, ListEventsParams,
     ListSessionsParams, PingResult, ProjectListResult, PromptParams, PromptResult,
-    ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionListResult, SubscribeParams,
+    ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams, SessionListResult,
+    SubscribeParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -391,6 +392,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "agent.info" => RpcResponse::success(id, state.agent.info()),
+        "session.diff" => match parse_params::<SessionDiffParams>(request.params) {
+            Ok(params) => match state.engine.session_diff(&params.session_id).await {
+                Ok(diff) => RpcResponse::success(id, diff),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "agent.configure" => match parse_params::<ConfigureAgentParams>(request.params) {
             Ok(params) => match state.agent.configure(params) {
                 Ok(info) => RpcResponse::success(id, info),

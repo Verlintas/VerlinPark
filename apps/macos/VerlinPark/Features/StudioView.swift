@@ -422,42 +422,18 @@ struct ExternalResidentPanel: View {
 
 struct PreviewPanelView: View {
     @Environment(AppModel.self) private var model
+    @State private var mode: PreviewMode = .changes
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let session = model.selectedSession {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        SectionLabel(title: "Session trace")
-                        Text(session.goal)
-                            .font(.system(size: 11, weight: .medium))
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                    Text("\(model.events.count) events")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-
+                header(session)
                 Divider().opacity(0.3)
-
-                if model.events.isEmpty {
-                    StudioEmptyView(
-                        icon: "list.bullet.rectangle",
-                        title: "No trace yet",
-                        detail: "Events from the Leader and the project team will appear here."
-                    )
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 6) {
-                            ForEach(model.events) { event in
-                                PreviewEventRow(event: event)
-                            }
-                        }
-                        .padding(12)
-                    }
+                switch mode {
+                case .changes:
+                    changes
+                case .trace:
+                    trace
                 }
             } else {
                 StudioEmptyView(
@@ -467,6 +443,179 @@ struct PreviewPanelView: View {
                 )
             }
         }
+        .task(id: model.selectedSessionID) {
+            if model.selectedSessionID != nil {
+                await model.loadDiff()
+            }
+        }
+    }
+
+    private func header(_ session: Session) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Session review")
+                    Text(session.goal)
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
+                }
+                Spacer()
+                Button {
+                    Task { await model.loadDiff() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .help("Refresh diff")
+                .disabled(model.diffLoading)
+            }
+            Picker("", selection: $mode) {
+                ForEach(PreviewMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private var changes: some View {
+        if model.diffLoading, model.sessionDiff == nil {
+            ProgressView()
+                .controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let error = model.diffError, model.sessionDiff == nil {
+            StudioEmptyView(
+                icon: "exclamationmark.triangle",
+                title: "Diff unavailable",
+                detail: error
+            )
+        } else if let diff = model.sessionDiff, !diff.isEmpty {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.triangle.branch")
+                        Text(diff.branch.isEmpty ? "worktree" : diff.branch)
+                        Spacer()
+                        Text("\(diff.patch.split(separator: "\n").count) lines")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+
+                    if !diff.status.isEmpty {
+                        Text(diff.status)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+
+                    if !diff.patch.isEmpty {
+                        DiffLines(text: diff.patch)
+                    }
+                }
+                .padding(12)
+            }
+        } else {
+            StudioEmptyView(
+                icon: "checkmark.circle",
+                title: "No changes yet",
+                detail: "Edits from the Leader will appear in this worktree diff."
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var trace: some View {
+        if model.events.isEmpty {
+            StudioEmptyView(
+                icon: "list.bullet.rectangle",
+                title: "No trace yet",
+                detail: "Events from the Leader and the project team will appear here."
+            )
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(model.events) { event in
+                        PreviewEventRow(event: event)
+                    }
+                }
+                .padding(12)
+            }
+        }
+    }
+}
+
+private enum PreviewMode: String, CaseIterable, Identifiable {
+    case changes
+    case trace
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .changes: "Changes"
+        case .trace: "Trace"
+        }
+    }
+}
+
+private struct DiffLines: View {
+    let text: String
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 1) {
+            ForEach(
+                Array(text.split(separator: "\n", omittingEmptySubsequences: false).enumerated()),
+                id: \.offset
+            ) { _, line in
+                let value = String(line)
+                Text(value.isEmpty ? " " : value)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(color(for: value))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 3)
+                    .background(background(for: value))
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func color(for line: String) -> Color {
+        if line.hasPrefix("+++") || line.hasPrefix("---") {
+            return .secondary
+        }
+        if line.hasPrefix("+") {
+            return .green
+        }
+        if line.hasPrefix("-") {
+            return .red
+        }
+        if line.hasPrefix("@@") || line.hasPrefix("diff --git") {
+            return .cyan
+        }
+        return .secondary
+    }
+
+    private func background(for line: String) -> Color {
+        if line.hasPrefix("+"), !line.hasPrefix("+++") {
+            return .green.opacity(0.07)
+        }
+        if line.hasPrefix("-"), !line.hasPrefix("---") {
+            return .red.opacity(0.06)
+        }
+        if line.hasPrefix("@@") {
+            return .blue.opacity(0.06)
+        }
+        return .clear
     }
 }
 
