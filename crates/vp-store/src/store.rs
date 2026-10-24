@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
-use vp_protocol::types::{Event, Project, Session};
+use vp_protocol::types::{Approval, Event, Project, Session, StoredMessage};
 
 use crate::paths;
 
@@ -65,6 +65,41 @@ impl Store {
                 ON events(session_id, seq);
             CREATE INDEX IF NOT EXISTS idx_sessions_project
                 ON sessions(project_id);
+
+            CREATE TABLE IF NOT EXISTS agents (
+                id         TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role       TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                model      TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id           TEXT PRIMARY KEY,
+                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role         TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                tool_calls   TEXT NOT NULL DEFAULT '[]',
+                tool_call_id TEXT,
+                created_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS approvals (
+                id           TEXT PRIMARY KEY,
+                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                tool_call_id TEXT NOT NULL,
+                tool         TEXT NOT NULL,
+                input        TEXT NOT NULL,
+                status       TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                resolved_at  TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_session
+                ON messages(session_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_approvals_session
+                ON approvals(session_id, created_at);
             "#,
         )?;
 
@@ -358,6 +393,183 @@ impl Store {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
         Ok(count as usize)
     }
+
+    pub fn create_leader_agent(&self, session_id: &str, model: &str) -> Result<String> {
+        let id = Uuid::now_v7().to_string();
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO agents (id, session_id, role, status, model, created_at)
+             VALUES (?1, ?2, 'leader', 'idle', ?3, ?4)",
+            params![id, session_id, model, now_rfc3339()],
+        )?;
+        Ok(id)
+    }
+
+    pub fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sessions SET status = ?1 WHERE id = ?2",
+            params![status, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_message(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls: &serde_json::Value,
+        tool_call_id: Option<&str>,
+    ) -> Result<StoredMessage> {
+        let message = StoredMessage {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: tool_calls.clone(),
+            tool_call_id: tool_call_id.map(ToOwned::to_owned),
+            created_at: now_rfc3339(),
+        };
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO messages
+             (id, session_id, role, content, tool_calls, tool_call_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                message.id,
+                message.session_id,
+                message.role,
+                message.content,
+                serde_json::to_string(&message.tool_calls)?,
+                message.tool_call_id,
+                message.created_at
+            ],
+        )?;
+        Ok(message)
+    }
+
+    pub fn list_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, role, content, tool_calls, tool_call_id, created_at
+             FROM messages WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            let tool_calls: String = row.get(4)?;
+            Ok(StoredMessage {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                tool_calls: serde_json::from_str(&tool_calls)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                tool_call_id: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn create_approval(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> Result<Approval> {
+        let approval = Approval {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            tool: tool.to_string(),
+            input: input.clone(),
+            status: "pending".to_string(),
+            created_at: now_rfc3339(),
+            resolved_at: None,
+        };
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO approvals
+             (id, session_id, tool_call_id, tool, input, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+            params![
+                approval.id,
+                approval.session_id,
+                approval.tool_call_id,
+                approval.tool,
+                serde_json::to_string(&approval.input)?,
+                approval.created_at
+            ],
+        )?;
+        Ok(approval)
+    }
+
+    pub fn resolve_approval(&self, approval_id: &str, approved: bool) -> Result<Option<Approval>> {
+        let status = if approved { "approved" } else { "denied" };
+        let resolved_at = now_rfc3339();
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE approvals SET status = ?1, resolved_at = ?2
+             WHERE id = ?3 AND status = 'pending'",
+            params![status, resolved_at, approval_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at
+             FROM approvals WHERE id = ?1",
+            params![approval_id],
+            |row| {
+                let input: String = row.get(4)?;
+                Ok(Approval {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    tool_call_id: row.get(2)?,
+                    tool: row.get(3)?,
+                    input: serde_json::from_str(&input).unwrap_or(serde_json::Value::Null),
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    resolved_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_approvals(&self, session_id: Option<&str>) -> Result<Vec<Approval>> {
+        let conn = self.lock()?;
+        let sql = match session_id {
+            Some(_) => {
+                "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at FROM approvals WHERE session_id = ?1 ORDER BY created_at ASC"
+            }
+            None => {
+                "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at FROM approvals ORDER BY created_at ASC"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = match session_id {
+            Some(id) => stmt.query(params![id])?,
+            None => stmt.query([])?,
+        };
+        let mut approvals = Vec::new();
+        while let Some(row) = rows.next()? {
+            let input: String = row.get(4)?;
+            approvals.push(Approval {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                tool_call_id: row.get(2)?,
+                tool: row.get(3)?,
+                input: serde_json::from_str(&input).unwrap_or(serde_json::Value::Null),
+                status: row.get(5)?,
+                created_at: row.get(6)?,
+                resolved_at: row.get(7)?,
+            });
+        }
+        Ok(approvals)
+    }
 }
 
 fn detect_default_branch(root: &Path) -> String {
@@ -449,6 +661,35 @@ mod tests {
             .join("events.jsonl");
         let mirror = std::fs::read_to_string(path).unwrap();
         assert_eq!(mirror.lines().count(), 2);
+    }
+
+    #[test]
+    fn persists_approvals_and_resolves_once() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "ship a feature").unwrap();
+        let approval = store
+            .create_approval(
+                &session.id,
+                "call_1",
+                "write_file",
+                &serde_json::json!({"path": "README.md"}),
+            )
+            .unwrap();
+        assert_eq!(store.list_approvals(Some(&session.id)).unwrap().len(), 1);
+
+        let resolved = store.resolve_approval(&approval.id, true).unwrap().unwrap();
+        assert_eq!(resolved.status, "approved");
+        assert!(
+            store
+                .resolve_approval(&approval.id, true)
+                .unwrap()
+                .is_none()
+        );
+        let listed = store.list_approvals(Some(&session.id)).unwrap();
+        assert_eq!(listed[0].status, "approved");
     }
 
     #[test]

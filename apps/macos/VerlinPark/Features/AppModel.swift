@@ -25,6 +25,17 @@ final class AppModel {
     var selectedSessionID: String?
     var isBusy = false
     var lastError: String?
+    var agentInfo: AgentInfo?
+    var streamingText = ""
+    var providerKind =
+        UserDefaults.standard.string(forKey: "provider.kind") ?? "openai-compatible"
+    var providerBaseURL =
+        UserDefaults.standard.string(forKey: "provider.baseURL")
+            ?? "https://api.openai.com/v1"
+    var providerModel = UserDefaults.standard.string(forKey: "provider.model") ?? ""
+    var providerAPIKey = Keychain.read(account: "provider.apiKey") ?? ""
+    var providerStatus: String?
+    var providerBusy = false
 
     private let core = CoreClient()
     private let daemon = DaemonController()
@@ -47,6 +58,8 @@ final class AppModel {
             let discovery = try await daemon.ensureRunning()
             try await core.connect(to: discovery)
             connection = .connected
+            await configureStoredProvider()
+            agentInfo = try? await core.agentInfo()
             consumeEvents()
             await refresh()
         } catch {
@@ -96,6 +109,7 @@ final class AppModel {
         guard selectedSessionID != id else { return }
         mode = .project
         selectedSessionID = id
+        streamingText = ""
         Task { await loadEvents() }
     }
 
@@ -146,6 +160,79 @@ final class AppModel {
             events = try await core.listEvents(sessionID: session.id)
         } catch {
             handle(error)
+        }
+    }
+
+    func sendMessage(_ text: String) async {
+        guard let sessionID = selectedSessionID else {
+            lastError = "Choose or create a session first."
+            return
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            try await core.prompt(sessionID: sessionID, content: trimmed)
+        } catch {
+            handle(error)
+        }
+    }
+
+    func resolveApproval(_ id: String, approved: Bool) async {
+        do {
+            try await core.resolveApproval(id: id, approved: approved)
+        } catch {
+            handle(error)
+        }
+    }
+
+    func saveProviderSettings() async {
+        let baseURL = providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = providerModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            providerStatus = "Enter a model name."
+            return
+        }
+        guard !baseURL.isEmpty else {
+            providerStatus = "Enter a base URL."
+            return
+        }
+        providerBusy = true
+        defer { providerBusy = false }
+        do {
+            let info = try await core.configureAgent(
+                kind: providerKind,
+                baseURL: baseURL,
+                model: model,
+                apiKey: providerAPIKey
+            )
+            agentInfo = info
+            UserDefaults.standard.set(providerKind, forKey: "provider.kind")
+            UserDefaults.standard.set(baseURL, forKey: "provider.baseURL")
+            UserDefaults.standard.set(model, forKey: "provider.model")
+            if providerAPIKey.isEmpty {
+                Keychain.delete(account: "provider.apiKey")
+            } else {
+                try Keychain.save(providerAPIKey, account: "provider.apiKey")
+            }
+            providerStatus = "Connected · \(model)"
+        } catch {
+            providerStatus = error.localizedDescription
+        }
+    }
+
+    private func configureStoredProvider() async {
+        let baseURL = providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = providerModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !baseURL.isEmpty, !model.isEmpty else { return }
+        do {
+            _ = try await core.configureAgent(
+                kind: providerKind,
+                baseURL: baseURL,
+                model: model,
+                apiKey: providerAPIKey
+            )
+        } catch {
+            providerStatus = error.localizedDescription
         }
     }
 
@@ -208,6 +295,36 @@ final class AppModel {
                 events.removeFirst(events.count - 1000)
             }
         }
+
+        if event.sessionId == selectedSessionID {
+            switch event.type {
+            case "agent.started":
+                streamingText = ""
+            case "agent.message_delta":
+                if let text = event.payload.objectValue?["text"]?.stringValue {
+                    streamingText += text
+                }
+            case "agent.message", "agent.turn_finished", "agent.failed":
+                streamingText = ""
+            default:
+                break
+            }
+        }
+
+        if event.type == "session.updated",
+           let status = event.payload.objectValue?["status"]?.stringValue,
+           let index = sessions.firstIndex(where: { $0.id == event.sessionId })
+        {
+            let old = sessions[index]
+            sessions[index] = Session(
+                id: old.id,
+                projectId: old.projectId,
+                goal: old.goal,
+                status: status,
+                createdAt: old.createdAt
+            )
+        }
+
         if event.type == "session.created" {
             Task { await self.loadSessions() }
         }

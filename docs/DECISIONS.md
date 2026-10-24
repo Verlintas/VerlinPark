@@ -24,6 +24,7 @@
 | [0012](adr/0012-computer-lease.md) | Computer Lease 只串行 GUI/浏览器 | Accepted | 执行/并发 |
 | [0013](adr/0013-glass-park-brand.md) | Glass Park UI + 可配置品牌 | Accepted | UI/品牌 |
 | [0014](adr/0014-external-aviiya.md) | Aviiya 是 NovaBAIC 外部常驻 Agent | Accepted | 集成边界 |
+| [0015](adr/0015-m1-leader-loop.md) | M1 单 Leader loop、审批与 Provider 配置 | Accepted | Agent runtime/安全/UI |
 
 ---
 

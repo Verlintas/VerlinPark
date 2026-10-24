@@ -11,7 +11,7 @@ This file is for coding agents working in this repository. Read it before changi
 
 ## Current milestone
 
-**M0.5 Glass UI.** The daemon, SQLite/event log, CLI, provider SSE adapters, and the Glass Park SwiftUI shell exist. The four-tier agent org, capacity controller, computer lease, and agent loop are **not** implemented yet. Do not pretend they are.
+**M1 Leader runtime.** The daemon, SQLite/event log, CLI, provider SSE adapters (including streamed tool calls), provider settings via Keychain, and a single-Leader agent loop with read tools plus write/shell approvals exist. The four-tier agent org, capacity controller, computer lease, per-task worktrees, budgets, and multi-agent scheduler are **not** implemented yet. Do not pretend they are.
 
 ## Invariants
 

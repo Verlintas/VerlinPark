@@ -466,6 +466,10 @@ loop {
 
 ## 7. Agent Runtime
 
+> **实现状态（M1）：** 当前实现是单 Leader、顺序工具、写/Shell 审批的子集：
+> `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`。四层 Actor、并行只读工具、
+> 预算、压缩和恢复仍是设计目标。见 [ADR-0015](adr/0015-m1-leader-loop.md)。
+
 ### 7.1 Actor 命令
 
 ```rust

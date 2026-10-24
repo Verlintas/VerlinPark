@@ -19,10 +19,28 @@ use serde_json::Value;
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiCompatibleProvider;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -30,6 +48,8 @@ impl ChatMessage {
         Self {
             role: "system".to_string(),
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -37,6 +57,26 @@ impl ChatMessage {
         Self {
             role: "user".to_string(),
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
@@ -48,6 +88,7 @@ pub struct ChatRequest {
     pub system: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub tools: Vec<ToolSchema>,
 }
 
 impl ChatRequest {
@@ -58,6 +99,7 @@ impl ChatRequest {
             system: None,
             max_tokens: None,
             temperature: None,
+            tools: Vec::new(),
         }
     }
 }
@@ -65,6 +107,7 @@ impl ChatRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     TextDelta(String),
+    ToolCall(ToolCall),
     Usage {
         input_tokens: u32,
         output_tokens: u32,
@@ -84,6 +127,8 @@ pub enum ProviderError {
     Stream(String),
     #[error("provider response parse error: {0}")]
     Parse(String),
+    #[error("provider does not support this request: {0}")]
+    Unsupported(String),
 }
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;

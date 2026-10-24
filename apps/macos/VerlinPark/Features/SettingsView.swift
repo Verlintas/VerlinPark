@@ -345,18 +345,73 @@ struct ResidentSettingsView: View {
 }
 
 struct ProvidersSettingsView: View {
+    @Environment(AppModel.self) private var model
+
+    private func defaultBaseURL(for kind: String) -> String {
+        kind == "anthropic"
+            ? "https://api.anthropic.com/v1"
+            : "https://api.openai.com/v1"
+    }
+
     var body: some View {
+        @Bindable var model = model
+
         Form {
-            Section("Providers") {
-                LabeledContent("OpenAI-compatible", value: "Ready for adapter")
-                LabeledContent("Anthropic", value: "Ready for adapter")
-                LabeledContent("Local endpoints", value: "LM Studio · Ollama · llama.cpp")
+            Section("Leader model") {
+                Picker("API", selection: $model.providerKind) {
+                    Text("OpenAI-compatible").tag("openai-compatible")
+                    Text("Anthropic").tag("anthropic")
+                }
+                .onChange(of: model.providerKind) { oldValue, newValue in
+                    if model.providerBaseURL.isEmpty
+                        || model.providerBaseURL == defaultBaseURL(for: oldValue)
+                    {
+                        model.providerBaseURL = defaultBaseURL(for: newValue)
+                    }
+                }
+                TextField("Base URL", text: $model.providerBaseURL)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Model", text: $model.providerModel)
+                    .textFieldStyle(.roundedBorder)
+                SecureField("API key", text: $model.providerAPIKey)
+                    .textFieldStyle(.roundedBorder)
                 Text(
-                    "Provider credentials and model selection are the next runtime milestone. Keys will live in Keychain, never in logs."
+                    "The key is stored in Keychain and sent only to the local daemon. It is never written to SQLite or logs."
                 )
-                .font(.callout)
+                .font(.caption)
                 .foregroundStyle(.secondary)
+                HStack {
+                    Button("Save & Connect") {
+                        Task { await model.saveProviderSettings() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.providerBusy)
+                    if model.providerBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                    Spacer()
+                    if let info = model.agentInfo {
+                        Text(info.configured ? (info.model ?? "configured") : "not configured")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(info.configured ? Color.green : Color.orange)
+                    }
+                }
+                if let status = model.providerStatus {
+                    Text(status)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
             }
+
+            Section("Local endpoints") {
+                LabeledContent("LM Studio", value: "http://127.0.0.1:1234/v1")
+                LabeledContent("Ollama", value: "http://127.0.0.1:11434/v1")
+                LabeledContent("llama.cpp", value: "http://127.0.0.1:8080/v1")
+                Text("Local endpoints usually need no API key. Any OpenAI-compatible endpoint works.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Models") {
                 LabeledContent("Routing", value: "Manual only")
                 LabeledContent("Budgets", value: "Per session · department · task")

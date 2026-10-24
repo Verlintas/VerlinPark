@@ -4,7 +4,7 @@
 
 VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets them collaborate through typed messages and shared artifacts, and makes every plan, tool call, diff, token, and permission decision inspectable and replayable.
 
-> **Status: M0.5 Glass UI.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. The new Glass Park UI, configurable brand mark, region/pride flags, Collab/Preview, and Manage Dash are in place. The agent runtime and four-tier scheduler land in M1/M2.
+> **Status: M1 Leader runtime (in progress).** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A single Leader can stream responses, inspect a repository, call tools, and ask for approval before writes or shell commands. The four-tier scheduler, per-task worktrees, budgets, and the full permission broker are still ahead.
 
 ---
 
@@ -121,6 +121,8 @@ just test
 just run
 ```
 
+Configure a model in **Settings → Providers** (any OpenAI-compatible endpoint, including LM Studio/Ollama/llama.cpp, or Anthropic). The API key is stored in Keychain and sent only to the local daemon. For headless runs, set `VERLINPARK_BASE_URL` and `VERLINPARK_MODEL` (plus `VERLINPARK_API_KEY` if needed).
+
 `just run` builds `verlinpadd` and the SwiftUI app, then opens it. The app launches the daemon on demand from `target/debug/verlinpadd` (debug builds). To run the daemon separately:
 
 ```bash
@@ -129,6 +131,9 @@ just cli ping
 just cli project-add /path/to/repo --name demo
 just cli session-new <project-id> "Add team invitations"
 just cli events <session-id>
+just cli prompt <session-id> "Now add tests"
+just cli approvals
+just cli approve <approval-id>
 ```
 
 Local state lives in `~/Library/Application Support/VerlinPark/`. The daemon binds to `127.0.0.1` with a random port and a per-run token in a `0600` discovery file. It does not expose a remote API.
@@ -176,7 +181,7 @@ VerlinPark learns from, and is not affiliated with:
 
 **VerlinPark 是 macOS 原生的 Agent 开发区（ADE）。**
 
-它把每个任务放进独立的 Git worktree，让一个三层部门制的 Agent 团队并行工作；Agent 之间通过结构化消息和共享工件协作；所有计划、工具调用、diff、token 和权限决策都可审计、可回放、可合并。
+它把每个任务放进独立的 Git worktree，让一个四层部门制的 Agent 团队并行工作；Agent 之间通过结构化消息和共享工件协作；所有计划、工具调用、diff、token 和权限决策都可审计、可回放、可合并。
 
 三个支柱：
 
@@ -184,7 +189,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M0.5 Glass UI**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；Agent loop、四层组织和多 Agent 调度在 M1/M2。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+当前处于 **M1 Leader runtime**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；单 Leader 可以流式对话、读取仓库、调用工具，并在写入/Shell 前请求审批。四层组织、多 Agent 调度、worktree 隔离和预算硬停仍在后续里程碑。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 ## 许可
 

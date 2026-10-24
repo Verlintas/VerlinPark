@@ -18,12 +18,14 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 use vp_core::Engine;
+use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
-    AddProjectParams, AuthParams, AuthResult, CreateSessionParams, EventListResult,
-    ListEventsParams, ListSessionsParams, PingResult, ProjectListResult, ServerInfo,
-    SessionListResult, SubscribeParams,
+    AddProjectParams, ApprovalListResult, AuthParams, AuthResult, ConfigureAgentParams,
+    CreateSessionParams, EventListResult, ListApprovalsParams, ListEventsParams,
+    ListSessionsParams, PingResult, ProjectListResult, PromptParams, PromptResult,
+    ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionListResult, SubscribeParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -43,6 +45,7 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
+    agent: AgentService,
     token: Arc<String>,
     data_dir: PathBuf,
     started_at: String,
@@ -68,10 +71,12 @@ async fn main() -> Result<()> {
 
     let store = Store::open(&data_dir)?;
     let engine = Engine::new(store);
+    let agent = AgentService::from_env(engine.clone());
     let token = generate_token();
     let started_at = now_rfc3339();
     let state = AppState {
         engine,
+        agent,
         token: Arc::new(token.clone()),
         data_dir: data_dir.clone(),
         started_at: started_at.clone(),
@@ -336,10 +341,21 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.create" => match parse_params::<CreateSessionParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .create_session(params.project_id, params.goal)
+                .create_session(params.project_id, params.goal.clone())
                 .await
             {
-                Ok(session) => RpcResponse::success(id, session),
+                Ok(session) => {
+                    let model = state
+                        .agent
+                        .info()
+                        .model
+                        .unwrap_or_else(|| "unconfigured".to_string());
+                    let _ = state.engine.create_leader_agent(&session.id, &model).await;
+                    if let Err(error) = state.agent.start(&session.id, &params.goal).await {
+                        tracing::warn!(%error, session_id = %session.id, "agent did not start");
+                    }
+                    RpcResponse::success(id, session)
+                }
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
@@ -370,6 +386,53 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(events) => RpcResponse::success(id, EventListResult { events }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.info" => RpcResponse::success(id, state.agent.info()),
+        "agent.configure" => match parse_params::<ConfigureAgentParams>(request.params) {
+            Ok(params) => match state.agent.configure(params) {
+                Ok(info) => RpcResponse::success(id, info),
+                Err(error) => {
+                    RpcResponse::error(id, RpcError::new(codes::INVALID_PARAMS, error.to_string()))
+                }
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.prompt" => match parse_params::<PromptParams>(request.params) {
+            Ok(params) => match state.agent.start(&params.session_id, &params.content).await {
+                Ok(()) => RpcResponse::success(id, PromptResult { accepted: true }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "approval.list" => {
+            let params: ListApprovalsParams = if request.params.is_null() {
+                ListApprovalsParams { session_id: None }
+            } else {
+                match serde_json::from_value(request.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RpcResponse::error(
+                            id,
+                            RpcError::new(codes::INVALID_PARAMS, error.to_string()),
+                        );
+                    }
+                }
+            };
+            match state.engine.list_approvals(params.session_id).await {
+                Ok(approvals) => RpcResponse::success(id, ApprovalListResult { approvals }),
+                Err(error) => internal_error(id, error),
+            }
+        }
+        "approval.resolve" => match parse_params::<ResolveApprovalParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .resolve_approval(&params.approval_id, params.approved)
+                .await
+            {
+                Ok(()) => RpcResponse::success(id, ResolveApprovalResult { resolved: true }),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

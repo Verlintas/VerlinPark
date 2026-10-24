@@ -111,3 +111,83 @@ pub struct AuthResult {
     pub ok: bool,
     pub server: ServerInfo,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredMessage {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub tool_calls: Value,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Approval {
+    pub id: String,
+    pub session_id: String,
+    pub tool_call_id: String,
+    pub tool: String,
+    pub input: Value,
+    pub status: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub configured: bool,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptParams {
+    pub session_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptResult {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListApprovalsParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalListResult {
+    pub approvals: Vec<Approval>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveApprovalParams {
+    pub approval_id: String,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolveApprovalResult {
+    pub resolved: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigureAgentParams {
+    pub provider: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}

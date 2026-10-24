@@ -49,6 +49,17 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
+    /// Send a follow-up prompt to the session Leader.
+    Prompt { session: String, content: String },
+    /// List approvals, optionally scoped to a session.
+    Approvals {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Approve a pending tool call.
+    Approve { approval: String },
+    /// Deny a pending tool call.
+    Deny { approval: String },
 }
 
 #[tokio::main]
@@ -103,6 +114,33 @@ async fn main() -> Result<()> {
                 &discovery,
                 "event.list",
                 json!({"session_id": session, "since_seq": since, "limit": limit}),
+            )
+            .await?
+        }
+        Command::Prompt { session, content } => {
+            rpc(
+                &discovery,
+                "session.prompt",
+                json!({"session_id": session, "content": content}),
+            )
+            .await?
+        }
+        Command::Approvals { session } => {
+            rpc(&discovery, "approval.list", json!({"session_id": session})).await?
+        }
+        Command::Approve { approval } => {
+            rpc(
+                &discovery,
+                "approval.resolve",
+                json!({"approval_id": approval, "approved": true}),
+            )
+            .await?
+        }
+        Command::Deny { approval } => {
+            rpc(
+                &discovery,
+                "approval.resolve",
+                json!({"approval_id": approval, "approved": false}),
             )
             .await?
         }
@@ -190,6 +228,21 @@ fn print_human(value: &Value) {
                 session["goal"].as_str().unwrap_or("?"),
                 session["status"].as_str().unwrap_or("?")
             );
+        }
+        return;
+    }
+    if let Some(approvals) = value.get("approvals").and_then(Value::as_array) {
+        if approvals.is_empty() {
+            println!("No approvals.");
+        }
+        for approval in approvals {
+            println!(
+                "{}  {}  [{}]",
+                approval["id"].as_str().unwrap_or("?"),
+                approval["tool"].as_str().unwrap_or("?"),
+                approval["status"].as_str().unwrap_or("?")
+            );
+            println!("  {}", approval["input"]);
         }
         return;
     }

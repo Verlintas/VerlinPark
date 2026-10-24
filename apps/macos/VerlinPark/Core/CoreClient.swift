@@ -141,6 +141,54 @@ actor CoreClient {
             .events
     }
 
+    func prompt(sessionID: String, content: String) async throws {
+        let params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "content": .string(content),
+        ]
+        _ = try await request(method: "session.prompt", params: params)
+    }
+
+    func listApprovals(sessionID: String?) async throws -> [Approval] {
+        let params: [String: JSONValue] = [
+            "session_id": sessionID.map(JSONValue.string) ?? .null,
+        ]
+        return try await request(method: "approval.list", params: params)
+            .decode(ApprovalListResult.self)
+            .approvals
+    }
+
+    func resolveApproval(id: String, approved: Bool) async throws {
+        let params: [String: JSONValue] = [
+            "approval_id": .string(id),
+            "approved": .bool(approved),
+        ]
+        _ = try await request(method: "approval.resolve", params: params)
+    }
+
+    func agentInfo() async throws -> AgentInfo {
+        try await request(method: "agent.info", params: [:])
+            .decode(AgentInfo.self)
+    }
+
+    func configureAgent(
+        kind: String,
+        baseURL: String,
+        model: String,
+        apiKey: String
+    ) async throws -> AgentInfo {
+        var params: [String: JSONValue] = [
+            "provider": .string(kind),
+            "base_url": .string(baseURL),
+            "model": .string(model),
+        ]
+        if !apiKey.isEmpty {
+            params["api_key"] = .string(apiKey)
+        }
+        return try await request(method: "agent.configure", params: params)
+            .decode(AgentInfo.self)
+    }
+
     private func request(
         method: String,
         params: [String: JSONValue]

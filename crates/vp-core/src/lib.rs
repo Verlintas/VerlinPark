@@ -1,23 +1,33 @@
 //! Application services shared by the daemon and future harness components.
 //!
-//! M0 is intentionally thin: project/session CRUD, event append, and a
-//! broadcast bus. The agent runtime and scheduler land in M1/M2.
+//! M1 adds the Leader agent loop, tool registry, approvals, and event stream.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use tokio::sync::broadcast;
-use vp_protocol::types::{Event, Project, Session};
+use tokio::sync::{broadcast, oneshot};
+use vp_protocol::types::{Approval, Event, Project, Session, StoredMessage};
 use vp_store::Store;
+
+pub mod agent;
+pub mod tools;
 
 #[derive(Clone)]
 pub struct Engine {
     store: Store,
     events: broadcast::Sender<Event>,
+    approval_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
 }
 
 impl Engine {
     pub fn new(store: Store) -> Self {
         let (events, _) = broadcast::channel(2048);
-        Self { store, events }
+        Self {
+            store,
+            events,
+            approval_waiters: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn store(&self) -> &Store {
@@ -66,6 +76,123 @@ impl Engine {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.list_events(&session_id, since_seq, limit))
             .await?
+    }
+
+    pub async fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let id_for_store = session_id.clone();
+        let status = status.to_string();
+        let status_for_store = status.clone();
+        tokio::task::spawn_blocking(move || {
+            store.update_session_status(&id_for_store, &status_for_store)
+        })
+        .await??;
+        self.append_event(
+            &session_id,
+            "session.updated",
+            serde_json::json!({"status": status}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn create_leader_agent(&self, session_id: &str, model: &str) -> Result<String> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let model = model.to_string();
+        tokio::task::spawn_blocking(move || store.create_leader_agent(&session_id, &model)).await?
+    }
+
+    pub async fn append_message(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls: serde_json::Value,
+        tool_call_id: Option<String>,
+    ) -> Result<StoredMessage> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let role = role.to_string();
+        let content = content.to_string();
+        tokio::task::spawn_blocking(move || {
+            store.append_message(
+                &session_id,
+                &role,
+                &content,
+                &tool_calls,
+                tool_call_id.as_deref(),
+            )
+        })
+        .await?
+    }
+
+    pub async fn list_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_messages(&session_id)).await?
+    }
+
+    pub async fn list_approvals(&self, session_id: Option<String>) -> Result<Vec<Approval>> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.list_approvals(session_id.as_deref())).await?
+    }
+
+    pub async fn request_approval(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool: &str,
+        input: serde_json::Value,
+    ) -> Result<(Approval, oneshot::Receiver<bool>)> {
+        let store = self.store.clone();
+        let session_id_owned = session_id.to_string();
+        let tool_call_id = tool_call_id.to_string();
+        let tool = tool.to_string();
+        let approval = tokio::task::spawn_blocking(move || {
+            store.create_approval(&session_id_owned, &tool_call_id, &tool, &input)
+        })
+        .await??;
+        let (sender, receiver) = oneshot::channel();
+        self.approval_waiters
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval mutex poisoned"))?
+            .insert(approval.id.clone(), sender);
+        self.append_event(
+            session_id,
+            "approval.requested",
+            serde_json::to_value(&approval)?,
+        )
+        .await?;
+        Ok((approval, receiver))
+    }
+
+    pub async fn resolve_approval(&self, approval_id: &str, approved: bool) -> Result<()> {
+        let store = self.store.clone();
+        let id = approval_id.to_string();
+        let approval =
+            tokio::task::spawn_blocking(move || store.resolve_approval(&id, approved)).await??;
+        if let Some(approval) = approval {
+            if let Some(sender) = self
+                .approval_waiters
+                .lock()
+                .ok()
+                .and_then(|mut waiters| waiters.remove(approval_id))
+            {
+                let _ = sender.send(approved);
+            }
+            self.append_event(
+                &approval.session_id,
+                "approval.resolved",
+                serde_json::json!({
+                    "approval_id": approval.id,
+                    "approved": approved,
+                }),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn append_event(
