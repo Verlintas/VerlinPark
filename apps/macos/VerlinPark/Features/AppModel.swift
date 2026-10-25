@@ -27,6 +27,7 @@ final class AppModel {
     var lastError: String?
     var agentInfo: AgentInfo?
     var streamingText = ""
+    var todos: [TodoItem] = []
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -96,6 +97,7 @@ final class AppModel {
             selectedSessionID = nil
             events = []
             sessionDiff = nil
+            todos = []
             lastCommit = nil
             mode = .resident
             return
@@ -106,6 +108,7 @@ final class AppModel {
         selectedSessionID = nil
         events = []
         sessionDiff = nil
+        todos = []
         lastCommit = nil
         Task { await loadSessions() }
     }
@@ -120,9 +123,11 @@ final class AppModel {
         selectedSessionID = id
         streamingText = ""
         sessionDiff = nil
+        todos = []
         lastCommit = nil
         Task {
             await loadEvents()
+            await loadTodos()
             await loadDiff()
         }
     }
@@ -184,6 +189,7 @@ final class AppModel {
             mode = .project
             events = try await core.listEvents(sessionID: session.id)
             sessionDiff = try? await core.sessionDiff(sessionID: session.id)
+            todos = await (try? core.sessionTodos(sessionID: session.id)) ?? []
             lastCommit = nil
         } catch {
             handle(error)
@@ -302,6 +308,21 @@ final class AppModel {
         }
     }
 
+    func loadTodos() async {
+        guard let sessionID = selectedSessionID else {
+            todos = []
+            return
+        }
+        do {
+            let items = try await core.sessionTodos(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                todos = items
+            }
+        } catch {
+            // The event stream will retry on the next todo.updated.
+        }
+    }
+
     func loadDiff() async {
         guard let sessionID = selectedSessionID else {
             sessionDiff = nil
@@ -344,6 +365,7 @@ final class AppModel {
                 selectedSessionID = sessions.first?.id
             }
             await loadEvents()
+            await loadTodos()
             await loadDiff()
         } catch {
             handle(error)
@@ -397,6 +419,15 @@ final class AppModel {
             default:
                 break
             }
+        }
+
+        if event.type == "todo.updated",
+           event.sessionId == selectedSessionID,
+           let items = event.payload.objectValue?["items"],
+           let data = try? JSONEncoder().encode(items),
+           let decoded = try? JSONDecoder().decode([TodoItem].self, from: data)
+        {
+            todos = decoded
         }
 
         if event.type == "agent.usage",

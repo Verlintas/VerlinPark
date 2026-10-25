@@ -27,7 +27,7 @@ use vp_protocol::types::{
     DiscardSessionParams, EventListResult, ListApprovalsParams, ListEventsParams,
     ListSessionsParams, PingResult, ProjectListResult, PromptParams, PromptResult,
     ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams, SessionListResult,
-    SubscribeParams,
+    SessionTodosParams, SessionTodosResult, SubscribeParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -423,6 +423,19 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(commit) => RpcResponse::success(id, commit),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.todos" => match parse_params::<SessionTodosParams>(request.params) {
+            Ok(params) => match state.engine.list_todos(&params.session_id).await {
+                Ok(items) => RpcResponse::success(
+                    id,
+                    SessionTodosResult {
+                        session_id: params.session_id,
+                        items,
+                    },
+                ),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

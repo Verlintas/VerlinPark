@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    Approval, Event, Project, Session, SessionCommit, SessionDiff, StoredMessage,
+    Approval, Event, Project, Session, SessionCommit, SessionDiff, StoredMessage, TodoItem,
 };
 use vp_store::Store;
 
@@ -203,6 +203,26 @@ impl Engine {
     pub async fn list_sessions(&self, project_id: Option<String>) -> Result<Vec<Session>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.list_sessions(project_id.as_deref())).await?
+    }
+
+    pub async fn set_todos(&self, session_id: &str, items: Vec<TodoItem>) -> Result<()> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let items_for_store = items.clone();
+        tokio::task::spawn_blocking(move || store.set_todos(&id, &items_for_store)).await??;
+        self.append_event(
+            session_id,
+            "todo.updated",
+            serde_json::json!({"items": items}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_todos(&self, session_id: &str) -> Result<Vec<TodoItem>> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_todos(&id)).await?
     }
 
     pub async fn recover_interrupted_sessions(&self) -> Result<usize> {

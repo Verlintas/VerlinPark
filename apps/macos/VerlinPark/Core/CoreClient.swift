@@ -162,6 +162,13 @@ actor CoreClient {
             .decode(SessionCommit.self)
     }
 
+    func sessionTodos(sessionID: String) async throws -> [TodoItem] {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.todos", params: params)
+            .decode(SessionTodosResult.self)
+            .items
+    }
+
     func sessionDiff(sessionID: String) async throws -> SessionDiff {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.diff", params: params)

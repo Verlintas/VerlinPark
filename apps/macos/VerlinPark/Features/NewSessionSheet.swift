@@ -11,9 +11,11 @@ struct NewSessionSheet: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("New Session")
                     .font(.title2.weight(.semibold))
-                Text("Give the Lead one concrete goal. You can review the plan before agents start.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Give the Lead one concrete goal. It starts in an isolated worktree and publishes its plan in Collab."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
             }
 
             TextField(

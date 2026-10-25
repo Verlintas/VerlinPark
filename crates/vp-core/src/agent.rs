@@ -7,10 +7,12 @@ use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
-use vp_protocol::types::{AgentInfo, ConfigureAgentParams, Project, Session, StoredMessage};
+use vp_protocol::types::{
+    AgentInfo, ConfigureAgentParams, Project, Session, StoredMessage, TodoItem,
+};
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, StreamEvent,
-    ToolCall,
+    ToolCall, ToolSchema,
 };
 use vp_store::Store;
 
@@ -332,7 +334,32 @@ async fn run_agent(
 
     let mut conversation = load_conversation(&engine, session_id).await?;
     let system = system_prompt(&project, &session, &worktree);
-    let tools = config.tools.schemas();
+    let mut tools = config.tools.schemas();
+    tools.push(ToolSchema {
+        name: "todo_write".to_string(),
+        description: "Replace the session plan/todo list. Use as work progresses.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"]
+                            }
+                        },
+                        "required": ["title", "status"]
+                    }
+                }
+            },
+            "required": ["items"]
+        }),
+    });
 
     for turn in 0..config.max_turns {
         if control.is_cancelled() {
@@ -486,10 +513,14 @@ async fn run_agent(
             let tool = config.tools.get(&call.name);
             let input: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
-            let requires_approval = tool
-                .as_ref()
-                .map(|tool| tool.requires_approval())
-                .unwrap_or(true);
+            let is_todo = call.name == "todo_write";
+            let requires_approval = if is_todo {
+                false
+            } else {
+                tool.as_ref()
+                    .map(|tool| tool.requires_approval())
+                    .unwrap_or(true)
+            };
 
             let mut approved = true;
             if requires_approval {
@@ -514,6 +545,25 @@ async fn run_agent(
                 ToolOutput {
                     content: "The user denied this tool call.".to_string(),
                     is_error: true,
+                }
+            } else if is_todo {
+                engine
+                    .append_event(
+                        session_id,
+                        "tool.started",
+                        serde_json::json!({
+                            "tool_call_id": call_id,
+                            "name": call.name,
+                            "input": input,
+                        }),
+                    )
+                    .await?;
+                match parse_todos(&input) {
+                    Ok(items) => match engine.set_todos(session_id, items).await {
+                        Ok(()) => ToolOutput::ok("Updated the session plan.".to_string()),
+                        Err(error) => ToolOutput::error(format!("todo_write failed: {error}")),
+                    },
+                    Err(error) => ToolOutput::error(format!("todo_write failed: {error}")),
                 }
             } else if let Some(tool) = tool {
                 engine
@@ -613,6 +663,37 @@ async fn load_conversation(engine: &Engine, session_id: &str) -> Result<Vec<Chat
         .collect())
 }
 
+fn parse_todos(input: &serde_json::Value) -> Result<Vec<TodoItem>> {
+    let items = input
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("items is required"))?;
+    if items.len() > 50 {
+        return Err(anyhow!("at most 50 todo items are allowed"));
+    }
+    let mut todos = Vec::with_capacity(items.len());
+    for item in items {
+        let title = item
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty() && title.len() <= 200)
+            .ok_or_else(|| anyhow!("each item needs a non-empty title (max 200 chars)"))?;
+        let status = item
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("pending");
+        if !matches!(status, "pending" | "in_progress" | "completed") {
+            return Err(anyhow!("status must be pending, in_progress, or completed"));
+        }
+        todos.push(TodoItem {
+            title: title.to_string(),
+            status: status.to_string(),
+        });
+    }
+    Ok(todos)
+}
+
 async fn finish_cancelled(engine: &Engine, session_id: &str) -> Result<()> {
     engine
         .append_event(session_id, "agent.cancelled", serde_json::json!({}))
@@ -655,6 +736,7 @@ fn system_prompt(project: &Project, session: &Session, worktree: &str) -> String
          Work only inside your session worktree at {}. \
          The original project root {} is read-only for you; never write there. \
          The worktree is on branch {}. Use read_file/list_dir/grep to inspect code. \
+         Maintain a short plan with todo_write (pending / in_progress / completed) and update it as you work. \
          Use edit_file for focused changes and write_file for new or fully rewritten files. \
          Use shell for tests/builds. Write, edit, and shell calls require user approval, \
          so explain what you are doing briefly. \
@@ -847,6 +929,45 @@ mod tests {
         let messages = engine.list_messages(&session.id).await.unwrap();
         assert!(messages.iter().any(|message| message.role == "assistant"));
     }
+    #[tokio::test]
+    async fn writes_a_persisted_plan() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_todo".into(),
+                        name: "todo_write".into(),
+                        arguments: serde_json::json!({
+                            "items": [
+                                {"title": "Inspect", "status": "completed"},
+                                {"title": "Implement", "status": "in_progress"}
+                            ]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("still working".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "plan the work".into(), None)
+            .await
+            .unwrap();
+        service.start(&session.id, "plan the work").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let todos = engine.list_todos(&session.id).await.unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[1].status, "in_progress");
+        let events = engine.list_events(session.id, 0, 100).await.unwrap();
+        assert!(events.iter().any(|event| event.kind == "todo.updated"));
+    }
+
     #[tokio::test]
     async fn stops_when_token_budget_is_exhausted() {
         let dir = TempDir::new().unwrap();

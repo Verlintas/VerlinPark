@@ -115,6 +115,11 @@ struct CollabGraphView: View {
                     isPlaceholder: false
                 )
 
+                if !model.todos.isEmpty {
+                    OrgConnector()
+                    LeaderPlanCard(todos: model.todos)
+                }
+
                 OrgConnector()
 
                 TierPlaceholder(
@@ -188,6 +193,64 @@ struct CollabGraphView: View {
         .overlay {
             RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .strokeBorder(.white.opacity(0.05), lineWidth: 1)
+        }
+    }
+}
+
+struct LeaderPlanCard: View {
+    let todos: [TodoItem]
+
+    private var completed: Int {
+        todos.count { $0.status == "completed" }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("LEADER PLAN")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(completed)/\(todos.count)")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            ForEach(todos) { todo in
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: icon(for: todo.status))
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(color(for: todo.status))
+                        .frame(width: 12)
+                    Text(todo.title)
+                        .font(.system(size: 10))
+                        .foregroundStyle(todo.status == "completed" ? .tertiary : .secondary)
+                        .strikethrough(todo.status == "completed")
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .padding(10)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private func icon(for status: String) -> String {
+        switch status {
+        case "completed": "checkmark.circle.fill"
+        case "in_progress": "circle.lefthalf.filled"
+        default: "circle"
+        }
+    }
+
+    private func color(for status: String) -> Color {
+        switch status {
+        case "completed": .green
+        case "in_progress": .orange
+        default: .secondary
         }
     }
 }

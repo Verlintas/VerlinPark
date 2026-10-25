@@ -33,7 +33,10 @@ approval, and result has to be an event that a client can replay.
    and calls `agent.configure` on launch and whenever settings change. The daemon
    keeps the key in memory and never persists it. Environment variables remain a
    headless/CLI fallback.
-6. **Both adapters support tool calls.** OpenAI-compatible streams reassemble
+6. **The Leader publishes a persisted plan.** `todo_write` replaces a small
+   session todo list (`pending` / `in_progress` / `completed`); the runtime stores
+   it and emits `todo.updated`. Collab reads it instead of inventing agent state.
+7. **Both adapters support tool calls.** OpenAI-compatible streams reassemble
    indexed `tool_calls`; Anthropic streams reassemble `tool_use` input JSON and
    map tool results back into `tool_result` blocks.
 

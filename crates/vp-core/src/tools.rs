@@ -26,14 +26,14 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
-    fn ok(content: impl Into<String>) -> Self {
+    pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: false,
         }
     }
 
-    fn error(content: impl Into<String>) -> Self {
+    pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: true,

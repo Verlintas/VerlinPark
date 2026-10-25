@@ -21,13 +21,14 @@
 | 错误反馈 | ✅ | App 顶部 ErrorBanner 显示 daemon/项目/会话错误，可关闭 |
 | Agent 事件 | ✅ | `agent.started/message_delta/message/turn_finished/failed/unavailable`、`tool.started/finished`、`agent.usage` |
 | 对话 UI | ✅ | 用户/Leader 气泡、流式光标、工具卡片、错误卡片、审批卡片、会话状态与模型标识 |
+| Leader 计划 | ✅ | `todo_write` 工具持久化 todo（pending / in_progress / completed）；`todo.updated` 事件；Collab 显示真实进度；CLI `vp todos` |
 | Diff 审阅 | ✅ | `session.diff` RPC；Preview → Changes 显示 status + 彩色 patch；CLI `vp diff`；200k 上限 |
 | Worktree commit | ✅ | Preview → Commit；`session.commit` 在 worktree 内 `git add -A` + commit；`session.committed` 事件；CLI `vp commit`；不做自动提交 |
 | 撤销改动 | ✅ | Preview → 垃圾桶；`session.discard` 在 worktree 内 reset --hard + clean -fd（保留 commit）；CLI `vp discard`；二次确认 |
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 28 个：worktree 创建/非 Git 拒绝、旧库迁移、中断恢复、显式 commit/discard、精确 edit_file、预算硬停、慢流取消、usage 累计、工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
+| 测试 | ✅ | Rust 30 个：worktree 创建/非 Git 拒绝、旧库迁移、中断恢复、显式 commit/discard、精确 edit_file、预算硬停、慢流取消、usage 累计、todo 持久化、工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M1 尚未完成：**

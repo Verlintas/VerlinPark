@@ -226,3 +226,22 @@ extension Int {
         Swift.max(1000, Swift.min(self, 2_000_000))
     }
 }
+
+struct TodoItem: Codable, Identifiable, Hashable, Sendable {
+    let title: String
+    let status: String
+
+    var id: String {
+        title
+    }
+}
+
+struct SessionTodosResult: Codable, Sendable {
+    let sessionId: String
+    let items: [TodoItem]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case items
+    }
+}

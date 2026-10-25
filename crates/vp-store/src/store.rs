@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
-use vp_protocol::types::{Approval, Event, Project, Session, StoredMessage};
+use vp_protocol::types::{Approval, Event, Project, Session, StoredMessage, TodoItem};
 
 use crate::paths;
 
@@ -103,6 +103,15 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_messages_session
                 ON messages(session_id, created_at);
+            CREATE TABLE IF NOT EXISTS todos (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                position   INTEGER NOT NULL,
+                title      TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, position)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_approvals_session
                 ON approvals(session_id, created_at);
             "#,
@@ -604,6 +613,48 @@ impl Store {
         .map_err(Into::into)
     }
 
+    pub fn set_todos(&self, session_id: &str, items: &[TodoItem]) -> Result<()> {
+        if self.get_session(session_id)?.is_none() {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let updated_at = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM todos WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for (position, item) in items.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO todos (session_id, position, title, status, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    session_id,
+                    position as i64,
+                    item.title,
+                    item.status,
+                    updated_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_todos(&self, session_id: &str) -> Result<Vec<TodoItem>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT title, status FROM todos WHERE session_id = ?1 ORDER BY position ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(TodoItem {
+                title: row.get(0)?,
+                status: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn interrupt_running_sessions(&self) -> Result<Vec<String>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare("SELECT id FROM sessions WHERE status = 'running'")?;
@@ -767,6 +818,45 @@ mod tests {
             .join("events.jsonl");
         let mirror = std::fs::read_to_string(path).unwrap();
         assert_eq!(mirror.lines().count(), 2);
+    }
+
+    #[test]
+    fn replaces_session_todos() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "plan").unwrap();
+        store
+            .set_todos(
+                &session.id,
+                &[
+                    TodoItem {
+                        title: "Inspect".into(),
+                        status: "completed".into(),
+                    },
+                    TodoItem {
+                        title: "Implement".into(),
+                        status: "in_progress".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        let todos = store.list_todos(&session.id).unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[1].title, "Implement");
+        store
+            .set_todos(
+                &session.id,
+                &[TodoItem {
+                    title: "Ship".into(),
+                    status: "pending".into(),
+                }],
+            )
+            .unwrap();
+        let todos = store.list_todos(&session.id).unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].title, "Ship");
     }
 
     #[test]

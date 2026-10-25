@@ -246,3 +246,20 @@ pub struct CancelSessionParams {
 pub struct CancelSessionResult {
     pub cancelled: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub title: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionTodosParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionTodosResult {
+    pub session_id: String,
+    pub items: Vec<TodoItem>,
+}

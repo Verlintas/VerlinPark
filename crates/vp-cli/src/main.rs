@@ -58,6 +58,8 @@ enum Command {
     Prompt { session: String, content: String },
     /// Ask the running Leader to stop.
     Cancel { session: String },
+    /// Show the session plan/todo list.
+    Todos { session: String },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
     /// Commit the session worktree.
@@ -152,6 +154,9 @@ async fn main() -> Result<()> {
         }
         Command::Cancel { session } => {
             rpc(&discovery, "session.cancel", json!({"session_id": session})).await?
+        }
+        Command::Todos { session } => {
+            rpc(&discovery, "session.todos", json!({"session_id": session})).await?
         }
         Command::Discard { session } => {
             rpc(
@@ -274,6 +279,26 @@ fn print_human(value: &Value) {
                 session["id"].as_str().unwrap_or("?"),
                 session["goal"].as_str().unwrap_or("?"),
                 session["status"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if let Some(items) = value.get("items").and_then(Value::as_array) {
+        if items.is_empty() {
+            println!("No plan yet.");
+        }
+        for (index, item) in items.iter().enumerate() {
+            let status = item["status"].as_str().unwrap_or("?");
+            let marker = match status {
+                "completed" => "✓",
+                "in_progress" => "•",
+                _ => "○",
+            };
+            println!(
+                "{marker} {}. {}  [{}]",
+                index + 1,
+                item["title"].as_str().unwrap_or("?"),
+                status
             );
         }
         return;
