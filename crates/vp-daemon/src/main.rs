@@ -22,11 +22,12 @@ use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
-    AddProjectParams, ApprovalListResult, AuthParams, AuthResult, CommitSessionParams,
-    ConfigureAgentParams, CreateSessionParams, DiscardSessionParams, EventListResult,
-    ListApprovalsParams, ListEventsParams, ListSessionsParams, PingResult, ProjectListResult,
-    PromptParams, PromptResult, ResolveApprovalParams, ResolveApprovalResult, ServerInfo,
-    SessionDiffParams, SessionListResult, SubscribeParams,
+    AddProjectParams, ApprovalListResult, AuthParams, AuthResult, CancelSessionParams,
+    CancelSessionResult, CommitSessionParams, ConfigureAgentParams, CreateSessionParams,
+    DiscardSessionParams, EventListResult, ListApprovalsParams, ListEventsParams,
+    ListSessionsParams, PingResult, ProjectListResult, PromptParams, PromptResult,
+    ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams, SessionListResult,
+    SubscribeParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -349,7 +350,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.create" => match parse_params::<CreateSessionParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .create_session(params.project_id, params.goal.clone())
+                .create_session(params.project_id, params.goal.clone(), params.token_budget)
                 .await
             {
                 Ok(session) => {
@@ -404,6 +405,15 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Ok(()) => RpcResponse::success(id, json!({"discarded": true})),
                 Err(error) => internal_error(id, error),
             },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.cancel" => match parse_params::<CancelSessionParams>(request.params) {
+            Ok(params) => RpcResponse::success(
+                id,
+                CancelSessionResult {
+                    cancelled: state.agent.cancel(&params.session_id),
+                },
+            ),
             Err(response) => response_with_id(id, response),
         },
         "session.commit" => match parse_params::<CommitSessionParams>(request.params) {

@@ -117,11 +117,18 @@ actor CoreClient {
             .sessions
     }
 
-    func createSession(projectID: String, goal: String) async throws -> Session {
-        let params: [String: JSONValue] = [
+    func createSession(
+        projectID: String,
+        goal: String,
+        tokenBudget: Int?
+    ) async throws -> Session {
+        var params: [String: JSONValue] = [
             "project_id": .string(projectID),
             "goal": .string(goal),
         ]
+        if let tokenBudget, tokenBudget > 0 {
+            params["token_budget"] = .number(Double(tokenBudget))
+        }
         return try await request(method: "session.create", params: params)
             .decode(Session.self)
     }
@@ -176,6 +183,13 @@ actor CoreClient {
         return try await request(method: "approval.list", params: params)
             .decode(ApprovalListResult.self)
             .approvals
+    }
+
+    func cancelSession(sessionID: String) async throws -> Bool {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.cancel", params: params)
+            .decode(CancelResult.self)
+            .cancelled
     }
 
     func resolveApproval(id: String, approved: Bool) async throws {

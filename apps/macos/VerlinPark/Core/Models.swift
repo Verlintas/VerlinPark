@@ -23,6 +23,9 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
     let status: String
     let worktree: String?
     let branch: String?
+    let tokenBudget: Int?
+    let tokensIn: Int
+    let tokensOut: Int
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -32,7 +35,14 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         case status
         case worktree
         case branch
+        case tokenBudget = "token_budget"
+        case tokensIn = "tokens_in"
+        case tokensOut = "tokens_out"
         case createdAt = "created_at"
+    }
+
+    var tokensUsed: Int {
+        tokensIn + tokensOut
     }
 }
 
@@ -204,5 +214,15 @@ struct SessionCommit: Codable, Sendable {
         case commit
         case message
         case summary
+    }
+}
+
+struct CancelResult: Codable, Sendable {
+    let cancelled: Bool
+}
+
+extension Int {
+    var clampedTokenBudget: Int {
+        Swift.max(1000, Swift.min(self, 2_000_000))
     }
 }

@@ -259,6 +259,17 @@ struct SessionChatView: View {
                     ?? event.payload.objectValue?["message"]?.stringValue
                     ?? "The agent stopped."
                 result.append(.error(id: event.id, text: message))
+            case "agent.budget_exceeded":
+                let limit = event.payload.objectValue?["limit"]?.intValue ?? 0
+                let spent = event.payload.objectValue?["spent"]?.intValue ?? 0
+                result.append(
+                    .notice(
+                        id: event.id,
+                        text: "Token budget exhausted (\(spent) / \(limit))."
+                    )
+                )
+            case "agent.cancelled":
+                result.append(.notice(id: event.id, text: "Run cancelled."))
             default:
                 continue
             }
@@ -293,7 +304,25 @@ struct SessionChatView: View {
                     .textSelection(.enabled)
                 }
                 Spacer()
-                StatusPill(status: session.status)
+                VStack(alignment: .trailing, spacing: 5) {
+                    HStack(spacing: 8) {
+                        if session.status == "running" {
+                            Button {
+                                Task { await model.cancelSession() }
+                            } label: {
+                                Label("Stop", systemImage: "stop.fill")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .tint(.red)
+                        }
+                        StatusPill(status: session.status)
+                    }
+                    Text(tokenUsageLabel)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(.horizontal, 22)
             .padding(.top, 18)
@@ -339,6 +368,24 @@ struct SessionChatView: View {
                 }
             }
         }
+    }
+
+    private var tokenUsageLabel: String {
+        let used = tokenLabel(session.tokensUsed)
+        guard let budget = session.tokenBudget, budget > 0 else {
+            return "\(used) tokens"
+        }
+        return "\(used) / \(tokenLabel(budget)) tokens"
+    }
+
+    private func tokenLabel(_ value: Int) -> String {
+        if value >= 1_000_000 {
+            return String(format: "%.1fm", Double(value) / 1_000_000)
+        }
+        if value >= 1000 {
+            return String(format: "%.1fk", Double(value) / 1000)
+        }
+        return "\(value)"
     }
 
     private var emptyState: some View {
@@ -388,6 +435,16 @@ struct SessionChatView: View {
             ApprovalCard(approval: approval, resolved: false)
         case let .approvalResolved(approval):
             ApprovalCard(approval: approval, resolved: true)
+        case let .notice(_, text):
+            HStack(spacing: 8) {
+                Image(systemName: "info.circle")
+                    .foregroundStyle(.secondary)
+                Text(text)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(10)
+            .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
         case let .error(_, text):
             HStack(spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
@@ -432,12 +489,13 @@ private enum ChatEntry: Identifiable {
     case tool(id: String, name: String, input: JSONValue, output: String, isError: Bool)
     case approval(Approval)
     case approvalResolved(Approval)
+    case notice(id: String, text: String)
     case error(id: String, text: String)
 
     var id: String {
         switch self {
         case let .user(id, _), let .assistant(id, _), let .tool(id, _, _, _, _),
-             let .error(id, _):
+             let .notice(id, _), let .error(id, _):
             id
         case let .approval(approval), let .approvalResolved(approval):
             "approval-\(approval.id)"

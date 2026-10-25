@@ -55,7 +55,12 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.list_projects()).await?
     }
 
-    pub async fn create_session(&self, project_id: String, goal: String) -> Result<Session> {
+    pub async fn create_session(
+        &self,
+        project_id: String,
+        goal: String,
+        token_budget: Option<u64>,
+    ) -> Result<Session> {
         let store = self.store.clone();
         let project_id_for_load = project_id.clone();
         let project = tokio::task::spawn_blocking(move || store.get_project(&project_id_for_load))
@@ -97,6 +102,7 @@ impl Engine {
                     &goal,
                     &worktree_path,
                     &branch,
+                    token_budget,
                 )
             }
         })
@@ -324,6 +330,22 @@ impl Engine {
             message,
             summary,
         })
+    }
+
+    pub async fn record_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.add_session_usage(&id, input, output)).await??;
+        self.append_event(
+            session_id,
+            "agent.usage",
+            serde_json::json!({
+                "input_tokens": input,
+                "output_tokens": output,
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
@@ -568,7 +590,7 @@ mod tests {
             .await
             .unwrap();
         let session = engine
-            .create_session(project.id, "discard".into())
+            .create_session(project.id, "discard".into(), None)
             .await
             .unwrap();
         let worktree = PathBuf::from(session.worktree.clone().unwrap());
@@ -607,7 +629,7 @@ mod tests {
             .await
             .unwrap();
         let session = engine
-            .create_session(project.id, "commit".into())
+            .create_session(project.id, "commit".into(), None)
             .await
             .unwrap();
         let worktree = session.worktree.clone().unwrap();
@@ -651,7 +673,7 @@ mod tests {
             .await
             .unwrap();
         let session = engine
-            .create_session(project.id, "run".into())
+            .create_session(project.id, "run".into(), None)
             .await
             .unwrap();
         engine
@@ -696,11 +718,12 @@ mod tests {
             .await
             .unwrap();
         let session = engine
-            .create_session(project.id, "ship it".into())
+            .create_session(project.id, "ship it".into(), Some(100_000))
             .await
             .unwrap();
         assert!(session.worktree.is_some());
         assert!(session.branch.is_some());
+        assert_eq!(session.token_budget, Some(100_000));
         let event = rx.recv().await.unwrap();
         assert_eq!(event.session_id, session.id);
         assert_eq!(event.kind, "session.created");

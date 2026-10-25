@@ -40,7 +40,12 @@ enum Command {
         project: Option<String>,
     },
     /// Create a session for a project.
-    SessionNew { project: String, goal: String },
+    SessionNew {
+        project: String,
+        goal: String,
+        #[arg(long)]
+        token_budget: Option<u64>,
+    },
     /// List events for a session.
     Events {
         session: String,
@@ -51,6 +56,8 @@ enum Command {
     },
     /// Send a follow-up prompt to the session Leader.
     Prompt { session: String, content: String },
+    /// Ask the running Leader to stop.
+    Cancel { session: String },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
     /// Commit the session worktree.
@@ -107,11 +114,19 @@ async fn main() -> Result<()> {
         Command::Sessions { project } => {
             rpc(&discovery, "session.list", json!({"project_id": project})).await?
         }
-        Command::SessionNew { project, goal } => {
+        Command::SessionNew {
+            project,
+            goal,
+            token_budget,
+        } => {
             rpc(
                 &discovery,
                 "session.create",
-                json!({"project_id": project, "goal": goal}),
+                json!({
+                    "project_id": project,
+                    "goal": goal,
+                    "token_budget": token_budget,
+                }),
             )
             .await?
         }
@@ -134,6 +149,9 @@ async fn main() -> Result<()> {
                 json!({"session_id": session, "content": content}),
             )
             .await?
+        }
+        Command::Cancel { session } => {
+            rpc(&discovery, "session.cancel", json!({"session_id": session})).await?
         }
         Command::Discard { session } => {
             rpc(
@@ -258,6 +276,17 @@ fn print_human(value: &Value) {
                 session["status"].as_str().unwrap_or("?")
             );
         }
+        return;
+    }
+    if let Some(cancelled) = value.get("cancelled").and_then(Value::as_bool) {
+        println!(
+            "{}",
+            if cancelled {
+                "cancellation requested."
+            } else {
+                "no active run for that session."
+            }
+        );
         return;
     }
     if value.get("discarded").and_then(Value::as_bool) == Some(true) {

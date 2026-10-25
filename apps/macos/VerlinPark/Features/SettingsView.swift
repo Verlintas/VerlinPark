@@ -346,6 +346,7 @@ struct ResidentSettingsView: View {
 
 struct ProvidersSettingsView: View {
     @Environment(AppModel.self) private var model
+    @AppStorage("verlinpark.session.tokenBudget") private var tokenBudget = 200_000
 
     private func defaultBaseURL(for kind: String) -> String {
         kind == "anthropic"
@@ -410,6 +411,17 @@ struct ProvidersSettingsView: View {
                 Text("Local endpoints usually need no API key. Any OpenAI-compatible endpoint works.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            Section("Session defaults") {
+                TextField("Token budget", value: $tokenBudget, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 160)
+                Text(
+                    "Input + output token hard stop for new sessions. Existing sessions keep their own budget."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Section("Models") {

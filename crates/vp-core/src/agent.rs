@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{AgentInfo, ConfigureAgentParams, Project, Session, StoredMessage};
 use vp_providers::{
@@ -32,7 +32,30 @@ pub struct AgentConfig {
 pub struct AgentService {
     engine: Engine,
     config: Arc<RwLock<Option<AgentConfig>>>,
-    running: Arc<Mutex<HashSet<String>>>,
+    runs: Arc<Mutex<HashMap<String, Arc<RunControl>>>>,
+}
+
+struct RunControl {
+    cancelled: watch::Sender<bool>,
+}
+
+impl RunControl {
+    fn new() -> Self {
+        let (cancelled, _) = watch::channel(false);
+        Self { cancelled }
+    }
+
+    fn cancel(&self) {
+        let _ = self.cancelled.send(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.cancelled.subscribe()
+    }
 }
 
 impl AgentService {
@@ -82,7 +105,7 @@ impl AgentService {
         Self {
             engine,
             config: Arc::new(RwLock::new(None)),
-            running: Arc::new(Mutex::new(HashSet::new())),
+            runs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -90,7 +113,7 @@ impl AgentService {
         Self {
             engine,
             config: Arc::new(RwLock::new(Some(config))),
-            running: Arc::new(Mutex::new(HashSet::new())),
+            runs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -179,14 +202,16 @@ impl AgentService {
             ));
         };
 
+        let control = Arc::new(RunControl::new());
         {
-            let mut running = self
-                .running
+            let mut runs = self
+                .runs
                 .lock()
                 .map_err(|_| anyhow!("agent run mutex poisoned"))?;
-            if !running.insert(session_id.to_string()) {
+            if runs.contains_key(session_id) {
                 return Err(anyhow!("session is already running"));
             }
+            runs.insert(session_id.to_string(), control.clone());
         }
 
         let prepared: Result<()> = async {
@@ -211,8 +236,8 @@ impl AgentService {
         }
         .await;
         if let Err(error) = prepared {
-            if let Ok(mut running) = self.running.lock() {
-                running.remove(session_id);
+            if let Ok(mut runs) = self.runs.lock() {
+                runs.remove(session_id);
             }
             return Err(error);
         }
@@ -220,9 +245,16 @@ impl AgentService {
         let engine = self.engine.clone();
         let session_id = session_id.to_string();
         let prompt = prompt.to_string();
-        let running = self.running.clone();
+        let runs = self.runs.clone();
         tokio::spawn(async move {
-            let result = run_agent(engine.clone(), config, &session_id, &prompt).await;
+            let result = run_agent(
+                engine.clone(),
+                config,
+                &session_id,
+                &prompt,
+                control.clone(),
+            )
+            .await;
             if let Err(error) = &result {
                 let _ = engine
                     .append_event(
@@ -233,11 +265,21 @@ impl AgentService {
                     .await;
                 let _ = engine.update_session_status(&session_id, "failed").await;
             }
-            if let Ok(mut running) = running.lock() {
-                running.remove(&session_id);
+            if let Ok(mut runs) = runs.lock() {
+                runs.remove(&session_id);
             }
         });
         Ok(())
+    }
+
+    pub fn cancel(&self, session_id: &str) -> bool {
+        if let Ok(runs) = self.runs.lock()
+            && let Some(control) = runs.get(session_id)
+        {
+            control.cancel();
+            return true;
+        }
+        false
     }
 }
 
@@ -246,6 +288,7 @@ async fn run_agent(
     config: AgentConfig,
     session_id: &str,
     prompt: &str,
+    control: Arc<RunControl>,
 ) -> Result<()> {
     let store = engine.store().clone();
     let (_, project) = load_session_project(store.clone(), session_id).await?;
@@ -257,6 +300,20 @@ async fn run_agent(
     let context = ToolContext {
         root: std::path::PathBuf::from(&worktree),
     };
+    let mut spent = session.tokens_in + session.tokens_out;
+    if let Some(budget) = session.token_budget
+        && spent >= budget
+    {
+        engine
+            .append_event(
+                session_id,
+                "agent.budget_exceeded",
+                serde_json::json!({"limit": budget, "spent": spent}),
+            )
+            .await?;
+        engine.update_session_status(session_id, "failed").await?;
+        return Ok(());
+    }
 
     engine
         .append_event(
@@ -278,6 +335,9 @@ async fn run_agent(
     let tools = config.tools.schemas();
 
     for turn in 0..config.max_turns {
+        if control.is_cancelled() {
+            return finish_cancelled(&engine, session_id).await;
+        }
         let request = ChatRequest {
             model: config.model.clone(),
             messages: conversation.clone(),
@@ -295,7 +355,26 @@ async fn run_agent(
         let mut text = String::new();
         let mut tool_calls = Vec::new();
         let mut usage = (0u32, 0u32);
-        while let Some(item) = stream.next().await {
+        let mut cancelled = false;
+        let mut cancel_rx = control.subscribe();
+        loop {
+            if control.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            let item = tokio::select! {
+                changed = cancel_rx.changed() => {
+                    if changed.is_err() || *cancel_rx.borrow() {
+                        cancelled = true;
+                        break;
+                    }
+                    continue;
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item? {
                 StreamEvent::TextDelta(delta) => {
                     text.push_str(&delta);
@@ -317,17 +396,27 @@ async fn run_agent(
                 StreamEvent::Done => {}
             }
         }
+        if cancelled {
+            return finish_cancelled(&engine, session_id).await;
+        }
         if usage != (0, 0) {
+            engine
+                .record_usage(session_id, usage.0 as u64, usage.1 as u64)
+                .await?;
+            spent += usage.0 as u64 + usage.1 as u64;
+        }
+        if let Some(budget) = session.token_budget
+            && spent >= budget
+        {
             engine
                 .append_event(
                     session_id,
-                    "agent.usage",
-                    serde_json::json!({
-                        "input_tokens": usage.0,
-                        "output_tokens": usage.1,
-                    }),
+                    "agent.budget_exceeded",
+                    serde_json::json!({"limit": budget, "spent": spent}),
                 )
                 .await?;
+            engine.update_session_status(session_id, "failed").await?;
+            return Ok(());
         }
 
         if text.is_empty() && tool_calls.is_empty() {
@@ -386,6 +475,9 @@ async fn run_agent(
         }
 
         for (index, call) in tool_calls.into_iter().enumerate() {
+            if control.is_cancelled() {
+                return finish_cancelled(&engine, session_id).await;
+            }
             let call_id = if call.id.is_empty() {
                 format!("call_{}_{}", turn, index)
             } else {
@@ -404,12 +496,16 @@ async fn run_agent(
                 let (approval, receiver) = engine
                     .request_approval(session_id, &call_id, &call.name, input.clone())
                     .await?;
-                match wait_for_approval(receiver).await {
+                match wait_for_approval(receiver, &control).await {
                     ApprovalOutcome::Approved => {}
                     ApprovalOutcome::Denied => approved = false,
                     ApprovalOutcome::TimedOut => {
                         approved = false;
                         let _ = engine.resolve_approval(&approval.id, false).await;
+                    }
+                    ApprovalOutcome::Cancelled => {
+                        let _ = engine.resolve_approval(&approval.id, false).await;
+                        return finish_cancelled(&engine, session_id).await;
                     }
                 }
             }
@@ -431,11 +527,20 @@ async fn run_agent(
                         }),
                     )
                     .await?;
-                match tool.execute(&context, input.clone()).await {
-                    Ok(output) => output,
-                    Err(error) => ToolOutput {
-                        content: format!("tool error: {error}"),
-                        is_error: true,
+                let mut cancel_rx = control.subscribe();
+                if control.is_cancelled() {
+                    return finish_cancelled(&engine, session_id).await;
+                }
+                tokio::select! {
+                    _ = cancel_rx.changed() => {
+                        return finish_cancelled(&engine, session_id).await;
+                    }
+                    result = tool.execute(&context, input.clone()) => match result {
+                        Ok(output) => output,
+                        Err(error) => ToolOutput {
+                            content: format!("tool error: {error}"),
+                            is_error: true,
+                        },
                     },
                 }
             } else {
@@ -508,17 +613,38 @@ async fn load_conversation(engine: &Engine, session_id: &str) -> Result<Vec<Chat
         .collect())
 }
 
+async fn finish_cancelled(engine: &Engine, session_id: &str) -> Result<()> {
+    engine
+        .append_event(session_id, "agent.cancelled", serde_json::json!({}))
+        .await?;
+    engine
+        .update_session_status(session_id, "cancelled")
+        .await?;
+    Ok(())
+}
+
 enum ApprovalOutcome {
     Approved,
     Denied,
     TimedOut,
+    Cancelled,
 }
 
-async fn wait_for_approval(receiver: oneshot::Receiver<bool>) -> ApprovalOutcome {
-    match timeout(Duration::from_secs(600), receiver).await {
-        Ok(Ok(true)) => ApprovalOutcome::Approved,
-        Ok(Ok(false)) | Ok(Err(_)) => ApprovalOutcome::Denied,
-        Err(_) => ApprovalOutcome::TimedOut,
+async fn wait_for_approval(
+    receiver: oneshot::Receiver<bool>,
+    control: &RunControl,
+) -> ApprovalOutcome {
+    if control.is_cancelled() {
+        return ApprovalOutcome::Cancelled;
+    }
+    let mut cancel_rx = control.subscribe();
+    tokio::select! {
+        _ = cancel_rx.changed() => ApprovalOutcome::Cancelled,
+        result = timeout(Duration::from_secs(600), receiver) => match result {
+            Ok(Ok(true)) => ApprovalOutcome::Approved,
+            Ok(Ok(false)) | Ok(Err(_)) => ApprovalOutcome::Denied,
+            Err(_) => ApprovalOutcome::TimedOut,
+        },
     }
 }
 
@@ -586,16 +712,6 @@ mod tests {
     }
 
     fn test_service(dir: &TempDir) -> (Engine, AgentService, vp_protocol::types::Project) {
-        let store = Store::open(dir.path()).unwrap();
-        let engine = Engine::new(store);
-        let project_dir = dir.path().join("repo");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::write(project_dir.join("README.md"), "hello from test\n").unwrap();
-        init_repo(&project_dir);
-        let project = engine
-            .store()
-            .add_project(project_dir.to_str().unwrap(), Some("repo"))
-            .unwrap();
         let provider = Arc::new(QueueProvider {
             responses: Mutex::new(VecDeque::from(vec![
                 vec![
@@ -612,6 +728,23 @@ mod tests {
                 ],
             ])),
         });
+        test_service_with_provider(dir, provider)
+    }
+
+    fn test_service_with_provider(
+        dir: &TempDir,
+        provider: Arc<dyn Provider>,
+    ) -> (Engine, AgentService, vp_protocol::types::Project) {
+        let store = Store::open(dir.path()).unwrap();
+        let engine = Engine::new(store);
+        let project_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("README.md"), "hello from test\n").unwrap();
+        init_repo(&project_dir);
+        let project = engine
+            .store()
+            .add_project(project_dir.to_str().unwrap(), Some("repo"))
+            .unwrap();
         let config = AgentConfig {
             provider,
             provider_name: "queue".into(),
@@ -623,6 +756,22 @@ mod tests {
         };
         let service = AgentService::configured(engine.clone(), config);
         (engine, service, project)
+    }
+
+    struct SlowProvider;
+
+    #[async_trait]
+    impl Provider for SlowProvider {
+        fn id(&self) -> &str {
+            "slow"
+        }
+
+        async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+            Ok(Box::pin(futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(StreamEvent::TextDelta("late".into()))
+            })))
+        }
     }
 
     #[test]
@@ -681,7 +830,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (engine, service, project) = test_service(&dir);
         let session = engine
-            .create_session(project.id, "inspect the repo".into())
+            .create_session(project.id, "inspect the repo".into(), None)
             .await
             .unwrap();
         service
@@ -697,5 +846,59 @@ mod tests {
         assert!(events.iter().any(|event| event.kind == "agent.message"));
         let messages = engine.list_messages(&session.id).await.unwrap();
         assert!(messages.iter().any(|message| message.role == "assistant"));
+    }
+    #[tokio::test]
+    async fn stops_when_token_budget_is_exhausted() {
+        let dir = TempDir::new().unwrap();
+        let (engine, service, project) = test_service(&dir);
+        let session = engine
+            .create_session(project.id, "stay in budget".into(), Some(100))
+            .await
+            .unwrap();
+        engine.record_usage(&session.id, 80, 40).await.unwrap();
+        service.start(&session.id, "stay in budget").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "agent.budget_exceeded")
+        );
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "failed");
+        assert_eq!(sessions[0].tokens_in, 80);
+        assert_eq!(sessions[0].tokens_out, 40);
+    }
+
+    #[tokio::test]
+    async fn cancels_a_slow_provider_stream() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(SlowProvider);
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "cancel me".into(), None)
+            .await
+            .unwrap();
+        service.start(&session.id, "cancel me").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(service.cancel(&session.id));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| event.kind == "agent.cancelled"));
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "cancelled");
+        assert!(!service.cancel(&session.id));
     }
 }

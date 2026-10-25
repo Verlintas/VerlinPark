@@ -156,18 +156,29 @@ final class AppModel {
         }
     }
 
-    func createSession(goal: String) async {
+    var defaultTokenBudget: Int {
+        UserDefaults.standard.object(forKey: "verlinpark.session.tokenBudget") as? Int
+            ?? 200_000
+    }
+
+    func createSession(goal: String, tokenBudget: Int? = nil) async {
         guard let projectID = selectedProjectID else {
             lastError = "Choose a project first."
             return
         }
         let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        let budget = (tokenBudget ?? defaultTokenBudget).clampedTokenBudget
+        UserDefaults.standard.set(budget, forKey: "verlinpark.session.tokenBudget")
 
         isBusy = true
         defer { isBusy = false }
         do {
-            let session = try await core.createSession(projectID: projectID, goal: trimmed)
+            let session = try await core.createSession(
+                projectID: projectID,
+                goal: trimmed,
+                tokenBudget: budget
+            )
             sessions = try await core.listSessions(projectID: projectID)
             selectedSessionID = session.id
             mode = .project
@@ -188,6 +199,15 @@ final class AppModel {
         guard !trimmed.isEmpty else { return }
         do {
             try await core.prompt(sessionID: sessionID, content: trimmed)
+        } catch {
+            handle(error)
+        }
+    }
+
+    func cancelSession() async {
+        guard let sessionID = selectedSessionID else { return }
+        do {
+            _ = try await core.cancelSession(sessionID: sessionID)
         } catch {
             handle(error)
         }
@@ -371,11 +391,32 @@ final class AppModel {
                 if let text = event.payload.objectValue?["text"]?.stringValue {
                     streamingText += text
                 }
-            case "agent.message", "agent.turn_finished", "agent.failed":
+            case "agent.message", "agent.turn_finished", "agent.failed", "agent.cancelled",
+                 "agent.budget_exceeded":
                 streamingText = ""
             default:
                 break
             }
+        }
+
+        if event.type == "agent.usage",
+           let input = event.payload.objectValue?["input_tokens"]?.intValue,
+           let output = event.payload.objectValue?["output_tokens"]?.intValue,
+           let index = sessions.firstIndex(where: { $0.id == event.sessionId })
+        {
+            let old = sessions[index]
+            sessions[index] = Session(
+                id: old.id,
+                projectId: old.projectId,
+                goal: old.goal,
+                status: old.status,
+                worktree: old.worktree,
+                branch: old.branch,
+                tokenBudget: old.tokenBudget,
+                tokensIn: old.tokensIn + input,
+                tokensOut: old.tokensOut + output,
+                createdAt: old.createdAt
+            )
         }
 
         if event.type == "session.updated",
@@ -390,6 +431,9 @@ final class AppModel {
                 status: status,
                 worktree: old.worktree,
                 branch: old.branch,
+                tokenBudget: old.tokenBudget,
+                tokensIn: old.tokensIn,
+                tokensOut: old.tokensOut,
                 createdAt: old.createdAt
             )
         }

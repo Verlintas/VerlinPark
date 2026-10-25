@@ -48,10 +48,13 @@ impl Store {
                 id         TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 goal       TEXT NOT NULL,
-                status     TEXT NOT NULL,
-                worktree   TEXT,
-                branch     TEXT,
-                created_at TEXT NOT NULL
+                status        TEXT NOT NULL,
+                worktree      TEXT,
+                branch        TEXT,
+                token_budget  INTEGER,
+                tokens_in     INTEGER NOT NULL DEFAULT 0,
+                tokens_out    INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -106,6 +109,14 @@ impl Store {
         )?;
         ensure_column(&conn, "sessions", "worktree", "TEXT")?;
         ensure_column(&conn, "sessions", "branch", "TEXT")?;
+        ensure_column(&conn, "sessions", "token_budget", "INTEGER")?;
+        ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(
+            &conn,
+            "sessions",
+            "tokens_out",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -216,9 +227,17 @@ impl Store {
     }
 
     pub fn create_session(&self, project_id: &str, goal: &str) -> Result<Session> {
-        self.insert_session(Uuid::now_v7().to_string(), project_id, goal, None, None)
+        self.insert_session(
+            Uuid::now_v7().to_string(),
+            project_id,
+            goal,
+            None,
+            None,
+            None,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_session_with_worktree(
         &self,
         id: &str,
@@ -226,6 +245,7 @@ impl Store {
         goal: &str,
         worktree: &str,
         branch: &str,
+        token_budget: Option<u64>,
     ) -> Result<Session> {
         self.insert_session(
             id.to_string(),
@@ -233,6 +253,7 @@ impl Store {
             goal,
             Some(worktree.to_string()),
             Some(branch.to_string()),
+            token_budget,
         )
     }
 
@@ -243,6 +264,7 @@ impl Store {
         goal: &str,
         worktree: Option<String>,
         branch: Option<String>,
+        token_budget: Option<u64>,
     ) -> Result<Session> {
         if self.get_project(project_id)?.is_none() {
             return Err(anyhow!("project not found: {project_id}"));
@@ -258,12 +280,16 @@ impl Store {
             status: "draft".to_string(),
             worktree,
             branch,
+            token_budget,
+            tokens_in: 0,
+            tokens_out: 0,
             created_at: now_rfc3339(),
         };
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO sessions (id, project_id, goal, status, worktree, branch, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO sessions
+             (id, project_id, goal, status, worktree, branch, token_budget, tokens_in, tokens_out, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8)",
             params![
                 session.id,
                 session.project_id,
@@ -271,6 +297,7 @@ impl Store {
                 session.status,
                 session.worktree,
                 session.branch,
+                session.token_budget,
                 session.created_at
             ],
         )?;
@@ -291,13 +318,24 @@ impl Store {
         Ok(())
     }
 
+    pub fn add_session_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sessions
+             SET tokens_in = tokens_in + ?1, tokens_out = tokens_out + ?2
+             WHERE id = ?3",
+            params![input as i64, output as i64, session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_sessions(&self, project_id: Option<&str>) -> Result<Vec<Session>> {
         let conn = self.lock()?;
         let mut sessions = Vec::new();
         match project_id {
             Some(project_id) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, worktree, branch, created_at
+                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, tokens_in, tokens_out, created_at
                      FROM sessions WHERE project_id = ?1
                      ORDER BY created_at DESC",
                 )?;
@@ -306,7 +344,7 @@ impl Store {
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, worktree, branch, created_at
+                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, tokens_in, tokens_out, created_at
                      FROM sessions ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map([], map_session)?;
@@ -319,7 +357,7 @@ impl Store {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, project_id, goal, status, worktree, branch, created_at
+            "SELECT id, project_id, goal, status, worktree, branch, token_budget, tokens_in, tokens_out, created_at
              FROM sessions WHERE id = ?1",
             params![id],
             map_session,
@@ -620,7 +658,10 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         status: row.get(3)?,
         worktree: row.get(4)?,
         branch: row.get(5)?,
-        created_at: row.get(6)?,
+        token_budget: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+        tokens_in: row.get::<_, i64>(7)? as u64,
+        tokens_out: row.get::<_, i64>(8)? as u64,
+        created_at: row.get(9)?,
     })
 }
 
@@ -726,6 +767,20 @@ mod tests {
             .join("events.jsonl");
         let mirror = std::fs::read_to_string(path).unwrap();
         assert_eq!(mirror.lines().count(), 2);
+    }
+
+    #[test]
+    fn accumulates_session_usage() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "usage").unwrap();
+        store.add_session_usage(&session.id, 10, 5).unwrap();
+        store.add_session_usage(&session.id, 20, 7).unwrap();
+        let session = store.get_session(&session.id).unwrap().unwrap();
+        assert_eq!(session.tokens_in, 30);
+        assert_eq!(session.tokens_out, 12);
     }
 
     #[test]

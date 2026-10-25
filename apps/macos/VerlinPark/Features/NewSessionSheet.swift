@@ -4,6 +4,7 @@ struct NewSessionSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var goal = ""
+    @State private var budget = 200_000
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -23,6 +24,18 @@ struct NewSessionSheet: View {
             .textFieldStyle(.roundedBorder)
             .lineLimit(3 ... 6)
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Token budget")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                TextField("200000", value: $budget, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 160)
+                Text("The runtime hard-stops the Leader when input + output tokens reach this limit.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+
             HStack {
                 if let project = model.selectedProject {
                     Label(project.name, systemImage: "folder")
@@ -37,7 +50,7 @@ struct NewSessionSheet: View {
 
                 Button("Create") {
                     Task {
-                        await model.createSession(goal: goal)
+                        await model.createSession(goal: goal, tokenBudget: budget)
                         dismiss()
                     }
                 }
@@ -48,6 +61,9 @@ struct NewSessionSheet: View {
         }
         .padding(24)
         .frame(width: 560)
+        .onAppear {
+            budget = model.defaultTokenBudget
+        }
     }
 
     private var isCreateDisabled: Bool {
