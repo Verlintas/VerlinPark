@@ -3,7 +3,7 @@
 > 版本：0.1（Draft）  
 > 日期：2026-10-21  
 > 负责人：Verlintas  
-> 状态：M0 walking skeleton + M0.5 Glass UI 已完成，M1 单 Leader runtime 进行中  
+> 状态：M0 / M0.5 / M1 已完成，M2 四层委派第一切片进行中  
 > 实现进度：[PROGRESS.md](PROGRESS.md)  
 > 2026-10-23 设计修订：组织改为四层（Leader → Manager → Worker → Labour），UI 改为 Glass Park，Computer Lease 只串行 GUI/浏览器，Aviiya 外置到 NovaBAIC。详见 ADR-0011 ~ ADR-0014；本文旧的三层/旧 UI 章节仍保留，后续合并。  
 > 许可：GPL-3.0-only
@@ -1162,8 +1162,8 @@ approval.requested / approval.resolved
 |---|---|---|---|
 | **M0 Foundation** | 1-2 | Monorepo、CI、Rust workspace、daemon hello、SwiftUI shell、SQLite/event log、provider streaming spike | `vp ping` 通；App 能打开项目；事件流可见 ✅ |
 | **M0.5 Glass UI** | 2-3 | Three-column Glass Park shell、BrandStore/BrandMark、248 region flags + 20 pride flags、Collab/Preview、Manage Dash、memory monitor、Aviiya external placeholder | App 可运行；品牌名/风格/旗帜持久化；项目/会话/事件可用 ✅ |
-| **M1 Single Agent** | 4-6 | Leader 对话 + agent loop、核心工具、权限代理、context compaction、checkpoint、终端、diff、trace、成本 | 单 Agent 在 fixture repo 修一个 failing test；可回滚；重启恢复。**进行中：** Leader loop、session worktree、read/write/shell 工具、审批、Provider 设置已完成 |
-| **M2 Four-tier Org** | 7-11 | 四层 org、Plan 校验、DAG 调度、mailbox、artifact、worktree per task、Verifier gate、merge queue、Collab 图 | 四层组织/预算门控扩编/完整 Verifier+Integrator 闭环；无写冲突；可合并 |
+| **M1 Single Agent** | 4-6 | Leader 对话 + agent loop、核心工具、权限代理、context compaction、checkpoint、终端、diff、trace、成本 | 单 Agent 在 fixture repo 修一个 failing test；可回滚；重启恢复。**M1 已完成：** Leader loop、session worktree、read/write/shell 工具、审批、Provider 设置、预算/取消、todo 计划 |
+| **M2 Four-tier Org** | 7-11 | 四层 org、Plan 校验、DAG 调度、mailbox、artifact、worktree per task、Verifier gate、merge queue、Collab 图 | 四层组织/预算门控扩编/完整 Verifier+Integrator 闭环；无写冲突；可合并。**第一切片：** 同步四层委派 + 真实 Agent roster 已完成 |
 | **M3 Control Plane** | 12-14 | 手动 org/model/budget 编辑器、Session wizard、审批队列、通知、暂停/恢复/取消、CLI、trace export、效率报告 | 用户不改文件即可配置四层组织；CLI 可驱动会话；v0.1 功能冻结 |
 | **M4 Release v0.1.0** | 15-17 | hardening、性能、签名/notarize、DMG、Homebrew、docs、benchmark | 干净 Mac 上安装/运行；onboarding < 5 分钟；崩溃率达标；v0.1.0 |
 | **M5 Open Bench v0.2** | 18-22 | MCP client、skills/hooks、本地 provider 向导、ACP client、插件 API 草案 | 接 1 个 MCP server + 1 个外部 Agent；本地模型跑通任务；v0.2.0-alpha |

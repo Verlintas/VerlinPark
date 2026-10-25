@@ -202,6 +202,12 @@ pub struct ConfigureAgentParams {
     pub max_turns: Option<u32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_managers: Option<u32>,
+    #[serde(default)]
+    pub max_workers: Option<u32>,
+    #[serde(default)]
+    pub max_labour: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -262,4 +268,26 @@ pub struct SessionTodosParams {
 pub struct SessionTodosResult {
     pub session_id: String,
     pub items: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRecord {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub status: String,
+    pub model: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentListParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentListResult {
+    pub agents: Vec<AgentRecord>,
 }

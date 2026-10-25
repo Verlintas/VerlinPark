@@ -144,6 +144,8 @@ struct Approval: Codable, Identifiable, Hashable, Sendable {
     let status: String
     let createdAt: String
     let resolvedAt: String?
+    let agentName: String?
+    let agentRole: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -154,6 +156,8 @@ struct Approval: Codable, Identifiable, Hashable, Sendable {
         case status
         case createdAt = "created_at"
         case resolvedAt = "resolved_at"
+        case agentName = "agent_name"
+        case agentRole = "agent_role"
     }
 }
 
@@ -244,4 +248,30 @@ struct SessionTodosResult: Codable, Sendable {
         case sessionId = "session_id"
         case items
     }
+}
+
+struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    let role: String
+    let name: String
+    let parentId: String?
+    let status: String
+    let model: String
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case role
+        case name
+        case parentId = "parent_id"
+        case status
+        case model
+        case createdAt = "created_at"
+    }
+}
+
+struct AgentListResult: Codable, Sendable {
+    let agents: [AgentRecord]
 }

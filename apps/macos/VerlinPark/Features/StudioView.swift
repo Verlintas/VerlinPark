@@ -110,7 +110,7 @@ struct CollabGraphView: View {
                     name: "Leader",
                     status: model.selectedSession?.status ?? "idle",
                     task: model.selectedSession?.goal ?? "Waiting for a session",
-                    model: "manual",
+                    model: model.agents.first { $0.role == "leader" }?.model ?? "manual",
                     accent: .green,
                     isPlaceholder: false
                 )
@@ -122,32 +122,35 @@ struct CollabGraphView: View {
 
                 OrgConnector()
 
-                TierPlaceholder(
+                AgentTierCard(
                     title: "Managers",
-                    range: "3–5",
-                    action: "auto-recruit",
-                    detail: "discuss · produce 2–3 outlines · assign work",
-                    icon: "person.2"
+                    range: "1–5",
+                    action: "delegate",
+                    detail: "split the objective · assign Workers · review",
+                    icon: "person.2",
+                    agents: model.agents.filter { $0.role == "manager" }
                 )
 
                 OrgConnector()
 
-                TierPlaceholder(
+                AgentTierCard(
                     title: "Workers",
-                    range: "2–10",
-                    action: "auto-hire",
-                    detail: "decompose tasks · run a worktree · report to Manager",
-                    icon: "person.3"
+                    range: "1–10",
+                    action: "execute",
+                    detail: "implement · test · report to Manager",
+                    icon: "person.3",
+                    agents: model.agents.filter { $0.role == "worker" }
                 )
 
                 OrgConnector()
 
-                TierPlaceholder(
+                AgentTierCard(
                     title: "Labour",
-                    range: "3–40",
-                    action: "auto-hire",
-                    detail: "write code · run subtasks · report to Worker",
-                    icon: "hammer"
+                    range: "1–20",
+                    action: "assist",
+                    detail: "research · small edits · report to Worker",
+                    icon: "hammer",
+                    agents: model.agents.filter { $0.role == "labour" }
                 )
 
                 Divider()
@@ -320,6 +323,73 @@ struct OrgNodeCard: View {
         case "MANAGER": "person.2"
         case "WORKER": "person.3"
         default: "hammer"
+        }
+    }
+}
+
+struct AgentTierCard: View {
+    let title: String
+    let range: String
+    let action: String
+    let detail: String
+    let icon: String
+    let agents: [AgentRecord]
+
+    var body: some View {
+        if agents.isEmpty {
+            TierPlaceholder(
+                title: title,
+                range: range,
+                action: action,
+                detail: detail,
+                icon: icon
+            )
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: icon)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(title.uppercased())
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(agents.count)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                ForEach(agents) { agent in
+                    HStack(alignment: .top, spacing: 7) {
+                        Circle()
+                            .fill(color(for: agent.status))
+                            .frame(width: 6, height: 6)
+                            .padding(.top, 3)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(agent.name)
+                                .font(.system(size: 10.5, weight: .medium))
+                            Text(agent.status)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+            .padding(10)
+            .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(.white.opacity(0.07), lineWidth: 1)
+            }
+        }
+    }
+
+    private func color(for status: String) -> Color {
+        switch status {
+        case "running": .orange
+        case "idle": .green
+        case "failed", "cancelled": .red
+        default: .secondary
         }
     }
 }
@@ -796,6 +866,7 @@ struct StudioEmptyView: View {
 
 struct OrgPresetSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(AppModel.self) private var model
     @AppStorage("verlinpark.org.managers") private var managers = 4
     @AppStorage("verlinpark.org.workers") private var workers = 6
     @AppStorage("verlinpark.org.labour") private var labour = 12
@@ -808,7 +879,7 @@ struct OrgPresetSheet: View {
                 Text("Org Preset")
                     .font(.title2.weight(.semibold))
                 Text(
-                    "Four-tier project team. Auto-expansion is budget-gated; the Leader cannot exceed these caps."
+                    "Runtime caps for delegated agents. The Leader can spawn Managers; Managers spawn Workers; Workers spawn Labour. Caps apply per run."
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -830,7 +901,8 @@ struct OrgPresetSheet: View {
             }
             .font(.system(size: 11))
 
-            Toggle("Auto-scale within budget", isOn: $autoScale)
+            Toggle("Auto-scale within budget (planned)", isOn: $autoScale)
+                .disabled(true)
             HStack {
                 Text("Freeze expansion at")
                 Slider(value: Binding(
@@ -842,18 +914,22 @@ struct OrgPresetSheet: View {
                     .frame(width: 38, alignment: .trailing)
             }
             .font(.system(size: 11))
+            .disabled(true)
 
             Text(
-                "The runtime and model bindings land in M2. This preset is stored locally for the org graph and future scheduler."
+                "Delegation is synchronous and runs in the session worktree. Parallel workers, per-task worktrees, and auto-expansion are not implemented yet."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.tertiary)
 
             HStack {
                 Spacer()
-                Button("Done") { dismiss() }
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent)
+                Button("Apply & Done") {
+                    Task { await model.applyOrgSettings() }
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
             }
         }
         .padding(24)

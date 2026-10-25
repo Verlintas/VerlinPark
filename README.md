@@ -4,7 +4,7 @@
 
 VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets them collaborate through typed messages and shared artifacts, and makes every plan, tool call, diff, token, and permission decision inspectable and replayable.
 
-> **Status: M1 Leader runtime (in progress).** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A single Leader can stream responses, work on its own Git worktree, inspect a repository, call tools, ask for approval before writes or shell commands, maintain a persisted plan, show a live worktree diff, commit or discard the reviewed result, and hard-stop on a per-session token budget. The four-tier scheduler, per-task worktrees, budgets, and the full permission broker are still ahead.
+> **Status: M2 four-tier delegation (in progress).** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A single Leader can stream responses, work on its own Git worktree, inspect a repository, call tools, ask for approval before writes or shell commands, maintain a persisted plan, show a live worktree diff, commit or discard the reviewed result, and hard-stop on a per-session token budget. The four-tier scheduler, per-task worktrees, budgets, and the full permission broker are still ahead.
 
 ---
 
@@ -194,7 +194,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M1 Leader runtime**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；单 Leader 在独立 Git worktree 中工作，可以流式对话、读取仓库、调用工具、在写入/Shell 前请求审批，在 Preview 中查看 worktree diff，维护可见的 todo 计划，提交或丢弃审阅后的结果，并在 session token 预算耗尽时硬停。四层组织、多 Agent 调度、worktree 隔离和预算硬停仍在后续里程碑。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+当前处于 **M2 四层委派**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；Leader 可以委派给 Manager → Worker → Labour，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果，并在 session token 预算耗尽时硬停。当前四层委派是串行、共享 session worktree；并行调度、per-task worktree、Verifier gate 和 merge queue 仍在后续里程碑。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 ## 许可
 

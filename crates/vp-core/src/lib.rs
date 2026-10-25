@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    Approval, Event, Project, Session, SessionCommit, SessionDiff, StoredMessage, TodoItem,
+    AgentRecord, Approval, Event, Project, Session, SessionCommit, SessionDiff, StoredMessage,
+    TodoItem,
 };
 use vp_store::Store;
 
@@ -227,8 +228,9 @@ impl Engine {
 
     pub async fn recover_interrupted_sessions(&self) -> Result<usize> {
         let store = self.store.clone();
-        let (sessions, approvals) = tokio::task::spawn_blocking(move || {
+        let (sessions, approvals, _agents) = tokio::task::spawn_blocking(move || {
             let sessions = store.interrupt_running_sessions()?;
+            let agents = store.interrupt_running_agents()?;
             let pending = store
                 .list_approvals(None)?
                 .into_iter()
@@ -240,7 +242,7 @@ impl Engine {
                     denied.push(approval);
                 }
             }
-            Ok::<_, anyhow::Error>((sessions, denied))
+            Ok::<_, anyhow::Error>((sessions, denied, agents))
         })
         .await??;
 
@@ -436,6 +438,38 @@ impl Engine {
         Ok(())
     }
 
+    pub async fn create_agent(
+        &self,
+        session_id: &str,
+        role: &str,
+        name: &str,
+        parent_id: Option<String>,
+        model: &str,
+    ) -> Result<AgentRecord> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let role = role.to_string();
+        let name = name.to_string();
+        let model = model.to_string();
+        tokio::task::spawn_blocking(move || {
+            store.create_agent(&session_id, &role, &name, parent_id.as_deref(), &model)
+        })
+        .await?
+    }
+
+    pub async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<()> {
+        let store = self.store.clone();
+        let id = agent_id.to_string();
+        let status = status.to_string();
+        tokio::task::spawn_blocking(move || store.update_agent_status(&id, &status)).await?
+    }
+
+    pub async fn list_agents(&self, session_id: &str) -> Result<Vec<AgentRecord>> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_agents(&id)).await?
+    }
+
     pub async fn create_leader_agent(&self, session_id: &str, model: &str) -> Result<String> {
         let store = self.store.clone();
         let session_id = session_id.to_string();
@@ -484,6 +518,7 @@ impl Engine {
         tool_call_id: &str,
         tool: &str,
         input: serde_json::Value,
+        agent: Option<serde_json::Value>,
     ) -> Result<(Approval, oneshot::Receiver<bool>)> {
         let store = self.store.clone();
         let session_id_owned = session_id.to_string();
@@ -498,12 +533,16 @@ impl Engine {
             .lock()
             .map_err(|_| anyhow::anyhow!("approval mutex poisoned"))?
             .insert(approval.id.clone(), sender);
-        self.append_event(
-            session_id,
-            "approval.requested",
-            serde_json::to_value(&approval)?,
-        )
-        .await?;
+        let mut payload = serde_json::to_value(&approval)?;
+        if let (Some(payload), Some(agent)) = (payload.as_object_mut(), agent)
+            && let Some(agent) = agent.as_object()
+        {
+            for (key, value) in agent {
+                payload.insert(key.clone(), value.clone());
+            }
+        }
+        self.append_event(session_id, "approval.requested", payload)
+            .await?;
         Ok((approval, receiver))
     }
 
@@ -636,6 +675,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attributes_approvals_to_agents() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("demo".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "approve".into(), None)
+            .await
+            .unwrap();
+        let (_approval, _receiver) = engine
+            .request_approval(
+                &session.id,
+                "call-1",
+                "write_file",
+                serde_json::json!({"path": "README.md"}),
+                Some(serde_json::json!({
+                    "agent_id": "worker-1",
+                    "agent_name": "Worker 1",
+                    "agent_role": "worker"
+                })),
+            )
+            .await
+            .unwrap();
+        let events = engine.list_events(session.id, 0, 10).await.unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == "approval.requested")
+            .unwrap();
+        assert_eq!(event.payload["agent_name"], "Worker 1");
+        assert_eq!(event.payload["agent_role"], "worker");
+    }
+
+    #[tokio::test]
     async fn commits_worktree_changes_once() {
         let data = TempDir::new().unwrap();
         let repo = TempDir::new().unwrap();
@@ -697,11 +776,21 @@ mod tests {
             .await
             .unwrap();
         engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        engine
             .update_session_status(&session.id, "running")
             .await
             .unwrap();
         let (approval, _receiver) = engine
-            .request_approval(&session.id, "call-1", "write_file", serde_json::json!({}))
+            .request_approval(
+                &session.id,
+                "call-1",
+                "write_file",
+                serde_json::json!({}),
+                None,
+            )
             .await
             .unwrap();
         let recovered = engine.recover_interrupted_sessions().await.unwrap();

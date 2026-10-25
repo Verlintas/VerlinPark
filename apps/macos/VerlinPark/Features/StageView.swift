@@ -210,7 +210,7 @@ struct SessionChatView: View {
 
     private var entries: [ChatEntry] {
         var result: [ChatEntry] = []
-        var runningTools: [String: (name: String, input: JSONValue)] = [:]
+        var runningTools: [String: (name: String, input: JSONValue, agent: String?)] = [:]
         var resolvedApprovals: Set<String> = []
 
         for event in model.events {
@@ -224,13 +224,13 @@ struct SessionChatView: View {
                 guard let text = event.payload.objectValue?["text"]?.stringValue,
                       !text.isEmpty
                 else { continue }
-                result.append(.assistant(id: event.id, text: text))
+                result.append(.assistant(id: event.id, text: text, agent: agentLabel(event)))
             case "tool.started":
                 guard let id = event.payload.objectValue?["tool_call_id"]?.stringValue,
                       let name = event.payload.objectValue?["name"]?.stringValue
                 else { continue }
                 let input = event.payload.objectValue?["input"] ?? .null
-                runningTools[id] = (name, input)
+                runningTools[id] = (name, input, agentLabel(event))
             case "tool.finished":
                 guard let id = event.payload.objectValue?["tool_call_id"]?.stringValue,
                       let name = event.payload.objectValue?["name"]?.stringValue
@@ -244,7 +244,8 @@ struct SessionChatView: View {
                         name: name,
                         input: meta?.input ?? .null,
                         output: output,
-                        isError: isError
+                        isError: isError,
+                        agent: meta?.agent ?? agentLabel(event)
                     )
                 )
             case "approval.requested":
@@ -370,6 +371,16 @@ struct SessionChatView: View {
         }
     }
 
+    private func agentLabel(_ event: Event) -> String? {
+        guard let role = event.payload.objectValue?["agent_role"]?.stringValue,
+              role != "leader"
+        else {
+            return nil
+        }
+        let name = event.payload.objectValue?["agent_name"]?.stringValue
+        return name.map { "\(role.capitalized) · \($0)" } ?? role.capitalized
+    }
+
     private var tokenUsageLabel: String {
         let used = tokenLabel(session.tokensUsed)
         guard let budget = session.tokenBudget, budget > 0 else {
@@ -427,10 +438,16 @@ struct SessionChatView: View {
                         in: RoundedRectangle(cornerRadius: 13, style: .continuous)
                     )
             }
-        case let .assistant(_, text):
-            assistantBubble(text)
-        case let .tool(_, name, input, output, isError):
-            ToolCallCard(name: name, input: input, output: output, isError: isError)
+        case let .assistant(_, text, agent):
+            assistantBubble(text, agent: agent)
+        case let .tool(_, name, input, output, isError, agent):
+            ToolCallCard(
+                name: name,
+                input: input,
+                output: output,
+                isError: isError,
+                agent: agent
+            )
         case let .approval(approval):
             ApprovalCard(approval: approval, resolved: false)
         case let .approvalResolved(approval):
@@ -458,7 +475,7 @@ struct SessionChatView: View {
         }
     }
 
-    private func assistantBubble(_ text: String) -> some View {
+    private func assistantBubble(_ text: String, agent: String? = nil) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Circle()
                 .fill(.green.opacity(0.2))
@@ -468,16 +485,27 @@ struct SessionChatView: View {
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(.green)
                 }
-            Text(text)
-                .font(.system(size: 13))
-                .textSelection(.enabled)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 13, style: .continuous)
-                        .strokeBorder(.white.opacity(0.07), lineWidth: 1)
+            VStack(alignment: .leading, spacing: 3) {
+                if let agent {
+                    Text(agent)
+                        .font(.system(size: 8, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .padding(.leading, 2)
                 }
+                Text(text)
+                    .font(.system(size: 13))
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .background(
+                        .ultraThinMaterial,
+                        in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 13, style: .continuous)
+                            .strokeBorder(.white.opacity(0.07), lineWidth: 1)
+                    }
+            }
             Spacer(minLength: 30)
         }
     }
@@ -485,8 +513,15 @@ struct SessionChatView: View {
 
 private enum ChatEntry: Identifiable {
     case user(id: String, text: String)
-    case assistant(id: String, text: String)
-    case tool(id: String, name: String, input: JSONValue, output: String, isError: Bool)
+    case assistant(id: String, text: String, agent: String?)
+    case tool(
+        id: String,
+        name: String,
+        input: JSONValue,
+        output: String,
+        isError: Bool,
+        agent: String?
+    )
     case approval(Approval)
     case approvalResolved(Approval)
     case notice(id: String, text: String)
@@ -494,7 +529,7 @@ private enum ChatEntry: Identifiable {
 
     var id: String {
         switch self {
-        case let .user(id, _), let .assistant(id, _), let .tool(id, _, _, _, _),
+        case let .user(id, _), let .assistant(id, _, _), let .tool(id, _, _, _, _, _),
              let .notice(id, _), let .error(id, _):
             id
         case let .approval(approval), let .approvalResolved(approval):
@@ -508,6 +543,7 @@ struct ToolCallCard: View {
     let input: JSONValue
     let output: String
     let isError: Bool
+    let agent: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -517,6 +553,12 @@ struct ToolCallCard: View {
                     .foregroundStyle(isError ? .red : .secondary)
                 Text(name)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
+                if let agent {
+                    Text(agent)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
                 Spacer()
                 Text(isError ? "failed" : "done")
                     .font(.system(size: 8, design: .monospaced))
@@ -544,6 +586,11 @@ struct ToolCallCard: View {
 }
 
 struct ApprovalCard: View {
+    private func agentLabel(role: String?, name: String) -> String {
+        guard let role, role != "leader" else { return name }
+        return "\(role.capitalized) · \(name)"
+    }
+
     @Environment(AppModel.self) private var model
     let approval: Approval
     let resolved: Bool
@@ -557,6 +604,11 @@ struct ApprovalCard: View {
                 Text("Permission required")
                     .font(.system(size: 11, weight: .semibold))
                 Spacer()
+                if let agentName = approval.agentName {
+                    Text(agentLabel(role: approval.agentRole, name: agentName))
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
                 Text(approval.tool)
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.secondary)

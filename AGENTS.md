@@ -11,7 +11,7 @@ This file is for coding agents working in this repository. Read it before changi
 
 ## Current milestone
 
-**M1 Leader runtime.** The daemon, SQLite/event log, CLI, provider SSE adapters (including streamed tool calls), provider settings via Keychain, and a single-Leader agent loop in a per-session Git worktree with read tools, write/shell approvals, a live worktree diff, explicit worktree commit, per-session token budgets, cooperative cancellation, and a persisted Leader todo plan exist. The four-tier agent org, capacity controller, computer lease, per-task worktrees, merge queue, USD/time budgets, and multi-agent scheduler are **not** implemented yet. Do not pretend they are.
+**M2 four-tier delegation.** The single-Leader runtime, worktree, approvals, diff, commit/discard, token budgets, cancellation, and persisted plan exist. The Leader can now recursively delegate through Manager → Worker → Labour using `delegate`; every role runs in the session worktree, synchronously, and agent records are visible in Collab. The parallel scheduler, per-task worktrees, merge queue, verifier/integrator gates, capacity controller, computer lease, per-role models, USD/time budgets, and auto-expansion are **not** implemented yet. Do not pretend they are.
 
 ## Invariants
 

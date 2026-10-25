@@ -22,12 +22,12 @@ use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
-    AddProjectParams, ApprovalListResult, AuthParams, AuthResult, CancelSessionParams,
-    CancelSessionResult, CommitSessionParams, ConfigureAgentParams, CreateSessionParams,
-    DiscardSessionParams, EventListResult, ListApprovalsParams, ListEventsParams,
-    ListSessionsParams, PingResult, ProjectListResult, PromptParams, PromptResult,
-    ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams, SessionListResult,
-    SessionTodosParams, SessionTodosResult, SubscribeParams,
+    AddProjectParams, AgentListParams, AgentListResult, ApprovalListResult, AuthParams, AuthResult,
+    CancelSessionParams, CancelSessionResult, CommitSessionParams, ConfigureAgentParams,
+    CreateSessionParams, DiscardSessionParams, EventListResult, ListApprovalsParams,
+    ListEventsParams, ListSessionsParams, PingResult, ProjectListResult, PromptParams,
+    PromptResult, ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams,
+    SessionListResult, SessionTodosParams, SessionTodosResult, SubscribeParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -443,6 +443,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.diff" => match parse_params::<SessionDiffParams>(request.params) {
             Ok(params) => match state.engine.session_diff(&params.session_id).await {
                 Ok(diff) => RpcResponse::success(id, diff),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.list" => match parse_params::<AgentListParams>(request.params) {
+            Ok(params) => match state.engine.list_agents(&params.session_id).await {
+                Ok(agents) => RpcResponse::success(id, AgentListResult { agents }),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

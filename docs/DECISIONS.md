@@ -28,6 +28,7 @@
 | [0016](adr/0016-session-worktree.md) | 每个 session 一个 Git worktree | Accepted | 隔离/Git/工具路径 |
 | [0017](adr/0017-session-commit.md) | 从 Review 显式提交 worktree | Accepted | 审阅/Git/UX |
 | [0018](adr/0018-budget-cancel.md) | Session token 预算 + 协作式取消 | Accepted | 成本/控制/可靠性 |
+| [0019](adr/0019-four-tier-delegation.md) | 四层递归委派（串行、同 worktree） | Accepted | 组织/Agent runtime/隔离 |
 
 ---
 

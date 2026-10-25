@@ -1,11 +1,22 @@
 # VerlinPark 进度
 
-> 最后更新：2026-10-24  
-> 当前里程碑：M1（单 Leader Agent runtime）进行中；M0.5 已完成
+> 最后更新：2026-10-25  
+> 当前里程碑：M2 四层 Agent runtime 第一切片进行中；M0 / M0.5 / M1 已完成
 
 ---
 
-## M1 进行中（单 Leader Agent runtime）
+## M2 进行中（四层委派）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| 四层委派 | ✅ | Leader → Manager → Worker → Labour 严格链路；`delegate` 工具；嵌套同步执行；越级/越权被拒绝 |
+| 角色工具策略 | ✅ | Manager 只读（read/list/grep）；Worker/Labour 可读写/Shell；Leader 全部工具 |
+| Agent roster | ✅ | `agents` 表持久化 role/name/parent/status/model；`agent.list` RPC；Collab 显示真实 Managers/Workers/Labour |
+| 委派上限 | ✅ | 按 run 限制 1–5 Managers / 1–10 Workers / 1–40 Labour；由 Org Preset 传给 `agent.configure` |
+| 审批归属 | ✅ | 审批事件带 `agent_id/agent_name/agent_role`；审批卡显示发起 Agent |
+| 边界 | ✅ | 串行、同一 session worktree；per-task worktree/并行/merge queue 尚未实现 |
+
+## M1 完成情况（单 Leader Agent runtime）
 
 | 项 | 状态 | 说明 |
 |---|---|---|
@@ -28,16 +39,16 @@
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 30 个：worktree 创建/非 Git 拒绝、旧库迁移、中断恢复、显式 commit/discard、精确 edit_file、预算硬停、慢流取消、usage 累计、todo 持久化、工具路径 jail、审批持久化/单次解决、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个：品牌/旗帜/JSON |
+| 测试 | ✅ | Rust 33 个：worktree、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
-**M1 尚未完成：**
+**M2 尚未完成：**
 
-- 多 Agent 的 per-task worktree / integration 分支 / merge queue；当前只有 session 级 Leader worktree 和手动 commit。
-- 完整权限代理（角色/命令分类/路径策略/预算）；当前只有路径 jail + 写/Shell 审批 + 简单拒绝列表。
+- 多 Agent 的 per-task worktree / integration 分支 / merge queue；当前四层委派共享 session worktree，串行执行。
+- 完整权限代理（命令分类/路径策略）；当前 Manager 只读、Worker/Labour 可写，写/Shell 仍需审批。
 - 上下文压缩、pause/resume、checkpoint（取消与 token 硬停已落地）。
 - 只读工具并行、MCP/ACP、逐 hunk review、终端、真实 Collab 节点。
-- 四层组织 runtime、Capacity Controller、真实 Computer Lease。
+- Capacity Controller、并行 Worker、真实 Computer Lease；当前四层委派是串行同步执行。
 - Anthropic 工具调用只做了 mock 测试，尚无真实账号 live 验证。
 
 ## M0.5 完成情况

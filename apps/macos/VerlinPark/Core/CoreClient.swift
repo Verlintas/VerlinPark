@@ -162,6 +162,13 @@ actor CoreClient {
             .decode(SessionCommit.self)
     }
 
+    func listAgents(sessionID: String) async throws -> [AgentRecord] {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "agent.list", params: params)
+            .decode(AgentListResult.self)
+            .agents
+    }
+
     func sessionTodos(sessionID: String) async throws -> [TodoItem] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.todos", params: params)
@@ -216,12 +223,18 @@ actor CoreClient {
         kind: String,
         baseURL: String,
         model: String,
-        apiKey: String
+        apiKey: String,
+        maxManagers: Int,
+        maxWorkers: Int,
+        maxLabour: Int
     ) async throws -> AgentInfo {
         var params: [String: JSONValue] = [
             "provider": .string(kind),
             "base_url": .string(baseURL),
             "model": .string(model),
+            "max_managers": .number(Double(maxManagers)),
+            "max_workers": .number(Double(maxWorkers)),
+            "max_labour": .number(Double(maxLabour)),
         ]
         if !apiKey.isEmpty {
             params["api_key"] = .string(apiKey)

@@ -60,6 +60,8 @@ enum Command {
     Cancel { session: String },
     /// Show the session plan/todo list.
     Todos { session: String },
+    /// List the agents spawned for a session.
+    Agents { session: String },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
     /// Commit the session worktree.
@@ -157,6 +159,9 @@ async fn main() -> Result<()> {
         }
         Command::Todos { session } => {
             rpc(&discovery, "session.todos", json!({"session_id": session})).await?
+        }
+        Command::Agents { session } => {
+            rpc(&discovery, "agent.list", json!({"session_id": session})).await?
         }
         Command::Discard { session } => {
             rpc(
@@ -279,6 +284,21 @@ fn print_human(value: &Value) {
                 session["id"].as_str().unwrap_or("?"),
                 session["goal"].as_str().unwrap_or("?"),
                 session["status"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if let Some(agents) = value.get("agents").and_then(Value::as_array) {
+        if agents.is_empty() {
+            println!("No agents.");
+        }
+        for agent in agents {
+            println!(
+                "{:<8} {:<16} {:<10} {}",
+                agent["role"].as_str().unwrap_or("?"),
+                agent["name"].as_str().unwrap_or("?"),
+                agent["status"].as_str().unwrap_or("?"),
+                agent["id"].as_str().unwrap_or("?")
             );
         }
         return;

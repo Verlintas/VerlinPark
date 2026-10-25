@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
-use vp_protocol::types::{Approval, Event, Project, Session, StoredMessage, TodoItem};
+use vp_protocol::types::{AgentRecord, Approval, Event, Project, Session, StoredMessage, TodoItem};
 
 use crate::paths;
 
@@ -75,6 +75,8 @@ impl Store {
                 id         TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 role       TEXT NOT NULL,
+                name       TEXT NOT NULL DEFAULT 'Agent',
+                parent_id  TEXT,
                 status     TEXT NOT NULL,
                 model      TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -469,14 +471,75 @@ impl Store {
     }
 
     pub fn create_leader_agent(&self, session_id: &str, model: &str) -> Result<String> {
-        let id = Uuid::now_v7().to_string();
+        Ok(self
+            .create_agent(session_id, "leader", "Leader", None, model)?
+            .id)
+    }
+
+    pub fn create_agent(
+        &self,
+        session_id: &str,
+        role: &str,
+        name: &str,
+        parent_id: Option<&str>,
+        model: &str,
+    ) -> Result<AgentRecord> {
+        let agent = AgentRecord {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            name: name.to_string(),
+            parent_id: parent_id.map(ToOwned::to_owned),
+            status: "running".to_string(),
+            model: model.to_string(),
+            created_at: now_rfc3339(),
+        };
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO agents (id, session_id, role, status, model, created_at)
-             VALUES (?1, ?2, 'leader', 'idle', ?3, ?4)",
-            params![id, session_id, model, now_rfc3339()],
+            "INSERT INTO agents (id, session_id, role, name, parent_id, status, model, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                agent.id,
+                agent.session_id,
+                agent.role,
+                agent.name,
+                agent.parent_id,
+                agent.status,
+                agent.model,
+                agent.created_at
+            ],
         )?;
-        Ok(id)
+        Ok(agent)
+    }
+
+    pub fn update_agent_status(&self, id: &str, status: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE agents SET status = ?1 WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_agents(&self, session_id: &str) -> Result<Vec<AgentRecord>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, role, name, parent_id, status, model, created_at
+             FROM agents WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(AgentRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                role: row.get(2)?,
+                name: row.get(3)?,
+                parent_id: row.get(4)?,
+                status: row.get(5)?,
+                model: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
@@ -611,6 +674,15 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn interrupt_running_agents(&self) -> Result<usize> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE agents SET status = 'failed' WHERE status = 'running'",
+            [],
+        )?;
+        Ok(changed)
     }
 
     pub fn set_todos(&self, session_id: &str, items: &[TodoItem]) -> Result<()> {
@@ -818,6 +890,27 @@ mod tests {
             .join("events.jsonl");
         let mirror = std::fs::read_to_string(path).unwrap();
         assert_eq!(mirror.lines().count(), 2);
+    }
+
+    #[test]
+    fn creates_lists_and_updates_agents() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "team").unwrap();
+        let leader = store.create_leader_agent(&session.id, "model").unwrap();
+        let worker = store
+            .create_agent(&session.id, "worker", "Worker 1", Some(&leader), "model")
+            .unwrap();
+        assert_eq!(worker.status, "running");
+        store.update_agent_status(&worker.id, "idle").unwrap();
+        let agents = store.list_agents(&session.id).unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].role, "leader");
+        assert_eq!(agents[1].name, "Worker 1");
+        assert_eq!(agents[1].status, "idle");
+        assert_eq!(agents[1].parent_id.as_deref(), Some(leader.as_str()));
     }
 
     #[test]

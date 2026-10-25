@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+use async_recursion::async_recursion;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
@@ -27,6 +30,9 @@ pub struct AgentConfig {
     pub base_url: Option<String>,
     pub max_turns: u32,
     pub max_tokens: Option<u32>,
+    pub max_managers: usize,
+    pub max_workers: usize,
+    pub max_labour: usize,
     pub tools: ToolRegistry,
 }
 
@@ -58,6 +64,167 @@ impl RunControl {
     fn subscribe(&self) -> watch::Receiver<bool> {
         self.cancelled.subscribe()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum AgentRole {
+    Leader,
+    Manager,
+    Worker,
+    Labour,
+}
+
+impl AgentRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Leader => "leader",
+            Self::Manager => "manager",
+            Self::Worker => "worker",
+            Self::Labour => "labour",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "leader" => Some(Self::Leader),
+            "manager" => Some(Self::Manager),
+            "worker" => Some(Self::Worker),
+            "labour" => Some(Self::Labour),
+            _ => None,
+        }
+    }
+
+    fn default_name(self) -> &'static str {
+        match self {
+            Self::Leader => "Leader",
+            Self::Manager => "Manager",
+            Self::Worker => "Worker",
+            Self::Labour => "Labour",
+        }
+    }
+
+    fn child_role(self) -> Option<Self> {
+        match self {
+            Self::Leader => Some(Self::Manager),
+            Self::Manager => Some(Self::Worker),
+            Self::Worker => Some(Self::Labour),
+            Self::Labour => None,
+        }
+    }
+
+    fn allows_tool(self, name: &str) -> bool {
+        match self {
+            Self::Manager => matches!(name, "read_file" | "list_dir" | "grep"),
+            Self::Leader | Self::Worker | Self::Labour => {
+                matches!(
+                    name,
+                    "read_file" | "list_dir" | "grep" | "edit_file" | "write_file" | "shell"
+                )
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AgentSpec {
+    id: String,
+    role: AgentRole,
+    name: String,
+    depth: u8,
+    parent_name: Option<String>,
+}
+
+struct SessionBudget {
+    limit: Option<u64>,
+    caps: AgentCaps,
+    state: Mutex<BudgetState>,
+}
+
+#[derive(Clone, Copy)]
+struct AgentCaps {
+    managers: usize,
+    workers: usize,
+    labour: usize,
+}
+
+struct BudgetState {
+    spent: u64,
+    managers: usize,
+    workers: usize,
+    labour: usize,
+}
+
+impl SessionBudget {
+    fn new(limit: Option<u64>, spent: u64, caps: AgentCaps) -> Self {
+        Self {
+            limit,
+            caps,
+            state: Mutex::new(BudgetState {
+                spent,
+                managers: 0,
+                workers: 0,
+                labour: 0,
+            }),
+        }
+    }
+
+    fn spent(&self) -> u64 {
+        self.state.lock().map(|state| state.spent).unwrap_or(0)
+    }
+
+    fn exhausted(&self) -> bool {
+        self.limit.is_some_and(|limit| self.spent() >= limit)
+    }
+
+    fn add_usage(&self, input: u64, output: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return true;
+        };
+        state.spent = state.spent.saturating_add(input).saturating_add(output);
+        self.limit.is_some_and(|limit| state.spent >= limit)
+    }
+
+    fn reserve(&self, role: AgentRole) -> Option<usize> {
+        let mut state = self.state.lock().ok()?;
+        let (counter, cap) = match role {
+            AgentRole::Manager => (&mut state.managers, self.caps.managers),
+            AgentRole::Worker => (&mut state.workers, self.caps.workers),
+            AgentRole::Labour => (&mut state.labour, self.caps.labour),
+            AgentRole::Leader => return None,
+        };
+        if *counter >= cap {
+            return None;
+        }
+        *counter += 1;
+        Some(*counter)
+    }
+}
+
+enum LoopOutcome {
+    Final(String),
+    Cancelled,
+    BudgetExceeded,
+}
+
+fn agent_fields(payload: &mut serde_json::Value, spec: &AgentSpec) {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("agent_id".into(), serde_json::json!(spec.id));
+        object.insert("agent_role".into(), serde_json::json!(spec.role.as_str()));
+        object.insert("agent_name".into(), serde_json::json!(spec.name));
+        object.insert("agent_depth".into(), serde_json::json!(spec.depth));
+    }
+}
+
+async fn emit(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+    kind: &str,
+    mut payload: serde_json::Value,
+) -> Result<()> {
+    agent_fields(&mut payload, spec);
+    engine.append_event(session_id, kind, payload).await?;
+    Ok(())
 }
 
 impl AgentService {
@@ -98,6 +265,18 @@ impl AgentService {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .or(Some(4096)),
+                max_managers: env::var("VERLINPARK_MAX_MANAGERS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(5),
+                max_workers: env::var("VERLINPARK_MAX_WORKERS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(10),
+                max_labour: env::var("VERLINPARK_MAX_LABOUR")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(20),
                 tools: ToolRegistry::default_tools(),
             },
         )
@@ -152,6 +331,9 @@ impl AgentService {
             base_url: Some(base_url),
             max_turns: params.max_turns.unwrap_or(20).clamp(1, 200),
             max_tokens: params.max_tokens.or(Some(4096)),
+            max_managers: params.max_managers.unwrap_or(5).clamp(1, 5) as usize,
+            max_workers: params.max_workers.unwrap_or(10).clamp(1, 10) as usize,
+            max_labour: params.max_labour.unwrap_or(20).clamp(1, 40) as usize,
             tools: ToolRegistry::default_tools(),
         };
         *self
@@ -295,75 +477,160 @@ async fn run_agent(
     let store = engine.store().clone();
     let (_, project) = load_session_project(store.clone(), session_id).await?;
     let session = engine.ensure_session_worktree(session_id).await?;
-    let worktree = session
-        .worktree
-        .clone()
-        .ok_or_else(|| anyhow!("session has no worktree"))?;
-    let context = ToolContext {
-        root: std::path::PathBuf::from(&worktree),
+    let worktree = PathBuf::from(
+        session
+            .worktree
+            .clone()
+            .ok_or_else(|| anyhow!("session has no worktree"))?,
+    );
+    let leader = engine
+        .list_agents(session_id)
+        .await?
+        .into_iter()
+        .find(|agent| agent.role == "leader");
+    let leader_id = leader.as_ref().map(|agent| agent.id.clone());
+    let spec = AgentSpec {
+        id: leader_id.clone().unwrap_or_else(|| "leader".to_string()),
+        role: AgentRole::Leader,
+        name: leader
+            .map(|agent| agent.name)
+            .unwrap_or_else(|| "Leader".to_string()),
+        depth: 0,
+        parent_name: None,
     };
-    let mut spent = session.tokens_in + session.tokens_out;
-    if let Some(budget) = session.token_budget
-        && spent >= budget
-    {
-        engine
-            .append_event(
-                session_id,
-                "agent.budget_exceeded",
-                serde_json::json!({"limit": budget, "spent": spent}),
-            )
-            .await?;
-        engine.update_session_status(session_id, "failed").await?;
-        return Ok(());
-    }
-
-    engine
-        .append_event(
+    let budget = SessionBudget::new(
+        session.token_budget,
+        session.tokens_in + session.tokens_out,
+        AgentCaps {
+            managers: config.max_managers,
+            workers: config.max_workers,
+            labour: config.max_labour,
+        },
+    );
+    if budget.exhausted() {
+        emit(
+            &engine,
             session_id,
-            "agent.started",
+            &spec,
+            "agent.budget_exceeded",
             serde_json::json!({
-                "goal": session.goal,
-                "prompt": prompt,
-                "model": config.model,
-                "provider": config.provider_name,
-                "worktree": session.worktree,
-                "branch": session.branch,
+                "limit": session.token_budget,
+                "spent": budget.spent(),
             }),
         )
         .await?;
+        engine.update_session_status(session_id, "failed").await?;
+        return Ok(());
+    }
+    if let Some(agent_id) = &leader_id {
+        engine.update_agent_status(agent_id, "running").await?;
+    }
+
+    emit(
+        &engine,
+        session_id,
+        &spec,
+        "agent.started",
+        serde_json::json!({
+            "goal": session.goal,
+            "prompt": prompt,
+            "model": config.model,
+            "provider": config.provider_name,
+            "worktree": session.worktree,
+            "branch": session.branch,
+        }),
+    )
+    .await?;
 
     let mut conversation = load_conversation(&engine, session_id).await?;
-    let system = system_prompt(&project, &session, &worktree);
-    let mut tools = config.tools.schemas();
-    tools.push(ToolSchema {
-        name: "todo_write".to_string(),
-        description: "Replace the session plan/todo list. Use as work progresses.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "maxItems": 50,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string"},
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"]
-                            }
-                        },
-                        "required": ["title", "status"]
-                    }
-                }
-            },
-            "required": ["items"]
-        }),
-    });
+    let result = run_loop(
+        &engine,
+        &config,
+        &session,
+        &project,
+        &worktree,
+        &control,
+        &budget,
+        &spec,
+        prompt,
+        &mut conversation,
+        true,
+    )
+    .await;
+    if result.is_err()
+        && let Some(agent_id) = &leader_id
+    {
+        let _ = engine.update_agent_status(agent_id, "failed").await;
+    }
+    match result? {
+        LoopOutcome::Final(_) => {
+            if let Some(agent_id) = &leader_id {
+                engine.update_agent_status(agent_id, "idle").await?;
+            }
+            engine.update_session_status(session_id, "idle").await?;
+        }
+        LoopOutcome::Cancelled => {
+            if let Some(agent_id) = &leader_id {
+                engine.update_agent_status(agent_id, "cancelled").await?;
+            }
+            finish_cancelled(&engine, session_id).await?;
+        }
+        LoopOutcome::BudgetExceeded => {
+            if let Some(agent_id) = &leader_id {
+                engine.update_agent_status(agent_id, "failed").await?;
+            }
+            emit(
+                &engine,
+                session_id,
+                &spec,
+                "agent.budget_exceeded",
+                serde_json::json!({
+                    "limit": session.token_budget,
+                    "spent": budget.spent(),
+                }),
+            )
+            .await?;
+            engine.update_session_status(session_id, "failed").await?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[async_recursion]
+async fn run_loop(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    worktree: &Path,
+    control: &RunControl,
+    budget: &SessionBudget,
+    spec: &AgentSpec,
+    objective: &str,
+    conversation: &mut Vec<ChatMessage>,
+    top_level: bool,
+) -> Result<LoopOutcome> {
+    let worktree_label = worktree.to_string_lossy().to_string();
+    let tool_context = ToolContext {
+        root: worktree.to_path_buf(),
+    };
+    let system = role_system_prompt(
+        spec.role,
+        project,
+        session,
+        &worktree_label,
+        spec,
+        objective,
+    );
+    let tools = tool_schemas(config, spec.role);
 
     for turn in 0..config.max_turns {
         if control.is_cancelled() {
-            return finish_cancelled(&engine, session_id).await;
+            return Ok(LoopOutcome::Cancelled);
+        }
+        if budget.exhausted() {
+            return Ok(LoopOutcome::BudgetExceeded);
         }
         let request = ChatRequest {
             model: config.model.clone(),
@@ -405,13 +672,14 @@ async fn run_agent(
             match item? {
                 StreamEvent::TextDelta(delta) => {
                     text.push_str(&delta);
-                    engine
-                        .append_event(
-                            session_id,
-                            "agent.message_delta",
-                            serde_json::json!({"text": delta}),
-                        )
-                        .await?;
+                    emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "agent.message_delta",
+                        serde_json::json!({"text": delta}),
+                    )
+                    .await?;
                 }
                 StreamEvent::ToolCall(call) => tool_calls.push(call),
                 StreamEvent::Usage {
@@ -424,38 +692,27 @@ async fn run_agent(
             }
         }
         if cancelled {
-            return finish_cancelled(&engine, session_id).await;
+            return Ok(LoopOutcome::Cancelled);
         }
         if usage != (0, 0) {
             engine
-                .record_usage(session_id, usage.0 as u64, usage.1 as u64)
+                .record_usage(&session.id, usage.0 as u64, usage.1 as u64)
                 .await?;
-            spent += usage.0 as u64 + usage.1 as u64;
-        }
-        if let Some(budget) = session.token_budget
-            && spent >= budget
-        {
-            engine
-                .append_event(
-                    session_id,
-                    "agent.budget_exceeded",
-                    serde_json::json!({"limit": budget, "spent": spent}),
-                )
-                .await?;
-            engine.update_session_status(session_id, "failed").await?;
-            return Ok(());
+            if budget.add_usage(usage.0 as u64, usage.1 as u64) {
+                return Ok(LoopOutcome::BudgetExceeded);
+            }
         }
 
         if text.is_empty() && tool_calls.is_empty() {
-            engine.update_session_status(session_id, "idle").await?;
-            engine
-                .append_event(
-                    session_id,
-                    "agent.turn_finished",
-                    serde_json::json!({"turn": turn + 1, "empty": true}),
-                )
-                .await?;
-            return Ok(());
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "agent.turn_finished",
+                serde_json::json!({"turn": turn + 1, "empty": true}),
+            )
+            .await?;
+            return Ok(LoopOutcome::Final(String::new()));
         }
 
         let assistant_tool_calls = if tool_calls.is_empty() {
@@ -463,25 +720,28 @@ async fn run_agent(
         } else {
             Some(tool_calls.clone())
         };
-        engine
-            .append_message(
-                session_id,
-                "assistant",
-                &text,
-                serde_json::to_value(assistant_tool_calls.as_deref().unwrap_or(&[]))?,
-                None,
-            )
-            .await?;
-        engine
-            .append_event(
-                session_id,
-                "agent.message",
-                serde_json::json!({
-                    "text": text,
-                    "tool_calls": tool_calls,
-                }),
-            )
-            .await?;
+        if top_level {
+            engine
+                .append_message(
+                    &session.id,
+                    "assistant",
+                    &text,
+                    serde_json::to_value(assistant_tool_calls.as_deref().unwrap_or(&[]))?,
+                    None,
+                )
+                .await?;
+        }
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "agent.message",
+            serde_json::json!({
+                "text": text,
+                "tool_calls": tool_calls,
+            }),
+        )
+        .await?;
         conversation.push(ChatMessage {
             role: "assistant".to_string(),
             content: text.clone(),
@@ -490,44 +750,60 @@ async fn run_agent(
         });
 
         if tool_calls.is_empty() {
-            engine.update_session_status(session_id, "idle").await?;
-            engine
-                .append_event(
-                    session_id,
-                    "agent.turn_finished",
-                    serde_json::json!({"turn": turn + 1}),
-                )
-                .await?;
-            return Ok(());
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "agent.turn_finished",
+                serde_json::json!({"turn": turn + 1}),
+            )
+            .await?;
+            return Ok(LoopOutcome::Final(text));
         }
 
         for (index, call) in tool_calls.into_iter().enumerate() {
             if control.is_cancelled() {
-                return finish_cancelled(&engine, session_id).await;
+                return Ok(LoopOutcome::Cancelled);
+            }
+            if budget.exhausted() {
+                return Ok(LoopOutcome::BudgetExceeded);
             }
             let call_id = if call.id.is_empty() {
                 format!("call_{}_{}", turn, index)
             } else {
                 call.id.clone()
             };
-            let tool = config.tools.get(&call.name);
             let input: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
-            let is_todo = call.name == "todo_write";
-            let requires_approval = if is_todo {
+            let is_delegate = call.name == "delegate";
+            let is_todo = call.name == "todo_write" && spec.role == AgentRole::Leader;
+            let registry_tool = config
+                .tools
+                .get(&call.name)
+                .filter(|_| spec.role.allows_tool(&call.name));
+            let requires_approval = if is_delegate || is_todo {
                 false
             } else {
-                tool.as_ref()
+                registry_tool
+                    .as_ref()
                     .map(|tool| tool.requires_approval())
-                    .unwrap_or(true)
+                    .unwrap_or(false)
             };
 
             let mut approved = true;
             if requires_approval {
+                let mut context = serde_json::json!({});
+                agent_fields(&mut context, spec);
                 let (approval, receiver) = engine
-                    .request_approval(session_id, &call_id, &call.name, input.clone())
+                    .request_approval(
+                        &session.id,
+                        &call_id,
+                        &call.name,
+                        input.clone(),
+                        Some(context),
+                    )
                     .await?;
-                match wait_for_approval(receiver, &control).await {
+                match wait_for_approval(receiver, control).await {
                     ApprovalOutcome::Approved => {}
                     ApprovalOutcome::Denied => approved = false,
                     ApprovalOutcome::TimedOut => {
@@ -536,96 +812,410 @@ async fn run_agent(
                     }
                     ApprovalOutcome::Cancelled => {
                         let _ = engine.resolve_approval(&approval.id, false).await;
-                        return finish_cancelled(&engine, session_id).await;
+                        return Ok(LoopOutcome::Cancelled);
                     }
                 }
             }
 
             let output = if !approved {
-                ToolOutput {
-                    content: "The user denied this tool call.".to_string(),
-                    is_error: true,
+                ToolOutput::error("The user denied this tool call.")
+            } else if is_delegate {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match parse_delegate(&input, spec.role) {
+                    Ok((role, name, child_objective)) => match budget.reserve(role) {
+                        None => ToolOutput::error(format!(
+                            "the {} cap for this session has been reached",
+                            role.as_str()
+                        )),
+                        Some(ordinal) => {
+                            let child_name = name
+                                .unwrap_or_else(|| format!("{} {}", role.default_name(), ordinal));
+                            let child = engine
+                                .create_agent(
+                                    &session.id,
+                                    role.as_str(),
+                                    &child_name,
+                                    Some(spec.id.clone()),
+                                    &config.model,
+                                )
+                                .await?;
+                            let child_spec = AgentSpec {
+                                id: child.id.clone(),
+                                role,
+                                name: child_name.clone(),
+                                depth: spec.depth.saturating_add(1),
+                                parent_name: Some(spec.name.clone()),
+                            };
+                            emit(
+                                engine,
+                                &session.id,
+                                &child_spec,
+                                "agent.spawned",
+                                serde_json::json!({
+                                    "parent_id": spec.id,
+                                    "parent_name": spec.name,
+                                    "objective": truncate(child_objective.as_str()),
+                                }),
+                            )
+                            .await?;
+                            let mut child_conversation =
+                                vec![ChatMessage::user(child_objective.clone())];
+                            let child_result = run_loop(
+                                engine,
+                                config,
+                                session,
+                                project,
+                                worktree,
+                                control,
+                                budget,
+                                &child_spec,
+                                &child_objective,
+                                &mut child_conversation,
+                                false,
+                            )
+                            .await;
+                            match child_result {
+                                Ok(LoopOutcome::Final(summary)) => {
+                                    let summary = if summary.trim().is_empty() {
+                                        "The agent completed without a summary.".to_string()
+                                    } else {
+                                        summary
+                                    };
+                                    engine.update_agent_status(&child.id, "idle").await?;
+                                    emit(
+                                        engine,
+                                        &session.id,
+                                        &child_spec,
+                                        "agent.finished",
+                                        serde_json::json!({
+                                            "status": "idle",
+                                            "summary": truncate(&summary),
+                                        }),
+                                    )
+                                    .await?;
+                                    ToolOutput::ok(format!(
+                                        "{} {} finished:\n{}",
+                                        role.default_name(),
+                                        child_name,
+                                        truncate(&summary)
+                                    ))
+                                }
+                                Ok(LoopOutcome::Cancelled) => {
+                                    engine.update_agent_status(&child.id, "cancelled").await?;
+                                    emit(
+                                        engine,
+                                        &session.id,
+                                        &child_spec,
+                                        "agent.finished",
+                                        serde_json::json!({"status": "cancelled"}),
+                                    )
+                                    .await?;
+                                    return Ok(LoopOutcome::Cancelled);
+                                }
+                                Ok(LoopOutcome::BudgetExceeded) => {
+                                    engine.update_agent_status(&child.id, "failed").await?;
+                                    emit(
+                                        engine,
+                                        &session.id,
+                                        &child_spec,
+                                        "agent.finished",
+                                        serde_json::json!({
+                                            "status": "failed",
+                                            "summary": "token budget exhausted",
+                                        }),
+                                    )
+                                    .await?;
+                                    return Ok(LoopOutcome::BudgetExceeded);
+                                }
+                                Err(error) => {
+                                    engine.update_agent_status(&child.id, "failed").await?;
+                                    emit(
+                                        engine,
+                                        &session.id,
+                                        &child_spec,
+                                        "agent.finished",
+                                        serde_json::json!({
+                                            "status": "failed",
+                                            "summary": truncate(error.to_string().as_str()),
+                                        }),
+                                    )
+                                    .await?;
+                                    ToolOutput::error(format!(
+                                        "{} {} failed: {error}",
+                                        role.default_name(),
+                                        child_name
+                                    ))
+                                }
+                            }
+                        }
+                    },
+                    Err(error) => ToolOutput::error(error.to_string()),
                 }
             } else if is_todo {
-                engine
-                    .append_event(
-                        session_id,
-                        "tool.started",
-                        serde_json::json!({
-                            "tool_call_id": call_id,
-                            "name": call.name,
-                            "input": input,
-                        }),
-                    )
-                    .await?;
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
                 match parse_todos(&input) {
-                    Ok(items) => match engine.set_todos(session_id, items).await {
+                    Ok(items) => match engine.set_todos(&session.id, items).await {
                         Ok(()) => ToolOutput::ok("Updated the session plan.".to_string()),
                         Err(error) => ToolOutput::error(format!("todo_write failed: {error}")),
                     },
                     Err(error) => ToolOutput::error(format!("todo_write failed: {error}")),
                 }
-            } else if let Some(tool) = tool {
-                engine
-                    .append_event(
-                        session_id,
-                        "tool.started",
-                        serde_json::json!({
-                            "tool_call_id": call_id,
-                            "name": call.name,
-                            "input": input,
-                        }),
-                    )
-                    .await?;
-                let mut cancel_rx = control.subscribe();
-                if control.is_cancelled() {
-                    return finish_cancelled(&engine, session_id).await;
-                }
-                tokio::select! {
-                    _ = cancel_rx.changed() => {
-                        return finish_cancelled(&engine, session_id).await;
-                    }
-                    result = tool.execute(&context, input.clone()) => match result {
-                        Ok(output) => output,
-                        Err(error) => ToolOutput {
-                            content: format!("tool error: {error}"),
-                            is_error: true,
-                        },
-                    },
-                }
-            } else {
-                ToolOutput {
-                    content: format!("Unknown tool: {}", call.name),
-                    is_error: true,
-                }
-            };
-
-            engine
-                .append_event(
-                    session_id,
-                    "tool.finished",
+            } else if let Some(tool) = registry_tool {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
                     serde_json::json!({
                         "tool_call_id": call_id,
                         "name": call.name,
-                        "output": truncate(&output.content),
-                        "is_error": output.is_error,
+                        "input": input,
                     }),
                 )
                 .await?;
-            engine
-                .append_message(
-                    session_id,
-                    "tool",
-                    &output.content,
-                    serde_json::json!([]),
-                    Some(call_id.clone()),
-                )
-                .await?;
+                let mut cancel_rx = control.subscribe();
+                if control.is_cancelled() {
+                    return Ok(LoopOutcome::Cancelled);
+                }
+                tokio::select! {
+                    _ = cancel_rx.changed() => {
+                        return Ok(LoopOutcome::Cancelled);
+                    }
+                    result = tool.execute(&tool_context, input.clone()) => match result {
+                        Ok(output) => output,
+                        Err(error) => ToolOutput::error(format!("tool error: {error}")),
+                    },
+                }
+            } else {
+                ToolOutput::error(format!(
+                    "tool '{}' is not available to {}",
+                    call.name,
+                    spec.role.as_str()
+                ))
+            };
+
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "tool.finished",
+                serde_json::json!({
+                    "tool_call_id": call_id,
+                    "name": call.name,
+                    "output": truncate(&output.content),
+                    "is_error": output.is_error,
+                }),
+            )
+            .await?;
+            if top_level {
+                engine
+                    .append_message(
+                        &session.id,
+                        "tool",
+                        &output.content,
+                        serde_json::json!([]),
+                        Some(call_id.clone()),
+                    )
+                    .await?;
+            }
             conversation.push(ChatMessage::tool(call_id, output.content));
         }
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "agent.turn_finished",
+            serde_json::json!({"turn": turn + 1}),
+        )
+        .await?;
     }
 
     Err(anyhow!("maximum turns reached"))
+}
+
+fn tool_schemas(config: &AgentConfig, role: AgentRole) -> Vec<ToolSchema> {
+    let mut tools = config
+        .tools
+        .schemas()
+        .into_iter()
+        .filter(|tool| role.allows_tool(&tool.name))
+        .collect::<Vec<_>>();
+    if role == AgentRole::Leader {
+        tools.push(ToolSchema {
+            name: "todo_write".to_string(),
+            description: "Replace the session plan/todo list. Use as work progresses.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "maxItems": 50,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"]
+                                }
+                            },
+                            "required": ["title", "status"]
+                        }
+                    }
+                },
+                "required": ["items"]
+            }),
+        });
+    }
+    if role.child_role().is_some() {
+        tools.push(ToolSchema {
+            name: "delegate".to_string(),
+            description: format!(
+                "Delegate a focused objective to a {}. The child agent runs synchronously and returns a summary.",
+                role.child_role()
+                    .map(AgentRole::as_str)
+                    .unwrap_or("worker")
+            ),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "enum": ["manager", "worker", "labour"]
+                    },
+                    "name": {"type": "string"},
+                    "objective": {"type": "string"},
+                    "instructions": {"type": "string"}
+                },
+                "required": ["role", "objective"]
+            }),
+        });
+    }
+    tools
+}
+
+fn parse_delegate(
+    input: &serde_json::Value,
+    parent_role: AgentRole,
+) -> Result<(AgentRole, Option<String>, String)> {
+    let role_name = input
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("role is required"))?;
+    let role = AgentRole::parse(role_name).ok_or_else(|| anyhow!("unknown role: {role_name}"))?;
+    let expected = parent_role
+        .child_role()
+        .ok_or_else(|| anyhow!("{} cannot delegate", parent_role.as_str()))?;
+    if role != expected {
+        return Err(anyhow!(
+            "{} can only delegate to {}",
+            parent_role.as_str(),
+            expected.as_str()
+        ));
+    }
+    let objective = input
+        .get("objective")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|objective| !objective.is_empty() && objective.len() <= 4000)
+        .ok_or_else(|| anyhow!("objective is required (max 4000 chars)"))?
+        .to_string();
+    let name = input
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && name.len() <= 80)
+        .map(ToOwned::to_owned);
+    let instructions = input
+        .get("instructions")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|instructions| !instructions.is_empty() && instructions.len() <= 4000);
+    let objective = match instructions {
+        Some(instructions) => format!("{objective}\n\nInstructions:\n{instructions}"),
+        None => objective,
+    };
+    Ok((role, name, objective))
+}
+
+fn role_system_prompt(
+    role: AgentRole,
+    project: &Project,
+    session: &Session,
+    worktree: &str,
+    spec: &AgentSpec,
+    objective: &str,
+) -> String {
+    let base = format!(
+        "Project: '{}' at {}. Session goal: '{}'. Worktree: {}. Branch: {}. \
+         The project root is read-only; all writes stay inside the worktree. \
+         Do not claim success without evidence.",
+        project.name,
+        project.root,
+        session.goal,
+        worktree,
+        session.branch.as_deref().unwrap_or("(detached)")
+    );
+    match role {
+        AgentRole::Leader => format!(
+            "{base}\n\
+             You are VerlinPark's Leader agent, {}. Keep a short plan with todo_write. \
+             For a goal that spans multiple areas, delegate department-level objectives to \
+             Managers with delegate(role=\"manager\"). Managers will split work and delegate \
+             to Workers; Workers may use Labour. Do not delegate directly to Workers or Labour. \
+             You can still inspect and edit files yourself for small tasks. \
+             Review summaries, verify the final diff, and report the result.",
+            spec.name
+        ),
+        AgentRole::Manager => format!(
+            "{base}\n\
+             You are Manager {}, reporting to {}. Objective: {objective}. \
+             You may read and search, but you must not edit files or run shell commands. \
+             Split the objective into focused Worker tasks and call delegate(role=\"worker\") \
+             for each. Review the returned summaries, resolve gaps, then return a concise \
+             consolidated result. Do not delegate to Managers or Labour.",
+            spec.name,
+            spec.parent_name.as_deref().unwrap_or("the Leader")
+        ),
+        AgentRole::Worker => format!(
+            "{base}\n\
+             You are Worker {}, reporting to a Manager. Task: {objective}. \
+             You own implementation in the worktree. Inspect first, make focused edits, \
+             and run tests. Delegate small research or verification subtasks to Labour with \
+             delegate(role=\"labour\") when useful. Return a concise summary with evidence. \
+             Do not delegate to Managers or Workers.",
+            spec.name
+        ),
+        AgentRole::Labour => format!(
+            "{base}\n\
+             You are Labour {}, reporting to a Worker. Subtask: {objective}. \
+             Execute it directly in the worktree and return a concise report. \
+             You cannot delegate to other agents.",
+            spec.name
+        ),
+    }
 }
 
 async fn load_session_project(store: Store, session_id: &str) -> Result<(Session, Project)> {
@@ -729,27 +1319,6 @@ async fn wait_for_approval(
     }
 }
 
-fn system_prompt(project: &Project, session: &Session, worktree: &str) -> String {
-    format!(
-        "You are VerlinPark's Leader agent for the project '{}'. \
-         The session goal is: {}. \
-         Work only inside your session worktree at {}. \
-         The original project root {} is read-only for you; never write there. \
-         The worktree is on branch {}. Use read_file/list_dir/grep to inspect code. \
-         Maintain a short plan with todo_write (pending / in_progress / completed) and update it as you work. \
-         Use edit_file for focused changes and write_file for new or fully rewritten files. \
-         Use shell for tests/builds. Write, edit, and shell calls require user approval, \
-         so explain what you are doing briefly. \
-         Prefer small, verifiable steps. When done, summarize the changes and test results. \
-         Do not claim success without evidence.",
-        project.name,
-        session.goal,
-        worktree,
-        project.root,
-        session.branch.as_deref().unwrap_or("(detached)")
-    )
-}
-
 fn truncate(content: &str) -> String {
     const MAX: usize = 8_000;
     if content.len() > MAX {
@@ -834,6 +1403,9 @@ mod tests {
             base_url: None,
             max_turns: 4,
             max_tokens: Some(1024),
+            max_managers: 5,
+            max_workers: 10,
+            max_labour: 20,
             tools: ToolRegistry::default_tools(),
         };
         let service = AgentService::configured(engine.clone(), config);
@@ -870,6 +1442,9 @@ mod tests {
                 api_key: Some("secret".to_string()),
                 max_turns: None,
                 max_tokens: None,
+                max_managers: None,
+                max_workers: None,
+                max_labour: None,
             })
             .unwrap();
         assert!(info.configured);
@@ -884,6 +1459,9 @@ mod tests {
                 api_key: None,
                 max_turns: None,
                 max_tokens: None,
+                max_managers: None,
+                max_workers: None,
+                max_labour: None,
             })
             .unwrap_err();
         assert!(error.to_string().contains("model is required"));
@@ -966,6 +1544,127 @@ mod tests {
         assert_eq!(todos[1].status, "in_progress");
         let events = engine.list_events(session.id, 0, 100).await.unwrap();
         assert!(events.iter().any(|event| event.kind == "todo.updated"));
+    }
+
+    #[tokio::test]
+    async fn delegates_through_four_tiers() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "objective": "handle the department"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "inspect the readme"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_labour".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "labour",
+                            "objective": "read the readme"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_read".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"README.md"}"#.into(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("labour done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "delegate the work".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service
+            .start(&session.id, "delegate the work")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let roles = agents
+            .iter()
+            .map(|agent| agent.role.as_str())
+            .collect::<Vec<_>>();
+        assert!(roles.contains(&"leader"));
+        assert!(roles.contains(&"manager"));
+        assert!(roles.contains(&"worker"));
+        assert!(roles.contains(&"labour"));
+        assert!(
+            agents
+                .iter()
+                .filter(|agent| agent.role != "leader")
+                .all(|agent| agent.status == "idle")
+        );
+
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "agent.spawned")
+                .count(),
+            3
+        );
+        assert!(
+            events.iter().any(
+                |event| event.kind == "agent.message" && event.payload["text"] == "leader done"
+            )
+        );
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "idle");
     }
 
     #[tokio::test]

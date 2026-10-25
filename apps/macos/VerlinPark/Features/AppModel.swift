@@ -28,6 +28,7 @@ final class AppModel {
     var agentInfo: AgentInfo?
     var streamingText = ""
     var todos: [TodoItem] = []
+    var agents: [AgentRecord] = []
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -98,6 +99,7 @@ final class AppModel {
             events = []
             sessionDiff = nil
             todos = []
+            agents = []
             lastCommit = nil
             mode = .resident
             return
@@ -109,6 +111,7 @@ final class AppModel {
         events = []
         sessionDiff = nil
         todos = []
+        agents = []
         lastCommit = nil
         Task { await loadSessions() }
     }
@@ -124,10 +127,12 @@ final class AppModel {
         streamingText = ""
         sessionDiff = nil
         todos = []
+        agents = []
         lastCommit = nil
         Task {
             await loadEvents()
             await loadTodos()
+            await loadAgents()
             await loadDiff()
         }
     }
@@ -227,6 +232,15 @@ final class AppModel {
         }
     }
 
+    private var orgCaps: (managers: Int, workers: Int, labour: Int) {
+        let defaults = UserDefaults.standard
+        return (
+            defaults.object(forKey: "verlinpark.org.managers") as? Int ?? 4,
+            defaults.object(forKey: "verlinpark.org.workers") as? Int ?? 6,
+            defaults.object(forKey: "verlinpark.org.labour") as? Int ?? 12
+        )
+    }
+
     func saveProviderSettings() async {
         let baseURL = providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let model = providerModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -241,11 +255,15 @@ final class AppModel {
         providerBusy = true
         defer { providerBusy = false }
         do {
+            let caps = orgCaps
             let info = try await core.configureAgent(
                 kind: providerKind,
                 baseURL: baseURL,
                 model: model,
-                apiKey: providerAPIKey
+                apiKey: providerAPIKey,
+                maxManagers: caps.managers,
+                maxWorkers: caps.workers,
+                maxLabour: caps.labour
             )
             agentInfo = info
             UserDefaults.standard.set(providerKind, forKey: "provider.kind")
@@ -267,15 +285,23 @@ final class AppModel {
         let model = providerModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !baseURL.isEmpty, !model.isEmpty else { return }
         do {
+            let caps = orgCaps
             _ = try await core.configureAgent(
                 kind: providerKind,
                 baseURL: baseURL,
                 model: model,
-                apiKey: providerAPIKey
+                apiKey: providerAPIKey,
+                maxManagers: caps.managers,
+                maxWorkers: caps.workers,
+                maxLabour: caps.labour
             )
         } catch {
             providerStatus = error.localizedDescription
         }
+    }
+
+    func applyOrgSettings() async {
+        await configureStoredProvider()
     }
 
     func commitSession(message: String) async {
@@ -323,6 +349,21 @@ final class AppModel {
         }
     }
 
+    func loadAgents() async {
+        guard let sessionID = selectedSessionID else {
+            agents = []
+            return
+        }
+        do {
+            let records = try await core.listAgents(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                agents = records
+            }
+        } catch {
+            // The event stream will retry on the next agent event.
+        }
+    }
+
     func loadDiff() async {
         guard let sessionID = selectedSessionID else {
             sessionDiff = nil
@@ -366,6 +407,7 @@ final class AppModel {
             }
             await loadEvents()
             await loadTodos()
+            await loadAgents()
             await loadDiff()
         } catch {
             handle(error)
@@ -471,6 +513,12 @@ final class AppModel {
 
         if event.type == "session.created" || event.type == "session.worktree" {
             Task { await self.loadSessions() }
+        }
+
+        if event.sessionId == selectedSessionID,
+           ["agent.spawned", "agent.finished"].contains(event.type)
+        {
+            Task { await self.loadAgents() }
         }
 
         if event.sessionId == selectedSessionID,
