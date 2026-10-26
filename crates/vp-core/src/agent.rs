@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -21,6 +21,7 @@ use vp_store::Store;
 
 use crate::Engine;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
+use crate::worktree;
 
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -132,6 +133,10 @@ struct AgentSpec {
     name: String,
     depth: u8,
     parent_name: Option<String>,
+    worktree: PathBuf,
+    branch: String,
+    session_worktree: PathBuf,
+    session_branch: String,
 }
 
 struct SessionBudget {
@@ -483,6 +488,7 @@ async fn run_agent(
             .clone()
             .ok_or_else(|| anyhow!("session has no worktree"))?,
     );
+    let session_branch = session.branch.clone().unwrap_or_default();
     let leader = engine
         .list_agents(session_id)
         .await?
@@ -497,6 +503,10 @@ async fn run_agent(
             .unwrap_or_else(|| "Leader".to_string()),
         depth: 0,
         parent_name: None,
+        worktree: worktree.clone(),
+        branch: session_branch.clone(),
+        session_worktree: worktree.clone(),
+        session_branch,
     };
     let budget = SessionBudget::new(
         session.token_budget,
@@ -548,7 +558,6 @@ async fn run_agent(
         &config,
         &session,
         &project,
-        &worktree,
         &control,
         &budget,
         &spec,
@@ -596,6 +605,34 @@ async fn run_agent(
     Ok(())
 }
 
+struct IntegrationResult {
+    commit: Option<String>,
+    merged: bool,
+}
+
+async fn integrate_worker(spec: &AgentSpec, name: &str) -> Result<IntegrationResult> {
+    let task_worktree = spec.worktree.clone();
+    let session_worktree = spec.session_worktree.clone();
+    let branch = spec.branch.clone();
+    let message = format!("task: {name}");
+    let merge_message = format!("merge {name}");
+    tokio::task::spawn_blocking(move || -> Result<IntegrationResult> {
+        let commit = worktree::commit_all(&task_worktree, &message)?;
+        let Some(commit) = commit else {
+            return Ok(IntegrationResult {
+                commit: None,
+                merged: false,
+            });
+        };
+        worktree::merge_branch(&session_worktree, &branch, &merge_message)?;
+        Ok(IntegrationResult {
+            commit: Some(commit),
+            merged: true,
+        })
+    })
+    .await?
+}
+
 #[allow(clippy::too_many_arguments)]
 #[async_recursion]
 async fn run_loop(
@@ -603,7 +640,6 @@ async fn run_loop(
     config: &AgentConfig,
     session: &Session,
     project: &Project,
-    worktree: &Path,
     control: &RunControl,
     budget: &SessionBudget,
     spec: &AgentSpec,
@@ -611,18 +647,10 @@ async fn run_loop(
     conversation: &mut Vec<ChatMessage>,
     top_level: bool,
 ) -> Result<LoopOutcome> {
-    let worktree_label = worktree.to_string_lossy().to_string();
     let tool_context = ToolContext {
-        root: worktree.to_path_buf(),
+        root: spec.worktree.clone(),
     };
-    let system = role_system_prompt(
-        spec.role,
-        project,
-        session,
-        &worktree_label,
-        spec,
-        objective,
-    );
+    let system = role_system_prompt(spec.role, project, session, spec, objective);
     let tools = tool_schemas(config, spec.role);
 
     for turn in 0..config.max_turns {
@@ -850,12 +878,44 @@ async fn run_loop(
                                     &config.model,
                                 )
                                 .await?;
+                            let (child_worktree, child_branch) = match role {
+                                AgentRole::Worker => {
+                                    let info = engine
+                                        .create_task_worktree(
+                                            &project.root,
+                                            &project.id,
+                                            &session.id,
+                                            &child.id,
+                                            &spec.session_branch,
+                                        )
+                                        .await?;
+                                    (info.path, info.branch)
+                                }
+                                AgentRole::Manager => {
+                                    (spec.session_worktree.clone(), spec.session_branch.clone())
+                                }
+                                AgentRole::Labour => (spec.worktree.clone(), spec.branch.clone()),
+                                AgentRole::Leader => {
+                                    (spec.session_worktree.clone(), spec.session_branch.clone())
+                                }
+                            };
+                            engine
+                                .set_agent_worktree(
+                                    &child.id,
+                                    &child_worktree.to_string_lossy(),
+                                    &child_branch,
+                                )
+                                .await?;
                             let child_spec = AgentSpec {
                                 id: child.id.clone(),
                                 role,
                                 name: child_name.clone(),
                                 depth: spec.depth.saturating_add(1),
                                 parent_name: Some(spec.name.clone()),
+                                worktree: child_worktree,
+                                branch: child_branch,
+                                session_worktree: spec.session_worktree.clone(),
+                                session_branch: spec.session_branch.clone(),
                             };
                             emit(
                                 engine,
@@ -876,7 +936,6 @@ async fn run_loop(
                                 config,
                                 session,
                                 project,
-                                worktree,
                                 control,
                                 budget,
                                 &child_spec,
@@ -892,24 +951,62 @@ async fn run_loop(
                                     } else {
                                         summary
                                     };
-                                    engine.update_agent_status(&child.id, "idle").await?;
-                                    emit(
-                                        engine,
-                                        &session.id,
-                                        &child_spec,
-                                        "agent.finished",
-                                        serde_json::json!({
-                                            "status": "idle",
-                                            "summary": truncate(&summary),
-                                        }),
-                                    )
-                                    .await?;
-                                    ToolOutput::ok(format!(
-                                        "{} {} finished:\n{}",
-                                        role.default_name(),
-                                        child_name,
-                                        truncate(&summary)
-                                    ))
+                                    let integration = if role == AgentRole::Worker {
+                                        integrate_worker(&child_spec, &child_name).await
+                                    } else {
+                                        Ok(IntegrationResult {
+                                            commit: None,
+                                            merged: false,
+                                        })
+                                    };
+                                    match integration {
+                                        Ok(integration) => {
+                                            engine.update_agent_status(&child.id, "idle").await?;
+                                            emit(
+                                                engine,
+                                                &session.id,
+                                                &child_spec,
+                                                "agent.finished",
+                                                serde_json::json!({
+                                                    "status": "idle",
+                                                    "summary": truncate(&summary),
+                                                    "commit": integration.commit,
+                                                    "merged": integration.merged,
+                                                    "worktree": child_spec.worktree,
+                                                    "branch": child_spec.branch,
+                                                }),
+                                            )
+                                            .await?;
+                                            ToolOutput::ok(format!(
+                                                "{} {} finished:\n{}\nmerged: {}",
+                                                role.default_name(),
+                                                child_name,
+                                                truncate(&summary),
+                                                integration.merged
+                                            ))
+                                        }
+                                        Err(error) => {
+                                            engine.update_agent_status(&child.id, "failed").await?;
+                                            emit(
+                                                engine,
+                                                &session.id,
+                                                &child_spec,
+                                                "agent.finished",
+                                                serde_json::json!({
+                                                    "status": "failed",
+                                                    "summary": truncate(error.to_string().as_str()),
+                                                    "worktree": child_spec.worktree,
+                                                    "branch": child_spec.branch,
+                                                }),
+                                            )
+                                            .await?;
+                                            ToolOutput::error(format!(
+                                                "{} {} finished but integration failed: {error}",
+                                                role.default_name(),
+                                                child_name
+                                            ))
+                                        }
+                                    }
                                 }
                                 Ok(LoopOutcome::Cancelled) => {
                                     engine.update_agent_status(&child.id, "cancelled").await?;
@@ -1164,19 +1261,15 @@ fn role_system_prompt(
     role: AgentRole,
     project: &Project,
     session: &Session,
-    worktree: &str,
     spec: &AgentSpec,
     objective: &str,
 ) -> String {
+    let worktree = spec.worktree.to_string_lossy();
     let base = format!(
         "Project: '{}' at {}. Session goal: '{}'. Worktree: {}. Branch: {}. \
          The project root is read-only; all writes stay inside the worktree. \
          Do not claim success without evidence.",
-        project.name,
-        project.root,
-        session.goal,
-        worktree,
-        session.branch.as_deref().unwrap_or("(detached)")
+        project.name, project.root, session.goal, worktree, spec.branch
     );
     match role {
         AgentRole::Leader => format!(
@@ -1660,6 +1753,124 @@ mod tests {
                 |event| event.kind == "agent.message" && event.payload["text"] == "leader done"
             )
         );
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "idle");
+    }
+
+    #[tokio::test]
+    async fn integrates_worker_changes_into_the_session_branch() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "objective": "deliver the file"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "write worker.txt"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "worker.txt",
+                            "content": "from worker\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker wrote".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "integrate".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..100 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        service.start(&session.id, "integrate").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        approver.abort();
+
+        let worktree = session.worktree.clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&worktree).join("worker.txt")).unwrap(),
+            "from worker\n"
+        );
+        let diff = engine.session_diff(&session.id).await.unwrap();
+        assert!(diff.status.is_empty());
+        assert!(diff.patch.contains("+from worker"));
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
+        assert_eq!(worker.status, "idle");
+        assert!(
+            worker
+                .branch
+                .as_deref()
+                .is_some_and(|branch| branch.starts_with("verlinpark/"))
+        );
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.finished"
+                && event.payload["agent_role"] == "worker"
+                && event.payload["merged"] == true
+        }));
         let sessions = engine
             .list_sessions(Some(session.project_id))
             .await

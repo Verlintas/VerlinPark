@@ -466,7 +466,7 @@ loop {
 
 ## 7. Agent Runtime
 
-> **实现状态（M2 第一切片）：** 当前实现是 Leader → Manager → Worker → Labour 的同步递归委派，共享 session worktree；角色工具策略、审批归属、token 预算、取消与持久化 todo 计划已落地。并行调度、per-task worktree、merge queue、Verifier/Integrator gate 仍是设计目标：
+> **实现状态（M2 第二切片）：** 当前实现是 Leader → Manager → Worker → Labour 的同步递归委派；Manager 只读，Worker 有独立 task worktree，Labour 继承 Worker worktree，Worker 完成后串行 commit + merge 到 session 分支；session diff 从 base commit 起算。并行调度、task DAG、写作用域锁、merge queue、Verifier/Integrator gate 仍是设计目标：
 > `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`、`crates/vp-core/src/worktree.rs`。
 > 四层 Actor、并行只读工具、预算、压缩和恢复仍是设计目标。
 > 见 [ADR-0015](adr/0015-m1-leader-loop.md)、[ADR-0016](adr/0016-session-worktree.md)、[ADR-0019](adr/0019-four-tier-delegation.md)。

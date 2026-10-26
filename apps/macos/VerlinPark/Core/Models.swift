@@ -24,6 +24,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
     let worktree: String?
     let branch: String?
     let tokenBudget: Int?
+    let baseCommit: String?
     let tokensIn: Int
     let tokensOut: Int
     let createdAt: String
@@ -36,6 +37,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         case worktree
         case branch
         case tokenBudget = "token_budget"
+        case baseCommit = "base_commit"
         case tokensIn = "tokens_in"
         case tokensOut = "tokens_out"
         case createdAt = "created_at"
@@ -191,6 +193,7 @@ struct SessionDiff: Codable, Sendable {
     let sessionId: String
     let branch: String
     let worktree: String
+    let baseCommit: String?
     let status: String
     let patch: String
 
@@ -198,8 +201,13 @@ struct SessionDiff: Codable, Sendable {
         case sessionId = "session_id"
         case branch
         case worktree
+        case baseCommit = "base_commit"
         case status
         case patch
+    }
+
+    var hasUncommittedChanges: Bool {
+        !status.isEmpty
     }
 
     var isEmpty: Bool {
@@ -256,6 +264,8 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
     let role: String
     let name: String
     let parentId: String?
+    let worktree: String?
+    let branch: String?
     let status: String
     let model: String
     let createdAt: String
@@ -266,6 +276,8 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
         case role
         case name
         case parentId = "parent_id"
+        case worktree
+        case branch
         case status
         case model
         case createdAt = "created_at"

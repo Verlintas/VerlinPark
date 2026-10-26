@@ -52,6 +52,7 @@ impl Store {
                 worktree      TEXT,
                 branch        TEXT,
                 token_budget  INTEGER,
+                base_commit   TEXT,
                 tokens_in     INTEGER NOT NULL DEFAULT 0,
                 tokens_out    INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT NOT NULL
@@ -77,6 +78,8 @@ impl Store {
                 role       TEXT NOT NULL,
                 name       TEXT NOT NULL DEFAULT 'Agent',
                 parent_id  TEXT,
+                worktree   TEXT,
+                branch     TEXT,
                 status     TEXT NOT NULL,
                 model      TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -121,6 +124,7 @@ impl Store {
         ensure_column(&conn, "sessions", "worktree", "TEXT")?;
         ensure_column(&conn, "sessions", "branch", "TEXT")?;
         ensure_column(&conn, "sessions", "token_budget", "INTEGER")?;
+        ensure_column(&conn, "sessions", "base_commit", "TEXT")?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(
             &conn,
@@ -245,6 +249,7 @@ impl Store {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -257,6 +262,7 @@ impl Store {
         worktree: &str,
         branch: &str,
         token_budget: Option<u64>,
+        base_commit: &str,
     ) -> Result<Session> {
         self.insert_session(
             id.to_string(),
@@ -265,9 +271,11 @@ impl Store {
             Some(worktree.to_string()),
             Some(branch.to_string()),
             token_budget,
+            Some(base_commit.to_string()),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_session(
         &self,
         id: String,
@@ -276,6 +284,7 @@ impl Store {
         worktree: Option<String>,
         branch: Option<String>,
         token_budget: Option<u64>,
+        base_commit: Option<String>,
     ) -> Result<Session> {
         if self.get_project(project_id)?.is_none() {
             return Err(anyhow!("project not found: {project_id}"));
@@ -292,6 +301,7 @@ impl Store {
             worktree,
             branch,
             token_budget,
+            base_commit,
             tokens_in: 0,
             tokens_out: 0,
             created_at: now_rfc3339(),
@@ -299,8 +309,8 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO sessions
-             (id, project_id, goal, status, worktree, branch, token_budget, tokens_in, tokens_out, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8)",
+             (id, project_id, goal, status, worktree, branch, token_budget, base_commit, tokens_in, tokens_out, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9)",
             params![
                 session.id,
                 session.project_id,
@@ -309,6 +319,7 @@ impl Store {
                 session.worktree,
                 session.branch,
                 session.token_budget,
+                session.base_commit,
                 session.created_at
             ],
         )?;
@@ -346,7 +357,7 @@ impl Store {
         match project_id {
             Some(project_id) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, tokens_in, tokens_out, created_at
+                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, base_commit, tokens_in, tokens_out, created_at
                      FROM sessions WHERE project_id = ?1
                      ORDER BY created_at DESC",
                 )?;
@@ -355,7 +366,7 @@ impl Store {
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, tokens_in, tokens_out, created_at
+                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, base_commit, tokens_in, tokens_out, created_at
                      FROM sessions ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map([], map_session)?;
@@ -368,7 +379,7 @@ impl Store {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, project_id, goal, status, worktree, branch, token_budget, tokens_in, tokens_out, created_at
+            "SELECT id, project_id, goal, status, worktree, branch, token_budget, base_commit, tokens_in, tokens_out, created_at
              FROM sessions WHERE id = ?1",
             params![id],
             map_session,
@@ -490,26 +501,40 @@ impl Store {
             role: role.to_string(),
             name: name.to_string(),
             parent_id: parent_id.map(ToOwned::to_owned),
+            worktree: None,
+            branch: None,
             status: "running".to_string(),
             model: model.to_string(),
             created_at: now_rfc3339(),
         };
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO agents (id, session_id, role, name, parent_id, status, model, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO agents
+             (id, session_id, role, name, parent_id, worktree, branch, status, model, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 agent.id,
                 agent.session_id,
                 agent.role,
                 agent.name,
                 agent.parent_id,
+                agent.worktree,
+                agent.branch,
                 agent.status,
                 agent.model,
                 agent.created_at
             ],
         )?;
         Ok(agent)
+    }
+
+    pub fn set_agent_worktree(&self, id: &str, worktree: &str, branch: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE agents SET worktree = ?1, branch = ?2 WHERE id = ?3",
+            params![worktree, branch, id],
+        )?;
+        Ok(())
     }
 
     pub fn update_agent_status(&self, id: &str, status: &str) -> Result<()> {
@@ -524,7 +549,7 @@ impl Store {
     pub fn list_agents(&self, session_id: &str) -> Result<Vec<AgentRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, name, parent_id, status, model, created_at
+            "SELECT id, session_id, role, name, parent_id, worktree, branch, status, model, created_at
              FROM agents WHERE session_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -534,9 +559,11 @@ impl Store {
                 role: row.get(2)?,
                 name: row.get(3)?,
                 parent_id: row.get(4)?,
-                status: row.get(5)?,
-                model: row.get(6)?,
-                created_at: row.get(7)?,
+                worktree: row.get(5)?,
+                branch: row.get(6)?,
+                status: row.get(7)?,
+                model: row.get(8)?,
+                created_at: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -782,9 +809,10 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         worktree: row.get(4)?,
         branch: row.get(5)?,
         token_budget: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
-        tokens_in: row.get::<_, i64>(7)? as u64,
-        tokens_out: row.get::<_, i64>(8)? as u64,
-        created_at: row.get(9)?,
+        base_commit: row.get(7)?,
+        tokens_in: row.get::<_, i64>(8)? as u64,
+        tokens_out: row.get::<_, i64>(9)? as u64,
+        created_at: row.get(10)?,
     })
 }
 

@@ -486,6 +486,7 @@ final class AppModel {
                 worktree: old.worktree,
                 branch: old.branch,
                 tokenBudget: old.tokenBudget,
+                baseCommit: old.baseCommit,
                 tokensIn: old.tokensIn + input,
                 tokensOut: old.tokensOut + output,
                 createdAt: old.createdAt
@@ -505,6 +506,7 @@ final class AppModel {
                 worktree: old.worktree,
                 branch: old.branch,
                 tokenBudget: old.tokenBudget,
+                baseCommit: old.baseCommit,
                 tokensIn: old.tokensIn,
                 tokensOut: old.tokensOut,
                 createdAt: old.createdAt

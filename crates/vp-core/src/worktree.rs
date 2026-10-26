@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: String,
+    pub base_commit: String,
 }
 
 /// Create (or reattach) the Leader worktree for a session.
@@ -31,9 +32,14 @@ pub fn create(
         .join(project_id)
         .join(session_id)
         .join("leader");
+    let base_commit = git_output(&root, &["rev-parse", "HEAD"])?;
 
     if path.join(".git").is_file() {
-        return Ok(WorktreeInfo { path, branch });
+        return Ok(WorktreeInfo {
+            path,
+            branch,
+            base_commit,
+        });
     }
 
     run_git(&root, &["worktree", "prune"])?;
@@ -68,7 +74,89 @@ pub fn create(
         )?;
     }
 
-    Ok(WorktreeInfo { path, branch })
+    Ok(WorktreeInfo {
+        path,
+        branch,
+        base_commit,
+    })
+}
+
+/// Create a Worker worktree based on the session branch.
+pub fn create_task(
+    project_root: &Path,
+    data_dir: &Path,
+    project_id: &str,
+    session_id: &str,
+    task_id: &str,
+    base_branch: &str,
+) -> Result<WorktreeInfo> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving project root {}", project_root.display()))?;
+    // A slash would make the task branch a child ref of the session branch,
+    // which Git refuses (a ref cannot be both a file and a directory).
+    let branch = format!("verlinpark/{session_id}--{task_id}");
+    let path = data_dir
+        .join("worktrees")
+        .join(project_id)
+        .join(session_id)
+        .join(task_id);
+    let base_commit = git_output(&root, &["rev-parse", base_branch])?;
+
+    if path.join(".git").is_file() {
+        return Ok(WorktreeInfo {
+            path,
+            branch,
+            base_commit,
+        });
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating worktree directory {}", parent.display()))?;
+    }
+
+    run_git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            path.to_str()
+                .ok_or_else(|| anyhow!("worktree path is not valid UTF-8"))?,
+            base_branch,
+        ],
+    )?;
+
+    Ok(WorktreeInfo {
+        path,
+        branch,
+        base_commit,
+    })
+}
+
+pub fn commit_all(worktree: &Path, message: &str) -> Result<Option<String>> {
+    let status = git_output(worktree, &["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        return Ok(None);
+    }
+    run_git(worktree, &["add", "-A"])?;
+    run_git(worktree, &["commit", "-m", message])?;
+    Ok(Some(git_output(worktree, &["rev-parse", "HEAD"])?))
+}
+
+pub fn merge_branch(session_worktree: &Path, branch: &str, message: &str) -> Result<()> {
+    match run_git(
+        session_worktree,
+        &["merge", "--no-ff", branch, "-m", message],
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = run_git(session_worktree, &["merge", "--abort"]);
+            Err(error.context("integrating task branch"))
+        }
+    }
 }
 
 pub fn remove(project_root: &Path, worktree: &Path, branch: &str) {
@@ -92,7 +180,7 @@ fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
     Ok(status.success())
 }
 
-fn run_git(root: &Path, args: &[&str]) -> Result<()> {
+fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -106,7 +194,11 @@ fn run_git(root: &Path, args: &[&str]) -> Result<()> {
         let detail = if stderr.is_empty() { stdout } else { stderr };
         bail!("git {} failed: {detail}", args.join(" "));
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_git(root: &Path, args: &[&str]) -> Result<()> {
+    git_output(root, args).map(|_| ())
 }
 
 #[cfg(test)]
@@ -157,6 +249,7 @@ mod tests {
         let info = create(repo.path(), data.path(), "project-1", "session-1").unwrap();
         assert!(info.path.join("README.md").is_file());
         assert!(info.branch.starts_with("verlinpark/"));
+        assert_eq!(info.base_commit.len(), 40);
         let branch = Command::new("git")
             .arg("-C")
             .arg(repo.path())
@@ -164,6 +257,31 @@ mod tests {
             .output()
             .unwrap();
         assert_ne!(String::from_utf8_lossy(&branch.stdout).trim(), info.branch);
+    }
+
+    #[test]
+    fn creates_and_integrates_a_task_worktree() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let session = create(repo.path(), data.path(), "project-1", "session-1").unwrap();
+        let task = create_task(
+            repo.path(),
+            data.path(),
+            "project-1",
+            "session-1",
+            "task-1",
+            &session.branch,
+        )
+        .unwrap();
+        std::fs::write(task.path.join("worker.txt"), "from worker\n").unwrap();
+        let commit = commit_all(&task.path, "task work").unwrap().unwrap();
+        assert_eq!(commit.len(), 40);
+        merge_branch(&session.path, &task.branch, "merge task").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(session.path.join("worker.txt")).unwrap(),
+            "from worker\n"
+        );
     }
 
     #[test]

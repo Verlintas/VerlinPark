@@ -370,6 +370,13 @@ struct AgentTierCard: View {
                             Text(agent.status)
                                 .font(.system(size: 8, design: .monospaced))
                                 .foregroundStyle(.tertiary)
+                            if let branch = agent.branch {
+                                Text(branch)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
                         }
                         Spacer(minLength: 0)
                     }
@@ -613,7 +620,7 @@ struct PreviewPanelView: View {
     }
 
     private var canCommit: Bool {
-        model.sessionDiff.map { !$0.isEmpty } ?? false
+        model.sessionDiff?.hasUncommittedChanges ?? false
     }
 
     private func header(_ session: Session) -> some View {
@@ -691,6 +698,19 @@ struct PreviewPanelView: View {
                     }
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.secondary)
+
+                    if let base = diff.baseCommit {
+                        Text("since \(String(base.prefix(7))) · worktree is the session branch")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                    if !diff.hasUncommittedChanges, !diff.patch.isEmpty {
+                        Text(
+                            "All changes are committed on the session branch. Landing is not implemented yet."
+                        )
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    }
 
                     if !diff.status.isEmpty {
                         Text(diff.status)

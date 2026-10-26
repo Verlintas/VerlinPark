@@ -23,6 +23,8 @@ pub struct Session {
     #[serde(default)]
     pub token_budget: Option<u64>,
     #[serde(default)]
+    pub base_commit: Option<String>,
+    #[serde(default)]
     pub tokens_in: u64,
     #[serde(default)]
     pub tokens_out: u64,
@@ -220,6 +222,8 @@ pub struct SessionDiff {
     pub session_id: String,
     pub branch: String,
     pub worktree: String,
+    #[serde(default)]
+    pub base_commit: Option<String>,
     pub status: String,
     pub patch: String,
 }
@@ -277,6 +281,10 @@ pub struct AgentRecord {
     pub role: String,
     pub name: String,
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub worktree: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
     pub status: String,
     pub model: String,
     pub created_at: String,

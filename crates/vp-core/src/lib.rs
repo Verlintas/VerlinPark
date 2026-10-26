@@ -90,12 +90,14 @@ impl Engine {
         let store = self.store.clone();
         let worktree_path = worktree.path.to_string_lossy().to_string();
         let branch = worktree.branch.clone();
+        let base_commit = worktree.base_commit.clone();
         let session = tokio::task::spawn_blocking({
             let session_id = session_id.clone();
             let project_id = project.id.clone();
             let goal = goal.clone();
             let worktree_path = worktree_path.clone();
             let branch = branch.clone();
+            let base_commit = base_commit.clone();
             move || {
                 store.create_session_with_worktree(
                     &session_id,
@@ -104,6 +106,7 @@ impl Engine {
                     &worktree_path,
                     &branch,
                     token_budget,
+                    &base_commit,
                 )
             }
         })
@@ -377,12 +380,14 @@ impl Engine {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?;
         let branch = session.branch.clone().unwrap_or_default();
+        let base_commit = session.base_commit.clone();
         let session_id = session.id.clone();
+        let diff_base = base_commit.clone().unwrap_or_else(|| "HEAD".to_string());
         let worktree_for_git = PathBuf::from(&worktree);
         let (status, patch) = tokio::task::spawn_blocking(move || {
             let status = git_output(&worktree_for_git, &["status", "--short"])?;
-            let stat = git_output(&worktree_for_git, &["diff", "--stat"])?;
-            let diff = git_output(&worktree_for_git, &["diff", "--no-color"])?;
+            let stat = git_output(&worktree_for_git, &["diff", "--stat", &diff_base])?;
+            let diff = git_output(&worktree_for_git, &["diff", "--no-color", &diff_base])?;
             let mut patch = String::new();
             if !stat.is_empty() {
                 patch.push_str(&stat);
@@ -403,6 +408,7 @@ impl Engine {
             session_id,
             branch,
             worktree,
+            base_commit,
             status,
             patch,
         })
@@ -455,6 +461,51 @@ impl Engine {
             store.create_agent(&session_id, &role, &name, parent_id.as_deref(), &model)
         })
         .await?
+    }
+
+    pub async fn create_task_worktree(
+        &self,
+        project_root: &str,
+        project_id: &str,
+        session_id: &str,
+        task_id: &str,
+        base_branch: &str,
+    ) -> Result<worktree::WorktreeInfo> {
+        let data_dir = self.store.data_dir().to_path_buf();
+        let root = PathBuf::from(project_root);
+        let project_id = project_id.to_string();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let base_branch = base_branch.to_string();
+        let git_lock = self.git_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            worktree::create_task(
+                &root,
+                &data_dir,
+                &project_id,
+                &session_id,
+                &task_id,
+                &base_branch,
+            )
+        })
+        .await?
+    }
+
+    pub async fn set_agent_worktree(
+        &self,
+        agent_id: &str,
+        worktree: &str,
+        branch: &str,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let id = agent_id.to_string();
+        let worktree = worktree.to_string();
+        let branch = branch.to_string();
+        tokio::task::spawn_blocking(move || store.set_agent_worktree(&id, &worktree, &branch))
+            .await?
     }
 
     pub async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<()> {
@@ -662,14 +713,9 @@ mod tests {
             "hello\n"
         );
         assert!(!worktree.join("scratch.txt").exists());
-        assert!(
-            engine
-                .session_diff(&session.id)
-                .await
-                .unwrap()
-                .patch
-                .is_empty()
-        );
+        let diff = engine.session_diff(&session.id).await.unwrap();
+        assert!(diff.status.is_empty());
+        assert!(diff.patch.is_empty());
         let events = engine.list_events(session.id, 0, 100).await.unwrap();
         assert!(events.iter().any(|event| event.kind == "session.discarded"));
     }
@@ -740,14 +786,9 @@ mod tests {
             .unwrap();
         assert_eq!(commit.commit.len(), 7);
         assert_eq!(commit.message, "update readme");
-        assert!(
-            engine
-                .session_diff(&session.id)
-                .await
-                .unwrap()
-                .patch
-                .is_empty()
-        );
+        let diff = engine.session_diff(&session.id).await.unwrap();
+        assert!(diff.status.is_empty());
+        assert!(diff.patch.contains("+committed"));
 
         let error = engine
             .commit_session(&session.id, "again")
