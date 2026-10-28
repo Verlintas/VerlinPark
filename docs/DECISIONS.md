@@ -31,6 +31,7 @@
 | [0019](adr/0019-four-tier-delegation.md) | 四层递归委派（串行、同 worktree） | Accepted | 组织/Agent runtime/隔离 |
 | [0020](adr/0020-task-worktrees.md) | Worker 任务 worktree + 串行集成 | Accepted | 隔离/Git/审阅 |
 | [0021](adr/0021-parallel-workers-scopes.md) | 并行 Worker + write scope 校验 | Accepted | 调度/并发/安全 |
+| [0022](adr/0022-manager-titles.md) | Manager 必须有部门角色 title | Accepted | 组织/委派/UI |
 
 ---
 

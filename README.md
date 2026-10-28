@@ -194,7 +194,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M2 四层委派**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；Leader 可以委派给 Manager → Worker → Labour，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果，并在 session token 预算耗尽时硬停。Worker 拥有独立 task worktree，成功后串行合并到 session 分支；session diff 从 base commit 起算，已合并的改动仍可审阅。Manager 可以用 `delegate_many` 并行运行写作用域不重叠的 Worker；集成仍串行，独立 Verifier gate 和 merge queue 仍在后续里程碑。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+当前处于 **M2 四层委派**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；Leader 可以委派给 Manager → Worker → Labour，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果，并在 session token 预算耗尽时硬停。Worker 拥有独立 task worktree，成功后串行合并到 session 分支；session diff 从 base commit 起算，已合并的改动仍可审阅。Leader 必须给每个 Manager 分配部门角色（Discovery / Implementation / Quality 或自定义）；Manager 可以用 `delegate_many` 并行运行写作用域不重叠的 Worker。集成仍串行，独立 Verifier gate 和 merge queue 仍在后续里程碑。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 ## 许可
 

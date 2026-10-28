@@ -444,11 +444,13 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_agent(
         &self,
         session_id: &str,
         role: &str,
         name: &str,
+        title: Option<String>,
         parent_id: Option<String>,
         model: &str,
     ) -> Result<AgentRecord> {
@@ -458,7 +460,14 @@ impl Engine {
         let name = name.to_string();
         let model = model.to_string();
         tokio::task::spawn_blocking(move || {
-            store.create_agent(&session_id, &role, &name, parent_id.as_deref(), &model)
+            store.create_agent(
+                &session_id,
+                &role,
+                &name,
+                title.as_deref(),
+                parent_id.as_deref(),
+                &model,
+            )
         })
         .await?
     }

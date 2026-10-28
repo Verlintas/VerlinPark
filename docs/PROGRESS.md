@@ -11,7 +11,8 @@
 |---|---|---|
 | 四层委派 | ✅ | Leader → Manager → Worker → Labour 严格链路；`delegate` 工具；嵌套同步执行；越级/越权被拒绝 |
 | 角色工具策略 | ✅ | Manager 只读（read/list/grep）；Worker/Labour 可读写/Shell；Leader 全部工具 |
-| Agent roster | ✅ | `agents` 表持久化 role/name/parent/status/model；`agent.list` RPC；Collab 显示真实 Managers/Workers/Labour |
+| Agent roster | ✅ | `agents` 表持久化 role/name/title/parent/status/model；`agent.list` RPC；Collab 显示真实 Managers/Workers/Labour |
+| Manager 角色 | ✅ | Leader 委派 Manager 时必须给 `title`（Discovery / Implementation / Quality 等）；title 持久化、显示在 Collab/审批卡/CLI |
 | 委派上限 | ✅ | 按 run 限制 1–5 Managers / 1–10 Workers / 1–40 Labour；由 Org Preset 传给 `agent.configure` |
 | 任务 worktree | ✅ | Worker 独立 worktree/branch；Labour 继承 Worker worktree；Leader/Manager 用 session worktree |
 | 串行集成 | ✅ | Worker 完成后内部 commit + `--no-ff` 合并到 session 分支；冲突 abort、标记 Worker failed、保留分支 |
@@ -44,7 +45,7 @@
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 38 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
+| 测试 | ✅ | Rust 39 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、Manager title 必填、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M2 尚未完成：**

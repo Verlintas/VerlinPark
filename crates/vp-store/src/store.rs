@@ -77,6 +77,7 @@ impl Store {
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 role       TEXT NOT NULL,
                 name       TEXT NOT NULL DEFAULT 'Agent',
+                title      TEXT,
                 parent_id  TEXT,
                 worktree   TEXT,
                 branch     TEXT,
@@ -483,7 +484,7 @@ impl Store {
 
     pub fn create_leader_agent(&self, session_id: &str, model: &str) -> Result<String> {
         Ok(self
-            .create_agent(session_id, "leader", "Leader", None, model)?
+            .create_agent(session_id, "leader", "Leader", None, None, model)?
             .id)
     }
 
@@ -492,6 +493,7 @@ impl Store {
         session_id: &str,
         role: &str,
         name: &str,
+        title: Option<&str>,
         parent_id: Option<&str>,
         model: &str,
     ) -> Result<AgentRecord> {
@@ -500,6 +502,7 @@ impl Store {
             session_id: session_id.to_string(),
             role: role.to_string(),
             name: name.to_string(),
+            title: title.map(ToOwned::to_owned),
             parent_id: parent_id.map(ToOwned::to_owned),
             worktree: None,
             branch: None,
@@ -510,13 +513,14 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO agents
-             (id, session_id, role, name, parent_id, worktree, branch, status, model, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, session_id, role, name, title, parent_id, worktree, branch, status, model, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 agent.id,
                 agent.session_id,
                 agent.role,
                 agent.name,
+                agent.title,
                 agent.parent_id,
                 agent.worktree,
                 agent.branch,
@@ -549,7 +553,7 @@ impl Store {
     pub fn list_agents(&self, session_id: &str) -> Result<Vec<AgentRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, name, parent_id, worktree, branch, status, model, created_at
+            "SELECT id, session_id, role, name, title, parent_id, worktree, branch, status, model, created_at
              FROM agents WHERE session_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -558,12 +562,13 @@ impl Store {
                 session_id: row.get(1)?,
                 role: row.get(2)?,
                 name: row.get(3)?,
-                parent_id: row.get(4)?,
-                worktree: row.get(5)?,
-                branch: row.get(6)?,
-                status: row.get(7)?,
-                model: row.get(8)?,
-                created_at: row.get(9)?,
+                title: row.get(4)?,
+                parent_id: row.get(5)?,
+                worktree: row.get(6)?,
+                branch: row.get(7)?,
+                status: row.get(8)?,
+                model: row.get(9)?,
+                created_at: row.get(10)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -929,7 +934,14 @@ mod tests {
         let session = store.create_session(&project.id, "team").unwrap();
         let leader = store.create_leader_agent(&session.id, "model").unwrap();
         let worker = store
-            .create_agent(&session.id, "worker", "Worker 1", Some(&leader), "model")
+            .create_agent(
+                &session.id,
+                "worker",
+                "Worker 1",
+                None,
+                Some(&leader),
+                "model",
+            )
             .unwrap();
         assert_eq!(worker.status, "running");
         store.update_agent_status(&worker.id, "idle").unwrap();

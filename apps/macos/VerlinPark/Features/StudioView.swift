@@ -367,6 +367,11 @@ struct AgentTierCard: View {
                         VStack(alignment: .leading, spacing: 1) {
                             Text(agent.name)
                                 .font(.system(size: 10.5, weight: .medium))
+                            if let title = agent.title, title != agent.name {
+                                Text(title)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
                             Text(agent.status)
                                 .font(.system(size: 8, design: .monospaced))
                                 .foregroundStyle(.tertiary)

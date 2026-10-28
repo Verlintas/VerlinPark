@@ -378,7 +378,9 @@ struct SessionChatView: View {
             return nil
         }
         let name = event.payload.objectValue?["agent_name"]?.stringValue
-        return name.map { "\(role.capitalized) · \($0)" } ?? role.capitalized
+        let title = event.payload.objectValue?["agent_title"]?.stringValue
+        let label = title ?? name
+        return label.map { "\(role.capitalized) · \($0)" } ?? role.capitalized
     }
 
     private var tokenUsageLabel: String {
@@ -605,9 +607,14 @@ struct ApprovalCard: View {
                     .font(.system(size: 11, weight: .semibold))
                 Spacer()
                 if let agentName = approval.agentName {
-                    Text(agentLabel(role: approval.agentRole, name: agentName))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                    Text(
+                        agentLabel(
+                            role: approval.agentRole,
+                            name: approval.agentTitle ?? agentName
+                        )
+                    )
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
                 }
                 Text(approval.tool)
                     .font(.system(size: 9, design: .monospaced))

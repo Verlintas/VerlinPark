@@ -148,6 +148,7 @@ struct Approval: Codable, Identifiable, Hashable, Sendable {
     let resolvedAt: String?
     let agentName: String?
     let agentRole: String?
+    let agentTitle: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -160,6 +161,7 @@ struct Approval: Codable, Identifiable, Hashable, Sendable {
         case resolvedAt = "resolved_at"
         case agentName = "agent_name"
         case agentRole = "agent_role"
+        case agentTitle = "agent_title"
     }
 }
 
@@ -263,6 +265,7 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
     let sessionId: String
     let role: String
     let name: String
+    let title: String?
     let parentId: String?
     let worktree: String?
     let branch: String?
@@ -275,6 +278,7 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
         case sessionId = "session_id"
         case role
         case name
+        case title
         case parentId = "parent_id"
         case worktree
         case branch

@@ -280,6 +280,8 @@ pub struct AgentRecord {
     pub session_id: String,
     pub role: String,
     pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
     pub parent_id: Option<String>,
     #[serde(default)]
     pub worktree: Option<String>,

@@ -300,6 +300,9 @@ fn print_human(value: &Value) {
                 agent["status"].as_str().unwrap_or("?"),
                 agent["id"].as_str().unwrap_or("?")
             );
+            if let Some(title) = agent["title"].as_str() {
+                println!("         title {title}");
+            }
             if let Some(branch) = agent["branch"].as_str() {
                 println!("         branch {branch}");
             }

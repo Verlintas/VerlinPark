@@ -133,6 +133,7 @@ struct AgentSpec {
     name: String,
     depth: u8,
     parent_name: Option<String>,
+    title: Option<String>,
     worktree: PathBuf,
     branch: String,
     session_worktree: PathBuf,
@@ -219,6 +220,9 @@ fn agent_fields(payload: &mut serde_json::Value, spec: &AgentSpec) {
         object.insert("agent_role".into(), serde_json::json!(spec.role.as_str()));
         object.insert("agent_name".into(), serde_json::json!(spec.name));
         object.insert("agent_depth".into(), serde_json::json!(spec.depth));
+        if let Some(title) = &spec.title {
+            object.insert("agent_title".into(), serde_json::json!(title));
+        }
     }
 }
 
@@ -505,6 +509,7 @@ async fn run_agent(
             .unwrap_or_else(|| "Leader".to_string()),
         depth: 0,
         parent_name: None,
+        title: None,
         worktree: worktree.clone(),
         branch: session_branch.clone(),
         session_worktree: worktree.clone(),
@@ -935,19 +940,23 @@ async fn run_loop(
                 )
                 .await?;
                 match parse_delegate(&input, spec.role) {
-                    Ok((role, name, child_objective)) => match budget.reserve(role) {
+                    Ok((role, name, child_objective, title)) => match budget.reserve(role) {
                         None => ToolOutput::error(format!(
                             "the {} cap for this session has been reached",
                             role.as_str()
                         )),
                         Some(ordinal) => {
-                            let child_name = name
-                                .unwrap_or_else(|| format!("{} {}", role.default_name(), ordinal));
+                            let child_name = name.clone().unwrap_or_else(|| {
+                                title.clone().unwrap_or_else(|| {
+                                    format!("{} {}", role.default_name(), ordinal)
+                                })
+                            });
                             let child = engine
                                 .create_agent(
                                     &session.id,
                                     role.as_str(),
                                     &child_name,
+                                    title.clone(),
                                     Some(spec.id.clone()),
                                     &config.model,
                                 )
@@ -999,6 +1008,7 @@ async fn run_loop(
                                 name: child_name.clone(),
                                 depth: spec.depth.saturating_add(1),
                                 parent_name: Some(spec.name.clone()),
+                                title: title.clone(),
                                 worktree: child_worktree,
                                 branch: child_branch,
                                 session_worktree: spec.session_worktree.clone(),
@@ -1292,6 +1302,10 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole) -> Vec<ToolSchema> {
                         "enum": ["manager", "worker", "labour"]
                     },
                     "name": {"type": "string"},
+                    "title": {
+                        "type": "string",
+                        "description": "Required for Managers: a distinct department role such as Discovery, Implementation, or Quality"
+                    },
                     "objective": {"type": "string"},
                     "instructions": {"type": "string"},
                     "write_scope": {
@@ -1341,7 +1355,7 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole) -> Vec<ToolSchema> {
 fn parse_delegate(
     input: &serde_json::Value,
     parent_role: AgentRole,
-) -> Result<(AgentRole, Option<String>, String)> {
+) -> Result<(AgentRole, Option<String>, String, Option<String>)> {
     let role_name = input
         .get("role")
         .and_then(serde_json::Value::as_str)
@@ -1379,7 +1393,23 @@ fn parse_delegate(
         Some(instructions) => format!("{objective}\n\nInstructions:\n{instructions}"),
         None => objective,
     };
-    Ok((role, name, objective))
+    let title = if role == AgentRole::Manager {
+        let title = input
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty() && title.len() <= 60)
+            .map(ToOwned::to_owned);
+        if title.is_none() {
+            return Err(anyhow!(
+                "Managers need a title such as Discovery, Implementation, or Quality"
+            ));
+        }
+        title
+    } else {
+        None
+    };
+    Ok((role, name, objective, title))
 }
 
 fn parse_write_scope(input: &serde_json::Value) -> Result<Vec<String>> {
@@ -1510,6 +1540,7 @@ async fn run_parallel_workers(
                 &session.id,
                 AgentRole::Worker.as_str(),
                 &child_name,
+                None,
                 Some(spec.id.clone()),
                 &config.model,
             )
@@ -1532,6 +1563,7 @@ async fn run_parallel_workers(
             name: child_name.clone(),
             depth: spec.depth.saturating_add(1),
             parent_name: Some(spec.name.clone()),
+            title: None,
             worktree: info.path,
             branch: info.branch,
             session_worktree: spec.session_worktree.clone(),
@@ -1742,22 +1774,24 @@ fn role_system_prompt(
             "{base}\n\
              You are VerlinPark's Leader agent, {}. Keep a short plan with todo_write. \
              For a goal that spans multiple areas, delegate department-level objectives to \
-             Managers with delegate(role=\"manager\"). Managers will split work and delegate \
-             to Workers; Workers may use Labour. Do not delegate directly to Workers or Labour. \
+             Managers with delegate(role=\"manager\"). Give every Manager a distinct title \
+             (for example Discovery, Implementation, Quality) via the title field; each title \
+             defines that Manager's department role. Managers will split work and delegate to \
+             Workers; Workers may use Labour. Do not delegate directly to Workers or Labour. \
              You can still inspect and edit files yourself for small tasks. \
              Review summaries, verify the final diff, and report the result.",
             spec.name
         ),
         AgentRole::Manager => format!(
             "{base}\n\
-             You are Manager {}, reporting to {}. Objective: {objective}. \
+             You are the {} Manager, reporting to {}. Objective: {objective}. \
              You may read and search, but you must not edit files or run shell commands. \
              Split the objective into focused Worker tasks. For independent tasks, use \
              delegate_many(tasks=[...]) with non-overlapping write_scope values so Workers \
              run in parallel; otherwise use delegate(role=\"worker\"). Review the returned \
              summaries, resolve gaps, then return a concise consolidated result. \
              Do not delegate to Managers or Labour.",
-            spec.name,
+            spec.title.as_deref().unwrap_or(spec.name.as_str()),
             spec.parent_name.as_deref().unwrap_or("the Leader")
         ),
         AgentRole::Worker => format!(
@@ -2079,6 +2113,7 @@ mod tests {
                         name: "delegate".into(),
                         arguments: serde_json::json!({
                             "role": "manager",
+                            "title": "Implementation",
                             "objective": "department"
                         })
                         .to_string(),
@@ -2221,6 +2256,7 @@ mod tests {
                         name: "delegate".into(),
                         arguments: serde_json::json!({
                             "role": "manager",
+                            "title": "Discovery",
                             "objective": "handle the department"
                         })
                         .to_string(),
@@ -2342,6 +2378,7 @@ mod tests {
                         name: "delegate".into(),
                         arguments: serde_json::json!({
                             "role": "manager",
+                            "title": "Implementation",
                             "objective": "deliver the file"
                         })
                         .to_string(),
@@ -2534,6 +2571,7 @@ mod tests {
                         name: "delegate".into(),
                         arguments: serde_json::json!({
                             "role": "manager",
+                            "title": "Quality",
                             "objective": "deliver"
                         })
                         .to_string(),
@@ -2627,6 +2665,53 @@ mod tests {
                 && event.payload["summary"]
                     .as_str()
                     .is_some_and(|summary| summary.contains("write scope violation"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn requires_a_title_for_managers() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "objective": "unowned department"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("no manager".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "title check".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "title check").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        assert!(!agents.iter().any(|agent| agent.role == "manager"));
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "delegate"
+                && event.payload["is_error"] == true
         }));
     }
 
