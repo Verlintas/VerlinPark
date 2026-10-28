@@ -11,7 +11,7 @@ This file is for coding agents working in this repository. Read it before changi
 
 ## Current milestone
 
-**M2 four-tier delegation.** The single-Leader runtime, worktree, approvals, diff, commit/discard, token budgets, cancellation, and persisted plan exist. The Leader can recursively delegate through Manager → Worker → Labour using `delegate`. Managers are read-only, Workers get isolated task worktrees, Labour inherits the Worker worktree, and successful Worker commits are serially merged into the session branch. Session diffs are based on the stored base commit. The parallel scheduler, task DAG, write-scope locks, Verifier/Integrator gates, merge queue, capacity controller, computer lease, per-role models, USD/time budgets, and auto-expansion are **not** implemented yet. Do not pretend they are.
+**M2 four-tier delegation.** The single-Leader runtime, worktree, approvals, diff, commit/discard, token budgets, cancellation, and persisted plan exist. The Leader can recursively delegate through Manager → Worker → Labour using `delegate`. Managers are read-only, Workers get isolated task worktrees, Labour inherits the Worker worktree, and successful Worker commits are serially merged into the session branch. Session diffs are based on the stored base commit. Managers can run 1–5 Workers in parallel via `delegate_many`; parallel tasks must declare non-overlapping write scopes, and final changed paths are checked before serial integration. The full task DAG scheduler, global write-scope locks, Verifier/Integrator gates, merge queue, capacity controller, computer lease, per-role models, USD/time budgets, and auto-expansion are **not** implemented yet. Do not pretend they are.
 
 ## Invariants
 

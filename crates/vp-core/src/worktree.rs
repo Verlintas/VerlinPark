@@ -136,6 +136,21 @@ pub fn create_task(
     })
 }
 
+pub fn changed_paths(worktree: &Path, base: &str) -> Result<Vec<String>> {
+    let tracked = git_output(worktree, &["diff", "--name-only", base])?;
+    let untracked = git_output(worktree, &["ls-files", "--others", "--exclude-standard"])?;
+    let mut paths = tracked
+        .lines()
+        .chain(untracked.lines())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 pub fn commit_all(worktree: &Path, message: &str) -> Result<Option<String>> {
     let status = git_output(worktree, &["status", "--porcelain"])?;
     if status.trim().is_empty() {

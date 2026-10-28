@@ -466,7 +466,7 @@ loop {
 
 ## 7. Agent Runtime
 
-> **实现状态（M2 第二切片）：** 当前实现是 Leader → Manager → Worker → Labour 的同步递归委派；Manager 只读，Worker 有独立 task worktree，Labour 继承 Worker worktree，Worker 完成后串行 commit + merge 到 session 分支；session diff 从 base commit 起算。并行调度、task DAG、写作用域锁、merge queue、Verifier/Integrator gate 仍是设计目标：
+> **实现状态（M2 第三切片）：** Leader → Manager → Worker → Labour 委派；Manager 可用 `delegate_many` 并行启动 1–5 个 Worker，每个 Worker 有独立 task worktree 和非重叠 write scope；完成后按任务顺序串行 commit + merge 到 session 分支；session diff 从 base commit 起算。完整 task DAG 调度器、全局写锁、merge queue、Verifier/Integrator gate 仍是设计目标：
 > `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`、`crates/vp-core/src/worktree.rs`。
 > 四层 Actor、并行只读工具、预算、压缩和恢复仍是设计目标。
 > 见 [ADR-0015](adr/0015-m1-leader-loop.md)、[ADR-0016](adr/0016-session-worktree.md)、[ADR-0019](adr/0019-four-tier-delegation.md)。

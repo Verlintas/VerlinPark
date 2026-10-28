@@ -16,6 +16,8 @@
 | 任务 worktree | ✅ | Worker 独立 worktree/branch；Labour 继承 Worker worktree；Leader/Manager 用 session worktree |
 | 串行集成 | ✅ | Worker 完成后内部 commit + `--no-ff` 合并到 session 分支；冲突 abort、标记 Worker failed、保留分支 |
 | Base diff | ✅ | session 记录 base_commit；diff 对比 base..worktree，已合并/已提交的 Worker 改动仍可审阅 |
+| 并行 Worker | ✅ | Manager `delegate_many` 一次启动 1–5 个 Worker；独立 task worktree；`join_all` 并发执行，完成后按任务顺序串行集成 |
+| Write scope | ✅ | 并行任务必须声明不重叠 `write_scope`；集成前检查 tracked + untracked 变更，越界 Worker 失败且不合并 |
 | 审批归属 | ✅ | 审批事件带 `agent_id/agent_name/agent_role`；审批卡显示发起 Agent |
 | 边界 | ✅ | 串行、同一 session worktree；per-task worktree/并行/merge queue 尚未实现 |
 
@@ -42,12 +44,12 @@
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 35 个：session/task worktree、串行集成、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
+| 测试 | ✅ | Rust 38 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M2 尚未完成：**
 
-- 并行 Worker / task DAG 调度 / 写作用域锁 / merge queue；当前 Worker 有独立 task worktree，但集成是串行、无 Verifier gate。
+- 完整 task DAG / 全局调度器 / merge queue / Verifier gate；当前并行 Worker 由 Manager 显式 `delegate_many` 触发，集成串行且无独立验证。
 - 完整权限代理（命令分类/路径策略）；当前 Manager 只读、Worker/Labour 可写，写/Shell 仍需审批。
 - 上下文压缩、pause/resume、checkpoint（取消与 token 硬停已落地）。
 - 只读工具并行、MCP/ACP、逐 hunk review、终端、真实 Collab 节点。

@@ -137,6 +137,8 @@ struct AgentSpec {
     branch: String,
     session_worktree: PathBuf,
     session_branch: String,
+    write_scope: Vec<String>,
+    base_commit: String,
 }
 
 struct SessionBudget {
@@ -507,6 +509,8 @@ async fn run_agent(
         branch: session_branch.clone(),
         session_worktree: worktree.clone(),
         session_branch,
+        write_scope: Vec::new(),
+        base_commit: session.base_commit.clone().unwrap_or_default(),
     };
     let budget = SessionBudget::new(
         session.token_budget,
@@ -605,6 +609,38 @@ async fn run_agent(
     Ok(())
 }
 
+fn normalize_scope(scope: &str) -> String {
+    scope
+        .trim()
+        .trim_start_matches("./")
+        .trim_end_matches("/**")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn path_in_scope(path: &str, scopes: &[String]) -> bool {
+    if scopes.is_empty() {
+        return true;
+    }
+    scopes.iter().any(|scope| {
+        let scope = normalize_scope(scope);
+        scope == "*" || scope == "**" || path == scope || path.starts_with(&format!("{scope}/"))
+    })
+}
+
+fn scopes_overlap(left: &[String], right: &[String]) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return true;
+    }
+    left.iter().any(|a| {
+        let a = normalize_scope(a);
+        right.iter().any(|b| {
+            let b = normalize_scope(b);
+            a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+        })
+    })
+}
+
 struct IntegrationResult {
     commit: Option<String>,
     merged: bool,
@@ -616,7 +652,20 @@ async fn integrate_worker(spec: &AgentSpec, name: &str) -> Result<IntegrationRes
     let branch = spec.branch.clone();
     let message = format!("task: {name}");
     let merge_message = format!("merge {name}");
+    let write_scope = spec.write_scope.clone();
+    let base_commit = spec.base_commit.clone();
     tokio::task::spawn_blocking(move || -> Result<IntegrationResult> {
+        if !write_scope.is_empty() {
+            let paths = worktree::changed_paths(&task_worktree, &base_commit)?;
+            let outside = paths
+                .iter()
+                .filter(|path| !path_in_scope(path, &write_scope))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !outside.is_empty() {
+                return Err(anyhow!("write scope violation: {}", outside.join(", ")));
+            }
+        }
         let commit = worktree::commit_all(&task_worktree, &message)?;
         let Some(commit) = commit else {
             return Ok(IntegrationResult {
@@ -804,12 +853,13 @@ async fn run_loop(
             let input: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
             let is_delegate = call.name == "delegate";
+            let is_delegate_many = call.name == "delegate_many" && spec.role == AgentRole::Manager;
             let is_todo = call.name == "todo_write" && spec.role == AgentRole::Leader;
             let registry_tool = config
                 .tools
                 .get(&call.name)
                 .filter(|_| spec.role.allows_tool(&call.name));
-            let requires_approval = if is_delegate || is_todo {
+            let requires_approval = if is_delegate || is_delegate_many || is_todo {
                 false
             } else {
                 registry_tool
@@ -847,6 +897,30 @@ async fn run_loop(
 
             let output = if !approved {
                 ToolOutput::error("The user denied this tool call.")
+            } else if is_delegate_many {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_parallel_workers(
+                    engine, config, session, project, control, budget, spec, &input,
+                )
+                .await?
+                {
+                    ParallelResult::Output(output) => output,
+                    ParallelResult::Cancelled => return Ok(LoopOutcome::Cancelled),
+                    ParallelResult::BudgetExceeded => {
+                        return Ok(LoopOutcome::BudgetExceeded);
+                    }
+                }
             } else if is_delegate {
                 emit(
                     engine,
@@ -878,7 +952,9 @@ async fn run_loop(
                                     &config.model,
                                 )
                                 .await?;
-                            let (child_worktree, child_branch) = match role {
+                            let write_scope = parse_write_scope(&input)?;
+                            let (child_worktree, child_branch, child_base, child_scope) = match role
+                            {
                                 AgentRole::Worker => {
                                     let info = engine
                                         .create_task_worktree(
@@ -889,15 +965,26 @@ async fn run_loop(
                                             &spec.session_branch,
                                         )
                                         .await?;
-                                    (info.path, info.branch)
+                                    (info.path, info.branch, info.base_commit, write_scope)
                                 }
-                                AgentRole::Manager => {
-                                    (spec.session_worktree.clone(), spec.session_branch.clone())
-                                }
-                                AgentRole::Labour => (spec.worktree.clone(), spec.branch.clone()),
-                                AgentRole::Leader => {
-                                    (spec.session_worktree.clone(), spec.session_branch.clone())
-                                }
+                                AgentRole::Manager => (
+                                    spec.session_worktree.clone(),
+                                    spec.session_branch.clone(),
+                                    spec.base_commit.clone(),
+                                    Vec::new(),
+                                ),
+                                AgentRole::Labour => (
+                                    spec.worktree.clone(),
+                                    spec.branch.clone(),
+                                    spec.base_commit.clone(),
+                                    spec.write_scope.clone(),
+                                ),
+                                AgentRole::Leader => (
+                                    spec.session_worktree.clone(),
+                                    spec.session_branch.clone(),
+                                    spec.base_commit.clone(),
+                                    Vec::new(),
+                                ),
                             };
                             engine
                                 .set_agent_worktree(
@@ -916,6 +1003,8 @@ async fn run_loop(
                                 branch: child_branch,
                                 session_worktree: spec.session_worktree.clone(),
                                 session_branch: spec.session_branch.clone(),
+                                write_scope: child_scope,
+                                base_commit: child_base,
                             };
                             emit(
                                 engine,
@@ -1204,9 +1293,45 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole) -> Vec<ToolSchema> {
                     },
                     "name": {"type": "string"},
                     "objective": {"type": "string"},
-                    "instructions": {"type": "string"}
+                    "instructions": {"type": "string"},
+                    "write_scope": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string"}
+                    }
                 },
                 "required": ["role", "objective"]
+            }),
+        });
+    }
+    if role == AgentRole::Manager {
+        tools.push(ToolSchema {
+            name: "delegate_many".to_string(),
+            description: "Run 1-5 Workers in parallel. Each task must declare a non-overlapping write_scope when more than one task is provided.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 5,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "objective": {"type": "string"},
+                                "instructions": {"type": "string"},
+                                "write_scope": {
+                                    "type": "array",
+                                    "maxItems": 20,
+                                    "items": {"type": "string"}
+                                }
+                            },
+                            "required": ["objective", "write_scope"]
+                        }
+                    }
+                },
+                "required": ["tasks"]
             }),
         });
     }
@@ -1257,6 +1382,339 @@ fn parse_delegate(
     Ok((role, name, objective))
 }
 
+fn parse_write_scope(input: &serde_json::Value) -> Result<Vec<String>> {
+    let Some(items) = input.get("write_scope") else {
+        return Ok(Vec::new());
+    };
+    let items = items
+        .as_array()
+        .ok_or_else(|| anyhow!("write_scope must be an array"))?;
+    if items.len() > 20 {
+        return Err(anyhow!("at most 20 write scopes are allowed"));
+    }
+    let mut scopes = Vec::with_capacity(items.len());
+    for item in items {
+        let scope = item
+            .as_str()
+            .ok_or_else(|| anyhow!("write_scope entries must be strings"))?;
+        let scope = normalize_scope(scope);
+        if scope.is_empty()
+            || scope.contains("..")
+            || scope.starts_with('/')
+            || scope.starts_with('~')
+        {
+            return Err(anyhow!("invalid write scope: {scope}"));
+        }
+        scopes.push(scope);
+    }
+    Ok(scopes)
+}
+
+struct ParallelTask {
+    name: Option<String>,
+    objective: String,
+    scope: Vec<String>,
+}
+
+enum ParallelResult {
+    Output(ToolOutput),
+    Cancelled,
+    BudgetExceeded,
+}
+
+fn parse_parallel_tasks(input: &serde_json::Value) -> Result<Vec<ParallelTask>> {
+    let tasks = input
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("tasks is required"))?;
+    if tasks.is_empty() || tasks.len() > 5 {
+        return Err(anyhow!("delegate_many accepts 1 to 5 tasks"));
+    }
+    let mut parsed = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let objective = task
+            .get("objective")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|objective| !objective.is_empty() && objective.len() <= 4000)
+            .ok_or_else(|| anyhow!("each task needs an objective (max 4000 chars)"))?;
+        let instructions = task
+            .get("instructions")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|instructions| !instructions.is_empty() && instructions.len() <= 4000);
+        let objective = match instructions {
+            Some(instructions) => format!("{objective}\n\nInstructions:\n{instructions}"),
+            None => objective.to_string(),
+        };
+        let name = task
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && name.len() <= 80)
+            .map(ToOwned::to_owned);
+        let scope = parse_write_scope(task)?;
+        if tasks.len() > 1 && scope.is_empty() {
+            return Err(anyhow!(
+                "parallel Workers require a non-empty write_scope for every task"
+            ));
+        }
+        parsed.push(ParallelTask {
+            name,
+            objective,
+            scope,
+        });
+    }
+    for (index, left) in parsed.iter().enumerate() {
+        for right in parsed.iter().skip(index + 1) {
+            if scopes_overlap(&left.scope, &right.scope) {
+                return Err(anyhow!(
+                    "write scopes overlap: {} and {}",
+                    left.scope.join(","),
+                    right.scope.join(",")
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_parallel_workers(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    control: &RunControl,
+    budget: &SessionBudget,
+    spec: &AgentSpec,
+    input: &serde_json::Value,
+) -> Result<ParallelResult> {
+    let tasks = parse_parallel_tasks(input)?;
+    let mut prepared = Vec::new();
+    for task in tasks {
+        if control.is_cancelled() {
+            return Ok(ParallelResult::Cancelled);
+        }
+        let Some(ordinal) = budget.reserve(AgentRole::Worker) else {
+            return Ok(ParallelResult::Output(ToolOutput::error(
+                "the Worker cap for this session has been reached",
+            )));
+        };
+        let child_name = task
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("Worker {}", ordinal));
+        let child = engine
+            .create_agent(
+                &session.id,
+                AgentRole::Worker.as_str(),
+                &child_name,
+                Some(spec.id.clone()),
+                &config.model,
+            )
+            .await?;
+        let info = engine
+            .create_task_worktree(
+                &project.root,
+                &project.id,
+                &session.id,
+                &child.id,
+                &spec.session_branch,
+            )
+            .await?;
+        engine
+            .set_agent_worktree(&child.id, &info.path.to_string_lossy(), &info.branch)
+            .await?;
+        let child_spec = AgentSpec {
+            id: child.id.clone(),
+            role: AgentRole::Worker,
+            name: child_name.clone(),
+            depth: spec.depth.saturating_add(1),
+            parent_name: Some(spec.name.clone()),
+            worktree: info.path,
+            branch: info.branch,
+            session_worktree: spec.session_worktree.clone(),
+            session_branch: spec.session_branch.clone(),
+            write_scope: task.scope.clone(),
+            base_commit: info.base_commit,
+        };
+        emit(
+            engine,
+            &session.id,
+            &child_spec,
+            "agent.spawned",
+            serde_json::json!({
+                "parent_id": spec.id,
+                "parent_name": spec.name,
+                "objective": truncate(&task.objective),
+                "write_scope": child_spec.write_scope,
+            }),
+        )
+        .await?;
+        let conversation = vec![ChatMessage::user(task.objective.clone())];
+        prepared.push((child_spec, task.objective, conversation));
+    }
+
+    let futures = prepared
+        .iter_mut()
+        .map(|(child_spec, objective, conversation)| {
+            run_loop(
+                engine,
+                config,
+                session,
+                project,
+                control,
+                budget,
+                child_spec,
+                objective,
+                conversation,
+                false,
+            )
+        });
+    let results = futures_util::future::join_all(futures).await;
+
+    let mut cancelled = false;
+    let mut budget_exceeded = false;
+    let mut handled = vec![false; prepared.len()];
+    for (index, result) in results.iter().enumerate() {
+        handled[index] = true;
+        match result {
+            Ok(LoopOutcome::Cancelled) => {
+                cancelled = true;
+                let (child_spec, _, _) = &prepared[index];
+                engine
+                    .update_agent_status(&child_spec.id, "cancelled")
+                    .await?;
+                emit(
+                    engine,
+                    &session.id,
+                    child_spec,
+                    "agent.finished",
+                    serde_json::json!({"status": "cancelled"}),
+                )
+                .await?;
+            }
+            Ok(LoopOutcome::BudgetExceeded) => {
+                budget_exceeded = true;
+                let (child_spec, _, _) = &prepared[index];
+                engine.update_agent_status(&child_spec.id, "failed").await?;
+                emit(
+                    engine,
+                    &session.id,
+                    child_spec,
+                    "agent.finished",
+                    serde_json::json!({
+                        "status": "failed",
+                        "summary": "token budget exhausted",
+                    }),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+    }
+    if cancelled || budget_exceeded {
+        let status = if cancelled { "cancelled" } else { "failed" };
+        for (index, (child_spec, _, _)) in prepared.iter().enumerate() {
+            if handled[index] {
+                continue;
+            }
+            engine.update_agent_status(&child_spec.id, status).await?;
+            emit(
+                engine,
+                &session.id,
+                child_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": status,
+                    "summary": "batch aborted before integration",
+                }),
+            )
+            .await?;
+        }
+        return if cancelled {
+            Ok(ParallelResult::Cancelled)
+        } else {
+            Ok(ParallelResult::BudgetExceeded)
+        };
+    }
+
+    let mut reports = Vec::new();
+    for (index, result) in results.into_iter().enumerate() {
+        let (child_spec, _, _) = &prepared[index];
+        match result {
+            Ok(LoopOutcome::Final(summary)) => {
+                let summary = if summary.trim().is_empty() {
+                    "The agent completed without a summary.".to_string()
+                } else {
+                    summary
+                };
+                match integrate_worker(child_spec, &child_spec.name).await {
+                    Ok(integration) => {
+                        engine.update_agent_status(&child_spec.id, "idle").await?;
+                        emit(
+                            engine,
+                            &session.id,
+                            child_spec,
+                            "agent.finished",
+                            serde_json::json!({
+                                "status": "idle",
+                                "summary": truncate(&summary),
+                                "commit": integration.commit,
+                                "merged": integration.merged,
+                                "worktree": child_spec.worktree,
+                                "branch": child_spec.branch,
+                            }),
+                        )
+                        .await?;
+                        reports.push(format!(
+                            "{}: merged={}\n{}",
+                            child_spec.name,
+                            integration.merged,
+                            truncate(&summary)
+                        ));
+                    }
+                    Err(error) => {
+                        engine.update_agent_status(&child_spec.id, "failed").await?;
+                        emit(
+                            engine,
+                            &session.id,
+                            child_spec,
+                            "agent.finished",
+                            serde_json::json!({
+                                "status": "failed",
+                                "summary": truncate(error.to_string().as_str()),
+                                "worktree": child_spec.worktree,
+                                "branch": child_spec.branch,
+                            }),
+                        )
+                        .await?;
+                        reports.push(format!("{}: integration failed: {error}", child_spec.name));
+                    }
+                }
+            }
+            Ok(LoopOutcome::Cancelled) | Ok(LoopOutcome::BudgetExceeded) => {}
+            Err(error) => {
+                engine.update_agent_status(&child_spec.id, "failed").await?;
+                emit(
+                    engine,
+                    &session.id,
+                    child_spec,
+                    "agent.finished",
+                    serde_json::json!({
+                        "status": "failed",
+                        "summary": truncate(error.to_string().as_str()),
+                    }),
+                )
+                .await?;
+                reports.push(format!("{}: failed: {error}", child_spec.name));
+            }
+        }
+    }
+    Ok(ParallelResult::Output(ToolOutput::ok(reports.join("\n\n"))))
+}
+
 fn role_system_prompt(
     role: AgentRole,
     project: &Project,
@@ -1265,11 +1723,19 @@ fn role_system_prompt(
     objective: &str,
 ) -> String {
     let worktree = spec.worktree.to_string_lossy();
+    let scope_note = if spec.write_scope.is_empty() {
+        "Write scope: unrestricted within the worktree.".to_string()
+    } else {
+        format!(
+            "Write scope: {}. Changes outside this scope are rejected before integration.",
+            spec.write_scope.join(", ")
+        )
+    };
     let base = format!(
-        "Project: '{}' at {}. Session goal: '{}'. Worktree: {}. Branch: {}. \
+        "Project: '{}' at {}. Session goal: '{}'. Worktree: {}. Branch: {}. {} \
          The project root is read-only; all writes stay inside the worktree. \
          Do not claim success without evidence.",
-        project.name, project.root, session.goal, worktree, spec.branch
+        project.name, project.root, session.goal, worktree, spec.branch, scope_note
     );
     match role {
         AgentRole::Leader => format!(
@@ -1286,9 +1752,11 @@ fn role_system_prompt(
             "{base}\n\
              You are Manager {}, reporting to {}. Objective: {objective}. \
              You may read and search, but you must not edit files or run shell commands. \
-             Split the objective into focused Worker tasks and call delegate(role=\"worker\") \
-             for each. Review the returned summaries, resolve gaps, then return a concise \
-             consolidated result. Do not delegate to Managers or Labour.",
+             Split the objective into focused Worker tasks. For independent tasks, use \
+             delegate_many(tasks=[...]) with non-overlapping write_scope values so Workers \
+             run in parallel; otherwise use delegate(role=\"worker\"). Review the returned \
+             summaries, resolve gaps, then return a concise consolidated result. \
+             Do not delegate to Managers or Labour.",
             spec.name,
             spec.parent_name.as_deref().unwrap_or("the Leader")
         ),
@@ -1560,6 +2028,109 @@ mod tests {
         assert!(error.to_string().contains("model is required"));
     }
 
+    struct RoutingProvider {
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RoutingProvider {
+        fn new() -> Self {
+            Self {
+                active: std::sync::atomic::AtomicUsize::new(0),
+                max_active: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RoutingProvider {
+        fn id(&self) -> &str {
+            "routing"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+            let last_is_tool = request
+                .messages
+                .last()
+                .is_some_and(|message| message.role == "tool");
+            let user_text = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let events = if last_is_tool {
+                if user_text.contains("parallel goal") {
+                    vec![
+                        StreamEvent::TextDelta("leader done".into()),
+                        StreamEvent::Done,
+                    ]
+                } else {
+                    vec![
+                        StreamEvent::TextDelta("department done".into()),
+                        StreamEvent::Done,
+                    ]
+                }
+            } else if user_text.contains("parallel goal") {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "objective": "department"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else if user_text.contains("department") {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_many".into(),
+                        name: "delegate_many".into(),
+                        arguments: serde_json::json!({
+                            "tasks": [
+                                {
+                                    "name": "Worker A",
+                                    "objective": "task A",
+                                    "write_scope": ["src/a"]
+                                },
+                                {
+                                    "name": "Worker B",
+                                    "objective": "task B",
+                                    "write_scope": ["src/b"]
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else {
+                let current = self
+                    .active
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.max_active
+                    .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.active
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let text = if user_text.contains("task A") {
+                    "A done"
+                } else {
+                    "B done"
+                };
+                vec![StreamEvent::TextDelta(text.into()), StreamEvent::Done]
+            };
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+
     fn init_repo(path: &Path) {
         for args in [
             vec!["init", "-q"],
@@ -1783,7 +2354,8 @@ mod tests {
                         name: "delegate".into(),
                         arguments: serde_json::json!({
                             "role": "worker",
-                            "objective": "write worker.txt"
+                            "objective": "write worker.txt",
+                            "write_scope": ["worker.txt"]
                         })
                         .to_string(),
                     }),
@@ -1876,6 +2448,186 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions[0].status, "idle");
+    }
+
+    #[test]
+    fn matches_write_scopes() {
+        assert!(path_in_scope("src/a.rs", &["src".to_string()]));
+        assert!(path_in_scope("src/a.rs", &["src/**".to_string()]));
+        assert!(!path_in_scope("docs/a.md", &["src".to_string()]));
+        assert!(path_in_scope("anything", &[]));
+        assert!(scopes_overlap(
+            &["src".to_string()],
+            &["src/components".to_string()]
+        ));
+        assert!(!scopes_overlap(&["src".to_string()], &["docs".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn runs_parallel_workers_in_isolated_scopes() {
+        let dir = TempDir::new().unwrap();
+        let provider = Arc::new(RoutingProvider::new());
+        let provider_trait: Arc<dyn Provider> = provider.clone();
+        let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+        let session = engine
+            .create_session(project.id, "parallel goal".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "parallel goal").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        assert!(
+            provider
+                .max_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "workers did not run concurrently"
+        );
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let workers = agents
+            .iter()
+            .filter(|agent| agent.role == "worker")
+            .collect::<Vec<_>>();
+        assert_eq!(workers.len(), 2);
+        assert!(workers.iter().all(|worker| worker.status == "idle"));
+        assert!(workers.iter().all(|worker| worker.branch.is_some()));
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "agent.spawned")
+                .count(),
+            3
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "agent.message" && event.payload["text"] == "A done")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "agent.message" && event.payload["text"] == "B done")
+        );
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "idle");
+    }
+
+    #[tokio::test]
+    async fn rejects_worker_changes_outside_the_write_scope() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "objective": "deliver"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "write outside the scope",
+                            "write_scope": ["src"]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "docs/out.txt",
+                            "content": "outside\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker wrote".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "scope".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..100 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        service.start(&session.id, "scope").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        approver.abort();
+
+        let worktree = session.worktree.clone().unwrap();
+        assert!(
+            !std::path::Path::new(&worktree)
+                .join("docs/out.txt")
+                .exists()
+        );
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
+        assert_eq!(worker.status, "failed");
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.finished"
+                && event.payload["agent_role"] == "worker"
+                && event.payload["status"] == "failed"
+                && event.payload["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("write scope violation"))
+        }));
     }
 
     #[tokio::test]
