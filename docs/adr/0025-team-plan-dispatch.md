@@ -1,6 +1,6 @@
 # ADR-0025: Automatic TeamPlan dispatch with fewer hard caps
 
-- **Status:** Accepted
+- **Status:** Accepted; capacity defaults superseded by ADR-0026
 - **Date:** 2026-10-29
 
 ## Context

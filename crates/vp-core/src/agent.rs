@@ -11,7 +11,8 @@ use futures_util::StreamExt;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
-    AgentInfo, ConfigureAgentParams, PlanTask, Project, Session, StoredMessage, TeamPlan, TodoItem,
+    AgentInfo, ConfigureAgentParams, PlanDepartment, PlanTask, Project, Session, StoredMessage,
+    TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, StreamEvent,
@@ -256,7 +257,7 @@ impl SessionBudget {
         let (counter, cap) = match role {
             AgentRole::Manager => (&mut state.managers, self.caps.managers),
             AgentRole::Worker => (&mut state.workers, self.caps.workers),
-            AgentRole::Verifier => (&mut state.verifiers, 1000),
+            AgentRole::Verifier => (&mut state.verifiers, 100),
             AgentRole::Labour => (&mut state.labour, self.caps.labour),
             AgentRole::Leader => return None,
         };
@@ -350,15 +351,15 @@ impl AgentService {
                 max_managers: env::var("VERLINPARK_MAX_MANAGERS")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(8),
+                    .unwrap_or(5),
                 max_workers: env::var("VERLINPARK_MAX_WORKERS")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(32),
+                    .unwrap_or(10),
                 max_labour: env::var("VERLINPARK_MAX_LABOUR")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(128),
+                    .unwrap_or(40),
                 tools: ToolRegistry::default_tools(),
             },
         )
@@ -413,9 +414,9 @@ impl AgentService {
             base_url: Some(base_url),
             max_turns: params.max_turns.unwrap_or(20).clamp(1, 200),
             max_tokens: params.max_tokens.or(Some(4096)),
-            max_managers: params.max_managers.unwrap_or(8).clamp(1, 32) as usize,
-            max_workers: params.max_workers.unwrap_or(32).clamp(1, 128) as usize,
-            max_labour: params.max_labour.unwrap_or(128).clamp(1, 512) as usize,
+            max_managers: params.max_managers.unwrap_or(5).clamp(1, 5) as usize,
+            max_workers: params.max_workers.unwrap_or(10).clamp(1, 10) as usize,
+            max_labour: params.max_labour.unwrap_or(40).clamp(1, 40) as usize,
             tools: ToolRegistry::default_tools(),
         };
         *self
@@ -1987,7 +1988,7 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
                     },
                     "tasks": {
                         "type": "array",
-                        "maxItems": 500,
+                        "maxItems": 100,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2046,7 +2047,7 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
                     "tasks": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 20,
+                        "maxItems": 10,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2221,8 +2222,8 @@ fn parse_parallel_tasks(
         .get("tasks")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow!("tasks is required"))?;
-    if tasks.is_empty() || tasks.len() > 20 {
-        return Err(anyhow!("delegate_many accepts 1 to 20 tasks"));
+    if tasks.is_empty() || tasks.len() > 10 {
+        return Err(anyhow!("delegate_many accepts 1 to 10 tasks"));
     }
     let mut parsed = Vec::with_capacity(tasks.len());
     for task in tasks {
@@ -2566,8 +2567,8 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
             ));
         }
     }
-    if plan.tasks.len() > 500 {
-        return Err(anyhow!("team plan supports at most 500 tasks"));
+    if plan.tasks.len() > 100 {
+        return Err(anyhow!("team plan supports at most 100 tasks"));
     }
     let mut ids = std::collections::HashSet::new();
     for task in &plan.tasks {
@@ -2671,6 +2672,93 @@ fn task_profile(task: &PlanTask, department_profile: AgentProfile) -> AgentProfi
     }
 }
 
+async fn ensure_plan_manager(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    leader_spec: &AgentSpec,
+    department: &PlanDepartment,
+) -> Result<AgentSpec> {
+    let profile = AgentProfile::parse(&department.profile)
+        .ok_or_else(|| anyhow!("unknown profile: {}", department.profile))?;
+    let existing = engine
+        .list_agents(&session.id)
+        .await?
+        .into_iter()
+        .find(|agent| {
+            agent.role == "manager"
+                && agent
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.eq_ignore_ascii_case(&department.manager_title))
+        });
+    let agent = match existing {
+        Some(agent) => {
+            engine
+                .set_agent_profile(&agent.id, profile.as_str())
+                .await?;
+            engine.update_agent_status(&agent.id, "idle").await?;
+            agent
+        }
+        None => {
+            let agent = engine
+                .create_agent(
+                    &session.id,
+                    AgentRole::Manager.as_str(),
+                    &department.manager_title,
+                    Some(department.manager_title.clone()),
+                    Some(leader_spec.id.clone()),
+                    &config.model,
+                )
+                .await?;
+            engine
+                .set_agent_profile(&agent.id, profile.as_str())
+                .await?;
+            engine.update_agent_status(&agent.id, "idle").await?;
+            agent
+        }
+    };
+    let session_worktree = session
+        .worktree
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let session_branch = session.branch.clone().unwrap_or_default();
+    let spec = AgentSpec {
+        id: agent.id.clone(),
+        role: AgentRole::Manager,
+        name: agent.name.clone(),
+        depth: 1,
+        parent_name: Some(leader_spec.name.clone()),
+        title: Some(department.manager_title.clone()),
+        profile,
+        worktree: session_worktree.clone(),
+        branch: session_branch.clone(),
+        session_worktree,
+        session_branch,
+        write_scope: Vec::new(),
+        base_commit: session.base_commit.clone().unwrap_or_default(),
+    };
+    engine
+        .set_agent_worktree(&agent.id, &spec.worktree.to_string_lossy(), &spec.branch)
+        .await?;
+    emit(
+        engine,
+        &session.id,
+        &spec,
+        "agent.spawned",
+        serde_json::json!({
+            "parent_id": leader_spec.id,
+            "parent_name": leader_spec.name,
+            "objective": department.objective,
+            "department": department.name,
+            "lazy": true,
+        }),
+    )
+    .await?;
+    Ok(spec)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_team_plan(
     engine: &Engine,
@@ -2682,112 +2770,8 @@ async fn execute_team_plan(
     leader_spec: &AgentSpec,
     plan: &TeamPlan,
 ) -> Result<PlanRunResult> {
-    let mut manager_specs = std::collections::HashMap::new();
-    for department in &plan.departments {
-        let profile = AgentProfile::parse(&department.profile)
-            .ok_or_else(|| anyhow!("unknown profile: {}", department.profile))?;
-        let existing = engine
-            .list_agents(&session.id)
-            .await?
-            .into_iter()
-            .find(|agent| {
-                agent.role == "manager"
-                    && agent
-                        .title
-                        .as_deref()
-                        .is_some_and(|title| title.eq_ignore_ascii_case(&department.manager_title))
-            });
-        let agent = match existing {
-            Some(agent) => {
-                engine
-                    .set_agent_profile(&agent.id, profile.as_str())
-                    .await?;
-                engine.update_agent_status(&agent.id, "idle").await?;
-                agent
-            }
-            None => {
-                let agent = engine
-                    .create_agent(
-                        &session.id,
-                        AgentRole::Manager.as_str(),
-                        &department.manager_title,
-                        Some(department.manager_title.clone()),
-                        Some(leader_spec.id.clone()),
-                        &config.model,
-                    )
-                    .await?;
-                engine
-                    .set_agent_profile(&agent.id, profile.as_str())
-                    .await?;
-                engine.update_agent_status(&agent.id, "idle").await?;
-                let spec = AgentSpec {
-                    id: agent.id.clone(),
-                    role: AgentRole::Manager,
-                    name: agent.name.clone(),
-                    depth: 1,
-                    parent_name: Some(leader_spec.name.clone()),
-                    title: Some(department.manager_title.clone()),
-                    profile,
-                    worktree: session
-                        .worktree
-                        .clone()
-                        .map(PathBuf::from)
-                        .unwrap_or_default(),
-                    branch: session.branch.clone().unwrap_or_default(),
-                    session_worktree: session
-                        .worktree
-                        .clone()
-                        .map(PathBuf::from)
-                        .unwrap_or_default(),
-                    session_branch: session.branch.clone().unwrap_or_default(),
-                    write_scope: Vec::new(),
-                    base_commit: session.base_commit.clone().unwrap_or_default(),
-                };
-                engine
-                    .set_agent_worktree(&agent.id, &spec.worktree.to_string_lossy(), &spec.branch)
-                    .await?;
-                emit(
-                    engine,
-                    &session.id,
-                    &spec,
-                    "agent.spawned",
-                    serde_json::json!({
-                        "parent_id": leader_spec.id,
-                        "parent_name": leader_spec.name,
-                        "objective": department.objective,
-                        "department": department.name,
-                    }),
-                )
-                .await?;
-                manager_specs.insert(department.name.clone(), spec);
-                continue;
-            }
-        };
-        let spec = AgentSpec {
-            id: agent.id,
-            role: AgentRole::Manager,
-            name: agent.name,
-            depth: 1,
-            parent_name: Some(leader_spec.name.clone()),
-            title: Some(department.manager_title.clone()),
-            profile,
-            worktree: session
-                .worktree
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-            branch: session.branch.clone().unwrap_or_default(),
-            session_worktree: session
-                .worktree
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-            session_branch: session.branch.clone().unwrap_or_default(),
-            write_scope: Vec::new(),
-            base_commit: session.base_commit.clone().unwrap_or_default(),
-        };
-        manager_specs.insert(department.name.clone(), spec);
-    }
+    let mut manager_specs: std::collections::HashMap<String, AgentSpec> =
+        std::collections::HashMap::new();
 
     let mut statuses = plan
         .tasks
@@ -2873,10 +2857,19 @@ async fn execute_team_plan(
 
         let mut prepared = Vec::new();
         for task in &batch {
-            let manager_spec = manager_specs
-                .get(&task.department)
-                .ok_or_else(|| anyhow!("missing manager for department {}", task.department))?
-                .clone();
+            let manager_spec = if let Some(spec) = manager_specs.get(&task.department) {
+                spec.clone()
+            } else {
+                let department = plan
+                    .departments
+                    .iter()
+                    .find(|department| department.name == task.department)
+                    .ok_or_else(|| anyhow!("missing department for task {}", task.department))?;
+                let spec =
+                    ensure_plan_manager(engine, config, session, leader_spec, department).await?;
+                manager_specs.insert(task.department.clone(), spec.clone());
+                spec
+            };
             let profile = task_profile(task, manager_spec.profile);
             let acceptance = task.acceptance.join("; ");
             let write_scope = task
