@@ -24,6 +24,7 @@
 | Agent Profile | ✅ | 结构角色与领域 profile 分离：coding / research / verification / generic；profile 决定工具集与 prompt |
 | Research 工具 | ✅ | `fetch_url`：仅公网 HTTP(S)、阻止 localhost/private IP、不跟随重定向、超时与输出截断 |
 | TeamPlan 自动派发 | ✅ | `run_team_plan` 按依赖批次并发执行 ready tasks；Manager 懒创建，Worker 并发受 cap 限制；Verifier gate + 集成；失败阻塞依赖；任务/计划事件可审计 |
+| Task Board | ✅ | Preview → Plan 显示 departments / tasks / deps / 实时状态；`plan_task.started/finished` 驱动 UI |
 | 容量右尺寸 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；Manager 按 ready task 懒创建；plan 最多 100 tasks；delegate_many 最多 10；预算仍是主硬停 |
 | 审批归属 | ✅ | 审批事件带 `agent_id/agent_name/agent_role`；审批卡显示发起 Agent |
 | 边界 | ✅ | 串行、同一 session worktree；per-task worktree/并行/merge queue 尚未实现 |

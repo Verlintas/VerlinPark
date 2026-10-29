@@ -30,6 +30,7 @@ final class AppModel {
     var todos: [TodoItem] = []
     var agents: [AgentRecord] = []
     var teamPlan: TeamPlan?
+    var planTaskStatuses: [String: String] = [:]
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -102,6 +103,7 @@ final class AppModel {
             todos = []
             agents = []
             teamPlan = nil
+            planTaskStatuses = [:]
             lastCommit = nil
             mode = .resident
             return
@@ -115,6 +117,7 @@ final class AppModel {
         todos = []
         agents = []
         teamPlan = nil
+        planTaskStatuses = [:]
         lastCommit = nil
         Task { await loadSessions() }
     }
@@ -132,6 +135,7 @@ final class AppModel {
         todos = []
         agents = []
         teamPlan = nil
+        planTaskStatuses = [:]
         lastCommit = nil
         Task {
             await loadEvents()
@@ -198,6 +202,7 @@ final class AppModel {
             selectedSessionID = session.id
             mode = .project
             events = try await core.listEvents(sessionID: session.id)
+            refreshPlanTaskStatuses()
             sessionDiff = try? await core.sessionDiff(sessionID: session.id)
             todos = await (try? core.sessionTodos(sessionID: session.id)) ?? []
             lastCommit = nil
@@ -442,9 +447,24 @@ final class AppModel {
         }
         do {
             events = try await core.listEvents(sessionID: sessionID)
+            refreshPlanTaskStatuses()
         } catch {
             handle(error)
         }
+    }
+
+    private func refreshPlanTaskStatuses() {
+        var statuses: [String: String] = [:]
+        for event in events {
+            guard event.type == "plan_task.started" || event.type == "plan_task.finished",
+                  let taskID = event.payload.objectValue?["task_id"]?.stringValue,
+                  let status = event.payload.objectValue?["task_status"]?.stringValue
+            else {
+                continue
+            }
+            statuses[taskID] = status
+        }
+        planTaskStatuses = statuses
     }
 
     private func consumeEvents() {
@@ -544,8 +564,17 @@ final class AppModel {
             Task { await self.loadAgents() }
         }
 
-        if event.sessionId == selectedSessionID, event.type == "team_plan.submitted" {
-            Task { await self.loadTeamPlan() }
+        if event.sessionId == selectedSessionID {
+            if event.type == "team_plan.submitted" {
+                planTaskStatuses = [:]
+                Task { await self.loadTeamPlan() }
+            }
+            if event.type == "plan_task.started" || event.type == "plan_task.finished",
+               let taskID = event.payload.objectValue?["task_id"]?.stringValue,
+               let status = event.payload.objectValue?["task_status"]?.stringValue
+            {
+                planTaskStatuses[taskID] = status
+            }
         }
 
         if event.sessionId == selectedSessionID,

@@ -216,8 +216,73 @@ struct CollabGraphView: View {
     }
 }
 
+private struct PlanTaskRow: View {
+    let task: PlanTask
+    let status: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 12)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Text(task.id)
+                        .font(.system(size: 8, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    Text(task.title)
+                        .font(.system(size: 10))
+                        .lineLimit(2)
+                }
+                HStack(spacing: 5) {
+                    Text(task.department)
+                    if let profile = task.profile {
+                        Text("· \(profile)")
+                    }
+                    if !task.deps.isEmpty {
+                        Text("· deps \(task.deps.joined(separator: ","))")
+                    }
+                }
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+            Text(status)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(color)
+        }
+        .padding(7)
+        .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var icon: String {
+        switch status {
+        case "running": "circle.lefthalf.filled"
+        case "completed": "checkmark.circle.fill"
+        case "failed", "blocked", "cancelled": "xmark.octagon"
+        default: "circle"
+        }
+    }
+
+    private var color: Color {
+        switch status {
+        case "running": .orange
+        case "completed": .green
+        case "failed", "blocked", "cancelled": .red
+        default: .secondary
+        }
+    }
+}
+
 struct TeamPlanCard: View {
+    @Environment(AppModel.self) private var model
     let plan: TeamPlan
+
+    private var completed: Int {
+        plan.tasks.count { model.planTaskStatuses[$0.id] == "completed" }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -226,7 +291,7 @@ struct TeamPlanCard: View {
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("\(plan.departments.count) dept · \(plan.tasks.count) tasks")
+                Text("\(completed)/\(plan.tasks.count) tasks · \(plan.departments.count) dept")
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
@@ -645,6 +710,8 @@ struct PreviewPanelView: View {
                 switch mode {
                 case .changes:
                     changes
+                case .plan:
+                    plan
                 case .trace:
                     trace
                 }
@@ -820,6 +887,54 @@ struct PreviewPanelView: View {
     }
 
     @ViewBuilder
+    private var plan: some View {
+        if let plan = model.teamPlan {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(plan.goal)
+                            .font(.system(size: 12, weight: .semibold))
+                        Text(
+                            "\(plan.departments.count) departments · \(plan.tasks.count) tasks"
+                        )
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    }
+                    ForEach(plan.departments) { department in
+                        HStack(spacing: 6) {
+                            Image(systemName: "person.2")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                            Text(department.managerTitle)
+                                .font(.system(size: 10, weight: .medium))
+                            Text("\(department.profile)")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                            Spacer()
+                        }
+                    }
+                    Divider().opacity(0.25)
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        ForEach(plan.tasks) { task in
+                            PlanTaskRow(
+                                task: task,
+                                status: model.planTaskStatuses[task.id] ?? "pending"
+                            )
+                        }
+                    }
+                }
+                .padding(12)
+            }
+        } else {
+            StudioEmptyView(
+                icon: "list.bullet.clipboard",
+                title: "No team plan",
+                detail: "The Leader can submit a TeamPlan with departments, profiles, and a task DAG."
+            )
+        }
+    }
+
+    @ViewBuilder
     private var trace: some View {
         if model.events.isEmpty {
             StudioEmptyView(
@@ -842,6 +957,7 @@ struct PreviewPanelView: View {
 
 private enum PreviewMode: String, CaseIterable, Identifiable {
     case changes
+    case plan
     case trace
 
     var id: String {
@@ -851,6 +967,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .changes: "Changes"
+        case .plan: "Plan"
         case .trace: "Trace"
         }
     }
