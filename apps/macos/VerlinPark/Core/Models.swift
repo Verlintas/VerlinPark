@@ -330,6 +330,26 @@ struct MergeQueueListResult: Codable, Sendable {
     let entries: [MergeQueueEntry]
 }
 
+struct MergeQueueRetryResult: Codable, Sendable {
+    let entry: MergeQueueEntry
+}
+
+struct SessionLandResult: Codable, Sendable {
+    let sessionId: String
+    let branch: String
+    let targetBranch: String
+    let commit: String
+    let detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case branch
+        case targetBranch = "target_branch"
+        case commit
+        case detail
+    }
+}
+
 struct PlanDepartment: Codable, Identifiable, Hashable, Sendable {
     let name: String
     let managerTitle: String

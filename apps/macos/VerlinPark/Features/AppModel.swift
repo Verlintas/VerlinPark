@@ -37,6 +37,8 @@ final class AppModel {
     var diffError: String?
     var lastCommit: SessionCommit?
     var commitBusy = false
+    var landingBusy = false
+    var lastLanding: SessionLandResult?
     var providerKind =
         UserDefaults.standard.string(forKey: "provider.kind") ?? "openai-compatible"
     var providerBaseURL =
@@ -107,6 +109,7 @@ final class AppModel {
             teamPlan = nil
             planTaskStatuses = [:]
             lastCommit = nil
+            lastLanding = nil
             mode = .resident
             return
         }
@@ -122,6 +125,7 @@ final class AppModel {
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
+        lastLanding = nil
         Task { await loadSessions() }
     }
 
@@ -141,6 +145,7 @@ final class AppModel {
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
+        lastLanding = nil
         Task {
             await loadEvents()
             await loadTodos()
@@ -404,6 +409,30 @@ final class AppModel {
             mergeQueue = try await core.listMergeQueue(sessionID: sessionID)
         } catch {
             // The event stream will retry on the next merge queue event.
+        }
+    }
+
+    func retryMergeEntry(_ entryID: String) async {
+        do {
+            _ = try await core.retryMerge(entryID: entryID)
+            await loadMergeQueue()
+            await loadDiff()
+        } catch {
+            handle(error)
+        }
+    }
+
+    func landSession() async {
+        guard let sessionID = selectedSessionID else { return }
+        landingBusy = true
+        defer { landingBusy = false }
+        do {
+            lastLanding = try await core.landSession(sessionID: sessionID)
+            await loadSessions()
+            await loadDiff()
+            await loadMergeQueue()
+        } catch {
+            handle(error)
         }
     }
 

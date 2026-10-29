@@ -702,6 +702,7 @@ struct PreviewPanelView: View {
     @State private var mode: PreviewMode = .changes
     @State private var showingCommit = false
     @State private var showingDiscard = false
+    @State private var showingLand = false
     @State private var commitMessage = ""
 
     var body: some View {
@@ -758,10 +759,32 @@ struct PreviewPanelView: View {
                 "This resets tracked files and removes untracked files in the session worktree. Commits are kept."
             )
         }
+        .confirmationDialog(
+            "Land the session branch?",
+            isPresented: $showingLand
+        ) {
+            Button("Land into \(model.selectedProject?.defaultBranch ?? "the default branch")") {
+                Task { await model.landSession() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "The project checkout must be clean and checked out on its default branch. The session branch is merged with --no-ff; no push or PR is performed."
+            )
+        }
     }
 
     private var canCommit: Bool {
         model.sessionDiff?.hasUncommittedChanges ?? false
+    }
+
+    private func canLand(_ session: Session) -> Bool {
+        guard session.status != "landed",
+              let diff = model.sessionDiff
+        else {
+            return false
+        }
+        return !diff.hasUncommittedChanges && !diff.patch.isEmpty
     }
 
     private func header(_ session: Session) -> some View {
@@ -791,6 +814,14 @@ struct PreviewPanelView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(model.commitBusy)
+                } else if mode == .changes, canLand(session) {
+                    Button("Land") {
+                        showingLand = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(.green)
+                    .disabled(model.landingBusy)
                 }
                 Button {
                     Task {
@@ -853,7 +884,7 @@ struct PreviewPanelView: View {
                     }
                     if !diff.hasUncommittedChanges, !diff.patch.isEmpty {
                         Text(
-                            "All changes are committed on the session branch. Landing is not implemented yet."
+                            "All changes are committed on the session branch. Use Land to merge it into the project default branch."
                         )
                         .font(.system(size: 8, design: .monospaced))
                         .foregroundStyle(.tertiary)
@@ -870,6 +901,14 @@ struct PreviewPanelView: View {
                         Label(
                             "Committed \(commit.commit) · \(commit.message)",
                             systemImage: "checkmark.seal.fill"
+                        )
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.green)
+                    }
+                    if let landing = model.lastLanding {
+                        Label(
+                            "Landed \(landing.commit) · \(landing.targetBranch)",
+                            systemImage: "arrow.up.to.line"
                         )
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.green)
@@ -986,7 +1025,9 @@ struct PreviewPanelView: View {
 }
 
 private struct MergeQueueRow: View {
+    @Environment(AppModel.self) private var model
     let entry: MergeQueueEntry
+    @State private var retrying = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1020,6 +1061,21 @@ private struct MergeQueueRow: View {
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
+            }
+            if entry.status == "conflict" || entry.status == "failed" {
+                Button {
+                    retrying = true
+                    Task {
+                        await model.retryMergeEntry(entry.id)
+                        retrying = false
+                    }
+                } label: {
+                    Label("Rebase & retry", systemImage: "arrow.clockwise")
+                        .font(.system(size: 9, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(retrying)
             }
         }
         .padding(10)

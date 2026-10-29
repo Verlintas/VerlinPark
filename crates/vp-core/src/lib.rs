@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
     AgentRecord, Approval, Event, MergeQueueEntry, Project, Session, SessionCommit, SessionDiff,
-    StoredMessage, TeamPlan, TodoItem,
+    SessionLandResult, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
 
@@ -378,6 +378,91 @@ impl Engine {
         })
     }
 
+    pub async fn land_session(&self, session_id: &str) -> Result<SessionLandResult> {
+        let session = self.ensure_session_worktree(session_id).await?;
+        let session_branch = session
+            .branch
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session has no branch"))?;
+        let session_worktree = PathBuf::from(
+            session
+                .worktree
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?,
+        );
+        let status = tokio::task::spawn_blocking(move || {
+            git_output(&session_worktree, &["status", "--porcelain"])
+        })
+        .await??;
+        if !status.is_empty() {
+            anyhow::bail!("session worktree has uncommitted changes; commit or discard them first");
+        }
+        let store = self.store.clone();
+        let project_id = session.project_id.clone();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let target_branch = project.default_branch.clone();
+        let project_root = PathBuf::from(&project.root);
+        let branch_for_merge = session_branch.clone();
+        let target_for_merge = target_branch.clone();
+        let git_lock = self.git_lock.clone();
+        let commit = tokio::task::spawn_blocking(move || -> Result<String> {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            let status = git_output(&project_root, &["status", "--porcelain"])?;
+            if !status.is_empty() {
+                anyhow::bail!(
+                    "project worktree has uncommitted changes; commit or stash them first"
+                );
+            }
+            let current = git_output(&project_root, &["branch", "--show-current"])?;
+            if current != target_for_merge {
+                anyhow::bail!("project is on branch '{current}', expected '{target_for_merge}'");
+            }
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project_root)
+                .args([
+                    "merge",
+                    "--no-ff",
+                    &branch_for_merge,
+                    "-m",
+                    &format!("land {branch_for_merge}"),
+                ])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .context("running git merge")?;
+            if !output.status.success() {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let _ = git_output(&project_root, &["merge", "--abort"]);
+                anyhow::bail!("landing merge failed: {detail}");
+            }
+            git_output(&project_root, &["rev-parse", "--short", "HEAD"])
+        })
+        .await??;
+
+        self.append_event(
+            &session.id,
+            "session.landed",
+            serde_json::json!({
+                "branch": session_branch,
+                "target_branch": target_branch,
+                "commit": commit,
+            }),
+        )
+        .await?;
+        self.update_session_status(&session.id, "landed").await?;
+        Ok(SessionLandResult {
+            session_id: session.id,
+            branch: session_branch,
+            target_branch,
+            commit,
+            detail: "landed into the project default branch".to_string(),
+        })
+    }
+
     pub async fn record_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
         self.record_usage_with_source(session_id, input, output, false)
             .await
@@ -649,6 +734,38 @@ impl Engine {
         let store = self.store.clone();
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || store.list_merge_queue(&id)).await?
+    }
+
+    pub async fn get_merge_queue_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.get_merge_queue_entry(&id)).await?
+    }
+
+    pub async fn retry_merge_queue_entry(
+        &self,
+        id: &str,
+        commit: &str,
+        base_commit: &str,
+        detail: Option<String>,
+    ) -> Result<Option<MergeQueueEntry>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let commit = commit.to_string();
+        let base_commit = base_commit.to_string();
+        let entry = tokio::task::spawn_blocking(move || {
+            store.retry_merge_queue_entry(&id, &commit, &base_commit, detail.as_deref())
+        })
+        .await??;
+        if let Some(entry) = &entry {
+            self.append_event(
+                &entry.session_id,
+                "merge_queue.updated",
+                serde_json::json!({"entry": entry}),
+            )
+            .await?;
+        }
+        Ok(entry)
     }
 
     pub async fn create_leader_agent(&self, session_id: &str, model: &str) -> Result<String> {
@@ -927,6 +1044,42 @@ mod tests {
         assert!(error.to_string().contains("no changes"));
         let events = engine.list_events(session.id, 0, 100).await.unwrap();
         assert!(events.iter().any(|event| event.kind == "session.committed"));
+    }
+
+    #[tokio::test]
+    async fn lands_a_committed_session_into_the_default_branch() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("demo".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "land".into(), None)
+            .await
+            .unwrap();
+        let worktree = session.worktree.clone().unwrap();
+        std::fs::write(Path::new(&worktree).join("README.md"), "landed\n").unwrap();
+        engine
+            .commit_session(&session.id, "session change")
+            .await
+            .unwrap();
+
+        let landed = engine.land_session(&session.id).await.unwrap();
+        assert_eq!(landed.target_branch, project.default_branch);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+            "landed\n"
+        );
+        let sessions = engine.list_sessions(Some(project.id)).await.unwrap();
+        assert_eq!(sessions[0].status, "landed");
+        let events = engine.list_events(session.id, 0, 100).await.unwrap();
+        assert!(events.iter().any(|event| event.kind == "session.landed"));
     }
 
     #[tokio::test]

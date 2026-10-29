@@ -902,6 +902,37 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn get_merge_queue_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+             FROM merge_queue WHERE id = ?1",
+            params![id],
+            map_merge_queue_entry,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn retry_merge_queue_entry(
+        &self,
+        id: &str,
+        commit: &str,
+        base_commit: &str,
+        detail: Option<&str>,
+    ) -> Result<Option<MergeQueueEntry>> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE merge_queue
+             SET status = 'queued', attempt = attempt + 1, commit_hash = ?1,
+                 base_commit = ?2, detail = ?3, updated_at = ?4
+             WHERE id = ?5 AND status IN ('conflict', 'failed')",
+            params![commit, base_commit, detail, now_rfc3339(), id],
+        )?;
+        drop(conn);
+        self.get_merge_queue_entry(id)
+    }
+
     pub fn list_approvals(&self, session_id: Option<&str>) -> Result<Vec<Approval>> {
         let conn = self.lock()?;
         let sql = match session_id {

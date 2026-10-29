@@ -24,11 +24,12 @@ use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes
 use vp_protocol::types::{
     AddProjectParams, AgentListParams, AgentListResult, ApprovalListResult, AuthParams, AuthResult,
     CancelSessionParams, CancelSessionResult, CommitSessionParams, ConfigureAgentParams,
-    CreateSessionParams, DiscardSessionParams, EventListResult, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, MergeQueueListParams, MergeQueueListResult, PingResult,
-    ProjectListResult, PromptParams, PromptResult, ResolveApprovalParams, ResolveApprovalResult,
-    ServerInfo, SessionDiffParams, SessionListResult, SessionTodosParams, SessionTodosResult,
-    SubscribeParams, TeamPlanParams, TeamPlanResult,
+    CreateSessionParams, DiscardSessionParams, EventListResult, LandSessionParams,
+    ListApprovalsParams, ListEventsParams, ListSessionsParams, MergeQueueListParams,
+    MergeQueueListResult, PingResult, ProjectListResult, PromptParams, PromptResult,
+    ResolveApprovalParams, ResolveApprovalResult, RetryMergeParams, RetryMergeResult, ServerInfo,
+    SessionDiffParams, SessionListResult, SessionTodosParams, SessionTodosResult, SubscribeParams,
+    TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -465,6 +466,20 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "merge_queue.list" => match parse_params::<MergeQueueListParams>(request.params) {
             Ok(params) => match state.engine.list_merge_queue(&params.session_id).await {
                 Ok(entries) => RpcResponse::success(id, MergeQueueListResult { entries }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "merge_queue.retry" => match parse_params::<RetryMergeParams>(request.params) {
+            Ok(params) => match state.agent.retry_merge(&params.entry_id).await {
+                Ok(entry) => RpcResponse::success(id, RetryMergeResult { entry }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.land" => match parse_params::<LandSessionParams>(request.params) {
+            Ok(params) => match state.engine.land_session(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

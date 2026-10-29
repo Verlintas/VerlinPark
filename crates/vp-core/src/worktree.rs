@@ -174,6 +174,16 @@ pub fn merge_branch(session_worktree: &Path, branch: &str, message: &str) -> Res
     }
 }
 
+pub fn rebase_onto(worktree: &Path, onto: &str) -> Result<()> {
+    match run_git(worktree, &["rebase", onto]) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = run_git(worktree, &["rebase", "--abort"]);
+            Err(error.context("rebasing task branch"))
+        }
+    }
+}
+
 pub fn head_commit(worktree: &Path) -> Result<String> {
     git_output(worktree, &["rev-parse", "HEAD"])
 }

@@ -66,6 +66,10 @@ enum Command {
     Agents { session: String },
     /// Show the session merge queue and Integrator results.
     Queue { session: String },
+    /// Retry a conflicted or failed merge queue entry after rebasing it.
+    Retry { entry: String },
+    /// Land the session branch into the project default branch.
+    Land { session: String },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
     /// Commit the session worktree.
@@ -177,6 +181,12 @@ async fn main() -> Result<()> {
                 json!({"session_id": session}),
             )
             .await?
+        }
+        Command::Retry { entry } => {
+            rpc(&discovery, "merge_queue.retry", json!({"entry_id": entry})).await?
+        }
+        Command::Land { session } => {
+            rpc(&discovery, "session.land", json!({"session_id": session})).await?
         }
         Command::Discard { session } => {
             rpc(
@@ -320,6 +330,30 @@ fn print_human(value: &Value) {
                 task["department"].as_str().unwrap_or("?"),
                 task["kind"].as_str().unwrap_or("?")
             );
+        }
+        return;
+    }
+    if let Some(entry) = value.get("entry").filter(|entry| !entry.is_null()) {
+        println!(
+            "{}  {}  {}",
+            entry["status"].as_str().unwrap_or("?"),
+            entry["agent_name"].as_str().unwrap_or("?"),
+            entry["commit"].as_str().unwrap_or("?")
+        );
+        if let Some(detail) = entry["detail"].as_str() {
+            println!("{detail}");
+        }
+        return;
+    }
+    if let Some(target) = value.get("target_branch").and_then(Value::as_str) {
+        println!(
+            "landed {} → {} at {}",
+            value["branch"].as_str().unwrap_or("?"),
+            target,
+            value["commit"].as_str().unwrap_or("?")
+        );
+        if let Some(detail) = value["detail"].as_str() {
+            println!("{detail}");
         }
         return;
     }

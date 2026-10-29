@@ -303,6 +303,30 @@ pub struct MergeQueueListResult {
     pub entries: Vec<MergeQueueEntry>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryMergeParams {
+    pub entry_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetryMergeResult {
+    pub entry: MergeQueueEntry,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LandSessionParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLandResult {
+    pub session_id: String,
+    pub branch: String,
+    pub target_branch: String,
+    pub commit: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub id: String,

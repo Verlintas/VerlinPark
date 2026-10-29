@@ -11,8 +11,8 @@ use futures_util::StreamExt;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
-    AgentInfo, ConfigureAgentParams, PlanDepartment, PlanTask, Project, Session, StoredMessage,
-    TeamPlan, TodoItem,
+    AgentInfo, ConfigureAgentParams, MergeQueueEntry, PlanDepartment, PlanTask, Project, Session,
+    StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, StreamEvent,
@@ -554,6 +554,115 @@ impl AgentService {
         }
     }
 
+    pub async fn retry_merge(&self, entry_id: &str) -> Result<MergeQueueEntry> {
+        let entry = self
+            .engine
+            .get_merge_queue_entry(entry_id)
+            .await?
+            .ok_or_else(|| anyhow!("merge queue entry not found: {entry_id}"))?;
+        if !matches!(entry.status.as_str(), "conflict" | "failed") {
+            return Err(anyhow!(
+                "merge queue entry is {}, only conflict/failed can be retried",
+                entry.status
+            ));
+        }
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned())
+            .ok_or_else(|| anyhow!("agent provider is not configured"))?;
+        let (session, _) =
+            load_session_project(self.engine.store().clone(), &entry.session_id).await?;
+        let agents = self.engine.list_agents(&entry.session_id).await?;
+        let agent = agents
+            .iter()
+            .find(|agent| agent.id == entry.agent_id)
+            .ok_or_else(|| anyhow!("worker agent not found: {}", entry.agent_id))?;
+        let agent_worktree = agent
+            .worktree
+            .clone()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("worker has no worktree: {}", entry.agent_id))?;
+        let session_worktree = session
+            .worktree
+            .clone()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("session has no worktree"))?;
+        let session_branch = session
+            .branch
+            .clone()
+            .ok_or_else(|| anyhow!("session has no branch"))?;
+
+        let rebase_worktree = agent_worktree.clone();
+        let rebase_onto = session_branch.clone();
+        let rebase = tokio::task::spawn_blocking(move || {
+            worktree::rebase_onto(&rebase_worktree, &rebase_onto)
+        })
+        .await?;
+        if let Err(error) = rebase {
+            let detail = truncate(&format!("rebase failed: {error:#}"));
+            self.engine
+                .update_merge_queue_entry(&entry.id, "conflict", Some(detail.clone()))
+                .await?;
+            return Err(anyhow!(detail));
+        }
+
+        let commit_worktree = agent_worktree.clone();
+        let commit =
+            tokio::task::spawn_blocking(move || worktree::head_commit(&commit_worktree)).await??;
+        let base_worktree = session_worktree.clone();
+        let base_commit =
+            tokio::task::spawn_blocking(move || worktree::head_commit(&base_worktree)).await??;
+        let Some(entry) = self
+            .engine
+            .retry_merge_queue_entry(
+                &entry.id,
+                &commit,
+                &base_commit,
+                Some("rebased onto the current session branch".to_string()),
+            )
+            .await?
+        else {
+            return Err(anyhow!("merge queue entry can no longer be retried"));
+        };
+
+        let profile = agent
+            .profile
+            .as_deref()
+            .and_then(AgentProfile::parse)
+            .unwrap_or(AgentProfile::Coding);
+        let spec = AgentSpec {
+            id: agent.id.clone(),
+            role: AgentRole::Worker,
+            name: agent.name.clone(),
+            depth: 2,
+            parent_name: None,
+            title: agent.title.clone(),
+            task_id: entry.task_id.clone(),
+            profile,
+            allow_delegation: true,
+            worktree: agent_worktree,
+            branch: entry.branch.clone(),
+            session_worktree,
+            session_branch,
+            write_scope: Vec::new(),
+            base_commit: entry.base_commit.clone(),
+        };
+        process_merge_entry(
+            &self.engine,
+            &session,
+            &spec,
+            &entry,
+            config.integration_command.as_deref(),
+        )
+        .await?;
+        self.engine
+            .get_merge_queue_entry(&entry.id)
+            .await?
+            .ok_or_else(|| anyhow!("merge queue entry disappeared after retry"))
+    }
+
     pub async fn start(&self, session_id: &str, prompt: &str) -> Result<()> {
         let config = self
             .config
@@ -955,6 +1064,18 @@ async fn integrate_worker(
             Some(verifier_summary.to_string()),
         )
         .await?;
+    process_merge_entry(engine, session, spec, &entry, integration_command).await
+}
+
+/// Merge and integration-check an existing queue entry. The entry must already
+/// have a valid `base_commit` (the session HEAD before this merge).
+async fn process_merge_entry(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    entry: &MergeQueueEntry,
+    integration_command: Option<&str>,
+) -> Result<String> {
     engine
         .update_merge_queue_entry(&entry.id, "merging", None)
         .await?;
@@ -965,15 +1086,16 @@ async fn integrate_worker(
         "integrator.started",
         serde_json::json!({
             "entry_id": entry.id,
-            "branch": spec.branch,
-            "base_commit": base_commit,
+            "branch": entry.branch,
+            "base_commit": entry.base_commit,
+            "attempt": entry.attempt,
             "has_command": integration_command.is_some(),
         }),
     )
     .await?;
 
     let merge_worktree = spec.session_worktree.clone();
-    let branch = spec.branch.clone();
+    let branch = entry.branch.clone();
     let message = format!("merge {}", spec.name);
     let merge_result = tokio::task::spawn_blocking(move || {
         worktree::merge_branch(&merge_worktree, &branch, &message)
@@ -1000,7 +1122,7 @@ async fn integrate_worker(
             serde_json::json!({
                 "entry_id": entry.id,
                 "status": status,
-                "detail": truncate(&detail),
+                "detail": detail,
             }),
         )
         .await?;
@@ -1011,7 +1133,7 @@ async fn integrate_worker(
         .update_merge_queue_entry(&entry.id, "checking", None)
         .await?;
     let check_worktree = spec.session_worktree.clone();
-    let check_base = base_commit.clone();
+    let check_base = entry.base_commit.clone();
     let check_result = tokio::task::spawn_blocking(move || {
         worktree::check_merged_diff(&check_worktree, &check_base)
     })
@@ -1032,7 +1154,7 @@ async fn integrate_worker(
         Err(error) => {
             let detail = format!("integration check failed: {error}");
             let reset_worktree = spec.session_worktree.clone();
-            let reset_base = base_commit.clone();
+            let reset_base = entry.base_commit.clone();
             let reset = tokio::task::spawn_blocking(move || {
                 worktree::reset_hard(&reset_worktree, &reset_base)
             })
@@ -1072,6 +1194,7 @@ async fn integrate_worker(
             "entry_id": entry.id,
             "status": "merged",
             "detail": integration_detail,
+            "attempt": entry.attempt,
         }),
     )
     .await?;
@@ -4941,6 +5064,73 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(session_worktree.join("README.md")).unwrap(),
             "session\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_a_conflicted_merge_after_rebase() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::new()),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id.clone(), "retry conflict".into(), None)
+            .await
+            .unwrap();
+        let worker = engine
+            .create_agent(&session.id, "worker", "Worker retry", None, None, "test")
+            .await
+            .unwrap();
+        let branch = session.branch.clone().unwrap();
+        let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let task = engine
+            .create_task_worktree(&project.root, &project.id, &session.id, "T1", &branch)
+            .await
+            .unwrap();
+        engine
+            .set_agent_worktree(&worker.id, &task.path.to_string_lossy(), &task.branch)
+            .await
+            .unwrap();
+        std::fs::write(task.path.join("README.md"), "worker\n").unwrap();
+        let commit = worktree::commit_all(&task.path, "worker change")
+            .unwrap()
+            .unwrap();
+        std::fs::write(session_worktree.join("README.md"), "session\n").unwrap();
+        worktree::commit_all(&session_worktree, "session change").unwrap();
+
+        let spec = AgentSpec {
+            id: worker.id.clone(),
+            role: AgentRole::Worker,
+            name: worker.name.clone(),
+            depth: 2,
+            parent_name: None,
+            title: None,
+            task_id: Some("T1".into()),
+            profile: AgentProfile::Coding,
+            allow_delegation: true,
+            worktree: task.path.clone(),
+            branch: task.branch.clone(),
+            session_worktree: session_worktree.clone(),
+            session_branch: branch,
+            write_scope: vec!["README.md".into()],
+            base_commit: task.base_commit.clone(),
+        };
+        integrate_worker(&engine, &session, &spec, &commit, "verified", None)
+            .await
+            .unwrap_err();
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue[0].status, "conflict");
+
+        // Drop the conflicting session commit, then retry: the worker branch can
+        // be rebased and merged cleanly.
+        worktree::reset_hard(&session_worktree, &task.base_commit).unwrap();
+        let retried = service.retry_merge(&queue[0].id).await.unwrap();
+        assert_eq!(retried.status, "merged");
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(
+            std::fs::read_to_string(session_worktree.join("README.md")).unwrap(),
+            "worker\n"
         );
     }
 

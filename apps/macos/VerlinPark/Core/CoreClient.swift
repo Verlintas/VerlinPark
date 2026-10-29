@@ -183,6 +183,19 @@ actor CoreClient {
             .entries
     }
 
+    func retryMerge(entryID: String) async throws -> MergeQueueEntry {
+        let params: [String: JSONValue] = ["entry_id": .string(entryID)]
+        return try await request(method: "merge_queue.retry", params: params)
+            .decode(MergeQueueRetryResult.self)
+            .entry
+    }
+
+    func landSession(sessionID: String) async throws -> SessionLandResult {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.land", params: params)
+            .decode(SessionLandResult.self)
+    }
+
     func sessionTodos(sessionID: String) async throws -> [TodoItem] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.todos", params: params)

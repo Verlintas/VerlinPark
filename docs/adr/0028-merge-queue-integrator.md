@@ -50,7 +50,8 @@ merge mechanics.
 - The integration command is explicit and opt-in; projects without one still get
   the diff check, not a language-specific test assumption.
 - The queue currently drains one entry at a time as each Worker completes. It is
-  persistent and serial, but not yet a batch scheduler with retry.
+  persistent and serial; retry/rebase is now available for conflict/failed entries,
+  but it is not yet a batch scheduler with automatic conflict resolution.
 - An LLM Integrator that reviews semantics/conflicts can be added later as an
   optional reviewer; it must not replace deterministic merge mechanics.
 
@@ -64,7 +65,7 @@ merge mechanics.
 
 ## Follow-up
 
-- Add queue retry/rebase after a conflict.
-- Add post-merge integration checks to a temporary integration branch before
-  touching the session branch.
+- Move integration checks to a temporary integration branch before touching the
+  session branch.
 - Add an optional LLM Integrator reviewer with a strict read-only scope.
+- Consider batch queue draining and cross-entry backpressure.
