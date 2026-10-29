@@ -145,6 +145,17 @@ struct CollabGraphView: View {
                 OrgConnector()
 
                 AgentTierCard(
+                    title: "Verifiers",
+                    range: "1–10",
+                    action: "gate",
+                    detail: "inspect diff · run tests · approve or reject",
+                    icon: "checkmark.shield",
+                    agents: model.agents.filter { $0.role == "verifier" }
+                )
+
+                OrgConnector()
+
+                AgentTierCard(
                     title: "Labour",
                     range: "1–20",
                     action: "assist",
@@ -399,6 +410,7 @@ struct AgentTierCard: View {
     private func color(for status: String) -> Color {
         switch status {
         case "running": .orange
+        case "changes_requested": .orange
         case "idle": .green
         case "failed", "cancelled": .red
         default: .secondary

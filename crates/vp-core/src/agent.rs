@@ -72,6 +72,7 @@ enum AgentRole {
     Leader,
     Manager,
     Worker,
+    Verifier,
     Labour,
 }
 
@@ -81,6 +82,7 @@ impl AgentRole {
             Self::Leader => "leader",
             Self::Manager => "manager",
             Self::Worker => "worker",
+            Self::Verifier => "verifier",
             Self::Labour => "labour",
         }
     }
@@ -90,6 +92,7 @@ impl AgentRole {
             "leader" => Some(Self::Leader),
             "manager" => Some(Self::Manager),
             "worker" => Some(Self::Worker),
+            "verifier" => Some(Self::Verifier),
             "labour" => Some(Self::Labour),
             _ => None,
         }
@@ -100,6 +103,7 @@ impl AgentRole {
             Self::Leader => "Leader",
             Self::Manager => "Manager",
             Self::Worker => "Worker",
+            Self::Verifier => "Verifier",
             Self::Labour => "Labour",
         }
     }
@@ -109,13 +113,16 @@ impl AgentRole {
             Self::Leader => Some(Self::Manager),
             Self::Manager => Some(Self::Worker),
             Self::Worker => Some(Self::Labour),
-            Self::Labour => None,
+            Self::Verifier | Self::Labour => None,
         }
     }
 
     fn allows_tool(self, name: &str) -> bool {
         match self {
             Self::Manager => matches!(name, "read_file" | "list_dir" | "grep"),
+            Self::Verifier => {
+                matches!(name, "read_file" | "list_dir" | "grep" | "shell")
+            }
             Self::Leader | Self::Worker | Self::Labour => {
                 matches!(
                     name,
@@ -159,6 +166,7 @@ struct BudgetState {
     spent: u64,
     managers: usize,
     workers: usize,
+    verifiers: usize,
     labour: usize,
 }
 
@@ -171,6 +179,7 @@ impl SessionBudget {
                 spent,
                 managers: 0,
                 workers: 0,
+                verifiers: 0,
                 labour: 0,
             }),
         }
@@ -197,6 +206,7 @@ impl SessionBudget {
         let (counter, cap) = match role {
             AgentRole::Manager => (&mut state.managers, self.caps.managers),
             AgentRole::Worker => (&mut state.workers, self.caps.workers),
+            AgentRole::Verifier => (&mut state.verifiers, 10),
             AgentRole::Labour => (&mut state.labour, self.caps.labour),
             AgentRole::Leader => return None,
         };
@@ -208,8 +218,15 @@ impl SessionBudget {
     }
 }
 
+#[derive(Clone, Debug)]
+struct VerifierVerdict {
+    approved: bool,
+    summary: String,
+}
+
 enum LoopOutcome {
     Final(String),
+    Verdict(VerifierVerdict),
     Cancelled,
     BudgetExceeded,
 }
@@ -610,6 +627,17 @@ async fn run_agent(
             .await?;
             engine.update_session_status(session_id, "failed").await?;
         }
+        LoopOutcome::Verdict(_) => {
+            emit(
+                &engine,
+                session_id,
+                &spec,
+                "agent.failed",
+                serde_json::json!({"error": "a verdict was submitted outside a verification run"}),
+            )
+            .await?;
+            engine.update_session_status(session_id, "failed").await?;
+        }
     }
     Ok(())
 }
@@ -646,20 +674,12 @@ fn scopes_overlap(left: &[String], right: &[String]) -> bool {
     })
 }
 
-struct IntegrationResult {
-    commit: Option<String>,
-    merged: bool,
-}
-
-async fn integrate_worker(spec: &AgentSpec, name: &str) -> Result<IntegrationResult> {
+async fn commit_worker(spec: &AgentSpec, name: &str) -> Result<Option<String>> {
     let task_worktree = spec.worktree.clone();
-    let session_worktree = spec.session_worktree.clone();
-    let branch = spec.branch.clone();
     let message = format!("task: {name}");
-    let merge_message = format!("merge {name}");
     let write_scope = spec.write_scope.clone();
     let base_commit = spec.base_commit.clone();
-    tokio::task::spawn_blocking(move || -> Result<IntegrationResult> {
+    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         if !write_scope.is_empty() {
             let paths = worktree::changed_paths(&task_worktree, &base_commit)?;
             let outside = paths
@@ -671,20 +691,439 @@ async fn integrate_worker(spec: &AgentSpec, name: &str) -> Result<IntegrationRes
                 return Err(anyhow!("write scope violation: {}", outside.join(", ")));
             }
         }
-        let commit = worktree::commit_all(&task_worktree, &message)?;
-        let Some(commit) = commit else {
-            return Ok(IntegrationResult {
-                commit: None,
-                merged: false,
-            });
-        };
-        worktree::merge_branch(&session_worktree, &branch, &merge_message)?;
-        Ok(IntegrationResult {
-            commit: Some(commit),
-            merged: true,
-        })
+        worktree::commit_all(&task_worktree, &message)
     })
     .await?
+}
+
+async fn merge_worker(spec: &AgentSpec, name: &str) -> Result<()> {
+    let session_worktree = spec.session_worktree.clone();
+    let branch = spec.branch.clone();
+    let message = format!("merge {name}");
+    tokio::task::spawn_blocking(move || {
+        worktree::merge_branch(&session_worktree, &branch, &message)
+    })
+    .await?
+}
+
+enum VerificationOutcome {
+    Approved(VerifierVerdict),
+    Rejected(VerifierVerdict),
+    Cancelled,
+    BudgetExceeded,
+    Error(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_worker(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    control: &RunControl,
+    budget: &SessionBudget,
+    manager_spec: &AgentSpec,
+    worker_spec: &AgentSpec,
+    objective: &str,
+    worker_summary: &str,
+) -> Result<VerificationOutcome> {
+    let Some(ordinal) = budget.reserve(AgentRole::Verifier) else {
+        return Ok(VerificationOutcome::Error(
+            "the Verifier cap for this session has been reached".to_string(),
+        ));
+    };
+    let verifier_name = format!("Verifier {ordinal}");
+    let verifier = engine
+        .create_agent(
+            &session.id,
+            AgentRole::Verifier.as_str(),
+            &verifier_name,
+            Some("Verification".to_string()),
+            Some(manager_spec.id.clone()),
+            &config.model,
+        )
+        .await?;
+    engine
+        .set_agent_worktree(
+            &verifier.id,
+            &worker_spec.worktree.to_string_lossy(),
+            &worker_spec.branch,
+        )
+        .await?;
+    let verifier_spec = AgentSpec {
+        id: verifier.id.clone(),
+        role: AgentRole::Verifier,
+        name: verifier_name.clone(),
+        depth: manager_spec.depth.saturating_add(1),
+        parent_name: Some(manager_spec.name.clone()),
+        title: Some("Verification".to_string()),
+        worktree: worker_spec.worktree.clone(),
+        branch: worker_spec.branch.clone(),
+        session_worktree: manager_spec.session_worktree.clone(),
+        session_branch: manager_spec.session_branch.clone(),
+        write_scope: Vec::new(),
+        base_commit: worker_spec.base_commit.clone(),
+    };
+    let prompt = format!(
+        "Verify Worker {} for this task. Objective: {objective}. Worker summary: {worker_summary}. \
+         The worktree is {} on branch {}; base commit {}. \
+         Inspect the diff, run relevant tests with shell, and do not edit files. \
+         Then call submit_verdict with approved and summary.",
+        worker_spec.name,
+        worker_spec.worktree.to_string_lossy(),
+        worker_spec.branch,
+        worker_spec.base_commit
+    );
+    emit(
+        engine,
+        &session.id,
+        &verifier_spec,
+        "agent.spawned",
+        serde_json::json!({
+            "parent_id": manager_spec.id,
+            "parent_name": manager_spec.name,
+            "objective": truncate(&prompt),
+            "verified_worker": worker_spec.name,
+        }),
+    )
+    .await?;
+    let mut conversation = vec![ChatMessage::user(prompt.clone())];
+    let result = run_loop(
+        engine,
+        config,
+        session,
+        project,
+        control,
+        budget,
+        &verifier_spec,
+        &prompt,
+        &mut conversation,
+        false,
+    )
+    .await;
+    match result {
+        Ok(LoopOutcome::Verdict(verdict)) => {
+            engine.update_agent_status(&verifier.id, "idle").await?;
+            emit(
+                engine,
+                &session.id,
+                &verifier_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "idle",
+                    "approved": verdict.approved,
+                    "summary": truncate(&verdict.summary),
+                    "verified_worker": worker_spec.name,
+                    "worktree": verifier_spec.worktree,
+                    "branch": verifier_spec.branch,
+                }),
+            )
+            .await?;
+            Ok(if verdict.approved {
+                VerificationOutcome::Approved(verdict)
+            } else {
+                VerificationOutcome::Rejected(verdict)
+            })
+        }
+        Ok(LoopOutcome::Final(text)) => {
+            let summary = if text.trim().is_empty() {
+                "Verifier finished without submitting a verdict.".to_string()
+            } else {
+                format!("Verifier finished without submitting a verdict: {text}")
+            };
+            engine.update_agent_status(&verifier.id, "failed").await?;
+            emit(
+                engine,
+                &session.id,
+                &verifier_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "approved": false,
+                    "summary": truncate(&summary),
+                    "verified_worker": worker_spec.name,
+                }),
+            )
+            .await?;
+            Ok(VerificationOutcome::Error(summary))
+        }
+        Ok(LoopOutcome::Cancelled) => {
+            engine
+                .update_agent_status(&verifier.id, "cancelled")
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                &verifier_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "cancelled",
+                    "verified_worker": worker_spec.name,
+                }),
+            )
+            .await?;
+            Ok(VerificationOutcome::Cancelled)
+        }
+        Ok(LoopOutcome::BudgetExceeded) => {
+            engine.update_agent_status(&verifier.id, "failed").await?;
+            emit(
+                engine,
+                &session.id,
+                &verifier_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "summary": "token budget exhausted",
+                    "verified_worker": worker_spec.name,
+                }),
+            )
+            .await?;
+            Ok(VerificationOutcome::BudgetExceeded)
+        }
+        Err(error) => {
+            engine.update_agent_status(&verifier.id, "failed").await?;
+            emit(
+                engine,
+                &session.id,
+                &verifier_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "approved": false,
+                    "summary": truncate(error.to_string().as_str()),
+                    "verified_worker": worker_spec.name,
+                }),
+            )
+            .await?;
+            Ok(VerificationOutcome::Error(error.to_string()))
+        }
+    }
+}
+
+enum WorkerFinish {
+    Done(String),
+    Cancelled,
+    BudgetExceeded,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_worker(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    control: &RunControl,
+    budget: &SessionBudget,
+    manager_spec: &AgentSpec,
+    worker_spec: &AgentSpec,
+    objective: &str,
+    summary: &str,
+) -> Result<WorkerFinish> {
+    let commit = match commit_worker(worker_spec, &worker_spec.name).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            let summary = format!("integration failed: {error}");
+            engine
+                .update_agent_status(&worker_spec.id, "failed")
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                worker_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "summary": truncate(&summary),
+                    "merged": false,
+                    "worktree": worker_spec.worktree,
+                    "branch": worker_spec.branch,
+                }),
+            )
+            .await?;
+            return Ok(WorkerFinish::Done(summary));
+        }
+    };
+    let Some(commit) = commit else {
+        engine.update_agent_status(&worker_spec.id, "idle").await?;
+        emit(
+            engine,
+            &session.id,
+            worker_spec,
+            "agent.finished",
+            serde_json::json!({
+                "status": "idle",
+                "summary": truncate(summary),
+                "merged": false,
+                "verified": false,
+                "worktree": worker_spec.worktree,
+                "branch": worker_spec.branch,
+            }),
+        )
+        .await?;
+        return Ok(WorkerFinish::Done(format!(
+            "no changes to merge\n{}",
+            truncate(summary)
+        )));
+    };
+
+    let verification = verify_worker(
+        engine,
+        config,
+        session,
+        project,
+        control,
+        budget,
+        manager_spec,
+        worker_spec,
+        objective,
+        summary,
+    )
+    .await?;
+    match verification {
+        VerificationOutcome::Approved(verdict) => {
+            match merge_worker(worker_spec, &worker_spec.name).await {
+                Ok(()) => {
+                    engine.update_agent_status(&worker_spec.id, "idle").await?;
+                    emit(
+                        engine,
+                        &session.id,
+                        worker_spec,
+                        "agent.finished",
+                        serde_json::json!({
+                            "status": "idle",
+                            "summary": truncate(summary),
+                            "commit": commit,
+                            "merged": true,
+                            "verified": true,
+                            "approved": true,
+                            "verdict": truncate(&verdict.summary),
+                            "worktree": worker_spec.worktree,
+                            "branch": worker_spec.branch,
+                        }),
+                    )
+                    .await?;
+                    Ok(WorkerFinish::Done(format!(
+                        "merged: true\nverified: true\n{}\nverdict: {}",
+                        truncate(summary),
+                        truncate(&verdict.summary)
+                    )))
+                }
+                Err(error) => {
+                    engine
+                        .update_agent_status(&worker_spec.id, "failed")
+                        .await?;
+                    emit(
+                        engine,
+                        &session.id,
+                        worker_spec,
+                        "agent.finished",
+                        serde_json::json!({
+                            "status": "failed",
+                            "summary": truncate(error.to_string().as_str()),
+                            "commit": commit,
+                            "merged": false,
+                            "verified": true,
+                            "approved": true,
+                            "verdict": truncate(&verdict.summary),
+                            "worktree": worker_spec.worktree,
+                            "branch": worker_spec.branch,
+                        }),
+                    )
+                    .await?;
+                    Ok(WorkerFinish::Done(format!(
+                        "merge failed: {error}\nverdict: {}",
+                        truncate(&verdict.summary)
+                    )))
+                }
+            }
+        }
+        VerificationOutcome::Rejected(verdict) => {
+            engine
+                .update_agent_status(&worker_spec.id, "changes_requested")
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                worker_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "changes_requested",
+                    "summary": truncate(summary),
+                    "commit": commit,
+                    "merged": false,
+                    "verified": true,
+                    "approved": false,
+                    "verdict": truncate(&verdict.summary),
+                    "worktree": worker_spec.worktree,
+                    "branch": worker_spec.branch,
+                }),
+            )
+            .await?;
+            Ok(WorkerFinish::Done(format!(
+                "merged: false\nverification rejected:\n{}",
+                truncate(&verdict.summary)
+            )))
+        }
+        VerificationOutcome::Error(error) => {
+            engine
+                .update_agent_status(&worker_spec.id, "failed")
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                worker_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "summary": truncate(&error),
+                    "commit": commit,
+                    "merged": false,
+                    "verified": false,
+                    "worktree": worker_spec.worktree,
+                    "branch": worker_spec.branch,
+                }),
+            )
+            .await?;
+            Ok(WorkerFinish::Done(format!("verification error: {error}")))
+        }
+        VerificationOutcome::Cancelled => {
+            engine
+                .update_agent_status(&worker_spec.id, "cancelled")
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                worker_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "cancelled",
+                    "commit": commit,
+                    "merged": false,
+                }),
+            )
+            .await?;
+            Ok(WorkerFinish::Cancelled)
+        }
+        VerificationOutcome::BudgetExceeded => {
+            engine
+                .update_agent_status(&worker_spec.id, "failed")
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                worker_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "summary": "token budget exhausted during verification",
+                    "commit": commit,
+                    "merged": false,
+                }),
+            )
+            .await?;
+            Ok(WorkerFinish::BudgetExceeded)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -859,12 +1298,13 @@ async fn run_loop(
                 serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
             let is_delegate = call.name == "delegate";
             let is_delegate_many = call.name == "delegate_many" && spec.role == AgentRole::Manager;
+            let is_verdict = call.name == "submit_verdict" && spec.role == AgentRole::Verifier;
             let is_todo = call.name == "todo_write" && spec.role == AgentRole::Leader;
             let registry_tool = config
                 .tools
                 .get(&call.name)
                 .filter(|_| spec.role.allows_tool(&call.name));
-            let requires_approval = if is_delegate || is_delegate_many || is_todo {
+            let requires_approval = if is_delegate || is_delegate_many || is_verdict || is_todo {
                 false
             } else {
                 registry_tool
@@ -902,6 +1342,38 @@ async fn run_loop(
 
             let output = if !approved {
                 ToolOutput::error("The user denied this tool call.")
+            } else if is_verdict {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match parse_verdict(&input) {
+                    Ok(verdict) => {
+                        emit(
+                            engine,
+                            &session.id,
+                            spec,
+                            "tool.finished",
+                            serde_json::json!({
+                                "tool_call_id": call_id,
+                                "name": call.name,
+                                "output": "verdict recorded",
+                                "is_error": false,
+                            }),
+                        )
+                        .await?;
+                        return Ok(LoopOutcome::Verdict(verdict));
+                    }
+                    Err(error) => ToolOutput::error(error.to_string()),
+                }
             } else if is_delegate_many {
                 emit(
                     engine,
@@ -994,6 +1466,12 @@ async fn run_loop(
                                     spec.base_commit.clone(),
                                     Vec::new(),
                                 ),
+                                AgentRole::Verifier => (
+                                    spec.worktree.clone(),
+                                    spec.branch.clone(),
+                                    spec.base_commit.clone(),
+                                    Vec::new(),
+                                ),
                             };
                             engine
                                 .set_agent_worktree(
@@ -1044,67 +1522,62 @@ async fn run_loop(
                             )
                             .await;
                             match child_result {
+                                Ok(LoopOutcome::Verdict(_)) => ToolOutput::error(
+                                    "a child agent returned a verdict unexpectedly",
+                                ),
                                 Ok(LoopOutcome::Final(summary)) => {
                                     let summary = if summary.trim().is_empty() {
                                         "The agent completed without a summary.".to_string()
                                     } else {
                                         summary
                                     };
-                                    let integration = if role == AgentRole::Worker {
-                                        integrate_worker(&child_spec, &child_name).await
+                                    if role == AgentRole::Worker {
+                                        match finish_worker(
+                                            engine,
+                                            config,
+                                            session,
+                                            project,
+                                            control,
+                                            budget,
+                                            spec,
+                                            &child_spec,
+                                            &child_objective,
+                                            &summary,
+                                        )
+                                        .await?
+                                        {
+                                            WorkerFinish::Done(report) => ToolOutput::ok(format!(
+                                                "Worker {} finished:\n{}",
+                                                child_name, report
+                                            )),
+                                            WorkerFinish::Cancelled => {
+                                                return Ok(LoopOutcome::Cancelled);
+                                            }
+                                            WorkerFinish::BudgetExceeded => {
+                                                return Ok(LoopOutcome::BudgetExceeded);
+                                            }
+                                        }
                                     } else {
-                                        Ok(IntegrationResult {
-                                            commit: None,
-                                            merged: false,
-                                        })
-                                    };
-                                    match integration {
-                                        Ok(integration) => {
-                                            engine.update_agent_status(&child.id, "idle").await?;
-                                            emit(
-                                                engine,
-                                                &session.id,
-                                                &child_spec,
-                                                "agent.finished",
-                                                serde_json::json!({
-                                                    "status": "idle",
-                                                    "summary": truncate(&summary),
-                                                    "commit": integration.commit,
-                                                    "merged": integration.merged,
-                                                    "worktree": child_spec.worktree,
-                                                    "branch": child_spec.branch,
-                                                }),
-                                            )
-                                            .await?;
-                                            ToolOutput::ok(format!(
-                                                "{} {} finished:\n{}\nmerged: {}",
-                                                role.default_name(),
-                                                child_name,
-                                                truncate(&summary),
-                                                integration.merged
-                                            ))
-                                        }
-                                        Err(error) => {
-                                            engine.update_agent_status(&child.id, "failed").await?;
-                                            emit(
-                                                engine,
-                                                &session.id,
-                                                &child_spec,
-                                                "agent.finished",
-                                                serde_json::json!({
-                                                    "status": "failed",
-                                                    "summary": truncate(error.to_string().as_str()),
-                                                    "worktree": child_spec.worktree,
-                                                    "branch": child_spec.branch,
-                                                }),
-                                            )
-                                            .await?;
-                                            ToolOutput::error(format!(
-                                                "{} {} finished but integration failed: {error}",
-                                                role.default_name(),
-                                                child_name
-                                            ))
-                                        }
+                                        engine.update_agent_status(&child.id, "idle").await?;
+                                        emit(
+                                            engine,
+                                            &session.id,
+                                            &child_spec,
+                                            "agent.finished",
+                                            serde_json::json!({
+                                                "status": "idle",
+                                                "summary": truncate(&summary),
+                                                "worktree": child_spec.worktree,
+                                                "branch": child_spec.branch,
+                                            }),
+                                        )
+                                        .await?;
+                                        ToolOutput::ok(format!(
+                                            "{} {} finished:\n{}",
+                                            role.default_name(),
+                                            child_name,
+                                            truncate(&summary)
+                                        ))
                                     }
                                 }
                                 Ok(LoopOutcome::Cancelled) => {
@@ -1315,6 +1788,20 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole) -> Vec<ToolSchema> {
                     }
                 },
                 "required": ["role", "objective"]
+            }),
+        });
+    }
+    if role == AgentRole::Verifier {
+        tools.push(ToolSchema {
+            name: "submit_verdict".to_string(),
+            description: "Submit the verification verdict. Approve only with evidence; do not edit files.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "approved": {"type": "boolean"},
+                    "summary": {"type": "string", "description": "Evidence and decision, max 2000 chars"}
+                },
+                "required": ["approved", "summary"]
             }),
         });
     }
@@ -1627,6 +2114,7 @@ async fn run_parallel_workers(
                 )
                 .await?;
             }
+            Ok(LoopOutcome::Verdict(_)) => {}
             Ok(LoopOutcome::BudgetExceeded) => {
                 budget_exceeded = true;
                 let (child_spec, _, _) = &prepared[index];
@@ -1674,7 +2162,7 @@ async fn run_parallel_workers(
 
     let mut reports = Vec::new();
     for (index, result) in results.into_iter().enumerate() {
-        let (child_spec, _, _) = &prepared[index];
+        let (child_spec, objective, _) = &prepared[index];
         match result {
             Ok(LoopOutcome::Final(summary)) => {
                 let summary = if summary.trim().is_empty() {
@@ -1682,51 +2170,56 @@ async fn run_parallel_workers(
                 } else {
                     summary
                 };
-                match integrate_worker(child_spec, &child_spec.name).await {
-                    Ok(integration) => {
-                        engine.update_agent_status(&child_spec.id, "idle").await?;
-                        emit(
-                            engine,
-                            &session.id,
-                            child_spec,
-                            "agent.finished",
-                            serde_json::json!({
-                                "status": "idle",
-                                "summary": truncate(&summary),
-                                "commit": integration.commit,
-                                "merged": integration.merged,
-                                "worktree": child_spec.worktree,
-                                "branch": child_spec.branch,
-                            }),
-                        )
-                        .await?;
-                        reports.push(format!(
-                            "{}: merged={}\n{}",
-                            child_spec.name,
-                            integration.merged,
-                            truncate(&summary)
-                        ));
+                match finish_worker(
+                    engine, config, session, project, control, budget, spec, child_spec, objective,
+                    &summary,
+                )
+                .await?
+                {
+                    WorkerFinish::Done(report) => {
+                        reports.push(format!("{}: {}", child_spec.name, report));
                     }
-                    Err(error) => {
-                        engine.update_agent_status(&child_spec.id, "failed").await?;
-                        emit(
-                            engine,
-                            &session.id,
-                            child_spec,
-                            "agent.finished",
-                            serde_json::json!({
-                                "status": "failed",
-                                "summary": truncate(error.to_string().as_str()),
-                                "worktree": child_spec.worktree,
-                                "branch": child_spec.branch,
-                            }),
-                        )
-                        .await?;
-                        reports.push(format!("{}: integration failed: {error}", child_spec.name));
+                    WorkerFinish::Cancelled => {
+                        for (_, (remaining, _, _)) in prepared.iter().enumerate().skip(index + 1) {
+                            engine
+                                .update_agent_status(&remaining.id, "cancelled")
+                                .await?;
+                            emit(
+                                engine,
+                                &session.id,
+                                remaining,
+                                "agent.finished",
+                                serde_json::json!({
+                                    "status": "cancelled",
+                                    "summary": "batch aborted during verification",
+                                }),
+                            )
+                            .await?;
+                        }
+                        return Ok(ParallelResult::Cancelled);
+                    }
+                    WorkerFinish::BudgetExceeded => {
+                        for (_, (remaining, _, _)) in prepared.iter().enumerate().skip(index + 1) {
+                            engine.update_agent_status(&remaining.id, "failed").await?;
+                            emit(
+                                engine,
+                                &session.id,
+                                remaining,
+                                "agent.finished",
+                                serde_json::json!({
+                                    "status": "failed",
+                                    "summary": "batch aborted during verification",
+                                }),
+                            )
+                            .await?;
+                        }
+                        return Ok(ParallelResult::BudgetExceeded);
                     }
                 }
             }
-            Ok(LoopOutcome::Cancelled) | Ok(LoopOutcome::BudgetExceeded) => {}
+            Ok(LoopOutcome::Verdict(_))
+            | Ok(LoopOutcome::Cancelled)
+            | Ok(LoopOutcome::BudgetExceeded) => {}
             Err(error) => {
                 engine.update_agent_status(&child_spec.id, "failed").await?;
                 emit(
@@ -1745,6 +2238,21 @@ async fn run_parallel_workers(
         }
     }
     Ok(ParallelResult::Output(ToolOutput::ok(reports.join("\n\n"))))
+}
+
+fn parse_verdict(input: &serde_json::Value) -> Result<VerifierVerdict> {
+    let approved = input
+        .get("approved")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| anyhow!("approved is required"))?;
+    let summary = input
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty() && summary.len() <= 2000)
+        .ok_or_else(|| anyhow!("summary is required (max 2000 chars)"))?
+        .to_string();
+    Ok(VerifierVerdict { approved, summary })
 }
 
 fn role_system_prompt(
@@ -1801,6 +2309,15 @@ fn role_system_prompt(
              and run tests. Delegate small research or verification subtasks to Labour with \
              delegate(role=\"labour\") when useful. Return a concise summary with evidence. \
              Do not delegate to Managers or Workers.",
+            spec.name
+        ),
+        AgentRole::Verifier => format!(
+            "{base}\n\
+             You are Verifier {}, reporting to a Manager. Task under review: {objective}. \
+             You are read-only: do not edit files. Inspect the task branch/diff and run \
+             relevant tests or checks with shell. Approve only when the changes meet the \
+             objective and evidence is sufficient. Then call submit_verdict with \
+             approved and summary. You cannot delegate.",
             spec.name
         ),
         AgentRole::Labour => format!(
@@ -2415,6 +2932,18 @@ mod tests {
                     StreamEvent::Done,
                 ],
                 vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_verdict".into(),
+                        name: "submit_verdict".into(),
+                        arguments: serde_json::json!({
+                            "approved": true,
+                            "summary": "worker.txt exists and matches the task"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
                     StreamEvent::TextDelta("manager done".into()),
                     StreamEvent::Done,
                 ],
@@ -2451,7 +2980,7 @@ mod tests {
         });
 
         service.start(&session.id, "integrate").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
         approver.abort();
 
         let worktree = session.worktree.clone().unwrap();
@@ -2465,6 +2994,11 @@ mod tests {
         let agents = engine.list_agents(&session.id).await.unwrap();
         let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
         assert_eq!(worker.status, "idle");
+        assert!(
+            agents
+                .iter()
+                .any(|agent| agent.role == "verifier" && agent.status == "idle")
+        );
         assert!(
             worker
                 .branch
@@ -2485,6 +3019,131 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions[0].status, "idle");
+    }
+
+    #[tokio::test]
+    async fn blocks_integration_when_the_verifier_rejects() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "title": "Quality",
+                            "objective": "review the change"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "write rejected.txt",
+                            "write_scope": ["rejected.txt"]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "rejected.txt",
+                            "content": "not ready\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker wrote".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_verdict".into(),
+                        name: "submit_verdict".into(),
+                        arguments: serde_json::json!({
+                            "approved": false,
+                            "summary": "the acceptance test fails"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "verify".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..100 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        service.start(&session.id, "verify").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        approver.abort();
+
+        let worktree = session.worktree.clone().unwrap();
+        assert!(
+            !std::path::Path::new(&worktree)
+                .join("rejected.txt")
+                .exists()
+        );
+        let diff = engine.session_diff(&session.id).await.unwrap();
+        assert!(diff.patch.is_empty());
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
+        assert_eq!(worker.status, "changes_requested");
+        let verifier = agents
+            .iter()
+            .find(|agent| agent.role == "verifier")
+            .unwrap();
+        assert_eq!(verifier.status, "idle");
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.finished"
+                && event.payload["agent_role"] == "worker"
+                && event.payload["status"] == "changes_requested"
+                && event.payload["approved"] == false
+        }));
     }
 
     #[test]
