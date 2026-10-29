@@ -467,9 +467,9 @@ loop {
 
 ## 7. Agent Runtime
 
-> **实现状态（M2 第九切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建；Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由 Verifier 审查（只读是 prompt 约束，shell 未沙箱），approve 才 merge；Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–10 个 Worker，手动路径会校验不重叠 write scope，plan 自动派发的 pairwise 校验仍待补；每个 Worker 有独立 task worktree，完成后按任务顺序串行 commit + merge 到 session 分支；session diff 从 base commit 起算。**已实现：** session 内 TeamPlan DAG 调度、Verifier gate、串行集成。**仍是设计目标：** 全局跨 session 调度器、全局写锁、merge queue、Integrator gate、post-merge integration test、typed mailbox/artifact store：
+> **实现状态（M2 第九切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建；Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由 Verifier 审查（只读是 prompt 约束，shell 未沙箱），approve 才 merge；Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–10 个 Worker；手动 `delegate_many` 和 plan batch 都校验不重叠 write scope，空 scope/重叠 task 串行执行；每个 Worker 有独立 task worktree，完成后按任务顺序串行 commit + merge 到 session 分支；session diff 从 base commit 起算。**已实现：** session 内 TeamPlan DAG 调度、Verifier gate、串行集成。**仍是设计目标：** 全局跨 session 调度器、全局写锁、merge queue、Integrator gate、post-merge integration test、typed mailbox/artifact store：
 > `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`、`crates/vp-core/src/worktree.rs`。
-> 四层 Actor、并行只读工具、预算、压缩和恢复仍是设计目标。
+> 四层 Actor 模型、并行只读工具、上下文压缩和 checkpoint/resume 仍是设计目标；session 预算已实现 reservation-based enforcement（输入用保守估算，provider usage 结算）。
 > 见 [ADR-0015](adr/0015-m1-leader-loop.md)、[ADR-0016](adr/0016-session-worktree.md)、[ADR-0019](adr/0019-four-tier-delegation.md)。
 
 ### 7.1 Actor 命令

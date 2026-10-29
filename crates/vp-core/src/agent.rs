@@ -216,10 +216,30 @@ struct AgentCaps {
 
 struct BudgetState {
     spent: u64,
+    /// Tokens held by in-flight provider calls. Reservations count against the
+    /// limit before the request starts, so concurrent agents cannot all pass
+    /// the same pre-flight check and overshoot by a full batch.
+    reserved_tokens: u64,
     managers: usize,
     workers: usize,
     verifiers: usize,
     labour: usize,
+}
+
+struct AgentSlot<'a> {
+    budget: &'a SessionBudget,
+    role: AgentRole,
+}
+
+impl Drop for AgentSlot<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.role);
+    }
+}
+
+struct TokenReservation<'a> {
+    budget: &'a SessionBudget,
+    amount: u64,
 }
 
 impl SessionBudget {
@@ -229,6 +249,7 @@ impl SessionBudget {
             caps,
             state: Mutex::new(BudgetState {
                 spent,
+                reserved_tokens: 0,
                 managers: 0,
                 workers: 0,
                 verifiers: 0,
@@ -245,12 +266,29 @@ impl SessionBudget {
         self.limit.is_some_and(|limit| self.spent() >= limit)
     }
 
-    fn add_usage(&self, input: u64, output: u64) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return true;
-        };
-        state.spent = state.spent.saturating_add(input).saturating_add(output);
-        self.limit.is_some_and(|limit| state.spent >= limit)
+    fn available_tokens(&self) -> Option<u64> {
+        let limit = self.limit?;
+        let state = self.state.lock().ok()?;
+        Some(
+            limit
+                .saturating_sub(state.spent)
+                .saturating_sub(state.reserved_tokens),
+        )
+    }
+
+    fn reserve_tokens(&self, amount: u64) -> Option<TokenReservation<'_>> {
+        let limit = self.limit?;
+        let mut state = self.state.lock().ok()?;
+        let committed = state.spent.saturating_add(state.reserved_tokens);
+        if committed.saturating_add(amount) > limit {
+            return None;
+        }
+        state.reserved_tokens = state.reserved_tokens.saturating_add(amount);
+        drop(state);
+        Some(TokenReservation {
+            budget: self,
+            amount,
+        })
     }
 
     fn reserve(&self, role: AgentRole) -> Option<usize> {
@@ -267,6 +305,65 @@ impl SessionBudget {
         }
         *counter += 1;
         Some(*counter)
+    }
+
+    fn reserve_slot(&self, role: AgentRole) -> Option<(usize, AgentSlot<'_>)> {
+        let ordinal = self.reserve(role)?;
+        Some((ordinal, AgentSlot { budget: self, role }))
+    }
+
+    fn release(&self, role: AgentRole) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let counter = match role {
+            AgentRole::Manager => &mut state.managers,
+            AgentRole::Worker => &mut state.workers,
+            AgentRole::Verifier => &mut state.verifiers,
+            AgentRole::Labour => &mut state.labour,
+            AgentRole::Leader => return,
+        };
+        *counter = counter.saturating_sub(1);
+    }
+
+    fn available(&self, role: AgentRole) -> usize {
+        let Ok(state) = self.state.lock() else {
+            return 0;
+        };
+        let (active, cap) = match role {
+            AgentRole::Manager => (state.managers, self.caps.managers),
+            AgentRole::Worker => (state.workers, self.caps.workers),
+            AgentRole::Verifier => (state.verifiers, 100),
+            AgentRole::Labour => (state.labour, self.caps.labour),
+            AgentRole::Leader => return 0,
+        };
+        cap.saturating_sub(active)
+    }
+}
+
+impl TokenReservation<'_> {
+    /// Replace the pre-flight reservation with the provider's reported usage.
+    /// Returns true when the limit is now reached.
+    fn settle(mut self, actual: u64) -> bool {
+        let amount = self.amount;
+        self.amount = 0;
+        let Ok(mut state) = self.budget.state.lock() else {
+            return true;
+        };
+        state.reserved_tokens = state.reserved_tokens.saturating_sub(amount);
+        state.spent = state.spent.saturating_add(actual);
+        self.budget.limit.is_some_and(|limit| state.spent >= limit)
+    }
+}
+
+impl Drop for TokenReservation<'_> {
+    fn drop(&mut self) {
+        if self.amount == 0 {
+            return;
+        }
+        if let Ok(mut state) = self.budget.state.lock() {
+            state.reserved_tokens = state.reserved_tokens.saturating_sub(self.amount);
+        }
     }
 }
 
@@ -700,6 +797,37 @@ async fn run_agent(
     Ok(())
 }
 
+// Token counts are only exact after a provider reports usage. To keep parallel
+// calls from all passing the same pre-flight check, reserve a conservative
+// estimate up front: roughly two UTF-8 bytes per token, plus a small per-request
+// overhead. The provider's reported usage replaces the estimate on settlement.
+fn estimate_text_tokens(text: &str) -> u64 {
+    (text.len() as u64).div_ceil(2).max(1)
+}
+
+fn estimate_request_tokens(request: &ChatRequest) -> u64 {
+    let mut bytes = request.system.as_deref().map_or(0, str::len);
+    for message in &request.messages {
+        bytes = bytes.saturating_add(message.content.len());
+        if let Some(tool_calls) = &message.tool_calls {
+            for call in tool_calls {
+                bytes = bytes
+                    .saturating_add(call.name.len())
+                    .saturating_add(call.arguments.len());
+            }
+        }
+    }
+    for tool in &request.tools {
+        bytes = bytes
+            .saturating_add(tool.name.len())
+            .saturating_add(tool.description.len());
+        if let Ok(parameters) = serde_json::to_string(&tool.parameters) {
+            bytes = bytes.saturating_add(parameters.len());
+        }
+    }
+    (bytes as u64).div_ceil(2).saturating_add(64)
+}
+
 fn normalize_scope(scope: &str) -> String {
     scope
         .trim()
@@ -721,6 +849,12 @@ fn path_in_scope(path: &str, scopes: &[String]) -> bool {
 
 fn scopes_overlap(left: &[String], right: &[String]) -> bool {
     if left.is_empty() || right.is_empty() {
+        return true;
+    }
+    let is_unrestricted = |scope: &str| matches!(normalize_scope(scope).as_str(), "*" | "**");
+    if left.iter().any(|scope| is_unrestricted(scope))
+        || right.iter().any(|scope| is_unrestricted(scope))
+    {
         return true;
     }
     left.iter().any(|a| {
@@ -786,7 +920,7 @@ async fn verify_worker(
     worker_summary: &str,
     acceptance: Option<&str>,
 ) -> Result<VerificationOutcome> {
-    let Some(ordinal) = budget.reserve(AgentRole::Verifier) else {
+    let Some((ordinal, _verifier_slot)) = budget.reserve_slot(AgentRole::Verifier) else {
         return Ok(VerificationOutcome::Error(
             "the Verifier cap for this session has been reached".to_string(),
         ));
@@ -1248,7 +1382,7 @@ async fn run_loop(
         if budget.exhausted() {
             return Ok(LoopOutcome::BudgetExceeded);
         }
-        let request = ChatRequest {
+        let mut request = ChatRequest {
             model: config.model.clone(),
             messages: conversation.clone(),
             system: Some(system.clone()),
@@ -1256,9 +1390,27 @@ async fn run_loop(
             temperature: Some(0.2),
             tools: tools.clone(),
         };
+        let mut token_reservation = None;
+        if budget.limit.is_some() {
+            let input_estimate = estimate_request_tokens(&request);
+            let remaining = budget.available_tokens().unwrap_or(0);
+            const MIN_OUTPUT_TOKENS: u64 = 64;
+            if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
+                return Ok(LoopOutcome::BudgetExceeded);
+            }
+            let configured = config.max_tokens.unwrap_or(4096).max(1) as u64;
+            let output_budget = configured.min(remaining - input_estimate);
+            let Some(reservation) =
+                budget.reserve_tokens(input_estimate.saturating_add(output_budget))
+            else {
+                return Ok(LoopOutcome::BudgetExceeded);
+            };
+            request.max_tokens = Some(output_budget.min(u32::MAX as u64) as u32);
+            token_reservation = Some(reservation);
+        }
         let mut stream = config
             .provider
-            .stream_chat(request)
+            .stream_chat(request.clone())
             .await
             .context("starting provider stream")?;
 
@@ -1310,13 +1462,32 @@ async fn run_loop(
         if cancelled {
             return Ok(LoopOutcome::Cancelled);
         }
-        if usage != (0, 0) {
+        let actual_usage = if usage != (0, 0) {
             engine
                 .record_usage(&session.id, usage.0 as u64, usage.1 as u64)
                 .await?;
-            if budget.add_usage(usage.0 as u64, usage.1 as u64) {
-                return Ok(LoopOutcome::BudgetExceeded);
-            }
+            usage.0 as u64 + usage.1 as u64
+        } else {
+            // Some local endpoints omit usage. Persist a conservative estimate
+            // so the budget still survives across turns and daemon restarts;
+            // the event is marked `estimated` so it is not mistaken for
+            // provider-reported usage.
+            let input = estimate_request_tokens(&request);
+            let output = estimate_text_tokens(&text).saturating_add(
+                serde_json::to_string(&tool_calls)
+                    .map(|calls| estimate_text_tokens(&calls))
+                    .unwrap_or(0),
+            );
+            engine
+                .record_estimated_usage(&session.id, input, output)
+                .await?;
+            input.saturating_add(output)
+        };
+        if token_reservation
+            .take()
+            .is_some_and(|reservation| reservation.settle(actual_usage))
+        {
+            return Ok(LoopOutcome::BudgetExceeded);
         }
 
         if text.is_empty() && tool_calls.is_empty() {
@@ -1615,12 +1786,19 @@ async fn run_loop(
                 .await?;
                 match parse_delegate(&input, spec.role, spec.profile, team_plan.as_ref()) {
                     Ok((role, name, child_objective, title, child_profile)) => {
-                        match budget.reserve(role) {
+                        let reservation = if role == AgentRole::Manager {
+                            budget.reserve(role).map(|ordinal| (ordinal, None))
+                        } else {
+                            budget
+                                .reserve_slot(role)
+                                .map(|(ordinal, slot)| (ordinal, Some(slot)))
+                        };
+                        match reservation {
                             None => ToolOutput::error(format!(
                                 "the {} cap for this session has been reached",
                                 role.as_str()
                             )),
-                            Some(ordinal) => {
+                            Some((ordinal, _slot)) => {
                                 let child_name = name.clone().unwrap_or_else(|| {
                                     title.clone().unwrap_or_else(|| {
                                         format!("{} {}", role.default_name(), ordinal)
@@ -2359,15 +2537,17 @@ async fn run_parallel_workers(
 ) -> Result<ParallelResult> {
     let tasks = parse_parallel_tasks(input, spec.profile)?;
     let mut prepared = Vec::new();
+    let mut worker_slots = Vec::new();
     for task in tasks {
         if control.is_cancelled() {
             return Ok(ParallelResult::Cancelled);
         }
-        let Some(ordinal) = budget.reserve(AgentRole::Worker) else {
+        let Some((ordinal, slot)) = budget.reserve_slot(AgentRole::Worker) else {
             return Ok(ParallelResult::Output(ToolOutput::error(
                 "the Worker cap for this session has been reached",
             )));
         };
+        worker_slots.push(slot);
         let child_name = task
             .name
             .clone()
@@ -2768,7 +2948,9 @@ async fn deliberate_team_plan(
 ) -> Result<RoundtableResult> {
     let mut managers = Vec::new();
     for department in &plan.departments {
-        managers.push(ensure_plan_manager(engine, config, session, leader_spec, department).await?);
+        managers.push(
+            ensure_plan_manager(engine, config, session, budget, leader_spec, department).await?,
+        );
     }
     let overview = plan_prompt(plan);
     let mut positions: Vec<(String, String)> = Vec::new();
@@ -2916,6 +3098,7 @@ async fn ensure_plan_manager(
     engine: &Engine,
     config: &AgentConfig,
     session: &Session,
+    budget: &SessionBudget,
     leader_spec: &AgentSpec,
     department: &PlanDepartment,
 ) -> Result<AgentSpec> {
@@ -2941,6 +3124,9 @@ async fn ensure_plan_manager(
             agent
         }
         None => {
+            if budget.reserve(AgentRole::Manager).is_none() {
+                return Err(anyhow!("the Manager cap for this session has been reached"));
+            }
             let agent = engine
                 .create_agent(
                     &session.id,
@@ -2998,6 +3184,41 @@ async fn ensure_plan_manager(
     )
     .await?;
     Ok(spec)
+}
+
+fn normalized_task_scope(task: &PlanTask) -> Vec<String> {
+    task.write_scope
+        .iter()
+        .map(|scope| normalize_scope(scope))
+        .collect()
+}
+
+/// Select a ready batch that can safely run concurrently. Tasks with no scope
+/// are treated as unrestricted and run alone. A task that overlaps an earlier
+/// task in the batch stays pending for the next batch instead of being merged
+/// into a conflicting write set.
+fn select_plan_batch(ready: Vec<PlanTask>, limit: usize) -> Vec<PlanTask> {
+    let mut batch: Vec<PlanTask> = Vec::new();
+    for task in ready {
+        if batch.len() >= limit {
+            break;
+        }
+        let scope = normalized_task_scope(&task);
+        if !batch.is_empty() {
+            if scope.is_empty() {
+                continue;
+            }
+            let overlaps = batch.iter().any(|existing| {
+                let existing = normalized_task_scope(existing);
+                existing.is_empty() || scopes_overlap(&scope, &existing)
+            });
+            if overlaps {
+                continue;
+            }
+        }
+        batch.push(task);
+    }
+    batch
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3087,16 +3308,36 @@ async fn execute_team_plan(
             }
             break;
         }
-        let batch = ready
-            .into_iter()
-            .take(config.max_workers.max(1))
-            .collect::<Vec<_>>();
+        let capacity = config
+            .max_workers
+            .max(1)
+            .min(budget.available(AgentRole::Worker));
+        if capacity == 0 {
+            for task in &remaining {
+                statuses.insert(task.id.clone(), "blocked".to_string());
+                emit(
+                    engine,
+                    &session.id,
+                    leader_spec,
+                    "plan_task.finished",
+                    serde_json::json!({
+                        "task_id": task.id,
+                        "task_status": "blocked",
+                        "reason": "Worker cap is fully occupied",
+                    }),
+                )
+                .await?;
+            }
+            break;
+        }
+        let batch = select_plan_batch(ready, capacity);
         let batch_ids = batch
             .iter()
             .map(|task| task.id.clone())
             .collect::<std::collections::HashSet<_>>();
 
         let mut prepared = Vec::new();
+        let mut worker_slots = Vec::new();
         for task in &batch {
             let manager_spec = if let Some(spec) = manager_specs.get(&task.department) {
                 spec.clone()
@@ -3107,7 +3348,8 @@ async fn execute_team_plan(
                     .find(|department| department.name == task.department)
                     .ok_or_else(|| anyhow!("missing department for task {}", task.department))?;
                 let spec =
-                    ensure_plan_manager(engine, config, session, leader_spec, department).await?;
+                    ensure_plan_manager(engine, config, session, budget, leader_spec, department)
+                        .await?;
                 manager_specs.insert(task.department.clone(), spec.clone());
                 spec
             };
@@ -3119,6 +3361,10 @@ async fn execute_team_plan(
                 .map(|scope| normalize_scope(scope))
                 .collect::<Vec<_>>();
             let worker_name = format!("{} · {}", task.department, truncate_to(&task.title, 48));
+            let Some((_ordinal, slot)) = budget.reserve_slot(AgentRole::Worker) else {
+                return Err(anyhow!("the Worker cap for this session has been reached"));
+            };
+            worker_slots.push(slot);
             let worker = engine
                 .create_agent(
                     &session.id,
@@ -3712,6 +3958,18 @@ mod tests {
         (engine, service, project)
     }
 
+    fn set_worker_cap(service: &AgentService, max_workers: usize) {
+        let mut config = service
+            .config
+            .read()
+            .unwrap()
+            .as_ref()
+            .expect("test service is configured")
+            .clone();
+        config.max_workers = max_workers;
+        *service.config.write().unwrap() = Some(config);
+    }
+
     struct SlowProvider;
 
     #[async_trait]
@@ -3874,13 +4132,19 @@ mod tests {
     struct PlanRoutingProvider {
         active: std::sync::atomic::AtomicUsize,
         max_active: std::sync::atomic::AtomicUsize,
+        overlapping_scopes: bool,
     }
 
     impl PlanRoutingProvider {
         fn new() -> Self {
+            Self::with_overlapping_scopes(false)
+        }
+
+        fn with_overlapping_scopes(overlapping_scopes: bool) -> Self {
             Self {
                 active: std::sync::atomic::AtomicUsize::new(0),
                 max_active: std::sync::atomic::AtomicUsize::new(0),
+                overlapping_scopes,
             }
         }
     }
@@ -3948,8 +4212,8 @@ mod tests {
                         "objective": "collect sources"
                     }],
                     "tasks": [
-                        {"id": "T1", "department": "research", "title": "Task one", "kind": "research", "deps": [], "acceptance": ["done"]},
-                        {"id": "T2", "department": "research", "title": "Task two", "kind": "research", "deps": [], "acceptance": ["done"]}
+                        {"id": "T1", "department": "research", "title": "Task one", "kind": "research", "deps": [], "acceptance": ["done"], "write_scope": [if self.overlapping_scopes { "src/shared" } else { "src/t1" }]},
+                        {"id": "T2", "department": "research", "title": "Task two", "kind": "research", "deps": [], "acceptance": ["done"], "write_scope": [if self.overlapping_scopes { "src/shared" } else { "src/t2" }]}
                     ]
                 });
                 vec![
@@ -4524,6 +4788,8 @@ mod tests {
             &["src/components".to_string()]
         ));
         assert!(!scopes_overlap(&["src".to_string()], &["docs".to_string()]));
+        assert!(scopes_overlap(&["*".to_string()], &["src".to_string()]));
+        assert!(scopes_overlap(&["**".to_string()], &["docs".to_string()]));
     }
 
     #[tokio::test]
@@ -4952,6 +5218,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serializes_plan_tasks_with_overlapping_scopes() {
+        let dir = TempDir::new().unwrap();
+        let provider = Arc::new(PlanRoutingProvider::with_overlapping_scopes(true));
+        let provider_trait: Arc<dyn Provider> = provider.clone();
+        let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+        let session = engine
+            .create_session(project.id, "overlapping plan".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service
+            .start(&session.id, "overlapping plan")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        assert_eq!(
+            provider
+                .max_active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "overlapping write scopes must not run concurrently"
+        );
+        let events = engine
+            .list_events(session.id.clone(), 0, 400)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "plan_task.finished"
+                        && event.payload["task_status"] == "completed"
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_batches_respect_the_worker_cap() {
+        let dir = TempDir::new().unwrap();
+        let provider = Arc::new(PlanRoutingProvider::new());
+        let provider_trait: Arc<dyn Provider> = provider.clone();
+        let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+        set_worker_cap(&service, 1);
+        let session = engine
+            .create_session(project.id, "capped plan".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "capped plan").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        assert_eq!(
+            provider
+                .max_active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the worker cap must bound plan concurrency"
+        );
+        let events = engine
+            .list_events(session.id.clone(), 0, 400)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "plan_task.finished"
+                        && event.payload["task_status"] == "completed"
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn managers_deliberate_with_peer_positions() {
         let dir = TempDir::new().unwrap();
         let provider: Arc<dyn Provider> = Arc::new(RoundtableProvider);
@@ -5030,6 +5380,119 @@ mod tests {
         assert_eq!(sessions[0].status, "failed");
         assert_eq!(sessions[0].tokens_in, 80);
         assert_eq!(sessions[0].tokens_out, 40);
+    }
+
+    #[tokio::test]
+    async fn persists_estimated_usage_when_provider_omits_usage() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![vec![
+                StreamEvent::TextDelta("estimated".into()),
+                StreamEvent::Done,
+            ]])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "estimate".into(), Some(100_000))
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "estimate").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let session = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == session.id)
+            .unwrap();
+        assert!(session.tokens_in > 0);
+        assert!(session.tokens_out > 0);
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.kind == "agent.usage" && event.payload["estimated"] == true })
+        );
+    }
+
+    #[test]
+    fn plan_batch_serializes_unscoped_and_overlapping_tasks() {
+        fn task(id: &str, scope: &[&str]) -> PlanTask {
+            PlanTask {
+                id: id.to_string(),
+                department: "impl".to_string(),
+                title: id.to_string(),
+                kind: "coding".to_string(),
+                profile: None,
+                deps: Vec::new(),
+                write_scope: scope.iter().map(|scope| scope.to_string()).collect(),
+                acceptance: vec!["done".to_string()],
+            }
+        }
+
+        let batch = select_plan_batch(
+            vec![task("T1", &[]), task("T2", &["src"]), task("T3", &["src"])],
+            10,
+        );
+        assert_eq!(
+            batch
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["T1"]
+        );
+
+        let batch = select_plan_batch(
+            vec![
+                task("T1", &["src"]),
+                task("T2", &["docs"]),
+                task("T3", &["src/sub"]),
+            ],
+            10,
+        );
+        assert_eq!(
+            batch
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["T1", "T2"]
+        );
+    }
+
+    #[test]
+    fn token_reservations_bound_concurrent_requests() {
+        let budget = SessionBudget::new(
+            Some(1000),
+            0,
+            AgentCaps {
+                managers: 5,
+                workers: 10,
+                labour: 20,
+            },
+        );
+        let first = budget.reserve_tokens(600).expect("first reservation");
+        assert!(budget.reserve_tokens(500).is_none());
+        assert_eq!(budget.available_tokens(), Some(400));
+        assert!(!first.settle(300));
+        assert_eq!(budget.spent(), 300);
+
+        {
+            let _unused = budget.reserve_tokens(200).expect("temporary reservation");
+        }
+        assert_eq!(budget.available_tokens(), Some(700));
+
+        let second = budget.reserve_tokens(700).expect("second reservation");
+        assert!(second.settle(700));
+        assert_eq!(budget.spent(), 1000);
+        assert!(budget.reserve_tokens(1).is_none());
     }
 
     #[tokio::test]

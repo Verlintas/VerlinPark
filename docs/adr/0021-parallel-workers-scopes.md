@@ -3,9 +3,10 @@
 - **Status:** Accepted
 - **Date:** 2026-10-28
 
-> **Implementation note (2026-10-29):** The parallel Worker cap is now 10
-> (ADR-0026). Pairwise scope validation is enforced for manual `delegate_many`,
-> but not yet for TeamPlan auto-dispatch. See [AUDIT P0-1](../AUDIT.md).
+> **Implementation note (2026-10-30):** The parallel Worker cap is 10
+> (ADR-0026). Pairwise scope validation is enforced for manual `delegate_many`
+> and for TeamPlan batch selection; tasks with empty or overlapping scopes run
+> alone. See [AUDIT P0-1](../AUDIT.md).
 
 ## Context
 

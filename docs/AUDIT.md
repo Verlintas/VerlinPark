@@ -5,6 +5,18 @@
 > 范围：Rust runtime、SwiftUI app、协议/存储、Git 集成、权限与预算、文档与仓库卫生  
 > 结论先行：**M2 的功能闭环已经成立，但仍是一个强原型，不是可靠的多 Agent 平台。** 当前最需要的不是继续加组织层功能，而是把已经承诺的约束真正执行，并补上 merge queue / Integrator 闭环。
 
+## 0. 2026-10-30 跟进
+
+第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：
+
+- **P0-1 已修复**：TeamPlan 自动派发按 `write_scope` 选择可并行批次；空 scope / 重叠 scope 的任务串行执行。Worker 使用可释放的 active slot，Manager 继续按 run 计数；`available(Worker)` 限制 batch 大小。
+- **P0-2 已修复**：provider 请求前做 token reservation，按保守输入估算 + 动态 output budget 预留；provider 返回 usage 后结算，缺少 usage 的本地端点会以 `estimated: true` 的估算用量持久化。并发批次不再共用同一个 pre-flight 窗口。
+- **P1-4 已修复**：`fetch_url` 在连接前解析并固定已校验的 IP，阻止解析到 loopback/private/link-local/文档/benchmark 等地址；补充了 IPv4-mapped IPv6 与特殊段检查。
+- **P1-3 部分缓解**：Verifier shell 的审批卡会明确警告 “not sandboxed”；runtime 沙箱仍未实现。
+- **仍未解决**：shell 沙箱、完整 event sourcing、merge queue/Integrator、worktree 清理、P2 batch abort 状态一致性。
+
+当前测试：Rust 52（core 37 / store 10 / providers 5），Swift 9。CI 以最新提交为准。
+
 ---
 
 ## 1. 总体判断
@@ -29,11 +41,11 @@
 | 维度 | 评分 | 说明 |
 |---|---|---|
 | 功能完整度（M2） | B | 主链路真实可跑；缺 merge queue、Integrator、artifact、mailbox、landing |
-| 正确性/一致性 | C+ | 计划派发绕过部分 caps/scope 校验；预算不是严格硬停；事件溯源只做了一半 |
-| 隔离与安全 | C+ | 路径 jail 和 loopback token 做得不错；shell 无沙箱，fetch_url 有 DNS SSRF 缺口 |
+| 正确性/一致性 | B− | P0 的 plan scope/caps 与预算 reservation 已在 10-30 修复；事件溯源仍只做了一半 |
+| 隔离与安全 | C+ | 路径 jail、loopback token、fetch_url DNS 固定做得不错；shell 仍无沙箱 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
-| 测试 | B− | 45 Rust + 9 Swift 全绿；但关键并发/安全/合并冲突路径缺回归测试 |
+| 测试 | B− | 52 Rust + 9 Swift 全绿；并发/scope/SSRF 已有回归，合并冲突与真实 Provider 路径仍缺 |
 | 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -42,7 +54,7 @@
 
 ## 2. 必须优先处理的问题
 
-### P0-1：自动派发绕过 org caps 和 plan scope 重叠校验
+### P0-1（已修复 2026-10-30）：自动派发绕过 org caps 和 plan scope 重叠校验
 
 **证据**
 
@@ -65,7 +77,7 @@
 
 ---
 
-### P0-2：session token budget 不是真正的 hard stop
+### P0-2（已修复 2026-10-30）：session token budget 不是真正的 hard stop
 
 **证据**
 
@@ -75,7 +87,7 @@
 
 **影响**
 
-- “hard-stop on a per-session token budget”是 README 和产品叙事的核心卖点；当前实现更接近“下一轮不再开始”。
+- “hard-stop on a per-session token budget”是 README 和产品叙事的核心卖点；修复前更接近“下一轮不再开始”。
 - 对高并发 plan，账单可能明显超过用户设定值。对一个强调“用户控制成本”的自托管平台，这是信任问题。
 
 **建议**
@@ -108,7 +120,7 @@
 
 ---
 
-### P1-4：`fetch_url` 的 SSRF 防护可被 DNS 解析绕过
+### P1-4（已修复 2026-10-30）：`fetch_url` 的 SSRF 防护可被 DNS 解析绕过
 
 **证据**
 
@@ -284,24 +296,31 @@ README 开头仍然说 agent “collaborate through typed messages and shared ar
 
 ---
 
-## 5. 本次整理范围
+## 5. 整理与硬化范围
 
-本次只做**文档与明显过期文案**的整理，不改 runtime 行为：
+第一轮（审计当天）只做文档与过期文案：
 
-- 新增本审计。
-- 新增 `docs/README.md` 文档索引，明确 current / design / historical。
+- 新增本审计与 `docs/README.md` 文档索引。
 - 更新 README、PROGRESS、PLAN、ARCHITECTURE、DECISIONS、AGENTS 的状态与边界描述。
-- 修正 Dashboard / Settings / Studio 中与当前实现冲突的文案和范围数字。
-- 不修改 Rust 逻辑；P0/P1 需要单独的代码切片和测试。
+- 修正 Dashboard / Settings / Studio / NewSessionSheet 中与当前实现冲突的文案和范围数字。
+
+第二轮（2026-10-30）做 runtime 硬化：
+
+- plan batch 的 `write_scope` 选择与 active Worker slot。
+- token reservation、动态 output budget、无 usage 端点的估算用量。
+- `fetch_url` 的 DNS 解析 + IP 固定 + 特殊地址段检查。
+- Verifier shell 审批提示（仍不是沙箱）。
+- 新增 plan scope/cap、token reservation、IP 分类的回归测试。
 
 ---
 
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 45 passed at audit time
+cargo test --workspace     # 52 passed after the 10-30 hardening
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```
 
 审计基线 CI：GitHub Actions run `40902407039`（commit `cbef2e6`）成功。
+硬化后 CI 以最新提交为准。

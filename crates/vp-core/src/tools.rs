@@ -1,3 +1,4 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,6 +95,75 @@ struct WriteFile;
 struct Shell;
 struct FetchUrl;
 
+fn is_blocked_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+}
+
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_blocked_ipv4(ip),
+        IpAddr::V6(ip) => is_blocked_ipv6(ip),
+    }
+}
+
+fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    let [a, b, c, _] = octets;
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || a == 0
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 240
+}
+
+fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return is_blocked_ipv4(mapped);
+    }
+    let segments = ip.segments();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || ip.is_multicast()
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+        || (segments[0] & 0xffc0) == 0xfec0
+}
+
+async fn resolve_public_address(host: &str, port: u16) -> Result<SocketAddr> {
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolving {host}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(anyhow!("host did not resolve: {host}"));
+    }
+    if addresses.iter().any(|address| is_blocked_ip(address.ip())) {
+        return Err(anyhow!("host resolves to a private or local address"));
+    }
+    // Prefer IPv4 when both families are available; a v6-first address can
+    // fail on machines without a working IPv6 route even though v4 works.
+    Ok(addresses
+        .iter()
+        .find(|address| address.is_ipv4())
+        .copied()
+        .unwrap_or(addresses[0]))
+}
+
 #[async_trait]
 impl AgentTool for FetchUrl {
     fn name(&self) -> &'static str {
@@ -141,34 +211,30 @@ impl AgentTool for FetchUrl {
         let host = url
             .host_str()
             .ok_or_else(|| anyhow!("URL has no host"))?
+            .trim_end_matches('.')
             .to_ascii_lowercase();
-        if host == "localhost" || host.ends_with(".local") || host.ends_with(".internal") {
+        if is_blocked_host(&host) {
             return Ok(ToolOutput::error("local hosts are blocked"));
         }
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            let blocked = match ip {
-                std::net::IpAddr::V4(ip) => {
-                    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
-                }
-                std::net::IpAddr::V6(ip) => {
-                    ip.is_loopback()
-                        || ip.is_unspecified()
-                        || ip.is_unique_local()
-                        || ip.is_unicast_link_local()
-                }
-            };
-            if blocked {
+        let port = url.port_or_known_default().unwrap_or(80);
+        let mut client_builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent("VerlinPark/0.1 research fetcher");
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if is_blocked_ip(ip) {
                 return Ok(ToolOutput::error(
                     "private or local IP addresses are blocked",
                 ));
             }
+        } else {
+            // Resolve and pin the address that was actually checked. Checking
+            // only the hostname would let a public name resolve to loopback or
+            // a private network between validation and connection.
+            let address = resolve_public_address(&host, port).await?;
+            client_builder = client_builder.resolve(&host, address);
         }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(20))
-            .user_agent("VerlinPark/0.1 research fetcher")
-            .build()
-            .context("building HTTP client")?;
+        let client = client_builder.build().context("building HTTP client")?;
         let response = client
             .get(url)
             .send()
@@ -743,6 +809,43 @@ mod tests {
             std::fs::read_to_string(context.root.join("dup.txt")).unwrap(),
             "x x\n"
         );
+    }
+
+    #[test]
+    fn blocks_private_and_special_ip_ranges() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "198.18.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            let ip = address.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{address} should be blocked");
+        }
+        for address in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            let ip = address.parse().unwrap();
+            assert!(!is_blocked_ip(ip), "{address} should be public");
+        }
+        assert!(is_blocked_host("localhost"));
+        assert!(is_blocked_host("printer.local."));
+        assert!(is_blocked_host("metadata.internal"));
+        assert!(!is_blocked_host("example.com"));
+    }
+
+    #[tokio::test]
+    async fn rejects_hostnames_that_resolve_to_loopback() {
+        assert!(resolve_public_address("localhost", 80).await.is_err());
     }
 
     #[tokio::test]

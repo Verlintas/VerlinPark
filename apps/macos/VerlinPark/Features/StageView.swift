@@ -624,6 +624,13 @@ struct ApprovalCard: View {
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(6)
+            if approval.agentRole == "verifier", approval.tool == "shell" {
+                Text(
+                    "Verifier shell is not sandboxed. Approve only commands that cannot modify the worktree."
+                )
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.orange)
+            }
             if resolved || approval.status != "pending" {
                 Text("Resolved")
                     .font(.system(size: 9, design: .monospaced))

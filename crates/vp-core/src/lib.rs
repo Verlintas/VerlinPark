@@ -379,6 +379,27 @@ impl Engine {
     }
 
     pub async fn record_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
+        self.record_usage_with_source(session_id, input, output, false)
+            .await
+    }
+
+    pub async fn record_estimated_usage(
+        &self,
+        session_id: &str,
+        input: u64,
+        output: u64,
+    ) -> Result<()> {
+        self.record_usage_with_source(session_id, input, output, true)
+            .await
+    }
+
+    async fn record_usage_with_source(
+        &self,
+        session_id: &str,
+        input: u64,
+        output: u64,
+        estimated: bool,
+    ) -> Result<()> {
         let store = self.store.clone();
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || store.add_session_usage(&id, input, output)).await??;
@@ -388,6 +409,7 @@ impl Engine {
             serde_json::json!({
                 "input_tokens": input,
                 "output_tokens": output,
+                "estimated": estimated,
             }),
         )
         .await?;

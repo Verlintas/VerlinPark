@@ -3,10 +3,12 @@
 - **Status:** Accepted
 - **Date:** 2026-10-25
 
-> **Implementation note (2026-10-29):** The budget is checked before a turn and
-> after usage is recorded. Concurrent Workers/roundtable calls can overshoot the
-> limit by one turn; this is not yet a strict reservation-based hard stop. See
-> [AUDIT P0-2](../AUDIT.md).
+> **Implementation note (2026-10-30):** Before a provider call the runtime
+> reserves a conservative input estimate plus a dynamic output budget. Provider
+> usage settles the reservation; endpoints without usage are charged a persisted
+> estimate marked `estimated: true`. This removes the previous full-batch
+> pre-flight overshoot, though tokenization is still an estimate rather than an
+> exact tokenizer. See [AUDIT P0-2](../AUDIT.md).
 
 ## Context
 

@@ -3,8 +3,9 @@
 - **Status:** Accepted
 - **Date:** 2026-10-29
 
-> **Implementation note (2026-10-29):** The 1–3 round, read-only roundtable is
-> implemented. The session budget can overshoot by one concurrent round; see
+> **Implementation note (2026-10-30):** The 1–3 round, read-only roundtable is
+> implemented. The session budget now uses pre-flight reservations; a round can
+> still fail fast when concurrent calls reserve the remaining budget. See
 > [AUDIT P0-2](../AUDIT.md).
 
 ## Context

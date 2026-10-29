@@ -99,9 +99,9 @@ The first end-to-end demo is a complete multi-agent feature delivery on a benchm
 6. The Integrator merges approved work into an integration branch; the UI shows the plan, messages, tool calls, diffs, and token usage.
 7. The user reviews and lands the integration branch.
 
-**Today:** steps 1–5 and serial integration work with one configured model and a session-level budget; the Manager roundtable, task worktrees, and Verifier gate are real. **Still planned:** per-role models/budgets, plan scope-overlap enforcement, merge queue, Integrator, post-merge integration tests, cost ledger, artifact packets, and landing/PR. v0.1 is not a full IDE, not a model hub, and not a document workspace. See [docs/PLAN.md](docs/PLAN.md) for scope, milestones, and non-goals.
+**Today:** steps 1–5 and serial integration work with one configured model and a session-level budget; the Manager roundtable, task worktrees, and Verifier gate are real. Plan batches only group non-overlapping write scopes (unscoped tasks serialize), and the token budget uses pre-flight reservations. **Still planned:** per-role models/budgets, merge queue, Integrator, post-merge integration tests, cost ledger, artifact packets, and landing/PR. v0.1 is not a full IDE, not a model hub, and not a document workspace. See [docs/PLAN.md](docs/PLAN.md) for scope, milestones, and non-goals.
 
-> Known enforcement gaps at this milestone: plan auto-dispatch does not yet enforce pairwise write-scope overlap or org caps, and the token budget can overshoot under concurrency. See [docs/AUDIT.md](docs/AUDIT.md).
+> Known gaps at this milestone: the Verifier's shell is not sandboxed, the event log is an audit/projection stream rather than full replayable event sourcing, and merge queue/Integrator/landing are still ahead. See [docs/AUDIT.md](docs/AUDIT.md).
 
 ## Documentation
 
@@ -199,7 +199,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M2 四层委派已跑通**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经可用；Leader 可以委派给 Manager → Worker → Labour，召集 1–3 轮只读 Manager 圆桌，提交并自动派发 TeamPlan，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果。Worker 拥有独立 task worktree，Verifier 审查通过后串行合并到 session 分支；session diff 从 base commit 起算。Leader 必须给每个 Manager 分配部门角色；`delegate_many` 会校验不重叠写作用域；research profile 可读取公网 URL。当前限制：merge queue / Integrator / landing 未实现，TeamPlan 自动派发尚未执行 pairwise scope/caps 校验，token 预算在并发下可能有一轮超调，shell 没有沙箱。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md) 和 [docs/AUDIT.md](docs/AUDIT.md)。
+当前处于 **M2 四层委派已跑通**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经可用；Leader 可以委派给 Manager → Worker → Labour，召集 1–3 轮只读 Manager 圆桌，提交并自动派发 TeamPlan，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果。Worker 拥有独立 task worktree，Verifier 审查通过后串行合并到 session 分支；session diff 从 base commit 起算。Leader 必须给每个 Manager 分配部门角色；`delegate_many` 会校验不重叠写作用域；research profile 可读取公网 URL。当前限制：merge queue / Integrator / landing 未实现，shell 没有沙箱，事件日志仍是审计/投影流而非完整 replay。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md) 和 [docs/AUDIT.md](docs/AUDIT.md)。
 
 ## 许可
 

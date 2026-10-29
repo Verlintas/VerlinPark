@@ -1,6 +1,6 @@
 # VerlinPark 决策记录
 
-> 最后更新：2026-10-29  
+> 最后更新：2026-10-30
 > 格式：Architecture Decision Record（ADR）  
 > 规则：已接受的决策不删除；如果改变，新增一条“Supersedes”记录。
 

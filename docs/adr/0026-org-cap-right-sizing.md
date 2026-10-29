@@ -3,10 +3,10 @@
 - **Status:** Accepted
 - **Date:** 2026-10-29
 
-> **Implementation note (2026-10-29):** Defaults and lazy Managers are
-> implemented. The budget is not yet a strict reservation-based hard stop under
-> concurrent batches, and plan auto-dispatch does not yet reserve caps or check
-> pairwise scope overlap. See [AUDIT](../AUDIT.md).
+> **Implementation note (2026-10-30):** Defaults and lazy Managers are
+> implemented. Plan batches check pairwise scope overlap and use active Worker
+> slots; Workers/Labour release their slot on finish, while Managers are counted
+> per run. The budget uses pre-flight reservations. See [AUDIT](../AUDIT.md).
 
 ## Context
 

@@ -5,8 +5,9 @@
 
 > **Implementation note (2026-10-29):** The 8/32/128 caps, 500-task plan, and
 > Verifier cap of 1000 here were superseded by ADR-0026 (4/6/12 defaults,
-> 5/10/40 caps, 100 tasks, Verifier cap 100). See [AUDIT](../AUDIT.md) for the
-> current budget/scope enforcement gaps.
+> 5/10/40 caps, 100 tasks, Verifier cap 100). Plan scope/cap enforcement and
+> budget reservations were added on 2026-10-30; remaining gaps are in
+> [AUDIT](../AUDIT.md).
 
 ## Context
 
