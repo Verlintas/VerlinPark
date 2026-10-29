@@ -317,6 +317,7 @@ struct PlanTask: Codable, Identifiable, Hashable, Sendable {
     let department: String
     let title: String
     let kind: String
+    let profile: String?
     let deps: [String]
     let writeScope: [String]
     let acceptance: [String]
@@ -326,6 +327,7 @@ struct PlanTask: Codable, Identifiable, Hashable, Sendable {
         case department
         case title
         case kind
+        case profile
         case deps
         case writeScope = "write_scope"
         case acceptance

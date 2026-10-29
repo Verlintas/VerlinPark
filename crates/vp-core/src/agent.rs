@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
-    AgentInfo, ConfigureAgentParams, Project, Session, StoredMessage, TeamPlan, TodoItem,
+    AgentInfo, ConfigureAgentParams, PlanTask, Project, Session, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, StreamEvent,
@@ -256,7 +256,7 @@ impl SessionBudget {
         let (counter, cap) = match role {
             AgentRole::Manager => (&mut state.managers, self.caps.managers),
             AgentRole::Worker => (&mut state.workers, self.caps.workers),
-            AgentRole::Verifier => (&mut state.verifiers, 10),
+            AgentRole::Verifier => (&mut state.verifiers, 1000),
             AgentRole::Labour => (&mut state.labour, self.caps.labour),
             AgentRole::Leader => return None,
         };
@@ -350,15 +350,15 @@ impl AgentService {
                 max_managers: env::var("VERLINPARK_MAX_MANAGERS")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(5),
+                    .unwrap_or(8),
                 max_workers: env::var("VERLINPARK_MAX_WORKERS")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(10),
+                    .unwrap_or(32),
                 max_labour: env::var("VERLINPARK_MAX_LABOUR")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(20),
+                    .unwrap_or(128),
                 tools: ToolRegistry::default_tools(),
             },
         )
@@ -413,9 +413,9 @@ impl AgentService {
             base_url: Some(base_url),
             max_turns: params.max_turns.unwrap_or(20).clamp(1, 200),
             max_tokens: params.max_tokens.or(Some(4096)),
-            max_managers: params.max_managers.unwrap_or(5).clamp(1, 5) as usize,
-            max_workers: params.max_workers.unwrap_or(10).clamp(1, 10) as usize,
-            max_labour: params.max_labour.unwrap_or(20).clamp(1, 40) as usize,
+            max_managers: params.max_managers.unwrap_or(8).clamp(1, 32) as usize,
+            max_workers: params.max_workers.unwrap_or(32).clamp(1, 128) as usize,
+            max_labour: params.max_labour.unwrap_or(128).clamp(1, 512) as usize,
             tools: ToolRegistry::default_tools(),
         };
         *self
@@ -781,6 +781,7 @@ async fn verify_worker(
     worker_spec: &AgentSpec,
     objective: &str,
     worker_summary: &str,
+    acceptance: Option<&str>,
 ) -> Result<VerificationOutcome> {
     let Some(ordinal) = budget.reserve(AgentRole::Verifier) else {
         return Ok(VerificationOutcome::Error(
@@ -823,11 +824,24 @@ async fn verify_worker(
         write_scope: Vec::new(),
         base_commit: worker_spec.base_commit.clone(),
     };
+    let focus = match worker_spec.profile {
+        AgentProfile::Research => {
+            "Check the report, sources, and citations; use fetch_url if a source needs verification."
+        }
+        AgentProfile::Coding => {
+            "Inspect the diff, run relevant tests with shell, and check the acceptance criteria."
+        }
+        AgentProfile::Verification => "Inspect the evidence and run checks; do not edit files.",
+        AgentProfile::Generic => "Inspect the output and evidence; do not edit files.",
+    };
+    let acceptance_note = acceptance
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(" Acceptance criteria: {value}."))
+        .unwrap_or_default();
     let prompt = format!(
-        "Verify Worker {} for this task. Objective: {objective}. Worker summary: {worker_summary}. \
-         The worktree is {} on branch {}; base commit {}. \
-         Inspect the diff, run relevant tests with shell, and do not edit files. \
-         Then call submit_verdict with approved and summary.",
+        "Verify Worker {} for this task. Objective: {objective}.{acceptance_note} \
+         Worker summary: {worker_summary}. The worktree is {} on branch {}; base commit {}. \
+         {focus} Do not edit files. Then call submit_verdict with approved and summary.",
         worker_spec.name,
         worker_spec.worktree.to_string_lossy(),
         worker_spec.branch,
@@ -960,7 +974,7 @@ async fn verify_worker(
 }
 
 enum WorkerFinish {
-    Done(String),
+    Done { report: String, success: bool },
     Cancelled,
     BudgetExceeded,
 }
@@ -977,6 +991,7 @@ async fn finish_worker(
     worker_spec: &AgentSpec,
     objective: &str,
     summary: &str,
+    acceptance: Option<&str>,
 ) -> Result<WorkerFinish> {
     let commit = match commit_worker(worker_spec, &worker_spec.name).await {
         Ok(commit) => commit,
@@ -999,7 +1014,10 @@ async fn finish_worker(
                 }),
             )
             .await?;
-            return Ok(WorkerFinish::Done(summary));
+            return Ok(WorkerFinish::Done {
+                report: summary,
+                success: false,
+            });
         }
     };
     let Some(commit) = commit else {
@@ -1019,10 +1037,10 @@ async fn finish_worker(
             }),
         )
         .await?;
-        return Ok(WorkerFinish::Done(format!(
-            "no changes to merge\n{}",
-            truncate(summary)
-        )));
+        return Ok(WorkerFinish::Done {
+            report: format!("no changes to merge\n{}", truncate(summary)),
+            success: true,
+        });
     };
 
     let verification = verify_worker(
@@ -1036,6 +1054,7 @@ async fn finish_worker(
         worker_spec,
         objective,
         summary,
+        acceptance,
     )
     .await?;
     match verification {
@@ -1061,11 +1080,14 @@ async fn finish_worker(
                         }),
                     )
                     .await?;
-                    Ok(WorkerFinish::Done(format!(
-                        "merged: true\nverified: true\n{}\nverdict: {}",
-                        truncate(summary),
-                        truncate(&verdict.summary)
-                    )))
+                    Ok(WorkerFinish::Done {
+                        report: format!(
+                            "merged: true\nverified: true\n{}\nverdict: {}",
+                            truncate(summary),
+                            truncate(&verdict.summary)
+                        ),
+                        success: true,
+                    })
                 }
                 Err(error) => {
                     engine
@@ -1089,10 +1111,13 @@ async fn finish_worker(
                         }),
                     )
                     .await?;
-                    Ok(WorkerFinish::Done(format!(
-                        "merge failed: {error}\nverdict: {}",
-                        truncate(&verdict.summary)
-                    )))
+                    Ok(WorkerFinish::Done {
+                        report: format!(
+                            "merge failed: {error}\nverdict: {}",
+                            truncate(&verdict.summary)
+                        ),
+                        success: false,
+                    })
                 }
             }
         }
@@ -1118,10 +1143,13 @@ async fn finish_worker(
                 }),
             )
             .await?;
-            Ok(WorkerFinish::Done(format!(
-                "merged: false\nverification rejected:\n{}",
-                truncate(&verdict.summary)
-            )))
+            Ok(WorkerFinish::Done {
+                report: format!(
+                    "merged: false\nverification rejected:\n{}",
+                    truncate(&verdict.summary)
+                ),
+                success: false,
+            })
         }
         VerificationOutcome::Error(error) => {
             engine
@@ -1143,7 +1171,10 @@ async fn finish_worker(
                 }),
             )
             .await?;
-            Ok(WorkerFinish::Done(format!("verification error: {error}")))
+            Ok(WorkerFinish::Done {
+                report: format!("verification error: {error}"),
+                success: false,
+            })
         }
         VerificationOutcome::Cancelled => {
             engine
@@ -1360,20 +1391,26 @@ async fn run_loop(
             let is_delegate_many = call.name == "delegate_many" && spec.role == AgentRole::Manager;
             let is_verdict = call.name == "submit_verdict" && spec.role == AgentRole::Verifier;
             let is_team_plan = call.name == "submit_team_plan" && spec.role == AgentRole::Leader;
+            let is_run_plan = call.name == "run_team_plan" && spec.role == AgentRole::Leader;
             let is_todo = call.name == "todo_write" && spec.role == AgentRole::Leader;
             let registry_tool = config
                 .tools
                 .get(&call.name)
                 .filter(|_| spec.role.allows_tool(spec.profile, &call.name));
-            let requires_approval =
-                if is_delegate || is_delegate_many || is_verdict || is_team_plan || is_todo {
-                    false
-                } else {
-                    registry_tool
-                        .as_ref()
-                        .map(|tool| tool.requires_approval())
-                        .unwrap_or(false)
-                };
+            let requires_approval = if is_delegate
+                || is_delegate_many
+                || is_verdict
+                || is_team_plan
+                || is_run_plan
+                || is_todo
+            {
+                false
+            } else {
+                registry_tool
+                    .as_ref()
+                    .map(|tool| tool.requires_approval())
+                    .unwrap_or(false)
+            };
 
             let mut approved = true;
             if requires_approval {
@@ -1404,6 +1441,33 @@ async fn run_loop(
 
             let output = if !approved {
                 ToolOutput::error("The user denied this tool call.")
+            } else if is_run_plan {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match engine.get_team_plan(&session.id).await? {
+                    None => ToolOutput::error("no TeamPlan submitted; call submit_team_plan first"),
+                    Some(plan) => match execute_team_plan(
+                        engine, config, session, project, control, budget, spec, &plan,
+                    )
+                    .await?
+                    {
+                        PlanRunResult::Done(report) => ToolOutput::ok(report),
+                        PlanRunResult::Cancelled => return Ok(LoopOutcome::Cancelled),
+                        PlanRunResult::BudgetExceeded => {
+                            return Ok(LoopOutcome::BudgetExceeded);
+                        }
+                    },
+                }
             } else if is_team_plan {
                 emit(
                     engine,
@@ -1642,10 +1706,11 @@ async fn run_loop(
                                                 &child_spec,
                                                 &child_objective,
                                                 &summary,
+                                                None,
                                             )
                                             .await?
                                             {
-                                                WorkerFinish::Done(report) => {
+                                                WorkerFinish::Done { report, .. } => {
                                                     ToolOutput::ok(format!(
                                                         "Worker {} finished:\n{}",
                                                         child_name, report
@@ -1908,7 +1973,7 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
                     "departments": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 5,
+                        "maxItems": 32,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1922,7 +1987,7 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
                     },
                     "tasks": {
                         "type": "array",
-                        "maxItems": 50,
+                        "maxItems": 500,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1930,6 +1995,10 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
                                 "department": {"type": "string"},
                                 "title": {"type": "string"},
                                 "kind": {"type": "string"},
+                                "profile": {
+                                    "type": "string",
+                                    "enum": ["coding", "research", "verification", "generic"]
+                                },
                                 "deps": {"type": "array", "items": {"type": "string"}},
                                 "write_scope": {"type": "array", "items": {"type": "string"}},
                                 "acceptance": {"type": "array", "items": {"type": "string"}}
@@ -1939,6 +2008,17 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
                     }
                 },
                 "required": ["goal", "departments", "tasks"]
+            }),
+        });
+    }
+    if role == AgentRole::Leader {
+        tools.push(ToolSchema {
+            name: "run_team_plan".to_string(),
+            description: "Execute the submitted TeamPlan automatically. Runs ready tasks in dependency batches, creates task workers and verifies their output.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
             }),
         });
     }
@@ -1966,7 +2046,7 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
                     "tasks": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 5,
+                        "maxItems": 20,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2141,8 +2221,8 @@ fn parse_parallel_tasks(
         .get("tasks")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow!("tasks is required"))?;
-    if tasks.is_empty() || tasks.len() > 5 {
-        return Err(anyhow!("delegate_many accepts 1 to 5 tasks"));
+    if tasks.is_empty() || tasks.len() > 20 {
+        return Err(anyhow!("delegate_many accepts 1 to 20 tasks"));
     }
     let mut parsed = Vec::with_capacity(tasks.len());
     for task in tasks {
@@ -2380,11 +2460,11 @@ async fn run_parallel_workers(
                 };
                 match finish_worker(
                     engine, config, session, project, control, budget, spec, child_spec, objective,
-                    &summary,
+                    &summary, None,
                 )
                 .await?
                 {
-                    WorkerFinish::Done(report) => {
+                    WorkerFinish::Done { report, .. } => {
                         reports.push(format!("{}: {}", child_spec.name, report));
                     }
                     WorkerFinish::Cancelled => {
@@ -2486,8 +2566,8 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
             ));
         }
     }
-    if plan.tasks.len() > 50 {
-        return Err(anyhow!("team plan supports at most 50 tasks"));
+    if plan.tasks.len() > 500 {
+        return Err(anyhow!("team plan supports at most 500 tasks"));
     }
     let mut ids = std::collections::HashSet::new();
     for task in &plan.tasks {
@@ -2514,6 +2594,11 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
         }
         if task.kind.trim().is_empty() {
             return Err(anyhow!("task '{id}' needs a kind"));
+        }
+        if let Some(profile) = &task.profile
+            && AgentProfile::parse(profile).is_none()
+        {
+            return Err(anyhow!("task '{id}' has unknown profile: {profile}"));
         }
         if task.acceptance.is_empty() {
             return Err(anyhow!("task '{id}' needs at least one acceptance item"));
@@ -2564,6 +2649,532 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
         visit(&task.id, &plan.tasks, &mut state)?;
     }
     Ok(())
+}
+
+enum PlanRunResult {
+    Done(String),
+    Cancelled,
+    BudgetExceeded,
+}
+
+fn task_profile(task: &PlanTask, department_profile: AgentProfile) -> AgentProfile {
+    if let Some(profile) = &task.profile
+        && let Some(profile) = AgentProfile::parse(profile)
+    {
+        return profile;
+    }
+    match task.kind.as_str() {
+        "research" => AgentProfile::Research,
+        "review" | "verification" => AgentProfile::Verification,
+        "coding" => AgentProfile::Coding,
+        _ => department_profile,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_team_plan(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    control: &RunControl,
+    budget: &SessionBudget,
+    leader_spec: &AgentSpec,
+    plan: &TeamPlan,
+) -> Result<PlanRunResult> {
+    let mut manager_specs = std::collections::HashMap::new();
+    for department in &plan.departments {
+        let profile = AgentProfile::parse(&department.profile)
+            .ok_or_else(|| anyhow!("unknown profile: {}", department.profile))?;
+        let existing = engine
+            .list_agents(&session.id)
+            .await?
+            .into_iter()
+            .find(|agent| {
+                agent.role == "manager"
+                    && agent
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title.eq_ignore_ascii_case(&department.manager_title))
+            });
+        let agent = match existing {
+            Some(agent) => {
+                engine
+                    .set_agent_profile(&agent.id, profile.as_str())
+                    .await?;
+                engine.update_agent_status(&agent.id, "idle").await?;
+                agent
+            }
+            None => {
+                let agent = engine
+                    .create_agent(
+                        &session.id,
+                        AgentRole::Manager.as_str(),
+                        &department.manager_title,
+                        Some(department.manager_title.clone()),
+                        Some(leader_spec.id.clone()),
+                        &config.model,
+                    )
+                    .await?;
+                engine
+                    .set_agent_profile(&agent.id, profile.as_str())
+                    .await?;
+                engine.update_agent_status(&agent.id, "idle").await?;
+                let spec = AgentSpec {
+                    id: agent.id.clone(),
+                    role: AgentRole::Manager,
+                    name: agent.name.clone(),
+                    depth: 1,
+                    parent_name: Some(leader_spec.name.clone()),
+                    title: Some(department.manager_title.clone()),
+                    profile,
+                    worktree: session
+                        .worktree
+                        .clone()
+                        .map(PathBuf::from)
+                        .unwrap_or_default(),
+                    branch: session.branch.clone().unwrap_or_default(),
+                    session_worktree: session
+                        .worktree
+                        .clone()
+                        .map(PathBuf::from)
+                        .unwrap_or_default(),
+                    session_branch: session.branch.clone().unwrap_or_default(),
+                    write_scope: Vec::new(),
+                    base_commit: session.base_commit.clone().unwrap_or_default(),
+                };
+                engine
+                    .set_agent_worktree(&agent.id, &spec.worktree.to_string_lossy(), &spec.branch)
+                    .await?;
+                emit(
+                    engine,
+                    &session.id,
+                    &spec,
+                    "agent.spawned",
+                    serde_json::json!({
+                        "parent_id": leader_spec.id,
+                        "parent_name": leader_spec.name,
+                        "objective": department.objective,
+                        "department": department.name,
+                    }),
+                )
+                .await?;
+                manager_specs.insert(department.name.clone(), spec);
+                continue;
+            }
+        };
+        let spec = AgentSpec {
+            id: agent.id,
+            role: AgentRole::Manager,
+            name: agent.name,
+            depth: 1,
+            parent_name: Some(leader_spec.name.clone()),
+            title: Some(department.manager_title.clone()),
+            profile,
+            worktree: session
+                .worktree
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            branch: session.branch.clone().unwrap_or_default(),
+            session_worktree: session
+                .worktree
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            session_branch: session.branch.clone().unwrap_or_default(),
+            write_scope: Vec::new(),
+            base_commit: session.base_commit.clone().unwrap_or_default(),
+        };
+        manager_specs.insert(department.name.clone(), spec);
+    }
+
+    let mut statuses = plan
+        .tasks
+        .iter()
+        .map(|task| (task.id.clone(), "pending".to_string()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut remaining = plan.tasks.clone();
+    let mut reports = Vec::new();
+
+    while !remaining.is_empty() {
+        if control.is_cancelled() {
+            for task in &remaining {
+                statuses.insert(task.id.clone(), "cancelled".to_string());
+                emit(
+                    engine,
+                    &session.id,
+                    leader_spec,
+                    "plan_task.finished",
+                    serde_json::json!({
+                        "task_id": task.id,
+                        "task_status": "cancelled",
+                    }),
+                )
+                .await?;
+            }
+            return Ok(PlanRunResult::Cancelled);
+        }
+        if budget.exhausted() {
+            for task in &remaining {
+                statuses.insert(task.id.clone(), "blocked".to_string());
+                emit(
+                    engine,
+                    &session.id,
+                    leader_spec,
+                    "plan_task.finished",
+                    serde_json::json!({
+                        "task_id": task.id,
+                        "task_status": "blocked",
+                        "reason": "token budget exhausted",
+                    }),
+                )
+                .await?;
+            }
+            return Ok(PlanRunResult::BudgetExceeded);
+        }
+        let ready = remaining
+            .iter()
+            .filter(|task| {
+                task.deps.iter().all(|dep| {
+                    statuses
+                        .get(dep)
+                        .is_some_and(|status| status == "completed")
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            for task in &remaining {
+                statuses.insert(task.id.clone(), "blocked".to_string());
+                emit(
+                    engine,
+                    &session.id,
+                    leader_spec,
+                    "plan_task.finished",
+                    serde_json::json!({
+                        "task_id": task.id,
+                        "task_status": "blocked",
+                        "reason": "dependency not completed",
+                    }),
+                )
+                .await?;
+            }
+            break;
+        }
+        let batch = ready
+            .into_iter()
+            .take(config.max_workers.max(1))
+            .collect::<Vec<_>>();
+        let batch_ids = batch
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+
+        let mut prepared = Vec::new();
+        for task in &batch {
+            let manager_spec = manager_specs
+                .get(&task.department)
+                .ok_or_else(|| anyhow!("missing manager for department {}", task.department))?
+                .clone();
+            let profile = task_profile(task, manager_spec.profile);
+            let acceptance = task.acceptance.join("; ");
+            let write_scope = task
+                .write_scope
+                .iter()
+                .map(|scope| normalize_scope(scope))
+                .collect::<Vec<_>>();
+            let worker_name = format!("{} · {}", task.department, truncate_to(&task.title, 48));
+            let worker = engine
+                .create_agent(
+                    &session.id,
+                    AgentRole::Worker.as_str(),
+                    &worker_name,
+                    None,
+                    Some(manager_spec.id.clone()),
+                    &config.model,
+                )
+                .await?;
+            engine
+                .set_agent_profile(&worker.id, profile.as_str())
+                .await?;
+            let info = engine
+                .create_task_worktree(
+                    &project.root,
+                    &project.id,
+                    &session.id,
+                    &task.id,
+                    &manager_spec.session_branch,
+                )
+                .await?;
+            engine
+                .set_agent_worktree(&worker.id, &info.path.to_string_lossy(), &info.branch)
+                .await?;
+            let worker_spec = AgentSpec {
+                id: worker.id.clone(),
+                role: AgentRole::Worker,
+                name: worker_name,
+                depth: manager_spec.depth.saturating_add(1),
+                parent_name: Some(manager_spec.name.clone()),
+                title: None,
+                profile,
+                worktree: info.path,
+                branch: info.branch,
+                session_worktree: manager_spec.session_worktree.clone(),
+                session_branch: manager_spec.session_branch.clone(),
+                write_scope,
+                base_commit: info.base_commit,
+            };
+            emit(
+                engine,
+                &session.id,
+                &worker_spec,
+                "agent.spawned",
+                serde_json::json!({
+                    "parent_id": manager_spec.id,
+                    "parent_name": manager_spec.name,
+                    "objective": task.title,
+                    "plan_task_id": task.id,
+                    "department": task.department,
+                }),
+            )
+            .await?;
+            emit(
+                engine,
+                &session.id,
+                &worker_spec,
+                "plan_task.started",
+                serde_json::json!({
+                    "task_id": task.id,
+                    "task_status": "running",
+                    "department": task.department,
+                    "title": task.title,
+                }),
+            )
+            .await?;
+            statuses.insert(task.id.clone(), "running".to_string());
+            let objective = format!(
+                "Execute plan task {}: {}. Department: {} ({}). Acceptance: {}. \
+                 Work only in your task worktree and return a concise summary.",
+                task.id,
+                task.title,
+                task.department,
+                manager_spec.title.as_deref().unwrap_or(&manager_spec.name),
+                acceptance
+            );
+            prepared.push((
+                task.clone(),
+                worker_spec,
+                manager_spec,
+                objective.clone(),
+                acceptance,
+                vec![ChatMessage::user(objective)],
+            ));
+        }
+
+        let futures = prepared
+            .iter_mut()
+            .map(|(_, worker_spec, _, objective, _, conversation)| {
+                run_loop(
+                    engine,
+                    config,
+                    session,
+                    project,
+                    control,
+                    budget,
+                    worker_spec,
+                    objective,
+                    conversation,
+                    false,
+                )
+            });
+        let results = futures_util::future::join_all(futures).await;
+
+        for (index, result) in results.into_iter().enumerate() {
+            let (task, worker_spec, manager_spec, objective, acceptance, _) = &prepared[index];
+            match result {
+                Ok(LoopOutcome::Final(summary)) => {
+                    let summary = if summary.trim().is_empty() {
+                        "The worker completed without a summary.".to_string()
+                    } else {
+                        summary
+                    };
+                    match finish_worker(
+                        engine,
+                        config,
+                        session,
+                        project,
+                        control,
+                        budget,
+                        manager_spec,
+                        worker_spec,
+                        objective,
+                        &summary,
+                        Some(acceptance),
+                    )
+                    .await?
+                    {
+                        WorkerFinish::Done { report, success } => {
+                            let status = if success { "completed" } else { "failed" };
+                            statuses.insert(task.id.clone(), status.to_string());
+                            emit(
+                                engine,
+                                &session.id,
+                                worker_spec,
+                                "plan_task.finished",
+                                serde_json::json!({
+                                    "task_id": task.id,
+                                    "task_status": status,
+                                    "summary": truncate(&report),
+                                }),
+                            )
+                            .await?;
+                            reports.push(format!(
+                                "{} [{}]: {}",
+                                task.id,
+                                status,
+                                truncate(&report)
+                            ));
+                        }
+                        WorkerFinish::Cancelled => {
+                            statuses.insert(task.id.clone(), "cancelled".to_string());
+                            emit(
+                                engine,
+                                &session.id,
+                                worker_spec,
+                                "plan_task.finished",
+                                serde_json::json!({
+                                    "task_id": task.id,
+                                    "task_status": "cancelled",
+                                }),
+                            )
+                            .await?;
+                            for task in remaining
+                                .iter()
+                                .filter(|task| !batch_ids.contains(&task.id))
+                            {
+                                statuses.insert(task.id.clone(), "cancelled".to_string());
+                                emit(
+                                    engine,
+                                    &session.id,
+                                    leader_spec,
+                                    "plan_task.finished",
+                                    serde_json::json!({
+                                        "task_id": task.id,
+                                        "task_status": "cancelled",
+                                    }),
+                                )
+                                .await?;
+                            }
+                            return Ok(PlanRunResult::Cancelled);
+                        }
+                        WorkerFinish::BudgetExceeded => {
+                            statuses.insert(task.id.clone(), "blocked".to_string());
+                            emit(
+                                engine,
+                                &session.id,
+                                worker_spec,
+                                "plan_task.finished",
+                                serde_json::json!({
+                                    "task_id": task.id,
+                                    "task_status": "blocked",
+                                    "reason": "token budget exhausted",
+                                }),
+                            )
+                            .await?;
+                            for task in remaining
+                                .iter()
+                                .filter(|task| !batch_ids.contains(&task.id))
+                            {
+                                statuses.insert(task.id.clone(), "blocked".to_string());
+                                emit(
+                                    engine,
+                                    &session.id,
+                                    leader_spec,
+                                    "plan_task.finished",
+                                    serde_json::json!({
+                                        "task_id": task.id,
+                                        "task_status": "blocked",
+                                        "reason": "token budget exhausted",
+                                    }),
+                                )
+                                .await?;
+                            }
+                            return Ok(PlanRunResult::BudgetExceeded);
+                        }
+                    }
+                }
+                Ok(LoopOutcome::Cancelled) => {
+                    engine
+                        .update_agent_status(&worker_spec.id, "cancelled")
+                        .await?;
+                    statuses.insert(task.id.clone(), "cancelled".to_string());
+                    emit(
+                        engine,
+                        &session.id,
+                        worker_spec,
+                        "plan_task.finished",
+                        serde_json::json!({
+                            "task_id": task.id,
+                            "task_status": "cancelled",
+                        }),
+                    )
+                    .await?;
+                    return Ok(PlanRunResult::Cancelled);
+                }
+                Ok(LoopOutcome::BudgetExceeded) => {
+                    engine
+                        .update_agent_status(&worker_spec.id, "failed")
+                        .await?;
+                    statuses.insert(task.id.clone(), "blocked".to_string());
+                    return Ok(PlanRunResult::BudgetExceeded);
+                }
+                Ok(LoopOutcome::Verdict(_)) => {}
+                Err(error) => {
+                    engine
+                        .update_agent_status(&worker_spec.id, "failed")
+                        .await?;
+                    statuses.insert(task.id.clone(), "failed".to_string());
+                    emit(
+                        engine,
+                        &session.id,
+                        worker_spec,
+                        "plan_task.finished",
+                        serde_json::json!({
+                            "task_id": task.id,
+                            "task_status": "failed",
+                            "summary": truncate(error.to_string().as_str()),
+                        }),
+                    )
+                    .await?;
+                    reports.push(format!("{} [failed]: {error}", task.id));
+                }
+            }
+        }
+
+        remaining.retain(|task| !batch_ids.contains(&task.id));
+    }
+
+    let completed = statuses
+        .values()
+        .filter(|status| status.as_str() == "completed")
+        .count();
+    let failed = statuses
+        .values()
+        .filter(|status| matches!(status.as_str(), "failed" | "blocked" | "cancelled"))
+        .count();
+    reports.push(format!(
+        "Plan complete: {completed} completed, {failed} not completed."
+    ));
+    Ok(PlanRunResult::Done(reports.join("\n")))
+}
+
+fn truncate_to(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_string()
+    } else {
+        value.chars().take(max).collect::<String>() + "…"
+    }
 }
 
 fn parse_verdict(input: &serde_json::Value) -> Result<VerifierVerdict> {
@@ -2624,6 +3235,8 @@ fn role_system_prompt(
              (for example Discovery, Implementation, Quality) via the title field; each title \
              defines that Manager's department role. Managers will split work and delegate to \
              Workers; Workers may use Labour. Do not delegate directly to Workers or Labour. \
+             After the plan is recorded, call run_team_plan to execute it; do not manually \
+             delegate the planned Managers unless you intentionally override the plan. \
              You can still inspect and edit files yourself for small tasks. \
              Review summaries, verify the final diff, and report the result.",
             spec.name
@@ -3014,6 +3627,102 @@ mod tests {
                     "B done"
                 };
                 vec![StreamEvent::TextDelta(text.into()), StreamEvent::Done]
+            };
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+
+    struct PlanRoutingProvider {
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PlanRoutingProvider {
+        fn new() -> Self {
+            Self {
+                active: std::sync::atomic::AtomicUsize::new(0),
+                max_active: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for PlanRoutingProvider {
+        fn id(&self) -> &str {
+            "plan-routing"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+            let last_message = request.messages.last();
+            let last_role = last_message.map(|message| message.role.as_str());
+            let last_content = last_message
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let user_text = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let events = if user_text.contains("Execute plan task T1")
+                || user_text.contains("Execute plan task T2")
+            {
+                let current = self
+                    .active
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.max_active
+                    .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                self.active
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let text = if user_text.contains("T1") {
+                    "T1 done"
+                } else {
+                    "T2 done"
+                };
+                vec![StreamEvent::TextDelta(text.into()), StreamEvent::Done]
+            } else if last_role == Some("tool") {
+                if last_content.contains("Plan complete") {
+                    vec![
+                        StreamEvent::TextDelta("leader done".into()),
+                        StreamEvent::Done,
+                    ]
+                } else {
+                    vec![
+                        StreamEvent::ToolCall(ToolCall {
+                            id: "run_plan".into(),
+                            name: "run_team_plan".into(),
+                            arguments: "{}".into(),
+                        }),
+                        StreamEvent::Done,
+                    ]
+                }
+            } else {
+                let plan = serde_json::json!({
+                    "goal": "auto plan",
+                    "departments": [{
+                        "name": "research",
+                        "manager_title": "Sources",
+                        "profile": "research",
+                        "objective": "collect sources"
+                    }],
+                    "tasks": [
+                        {"id": "T1", "department": "research", "title": "Task one", "kind": "research", "deps": [], "acceptance": ["done"]},
+                        {"id": "T2", "department": "research", "title": "Task two", "kind": "research", "deps": [], "acceptance": ["done"]}
+                    ]
+                });
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "submit_plan".into(),
+                        name: "submit_team_plan".into(),
+                        arguments: plan.to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
             };
             Ok(Box::pin(futures_util::stream::iter(
                 events.into_iter().map(Ok),
@@ -3851,6 +4560,75 @@ mod tests {
                 && event.payload["name"] == "submit_team_plan"
                 && event.payload["is_error"] == true
         }));
+    }
+
+    #[tokio::test]
+    async fn auto_dispatches_a_team_plan_in_dependency_batches() {
+        let dir = TempDir::new().unwrap();
+        let provider = Arc::new(PlanRoutingProvider::new());
+        let provider_trait: Arc<dyn Provider> = provider.clone();
+        let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+        let session = engine
+            .create_session(project.id, "auto plan".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "auto plan").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        assert!(
+            provider
+                .max_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "plan tasks did not run concurrently"
+        );
+        let plan = engine.get_team_plan(&session.id).await.unwrap().unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let manager = agents.iter().find(|agent| agent.role == "manager").unwrap();
+        assert_eq!(manager.title.as_deref(), Some("Sources"));
+        assert_eq!(manager.profile.as_deref(), Some("research"));
+        let workers = agents
+            .iter()
+            .filter(|agent| agent.role == "worker")
+            .collect::<Vec<_>>();
+        assert_eq!(workers.len(), 2);
+        assert!(workers.iter().all(|worker| worker.status == "idle"));
+        assert!(
+            workers
+                .iter()
+                .all(|worker| worker.profile.as_deref() == Some("research"))
+        );
+        let events = engine
+            .list_events(session.id.clone(), 0, 400)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "plan_task.started")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "plan_task.finished"
+                        && event.payload["task_status"] == "completed"
+                })
+                .count(),
+            2
+        );
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "idle");
     }
 
     #[tokio::test]

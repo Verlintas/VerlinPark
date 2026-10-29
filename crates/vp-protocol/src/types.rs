@@ -321,6 +321,8 @@ pub struct PlanTask {
     #[serde(default)]
     pub kind: String,
     #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
     pub deps: Vec<String>,
     #[serde(default)]
     pub write_scope: Vec<String>,

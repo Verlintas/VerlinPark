@@ -957,9 +957,9 @@ struct StudioEmptyView: View {
 struct OrgPresetSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(AppModel.self) private var model
-    @AppStorage("verlinpark.org.managers") private var managers = 4
-    @AppStorage("verlinpark.org.workers") private var workers = 6
-    @AppStorage("verlinpark.org.labour") private var labour = 12
+    @AppStorage("verlinpark.org.managers") private var managers = 8
+    @AppStorage("verlinpark.org.workers") private var workers = 32
+    @AppStorage("verlinpark.org.labour") private var labour = 128
     @AppStorage("verlinpark.org.autoscale") private var autoScale = true
     @AppStorage("verlinpark.org.budgetGate") private var budgetGate = 80
 
@@ -969,7 +969,7 @@ struct OrgPresetSheet: View {
                 Text("Org Preset")
                     .font(.title2.weight(.semibold))
                 Text(
-                    "Runtime caps for delegated agents. The Leader can spawn Managers; Managers spawn Workers; Workers spawn Labour. Caps apply per run."
+                    "Runtime caps for delegated agents. The Leader can define departments and execute a TeamPlan; task batches use the Worker concurrency cap. Budgets are the primary hard stop."
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -978,15 +978,15 @@ struct OrgPresetSheet: View {
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
                 GridRow {
                     Text("Managers").font(.system(size: 12))
-                    Stepper("\(managers) · max 5", value: $managers, in: 3 ... 5)
+                    Stepper("\(managers) · max 32", value: $managers, in: 1 ... 32)
                 }
                 GridRow {
                     Text("Workers").font(.system(size: 12))
-                    Stepper("\(workers) · max 10", value: $workers, in: 2 ... 10)
+                    Stepper("\(workers) · max 128", value: $workers, in: 1 ... 128)
                 }
                 GridRow {
                     Text("Labour").font(.system(size: 12))
-                    Stepper("\(labour) · max 40", value: $labour, in: 3 ... 40)
+                    Stepper("\(labour) · max 512", value: $labour, in: 1 ... 512)
                 }
             }
             .font(.system(size: 11))

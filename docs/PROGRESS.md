@@ -23,6 +23,8 @@
 | TeamPlan | ✅ | Leader `submit_team_plan` 定义 departments/managers/tasks；runtime 校验 caps、唯一 title、profile、DAG、acceptance；计划持久化并在 Collab 显示 |
 | Agent Profile | ✅ | 结构角色与领域 profile 分离：coding / research / verification / generic；profile 决定工具集与 prompt |
 | Research 工具 | ✅ | `fetch_url`：仅公网 HTTP(S)、阻止 localhost/private IP、不跟随重定向、超时与输出截断 |
+| TeamPlan 自动派发 | ✅ | `run_team_plan` 按依赖批次并发执行 ready tasks；自动创建 Manager/Worker/task worktree；Verifier gate + 集成；失败阻塞依赖；任务/计划事件可审计 |
+| 容量放宽 | ✅ | 默认 8 Managers / 32 Workers / 128 Labour；可配置到 32/128/512；plan 最多 500 tasks；Verifier cap 1000；token 预算仍是主硬停 |
 | 审批归属 | ✅ | 审批事件带 `agent_id/agent_name/agent_role`；审批卡显示发起 Agent |
 | 边界 | ✅ | 串行、同一 session worktree；per-task worktree/并行/merge queue 尚未实现 |
 
@@ -49,12 +51,12 @@
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 43 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、Verifier approve/reject、TeamPlan 校验/循环拒绝、Manager title 必填、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
+| 测试 | ✅ | Rust 44 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、Verifier approve/reject、TeamPlan 校验/循环拒绝/自动派发、Manager title 必填、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M2 尚未完成：**
 
-- 完整 task DAG 自动调度 / 全局调度器 / merge queue / Integrator；当前 TeamPlan 已校验和展示，但 plan task 仍由 Leader 显式 delegate 触发，集成串行。
+- 全局跨 session 调度器 / merge queue / Integrator；当前 TeamPlan 可按依赖批次自动派发，但 Manager 在自动路径中是确定性部门节点，集成仍串行。
 - 完整权限代理（命令分类/路径策略）；当前 Manager 只读、Worker/Labour 可写，写/Shell 仍需审批。
 - 上下文压缩、pause/resume、checkpoint（取消与 token 硬停已落地）。
 - 只读工具并行、MCP/ACP、逐 hunk review、终端、真实 Collab 节点。
