@@ -36,6 +36,7 @@
 | [0024](adr/0024-team-plan-profiles.md) | Leader 定义 TeamPlan + AgentProfile/research | Accepted | 组织/平台化/工具 |
 | [0025](adr/0025-team-plan-dispatch.md) | TeamPlan 自动派发 + 放宽固定 caps | Accepted; caps superseded by 0026 | 调度/效率/预算 |
 | [0026](adr/0026-org-cap-right-sizing.md) | 默认小团队 + Manager 懒创建 | Accepted | 容量/成本/UX |
+| [0027](adr/0027-manager-roundtable.md) | Manager 圆桌商讨（1–3 轮、只读） | Accepted | 组织协作/计划质量 |
 
 ---
 

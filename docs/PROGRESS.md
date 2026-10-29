@@ -25,6 +25,7 @@
 | Research 工具 | ✅ | `fetch_url`：仅公网 HTTP(S)、阻止 localhost/private IP、不跟随重定向、超时与输出截断 |
 | TeamPlan 自动派发 | ✅ | `run_team_plan` 按依赖批次并发执行 ready tasks；Manager 懒创建，Worker 并发受 cap 限制；Verifier gate + 集成；失败阻塞依赖；任务/计划事件可审计 |
 | Task Board | ✅ | Preview → Plan 显示 departments / tasks / deps / 实时状态；`plan_task.started/finished` 驱动 UI |
+| Manager Roundtable | ✅ | `deliberate_team_plan`：1–3 轮，所有 Manager 并发参与，后一轮看到前一轮所有 peer positions；只读、不可 delegate；`manager.roundtable` 事件 |
 | 容量右尺寸 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；Manager 按 ready task 懒创建；plan 最多 100 tasks；delegate_many 最多 10；预算仍是主硬停 |
 | 审批归属 | ✅ | 审批事件带 `agent_id/agent_name/agent_role`；审批卡显示发起 Agent |
 | 边界 | ✅ | 串行、同一 session worktree；per-task worktree/并行/merge queue 尚未实现 |
@@ -52,7 +53,7 @@
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 44 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、Verifier approve/reject、TeamPlan 校验/循环拒绝/自动派发、Manager title 必填、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
+| 测试 | ✅ | Rust 45 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、Verifier approve/reject、TeamPlan 校验/循环拒绝/自动派发/Manager 圆桌、Manager title 必填、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M2 尚未完成：**

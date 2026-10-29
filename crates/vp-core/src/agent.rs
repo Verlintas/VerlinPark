@@ -192,6 +192,7 @@ struct AgentSpec {
     parent_name: Option<String>,
     title: Option<String>,
     profile: AgentProfile,
+    allow_delegation: bool,
     worktree: PathBuf,
     branch: String,
     session_worktree: PathBuf,
@@ -583,6 +584,7 @@ async fn run_agent(
         parent_name: None,
         title: None,
         profile: AgentProfile::Generic,
+        allow_delegation: true,
         worktree: worktree.clone(),
         branch: session_branch.clone(),
         session_worktree: worktree.clone(),
@@ -818,6 +820,7 @@ async fn verify_worker(
         parent_name: Some(manager_spec.name.clone()),
         title: Some("Verification".to_string()),
         profile: AgentProfile::Verification,
+        allow_delegation: false,
         worktree: worker_spec.worktree.clone(),
         branch: worker_spec.branch.clone(),
         session_worktree: manager_spec.session_worktree.clone(),
@@ -1235,7 +1238,7 @@ async fn run_loop(
         root: spec.worktree.clone(),
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
-    let tools = tool_schemas(config, spec.role, spec.profile);
+    let tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
     let mut team_plan = engine.get_team_plan(&session.id).await?;
 
     for turn in 0..config.max_turns {
@@ -1388,11 +1391,15 @@ async fn run_loop(
             };
             let input: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
-            let is_delegate = call.name == "delegate";
-            let is_delegate_many = call.name == "delegate_many" && spec.role == AgentRole::Manager;
+            let is_delegate = call.name == "delegate" && spec.allow_delegation;
+            let is_delegate_many = call.name == "delegate_many"
+                && spec.role == AgentRole::Manager
+                && spec.allow_delegation;
             let is_verdict = call.name == "submit_verdict" && spec.role == AgentRole::Verifier;
             let is_team_plan = call.name == "submit_team_plan" && spec.role == AgentRole::Leader;
             let is_run_plan = call.name == "run_team_plan" && spec.role == AgentRole::Leader;
+            let is_deliberate =
+                call.name == "deliberate_team_plan" && spec.role == AgentRole::Leader;
             let is_todo = call.name == "todo_write" && spec.role == AgentRole::Leader;
             let registry_tool = config
                 .tools
@@ -1442,6 +1449,42 @@ async fn run_loop(
 
             let output = if !approved {
                 ToolOutput::error("The user denied this tool call.")
+            } else if is_deliberate {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match engine.get_team_plan(&session.id).await? {
+                    None => ToolOutput::error("no TeamPlan submitted; call submit_team_plan first"),
+                    Some(plan) => {
+                        let rounds = input
+                            .get("rounds")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(2)
+                            .clamp(1, 3) as u32;
+                        match deliberate_team_plan(
+                            engine, config, session, project, control, budget, spec, &plan, rounds,
+                        )
+                        .await?
+                        {
+                            RoundtableResult::Done(report) => ToolOutput::ok(report),
+                            RoundtableResult::Cancelled => {
+                                return Ok(LoopOutcome::Cancelled);
+                            }
+                            RoundtableResult::BudgetExceeded => {
+                                return Ok(LoopOutcome::BudgetExceeded);
+                            }
+                        }
+                    }
+                }
             } else if is_run_plan {
                 emit(
                     engine,
@@ -1651,6 +1694,7 @@ async fn run_loop(
                                     parent_name: Some(spec.name.clone()),
                                     title: title.clone(),
                                     profile: child_profile,
+                                    allow_delegation: role.child_role().is_some(),
                                     worktree: child_worktree,
                                     branch: child_branch,
                                     session_worktree: spec.session_worktree.clone(),
@@ -1892,7 +1936,12 @@ async fn run_loop(
     Err(anyhow!("maximum turns reached"))
 }
 
-fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) -> Vec<ToolSchema> {
+fn tool_schemas(
+    config: &AgentConfig,
+    role: AgentRole,
+    profile: AgentProfile,
+    allow_delegation: bool,
+) -> Vec<ToolSchema> {
     let mut tools = config
         .tools
         .schemas()
@@ -1926,7 +1975,7 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
             }),
         });
     }
-    if role.child_role().is_some() {
+    if role.child_role().is_some() && allow_delegation {
         tools.push(ToolSchema {
             name: "delegate".to_string(),
             description: format!(
@@ -2023,6 +2072,19 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
             }),
         });
     }
+    if role == AgentRole::Leader {
+        tools.push(ToolSchema {
+            name: "deliberate_team_plan".to_string(),
+            description: "Convene the planned Managers for a bounded roundtable. Each round shares peer positions; Managers cannot delegate or edit. Use before run_team_plan for multi-department plans.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rounds": {"type": "integer", "minimum": 1, "maximum": 3}
+                },
+                "additionalProperties": false
+            }),
+        });
+    }
     if role == AgentRole::Verifier {
         tools.push(ToolSchema {
             name: "submit_verdict".to_string(),
@@ -2037,7 +2099,7 @@ fn tool_schemas(config: &AgentConfig, role: AgentRole, profile: AgentProfile) ->
             }),
         });
     }
-    if role == AgentRole::Manager {
+    if role == AgentRole::Manager && allow_delegation {
         tools.push(ToolSchema {
             name: "delegate_many".to_string(),
             description: "Run 1-5 Workers in parallel. Each task must declare a non-overlapping write_scope when more than one task is provided.".to_string(),
@@ -2340,6 +2402,7 @@ async fn run_parallel_workers(
             parent_name: Some(spec.name.clone()),
             title: None,
             profile: task.profile,
+            allow_delegation: true,
             worktree: info.path,
             branch: info.branch,
             session_worktree: spec.session_worktree.clone(),
@@ -2652,6 +2715,183 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
     Ok(())
 }
 
+enum RoundtableResult {
+    Done(String),
+    Cancelled,
+    BudgetExceeded,
+}
+
+fn plan_prompt(plan: &TeamPlan) -> String {
+    let departments = plan
+        .departments
+        .iter()
+        .map(|department| {
+            format!(
+                "- {}: manager '{}' ({}) — {}",
+                department.name, department.manager_title, department.profile, department.objective
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tasks = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            format!(
+                "- {} [{}] {} deps={} scope={}",
+                task.id,
+                task.department,
+                task.title,
+                task.deps.join(","),
+                task.write_scope.join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Goal: {}\nDepartments:\n{departments}\nTasks:\n{tasks}",
+        plan.goal
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliberate_team_plan(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    control: &RunControl,
+    budget: &SessionBudget,
+    leader_spec: &AgentSpec,
+    plan: &TeamPlan,
+    rounds: u32,
+) -> Result<RoundtableResult> {
+    let mut managers = Vec::new();
+    for department in &plan.departments {
+        managers.push(ensure_plan_manager(engine, config, session, leader_spec, department).await?);
+    }
+    let overview = plan_prompt(plan);
+    let mut positions: Vec<(String, String)> = Vec::new();
+    let mut report = Vec::new();
+
+    for round in 1..=rounds {
+        if control.is_cancelled() {
+            return Ok(RoundtableResult::Cancelled);
+        }
+        if budget.exhausted() {
+            return Ok(RoundtableResult::BudgetExceeded);
+        }
+        let peer_context = positions
+            .iter()
+            .map(|(name, position)| format!("{name}: {position}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut prepared = Vec::new();
+        for manager in &managers {
+            let title = manager.title.as_deref().unwrap_or(manager.name.as_str());
+            let prompt = if round == 1 {
+                format!(
+                    "Manager roundtable, round 1.\n{overview}\n\
+                     You are the {title} Manager ({profile}). Analyze your department scope, \
+                     dependencies, risks, and required handoffs with the other Managers. \
+                     Do not delegate, edit, or run shell. Return a concise position.",
+                    profile = manager.profile.as_str()
+                )
+            } else {
+                format!(
+                    "Manager roundtable, round {round}.\n{overview}\n\
+                     Positions from the previous round:\n{peer_context}\n\
+                     You are the {title} Manager ({profile}). Respond to peers, resolve \
+                     conflicts, agree interfaces and handoffs, and update your position. \
+                     Do not delegate, edit, or run shell. Return a concise decision.",
+                    profile = manager.profile.as_str()
+                )
+            };
+            let conversation = vec![ChatMessage::user(prompt.clone())];
+            prepared.push((manager.clone(), prompt, conversation));
+        }
+
+        let futures = prepared.iter_mut().map(|(manager, prompt, conversation)| {
+            run_loop(
+                engine,
+                config,
+                session,
+                project,
+                control,
+                budget,
+                manager,
+                prompt,
+                conversation,
+                false,
+            )
+        });
+        let results = futures_util::future::join_all(futures).await;
+        let mut round_positions = Vec::new();
+        for (index, result) in results.into_iter().enumerate() {
+            let (manager, _, _) = &prepared[index];
+            match result {
+                Ok(LoopOutcome::Final(position)) => {
+                    let position = if position.trim().is_empty() {
+                        "No position returned.".to_string()
+                    } else {
+                        position
+                    };
+                    emit(
+                        engine,
+                        &session.id,
+                        manager,
+                        "manager.roundtable",
+                        serde_json::json!({
+                            "round": round,
+                            "position": truncate(&position),
+                            "title": manager.title,
+                            "profile": manager.profile.as_str(),
+                        }),
+                    )
+                    .await?;
+                    round_positions.push((
+                        manager
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| manager.name.clone()),
+                        position,
+                    ));
+                }
+                Ok(LoopOutcome::Cancelled) => return Ok(RoundtableResult::Cancelled),
+                Ok(LoopOutcome::BudgetExceeded) => {
+                    return Ok(RoundtableResult::BudgetExceeded);
+                }
+                Ok(LoopOutcome::Verdict(_)) => {}
+                Err(error) => {
+                    emit(
+                        engine,
+                        &session.id,
+                        manager,
+                        "manager.roundtable.failed",
+                        serde_json::json!({
+                            "round": round,
+                            "error": truncate(error.to_string().as_str()),
+                        }),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            }
+        }
+        positions = round_positions;
+        report.push(format!(
+            "Round {round}\n{}",
+            positions
+                .iter()
+                .map(|(title, position)| format!("{title}: {}", truncate(position)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    Ok(RoundtableResult::Done(report.join("\n\n")))
+}
+
 enum PlanRunResult {
     Done(String),
     Cancelled,
@@ -2732,6 +2972,7 @@ async fn ensure_plan_manager(
         parent_name: Some(leader_spec.name.clone()),
         title: Some(department.manager_title.clone()),
         profile,
+        allow_delegation: false,
         worktree: session_worktree.clone(),
         branch: session_branch.clone(),
         session_worktree,
@@ -2911,6 +3152,7 @@ async fn execute_team_plan(
                 parent_name: Some(manager_spec.name.clone()),
                 title: None,
                 profile,
+                allow_delegation: true,
                 worktree: info.path,
                 branch: info.branch,
                 session_worktree: manager_spec.session_worktree.clone(),
@@ -3228,8 +3470,10 @@ fn role_system_prompt(
              (for example Discovery, Implementation, Quality) via the title field; each title \
              defines that Manager's department role. Managers will split work and delegate to \
              Workers; Workers may use Labour. Do not delegate directly to Workers or Labour. \
-             After the plan is recorded, call run_team_plan to execute it; do not manually \
-             delegate the planned Managers unless you intentionally override the plan. \
+             For a multi-department plan, call deliberate_team_plan first so Managers can \
+             review peer positions and agree on handoffs; then call run_team_plan to execute. \
+             Do not manually delegate the planned Managers unless you intentionally override \
+             the plan. \
              You can still inspect and edit files yourself for small tasks. \
              Review summaries, verify the final diff, and report the result.",
             spec.name
@@ -3706,6 +3950,89 @@ mod tests {
                     "tasks": [
                         {"id": "T1", "department": "research", "title": "Task one", "kind": "research", "deps": [], "acceptance": ["done"]},
                         {"id": "T2", "department": "research", "title": "Task two", "kind": "research", "deps": [], "acceptance": ["done"]}
+                    ]
+                });
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "submit_plan".into(),
+                        name: "submit_team_plan".into(),
+                        arguments: plan.to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            };
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+
+    struct RoundtableProvider;
+
+    #[async_trait]
+    impl Provider for RoundtableProvider {
+        fn id(&self) -> &str {
+            "roundtable"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+            let last = request.messages.last();
+            let last_content = last
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let user_text = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let events = if user_text.contains("Manager roundtable, round 1") {
+                let title = if user_text.contains("Sources") {
+                    "Sources"
+                } else {
+                    "Implementation"
+                };
+                vec![
+                    StreamEvent::TextDelta(format!("{title} r1 position")),
+                    StreamEvent::Done,
+                ]
+            } else if user_text.contains("Manager roundtable, round 2") {
+                let title = if user_text.contains("Sources") {
+                    "Sources"
+                } else {
+                    "Implementation"
+                };
+                vec![
+                    StreamEvent::TextDelta(format!("{title} r2 decision")),
+                    StreamEvent::Done,
+                ]
+            } else if last.map(|message| message.role.as_str()) == Some("tool")
+                && last_content.contains("Team plan recorded")
+            {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "deliberate".into(),
+                        name: "deliberate_team_plan".into(),
+                        arguments: serde_json::json!({"rounds": 2}).to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else if last.map(|message| message.role.as_str()) == Some("tool") {
+                vec![
+                    StreamEvent::TextDelta("deliberation complete".into()),
+                    StreamEvent::Done,
+                ]
+            } else {
+                let plan = serde_json::json!({
+                    "goal": "deliberate the plan",
+                    "departments": [
+                        {"name": "sources", "manager_title": "Sources", "profile": "research", "objective": "collect sources"},
+                        {"name": "implementation", "manager_title": "Implementation", "profile": "coding", "objective": "implement"}
+                    ],
+                    "tasks": [
+                        {"id": "T1", "department": "sources", "title": "Research", "kind": "research", "deps": [], "acceptance": ["sources"]},
+                        {"id": "T2", "department": "implementation", "title": "Build", "kind": "coding", "deps": ["T1"], "acceptance": ["tests"]}
                     ]
                 });
                 vec![
@@ -4616,6 +4943,58 @@ mod tests {
                 })
                 .count(),
             2
+        );
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "idle");
+    }
+
+    #[tokio::test]
+    async fn managers_deliberate_with_peer_positions() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(RoundtableProvider);
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "deliberate".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "deliberate").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let managers = agents
+            .iter()
+            .filter(|agent| agent.role == "manager")
+            .collect::<Vec<_>>();
+        assert_eq!(managers.len(), 2);
+        let events = engine
+            .list_events(session.id.clone(), 0, 400)
+            .await
+            .unwrap();
+        let positions = events
+            .iter()
+            .filter(|event| event.kind == "manager.roundtable")
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 4);
+        assert!(positions.iter().any(|event| event.payload["round"] == 1));
+        assert!(positions.iter().any(|event| event.payload["round"] == 2));
+        assert!(
+            positions
+                .iter()
+                .any(|event| event.payload["position"].as_str() == Some("Sources r2 decision"))
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.message" && event.payload["text"] == "deliberation complete"
+        }));
+        assert!(
+            !events.iter().any(|event| event.kind == "plan_task.started"),
+            "deliberation should not execute plan tasks"
         );
         let sessions = engine
             .list_sessions(Some(session.project_id))
