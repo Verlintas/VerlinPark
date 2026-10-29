@@ -46,7 +46,7 @@
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 42 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、Verifier approve/reject、Manager title 必填、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
+| 测试 | ✅ | Rust 40 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、Verifier approve/reject、Manager title 必填、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M2 尚未完成：**
