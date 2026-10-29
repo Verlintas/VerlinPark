@@ -714,6 +714,8 @@ struct PreviewPanelView: View {
                     changes
                 case .plan:
                     plan
+                case .queue:
+                    queue
                 case .trace:
                     trace
                 }
@@ -791,13 +793,19 @@ struct PreviewPanelView: View {
                     .disabled(model.commitBusy)
                 }
                 Button {
-                    Task { await model.loadDiff() }
+                    Task {
+                        if mode == .queue {
+                            await model.loadMergeQueue()
+                        } else {
+                            await model.loadDiff()
+                        }
+                    }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 10, weight: .semibold))
                 }
                 .buttonStyle(.plain)
-                .help("Refresh diff")
+                .help(mode == .queue ? "Refresh queue" : "Refresh diff")
                 .disabled(model.diffLoading)
             }
             Picker("", selection: $mode) {
@@ -937,6 +945,26 @@ struct PreviewPanelView: View {
     }
 
     @ViewBuilder
+    private var queue: some View {
+        if model.mergeQueue.isEmpty {
+            StudioEmptyView(
+                icon: "arrow.triangle.merge",
+                title: "Merge queue is empty",
+                detail: "Verifier-approved Workers enter the queue; the deterministic Integrator merges and checks them here."
+            )
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(model.mergeQueue) { entry in
+                        MergeQueueRow(entry: entry)
+                    }
+                }
+                .padding(12)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var trace: some View {
         if model.events.isEmpty {
             StudioEmptyView(
@@ -957,9 +985,75 @@ struct PreviewPanelView: View {
     }
 }
 
+private struct MergeQueueRow: View {
+    let entry: MergeQueueEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .foregroundStyle(color)
+                Text(entry.status.uppercased())
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(color)
+                Spacer()
+                Text(entry.taskId ?? entry.agentName)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            HStack(spacing: 6) {
+                Text(entry.agentName)
+                    .font(.system(size: 10.5, weight: .medium))
+                Spacer()
+                Text(String(entry.commit.prefix(7)))
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            Text(entry.branch)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if let detail = entry.detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+            }
+        }
+        .padding(10)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(color.opacity(0.16), lineWidth: 1)
+        }
+    }
+
+    private var color: Color {
+        switch entry.status {
+        case "merged": .green
+        case "conflict", "failed": .red
+        case "merging", "checking": .orange
+        default: .secondary
+        }
+    }
+
+    private var icon: String {
+        switch entry.status {
+        case "merged": "checkmark.circle.fill"
+        case "conflict": "exclamationmark.triangle.fill"
+        case "failed": "xmark.circle.fill"
+        case "merging", "checking": "arrow.triangle.2.circlepath"
+        default: "clock"
+        }
+    }
+}
+
 private enum PreviewMode: String, CaseIterable, Identifiable {
     case changes
     case plan
+    case queue
     case trace
 
     var id: String {
@@ -970,6 +1064,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         switch self {
         case .changes: "Changes"
         case .plan: "Plan"
+        case .queue: "Queue"
         case .trace: "Trace"
         }
     }
@@ -1126,7 +1221,7 @@ struct OrgPresetSheet: View {
             .disabled(true)
 
             Text(
-                "Plan dispatch runs ready tasks in dependency batches, each Worker in its own task worktree; Managers are created lazily. Merge queue, Integrator, auto-expansion, and per-role budgets are not implemented yet."
+                "Plan dispatch runs ready tasks in dependency batches, each Worker in its own task worktree; Managers are created lazily. Merge queue and deterministic Integrator are implemented; cross-entry retry, auto-expansion, and per-role budgets are not."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.tertiary)

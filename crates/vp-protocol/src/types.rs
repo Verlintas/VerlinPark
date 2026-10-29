@@ -275,6 +275,35 @@ pub struct SessionTodosResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeQueueEntry {
+    pub id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    pub branch: String,
+    pub commit: String,
+    pub base_commit: String,
+    pub status: String,
+    pub attempt: u32,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MergeQueueListParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeQueueListResult {
+    pub entries: Vec<MergeQueueEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub id: String,
     pub session_id: String,

@@ -25,10 +25,10 @@ use vp_protocol::types::{
     AddProjectParams, AgentListParams, AgentListResult, ApprovalListResult, AuthParams, AuthResult,
     CancelSessionParams, CancelSessionResult, CommitSessionParams, ConfigureAgentParams,
     CreateSessionParams, DiscardSessionParams, EventListResult, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, PingResult, ProjectListResult, PromptParams,
-    PromptResult, ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams,
-    SessionListResult, SessionTodosParams, SessionTodosResult, SubscribeParams, TeamPlanParams,
-    TeamPlanResult,
+    ListEventsParams, ListSessionsParams, MergeQueueListParams, MergeQueueListResult, PingResult,
+    ProjectListResult, PromptParams, PromptResult, ResolveApprovalParams, ResolveApprovalResult,
+    ServerInfo, SessionDiffParams, SessionListResult, SessionTodosParams, SessionTodosResult,
+    SubscribeParams, TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -458,6 +458,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "agent.list" => match parse_params::<AgentListParams>(request.params) {
             Ok(params) => match state.engine.list_agents(&params.session_id).await {
                 Ok(agents) => RpcResponse::success(id, AgentListResult { agents }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "merge_queue.list" => match parse_params::<MergeQueueListParams>(request.params) {
+            Ok(params) => match state.engine.list_merge_queue(&params.session_id).await {
+                Ok(entries) => RpcResponse::success(id, MergeQueueListResult { entries }),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

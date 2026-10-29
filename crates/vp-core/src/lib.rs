@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    AgentRecord, Approval, Event, Project, Session, SessionCommit, SessionDiff, StoredMessage,
-    TeamPlan, TodoItem,
+    AgentRecord, Approval, Event, MergeQueueEntry, Project, Session, SessionCommit, SessionDiff,
+    StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
 
@@ -578,6 +578,77 @@ impl Engine {
         let store = self.store.clone();
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || store.list_agents(&id)).await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_merge(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<String>,
+        branch: &str,
+        commit: &str,
+        base_commit: &str,
+        detail: Option<String>,
+    ) -> Result<MergeQueueEntry> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+        let agent_name = agent_name.to_string();
+        let branch = branch.to_string();
+        let commit = commit.to_string();
+        let base_commit = base_commit.to_string();
+        let entry = tokio::task::spawn_blocking(move || {
+            store.enqueue_merge(
+                &session_id,
+                &agent_id,
+                &agent_name,
+                task_id.as_deref(),
+                &branch,
+                &commit,
+                &base_commit,
+                detail.as_deref(),
+            )
+        })
+        .await??;
+        self.append_event(
+            &entry.session_id,
+            "merge_queue.enqueued",
+            serde_json::json!({"entry": entry}),
+        )
+        .await?;
+        Ok(entry)
+    }
+
+    pub async fn update_merge_queue_entry(
+        &self,
+        id: &str,
+        status: &str,
+        detail: Option<String>,
+    ) -> Result<Option<MergeQueueEntry>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let status = status.to_string();
+        let entry = tokio::task::spawn_blocking(move || {
+            store.update_merge_queue_entry(&id, &status, detail.as_deref())
+        })
+        .await??;
+        if let Some(entry) = &entry {
+            self.append_event(
+                &entry.session_id,
+                "merge_queue.updated",
+                serde_json::json!({"entry": entry}),
+            )
+            .await?;
+        }
+        Ok(entry)
+    }
+
+    pub async fn list_merge_queue(&self, session_id: &str) -> Result<Vec<MergeQueueEntry>> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_merge_queue(&id)).await?
     }
 
     pub async fn create_leader_agent(&self, session_id: &str, model: &str) -> Result<String> {

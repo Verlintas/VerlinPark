@@ -64,6 +64,8 @@ enum Command {
     TeamPlan { session: String },
     /// List the agents spawned for a session.
     Agents { session: String },
+    /// Show the session merge queue and Integrator results.
+    Queue { session: String },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
     /// Commit the session worktree.
@@ -167,6 +169,14 @@ async fn main() -> Result<()> {
         }
         Command::Agents { session } => {
             rpc(&discovery, "agent.list", json!({"session_id": session})).await?
+        }
+        Command::Queue { session } => {
+            rpc(
+                &discovery,
+                "merge_queue.list",
+                json!({"session_id": session}),
+            )
+            .await?
         }
         Command::Discard { session } => {
             rpc(
@@ -310,6 +320,24 @@ fn print_human(value: &Value) {
                 task["department"].as_str().unwrap_or("?"),
                 task["kind"].as_str().unwrap_or("?")
             );
+        }
+        return;
+    }
+    if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+        if entries.is_empty() {
+            println!("Merge queue is empty.");
+        }
+        for entry in entries {
+            println!(
+                "{:<10} {:<10} {:<16} {}",
+                entry["status"].as_str().unwrap_or("?"),
+                entry["task_id"].as_str().unwrap_or("—"),
+                entry["agent_name"].as_str().unwrap_or("?"),
+                entry["commit"].as_str().unwrap_or("?")
+            );
+            if let Some(detail) = entry["detail"].as_str() {
+                println!("  {detail}");
+            }
         }
         return;
     }

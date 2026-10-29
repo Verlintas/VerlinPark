@@ -29,6 +29,7 @@ final class AppModel {
     var streamingText = ""
     var todos: [TodoItem] = []
     var agents: [AgentRecord] = []
+    var mergeQueue: [MergeQueueEntry] = []
     var teamPlan: TeamPlan?
     var planTaskStatuses: [String: String] = [:]
     var sessionDiff: SessionDiff?
@@ -102,6 +103,7 @@ final class AppModel {
             sessionDiff = nil
             todos = []
             agents = []
+            mergeQueue = []
             teamPlan = nil
             planTaskStatuses = [:]
             lastCommit = nil
@@ -116,6 +118,7 @@ final class AppModel {
         sessionDiff = nil
         todos = []
         agents = []
+        mergeQueue = []
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -134,6 +137,7 @@ final class AppModel {
         sessionDiff = nil
         todos = []
         agents = []
+        mergeQueue = []
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -141,6 +145,7 @@ final class AppModel {
             await loadEvents()
             await loadTodos()
             await loadAgents()
+            await loadMergeQueue()
             await loadTeamPlan()
             await loadDiff()
         }
@@ -205,6 +210,7 @@ final class AppModel {
             refreshPlanTaskStatuses()
             sessionDiff = try? await core.sessionDiff(sessionID: session.id)
             todos = await (try? core.sessionTodos(sessionID: session.id)) ?? []
+            mergeQueue = await (try? core.listMergeQueue(sessionID: session.id)) ?? []
             lastCommit = nil
         } catch {
             handle(error)
@@ -389,6 +395,18 @@ final class AppModel {
         }
     }
 
+    func loadMergeQueue() async {
+        guard let sessionID = selectedSessionID else {
+            mergeQueue = []
+            return
+        }
+        do {
+            mergeQueue = try await core.listMergeQueue(sessionID: sessionID)
+        } catch {
+            // The event stream will retry on the next merge queue event.
+        }
+    }
+
     func loadDiff() async {
         guard let sessionID = selectedSessionID else {
             sessionDiff = nil
@@ -433,6 +451,7 @@ final class AppModel {
             await loadEvents()
             await loadTodos()
             await loadAgents()
+            await loadMergeQueue()
             await loadTeamPlan()
             await loadDiff()
         } catch {
@@ -574,6 +593,15 @@ final class AppModel {
                let status = event.payload.objectValue?["task_status"]?.stringValue
             {
                 planTaskStatuses[taskID] = status
+            }
+        }
+
+        if event.sessionId == selectedSessionID,
+           event.type.hasPrefix("merge_queue.") || event.type.hasPrefix("integrator.")
+        {
+            Task {
+                await self.loadMergeQueue()
+                await self.loadDiff()
             }
         }
 

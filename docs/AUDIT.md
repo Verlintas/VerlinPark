@@ -3,7 +3,7 @@
 > 审计日期：2026-10-29  
 > 审计基线：`cbef2e6`（`main`，Manager roundtable 已合入）  
 > 范围：Rust runtime、SwiftUI app、协议/存储、Git 集成、权限与预算、文档与仓库卫生  
-> 结论先行：**M2 的功能闭环已经成立，但仍是一个强原型，不是可靠的多 Agent 平台。** 当前最需要的不是继续加组织层功能，而是把已经承诺的约束真正执行，并补上 merge queue / Integrator 闭环。
+> 结论先行：**M2 的功能闭环已经成立，但仍是一个强原型，不是可靠的多 Agent 平台。** P0 约束、merge queue 和确定性 Integrator 已经补上；下一步是 queue retry、event sourcing、shell sandbox 与 landing 闭环。
 
 ## 0. 2026-10-30 跟进
 
@@ -13,9 +13,10 @@
 - **P0-2 已修复**：provider 请求前做 token reservation，按保守输入估算 + 动态 output budget 预留；provider 返回 usage 后结算，缺少 usage 的本地端点会以 `estimated: true` 的估算用量持久化。并发批次不再共用同一个 pre-flight 窗口。
 - **P1-4 已修复**：`fetch_url` 在连接前解析并固定已校验的 IP，阻止解析到 loopback/private/link-local/文档/benchmark 等地址；补充了 IPv4-mapped IPv6 与特殊段检查。
 - **P1-3 部分缓解**：Verifier shell 的审批卡会明确警告 “not sandboxed”；runtime 沙箱仍未实现。
-- **仍未解决**：shell 沙箱、完整 event sourcing、merge queue/Integrator、worktree 清理、P2 batch abort 状态一致性。
+- **P1-6 部分修复**：Verifier-approved commit 现在进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录。仍缺跨 entry retry/rebase、自动冲突解决、LLM Integrator。
+- **仍未解决**：shell 沙箱、完整 event sourcing、worktree 清理、P2 batch abort 状态一致性。
 
-当前测试：Rust 52（core 37 / store 10 / providers 5），Swift 9。CI 以最新提交为准。
+当前测试：Rust 55（core 39 / store 11 / providers 5），Swift 9。CI 以最新提交为准。
 
 ---
 
@@ -40,7 +41,7 @@
 
 | 维度 | 评分 | 说明 |
 |---|---|---|
-| 功能完整度（M2） | B | 主链路真实可跑；缺 merge queue、Integrator、artifact、mailbox、landing |
+| 功能完整度（M3 首切片） | B | 主链路真实可跑；merge queue/确定性 Integrator 已有；缺 queue retry、artifact、mailbox、landing |
 | 正确性/一致性 | B− | P0 的 plan scope/caps 与预算 reservation 已在 10-30 修复；事件溯源仍只做了一半 |
 | 隔离与安全 | C+ | 路径 jail、loopback token、fetch_url DNS 固定做得不错；shell 仍无沙箱 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
@@ -164,25 +165,25 @@
 
 ---
 
-### P1-6：没有 merge queue / Integrator，串行合并的失败不可恢复
+### P1-6（部分修复 2026-10-30）：没有 merge queue / Integrator，串行合并的失败不可恢复
 
 **证据**
 
 - `finish_worker` 在 Verifier approve 后直接 `merge_branch` 到 session worktree；`merge_branch` 冲突时 `merge --abort`，Worker 标记 failed。
-- 没有队列、没有 rebase/retry、没有 post-merge integration test、没有 Integrator agent。
+- 修复前没有队列、没有 rebase/retry、没有 post-merge integration test、没有 Integrator gate。
 - 并行 batch 的 task 都从当前 session branch 创建；后合并的 task 可能基于旧 base，冲突只能失败。
 
 **影响**
 
 - 一个 task 的合并失败会阻塞其 dependents，但没有重新排队/重新验证机制；用户只能手动处理。
 - Verifier 审查的是 task branch，不是“合并后的集成结果”；跨 task 的语义冲突不会被发现。
-- 这是 M2 之后最应该做的闭环，而不是继续扩大 org。
+- 修复后：持久 queue、确定性 merge、diff check、可选 integration command、失败回滚、冲突记录。仍缺跨 entry retry/rebase 与 LLM Integrator。
 
-**建议**
+**后续**
 
-- 先做 deterministic merge queue：queued → rebasing → integration-check → merged/failed，冲突可重试一次并记录原因。
-- 再加 Integrator：只做合并、冲突解决、集成测试，不改业务逻辑；其输出仍需 Verifier/人类批准。
-- UI 增加 queue 状态和失败原因；CLI 增加 `queue`/`retry`。
+- 增加 queue retry/rebase：冲突后可以重放或人工触发，不要把 failed 变成终态。
+- 可选 LLM Integrator 只做语义 review/冲突建议，不替代确定性 merge 和 rollback。
+- 增加跨 entry 的 blocking/backpressure 和 post-merge 集成分支，避免后续 entry 基于旧 base。
 
 ---
 
@@ -247,7 +248,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-13：产品叙事大于实现
 
-README 开头仍然说 agent “collaborate through typed messages and shared artifacts”，架构图把 MCP、ACP、artifact store、merge queue 画成已有组件；这些大部分是设计目标。对一个“玻璃盒”产品，文档必须区分 **current** / **planned**，否则第一次认真试用就会掉信任。
+审计时 README 仍说 agent “collaborate through typed messages and shared artifacts”，架构图把 MCP、ACP、artifact store、merge queue 画成已有组件；本次已把 typed mailbox/artifact、MCP/ACP 标为 planned，并补上 merge queue/Integrator 的真实实现。后续仍需在每次能力变化时维护 **current / planned** 分离，否则第一次认真试用就会掉信任。
 
 ---
 
@@ -265,8 +266,8 @@ README 开头仍然说 agent “collaborate through typed messages and shared ar
 
 **“组织层很热闹，交付链没有闭合。”**
 
-- 用户可以看见 Managers、Workers、Plan board、圆桌，但最后仍然停在 session branch，没有 merge queue、没有 landing、没有 PR。
-- 自动派发的并行 task 可能写冲突；预算可能超调；Verifier 不是沙箱。
+- 用户可以看见 Managers、Workers、Plan board、圆桌和 merge queue，但最后仍然停在 session branch，没有 landing/PR；queue 冲突也只记录，不自动 retry。
+- 并行 task 的 scope/caps 与预算已经收紧；剩下的是 Verifier shell 不是沙箱、事件链不是完整 replay、冲突需要人工处理。
 - 这些会让“更少限制、更高效率”的主张反噬：限制少了，但失败模式更多。
 
 ### 4.3 建议的 milestone 顺序
@@ -311,13 +312,14 @@ README 开头仍然说 agent “collaborate through typed messages and shared ar
 - `fetch_url` 的 DNS 解析 + IP 固定 + 特殊地址段检查。
 - Verifier shell 审批提示（仍不是沙箱）。
 - 新增 plan scope/cap、token reservation、IP 分类的回归测试。
+- merge queue、确定性 Integrator、失败回滚和冲突记录。
 
 ---
 
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 52 passed after the 10-30 hardening
+cargo test --workspace     # 55 passed after the 10-30 hardening
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```

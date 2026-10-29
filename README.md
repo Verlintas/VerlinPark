@@ -4,7 +4,7 @@
 
 VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets Managers compare plans before work starts, and makes every plan, tool call, diff, token, and permission decision inspectable and traceable. A typed peer mailbox and shared artifact store are planned, not implemented yet.
 
-> **Status: M2 four-tier delegation implemented.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A session Leader can plan and delegate through Manager → Worker → Labour, convene a read-only Manager roundtable, auto-dispatch a validated TeamPlan in dependency batches, isolate Workers in Git worktrees, gate merges on a Verifier verdict, and serialize approved merges into the session branch. Sessions have approvals, cancellation, a live diff, and an event trace. Merge queue/Integrator, typed mailbox/artifact store, global cross-session scheduling, per-role models, and a true tool sandbox are **not** implemented yet — see [PROGRESS](docs/PROGRESS.md) and [AUDIT](docs/AUDIT.md).
+> **Status: M2 four-tier delegation + M3 merge queue (first slice).** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A session Leader can plan and delegate through Manager → Worker → Labour, convene a read-only Manager roundtable, auto-dispatch a validated TeamPlan in dependency batches, isolate Workers in Git worktrees, gate merges on a Verifier verdict, and pass approved commits through a persisted merge queue and a deterministic Integrator (merge, diff check, optional project check, rollback on failure). Sessions have approvals, cancellation, a live diff, and an event trace. Typed mailbox/artifact store, cross-entry queue retry/rebase, global cross-session scheduling, per-role models, and a true tool sandbox are **not** implemented yet — see [PROGRESS](docs/PROGRESS.md) and [AUDIT](docs/AUDIT.md).
 
 ---
 
@@ -50,7 +50,7 @@ VerlinPark records the full session as an append-only event log:
 - every LLM request and response
 - every tool call, approval, and diff
 - tokens, cost, latency, retries, and budget state
-- every Git worktree, commit, and merge
+- every Git worktree, commit, merge queue entry, and Integrator result
 
 The UI can inspect a session and show exactly why a change was proposed. Full replay/export and a complete event-sourced rebuild are planned; today events are the audit stream and UI feed, while SQLite remains the projection store. See [AUDIT](docs/AUDIT.md).
 
@@ -77,7 +77,7 @@ flowchart LR
   CLI["vp CLI"] --> CORE
   APP <-->|"JSON-RPC over WebSocket<br/>127.0.0.1 + token"| CORE["verlinpadd<br/>Rust agent runtime"]
   CORE --> DB[("SQLite + event/audit log")]
-  CORE --> GIT["Git worktrees<br/>serial integration<br/>(merge queue planned)"]
+  CORE --> GIT["Git worktrees<br/>merge queue + Integrator"]
   CORE --> PTY["shell processes<br/>(no PTY yet)"]
   CORE --> LLM["Model providers<br/>cloud + local"]
   CORE --> MCP["MCP servers<br/>(planned)"]
@@ -96,12 +96,12 @@ The first end-to-end demo is a complete multi-agent feature delivery on a benchm
 3. The Leader produces a plan; the runtime validates the DAG, scope syntax, fan-out, and budget.
 4. Departments execute tasks in parallel, each Worker in its own worktree.
 5. A read-only Verifier runs tests and submits a verdict.
-6. The Integrator merges approved work into an integration branch; the UI shows the plan, messages, tool calls, diffs, and token usage.
+6. The Integrator merges approved work into the session branch; the UI shows the plan, messages, tool calls, diffs, queue state, and token usage.
 7. The user reviews and lands the integration branch.
 
-**Today:** steps 1–5 and serial integration work with one configured model and a session-level budget; the Manager roundtable, task worktrees, and Verifier gate are real. Plan batches only group non-overlapping write scopes (unscoped tasks serialize), and the token budget uses pre-flight reservations. **Still planned:** per-role models/budgets, merge queue, Integrator, post-merge integration tests, cost ledger, artifact packets, and landing/PR. v0.1 is not a full IDE, not a model hub, and not a document workspace. See [docs/PLAN.md](docs/PLAN.md) for scope, milestones, and non-goals.
+**Today:** steps 1–5, the merge queue, and the deterministic Integrator work with one configured model and a session-level budget; the Manager roundtable, task worktrees, and Verifier gate are real. Plan batches only group non-overlapping write scopes (unscoped tasks serialize), and the token budget uses pre-flight reservations. **Still planned:** per-role models/budgets, cross-entry queue retry/rebase, optional LLM Integrator, cost ledger, artifact packets, and landing/PR. v0.1 is not a full IDE, not a model hub, and not a document workspace. See [docs/PLAN.md](docs/PLAN.md) for scope, milestones, and non-goals.
 
-> Known gaps at this milestone: the Verifier's shell is not sandboxed, the event log is an audit/projection stream rather than full replayable event sourcing, and merge queue/Integrator/landing are still ahead. See [docs/AUDIT.md](docs/AUDIT.md).
+> Known gaps at this milestone: the Verifier's shell is not sandboxed, the event log is an audit/projection stream rather than full replayable event sourcing, conflicts are recorded but not auto-retried, and landing/PR are still ahead. See [docs/AUDIT.md](docs/AUDIT.md).
 
 ## Documentation
 
@@ -126,7 +126,7 @@ just test
 just run
 ```
 
-Configure a model in **Settings → Providers** (any OpenAI-compatible endpoint, including LM Studio/Ollama/llama.cpp, or Anthropic). The API key is stored in Keychain and sent only to the local daemon. For headless runs, set `VERLINPARK_BASE_URL` and `VERLINPARK_MODEL` (plus `VERLINPARK_API_KEY` if needed).
+Configure a model in **Settings → Providers** (any OpenAI-compatible endpoint, including LM Studio/Ollama/llama.cpp, or Anthropic). The API key is stored in Keychain and sent only to the local daemon. For headless runs, set `VERLINPARK_BASE_URL` and `VERLINPARK_MODEL` (plus `VERLINPARK_API_KEY` if needed). Set `VERLINPARK_INTEGRATION_COMMAND` to add a project-specific post-merge check (for example `cargo test`); without it the Integrator still runs `git diff --check`.
 
 `just run` builds `verlinpadd` and the SwiftUI app, then opens it. The app launches the daemon on demand from `target/debug/verlinpadd` (debug builds). To run the daemon separately:
 
@@ -142,6 +142,7 @@ just cli commit <session-id> -m "Add tests"
 just cli discard <session-id>
 just cli cancel <session-id>
 just cli todos <session-id>
+just cli queue <session-id>
 just cli approvals
 just cli approve <approval-id>
 ```
@@ -199,7 +200,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M2 四层委派已跑通**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经可用；Leader 可以委派给 Manager → Worker → Labour，召集 1–3 轮只读 Manager 圆桌，提交并自动派发 TeamPlan，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果。Worker 拥有独立 task worktree，Verifier 审查通过后串行合并到 session 分支；session diff 从 base commit 起算。Leader 必须给每个 Manager 分配部门角色；`delegate_many` 会校验不重叠写作用域；research profile 可读取公网 URL。当前限制：merge queue / Integrator / landing 未实现，shell 没有沙箱，事件日志仍是审计/投影流而非完整 replay。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md) 和 [docs/AUDIT.md](docs/AUDIT.md)。
+当前处于 **M2 四层委派 + M3 Merge Queue 第一切片**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经可用；Leader 可以委派给 Manager → Worker → Labour，召集 1–3 轮只读 Manager 圆桌，提交并自动派发 TeamPlan，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果。Worker 拥有独立 task worktree；Verifier 审查通过后进入持久 merge queue，由确定性 Integrator 串行合并、做 diff check 和可选项目检查，失败则回滚；session diff 从 base commit 起算。Leader 必须给每个 Manager 分配部门角色；`delegate_many` 会校验不重叠写作用域；research profile 可读取公网 URL。当前限制：landing / PR 未实现，merge queue 冲突只记录不自动 retry，shell 没有沙箱，事件日志仍是审计/投影流而非完整 replay。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md) 和 [docs/AUDIT.md](docs/AUDIT.md)。
 
 ## 许可
 

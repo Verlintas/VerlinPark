@@ -35,6 +35,7 @@ pub struct AgentConfig {
     pub max_managers: usize,
     pub max_workers: usize,
     pub max_labour: usize,
+    pub integration_command: Option<String>,
     pub tools: ToolRegistry,
 }
 
@@ -191,6 +192,7 @@ struct AgentSpec {
     depth: u8,
     parent_name: Option<String>,
     title: Option<String>,
+    task_id: Option<String>,
     profile: AgentProfile,
     allow_delegation: bool,
     worktree: PathBuf,
@@ -458,6 +460,9 @@ impl AgentService {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(40),
+                integration_command: env::var("VERLINPARK_INTEGRATION_COMMAND")
+                    .ok()
+                    .filter(|command| !command.trim().is_empty()),
                 tools: ToolRegistry::default_tools(),
             },
         )
@@ -515,6 +520,9 @@ impl AgentService {
             max_managers: params.max_managers.unwrap_or(5).clamp(1, 5) as usize,
             max_workers: params.max_workers.unwrap_or(10).clamp(1, 10) as usize,
             max_labour: params.max_labour.unwrap_or(40).clamp(1, 40) as usize,
+            integration_command: env::var("VERLINPARK_INTEGRATION_COMMAND")
+                .ok()
+                .filter(|command| !command.trim().is_empty()),
             tools: ToolRegistry::default_tools(),
         };
         *self
@@ -680,6 +688,7 @@ async fn run_agent(
         depth: 0,
         parent_name: None,
         title: None,
+        task_id: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         worktree: worktree.clone(),
@@ -888,14 +897,185 @@ async fn commit_worker(spec: &AgentSpec, name: &str) -> Result<Option<String>> {
     .await?
 }
 
-async fn merge_worker(spec: &AgentSpec, name: &str) -> Result<()> {
-    let session_worktree = spec.session_worktree.clone();
+async fn run_integration_command(worktree: PathBuf, command: String) -> Result<String> {
+    let output = timeout(
+        Duration::from_secs(300),
+        tokio::process::Command::new("sh")
+            .arg("-lc")
+            .arg(&command)
+            .current_dir(&worktree)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("integration command timed out after 300s"))??;
+
+    let mut text = String::new();
+    if !output.stdout.is_empty() {
+        text.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    let text = truncate(&text);
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(anyhow!(
+            "integration command exited with {}:\n{}",
+            output.status.code().unwrap_or(-1),
+            text
+        ))
+    }
+}
+
+async fn integrate_worker(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    commit: &str,
+    verifier_summary: &str,
+    integration_command: Option<&str>,
+) -> Result<String> {
+    let worktree = spec.session_worktree.clone();
+    let base_commit =
+        tokio::task::spawn_blocking(move || worktree::head_commit(&worktree)).await??;
+    let entry = engine
+        .enqueue_merge(
+            &session.id,
+            &spec.id,
+            &spec.name,
+            spec.task_id.clone(),
+            &spec.branch,
+            commit,
+            &base_commit,
+            Some(verifier_summary.to_string()),
+        )
+        .await?;
+    engine
+        .update_merge_queue_entry(&entry.id, "merging", None)
+        .await?;
+    emit(
+        engine,
+        &session.id,
+        spec,
+        "integrator.started",
+        serde_json::json!({
+            "entry_id": entry.id,
+            "branch": spec.branch,
+            "base_commit": base_commit,
+            "has_command": integration_command.is_some(),
+        }),
+    )
+    .await?;
+
+    let merge_worktree = spec.session_worktree.clone();
     let branch = spec.branch.clone();
-    let message = format!("merge {name}");
-    tokio::task::spawn_blocking(move || {
-        worktree::merge_branch(&session_worktree, &branch, &message)
+    let message = format!("merge {}", spec.name);
+    let merge_result = tokio::task::spawn_blocking(move || {
+        worktree::merge_branch(&merge_worktree, &branch, &message)
     })
-    .await?
+    .await?;
+    if let Err(error) = merge_result {
+        let message = format!("{error:#}");
+        let conflict = message.to_lowercase().contains("conflict")
+            || message.contains("Automatic merge failed");
+        let status = if conflict { "conflict" } else { "failed" };
+        let detail = truncate(&if conflict {
+            format!("merge conflict: {message}")
+        } else {
+            format!("merge failed: {message}")
+        });
+        engine
+            .update_merge_queue_entry(&entry.id, status, Some(detail.clone()))
+            .await?;
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "integrator.finished",
+            serde_json::json!({
+                "entry_id": entry.id,
+                "status": status,
+                "detail": truncate(&detail),
+            }),
+        )
+        .await?;
+        return Err(anyhow!(detail));
+    }
+
+    engine
+        .update_merge_queue_entry(&entry.id, "checking", None)
+        .await?;
+    let check_worktree = spec.session_worktree.clone();
+    let check_base = base_commit.clone();
+    let check_result = tokio::task::spawn_blocking(move || {
+        worktree::check_merged_diff(&check_worktree, &check_base)
+    })
+    .await?;
+    let check_result = match check_result {
+        Ok(()) => {
+            if let Some(command) = integration_command {
+                run_integration_command(spec.session_worktree.clone(), command.to_string()).await
+            } else {
+                Ok("diff check passed".to_string())
+            }
+        }
+        Err(error) => Err(error),
+    };
+
+    let integration_detail = match check_result {
+        Ok(detail) => detail,
+        Err(error) => {
+            let detail = format!("integration check failed: {error}");
+            let reset_worktree = spec.session_worktree.clone();
+            let reset_base = base_commit.clone();
+            let reset = tokio::task::spawn_blocking(move || {
+                worktree::reset_hard(&reset_worktree, &reset_base)
+            })
+            .await?;
+            let detail = truncate(&match reset {
+                Ok(()) => detail,
+                Err(reset_error) => format!("{detail}; rollback failed: {reset_error}"),
+            });
+            engine
+                .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "integrator.finished",
+                serde_json::json!({
+                    "entry_id": entry.id,
+                    "status": "failed",
+                    "detail": detail,
+                }),
+            )
+            .await?;
+            return Err(anyhow!(detail));
+        }
+    };
+    let integration_detail = truncate(&integration_detail);
+    engine
+        .update_merge_queue_entry(&entry.id, "merged", Some(integration_detail.clone()))
+        .await?;
+    emit(
+        engine,
+        &session.id,
+        spec,
+        "integrator.finished",
+        serde_json::json!({
+            "entry_id": entry.id,
+            "status": "merged",
+            "detail": integration_detail,
+        }),
+    )
+    .await?;
+    Ok(format!("merged; {integration_detail}"))
 }
 
 enum VerificationOutcome {
@@ -953,6 +1133,7 @@ async fn verify_worker(
         depth: manager_spec.depth.saturating_add(1),
         parent_name: Some(manager_spec.name.clone()),
         title: Some("Verification".to_string()),
+        task_id: None,
         profile: AgentProfile::Verification,
         allow_delegation: false,
         worktree: worker_spec.worktree.clone(),
@@ -1197,8 +1378,17 @@ async fn finish_worker(
     .await?;
     match verification {
         VerificationOutcome::Approved(verdict) => {
-            match merge_worker(worker_spec, &worker_spec.name).await {
-                Ok(()) => {
+            match integrate_worker(
+                engine,
+                session,
+                worker_spec,
+                &commit,
+                &verdict.summary,
+                config.integration_command.as_deref(),
+            )
+            .await
+            {
+                Ok(detail) => {
                     engine.update_agent_status(&worker_spec.id, "idle").await?;
                     emit(
                         engine,
@@ -1212,6 +1402,8 @@ async fn finish_worker(
                             "merged": true,
                             "verified": true,
                             "approved": true,
+                            "integrator": true,
+                            "integration": truncate(&detail),
                             "verdict": truncate(&verdict.summary),
                             "worktree": worker_spec.worktree,
                             "branch": worker_spec.branch,
@@ -1220,7 +1412,8 @@ async fn finish_worker(
                     .await?;
                     Ok(WorkerFinish::Done {
                         report: format!(
-                            "merged: true\nverified: true\n{}\nverdict: {}",
+                            "merged: true\nverified: true\nintegrator: {}\n{}\nverdict: {}",
+                            truncate(&detail),
                             truncate(summary),
                             truncate(&verdict.summary)
                         ),
@@ -1243,6 +1436,7 @@ async fn finish_worker(
                             "merged": false,
                             "verified": true,
                             "approved": true,
+                            "integrator": true,
                             "verdict": truncate(&verdict.summary),
                             "worktree": worker_spec.worktree,
                             "branch": worker_spec.branch,
@@ -1251,7 +1445,7 @@ async fn finish_worker(
                     .await?;
                     Ok(WorkerFinish::Done {
                         report: format!(
-                            "merge failed: {error}\nverdict: {}",
+                            "merge/integration failed: {error}\nverdict: {}",
                             truncate(&verdict.summary)
                         ),
                         success: false,
@@ -1871,6 +2065,7 @@ async fn run_loop(
                                     depth: spec.depth.saturating_add(1),
                                     parent_name: Some(spec.name.clone()),
                                     title: title.clone(),
+                                    task_id: None,
                                     profile: child_profile,
                                     allow_delegation: role.child_role().is_some(),
                                     worktree: child_worktree,
@@ -2581,6 +2776,7 @@ async fn run_parallel_workers(
             depth: spec.depth.saturating_add(1),
             parent_name: Some(spec.name.clone()),
             title: None,
+            task_id: None,
             profile: task.profile,
             allow_delegation: true,
             worktree: info.path,
@@ -3157,6 +3353,7 @@ async fn ensure_plan_manager(
         depth: 1,
         parent_name: Some(leader_spec.name.clone()),
         title: Some(department.manager_title.clone()),
+        task_id: None,
         profile,
         allow_delegation: false,
         worktree: session_worktree.clone(),
@@ -3397,6 +3594,7 @@ async fn execute_team_plan(
                 depth: manager_spec.depth.saturating_add(1),
                 parent_name: Some(manager_spec.name.clone()),
                 title: None,
+                task_id: Some(task.id.clone()),
                 profile,
                 allow_delegation: true,
                 worktree: info.path,
@@ -3952,6 +4150,7 @@ mod tests {
             max_managers: 5,
             max_workers: 10,
             max_labour: 20,
+            integration_command: None,
             tools: ToolRegistry::default_tools(),
         };
         let service = AgentService::configured(engine.clone(), config);
@@ -3967,6 +4166,18 @@ mod tests {
             .expect("test service is configured")
             .clone();
         config.max_workers = max_workers;
+        *service.config.write().unwrap() = Some(config);
+    }
+
+    fn set_integration_command(service: &AgentService, command: Option<&str>) {
+        let mut config = service
+            .config
+            .read()
+            .unwrap()
+            .as_ref()
+            .expect("test service is configured")
+            .clone();
+        config.integration_command = command.map(ToOwned::to_owned);
         *service.config.write().unwrap() = Some(config);
     }
 
@@ -4645,11 +4856,221 @@ mod tests {
                 && event.payload["agent_role"] == "worker"
                 && event.payload["merged"] == true
         }));
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].status, "merged");
+        assert_eq!(queue[0].agent_name, "Worker 1");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "merge_queue.enqueued")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "integrator.started")
+        );
+        assert!(events.iter().any(
+            |event| event.kind == "integrator.finished" && event.payload["status"] == "merged"
+        ));
         let sessions = engine
             .list_sessions(Some(session.project_id))
             .await
             .unwrap();
         assert_eq!(sessions[0].status, "idle");
+    }
+
+    #[tokio::test]
+    async fn records_merge_conflicts_in_the_queue() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let engine = Engine::new(store);
+        let project_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("README.md"), "initial\n").unwrap();
+        init_repo(&project_dir);
+        let project = engine
+            .add_project(
+                project_dir.to_string_lossy().to_string(),
+                Some("repo".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "conflict".into(), None)
+            .await
+            .unwrap();
+        let branch = session.branch.clone().unwrap();
+        let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let task = engine
+            .create_task_worktree(&project.root, &project.id, &session.id, "T1", &branch)
+            .await
+            .unwrap();
+        std::fs::write(task.path.join("README.md"), "worker\n").unwrap();
+        let commit = worktree::commit_all(&task.path, "worker change")
+            .unwrap()
+            .unwrap();
+        std::fs::write(session_worktree.join("README.md"), "session\n").unwrap();
+        worktree::commit_all(&session_worktree, "session change").unwrap();
+
+        let spec = AgentSpec {
+            id: "worker-test".into(),
+            role: AgentRole::Worker,
+            name: "Worker test".into(),
+            depth: 2,
+            parent_name: Some("Manager".into()),
+            title: None,
+            task_id: Some("T1".into()),
+            profile: AgentProfile::Coding,
+            allow_delegation: true,
+            worktree: task.path.clone(),
+            branch: task.branch.clone(),
+            session_worktree: session_worktree.clone(),
+            session_branch: branch,
+            write_scope: vec!["README.md".into()],
+            base_commit: task.base_commit.clone(),
+        };
+        let error = integrate_worker(&engine, &session, &spec, &commit, "verified", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("merge conflict"), "{error}");
+
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].status, "conflict");
+        assert_eq!(
+            std::fs::read_to_string(session_worktree.join("README.md")).unwrap(),
+            "session\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn rolls_back_a_merge_when_integration_checks_fail() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "title": "Implementation",
+                            "objective": "deliver the file"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "write worker.txt",
+                            "write_scope": ["worker.txt"]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "worker.txt",
+                            "content": "from worker\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker wrote".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_verdict".into(),
+                        name: "submit_verdict".into(),
+                        arguments: serde_json::json!({
+                            "approved": true,
+                            "summary": "worker.txt exists and matches the task"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        set_integration_command(&service, Some("exit 7"));
+        let session = engine
+            .create_session(project.id, "integration failure".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..100 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        service
+            .start(&session.id, "integration failure")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        approver.abort();
+
+        let worktree = session.worktree.clone().unwrap();
+        assert!(
+            !std::path::Path::new(&worktree).join("worker.txt").exists(),
+            "a failed integration check must roll the merge back"
+        );
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].status, "failed");
+        assert!(
+            queue[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("integration command exited"))
+        );
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
+        assert_eq!(worker.status, "failed");
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "integrator.finished" && event.payload["status"] == "failed"
+        }));
     }
 
     #[tokio::test]

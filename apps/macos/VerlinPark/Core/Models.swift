@@ -294,6 +294,42 @@ struct AgentListResult: Codable, Sendable {
     let agents: [AgentRecord]
 }
 
+struct MergeQueueEntry: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    let agentId: String
+    let agentName: String
+    let taskId: String?
+    let branch: String
+    let commit: String
+    let baseCommit: String
+    let status: String
+    let attempt: Int
+    let detail: String?
+    let createdAt: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case taskId = "task_id"
+        case branch
+        case commit
+        case baseCommit = "base_commit"
+        case status
+        case attempt
+        case detail
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+struct MergeQueueListResult: Codable, Sendable {
+    let entries: [MergeQueueEntry]
+}
+
 struct PlanDepartment: Codable, Identifiable, Hashable, Sendable {
     let name: String
     let managerTitle: String

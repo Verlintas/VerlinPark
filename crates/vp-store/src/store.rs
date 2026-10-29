@@ -7,7 +7,9 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
-use vp_protocol::types::{AgentRecord, Approval, Event, Project, Session, StoredMessage, TodoItem};
+use vp_protocol::types::{
+    AgentRecord, Approval, Event, MergeQueueEntry, Project, Session, StoredMessage, TodoItem,
+};
 
 use crate::paths;
 
@@ -122,6 +124,25 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_approvals_session
                 ON approvals(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS merge_queue (
+                id          TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                agent_id    TEXT NOT NULL,
+                agent_name  TEXT NOT NULL,
+                task_id     TEXT,
+                branch       TEXT NOT NULL,
+                commit_hash  TEXT NOT NULL,
+                base_commit  TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                attempt     INTEGER NOT NULL DEFAULT 1,
+                detail      TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_merge_queue_session
+                ON merge_queue(session_id, created_at);
             "#,
         )?;
         ensure_column(&conn, "sessions", "worktree", "TEXT")?;
@@ -807,6 +828,80 @@ impl Store {
         Ok(ids)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_merge(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<&str>,
+        branch: &str,
+        commit: &str,
+        base_commit: &str,
+        detail: Option<&str>,
+    ) -> Result<MergeQueueEntry> {
+        let id = Uuid::now_v7().to_string();
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO merge_queue
+             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 1, ?9, ?10, ?10)",
+            params![
+                id,
+                session_id,
+                agent_id,
+                agent_name,
+                task_id,
+                branch,
+                commit,
+                base_commit,
+                detail,
+                now
+            ],
+        )?;
+        conn.query_row(
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+             FROM merge_queue WHERE id = ?1",
+            params![id],
+            map_merge_queue_entry,
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn update_merge_queue_entry(
+        &self,
+        id: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<Option<MergeQueueEntry>> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE merge_queue
+             SET status = ?1, detail = COALESCE(?2, detail), updated_at = ?3
+             WHERE id = ?4",
+            params![status, detail, now_rfc3339(), id],
+        )?;
+        conn.query_row(
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+             FROM merge_queue WHERE id = ?1",
+            params![id],
+            map_merge_queue_entry,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_merge_queue(&self, session_id: &str) -> Result<Vec<MergeQueueEntry>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+             FROM merge_queue WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], map_merge_queue_entry)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn list_approvals(&self, session_id: Option<&str>) -> Result<Vec<Approval>> {
         let conn = self.lock()?;
         let sql = match session_id {
@@ -838,6 +933,24 @@ impl Store {
         }
         Ok(approvals)
     }
+}
+
+fn map_merge_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueEntry> {
+    Ok(MergeQueueEntry {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        agent_name: row.get(3)?,
+        task_id: row.get(4)?,
+        branch: row.get(5)?,
+        commit: row.get(6)?,
+        base_commit: row.get(7)?,
+        status: row.get(8)?,
+        attempt: row.get::<_, i64>(9)? as u32,
+        detail: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
 }
 
 fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -1117,6 +1230,40 @@ mod tests {
         );
         let listed = store.list_approvals(Some(&session.id)).unwrap();
         assert_eq!(listed[0].status, "approved");
+    }
+
+    #[test]
+    fn persists_and_updates_merge_queue_entries() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "merge").unwrap();
+        let entry = store
+            .enqueue_merge(
+                &session.id,
+                "agent_1",
+                "Worker 1",
+                Some("T1"),
+                "verlinpark/task",
+                "abc123",
+                "def456",
+                Some("verifier approved"),
+            )
+            .unwrap();
+        assert_eq!(entry.status, "queued");
+        assert_eq!(entry.attempt, 1);
+        assert_eq!(entry.task_id.as_deref(), Some("T1"));
+
+        let updated = store
+            .update_merge_queue_entry(&entry.id, "merged", Some("ok"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "merged");
+        assert_eq!(updated.detail.as_deref(), Some("ok"));
+        let listed = store.list_merge_queue(&session.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, entry.id);
     }
 
     #[test]

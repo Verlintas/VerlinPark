@@ -174,6 +174,25 @@ pub fn merge_branch(session_worktree: &Path, branch: &str, message: &str) -> Res
     }
 }
 
+pub fn head_commit(worktree: &Path) -> Result<String> {
+    git_output(worktree, &["rev-parse", "HEAD"])
+}
+
+pub fn reset_hard(worktree: &Path, commit: &str) -> Result<()> {
+    run_git(worktree, &["reset", "--hard", commit])
+}
+
+/// Check the merge result for whitespace errors and conflict markers before it
+/// becomes the session branch. This is deliberately language-agnostic; projects
+/// can add a real test command through `VERLINPARK_INTEGRATION_COMMAND`.
+pub fn check_merged_diff(worktree: &Path, base_commit: &str) -> Result<()> {
+    match git_output(worktree, &["diff", "--check", base_commit, "HEAD"]) {
+        Ok(output) if output.trim().is_empty() => Ok(()),
+        Ok(output) => Err(anyhow!("integration diff check failed:\n{output}")),
+        Err(error) => Err(error.context("integration diff check failed")),
+    }
+}
+
 pub fn remove(project_root: &Path, worktree: &Path, branch: &str) {
     if let Ok(root) = project_root.canonicalize() {
         let _ = run_git(

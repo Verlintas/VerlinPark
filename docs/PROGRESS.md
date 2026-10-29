@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
-> 最后更新：2026-10-29  
-> 当前阶段：M2 四层 Agent runtime 与 M2.5 硬化已跑通；下一阶段是 Merge Queue / Integrator
+> 最后更新：2026-10-30
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + 确定性 Merge Queue/Integrator 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
 
@@ -21,17 +21,19 @@
 | Task worktree | ✅ | Worker 独立 task worktree/branch；Labour 继承 Worker worktree |
 | 并行 Worker | ✅ | `delegate_many` / plan batch 并发；两边都校验 write scope 不重叠；空 scope 或重叠 scope 的 plan task 串行执行 |
 | Verifier gate | ✅ | 独立 Verifier；`submit_verdict`；approve 才合并。只读是 prompt 约束，shell 未沙箱；审批卡会提示 |
+| Merge queue | ✅ | Verifier-approved commit 入持久队列；`merge_queue.list` / `vp queue` / Preview → Queue；状态 queued/merging/checking/merged/conflict/failed |
+| Integrator gate | ✅ | 确定性 merge：`--no-ff` + `git diff --check` + 可选 `VERLINPARK_INTEGRATION_COMMAND`；失败 reset 到 merge 前 commit；冲突 abort 并保留 Worker 分支 |
 | Diff / commit | ✅ | base..worktree diff、显式 commit、discard、session committed 事件 |
 | 预算 / 取消 | ✅ | token reservation + provider usage 结算；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复 |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；UI Approve/Deny |
-| 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable 事件；Collab roster；Preview Plan/Changes/Trace |
+| 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator 事件；Collab roster；Preview Plan/Changes/Queue/Trace |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
 | Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
-| CLI | ✅ | ping/info/projects/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/todos/agents/team-plan |
+| CLI | ✅ | ping/info/projects/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/todos/agents/team-plan/queue |
 
 ## 验证
 
-- `cargo test --workspace`：52 个测试通过（core 37、store 10、providers 5）。
+- `cargo test --workspace`：55 个测试通过（core 39、store 11、providers 5）。
 - `xcodebuild test`：9 个 Swift 测试通过。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -43,12 +45,12 @@
 
 1. **Verifier 只读**：只是 prompt 约束；`shell` 工具没有被沙箱限制。审批卡会提示，但 runtime 不阻止写操作。见 AUDIT P1-3。
 2. **事件溯源**：部分状态先写 SQLite 再 append event，部分状态没有事件；事件日志目前是审计流，不是完整 replay 的 source of truth。见 AUDIT P1-5。
-3. **merge queue / Integrator**：见下节；这是下一阶段的主功能，不是隐蔽缺口。
-4. **batch abort 状态一致性**：同批 task 在预算/取消中止时可能残留 `running` UI 状态；见 AUDIT P2-7。
+3. **batch abort 状态一致性**：同批 task 在预算/取消中止时可能残留 `running` UI 状态；见 AUDIT P2-7。
 
 ## 当前限制（明确未实现）
 
-- 没有 merge queue / Integrator / landing；Verifier 通过后直接串行合并到 session 分支，不会自动创建 PR 或落 main。
+- landing / PR 仍未实现；session branch 完成后仍由用户最终处理。
+- merge queue 目前是 session 内、逐条 drain；没有跨 entry retry/rebase、自动冲突解决或 LLM Integrator。
 - 自动派发中的 Manager 是确定性部门节点；LLM 圆桌只在 `deliberate_team_plan` 中运行。
 - 没有全局跨 session 调度器、task retry UI、单 task cancel/pause。
 - 没有 auto-expansion；Manager/Worker 上限是固定 caps，不是按预算自动扩编。
@@ -67,6 +69,7 @@
 - **M1 Leader runtime**：session worktree、工具、审批、token 预算、取消、diff/commit/discard、Provider 设置、todo 计划。
 - **M2 四层 runtime**：Manager titles/profiles、TeamPlan、manager roundtable、自动派发、task worktrees、并行 Worker、write scope、Verifier gate、Task Board。
 - **M2.5 硬化**：plan batch scope/cap、token reservation、DNS 固定的 fetch_url、Verifier shell 审批提示。
+- **M3 第一切片**：持久 merge queue、确定性 Integrator、diff check、可选 integration command、失败回滚、冲突记录、Queue UI/CLI。
 
 ## 如何运行
 

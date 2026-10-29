@@ -176,6 +176,13 @@ actor CoreClient {
             .agents
     }
 
+    func listMergeQueue(sessionID: String) async throws -> [MergeQueueEntry] {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "merge_queue.list", params: params)
+            .decode(MergeQueueListResult.self)
+            .entries
+    }
+
     func sessionTodos(sessionID: String) async throws -> [TodoItem] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.todos", params: params)
