@@ -3,6 +3,10 @@
 - **Status:** Accepted
 - **Date:** 2026-10-29
 
+> **Implementation note (2026-10-29):** The 1–3 round, read-only roundtable is
+> implemented. The session budget can overshoot by one concurrent round; see
+> [AUDIT P0-2](../AUDIT.md).
+
 ## Context
 
 Managers could split work and delegate, but they could not exchange positions with

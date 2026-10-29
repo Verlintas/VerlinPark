@@ -418,7 +418,7 @@ struct ProvidersSettingsView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
                 Text(
-                    "Input + output token hard stop for new sessions. Existing sessions keep their own budget."
+                    "Input + output token budget for new sessions. Existing sessions keep their own budget. Concurrent agent batches may overshoot by one turn."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

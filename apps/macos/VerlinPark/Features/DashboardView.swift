@@ -39,13 +39,13 @@ struct DashboardView: View {
                     )
                     metric(
                         "Agents",
-                        value: "0 active",
-                        detail: "Leader 1 · Managers 3–5 · Workers 2–10 · Labour 3–40"
+                        value: "\(model.agents.count) known",
+                        detail: "Defaults 4 / 6 / 12 · caps 5 / 10 / 40"
                     )
                     metric(
                         "Computer",
-                        value: "idle",
-                        detail: "GUI / browser only · 0 active · 0 queued"
+                        value: "not wired",
+                        detail: "GUI/browser lease is design-only · shell/worktrees run in parallel"
                     )
                     metric(
                         "Memory",
@@ -71,11 +71,13 @@ struct DashboardView: View {
                         Image(systemName: "hammer")
                             .foregroundStyle(.green)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("M1 · Leader chat + native tools + trace")
+                            Text("Next · Merge queue + Integrator")
                                 .font(.system(size: 12, weight: .medium))
-                            Text("The org graph is a design preview until the agent runtime lands.")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.secondary)
+                            Text(
+                                "Approved branches merge serially today; queue, retry, and post-merge checks are next."
+                            )
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
                         }
                         Spacer()
                     }

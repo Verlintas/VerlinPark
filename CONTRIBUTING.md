@@ -1,12 +1,12 @@
 # Contributing to VerlinPark
 
-VerlinPark is currently in the **design phase**. The most useful contributions right now are:
+VerlinPark is in the **M2 implementation phase**: the daemon, CLI, SwiftUI app, session worktrees, four-tier delegation, TeamPlan dispatch, and Verifier gate run end-to-end. The most useful contributions right now are:
 
-- critique of the product thesis and multi-agent organization design
+- runtime correctness/security review, especially concurrency, budgets, shell isolation, and merge conflicts
 - counterexamples / failure modes from running agent teams on real repositories
 - benchmark tasks and fixture repositories
 - ADR proposals for the open questions in [docs/DECISIONS.md](docs/DECISIONS.md)
-- once the first code lands: Rust core, SwiftUI app, tests, docs
+- code, tests, and documentation; see [docs/AUDIT.md](docs/AUDIT.md) for known gaps
 
 ## Ground rules
 

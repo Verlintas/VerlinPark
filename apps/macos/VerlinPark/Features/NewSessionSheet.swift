@@ -33,9 +33,11 @@ struct NewSessionSheet: View {
                 TextField("200000", value: $budget, format: .number)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
-                Text("The runtime hard-stops the Leader when input + output tokens reach this limit.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                Text(
+                    "The runtime stops the Leader when input + output tokens reach this limit. Concurrent batches may overshoot by one turn."
+                )
+                .font(.caption)
+                .foregroundStyle(.tertiary)
             }
 
             HStack {

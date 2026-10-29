@@ -2,9 +2,9 @@
 
 **A native macOS agentic development environment for agent teams.**
 
-VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets them collaborate through typed messages and shared artifacts, and makes every plan, tool call, diff, token, and permission decision inspectable and replayable.
+VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets Managers compare plans before work starts, and makes every plan, tool call, diff, token, and permission decision inspectable and traceable. A typed peer mailbox and shared artifact store are planned, not implemented yet.
 
-> **Status: M2 four-tier delegation (in progress).** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A single Leader can stream responses, work on its own Git worktree, inspect a repository, call tools, ask for approval before writes or shell commands, maintain a persisted plan, show a live worktree diff, commit or discard the reviewed result, and hard-stop on a per-session token budget. The four-tier scheduler, per-task worktrees, budgets, and the full permission broker are still ahead.
+> **Status: M2 four-tier delegation implemented.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A session Leader can plan and delegate through Manager → Worker → Labour, convene a read-only Manager roundtable, auto-dispatch a validated TeamPlan in dependency batches, isolate Workers in Git worktrees, gate merges on a Verifier verdict, and serialize approved merges into the session branch. Sessions have approvals, cancellation, a live diff, and an event trace. Merge queue/Integrator, typed mailbox/artifact store, global cross-session scheduling, per-role models, and a true tool sandbox are **not** implemented yet — see [PROGRESS](docs/PROGRESS.md) and [AUDIT](docs/AUDIT.md).
 
 ---
 
@@ -32,14 +32,14 @@ The default organization is a four-tier structure:
 
 ```text
 Leader (1)
-├── Managers (3–5)        discuss, produce outlines, assign work
-│   ├── Workers (2–10)    decompose tasks, own worktrees, hire Labour
-│   │   └── Labour (3–40) write code, run subtasks
+├── Managers (4 default, max 5)        discuss, produce outlines, assign work
+│   ├── Workers (6 default, max 10)    execute tasks, own worktrees, hire Labour
+│   │   └── Labour (12 default, max 40) assist with subtasks
 ```
 
-Auto-expansion is budget-gated: start with a minimal team, grow only when the task queue and budget justify it, and freeze at 80% of the session budget.
+Auto-expansion is a planned budget-gated feature; the current runtime uses fixed, configurable caps and creates Managers lazily when a department has ready work.
 
-Plans are proposed by the Lead, validated by code, and executed by a DAG scheduler. Agents can talk to each other, but only through typed messages and artifact references — not by forwarding entire chat histories.
+Plans are proposed by the Leader, validated by code, and executed in dependency batches. Managers can exchange positions in a bounded roundtable; a typed peer mailbox and artifact references are planned, not implemented yet.
 
 ### 2. Glass Box — everything is inspectable
 
@@ -52,7 +52,7 @@ VerlinPark records the full session as an append-only event log:
 - tokens, cost, latency, retries, and budget state
 - every Git worktree, commit, and merge
 
-The UI can reconstruct a session, replay it, export it, and show exactly why a change landed.
+The UI can inspect a session and show exactly why a change was proposed. Full replay/export and a complete event-sourced rebuild are planned; today events are the audit stream and UI feed, while SQLite remains the projection store. See [AUDIT](docs/AUDIT.md).
 
 ### 3. Open Bench — native, local-first, and extensible
 
@@ -76,42 +76,47 @@ flowchart LR
   U[User] --> APP["VerlinPark.app<br/>SwiftUI + AppKit"]
   CLI["vp CLI"] --> CORE
   APP <-->|"JSON-RPC over WebSocket<br/>127.0.0.1 + token"| CORE["verlinpadd<br/>Rust agent runtime"]
-  CORE --> DB[("SQLite + append-only event log")]
-  CORE --> GIT["Git worktrees<br/>branches + merge queue"]
-  CORE --> PTY["PTY / shell processes"]
+  CORE --> DB[("SQLite + event/audit log")]
+  CORE --> GIT["Git worktrees<br/>serial integration<br/>(merge queue planned)"]
+  CORE --> PTY["shell processes<br/>(no PTY yet)"]
   CORE --> LLM["Model providers<br/>cloud + local"]
-  CORE --> MCP["MCP servers"]
-  CORE --> ACP["ACP agents"]
-  CORE --> ART["Artifact store<br/>plans, patches, reports"]
+  CORE --> MCP["MCP servers<br/>(planned)"]
+  CORE --> ACP["ACP agents<br/>(planned)"]
+  CORE --> ART["Artifact store<br/>(planned)"]
 ```
 
-The daemon owns sessions and keeps running when the app closes. The SwiftUI app is a client. The CLI is another client. The protocol is versioned and replayable.
+The daemon owns sessions and keeps running when the app closes. The SwiftUI app is a client. The CLI is another client. The protocol is versioned; full replay is not implemented yet.
 
-## Planned v0.1
+## Toward v0.1
 
-The first demo is a complete multi-agent feature delivery on a benchmark repository:
+The first end-to-end demo is a complete multi-agent feature delivery on a benchmark repository:
 
 1. Open a repository and create a session with a goal.
-2. Pick a four-tier org template. Assign models and budgets manually.
-3. The Lead produces a plan; the runtime validates the DAG, write scopes, fan-out, and budgets.
-4. Departments execute tasks in parallel, each Builder in its own worktree.
-5. Scouts produce context packets; Verifiers run tests and review; the Integrator merges into an integration branch.
-6. The UI shows the Park Map, every message, every tool call, every diff, and the cost ledger.
+2. Pick a four-tier org preset. Assign models and budgets manually.
+3. The Leader produces a plan; the runtime validates the DAG, scope syntax, fan-out, and budget.
+4. Departments execute tasks in parallel, each Worker in its own worktree.
+5. A read-only Verifier runs tests and submits a verdict.
+6. The Integrator merges approved work into an integration branch; the UI shows the plan, messages, tool calls, diffs, and token usage.
 7. The user reviews and lands the integration branch.
 
-v0.1 is not a full IDE, not a model hub, and not a document workspace. See [docs/PLAN.md](docs/PLAN.md) for scope, milestones, and non-goals.
+**Today:** steps 1–5 and serial integration work with one configured model and a session-level budget; the Manager roundtable, task worktrees, and Verifier gate are real. **Still planned:** per-role models/budgets, plan scope-overlap enforcement, merge queue, Integrator, post-merge integration tests, cost ledger, artifact packets, and landing/PR. v0.1 is not a full IDE, not a model hub, and not a document workspace. See [docs/PLAN.md](docs/PLAN.md) for scope, milestones, and non-goals.
+
+> Known enforcement gaps at this milestone: plan auto-dispatch does not yet enforce pairwise write-scope overlap or org caps, and the token budget can overshoot under concurrency. See [docs/AUDIT.md](docs/AUDIT.md).
 
 ## Documentation
 
+Start with the [documentation index](docs/README.md). The short version:
+
+- [Progress](docs/PROGRESS.md) — what actually works today (source of truth)
+- [Audit](docs/AUDIT.md) — known gaps, evidence, and recommended order
+- [Architecture](docs/ARCHITECTURE.md) — target runtime, protocol, data model, security
 - [Development plan](docs/PLAN.md) — product thesis, scope, milestones, risks
-- [Architecture](docs/ARCHITECTURE.md) — runtime, protocol, data model, security
-- [Research](docs/RESEARCH.md) — competitive analysis and sources
 - [Decisions](docs/DECISIONS.md) — locked architectural decisions (ADRs)
-- [Progress](docs/PROGRESS.md) — what actually works today
+- [Research](docs/RESEARCH.md) — competitive analysis and sources (historical)
 - [Third-party notices](THIRD_PARTY_NOTICES.md) — bundled FlagKit assets (MIT)
 - [Pride flag sources](docs/PRIDE_FLAGS.md) — Wikimedia Commons file/author/license table
 
-## Build and run (M0)
+## Build and run
 
 Requirements: macOS 15+, Xcode 27+, Rust stable, [XcodeGen](https://github.com/yonaskolb/XcodeGen), [`just`](https://github.com/casey/just).
 
@@ -194,7 +199,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M2 四层委派**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经跑通；Leader 可以委派给 Manager → Worker → Labour，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果，并在 session token 预算耗尽时硬停。Worker 拥有独立 task worktree，成功后串行合并到 session 分支；session diff 从 base commit 起算，已合并的改动仍可审阅。Leader 必须给每个 Manager 分配部门角色（Discovery / Implementation / Quality 或自定义）；Manager 可以用 `delegate_many` 并行运行写作用域不重叠的 Worker；独立 Verifier 审查通过后才合并；research profile 可读取公网 URL。集成仍串行，merge queue 仍在后续里程碑。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+当前处于 **M2 四层委派已跑通**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经可用；Leader 可以委派给 Manager → Worker → Labour，召集 1–3 轮只读 Manager 圆桌，提交并自动派发 TeamPlan，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果。Worker 拥有独立 task worktree，Verifier 审查通过后串行合并到 session 分支；session diff 从 base commit 起算。Leader 必须给每个 Manager 分配部门角色；`delegate_many` 会校验不重叠写作用域；research profile 可读取公网 URL。当前限制：merge queue / Integrator / landing 未实现，TeamPlan 自动派发尚未执行 pairwise scope/caps 校验，token 预算在并发下可能有一轮超调，shell 没有沙箱。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md) 和 [docs/AUDIT.md](docs/AUDIT.md)。
 
 ## 许可
 

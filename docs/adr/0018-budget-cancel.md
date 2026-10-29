@@ -3,6 +3,11 @@
 - **Status:** Accepted
 - **Date:** 2026-10-25
 
+> **Implementation note (2026-10-29):** The budget is checked before a turn and
+> after usage is recorded. Concurrent Workers/roundtable calls can overshoot the
+> limit by one turn; this is not yet a strict reservation-based hard stop. See
+> [AUDIT P0-2](../AUDIT.md).
+
 ## Context
 
 The Leader loop can run for many turns and call tools repeatedly. Without a hard

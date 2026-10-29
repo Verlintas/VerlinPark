@@ -3,6 +3,11 @@
 - **Status:** Accepted
 - **Date:** 2026-10-29
 
+> **Implementation note (2026-10-29):** Defaults and lazy Managers are
+> implemented. The budget is not yet a strict reservation-based hard stop under
+> concurrent batches, and plan auto-dispatch does not yet reserve caps or check
+> pairwise scope overlap. See [AUDIT](../AUDIT.md).
+
 ## Context
 
 ADR-0025 removed small limits by raising defaults to 8 Managers / 32 Workers /

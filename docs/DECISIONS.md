@@ -1,6 +1,6 @@
 # VerlinPark 决策记录
 
-> 最后更新：2026-10-21  
+> 最后更新：2026-10-29  
 > 格式：Architecture Decision Record（ADR）  
 > 规则：已接受的决策不删除；如果改变，新增一条“Supersedes”记录。
 
@@ -47,7 +47,7 @@
 | 问题 | 默认/倾向 | 何时决定 |
 |---|---|---|
 | Aviiya / NovaBAIC 桥接协议 | 不在 VerlinPark 实现 Aviiya；等 NovaBAIC 协议 | NovaBAIC 稳定后 |
-| 四层扩编默认值 | 1 Leader / 4 Managers / 6 Workers / 12 Labour，预算门控 | M2 |
+| 四层扩编默认值 | 已定：1 Leader / 4 Managers / 6 Workers / 12 Labour；runtime caps 5 / 10 / 40；自动扩编仍未实现 | 已定（ADR-0026） |
 | 最低 macOS | 15+，Apple Silicon only | M0 |
 | UI 语言 | 英文 UI，中文文档 | M0 |
 | Hero demo 仓库 | 自建 `fixtures/tiny-webapp` | M1 前 |

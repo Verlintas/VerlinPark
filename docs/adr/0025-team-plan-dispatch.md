@@ -3,6 +3,11 @@
 - **Status:** Accepted; capacity defaults superseded by ADR-0026
 - **Date:** 2026-10-29
 
+> **Implementation note (2026-10-29):** The 8/32/128 caps, 500-task plan, and
+> Verifier cap of 1000 here were superseded by ADR-0026 (4/6/12 defaults,
+> 5/10/40 caps, 100 tasks, Verifier cap 100). See [AUDIT](../AUDIT.md) for the
+> current budget/scope enforcement gaps.
+
 ## Context
 
 The Leader could submit a validated TeamPlan, but the plan was only informational:

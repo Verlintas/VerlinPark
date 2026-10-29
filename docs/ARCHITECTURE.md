@@ -1,9 +1,10 @@
 # VerlinPark 技术架构
 
-> 版本：0.2（Draft）  
-> 日期：2026-10-23  
-> 关联：[PLAN.md](PLAN.md)、[DECISIONS.md](DECISIONS.md)  
-> 2026-10-23 修订：组织改为四层（Leader → Manager → Worker → Labour），Computer Lease 只串行 GUI/浏览器，UI 改为 Glass Park，Aviiya 外置到 NovaBAIC。旧的三层/旧 UI 章节视为历史设计；以 ADR-0011 ~ ADR-0014 为准。
+> 版本：0.3（Draft）  
+> 日期：2026-10-29  
+> 关联：[PLAN.md](PLAN.md)、[DECISIONS.md](DECISIONS.md)、[PROGRESS.md](PROGRESS.md)、[AUDIT.md](AUDIT.md)  
+> 2026-10-23 修订：组织改为四层（Leader → Manager → Worker → Labour），Computer Lease 只串行 GUI/浏览器，UI 改为 Glass Park，Aviiya 外置到 NovaBAIC。旧的三层/旧 UI 章节视为历史设计；以 ADR-0011 ~ ADR-0014 为准。  
+> 2026-10-29 修订：本文主要描述**目标架构**，不是当前实现清单。当前实现边界、已知 enforcement 缺口和测试情况以 [PROGRESS.md](PROGRESS.md) / [AUDIT.md](AUDIT.md) 为准。事件溯源目前是“审计事件 + SQLite 投影”的部分实现，尚未做到完整 replay。
 
 ---
 
@@ -15,7 +16,7 @@ VerlinPark 的架构围绕一组**不变量**设计。任何实现都不能破�
 2. **所有状态变更都是事件。** 可回放、可审计、可恢复。
 3. **Agent 不能越界写。** 写操作限制在自己的 worktree；只读操作限制在项目根 + 显式 allowlist。
 4. **没有隐藏的模型切换。** 每个 Agent 的模型由用户显式配置；运行时只校验能力，不自动路由。
-5. **没有跳过验证的合并。** 合并必须经过 Verifier + Integrator；人最终批准 land。
+5. **没有跳过验证的合并。** 目标状态是 Verifier + Integrator；人最终批准 land。当前只有 Verifier gate，Integrator 尚未实现，approved task 直接串行 merge 到 session 分支。
 6. **副作用必须可审计。** 每个工具调用、审批、命令、diff 都有事件记录。
 7. **大产物不进消息。** 消息只传 artifact 引用，避免上下文爆炸。
 8. **协议向后兼容。** 同一 major 版本内，旧客户端可以连接新 daemon（或明确拒绝并提示升级）。
@@ -466,7 +467,7 @@ loop {
 
 ## 7. Agent Runtime
 
-> **实现状态（M2 第八切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建； Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由只读 Verifier 审查，approve 才 merge； Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–5 个 Worker，每个 Worker 有独立 task worktree 和非重叠 write scope；完成后按任务顺序串行 commit + merge 到 session 分支；session diff 从 base commit 起算。完整 task DAG 调度器、全局写锁、merge queue、Verifier/Integrator gate 仍是设计目标：
+> **实现状态（M2 第九切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建；Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由 Verifier 审查（只读是 prompt 约束，shell 未沙箱），approve 才 merge；Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–10 个 Worker，手动路径会校验不重叠 write scope，plan 自动派发的 pairwise 校验仍待补；每个 Worker 有独立 task worktree，完成后按任务顺序串行 commit + merge 到 session 分支；session diff 从 base commit 起算。**已实现：** session 内 TeamPlan DAG 调度、Verifier gate、串行集成。**仍是设计目标：** 全局跨 session 调度器、全局写锁、merge queue、Integrator gate、post-merge integration test、typed mailbox/artifact store：
 > `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`、`crates/vp-core/src/worktree.rs`。
 > 四层 Actor、并行只读工具、预算、压缩和恢复仍是设计目标。
 > 见 [ADR-0015](adr/0015-m1-leader-loop.md)、[ADR-0016](adr/0016-session-worktree.md)、[ADR-0019](adr/0019-four-tier-delegation.md)。

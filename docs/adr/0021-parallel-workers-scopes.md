@@ -3,6 +3,10 @@
 - **Status:** Accepted
 - **Date:** 2026-10-28
 
+> **Implementation note (2026-10-29):** The parallel Worker cap is now 10
+> (ADR-0026). Pairwise scope validation is enforced for manual `delegate_many`,
+> but not yet for TeamPlan auto-dispatch. See [AUDIT P0-1](../AUDIT.md).
+
 ## Context
 
 Workers now run in isolated task worktrees and integrate serially. The Manager

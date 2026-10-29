@@ -5,20 +5,22 @@ This file is for coding agents working in this repository. Read it before changi
 ## Read first
 
 - [docs/PLAN.md](docs/PLAN.md) — product direction, scope, milestones
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — runtime/protocol invariants
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — target runtime/protocol invariants
 - [docs/DECISIONS.md](docs/DECISIONS.md) — accepted ADRs
 - [docs/PROGRESS.md](docs/PROGRESS.md) — what is actually implemented
+- [docs/AUDIT.md](docs/AUDIT.md) — known enforcement gaps and priority order
+- [docs/README.md](docs/README.md) — documentation map
 
 ## Current milestone
 
-**M2 four-tier delegation.** The single-Leader runtime, worktree, approvals, diff, commit/discard, token budgets, cancellation, and persisted plan exist. The Leader submits a validated TeamPlan (departments, Manager titles, profiles, task DAG), then delegates through Manager → Worker → Labour using `delegate`; plan Manager titles are enforced. Managers are read-only and must receive a department `title` from the Leader, Workers get isolated task worktrees, Labour inherits the Worker worktree, and successful Worker commits are serially merged into the session branch. Session diffs are based on the stored base commit. Managers can run up to 10 Workers in parallel via `delegate_many`; parallel tasks must declare non-overlapping write scopes, and final changed paths are checked before serial integration. Structural roles and domain profiles (coding/research/verification/generic) are separate; research has a public-URL `fetch_url` tool. A read-only Verifier agent must submit an approving verdict before a Worker branch is merged. The Leader can convene a bounded 1–3 round Manager roundtable via `deliberate_team_plan` (all planned Managers, read-only, peer positions shared between rounds), then auto-dispatch the plan in dependency batches via `run_team_plan`; Managers are deterministic department owners in this path, Workers are real agents with task worktrees and Verifier gates, and defaults are 4 Managers / 6 Workers / 12 Labour, runtime caps 5/10/40; plans support up to 100 tasks and Manager creation is lazy. The global cross-session scheduler, global write-scope locks, merge queue, Integrator gate, capacity controller, computer lease, per-role models, USD/time budgets, and auto-expansion are **not** implemented yet. Do not pretend they are.
+**M2 four-tier delegation.** The single-Leader runtime, worktree, approvals, diff, commit/discard, token budgets, cancellation, and persisted plan exist. The Leader submits a validated TeamPlan (departments, Manager titles, profiles, task DAG), then delegates through Manager → Worker → Labour using `delegate`; plan Manager titles are enforced. Managers must receive a department `title` from the Leader and are read-only by tool policy; Workers get isolated task worktrees, Labour inherits the Worker worktree, and successful Worker commits are serially merged into the session branch. Session diffs are based on the stored base commit. Managers can run up to the configured Worker cap (max 10) in parallel via `delegate_many`; manual parallel tasks must declare non-overlapping write scopes, and final changed paths are checked before serial integration. Structural roles and domain profiles (coding/research/verification/generic) are separate; research has a public-URL `fetch_url` tool. A Verifier must submit an approving verdict before a Worker branch is merged; its read-only behavior is prompt-level only, not a sandbox. The Leader can convene a bounded 1–3 round Manager roundtable via `deliberate_team_plan` (all planned Managers, read-only, peer positions shared between rounds), then auto-dispatch the plan in dependency batches via `run_team_plan`; Managers are deterministic department owners in this path, Workers are real agents with task worktrees and Verifier gates, and defaults are 4 Managers / 6 Workers / 12 Labour, runtime caps 5/10/40; plans support up to 100 tasks and Manager creation is lazy. The global cross-session scheduler, global write-scope locks, merge queue, Integrator gate, capacity controller, computer lease, per-role models, USD/time budgets, and auto-expansion are **not** implemented yet. Plan auto-dispatch also does not yet reserve org caps or enforce pairwise write-scope overlap, and the token budget can overshoot under concurrency; see [docs/AUDIT.md](docs/AUDIT.md). Do not pretend these are solved.
 
 ## Invariants
 
 1. The Rust daemon owns state; the SwiftUI app is a client.
-2. Every state change is an event; append events before updating projections.
+2. Every state change is an event; append events before updating projections. This is the target; current code has projection-first and eventless paths (see AUDIT P1-5), so do not claim full event sourcing.
 3. Do not add hidden model routing. Models and budgets are user-configured.
-4. Do not add an agent write path outside its worktree.
+4. Do not add an agent write path outside its worktree. The shell tool is not sandboxed yet; do not claim this is enforced for arbitrary commands.
 5. Do not log API keys or full secrets. Keychain is for secrets.
 6. Keep the JSON-RPC protocol backward compatible within major version 1.
 7. Prefer deterministic Rust for scheduling/permissions/merge; LLM only inside a task.

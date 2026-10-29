@@ -1,11 +1,14 @@
 # VerlinPark 开发计划
 
-> 版本：0.1（Draft）  
-> 日期：2026-10-21  
+> 版本：0.2（Draft）  
+> 日期：2026-10-29  
 > 负责人：Verlintas  
-> 状态：M0 / M0.5 / M1 已完成，M2 四层委派第一切片进行中  
+> 状态：M0 / M0.5 / M1 已完成；M2 四层委派已跑通；下一阶段是 Control Plane / Merge Queue  
 > 实现进度：[PROGRESS.md](PROGRESS.md)  
+> 项目审计：[AUDIT.md](AUDIT.md)  
+> 文档索引：[README.md](README.md)  
 > 2026-10-23 设计修订：组织改为四层（Leader → Manager → Worker → Labour），UI 改为 Glass Park，Computer Lease 只串行 GUI/浏览器，Aviiya 外置到 NovaBAIC。详见 ADR-0011 ~ ADR-0014；本文旧的三层/旧 UI 章节仍保留，后续合并。  
+> 2026-10-29 实现修订：Manager 圆桌、TeamPlan 自动派发、默认小团队容量已完成。本文保留早期设计章节作为背景；当前实现边界以 PROGRESS/AUDIT 为准，不要求每个切片回写本文件。  
 > 许可：GPL-3.0-only
 
 ---
@@ -219,7 +222,7 @@ flowchart TD
 ## 5. 多 Agent 组织设计
 
 > **2026-10-23 修订：本节旧的“三层部门制”已被 ADR-0011 取代。**  
-> 当前设计是四层：Leader（1）→ Manager（3–5）→ Worker（2–10）→ Labour（3–40），预算门控自动扩编。  
+> 当前设计是四层：Leader（1）→ Manager（默认 4 / cap 5）→ Worker（默认 6 / cap 10）→ Labour（默认 12 / cap 40）。预算门控自动扩编是设计目标，当前尚未实现。  
 > 下面的三层细节保留作历史对照；实现以 ADR-0011 和 `docs/ARCHITECTURE.md` 为准。
 
 这是 VerlinPark 的核心，也是与普通 Agent 产品最大的差异。

@@ -151,7 +151,7 @@ struct CollabGraphView: View {
 
                 AgentTierCard(
                     title: "Verifiers",
-                    range: "1–10",
+                    range: "1–100",
                     action: "gate",
                     detail: "inspect diff · run tests · approve or reject",
                     icon: "checkmark.shield",
@@ -162,7 +162,7 @@ struct CollabGraphView: View {
 
                 AgentTierCard(
                     title: "Labour",
-                    range: "1–20",
+                    range: "1–40",
                     action: "assist",
                     detail: "research · small edits · report to Worker",
                     icon: "hammer",
@@ -186,16 +186,18 @@ struct CollabGraphView: View {
                 Label("Computer lease", systemImage: "display")
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                 Spacer()
-                Text("idle")
+                Text("planned")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
-            Text("Only GUI / browser actions are serialized. Shell and worktree writes run in parallel.")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
+            Text(
+                "GUI/browser serialization is design-only; shell and worktree writes already run in parallel."
+            )
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
             HStack(spacing: 6) {
                 Circle().fill(.green).frame(width: 5, height: 5)
-                Text("0 active · 0 queued")
+                Text("not wired · 0 queued")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.tertiary)
                 Spacer()
@@ -1086,7 +1088,7 @@ struct OrgPresetSheet: View {
                 Text("Org Preset")
                     .font(.title2.weight(.semibold))
                 Text(
-                    "Small default team. Managers are created lazily when a plan task needs their department; Workers control batch concurrency. The session budget remains the hard stop."
+                    "Small default team. Managers are created lazily when a plan task needs their department; Workers control batch concurrency. The session budget is the primary cost limit, though concurrent batches can overshoot by one turn."
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -1124,7 +1126,7 @@ struct OrgPresetSheet: View {
             .disabled(true)
 
             Text(
-                "Delegation is synchronous and runs in the session worktree. Parallel workers, per-task worktrees, and auto-expansion are not implemented yet."
+                "Plan dispatch runs ready tasks in dependency batches, each Worker in its own task worktree; Managers are created lazily. Merge queue, Integrator, auto-expansion, and per-role budgets are not implemented yet."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.tertiary)
