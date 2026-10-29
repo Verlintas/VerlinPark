@@ -284,6 +284,8 @@ pub struct AgentRecord {
     pub title: Option<String>,
     pub parent_id: Option<String>,
     #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
     pub worktree: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
@@ -300,4 +302,45 @@ pub struct AgentListParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentListResult {
     pub agents: Vec<AgentRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanDepartment {
+    pub name: String,
+    pub manager_title: String,
+    pub profile: String,
+    pub objective: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanTask {
+    pub id: String,
+    pub department: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamPlan {
+    pub goal: String,
+    pub departments: Vec<PlanDepartment>,
+    pub tasks: Vec<PlanTask>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TeamPlanParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamPlanResult {
+    pub plan: Option<TeamPlan>,
 }

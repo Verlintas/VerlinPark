@@ -53,6 +53,7 @@ impl Store {
                 branch        TEXT,
                 token_budget  INTEGER,
                 base_commit   TEXT,
+                team_plan     TEXT,
                 tokens_in     INTEGER NOT NULL DEFAULT 0,
                 tokens_out    INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT NOT NULL
@@ -78,6 +79,7 @@ impl Store {
                 role       TEXT NOT NULL,
                 name       TEXT NOT NULL DEFAULT 'Agent',
                 title      TEXT,
+                profile    TEXT,
                 parent_id  TEXT,
                 worktree   TEXT,
                 branch     TEXT,
@@ -126,6 +128,7 @@ impl Store {
         ensure_column(&conn, "sessions", "branch", "TEXT")?;
         ensure_column(&conn, "sessions", "token_budget", "INTEGER")?;
         ensure_column(&conn, "sessions", "base_commit", "TEXT")?;
+        ensure_column(&conn, "sessions", "team_plan", "TEXT")?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(
             &conn,
@@ -503,6 +506,7 @@ impl Store {
             role: role.to_string(),
             name: name.to_string(),
             title: title.map(ToOwned::to_owned),
+            profile: None,
             parent_id: parent_id.map(ToOwned::to_owned),
             worktree: None,
             branch: None,
@@ -541,6 +545,15 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_agent_profile(&self, id: &str, profile: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE agents SET profile = ?1 WHERE id = ?2",
+            params![profile, id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_agent_status(&self, id: &str, status: &str) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
@@ -553,7 +566,7 @@ impl Store {
     pub fn list_agents(&self, session_id: &str) -> Result<Vec<AgentRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, name, title, parent_id, worktree, branch, status, model, created_at
+            "SELECT id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at
              FROM agents WHERE session_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -563,12 +576,13 @@ impl Store {
                 role: row.get(2)?,
                 name: row.get(3)?,
                 title: row.get(4)?,
-                parent_id: row.get(5)?,
-                worktree: row.get(6)?,
-                branch: row.get(7)?,
-                status: row.get(8)?,
-                model: row.get(9)?,
-                created_at: row.get(10)?,
+                profile: row.get(5)?,
+                parent_id: row.get(6)?,
+                worktree: row.get(7)?,
+                branch: row.get(8)?,
+                status: row.get(9)?,
+                model: row.get(10)?,
+                created_at: row.get(11)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -715,6 +729,27 @@ impl Store {
             [],
         )?;
         Ok(changed)
+    }
+
+    pub fn set_team_plan(&self, session_id: &str, plan: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sessions SET team_plan = ?1 WHERE id = ?2",
+            params![plan, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_team_plan(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT team_plan FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.flatten())
+        .map_err(Into::into)
     }
 
     pub fn set_todos(&self, session_id: &str, items: &[TodoItem]) -> Result<()> {

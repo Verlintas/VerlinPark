@@ -29,6 +29,7 @@ final class AppModel {
     var streamingText = ""
     var todos: [TodoItem] = []
     var agents: [AgentRecord] = []
+    var teamPlan: TeamPlan?
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -100,6 +101,7 @@ final class AppModel {
             sessionDiff = nil
             todos = []
             agents = []
+            teamPlan = nil
             lastCommit = nil
             mode = .resident
             return
@@ -112,6 +114,7 @@ final class AppModel {
         sessionDiff = nil
         todos = []
         agents = []
+        teamPlan = nil
         lastCommit = nil
         Task { await loadSessions() }
     }
@@ -128,11 +131,13 @@ final class AppModel {
         sessionDiff = nil
         todos = []
         agents = []
+        teamPlan = nil
         lastCommit = nil
         Task {
             await loadEvents()
             await loadTodos()
             await loadAgents()
+            await loadTeamPlan()
             await loadDiff()
         }
     }
@@ -349,6 +354,21 @@ final class AppModel {
         }
     }
 
+    func loadTeamPlan() async {
+        guard let sessionID = selectedSessionID else {
+            teamPlan = nil
+            return
+        }
+        do {
+            let plan = try await core.getTeamPlan(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                teamPlan = plan
+            }
+        } catch {
+            // The event stream will retry on team_plan.submitted.
+        }
+    }
+
     func loadAgents() async {
         guard let sessionID = selectedSessionID else {
             agents = []
@@ -408,6 +428,7 @@ final class AppModel {
             await loadEvents()
             await loadTodos()
             await loadAgents()
+            await loadTeamPlan()
             await loadDiff()
         } catch {
             handle(error)
@@ -521,6 +542,10 @@ final class AppModel {
            ["agent.spawned", "agent.finished"].contains(event.type)
         {
             Task { await self.loadAgents() }
+        }
+
+        if event.sessionId == selectedSessionID, event.type == "team_plan.submitted" {
+            Task { await self.loadTeamPlan() }
         }
 
         if event.sessionId == selectedSessionID,

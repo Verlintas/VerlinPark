@@ -20,6 +20,9 @@
 | 并行 Worker | ✅ | Manager `delegate_many` 一次启动 1–5 个 Worker；独立 task worktree；`join_all` 并发执行，完成后按任务顺序串行集成 |
 | Write scope | ✅ | 并行任务必须声明不重叠 `write_scope`；集成前检查 tracked + untracked 变更，越界 Worker 失败且不合并 |
 | Verifier gate | ✅ | Worker 内部 commit 后启动独立 Verifier（只读 + shell）；`submit_verdict` 结构化结论；approve 才 merge，reject 标记 changes_requested 并保留分支 |
+| TeamPlan | ✅ | Leader `submit_team_plan` 定义 departments/managers/tasks；runtime 校验 caps、唯一 title、profile、DAG、acceptance；计划持久化并在 Collab 显示 |
+| Agent Profile | ✅ | 结构角色与领域 profile 分离：coding / research / verification / generic；profile 决定工具集与 prompt |
+| Research 工具 | ✅ | `fetch_url`：仅公网 HTTP(S)、阻止 localhost/private IP、不跟随重定向、超时与输出截断 |
 | 审批归属 | ✅ | 审批事件带 `agent_id/agent_name/agent_role`；审批卡显示发起 Agent |
 | 边界 | ✅ | 串行、同一 session worktree；per-task worktree/并行/merge queue 尚未实现 |
 
@@ -46,12 +49,12 @@
 | Provider 设置 | ✅ | Settings → Providers：API、Base URL、Model、API key；Keychain 存 key；App 启动时 `agent.configure` |
 | Headless 配置 | ✅ | `VERLINPARK_BASE_URL` / `VERLINPARK_MODEL` / `VERLINPARK_API_KEY` 环境变量兜底 |
 | CLI | ✅ | 新增 `prompt` / `approvals` / `approve` / `deny` |
-| 测试 | ✅ | Rust 40 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、Verifier approve/reject、Manager title 必填、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
+| 测试 | ✅ | Rust 43 个：session/task worktree、串行集成、并行 Worker、write scope 拒绝、Verifier approve/reject、TeamPlan 校验/循环拒绝、Manager title 必填、base diff、旧库迁移、中断恢复、commit/discard、edit_file、预算/取消、todo、四层委派、Agent roster、审批归属、工具路径 jail、Leader 工具调用闭环、Provider 配置、OpenAI/Anthropic 流式工具解析；Swift 9 个 |
 | 手工 E2E | ✅ | mock SSE：configure → session/worktree → read_file → approval → write_file → final；Preview 显示 worktree diff；项目根保持干净 |
 
 **M2 尚未完成：**
 
-- 完整 task DAG / 全局调度器 / merge queue / Integrator；当前已有 Verifier gate，但并行由 Manager 显式 `delegate_many` 触发，集成仍串行。
+- 完整 task DAG 自动调度 / 全局调度器 / merge queue / Integrator；当前 TeamPlan 已校验和展示，但 plan task 仍由 Leader 显式 delegate 触发，集成串行。
 - 完整权限代理（命令分类/路径策略）；当前 Manager 只读、Worker/Labour 可写，写/Shell 仍需审批。
 - 上下文压缩、pause/resume、checkpoint（取消与 token 硬停已落地）。
 - 只读工具并行、MCP/ACP、逐 hunk review、终端、真实 Collab 节点。

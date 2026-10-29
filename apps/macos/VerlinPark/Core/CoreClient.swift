@@ -162,6 +162,13 @@ actor CoreClient {
             .decode(SessionCommit.self)
     }
 
+    func getTeamPlan(sessionID: String) async throws -> TeamPlan? {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "team_plan.get", params: params)
+            .decode(TeamPlanResult.self)
+            .plan
+    }
+
     func listAgents(sessionID: String) async throws -> [AgentRecord] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "agent.list", params: params)

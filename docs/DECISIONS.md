@@ -33,6 +33,7 @@
 | [0021](adr/0021-parallel-workers-scopes.md) | 并行 Worker + write scope 校验 | Accepted | 调度/并发/安全 |
 | [0022](adr/0022-manager-titles.md) | Manager 必须有部门角色 title | Accepted | 组织/委派/UI |
 | [0023](adr/0023-verifier-gate.md) | Verifier gate：审查通过才合并 Worker 分支 | Accepted | 质量/集成/安全 |
+| [0024](adr/0024-team-plan-profiles.md) | Leader 定义 TeamPlan + AgentProfile/research | Accepted | 组织/平台化/工具 |
 
 ---
 

@@ -2119,6 +2119,7 @@ dependencies = [
  "globset",
  "ignore",
  "regex",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",

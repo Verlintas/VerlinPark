@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
     AgentRecord, Approval, Event, Project, Session, SessionCommit, SessionDiff, StoredMessage,
-    TodoItem,
+    TeamPlan, TodoItem,
 };
 use vp_store::Store;
 
@@ -207,6 +207,27 @@ impl Engine {
     pub async fn list_sessions(&self, project_id: Option<String>) -> Result<Vec<Session>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.list_sessions(project_id.as_deref())).await?
+    }
+
+    pub async fn set_team_plan(&self, session_id: &str, plan: &TeamPlan) -> Result<()> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let json = serde_json::to_string(plan)?;
+        tokio::task::spawn_blocking(move || store.set_team_plan(&id, &json)).await??;
+        self.append_event(
+            session_id,
+            "team_plan.submitted",
+            serde_json::to_value(plan)?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_team_plan(&self, session_id: &str) -> Result<Option<TeamPlan>> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let raw = tokio::task::spawn_blocking(move || store.get_team_plan(&id)).await??;
+        Ok(raw.and_then(|json| serde_json::from_str(&json).ok()))
     }
 
     pub async fn set_todos(&self, session_id: &str, items: Vec<TodoItem>) -> Result<()> {
@@ -515,6 +536,13 @@ impl Engine {
         let branch = branch.to_string();
         tokio::task::spawn_blocking(move || store.set_agent_worktree(&id, &worktree, &branch))
             .await?
+    }
+
+    pub async fn set_agent_profile(&self, agent_id: &str, profile: &str) -> Result<()> {
+        let store = self.store.clone();
+        let id = agent_id.to_string();
+        let profile = profile.to_string();
+        tokio::task::spawn_blocking(move || store.set_agent_profile(&id, &profile)).await?
     }
 
     pub async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<()> {

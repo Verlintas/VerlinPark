@@ -65,6 +65,7 @@ impl ToolRegistry {
                 Arc::new(EditFile),
                 Arc::new(WriteFile),
                 Arc::new(Shell),
+                Arc::new(FetchUrl),
             ],
         }
     }
@@ -91,6 +92,119 @@ struct Grep;
 struct EditFile;
 struct WriteFile;
 struct Shell;
+struct FetchUrl;
+
+#[async_trait]
+impl AgentTool for FetchUrl {
+    fn name(&self) -> &'static str {
+        "fetch_url"
+    }
+
+    fn description(&self) -> &'static str {
+        "Fetch a public HTTP(S) URL for research. Returns text content, truncated."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Public http(s) URL"},
+                "max_chars": {"type": "integer", "minimum": 100, "maximum": 20000}
+            },
+            "required": ["url"]
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    async fn execute(&self, _context: &ToolContext, input: Value) -> Result<ToolOutput> {
+        let raw_url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("url is required"))?;
+        let max_chars = input
+            .get("max_chars")
+            .and_then(Value::as_u64)
+            .unwrap_or(8000)
+            .clamp(100, 20000) as usize;
+        let url = reqwest::Url::parse(raw_url).context("invalid URL")?;
+        match url.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Ok(ToolOutput::error(format!(
+                    "unsupported URL scheme: {other}"
+                )));
+            }
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("URL has no host"))?
+            .to_ascii_lowercase();
+        if host == "localhost" || host.ends_with(".local") || host.ends_with(".internal") {
+            return Ok(ToolOutput::error("local hosts are blocked"));
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            let blocked = match ip {
+                std::net::IpAddr::V4(ip) => {
+                    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+                }
+                std::net::IpAddr::V6(ip) => {
+                    ip.is_loopback()
+                        || ip.is_unspecified()
+                        || ip.is_unique_local()
+                        || ip.is_unicast_link_local()
+                }
+            };
+            if blocked {
+                return Ok(ToolOutput::error(
+                    "private or local IP addresses are blocked",
+                ));
+            }
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent("VerlinPark/0.1 research fetcher")
+            .build()
+            .context("building HTTP client")?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| anyhow!("fetch failed: {error}"))?;
+        let status = response.status();
+        if status.is_redirection() {
+            return Ok(ToolOutput::error(
+                "redirects are not followed; request the final URL explicitly",
+            ));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let mut body = Vec::new();
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await? {
+            body.extend_from_slice(&chunk);
+            if body.len() >= max_chars * 4 {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&body);
+        let text = truncate(text.to_string());
+        let mut truncated = text.chars().take(max_chars).collect::<String>();
+        if truncated.len() < text.len() && !truncated.is_empty() {
+            truncated.push_str("\n… content truncated");
+        }
+        Ok(ToolOutput::ok(format!(
+            "GET {raw_url} -> {status} ({content_type})\n{truncated}"
+        )))
+    }
+}
 
 #[async_trait]
 impl AgentTool for ReadFile {
@@ -629,6 +743,21 @@ mod tests {
             std::fs::read_to_string(context.root.join("dup.txt")).unwrap(),
             "x x\n"
         );
+    }
+
+    #[tokio::test]
+    async fn blocks_local_fetches() {
+        let (_dir, context) = ctx();
+        let output = FetchUrl
+            .execute(&context, json!({"url": "http://127.0.0.1:1/"}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let output = FetchUrl
+            .execute(&context, json!({"url": "file:///etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
     }
 
     #[test]

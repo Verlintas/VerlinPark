@@ -115,6 +115,11 @@ struct CollabGraphView: View {
                     isPlaceholder: false
                 )
 
+                if let plan = model.teamPlan {
+                    OrgConnector()
+                    TeamPlanCard(plan: plan)
+                }
+
                 if !model.todos.isEmpty {
                     OrgConnector()
                     LeaderPlanCard(todos: model.todos)
@@ -207,6 +212,49 @@ struct CollabGraphView: View {
         .overlay {
             RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .strokeBorder(.white.opacity(0.05), lineWidth: 1)
+        }
+    }
+}
+
+struct TeamPlanCard: View {
+    let plan: TeamPlan
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("TEAM PLAN")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(plan.departments.count) dept · \(plan.tasks.count) tasks")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            Text(plan.goal)
+                .font(.system(size: 10, weight: .medium))
+                .lineLimit(2)
+            ForEach(plan.departments) { department in
+                HStack(alignment: .top, spacing: 6) {
+                    Circle()
+                        .fill(.cyan.opacity(0.7))
+                        .frame(width: 5, height: 5)
+                        .padding(.top, 4)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(department.managerTitle)
+                            .font(.system(size: 10, weight: .medium))
+                        Text("\(department.name) · \(department.profile)")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .padding(10)
+        .background(.cyan.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(.cyan.opacity(0.15), lineWidth: 1)
         }
     }
 }
@@ -383,9 +431,14 @@ struct AgentTierCard: View {
                                     .font(.system(size: 8, design: .monospaced))
                                     .foregroundStyle(.secondary)
                             }
-                            Text(agent.status)
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(.tertiary)
+                            HStack(spacing: 4) {
+                                Text(agent.status)
+                                if let profile = agent.profile {
+                                    Text("· \(profile)")
+                                }
+                            }
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
                             if let branch = agent.branch {
                                 Text(branch)
                                     .font(.system(size: 8, design: .monospaced))

@@ -27,7 +27,8 @@ use vp_protocol::types::{
     CreateSessionParams, DiscardSessionParams, EventListResult, ListApprovalsParams,
     ListEventsParams, ListSessionsParams, PingResult, ProjectListResult, PromptParams,
     PromptResult, ResolveApprovalParams, ResolveApprovalResult, ServerInfo, SessionDiffParams,
-    SessionListResult, SessionTodosParams, SessionTodosResult, SubscribeParams,
+    SessionListResult, SessionTodosParams, SessionTodosResult, SubscribeParams, TeamPlanParams,
+    TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -423,6 +424,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(commit) => RpcResponse::success(id, commit),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "team_plan.get" => match parse_params::<TeamPlanParams>(request.params) {
+            Ok(params) => match state.engine.get_team_plan(&params.session_id).await {
+                Ok(plan) => RpcResponse::success(id, TeamPlanResult { plan }),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

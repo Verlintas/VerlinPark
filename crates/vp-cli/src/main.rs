@@ -60,6 +60,8 @@ enum Command {
     Cancel { session: String },
     /// Show the session plan/todo list.
     Todos { session: String },
+    /// Show the validated team plan.
+    TeamPlan { session: String },
     /// List the agents spawned for a session.
     Agents { session: String },
     /// Discard uncommitted changes in the session worktree.
@@ -159,6 +161,9 @@ async fn main() -> Result<()> {
         }
         Command::Todos { session } => {
             rpc(&discovery, "session.todos", json!({"session_id": session})).await?
+        }
+        Command::TeamPlan { session } => {
+            rpc(&discovery, "team_plan.get", json!({"session_id": session})).await?
         }
         Command::Agents { session } => {
             rpc(&discovery, "agent.list", json!({"session_id": session})).await?
@@ -288,6 +293,26 @@ fn print_human(value: &Value) {
         }
         return;
     }
+    if let Some(plan) = value.get("plan").filter(|plan| !plan.is_null()) {
+        println!("GOAL  {}", plan["goal"].as_str().unwrap_or("?"));
+        for department in plan["departments"].as_array().into_iter().flatten() {
+            println!(
+                "  {:<16} manager {:<16} profile {}",
+                department["name"].as_str().unwrap_or("?"),
+                department["manager_title"].as_str().unwrap_or("?"),
+                department["profile"].as_str().unwrap_or("?")
+            );
+        }
+        for task in plan["tasks"].as_array().into_iter().flatten() {
+            println!(
+                "  task {:<12} {:<16} kind {}",
+                task["id"].as_str().unwrap_or("?"),
+                task["department"].as_str().unwrap_or("?"),
+                task["kind"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
     if let Some(agents) = value.get("agents").and_then(Value::as_array) {
         if agents.is_empty() {
             println!("No agents.");
@@ -302,6 +327,9 @@ fn print_human(value: &Value) {
             );
             if let Some(title) = agent["title"].as_str() {
                 println!("         title {title}");
+            }
+            if let Some(profile) = agent["profile"].as_str() {
+                println!("         profile {profile}");
             }
             if let Some(branch) = agent["branch"].as_str() {
                 println!("         branch {branch}");

@@ -266,6 +266,7 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
     let role: String
     let name: String
     let title: String?
+    let profile: String?
     let parentId: String?
     let worktree: String?
     let branch: String?
@@ -279,6 +280,7 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
         case role
         case name
         case title
+        case profile
         case parentId = "parent_id"
         case worktree
         case branch
@@ -290,4 +292,52 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
 
 struct AgentListResult: Codable, Sendable {
     let agents: [AgentRecord]
+}
+
+struct PlanDepartment: Codable, Identifiable, Hashable, Sendable {
+    let name: String
+    let managerTitle: String
+    let profile: String
+    let objective: String
+
+    var id: String {
+        name
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case managerTitle = "manager_title"
+        case profile
+        case objective
+    }
+}
+
+struct PlanTask: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let department: String
+    let title: String
+    let kind: String
+    let deps: [String]
+    let writeScope: [String]
+    let acceptance: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case department
+        case title
+        case kind
+        case deps
+        case writeScope = "write_scope"
+        case acceptance
+    }
+}
+
+struct TeamPlan: Codable, Sendable {
+    let goal: String
+    let departments: [PlanDepartment]
+    let tasks: [PlanTask]
+}
+
+struct TeamPlanResult: Codable, Sendable {
+    let plan: TeamPlan?
 }
