@@ -176,7 +176,7 @@ struct UsageTotals: Codable, Sendable {
     let byModel: [UsageBucket]
     let byAgent: [UsageBucket]
     let byTask: [UsageBucket]
-    let byDepartment: [UsageBucket]
+    let byDepartment: [UsageBucket]?
 
     enum CodingKeys: String, CodingKey {
         case calls

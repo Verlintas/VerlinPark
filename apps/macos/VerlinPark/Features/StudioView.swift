@@ -1117,7 +1117,7 @@ struct PreviewPanelView: View {
                         UsageBucketSection(title: "BY ROLE", buckets: ledger.totals.byRole)
                         UsageBucketSection(
                             title: "BY DEPARTMENT",
-                            buckets: ledger.totals.byDepartment
+                            buckets: ledger.totals.byDepartment ?? []
                         )
                         UsageBucketSection(title: "BY TASK", buckets: ledger.totals.byTask)
                         UsageBucketSection(title: "BY AGENT", buckets: ledger.totals.byAgent)

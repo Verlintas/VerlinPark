@@ -877,7 +877,10 @@ impl Store {
         let dir = self.data_dir.join("artifacts").join("blobs");
         paths::ensure_private_dir(&dir)?;
         let path = dir.join(sha256);
-        let created_file = !path.is_file();
+        let reuse = std::fs::metadata(&path)
+            .map(|metadata| metadata.len() == data.len() as u64)
+            .unwrap_or(false);
+        let created_file = !reuse;
         if created_file {
             std::fs::write(&path, data)
                 .with_context(|| format!("writing artifact blob {}", path.display()))?;
@@ -2727,7 +2730,10 @@ impl Store {
                     let dir = self.data_dir.join("artifacts").join("blobs");
                     paths::ensure_private_dir(&dir)?;
                     let file = dir.join(&sha256);
-                    if !file.is_file() {
+                    let reuse = std::fs::metadata(&file)
+                        .map(|metadata| metadata.len() == data.len() as u64)
+                        .unwrap_or(false);
+                    if !reuse {
                         std::fs::write(&file, &data)?;
                         paths::ensure_private_file(&file)?;
                     }

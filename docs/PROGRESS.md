@@ -47,7 +47,7 @@
 ## 验证
 
 - `cargo test --workspace`：95 个测试通过（core 77、store 13、providers 5）。
-- `xcodebuild test`：9 个 Swift 测试通过。
+- `xcodebuild test`：12 个 Swift 测试通过（含协议向后兼容解码）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
 - 手工 E2E 已覆盖：Leader/Manager/Worker/Labour 委派、task worktree、并行 Worker、Verifier approve/reject、TeamPlan 自动派发、Manager 圆桌、审批、diff、commit/discard、预算/取消/暂停恢复、项目 shell policy get/set。
