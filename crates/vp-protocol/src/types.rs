@@ -404,6 +404,18 @@ pub struct Approval {
     pub resolved_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityInfo {
+    #[serde(default)]
+    pub worker_limit: usize,
+    #[serde(default)]
+    pub worker_available: usize,
+    #[serde(default)]
+    pub labour_limit: usize,
+    #[serde(default)]
+    pub labour_available: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub configured: bool,
@@ -412,6 +424,8 @@ pub struct AgentInfo {
     pub base_url: Option<String>,
     #[serde(default)]
     pub role_models: RoleModels,
+    #[serde(default)]
+    pub capacity: CapacityInfo,
 }
 
 #[derive(Debug, Clone, Deserialize)]

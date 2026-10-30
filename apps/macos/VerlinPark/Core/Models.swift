@@ -374,12 +374,27 @@ struct RoleModels: Codable, Hashable, Sendable {
     }
 }
 
+struct CapacityInfo: Codable, Sendable {
+    let workerLimit: Int
+    let workerAvailable: Int
+    let labourLimit: Int
+    let labourAvailable: Int
+
+    enum CodingKeys: String, CodingKey {
+        case workerLimit = "worker_limit"
+        case workerAvailable = "worker_available"
+        case labourLimit = "labour_limit"
+        case labourAvailable = "labour_available"
+    }
+}
+
 struct AgentInfo: Codable, Sendable {
     let configured: Bool
     let provider: String?
     let model: String?
     let baseUrl: String?
     let roleModels: RoleModels
+    let capacity: CapacityInfo?
 
     enum CodingKeys: String, CodingKey {
         case configured
@@ -387,6 +402,7 @@ struct AgentInfo: Codable, Sendable {
         case model
         case baseUrl = "base_url"
         case roleModels = "role_models"
+        case capacity
     }
 }
 

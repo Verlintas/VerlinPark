@@ -696,6 +696,14 @@ final class AppModel {
         }
     }
 
+    func refreshAgentInfo() async {
+        do {
+            agentInfo = try await core.agentInfo()
+        } catch {
+            handle(error)
+        }
+    }
+
     func loadAgents() async {
         guard let sessionID = selectedSessionID else {
             agents = []

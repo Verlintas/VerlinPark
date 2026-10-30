@@ -417,6 +417,32 @@ struct ProvidersSettingsView: View {
                 RoleModelRow(title: "Labour", config: $model.roleModels.labour)
             }
 
+            Section("Global capacity") {
+                if let capacity = model.agentInfo?.capacity {
+                    LabeledContent(
+                        "Workers",
+                        value: "\(capacity.workerAvailable) free / \(capacity.workerLimit)"
+                    )
+                    LabeledContent(
+                        "Labour",
+                        value: "\(capacity.labourAvailable) free / \(capacity.labourLimit)"
+                    )
+                } else {
+                    Text("Capacity is unavailable until the daemon is connected.")
+                        .foregroundStyle(.secondary)
+                }
+                Text(
+                    "Daemon-wide Worker/Labour admission. Per-session caps still apply. Set VERLINPARK_GLOBAL_WORKERS and VERLINPARK_GLOBAL_LABOUR on the daemon to change the limits."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Button("Refresh") {
+                    Task { await model.refreshAgentInfo() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
             Section("Local endpoints") {
                 LabeledContent("LM Studio", value: "http://127.0.0.1:1234/v1")
                 LabeledContent("Ollama", value: "http://127.0.0.1:11434/v1")

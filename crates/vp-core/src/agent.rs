@@ -9,11 +9,11 @@ use async_recursion::async_recursion;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
-    AgentInfo, ConfigureAgentParams, MergeQueueEntry, PlanDepartment, PlanTask, Project,
-    RoleModels, Session, StoredMessage, TeamPlan, TodoItem,
+    AgentInfo, CapacityInfo, ConfigureAgentParams, MergeQueueEntry, PlanDepartment, PlanTask,
+    Project, RoleModels, Session, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, StreamEvent,
@@ -31,6 +31,22 @@ fn global_session_cap() -> usize {
         .and_then(|value| value.parse().ok())
         .unwrap_or(4)
         .clamp(1, 32)
+}
+
+fn global_worker_cap() -> usize {
+    env::var("VERLINPARK_GLOBAL_WORKERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(12)
+        .clamp(1, 100)
+}
+
+fn global_labour_cap() -> usize {
+    env::var("VERLINPARK_GLOBAL_LABOUR")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(24)
+        .clamp(1, 100)
 }
 
 #[derive(Clone)]
@@ -51,6 +67,51 @@ pub struct AgentConfig {
     pub max_active_sessions: usize,
     /// Cross-session write-scope locks for Worker/Labour runs.
     pub scope_locks: Arc<ScopeLocks>,
+    /// Daemon-wide Worker/Labour admission.
+    pub capacity: Arc<CapacityController>,
+}
+
+/// Daemon-wide admission control for Worker/Labour runs. Per-session caps still
+/// apply; this prevents many sessions from each running their own full cap.
+pub struct CapacityController {
+    workers: Arc<Semaphore>,
+    labour: Arc<Semaphore>,
+    worker_limit: usize,
+    labour_limit: usize,
+}
+
+impl CapacityController {
+    fn new(workers: usize, labour: usize) -> Self {
+        let worker_limit = workers.max(1);
+        let labour_limit = labour.max(1);
+        Self {
+            workers: Arc::new(Semaphore::new(worker_limit)),
+            labour: Arc::new(Semaphore::new(labour_limit)),
+            worker_limit,
+            labour_limit,
+        }
+    }
+
+    fn snapshot(&self) -> CapacityInfo {
+        CapacityInfo {
+            worker_limit: self.worker_limit,
+            worker_available: self.workers.available_permits(),
+            labour_limit: self.labour_limit,
+            labour_available: self.labour.available_permits(),
+        }
+    }
+
+    async fn acquire(&self, role: AgentRole, control: &RunControl) -> Option<OwnedSemaphorePermit> {
+        let semaphore = match role {
+            AgentRole::Worker => self.workers.clone(),
+            AgentRole::Labour => self.labour.clone(),
+            _ => return None,
+        };
+        tokio::select! {
+            permit = semaphore.acquire_owned() => permit.ok(),
+            _ = wait_for_cancel(control) => None,
+        }
+    }
 }
 
 /// A daemon-wide registry of active task write scopes. Tasks in different
@@ -141,6 +202,7 @@ pub struct AgentService {
     runs: Arc<Mutex<HashMap<String, Arc<RunControl>>>>,
     auto_resolver_started: Arc<AtomicBool>,
     global_slots: Arc<Semaphore>,
+    capacity: Arc<CapacityController>,
 }
 
 struct RunControl {
@@ -701,6 +763,10 @@ impl AgentService {
                 tools: ToolRegistry::default_tools(),
                 max_active_sessions: global_session_cap(),
                 scope_locks: Arc::new(ScopeLocks::default()),
+                capacity: Arc::new(CapacityController::new(
+                    global_worker_cap(),
+                    global_labour_cap(),
+                )),
             },
         )
     }
@@ -712,17 +778,23 @@ impl AgentService {
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
             global_slots: Arc::new(Semaphore::new(global_session_cap())),
+            capacity: Arc::new(CapacityController::new(
+                global_worker_cap(),
+                global_labour_cap(),
+            )),
         }
     }
 
     pub fn configured(engine: Engine, config: AgentConfig) -> Self {
         let global_cap = config.max_active_sessions.max(1);
+        let capacity = config.capacity.clone();
         Self {
             engine,
             config: Arc::new(RwLock::new(Some(config))),
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
             global_slots: Arc::new(Semaphore::new(global_cap)),
+            capacity,
         }
     }
 
@@ -769,6 +841,7 @@ impl AgentService {
             tools: ToolRegistry::default_tools(),
             max_active_sessions: global_session_cap(),
             scope_locks: Arc::new(ScopeLocks::default()),
+            capacity: self.capacity.clone(),
         };
         *self
             .config
@@ -790,6 +863,7 @@ impl AgentService {
                 model: Some(config.model.clone()),
                 base_url: config.base_url.clone(),
                 role_models: config.role_models.clone(),
+                capacity: self.capacity.snapshot(),
             },
             None => AgentInfo {
                 configured: false,
@@ -797,6 +871,7 @@ impl AgentService {
                 model: None,
                 base_url: None,
                 role_models: RoleModels::default(),
+                capacity: self.capacity.snapshot(),
             },
         }
     }
@@ -2828,6 +2903,15 @@ async fn run_loop(
     conversation: &mut Vec<ChatMessage>,
     top_level: bool,
 ) -> Result<LoopOutcome> {
+    let _capacity_permit =
+        if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
+            match config.capacity.acquire(spec.role, control).await {
+                Some(permit) => Some(permit),
+                None => return Ok(LoopOutcome::Cancelled),
+            }
+        } else {
+            None
+        };
     let _scope_guard =
         if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
             match config
@@ -5726,6 +5810,10 @@ mod tests {
             tools: ToolRegistry::default_tools(),
             max_active_sessions,
             scope_locks: Arc::new(ScopeLocks::default()),
+            capacity: Arc::new(CapacityController::new(
+                global_worker_cap(),
+                global_labour_cap(),
+            )),
         };
         let service = AgentService::configured(engine.clone(), config);
         (engine, service, project)
@@ -8013,6 +8101,58 @@ mod tests {
         assert_eq!(model_for(&config, AgentRole::Worker), "worker-model");
         assert_eq!(model_for(&config, AgentRole::Manager), "test");
         assert_eq!(role_price(&config, AgentRole::Worker), (2.0, 4.0));
+    }
+
+    #[tokio::test]
+    async fn global_capacity_serializes_worker_slots() {
+        let capacity = Arc::new(CapacityController::new(1, 1));
+        assert_eq!(
+            capacity.snapshot(),
+            CapacityInfo {
+                worker_limit: 1,
+                worker_available: 1,
+                labour_limit: 1,
+                labour_available: 1,
+            }
+        );
+        let control = RunControl::new();
+        let first = capacity.acquire(AgentRole::Worker, &control).await.unwrap();
+        assert_eq!(capacity.snapshot().worker_available, 0);
+        let second_capacity = capacity.clone();
+        let second_control = Arc::new(RunControl::new());
+        let mut waiter = tokio::spawn(async move {
+            second_capacity
+                .acquire(AgentRole::Worker, &second_control)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let acquired = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(acquired.is_some());
+        assert_eq!(capacity.snapshot().worker_available, 0);
+
+        let third_control = Arc::new(RunControl::new());
+        let third_capacity = capacity.clone();
+        let worker_control = third_control.clone();
+        let cancelled = tokio::spawn(async move {
+            third_capacity
+                .acquire(AgentRole::Worker, &worker_control)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        third_control.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), cancelled)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_none());
     }
 
     #[tokio::test]
