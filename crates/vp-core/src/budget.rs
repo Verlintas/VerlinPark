@@ -356,6 +356,37 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_threads_cannot_overshoot_the_same_department() {
+        let registry = Arc::new(BudgetRegistry::new());
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let handles = (0..4)
+            .map(|_| {
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                let results = results.clone();
+                std::thread::spawn(move || {
+                    let request = request("department", "impl", 100);
+                    let lease = registry.grant("session", &[request], 10, 50, 10).ok();
+                    let granted = lease.as_ref().map(BudgetLease::granted_output_tokens);
+                    if let Ok(mut results) = results.lock() {
+                        results.push(granted);
+                    }
+                    barrier.wait();
+                    drop(lease);
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let results = results.lock().unwrap();
+        let granted = results.iter().flatten().copied().collect::<Vec<_>>();
+        let used = granted.iter().sum::<u64>() + 10 * granted.len() as u64;
+        assert!(used <= 100, "reserved {used} of 100: {results:?}");
+    }
+
+    #[test]
     fn observed_ledger_spend_is_never_lowered_by_a_stale_request() {
         let registry = Arc::new(BudgetRegistry::new());
         let mut stale = request("task", "T1", 100);

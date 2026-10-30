@@ -46,7 +46,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：93 个测试通过（core 75、store 13、providers 5）。
+- `cargo test --workspace`：94 个测试通过（core 76、store 13、providers 5）。
 - `xcodebuild test`：9 个 Swift 测试通过。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
