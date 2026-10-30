@@ -5407,7 +5407,31 @@ mod tests {
             .await
             .unwrap();
         service.start(&session.id, "parallel goal").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let agents = engine.list_agents(&session.id).await.unwrap();
+            let workers = agents
+                .iter()
+                .filter(|agent| agent.role == "worker")
+                .collect::<Vec<_>>();
+            let status = engine
+                .list_sessions(Some(session.project_id.clone()))
+                .await
+                .unwrap()
+                .first()
+                .map(|session| session.status.clone());
+            if workers.len() == 2
+                && workers.iter().all(|worker| worker.status == "idle")
+                && status.as_deref() == Some("idle")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parallel workers did not finish; agents={agents:?}, session={status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
 
         assert!(
             provider
@@ -5876,7 +5900,28 @@ mod tests {
             .await
             .unwrap();
         service.start(&session.id, "capped plan").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let events = loop {
+            let events = engine
+                .list_events(session.id.clone(), 0, 400)
+                .await
+                .unwrap();
+            let completed = events
+                .iter()
+                .filter(|event| {
+                    event.kind == "plan_task.finished"
+                        && event.payload["task_status"] == "completed"
+                })
+                .count();
+            if completed == 2 {
+                break events;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plan did not finish both tasks; events={events:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
 
         assert_eq!(
             provider
@@ -5885,10 +5930,6 @@ mod tests {
             1,
             "the worker cap must bound plan concurrency"
         );
-        let events = engine
-            .list_events(session.id.clone(), 0, 400)
-            .await
-            .unwrap();
         assert_eq!(
             events
                 .iter()
