@@ -12,7 +12,7 @@ use uuid::Uuid;
 use vp_protocol::types::{
     AgentRecord, Approval, Event, MergeQueueEntry, Project, PullRequestResult, Session,
     SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
-    SessionReplayReport, StoredMessage, TeamPlan, TodoItem,
+    SessionRehydrateResult, SessionReplayReport, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -1073,6 +1073,91 @@ impl Engine {
         })
     }
 
+    pub async fn rehydrate_session(
+        &self,
+        session_id: &str,
+        worktree: Option<String>,
+    ) -> Result<SessionRehydrateResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if session.status != "imported" {
+            anyhow::bail!("only imported archive sessions can be rehydrated");
+        }
+        let store = self.store.clone();
+        let project_id = session.project_id.clone();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let project_root = PathBuf::from(&project.root);
+        if !project_root.is_dir() {
+            anyhow::bail!("project root does not exist: {}", project.root);
+        }
+        let branch = session
+            .branch
+            .clone()
+            .unwrap_or_else(|| format!("verlinpark/{session_id}"));
+        let base_commit = session.base_commit.clone().unwrap_or_default();
+        let target = match worktree {
+            Some(path) => PathBuf::from(path),
+            None => self
+                .store
+                .data_dir()
+                .join("worktrees")
+                .join(&project.id)
+                .join(&session.id)
+                .join("leader"),
+        };
+        let canonical_root = project_root.canonicalize()?;
+        let target_abs = if target.is_absolute() {
+            target
+        } else {
+            std::env::current_dir()?.join(target)
+        };
+        let target_for_check = target_abs.clone();
+        if target_abs.starts_with(&canonical_root) {
+            anyhow::bail!("worktree path must be outside the project root");
+        }
+        let git_lock = self.git_lock.clone();
+        let branch_for_worktree = branch.clone();
+        let base_for_worktree = base_commit.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            worktree::rehydrate(
+                &project_root,
+                &target_for_check,
+                &branch_for_worktree,
+                &base_for_worktree,
+            )
+        })
+        .await??;
+        let worktree_path = target_abs.clone();
+        let commit =
+            tokio::task::spawn_blocking(move || worktree::head_commit(&worktree_path)).await??;
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let worktree_string = target_abs.to_string_lossy().to_string();
+        let branch_for_store = branch.clone();
+        let events = tokio::task::spawn_blocking(move || {
+            store.rehydrate_session_with_events(&id, &worktree_string, &branch_for_store)
+        })
+        .await??;
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        Ok(SessionRehydrateResult {
+            session_id: session.id,
+            worktree: target_abs.to_string_lossy().to_string(),
+            branch,
+            commit,
+            status: "idle".to_string(),
+        })
+    }
+
     pub async fn import_session(&self, bundle: SessionBundle) -> Result<SessionImportResult> {
         let root = PathBuf::from(&bundle.project.root);
         if !root.is_dir() {
@@ -2082,6 +2167,8 @@ mod tests {
             .unwrap();
         assert!(events.iter().any(|event| event.kind == "session.rebuilt"));
 
+        let original_worktree = session.worktree.clone().unwrap();
+        let original_branch = session.branch.clone().unwrap();
         let import_data = TempDir::new().unwrap();
         let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
         let imported = imported_engine.import_session(bundle).await.unwrap();
@@ -2111,6 +2198,36 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("read-only"));
+
+        worktree::remove(
+            repo.path(),
+            std::path::Path::new(&original_worktree),
+            &original_branch,
+        );
+        let rehydrated_worktree = import_data.path().join("rehydrated");
+        let rehydrated = imported_engine
+            .rehydrate_session(
+                &session.id,
+                Some(rehydrated_worktree.to_string_lossy().to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rehydrated.status, "idle");
+        assert_eq!(rehydrated.worktree, rehydrated_worktree.to_string_lossy());
+        assert!(rehydrated_worktree.join(".git").is_file());
+        let rehydrated_report = imported_engine.replay_session(&session.id).await.unwrap();
+        assert!(
+            rehydrated_report.consistent,
+            "{:?}",
+            rehydrated_report.mismatches
+        );
+        let rehydrated_diff = imported_engine.session_diff(&session.id).await.unwrap();
+        assert!(!rehydrated_diff.status.contains("imported archive"));
+        let error = imported_engine
+            .rehydrate_session(&session.id, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("only imported"));
     }
 
     #[tokio::test]

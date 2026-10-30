@@ -174,6 +174,39 @@ pub fn merge_branch(session_worktree: &Path, branch: &str, message: &str) -> Res
     }
 }
 
+/// Create a worktree for an imported session at an explicit path. If the
+/// session branch already exists it is attached; otherwise it is created at the
+/// bundle's base commit.
+pub fn rehydrate(
+    project_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    base_commit: &str,
+) -> Result<()> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving project root {}", project_root.display()))?;
+    if worktree.exists() {
+        anyhow::bail!("worktree path already exists: {}", worktree.display());
+    }
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating worktree directory {}", parent.display()))?;
+    }
+    run_git(&root, &["worktree", "prune"])?;
+    let path = worktree
+        .to_str()
+        .ok_or_else(|| anyhow!("worktree path is not valid UTF-8"))?;
+    if branch_exists(&root, branch)? {
+        run_git(&root, &["worktree", "add", path, branch])?;
+    } else if base_commit.trim().is_empty() {
+        run_git(&root, &["worktree", "add", "-b", branch, path, "HEAD"])?;
+    } else {
+        run_git(&root, &["worktree", "add", "-b", branch, path, base_commit])?;
+    }
+    Ok(())
+}
+
 pub fn rebase_onto(worktree: &Path, onto: &str) -> Result<()> {
     match run_git(worktree, &["rebase", onto]) {
         Ok(()) => Ok(()),

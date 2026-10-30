@@ -30,9 +30,11 @@ would make an old session look runnable while its history no longer matches.
 5. **All events are preserved verbatim.** Imported events keep their original
    `seq`; import appends `session.updated` and `session.imported` events after the
    imported stream.
-6. **No automatic rehydration.** A future explicit rehydrate flow can map paths,
-   recreate worktrees at `base_commit`, and clear the archive flag. Import must
-   not silently do that.
+6. **No automatic rehydration.** Import never creates a worktree silently.
+   `session.rehydrate` / `vp rehydrate` is the explicit follow-up: it verifies the
+   imported state, creates or attaches the session branch at the stored base
+   commit, updates the worktree path, appends `session.rehydrated`, and returns
+   the session to `idle`.
 
 ## Consequences
 
@@ -41,6 +43,8 @@ would make an old session look runnable while its history no longer matches.
 - An imported session is inspectable/replayable but not silently mutated or
   resumed.
 - Working import still requires a separate rehydrate step; this is deliberate.
+- Rehydrate needs the target project/repository to be reachable; approvals are
+  not yet imported as a projection.
 - Projects with the same ID but a different local root are rejected.
 
 ## Alternatives considered

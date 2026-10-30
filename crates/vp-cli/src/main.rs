@@ -80,6 +80,12 @@ enum Command {
     },
     /// Import an archived session bundle into the local daemon.
     Import { bundle: PathBuf },
+    /// Recreate a worktree for an imported archive session.
+    Rehydrate {
+        session: String,
+        #[arg(long)]
+        worktree: Option<PathBuf>,
+    },
     /// Replay the event stream and check projection consistency.
     Replay {
         session: String,
@@ -224,6 +230,14 @@ async fn main() -> Result<()> {
             let parsed: Value = serde_json::from_slice(&data).context("parsing session bundle")?;
             rpc(&discovery, "session.import", json!({"bundle": parsed})).await?
         }
+        Command::Rehydrate { session, worktree } => {
+            rpc(
+                &discovery,
+                "session.rehydrate",
+                json!({"session_id": session, "worktree": worktree}),
+            )
+            .await?
+        }
         Command::Replay {
             session,
             repair,
@@ -332,6 +346,19 @@ fn print_json(value: &Value) -> Result<()> {
 }
 
 fn print_human(value: &Value) {
+    if value.get("session_id").is_some()
+        && value.get("worktree").is_some()
+        && value.get("commit").is_some()
+    {
+        println!(
+            "rehydrated {} at {} · branch {} · {}",
+            value["session_id"].as_str().unwrap_or("?"),
+            value["worktree"].as_str().unwrap_or("?"),
+            value["branch"].as_str().unwrap_or("?"),
+            value["commit"].as_str().unwrap_or("?")
+        );
+        return;
+    }
     if value.get("session_id").is_some() && value.get("events").is_some() {
         println!(
             "imported session {} into project {} · events={} · status={}",

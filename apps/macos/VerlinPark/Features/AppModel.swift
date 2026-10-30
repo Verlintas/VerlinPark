@@ -622,8 +622,12 @@ final class AppModel {
         if event.type == "session.created"
             || event.type == "session.worktree"
             || event.type == "session.imported"
+            || event.type == "session.rehydrated"
         {
-            Task { await self.loadSessions() }
+            Task {
+                await self.loadSessions()
+                await self.loadDiff()
+            }
         }
 
         if event.sessionId == selectedSessionID,

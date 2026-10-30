@@ -817,6 +817,47 @@ impl Store {
         Ok(())
     }
 
+    pub fn rehydrate_session_with_events(
+        &self,
+        session_id: &str,
+        worktree: &str,
+        branch: &str,
+    ) -> Result<Vec<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions
+             SET worktree = ?1, branch = ?2, status = 'idle'
+             WHERE id = ?3 AND status = 'imported'",
+            params![worktree, branch, session_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!(
+                "session is not an imported archive or does not exist: {session_id}"
+            ));
+        }
+        let status_event = insert_event_tx(
+            &tx,
+            session_id,
+            "session.updated",
+            serde_json::json!({"status": "idle"}),
+        )?;
+        let rehydrated = insert_event_tx(
+            &tx,
+            session_id,
+            "session.rehydrated",
+            serde_json::json!({"worktree": worktree, "branch": branch}),
+        )?;
+        tx.commit()?;
+        let events = vec![status_event, rehydrated];
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok(events)
+    }
+
     pub fn update_session_status_with_event(
         &self,
         session_id: &str,

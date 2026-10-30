@@ -362,6 +362,22 @@ pub struct SessionImportResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RehydrateSessionParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub worktree: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRehydrateResult {
+    pub session_id: String,
+    pub worktree: String,
+    pub branch: String,
+    pub commit: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ReplaySessionParams {
     pub session_id: String,
     #[serde(default)]

@@ -15,7 +15,7 @@
 - **P1-3 部分缓解**：Verifier shell 的审批卡会明确警告 “not sandboxed”；runtime 沙箱仍未实现。
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 和 `gh` PR flow 可用。仍缺自动冲突解决、LLM Integrator、非 GitHub PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
-- **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 目前是只读 archive，工作区 rehydrate 仍未实现。
+- **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive，`session.rehydrate` 可显式重建 worktree/branch 并恢复可运行状态。
 - **仍未解决**：shell 沙箱、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
 当前测试：Rust 61（core 44 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
@@ -44,7 +44,7 @@
 | 维度 | 评分 | 说明 |
 |---|---|---|
 | 功能完整度（M3 第三切片） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、本地 landing、`gh` PR 已有；缺 artifact、mailbox、自动冲突解决 |
-| 正确性/一致性 | B | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/rebuild 已覆盖关键投影；bundle import/从零数据库重建仍未完成 |
+| 正确性/一致性 | B | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影；从零数据库重建仍未完成 |
 | 隔离与安全 | C+ | 路径 jail、loopback token、fetch_url DNS 固定做得不错；shell 仍无沙箱 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
@@ -157,12 +157,12 @@
 
 - 修复前事件日志是审计流 + UI 增量来源，不是可完整 replay 的 event sourcing。
 - 修复后 session status / usage / agent status / merge queue 已同事务写事件；关键投影可由事件重建（有测试）。
-- team plan / todos / messages / recovery 已原子化；`session.replay` 校验关键投影，`--repair`/`--rebuild` 可修复/重建覆盖字段（含 agent roster），`session.export` 可导出 bundle；bundle import/从零数据库导入仍未完成。
+- team plan / todos / messages / recovery 已原子化；`session.replay` 校验关键投影，`--repair`/`--rebuild` 可修复/重建覆盖字段（含 agent roster），`session.export`/`import`/`rehydrate` 已形成 archive 迁移路径；从零数据库导入仍未完成。
 
 **后续**
 
 1. 把 team plan / todos / messages / recovery 搬到同一套 event+projection 事务。
-2. 继续做 bundle import 与 session/project 创建元数据的从零 rebuild；当前 export/rebuild 覆盖事件与关键投影。
+2. 继续做跨环境 approvals 导入与 session/project 创建元数据的从零 rebuild；当前 export/import/rehydrate 覆盖事件与关键投影。
 3. 保持文档明确区分“关键状态已原子化”和“完整 event sourcing 未完成”。
 
 ---
@@ -333,7 +333,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 - session status / usage / agent status / merge queue 的 event+projection 原子事务。
 - team plan / todos / messages / recovery 原子化。
 - `session.replay` / `vp replay` 投影一致性检查、`--repair` 与 `--rebuild`。
-- `session.export` / `vp export` bundle 与 `session.import` / `vp import` 只读 archive。
+- `session.export` / `vp export` bundle、`session.import` / `vp import` archive、`session.rehydrate` / `vp rehydrate`。
 - 事件流重建关键投影的回归测试。
 
 ---
