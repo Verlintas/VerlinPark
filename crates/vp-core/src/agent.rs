@@ -472,6 +472,9 @@ struct BudgetState {
     workers: usize,
     verifiers: usize,
     labour: usize,
+    warned_tokens: bool,
+    warned_cost: bool,
+    warned_time: bool,
 }
 
 struct AgentSlot<'a> {
@@ -506,6 +509,9 @@ impl SessionBudget {
                 workers: 0,
                 verifiers: 0,
                 labour: 0,
+                warned_tokens: false,
+                warned_cost: false,
+                warned_time: false,
             }),
         }
     }
@@ -549,6 +555,32 @@ impl SessionBudget {
             .time_limit
             .is_some_and(|limit| self.started.elapsed() >= limit)
         {
+            return Some("time");
+        }
+        None
+    }
+
+    fn warning(&self) -> Option<&'static str> {
+        let mut state = self.state.lock().ok()?;
+        if let Some(limit) = self.limit
+            && state.spent >= limit.saturating_mul(8) / 10
+            && !state.warned_tokens
+        {
+            state.warned_tokens = true;
+            return Some("tokens");
+        }
+        if let Some(limit) = self.cost_limit
+            && state.cost_spent >= limit * 0.8
+            && !state.warned_cost
+        {
+            state.warned_cost = true;
+            return Some("cost");
+        }
+        if let Some(limit) = self.time_limit
+            && self.started.elapsed() >= limit.mul_f64(0.8)
+            && !state.warned_time
+        {
+            state.warned_time = true;
             return Some("time");
         }
         None
@@ -3278,6 +3310,24 @@ async fn run_loop(
         }
         if budget.exhausted() {
             return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
+        }
+        if let Some(reason) = budget.warning() {
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "agent.budget_warning",
+                serde_json::json!({
+                    "reason": reason,
+                    "limit": budget.limit,
+                    "spent": budget.spent(),
+                    "cost_limit_usd": budget.cost_limit,
+                    "cost_spent_usd": budget.cost_spent(),
+                    "time_budget_secs": budget.time_limit.map(|limit| limit.as_secs()),
+                    "elapsed_secs": budget.elapsed_secs(),
+                }),
+            )
+            .await?;
         }
         let mut request = ChatRequest {
             model: model_for(config, spec.role),
@@ -8634,6 +8684,41 @@ mod tests {
                 && event.payload["task_id"] == "T1"
                 && event.payload["model"] == "worker-model"
         }));
+    }
+
+    #[tokio::test]
+    async fn warns_once_at_eighty_percent_of_token_budget() {
+        let dir = TempDir::new().unwrap();
+        let (engine, service, project) = test_service(&dir);
+        let session = engine
+            .create_session(project.id, "warn budget".into(), Some(1000))
+            .await
+            .unwrap();
+        engine.record_usage(&session.id, 800, 0).await.unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "warn budget").await.unwrap();
+        let _ = wait_until_idle(&engine, &session).await;
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        let warnings = events
+            .iter()
+            .filter(|event| {
+                event.kind == "agent.budget_warning" && event.payload["reason"] == "tokens"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].payload["limit"], 1000);
+        assert_eq!(warnings[0].payload["spent"], 800);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "agent.budget_exceeded")
+        );
     }
 
     #[tokio::test]

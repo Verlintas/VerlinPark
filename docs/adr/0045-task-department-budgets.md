@@ -40,7 +40,10 @@ task DAG, which is the natural place to declare narrower budgets.
    A department can overshoot by up to one call per concurrently running task.
    This is deliberate; per-scope reservations would need a shared atomic budget
    registry and are not implemented.
-8. **No silent retries.** A blocked task is not automatically retried with a
+8. **Warning threshold.** The session budget emits one `agent.budget_warning`
+   at 80% of tokens, cost, or time. Task/department warning thresholds are not
+   emitted separately; their blocked/failed events carry the scope.
+9. **No silent retries.** A blocked task is not automatically retried with a
    larger budget. The Leader can submit a new plan or the user can raise the
    session budget and retry.
 

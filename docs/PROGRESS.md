@@ -31,7 +31,7 @@
 | Queue recovery | ✅ | daemon 重启把 queued/merging/checking entry 标为 interrupted 并补事件；interrupted 可 rebase+retry |
 | Diff / commit | ✅ | base..worktree diff、显式 commit、discard、session committed 事件 |
 | Shell 写入沙箱 | ✅ | macOS Seatbelt（`sandbox-exec`）：只允许写 worktree、对应 Git 元数据、per-agent scratch 和 `/dev/null`；拒绝 common hooks/config 与 worktree `config.worktree`；`.git` 指向校验；scratch 承载 TMPDIR/构建缓存；env allowlist 不继承 provider/daemon secrets；常见 credential/state 路径 read-deny；timeout/cancel 杀整个 process group；项目级 `ShellPolicy` 可拒绝网络并追加 read-deny；sandbox 不可用时 fail closed |
-| 预算 / 取消 / 暂停 | ✅ | session token reservation + provider usage 结算；TeamPlan 可声明 department/task token/USD budget 树；turn 前按 ledger 剩余额度压低 max_tokens，turn 后复查；task/department 超限只 block 该任务，session 超限仍失败；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复；`session.pause` / `session.resume` / `vp pause` / `vp resume` 在 turn/tool 边界协作式暂停并继续同一 run |
+| 预算 / 取消 / 暂停 | ✅ | session token reservation + provider usage 结算；TeamPlan 可声明 department/task token/USD budget 树；turn 前按 ledger 剩余额度压低 max_tokens，turn 后复查；task/department 超限只 block 该任务，session 超限仍失败；session 用量到 80% 时发一次 `agent.budget_warning`；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复；`session.pause` / `session.resume` / `vp pause` / `vp resume` 在 turn/tool 边界协作式暂停并继续同一 run |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；UI Approve/Deny |
 | 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR/mailbox/artifact 事件；Collab roster；Preview Plan/Changes/Queue/Mailbox/Cost/Trace |
 | Mailbox / artifacts | ✅ | session-scoped typed messages（unread/read、sender/receiver、kind、body、JSON payload）+ text artifacts（≤100KB）+ binary file artifacts（≤5MiB，SHA-256/path）；agent tools `send_message`/`read_mailbox`/`publish_artifact`/`list_artifacts`/`read_artifact`；RPC/CLI/Preview Mailbox；bundle export/import（binary base64）；项目 artifact policy（max bytes/age/count、auto GC）+ manual GC；项目 mailbox policy（max age/count、delete_unread）+ manual oldest-first GC，默认保护 unread |
@@ -46,7 +46,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：87 个测试通过（core 69、store 13、providers 5）。
+- `cargo test --workspace`：88 个测试通过（core 70、store 13、providers 5）。
 - `xcodebuild test`：9 个 Swift 测试通过。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
