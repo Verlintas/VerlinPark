@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-10-30
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Landing/PR + Session 协作式 Pause/Resume 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Landing/PR + Session 协作式 Pause/Resume + Shell 写入沙箱已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
 
@@ -20,7 +20,7 @@
 | 自动派发 | ✅ | `run_team_plan` 按依赖批次执行 ready tasks；同批筛选不重叠 scope；Manager 懒创建；失败阻塞依赖 |
 | Task worktree | ✅ | Worker 独立 task worktree/branch；Labour 继承 Worker worktree |
 | 并行 Worker | ✅ | `delegate_many` / plan batch 并发；两边都校验 write scope 不重叠；空 scope 或重叠 scope 的 plan task 串行执行 |
-| Verifier gate | ✅ | 独立 Verifier；`submit_verdict`；approve 才合并。只读是 prompt 约束，shell 未沙箱；审批卡会提示 |
+| Verifier gate | ✅ | 独立 Verifier；`submit_verdict`；approve 才合并。只读是 prompt 约束；shell 写入被限制在其 worktree，但仍可修改该 worktree；审批卡会提示 |
 | Merge queue | ✅ | Verifier-approved commit 入持久队列；`merge_queue.list` / `vp queue` / Preview → Queue；状态 queued/merging/checking/merged/conflict/failed/interrupted |
 | Integrator gate | ✅ | 确定性 merge：`--no-ff` + `git diff --check` + 可选 `VERLINPARK_INTEGRATION_COMMAND`；失败 reset 到 merge 前 commit；冲突 abort 并保留 Worker 分支 |
 | Queue retry | ✅ | `merge_queue.retry` / `vp retry` / Queue UI：conflict/failed 先 rebase 到当前 session branch，再重新 merge；attempt +1 |
@@ -28,6 +28,7 @@
 | PR flow | ✅ | `session.pr` / `vp pr` / Preview → Open PR：preflight origin + `gh auth status`，push session branch，`gh pr create`；gh 失败会明确报告 branch 已 push |
 | Queue recovery | ✅ | daemon 重启把 queued/merging/checking entry 标为 interrupted 并补事件；interrupted 可 rebase+retry |
 | Diff / commit | ✅ | base..worktree diff、显式 commit、discard、session committed 事件 |
+| Shell 写入沙箱 | ✅ | macOS Seatbelt（`sandbox-exec`）：只允许写 worktree、对应 Git 元数据、per-agent scratch 和 `/dev/null`；拒绝 common hooks/config 与 worktree `config.worktree`；`.git` 指向校验；scratch 承载 TMPDIR/构建缓存；env allowlist 不继承 provider/daemon secrets；sandbox 不可用时 fail closed |
 | 预算 / 取消 / 暂停 | ✅ | token reservation + provider usage 结算；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复；`session.pause` / `session.resume` / `vp pause` / `vp resume` 在 turn/tool 边界协作式暂停并继续同一 run |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；UI Approve/Deny |
 | 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR 事件；Collab roster；Preview Plan/Changes/Queue/Trace |
@@ -40,7 +41,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：62 个测试通过（core 45、store 12、providers 5）。
+- `cargo test --workspace`：65 个测试通过（core 48、store 12、providers 5）。
 - `xcodebuild test`：9 个 Swift 测试通过。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -50,9 +51,10 @@
 
 第一轮硬化（2026-10-30）已修复 plan scope/caps、token reservation 和 fetch_url 的 DNS 绕过。仍然存在的：
 
-1. **Verifier 只读**：只是 prompt 约束；`shell` 工具没有被沙箱限制。审批卡会提示，但 runtime 不阻止写操作。见 AUDIT P1-3。
-2. **事件溯源**：关键状态已改为原子事件+投影；`session.replay` / `--repair` / `--rebuild` 可发现并重建覆盖的投影（含 agent roster）；`session.export` 可导出 bundle；数据库项目/会话创建元数据的从零导入仍未实现。见 AUDIT P1-5。
-3. **batch abort 状态一致性**：同批 task 在预算/取消中止时可能残留 `running` UI 状态；见 AUDIT P2-7。
+1. **Shell 仍非完整沙箱**：写入已由 Seatbelt 限制在 worktree/Git 元数据/scratch；读取、网络、进程执行、Docker 等 daemon 介导写入没有隔离；`sandbox-exec` 已废弃。见 AUDIT P1-3。
+2. **Verifier 只读**：只是 prompt 约束；shell 写入虽被限制在它自己的 worktree，但仍可修改该 worktree 的源码。见 AUDIT P1-3。
+3. **事件溯源**：关键状态已改为原子事件+投影；`session.replay` / `--repair` / `--rebuild` 可发现并重建覆盖的投影（含 agent roster）；`session.export` 可导出 bundle；数据库项目/会话创建元数据的从零导入仍未实现。见 AUDIT P1-5。
+4. **batch abort 状态一致性**：同批 task 在预算/取消中止时可能残留 `running` UI 状态；见 AUDIT P2-7。
 
 ## 当前限制（明确未实现）
 
@@ -66,7 +68,7 @@
 - 没有 typed message bus / artifact store；Agent 之间仍是委派调用 + 事件记录，没有异步 mailbox。
 - 没有 context compaction、checkpoint/resume；暂停状态只在内存中，daemon 重启会把 running/paused session 标为 failed。
 - 没有终端、逐 hunk review、真实 Collab 节点、MCP/ACP、web search。
-- Verifier 的 Shell 不是沙箱；task worktree/branch 暂无自动清理。
+- Shell 只做写入隔离；读取/网络/daemon 介导写入未隔离，`sandbox-exec` 是废弃 API；task worktree/branch/shell scratch 暂无自动清理。
 - Aviiya 仍是 NovaBAIC 外部桥接占位，不在本仓库实现人格/记忆。
 - 没有签名/公证；App 是 unsigned debug build。
 
@@ -89,6 +91,7 @@
 - **M3 第十切片**：`session.rehydrate` 将 imported session 的 worktree/branch 重建并恢复可运行状态；import 同时恢复 approvals 投影。
 - **M3 第十一切片**：rehydrate 按 branch 分组重建 imported agent task worktrees。
 - **M3 第十二切片**：session 级协作式 pause/resume（turn/tool 边界、同一 run 继续、terminal 状态不可覆盖），CLI + app 控制。
+- **M3 第十三切片**：macOS Seatbelt shell 写入沙箱（worktree + Git 元数据 + scratch；hooks/config 保护；fail closed）。
 
 ## 如何运行
 

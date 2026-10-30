@@ -655,9 +655,16 @@ struct ApprovalCard: View {
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(6)
+            if approval.tool == "shell" {
+                Text(
+                    "Write sandbox: worktree, Git metadata, and runtime scratch. Reads, network, and daemon-mediated writes are not confined."
+                )
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+            }
             if approval.agentRole == "verifier", approval.tool == "shell" {
                 Text(
-                    "Verifier shell is not sandboxed. Approve only commands that cannot modify the worktree."
+                    "The Verifier can still modify its own worktree through shell. Approve only read-only commands."
                 )
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundStyle(.orange)

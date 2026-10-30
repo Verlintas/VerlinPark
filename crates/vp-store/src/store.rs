@@ -787,7 +787,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at
-             FROM agents WHERE session_id = ?1 ORDER BY created_at ASC",
+             FROM agents WHERE session_id = ?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             Ok(AgentRecord {

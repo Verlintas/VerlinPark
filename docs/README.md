@@ -1,6 +1,6 @@
 # VerlinPark 文档索引
 
-> 最后更新：2026-10-29  
+> 最后更新：2026-10-30
 > 仓库：<https://github.com/Verlintas/VerlinPark>
 
 文档分成三类，避免把“设计目标”误读成“已经实现”：
@@ -43,7 +43,8 @@
 | 技术栈 / IPC / 分发 | [0001](adr/0001-swiftui-rust-core.md)、[0007](adr/0007-websocket-jsonrpc.md)、[0008](adr/0008-gpl3-direct-distribution.md) |
 | 组织模型 | [0011](adr/0011-four-level-org.md)（四层）、[0019](adr/0019-four-tier-delegation.md)（委派）、[0022](adr/0022-manager-titles.md)（Manager title）、[0024](adr/0024-team-plan-profiles.md)（TeamPlan/profile）、[0027](adr/0027-manager-roundtable.md)（圆桌） |
 | 隔离 / Git | [0004](adr/0004-worktree-per-task.md)、[0016](adr/0016-session-worktree.md)、[0017](adr/0017-session-commit.md)、[0020](adr/0020-task-worktrees.md)、[0021](adr/0021-parallel-workers-scopes.md) |
-| 质量 / 验证 | [0023](adr/0023-verifier-gate.md)（Verifier）、[0025](adr/0025-team-plan-dispatch.md)（自动派发）、[0028](adr/0028-merge-queue-integrator.md)（merge queue/Integrator）、[0029](adr/0029-local-landing.md)（本地 landing）、[0030](adr/0030-push-pr-flow.md)（push/PR）、[0031](adr/0031-queue-recovery.md)（queue recovery）、[0032](adr/0032-atomic-event-projections.md)（event/projection 原子写）、[0033](adr/0033-session-import-archive.md)（bundle 导入/archive） |
+| 质量 / 验证 | [0023](adr/0023-verifier-gate.md)（Verifier）、[0025](adr/0025-team-plan-dispatch.md)（自动派发）、[0028](adr/0028-merge-queue-integrator.md)（merge queue/Integrator）、[0029](adr/0029-local-landing.md)（本地 landing）、[0030](adr/0030-push-pr-flow.md)（push/PR）、[0031](adr/0031-queue-recovery.md)（queue recovery）、[0032](adr/0032-atomic-event-projections.md)（event/projection 原子写）、[0033](adr/0033-session-import-archive.md)（bundle 导入/archive）、[0034](adr/0034-cooperative-pause-resume.md)（pause/resume） |
+| 安全 / 权限 | [0035](adr/0035-shell-write-sandbox.md)（shell 写入沙箱） |
 | 成本 / 容量 | [0003](adr/0003-manual-model-budget.md)、[0018](adr/0018-budget-cancel.md)、[0026](adr/0026-org-cap-right-sizing.md) |
 | 产品 / UI | [0013](adr/0013-glass-park-brand.md)（Glass Park）、[0014](adr/0014-external-aviiya.md)（Aviiya 外置） |
 | 通信 / 存储 | [0005](adr/0005-typed-messages-artifacts.md)（typed message/artifact，设计）、[0006](adr/0006-event-sourcing.md)（事件溯源，部分实现） |

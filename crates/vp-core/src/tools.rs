@@ -18,6 +18,11 @@ const MAX_TOOL_OUTPUT: usize = 40_000;
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub root: PathBuf,
+    /// The repository the session was opened from. Used only to validate that
+    /// shell Git metadata belongs to this project.
+    pub project_root: PathBuf,
+    /// Runtime-owned scratch space for shell caches and temporary files.
+    pub sandbox_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +99,80 @@ struct EditFile;
 struct WriteFile;
 struct Shell;
 struct FetchUrl;
+
+/// Write confinement for the shell tool.
+///
+/// The Seatbelt profile allows normal reads, process execution, and network
+/// access, but denies file writes outside the agent worktree, its Git metadata,
+/// and a runtime-owned scratch directory.
+/// Git metadata must stay writable for `git add`/`commit`/`status`; this is the
+/// one intentional exception to "writes stay inside the worktree".
+const SHELL_SANDBOX_PROFILE: &str = r#"(version 1)
+(allow default)
+(deny file-write* (require-not (require-any
+  (subpath (param "WORKTREE"))
+  (subpath (param "SCRATCH"))
+  (subpath (param "GIT_DIR"))
+  (subpath (param "COMMON_DIR"))
+  (literal "/dev/null")
+)))
+(deny file-write* (subpath (param "COMMON_HOOKS")))
+(deny file-write* (literal (param "COMMON_CONFIG")))
+(deny file-write* (literal (param "WORKTREE_CONFIG")))
+(deny appleevent-send)
+"#;
+
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// Variables that are safe and useful to pass into a build/test shell. Provider
+/// keys, cloud credentials, tokens, and daemon configuration are deliberately
+/// excluded; a command must set any extra project env explicitly.
+const SHELL_ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "CI",
+    "SSH_AUTH_SOCK",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "RUSTUP_HOME",
+    "JAVA_HOME",
+    "GOROOT",
+    "GOPATH",
+    "NVM_DIR",
+    "NVM_BIN",
+    "NVM_INC",
+    "VOLTA_HOME",
+    "ASDF_DIR",
+    "ASDF_DATA_DIR",
+    "PYENV_ROOT",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "GEM_HOME",
+    "GEM_PATH",
+    "PNPM_HOME",
+    "BUN_INSTALL",
+    "HOMEBREW_PREFIX",
+    "HOMEBREW_CELLAR",
+    "HOMEBREW_REPOSITORY",
+    "DEVELOPER_DIR",
+    "SDKROOT",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "CC",
+    "CXX",
+    "CFLAGS",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "PKG_CONFIG_PATH",
+];
 
 fn is_blocked_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -566,7 +645,7 @@ impl AgentTool for Shell {
     }
 
     fn description(&self) -> &'static str {
-        "Run a non-interactive shell command in the project root. Requires approval."
+        "Run a non-interactive shell command in the agent worktree. Writes are confined to the worktree, its Git metadata, and runtime scratch. Requires approval."
     }
 
     fn schema(&self) -> Value {
@@ -597,22 +676,85 @@ impl AgentTool for Shell {
                 )));
             }
         }
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            return Ok(ToolOutput::error(
+                "shell sandbox is unavailable on this platform; refusing to run unsandboxed shell",
+            ));
+        }
         let timeout_secs = input
             .get("timeout_secs")
             .and_then(Value::as_u64)
             .unwrap_or(120)
             .min(900);
-        let output = timeout(
-            Duration::from_secs(timeout_secs),
-            Command::new("sh")
-                .arg("-lc")
-                .arg(command)
-                .current_dir(&context.root)
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow!("command timed out after {timeout_secs}s"))??;
+        let root = context.root.canonicalize().context("resolving worktree")?;
+        tokio::fs::create_dir_all(&context.sandbox_root).await?;
+        let scratch = context
+            .sandbox_root
+            .canonicalize()
+            .context("resolving shell scratch directory")?;
+        let tmp = scratch.join("tmp");
+        tokio::fs::create_dir_all(&tmp).await?;
+        let project_root = context
+            .project_root
+            .canonicalize()
+            .unwrap_or_else(|_| root.clone());
+        let (git_dir, common_dir) = git_metadata_dirs(&root, &project_root);
+        let mut process = Command::new(SANDBOX_EXEC);
+        process.env_clear();
+        for key in SHELL_ENV_PASSTHROUGH {
+            if let Some(value) = std::env::var_os(key) {
+                process.env(key, value);
+            }
+        }
+        process
+            .arg("-D")
+            .arg(format!("WORKTREE={}", root.display()))
+            .arg("-D")
+            .arg(format!("SCRATCH={}", scratch.display()))
+            .arg("-D")
+            .arg(format!("GIT_DIR={}", git_dir.display()))
+            .arg("-D")
+            .arg(format!("COMMON_DIR={}", common_dir.display()))
+            .arg("-D")
+            .arg(format!(
+                "COMMON_HOOKS={}",
+                common_dir.join("hooks").display()
+            ))
+            .arg("-D")
+            .arg(format!(
+                "COMMON_CONFIG={}",
+                common_dir.join("config").display()
+            ))
+            .arg("-D")
+            .arg(format!(
+                "WORKTREE_CONFIG={}",
+                git_dir.join("config.worktree").display()
+            ))
+            .arg("-p")
+            .arg(SHELL_SANDBOX_PROFILE)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&root)
+            .env("TMPDIR", &tmp)
+            .env("TMP", &tmp)
+            .env("TEMP", &tmp)
+            .env("XDG_CACHE_HOME", scratch.join("cache"))
+            .env("CARGO_HOME", scratch.join("cargo"))
+            .env("GOCACHE", scratch.join("go-build"))
+            .env("GOMODCACHE", scratch.join("go-mod"))
+            .env("npm_config_cache", scratch.join("npm"))
+            .env("YARN_CACHE_FOLDER", scratch.join("yarn"))
+            .env("PIP_CACHE_DIR", scratch.join("pip"))
+            .env("CLANG_MODULE_CACHE_PATH", scratch.join("clang-modules"))
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "gc.auto")
+            .env("GIT_CONFIG_VALUE_0", "0")
+            .kill_on_drop(true);
+        let output = timeout(Duration::from_secs(timeout_secs), process.output())
+            .await
+            .map_err(|_| anyhow!("command timed out after {timeout_secs}s"))??;
 
         let mut text = String::new();
         if !output.stdout.is_empty() {
@@ -632,6 +774,68 @@ impl AgentTool for Shell {
             Ok(ToolOutput::error(result))
         }
     }
+}
+
+/// Return the worktree-specific Git directory and the shared common directory.
+/// Linked worktrees keep only a `.git` file in the checkout; both paths are
+/// needed so normal Git writes (index, refs, objects, logs) keep working.
+fn git_metadata_dirs(root: &Path, project_root: &Path) -> (PathBuf, PathBuf) {
+    let project_git = resolve_git_dir(project_root).unwrap_or_else(|| project_root.join(".git"));
+    let resolved_common = resolve_common_dir(&project_git);
+    let project_common = if is_git_dir(&resolved_common) {
+        resolved_common
+    } else {
+        project_root.join(".git")
+    };
+    let worktrees_root = project_common.join("worktrees");
+    let is_project_root = root == project_root;
+    let git_dir = resolve_git_dir(root)
+        .filter(|path| {
+            (is_project_root && path == &project_git) || path.starts_with(&worktrees_root)
+        })
+        .unwrap_or_else(|| project_git.clone());
+    let common_dir = resolve_common_dir(&git_dir);
+    let common_dir = if common_dir == project_common || common_dir.starts_with(&project_common) {
+        common_dir
+    } else {
+        project_common
+    };
+    (git_dir, common_dir)
+}
+
+fn is_git_dir(path: &Path) -> bool {
+    path.is_dir() && path.join("HEAD").is_file() && path.join("objects").is_dir()
+}
+
+fn resolve_git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return dot_git.canonicalize().ok();
+    }
+    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let path = content.lines().next()?.strip_prefix("gitdir:")?.trim();
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    path.canonicalize().ok()
+}
+
+fn resolve_common_dir(git_dir: &Path) -> PathBuf {
+    std::fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .and_then(|content| {
+            let path = PathBuf::from(content.trim());
+            let path = if path.is_absolute() {
+                path
+            } else {
+                git_dir.join(path)
+            };
+            path.canonicalize().ok()
+        })
+        .unwrap_or_else(|| git_dir.to_path_buf())
 }
 
 fn build_globset(pattern: &str) -> Result<GlobSet> {
@@ -714,7 +918,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("hello.txt"), "hello\nworld\n").unwrap();
         let root = dir.path().to_path_buf();
-        (dir, ToolContext { root })
+        let sandbox_root = dir.path().join(".sandbox");
+        (
+            dir,
+            ToolContext {
+                root: root.clone(),
+                project_root: root,
+                sandbox_root,
+            },
+        )
     }
 
     #[tokio::test]
@@ -861,6 +1073,156 @@ mod tests {
             .await
             .unwrap();
         assert!(output.is_error);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn shell_confines_writes_to_worktree_and_scratch() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("worktree");
+        std::fs::create_dir(&root).unwrap();
+        let context = ToolContext {
+            root: root.clone(),
+            project_root: root.clone(),
+            sandbox_root: dir.path().join("sandbox"),
+        };
+        let inside = Shell
+            .execute(&context, json!({"command": "echo inside > inside.txt"}))
+            .await
+            .unwrap();
+        assert!(!inside.is_error, "{}", inside.content);
+        assert!(root.join("inside.txt").exists());
+
+        let outside = dir.path().join("outside.txt");
+        let escaped = Shell
+            .execute(
+                &context,
+                json!({"command": format!("echo bad > {}", outside.display())}),
+            )
+            .await
+            .unwrap();
+        assert!(escaped.is_error, "{}", escaped.content);
+        assert!(!outside.exists());
+
+        let scratch = Shell
+            .execute(
+                &context,
+                json!({"command": "mktemp >/dev/null; echo tmp-ok"}),
+            )
+            .await
+            .unwrap();
+        assert!(!scratch.is_error, "{}", scratch.content);
+        assert!(scratch.content.contains("tmp-ok"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn shell_allows_git_writes_in_a_linked_worktree() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_std_git(&repo, &["init", "-q"]);
+        run_std_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_std_git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        run_std_git(&repo, &["add", "a.txt"]);
+        run_std_git(&repo, &["commit", "-qm", "init"]);
+        let worktree = dir.path().join("task");
+        run_std_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "-b",
+                "task",
+            ],
+        );
+        let context = ToolContext {
+            root: worktree.clone(),
+            project_root: repo.clone(),
+            sandbox_root: dir.path().join("sandbox"),
+        };
+        let output = Shell
+            .execute(
+                &context,
+                json!({
+                    "command": "echo two > b.txt && git add b.txt && git -c user.email=test@example.com -c user.name=Test commit -qm task && git log --oneline -1"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert!(worktree.join("b.txt").exists());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty());
+
+        let common = repo.join(".git");
+        for target in [common.join("config"), common.join("hooks/pre-commit")] {
+            let output = Shell
+                .execute(
+                    &context,
+                    json!({"command": format!("echo hacked >> {}", target.display())}),
+                )
+                .await
+                .unwrap();
+            assert!(output.is_error, "{} was writable", target.display());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn shell_does_not_trust_a_tampered_git_file() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_std_git(&repo, &["init", "-q"]);
+        let worktree = dir.path().join("task");
+        std::fs::create_dir(&worktree).unwrap();
+        let target = dir.path().join("outside");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", target.display()),
+        )
+        .unwrap();
+        let context = ToolContext {
+            root: worktree,
+            project_root: repo,
+            sandbox_root: dir.path().join("sandbox"),
+        };
+        let output = Shell
+            .execute(
+                &context,
+                json!({"command": format!("echo pwn > {}/file", target.display())}),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error, "{}", output.content);
+        assert!(!target.join("file").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_std_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

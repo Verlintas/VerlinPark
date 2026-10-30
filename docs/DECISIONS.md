@@ -44,6 +44,7 @@
 | [0032](adr/0032-atomic-event-projections.md) | 关键状态 event + projection 原子写 | Accepted | 存储/审计/恢复 |
 | [0033](adr/0033-session-import-archive.md) | Session bundle 导入为只读 archive | Accepted | 迁移/恢复/安全 |
 | [0034](adr/0034-cooperative-pause-resume.md) | Session 协作式 pause/resume | Accepted | 控制/恢复/UX |
+| [0035](adr/0035-shell-write-sandbox.md) | macOS Seatbelt shell 写入沙箱 | Accepted | 安全/隔离/工具执行 |
 
 ---
 

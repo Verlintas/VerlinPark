@@ -43,7 +43,9 @@ still enter the session branch.
 - The Verifier uses the same configured model as the rest of the org until
   per-role model configuration exists.
 - Shell is not truly read-only; the Verifier is instructed not to edit, and its
-  writes are not merged unless it approves. A future sandbox should harden this.
+  writes are not merged unless it approves. Shell writes are now confined to the
+  Verifier's worktree by [ADR-0035](0035-shell-write-sandbox.md), but that still
+  permits edits inside the worktree.
 - Rejected work remains available on its task branch for a Manager to reassign or
   a user to inspect.
 - Verification is sequential, so large parallel batches pay a verification tail.

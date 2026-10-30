@@ -1810,6 +1810,13 @@ async fn run_loop(
 ) -> Result<LoopOutcome> {
     let tool_context = ToolContext {
         root: spec.worktree.clone(),
+        project_root: PathBuf::from(&project.root),
+        sandbox_root: engine
+            .store()
+            .data_dir()
+            .join("sandbox")
+            .join(&session.id)
+            .join(&spec.id),
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
     let tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);

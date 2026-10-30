@@ -468,7 +468,7 @@ loop {
 
 ## 7. Agent Runtime
 
-> **实现状态（M3 第一切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建；Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由 Verifier 审查（只读是 prompt 约束，shell 未沙箱），approve 才 merge；Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–10 个 Worker；手动 `delegate_many` 和 plan batch 都校验不重叠 write scope，空 scope/重叠 task 串行执行；每个 Worker 有独立 task worktree；Verifier approve 后进入持久 merge queue，由确定性 Integrator 串行 merge，执行 `git diff --check` 和可选 `VERLINPARK_INTEGRATION_COMMAND`，失败回滚，冲突记录；conflict/failed/interrupted 可 rebase+retry；clean project checkout 可显式 land 到默认分支，或显式 push 并用 `gh` 开 PR；daemon 重启把 in-flight queue entry 标为 interrupted；关键状态使用 atomic event+projection 事务；`session.replay` / `--repair/--rebuild` 可检查并重建覆盖的投影；session diff 从 base commit 起算。**已实现：** session 内 TeamPlan DAG 调度、Verifier gate、merge queue、确定性 Integrator、人工 retry、本地 landing、GitHub PR flow、queue recovery、replay 一致性检查、覆盖字段 repair/rebuild 与 session bundle export。**仍是设计目标：** 全局跨 session 调度器、全局写锁、自动冲突解决、可选 LLM Integrator、非 GitHub PR adapter、typed mailbox/artifact store：
+> **实现状态（M3 第一切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建；Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由 Verifier 审查（只读是 prompt 约束；shell 写入被限制在其 worktree，但仍可修改该 worktree），approve 才 merge；Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–10 个 Worker；手动 `delegate_many` 和 plan batch 都校验不重叠 write scope，空 scope/重叠 task 串行执行；每个 Worker 有独立 task worktree；Verifier approve 后进入持久 merge queue，由确定性 Integrator 串行 merge，执行 `git diff --check` 和可选 `VERLINPARK_INTEGRATION_COMMAND`，失败回滚，冲突记录；conflict/failed/interrupted 可 rebase+retry；clean project checkout 可显式 land 到默认分支，或显式 push 并用 `gh` 开 PR；daemon 重启把 in-flight queue entry 标为 interrupted；关键状态使用 atomic event+projection 事务；`session.replay` / `--repair/--rebuild` 可检查并重建覆盖的投影；session diff 从 base commit 起算。**已实现：** session 内 TeamPlan DAG 调度、Verifier gate、merge queue、确定性 Integrator、人工 retry、本地 landing、GitHub PR flow、queue recovery、replay 一致性检查、覆盖字段 repair/rebuild 与 session bundle export。**仍是设计目标：** 全局跨 session 调度器、全局写锁、自动冲突解决、可选 LLM Integrator、非 GitHub PR adapter、typed mailbox/artifact store：
 > `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`、`crates/vp-core/src/worktree.rs`。
 > 四层 Actor 模型、并行只读工具、上下文压缩和 checkpoint/resume 仍是设计目标；session 预算已实现 reservation-based enforcement（输入用保守估算，provider usage 结算）。
 > 见 [ADR-0015](adr/0015-m1-leader-loop.md)、[ADR-0016](adr/0016-session-worktree.md)、[ADR-0019](adr/0019-four-tier-delegation.md)。
@@ -821,6 +821,10 @@ pub fn classify(cmd: &str) -> CommandClass;
 - 所有命令记录原文、cwd、exit code、duration；输出大 → artifact。
 - 超时默认 10 分钟（可配置）；交互式命令不支持（需要 PTY 的用 terminal 工具）。
 - 进程组 kill：`setsid`/`setpgid`；取消时 `kill(-pgid, SIGTERM)`，宽限后 `SIGKILL`。
+- **实现状态（2026-10-30）**：shell 已用 macOS Seatbelt 做写入隔离
+  （worktree + Git 元数据 + per-agent scratch；common hooks/config 受保护；
+  `sandbox-exec` 缺失时 fail closed），并使用 env allowlist。读取、网络、
+  进程组和 Docker/GUI 等外部介导写入仍是后续工作；不能宣称 shell 已完整沙箱化。
 
 ### 10.5 apply_patch
 
