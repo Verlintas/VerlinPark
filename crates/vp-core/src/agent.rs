@@ -7488,7 +7488,22 @@ mod tests {
             .await
             .unwrap();
         service.start(&session.id, "auto plan").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let sessions = engine
+                .list_sessions(Some(session.project_id.clone()))
+                .await
+                .unwrap();
+            if sessions[0].status == "idle" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "auto plan did not finish: {}",
+                sessions[0].status
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
 
         assert!(
             provider
