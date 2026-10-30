@@ -8,8 +8,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AgentMessage, AgentRecord, Approval, Artifact, Event, IntegrationPolicy, MergeQueueEntry,
-    Project, Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem,
+    AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
+    MergeQueueEntry, Project, Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem,
 };
 
 use crate::paths;
@@ -163,11 +163,24 @@ impl Store {
                 kind       TEXT NOT NULL,
                 mime_type  TEXT NOT NULL,
                 content    TEXT NOT NULL,
+                storage    TEXT NOT NULL DEFAULT 'inline',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                sha256     TEXT NOT NULL DEFAULT '',
+                path       TEXT,
                 created_at TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_artifacts_session
                 ON artifacts(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS project_artifact_policies (
+                project_id   TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                auto_gc      INTEGER NOT NULL,
+                max_bytes    INTEGER,
+                max_age_secs INTEGER,
+                max_count    INTEGER,
+                updated_at   TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS approvals (
                 id           TEXT PRIMARY KEY,
@@ -232,6 +245,20 @@ impl Store {
         )?;
         ensure_column(&conn, "sessions", "base_commit", "TEXT")?;
         ensure_column(&conn, "sessions", "team_plan", "TEXT")?;
+        ensure_column(
+            &conn,
+            "artifacts",
+            "storage",
+            "TEXT NOT NULL DEFAULT 'inline'",
+        )?;
+        ensure_column(
+            &conn,
+            "artifacts",
+            "size_bytes",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "artifacts", "sha256", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "artifacts", "path", "TEXT")?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(
             &conn,
@@ -721,6 +748,10 @@ impl Store {
         kind: &str,
         mime_type: &str,
         content: &str,
+        storage: &str,
+        size_bytes: u64,
+        sha256: &str,
+        path: Option<&str>,
     ) -> Result<(Artifact, Event)> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -734,12 +765,18 @@ impl Store {
             kind: kind.to_string(),
             mime_type: mime_type.to_string(),
             content: content.to_string(),
+            storage: storage.to_string(),
+            size_bytes,
+            sha256: sha256.to_string(),
+            path: path.map(str::to_string),
+            data_base64: None,
             created_at: now_rfc3339(),
         };
         tx.execute(
             "INSERT INTO artifacts
-             (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type, content, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
+              content, storage, size_bytes, sha256, path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 artifact.id,
                 artifact.session_id,
@@ -750,6 +787,10 @@ impl Store {
                 artifact.kind,
                 artifact.mime_type,
                 artifact.content,
+                artifact.storage,
+                artifact.size_bytes as i64,
+                artifact.sha256,
+                artifact.path,
                 artifact.created_at
             ],
         )?;
@@ -772,11 +813,94 @@ impl Store {
         Ok((artifact, event))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_artifact_file_with_event(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<&str>,
+        name: &str,
+        kind: &str,
+        mime_type: &str,
+        data: &[u8],
+        sha256: &str,
+    ) -> Result<(Artifact, Event)> {
+        let id = Uuid::now_v7().to_string();
+        let dir = self.data_dir.join("artifacts").join(session_id);
+        paths::ensure_private_dir(&dir)?;
+        let path = dir.join(&id);
+        std::fs::write(&path, data)
+            .with_context(|| format!("writing artifact file {}", path.display()))?;
+        paths::ensure_private_file(&path)?;
+        let artifact = Artifact {
+            id: id.clone(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.to_string(),
+            agent_name: agent_name.to_string(),
+            task_id: task_id.map(str::to_string),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            mime_type: mime_type.to_string(),
+            content: String::new(),
+            storage: "file".to_string(),
+            size_bytes: data.len() as u64,
+            sha256: sha256.to_string(),
+            path: Some(path.to_string_lossy().to_string()),
+            data_base64: None,
+            created_at: now_rfc3339(),
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO artifacts
+             (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
+              content, storage, size_bytes, sha256, path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', 'file', ?9, ?10, ?11, ?12)",
+            params![
+                artifact.id,
+                artifact.session_id,
+                artifact.agent_id,
+                artifact.agent_name,
+                artifact.task_id,
+                artifact.name,
+                artifact.kind,
+                artifact.mime_type,
+                artifact.size_bytes as i64,
+                artifact.sha256,
+                artifact.path,
+                artifact.created_at
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "artifact.published",
+            serde_json::json!({
+                "artifact_id": artifact.id,
+                "name": artifact.name,
+                "kind": artifact.kind,
+                "agent_id": artifact.agent_id,
+                "agent_name": artifact.agent_name,
+                "storage": artifact.storage,
+                "size_bytes": artifact.size_bytes,
+            }),
+        )?;
+        if let Err(error) = tx.commit() {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((artifact, event))
+    }
+
     pub fn list_artifacts(&self, session_id: &str) -> Result<Vec<Artifact>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
-                    mime_type, content, created_at
+                    mime_type, content, storage, size_bytes, sha256, path, created_at
              FROM artifacts WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], map_artifact)?;
@@ -787,13 +911,78 @@ impl Store {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
-                    mime_type, content, created_at
+                    mime_type, content, storage, size_bytes, sha256, path, created_at
              FROM artifacts WHERE id = ?1",
             params![artifact_id],
             map_artifact,
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn get_artifact_policy(&self, project_id: &str) -> Result<ArtifactPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT auto_gc, max_bytes, max_age_secs, max_count
+                 FROM project_artifact_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(ArtifactPolicy {
+                        auto_gc: row.get::<_, i64>(0)? != 0,
+                        max_bytes: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
+                        max_age_secs: row.get::<_, Option<i64>>(2)?.map(|value| value as u64),
+                        max_count: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn set_artifact_policy(&self, project_id: &str, policy: &ArtifactPolicy) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_artifact_policies
+                (project_id, auto_gc, max_bytes, max_age_secs, max_count, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(project_id) DO UPDATE SET
+                auto_gc = excluded.auto_gc,
+                max_bytes = excluded.max_bytes,
+                max_age_secs = excluded.max_age_secs,
+                max_count = excluded.max_count,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                if policy.auto_gc { 1 } else { 0 },
+                policy.max_bytes.map(|value| value as i64),
+                policy.max_age_secs.map(|value| value as i64),
+                policy.max_count.map(|value| value as i64),
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_artifacts_for_project(&self, project_id: &str) -> Result<Vec<Artifact>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.session_id, a.agent_id, a.agent_name, a.task_id, a.name,
+                    a.kind, a.mime_type, a.content, a.storage, a.size_bytes, a.sha256,
+                    a.path, a.created_at
+             FROM artifacts a
+             JOIN sessions s ON s.id = a.session_id
+             WHERE s.project_id = ?1
+             ORDER BY a.created_at ASC, a.id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], map_artifact)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn delete_artifact(&self, artifact_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute("DELETE FROM artifacts WHERE id = ?1", params![artifact_id])?;
+        Ok(changed > 0)
     }
 
     pub fn add_session_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
@@ -2058,11 +2247,38 @@ impl Store {
             )?;
         }
         for artifact in &bundle.artifacts {
+            let (content, storage, size_bytes, sha256, path) =
+                if let Some(encoded) = &artifact.data_base64 {
+                    use base64::Engine as _;
+                    let data = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .context("decoding artifact data")?;
+                    let dir = self.data_dir.join("artifacts").join(&bundle.session.id);
+                    paths::ensure_private_dir(&dir)?;
+                    let file = dir.join(&artifact.id);
+                    std::fs::write(&file, &data)?;
+                    paths::ensure_private_file(&file)?;
+                    (
+                        String::new(),
+                        "file".to_string(),
+                        data.len() as u64,
+                        artifact.sha256.clone(),
+                        Some(file.to_string_lossy().to_string()),
+                    )
+                } else {
+                    (
+                        artifact.content.clone(),
+                        artifact.storage.clone(),
+                        artifact.size_bytes,
+                        artifact.sha256.clone(),
+                        None,
+                    )
+                };
             tx.execute(
                 "INSERT INTO artifacts
                  (id, session_id, agent_id, agent_name, task_id, name, kind,
-                  mime_type, content, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  mime_type, content, storage, size_bytes, sha256, path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     artifact.id,
                     artifact.session_id,
@@ -2072,7 +2288,11 @@ impl Store {
                     artifact.name,
                     artifact.kind,
                     artifact.mime_type,
-                    artifact.content,
+                    content,
+                    storage,
+                    size_bytes as i64,
+                    sha256,
+                    path,
                     artifact.created_at
                 ],
             )?;
@@ -2552,7 +2772,12 @@ fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
         kind: row.get(6)?,
         mime_type: row.get(7)?,
         content: row.get(8)?,
-        created_at: row.get(9)?,
+        storage: row.get(9)?,
+        size_bytes: row.get::<_, i64>(10)? as u64,
+        sha256: row.get(11)?,
+        path: row.get(12)?,
+        data_base64: None,
+        created_at: row.get(13)?,
     })
 }
 
@@ -2869,6 +3094,10 @@ mod tests {
                 "note",
                 "text/markdown",
                 "# API notes\n",
+                "inline",
+                12,
+                "test-sha",
+                None,
             )
             .unwrap();
         assert_eq!(event.kind, "artifact.published");

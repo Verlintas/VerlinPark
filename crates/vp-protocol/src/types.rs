@@ -292,8 +292,59 @@ pub struct Artifact {
     pub name: String,
     pub kind: String,
     pub mime_type: String,
+    #[serde(default)]
     pub content: String,
+    #[serde(default)]
+    pub storage: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactPolicy {
+    #[serde(default)]
+    pub auto_gc: bool,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+    #[serde(default)]
+    pub max_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetArtifactPolicyParams {
+    pub project_id: String,
+    pub policy: ArtifactPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactPolicyResult {
+    pub project_id: String,
+    pub policy: ArtifactPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactGcParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactGcResult {
+    pub removed: usize,
+    pub bytes_freed: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

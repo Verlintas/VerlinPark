@@ -40,6 +40,47 @@ struct IntegrationPolicyResult: Codable, Sendable {
     }
 }
 
+struct ArtifactPolicy: Codable, Hashable, Sendable {
+    var autoGc: Bool
+    var maxBytes: Int?
+    var maxAgeSecs: Int?
+    var maxCount: Int?
+
+    static let disabled = ArtifactPolicy(
+        autoGc: false,
+        maxBytes: nil,
+        maxAgeSecs: nil,
+        maxCount: nil
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case autoGc = "auto_gc"
+        case maxBytes = "max_bytes"
+        case maxAgeSecs = "max_age_secs"
+        case maxCount = "max_count"
+    }
+}
+
+struct ArtifactPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: ArtifactPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
+struct ArtifactGcResult: Codable, Sendable {
+    let removed: Int
+    let bytesFreed: Int
+
+    enum CodingKeys: String, CodingKey {
+        case removed
+        case bytesFreed = "bytes_freed"
+    }
+}
+
 struct ShellPolicyResult: Codable, Sendable {
     let projectId: String
     let policy: ShellPolicy
@@ -233,6 +274,10 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
     let kind: String
     let mimeType: String
     let content: String
+    let storage: String
+    let sizeBytes: Int
+    let sha256: String
+    let path: String?
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -245,6 +290,10 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
         case kind
         case mimeType = "mime_type"
         case content
+        case storage
+        case sizeBytes = "size_bytes"
+        case sha256
+        case path
         case createdAt = "created_at"
     }
 }

@@ -271,6 +271,36 @@ actor CoreClient {
             .artifact
     }
 
+    func artifactPolicy(projectID: String) async throws -> ArtifactPolicy {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "artifact.policy.get", params: params)
+            .decode(ArtifactPolicyResult.self)
+            .policy
+    }
+
+    func setArtifactPolicy(
+        projectID: String,
+        policy: ArtifactPolicy
+    ) async throws -> ArtifactPolicy {
+        var value: [String: JSONValue] = ["auto_gc": .bool(policy.autoGc)]
+        value["max_bytes"] = policy.maxBytes.map { .number(Double($0)) } ?? .null
+        value["max_age_secs"] = policy.maxAgeSecs.map { .number(Double($0)) } ?? .null
+        value["max_count"] = policy.maxCount.map { .number(Double($0)) } ?? .null
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object(value),
+        ]
+        return try await request(method: "artifact.policy.set", params: params)
+            .decode(ArtifactPolicyResult.self)
+            .policy
+    }
+
+    func gcArtifacts(projectID: String) async throws -> ArtifactGcResult {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "artifact.gc", params: params)
+            .decode(ArtifactGcResult.self)
+    }
+
     func listMergeQueue(sessionID: String) async throws -> [MergeQueueEntry] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "merge_queue.list", params: params)

@@ -18,7 +18,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、worktree/scratch 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 80（core 62 / store 13 / providers 5），Swift 9。CI 以最新提交为准。
+当前测试：Rust 81（core 63 / store 13 / providers 5），Swift 9。CI 以最新提交为准。
 
 ---
 
@@ -48,7 +48,7 @@
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
-| 测试 | B− | 80 Rust + 9 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/models/budgets/mailbox/artifacts/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 81 Rust + 9 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/models/budgets/mailbox/binary artifacts/GC/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -240,7 +240,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 80 个 Rust 测试 + 9 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、per-role models/USD/time budgets、mailbox 与 artifact store。仍缺：
+已有 81 个 Rust 测试 + 9 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、per-role models/USD/time budgets、mailbox、text/binary artifacts 与 GC。仍缺：
 
 - plan 自动派发的 scope overlap / cap 回归
 - 并发预算超调上界
@@ -288,14 +288,14 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 1. queue 状态机、冲突 rebase/retry、集成检查、本地 landing、显式 push/PR 已实现。
 2. 确定性 Integrator 事件 + Queue UI 已实现；可选 LLM Integrator 仍待做。
 3. 下一步：一条真实 fixture 的端到端 demo：Leader plan → 多 Worker → Verifier → queue → 集成测试 → 人类 review → land/PR。
-4. 没有这个 demo，不建议继续加 auto-expansion、per-role token/task budget trees、binary artifact store。
+4. 没有这个 demo，不建议继续加 auto-expansion、per-role token/task budget trees、content-addressed artifact dedupe。
 
 **M3.5 — 事件与恢复**
 1. 统一 event/projection 写路径，或把文档改成 audit log。
 2. replay/export、worktree 清理、断线重连。
 
 **M4 — 平台化**
-1. binary/GC artifact store 与 mailbox retention。
+1. content-addressed artifact dedupe/compression 与 mailbox retention。
 2. per-role token/task budget tree；session 级 per-role model / USD / time budget 已实现。
 3. auto-expansion / capacity controller。
 4. MCP/ACP、终端、hunk review、非 GitHub PR adapter。
@@ -344,7 +344,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 80 passed after the 10-31 mailbox/artifact slice
+cargo test --workspace     # 81 passed after the 10-31 binary artifact/GC slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```

@@ -43,6 +43,13 @@ final class AppModel {
     var integrationMaxTokensText = ""
     var integrationPolicyBusy = false
     var integrationPolicyStatus: String?
+    var artifactPolicy = ArtifactPolicy.disabled
+    var artifactAutoGc = false
+    var artifactMaxBytesText = ""
+    var artifactMaxAgeText = ""
+    var artifactMaxCountText = ""
+    var artifactPolicyBusy = false
+    var artifactPolicyStatus: String?
     var teamPlan: TeamPlan?
     var planTaskStatuses: [String: String] = [:]
     var sessionDiff: SessionDiff?
@@ -122,6 +129,7 @@ final class AppModel {
             await loadSessions()
             await loadShellPolicy()
             await loadIntegrationPolicy()
+            await loadArtifactPolicy()
         } catch {
             handle(error)
         }
@@ -147,6 +155,12 @@ final class AppModel {
             integrationMaxAutoAttempts = 1
             integrationMaxTokensText = ""
             integrationPolicyStatus = nil
+            artifactPolicy = .disabled
+            artifactAutoGc = false
+            artifactMaxBytesText = ""
+            artifactMaxAgeText = ""
+            artifactMaxCountText = ""
+            artifactPolicyStatus = nil
             teamPlan = nil
             planTaskStatuses = [:]
             lastCommit = nil
@@ -168,6 +182,7 @@ final class AppModel {
         artifacts = []
         Task { await loadShellPolicy() }
         Task { await loadIntegrationPolicy() }
+        Task { await loadArtifactPolicy() }
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -435,6 +450,95 @@ final class AppModel {
                 : "Auto-resolve disabled"
         } catch {
             integrationPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadArtifactPolicy() async {
+        guard let projectID = selectedProjectID else {
+            artifactPolicy = .disabled
+            artifactAutoGc = false
+            artifactMaxBytesText = ""
+            artifactMaxAgeText = ""
+            artifactMaxCountText = ""
+            artifactPolicyStatus = nil
+            return
+        }
+        artifactPolicyBusy = true
+        defer { artifactPolicyBusy = false }
+        do {
+            let policy = try await core.artifactPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            artifactPolicy = policy
+            artifactAutoGc = policy.autoGc
+            artifactMaxBytesText = policy.maxBytes.map(String.init) ?? ""
+            artifactMaxAgeText = policy.maxAgeSecs.map(String.init) ?? ""
+            artifactMaxCountText = policy.maxCount.map(String.init) ?? ""
+            artifactPolicyStatus = nil
+        } catch {
+            handle(error)
+        }
+    }
+
+    func saveArtifactPolicy() async {
+        guard let projectID = selectedProjectID else {
+            artifactPolicyStatus = "Select a project first."
+            return
+        }
+        func optionalInt(_ text: String) -> Int? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty ? nil : Int(trimmed)
+        }
+        let maxBytes = optionalInt(artifactMaxBytesText)
+        let maxAge = optionalInt(artifactMaxAgeText)
+        let maxCount = optionalInt(artifactMaxCountText)
+        if (!artifactMaxBytesText.trimmingCharacters(in: .whitespaces).isEmpty && maxBytes == nil)
+            || (!artifactMaxAgeText.trimmingCharacters(in: .whitespaces).isEmpty && maxAge == nil)
+            || (!artifactMaxCountText.trimmingCharacters(in: .whitespaces).isEmpty && maxCount == nil)
+        {
+            artifactPolicyStatus = "Limits must be empty or positive integers."
+            return
+        }
+        artifactPolicyBusy = true
+        defer { artifactPolicyBusy = false }
+        do {
+            let policy = try await core.setArtifactPolicy(
+                projectID: projectID,
+                policy: ArtifactPolicy(
+                    autoGc: artifactAutoGc,
+                    maxBytes: maxBytes,
+                    maxAgeSecs: maxAge,
+                    maxCount: maxCount
+                )
+            )
+            guard projectID == selectedProjectID else { return }
+            artifactPolicy = policy
+            artifactPolicyStatus = policy.autoGc ? "Automatic GC enabled" : "Artifact policy saved"
+        } catch {
+            artifactPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func resetArtifactPolicy() async {
+        artifactAutoGc = false
+        artifactMaxBytesText = ""
+        artifactMaxAgeText = ""
+        artifactMaxCountText = ""
+        await saveArtifactPolicy()
+    }
+
+    func gcArtifacts() async {
+        guard let projectID = selectedProjectID else { return }
+        artifactPolicyBusy = true
+        defer { artifactPolicyBusy = false }
+        do {
+            let result = try await core.gcArtifacts(projectID: projectID)
+            artifactPolicyStatus =
+                "Removed \(result.removed) artifact(s), freed \(result.bytesFreed) bytes"
+            await loadMailbox()
+        } catch {
+            artifactPolicyStatus = error.localizedDescription
             handle(error)
         }
     }

@@ -72,6 +72,9 @@ struct DashboardView: View {
                     IntegrationPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    ArtifactPolicyCard(project: project)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         SectionLabel(title: "Shell policy")
@@ -291,6 +294,89 @@ private struct IntegrationPolicyCard: View {
         }
         .task(id: project.id) {
             await model.loadIntegrationPolicy()
+        }
+    }
+}
+
+private struct ArtifactPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Artifact policy")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.artifactPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Toggle("Auto GC", isOn: $model.artifactAutoGc)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+
+            Text(
+                "Retention uses the oldest artifacts first. Binary artifacts are copied into the data directory; text artifacts stay inline in SQLite. Limits are optional."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                limitField("Max bytes", text: $model.artifactMaxBytesText)
+                limitField("Max age secs", text: $model.artifactMaxAgeText)
+                limitField("Max count", text: $model.artifactMaxCountText)
+                Spacer()
+                Button("GC now") {
+                    Task { await model.gcArtifacts() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.artifactPolicyBusy)
+                Button("Reset") {
+                    Task { await model.resetArtifactPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.artifactPolicyBusy)
+                Button("Save policy") {
+                    Task { await model.saveArtifactPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.artifactPolicyBusy)
+            }
+
+            if let status = model.artifactPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadArtifactPolicy()
+        }
+    }
+
+    private func limitField(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            TextField("unlimited", text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 9, design: .monospaced))
+                .frame(width: 90)
         }
     }
 }

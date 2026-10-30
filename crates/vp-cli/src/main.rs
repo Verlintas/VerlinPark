@@ -111,6 +111,22 @@ enum Command {
     ReadMessage { message: String },
     /// List published artifacts.
     Artifacts { session: String },
+    /// Show the project artifact retention policy.
+    ArtifactPolicy { project: String },
+    /// Update artifact retention and optional automatic GC.
+    ArtifactPolicySet {
+        project: String,
+        #[arg(long)]
+        auto_gc: bool,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        #[arg(long)]
+        max_age_secs: Option<u64>,
+        #[arg(long)]
+        max_count: Option<u64>,
+    },
+    /// Run artifact retention GC for a project.
+    Gc { project: String },
     /// Read an artifact by id.
     Artifact { artifact: String },
     /// Show the session merge queue and Integrator results.
@@ -338,6 +354,39 @@ async fn main() -> Result<()> {
         Command::Artifact { artifact } => {
             rpc(&discovery, "artifact.get", json!({"artifact_id": artifact})).await?
         }
+        Command::ArtifactPolicy { project } => {
+            rpc(
+                &discovery,
+                "artifact.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ArtifactPolicySet {
+            project,
+            auto_gc,
+            max_bytes,
+            max_age_secs,
+            max_count,
+        } => {
+            rpc(
+                &discovery,
+                "artifact.policy.set",
+                json!({
+                    "project_id": project,
+                    "policy": {
+                        "auto_gc": auto_gc,
+                        "max_bytes": max_bytes,
+                        "max_age_secs": max_age_secs,
+                        "max_count": max_count,
+                    }
+                }),
+            )
+            .await?
+        }
+        Command::Gc { project } => {
+            rpc(&discovery, "artifact.gc", json!({"project_id": project})).await?
+        }
         Command::Queue { session } => {
             rpc(
                 &discovery,
@@ -529,6 +578,17 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(policy) = value.get("policy") {
+        if policy.get("auto_gc").is_some() {
+            println!(
+                "project {}  auto-gc={}  max-bytes={}  max-age={}  max-count={}",
+                value["project_id"].as_str().unwrap_or("?"),
+                policy["auto_gc"].as_bool().unwrap_or(false),
+                policy["max_bytes"].as_u64().unwrap_or(0),
+                policy["max_age_secs"].as_u64().unwrap_or(0),
+                policy["max_count"].as_u64().unwrap_or(0)
+            );
+            return;
+        }
         if policy.get("auto_resolve").is_some() {
             println!(
                 "project {}  auto-resolve={}  max-attempts={}  max-tokens={}",
@@ -662,6 +722,14 @@ fn print_human(value: &Value) {
         }
         return;
     }
+    if value.get("removed").is_some() && value.get("bytes_freed").is_some() {
+        println!(
+            "artifact GC removed {} artifact(s), freed {} bytes",
+            value["removed"].as_u64().unwrap_or(0),
+            value["bytes_freed"].as_u64().unwrap_or(0)
+        );
+        return;
+    }
     if let Some(messages) = value.get("messages").and_then(Value::as_array) {
         if messages.is_empty() {
             println!("Mailbox is empty.");
@@ -711,12 +779,21 @@ fn print_human(value: &Value) {
     }
     if let Some(artifact) = value.get("artifact") {
         println!(
-            "{}  {}  [{}]",
+            "{}  {}  [{}]  {}  {} bytes",
             artifact["name"].as_str().unwrap_or("?"),
             artifact["kind"].as_str().unwrap_or("?"),
-            artifact["mime_type"].as_str().unwrap_or("?")
+            artifact["mime_type"].as_str().unwrap_or("?"),
+            artifact["storage"].as_str().unwrap_or("?"),
+            artifact["size_bytes"].as_u64().unwrap_or(0)
         );
-        println!("{}", artifact["content"].as_str().unwrap_or(""));
+        if artifact["storage"].as_str() == Some("file") {
+            println!(
+                "stored at {}",
+                artifact["path"].as_str().unwrap_or("(path unavailable)")
+            );
+        } else {
+            println!("{}", artifact["content"].as_str().unwrap_or(""));
+        }
         return;
     }
     if let Some(entries) = value.get("entries").and_then(Value::as_array) {

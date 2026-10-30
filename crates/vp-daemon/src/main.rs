@@ -23,18 +23,19 @@ use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
     AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, ApprovalListResult,
-    ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactResult, AuthParams,
-    AuthResult, CancelSessionParams, CancelSessionResult, CommitSessionParams,
-    ConfigureAgentParams, CreateSessionParams, DiscardSessionParams, EventListResult,
-    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, MailboxListParams, MailboxListResult,
-    MarkMessageReadParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
-    PingResult, ProjectListResult, PromptParams, PromptResult, RehydrateSessionParams,
-    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
-    ResolveMergeResult, RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams,
-    SessionExportParams, SessionImportParams, SessionListResult, SessionPauseParams,
-    SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
-    SessionTodosResult, SetIntegrationPolicyParams, SetShellPolicyParams, ShellPolicyParams,
+    ArtifactGcParams, ArtifactGetParams, ArtifactListParams, ArtifactListResult,
+    ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult, AuthParams, AuthResult,
+    CancelSessionParams, CancelSessionResult, CommitSessionParams, ConfigureAgentParams,
+    CreateSessionParams, DiscardSessionParams, EventListResult, IntegrationPolicyParams,
+    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
+    ListSessionsParams, MailboxListParams, MailboxListResult, MarkMessageReadParams,
+    MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams, PingResult,
+    ProjectListResult, PromptParams, PromptResult, RehydrateSessionParams, ReplaySessionParams,
+    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
+    RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams,
+    SessionImportParams, SessionListResult, SessionPauseParams, SessionPauseResult,
+    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
+    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetShellPolicyParams, ShellPolicyParams,
     ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
@@ -613,6 +614,49 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Ok(artifacts) => RpcResponse::success(id, ArtifactListResult { artifacts }),
                 Err(error) => internal_error(id, error),
             },
+            Err(response) => response_with_id(id, response),
+        },
+        "artifact.policy.get" => match parse_params::<ArtifactPolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_artifact_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    ArtifactPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "artifact.policy.set" => match parse_params::<SetArtifactPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_artifact_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    ArtifactPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "artifact.gc" => match parse_params::<ArtifactGcParams>(request.params) {
+            Ok(params) => {
+                let policy = match state.engine.get_artifact_policy(&params.project_id).await {
+                    Ok(policy) => policy,
+                    Err(error) => return internal_error(id, error),
+                };
+                match state.engine.gc_artifacts(&params.project_id, &policy).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                }
+            }
             Err(response) => response_with_id(id, response),
         },
         "artifact.get" => match parse_params::<ArtifactGetParams>(request.params) {

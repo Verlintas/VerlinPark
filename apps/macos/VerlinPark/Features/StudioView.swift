@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 enum StudioTab: String, CaseIterable, Identifiable {
@@ -1245,16 +1246,40 @@ private struct ArtifactRow: View {
                 Text(artifact.kind)
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.secondary)
+                Text(artifact.storage)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
                 Spacer()
                 Text(artifact.agentName)
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
-            Text(artifact.content)
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .lineLimit(8)
-                .textSelection(.enabled)
+            Text("\(artifact.sizeBytes) bytes · \(artifact.mimeType)")
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            if artifact.storage == "file" {
+                HStack(spacing: 8) {
+                    Text(artifact.path ?? "path unavailable")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let path = artifact.path {
+                        Button("Open") {
+                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                Text(artifact.content)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(8)
+                    .textSelection(.enabled)
+            }
         }
         .padding(9)
         .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))

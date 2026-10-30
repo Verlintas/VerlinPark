@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-10-31
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Per-role Models/USD/Time Budgets + Typed Mailbox/Artifacts + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Per-role Models/USD/Time Budgets + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
 
@@ -34,7 +34,7 @@
 | 预算 / 取消 / 暂停 | ✅ | token reservation + provider usage 结算；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复；`session.pause` / `session.resume` / `vp pause` / `vp resume` 在 turn/tool 边界协作式暂停并继续同一 run |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；UI Approve/Deny |
 | 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR/mailbox/artifact 事件；Collab roster；Preview Plan/Changes/Queue/Mailbox/Trace |
-| Mailbox / artifacts | ✅ | session-scoped typed messages（unread/read、sender/receiver、kind、body、JSON payload）+ text artifacts（≤100KB）；agent tools `send_message`/`read_mailbox`/`publish_artifact`/`list_artifacts`/`read_artifact`；RPC/CLI/Preview Mailbox；bundle export/import |
+| Mailbox / artifacts | ✅ | session-scoped typed messages（unread/read、sender/receiver、kind、body、JSON payload）+ text artifacts（≤100KB）+ binary file artifacts（≤5MiB，SHA-256/path）；agent tools `send_message`/`read_mailbox`/`publish_artifact`/`list_artifacts`/`read_artifact`；RPC/CLI/Preview Mailbox；bundle export/import（binary base64）；项目 artifact policy（max bytes/age/count、auto GC）+ manual GC |
 | Event consistency | ✅ | session status / usage / agent status / team plan / todos / messages / merge queue / agent roster / recovery 使用 event+projection 原子事务；`session.replay` / `--repair` / `--rebuild` 可校验并重建覆盖投影；`session.export` / `session.import` 支持 bundle 迁移 |
 | Import archive | ✅ | `vp import <bundle>` 保留 session/project/事件/approvals/投影；导入 session 为只读 archive，不创建 worktree |
 | Rehydrate | ✅ | `vp rehydrate <session> [--worktree path]`：only imported；校验 project/base commit；创建/attach session worktree；按 branch 分组重建 imported agent task worktrees；状态回到 idle；返回 warnings/remapped count |
@@ -42,11 +42,11 @@
 | Global scheduling | ✅ | daemon-wide session semaphore：`VERLINPARK_GLOBAL_SESSION_CAP` 默认 4（1–32）；超出时 session 状态 `queued`，`agent.queued`，可 cancel；跨 session Worker/Labour write-scope 锁按 project 串行等待，同 session 共享，空 scope 视为 wildcard |
 | Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
 | Models / budgets | ✅ | 分角色 model override + input/output USD/1M price；session token / USD / wall-clock budget；cost 持久化 + `agent.cost`；time 在 turn/tool 边界检查；Providers/New Session/CLI/UI |
-| CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/mailbox/read-message/artifacts/artifact/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/export/import/rehydrate |
+| CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/mailbox/read-message/artifacts/artifact/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/export/import/rehydrate |
 
 ## 验证
 
-- `cargo test --workspace`：80 个测试通过（core 62、store 13、providers 5）。
+- `cargo test --workspace`：81 个测试通过（core 63、store 13、providers 5）。
 - `xcodebuild test`：9 个 Swift 测试通过。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -71,7 +71,7 @@
 - 没有完整全局 Task-DAG 调度器/公平队列、task retry UI、单 task cancel/pause；daemon-wide session admission 与 Worker/Labour scope locks 已实现。
 - 没有 auto-expansion；Manager/Worker 上限是固定 caps，不是按预算自动扩编。
 - 没有 per-role token budget / task/department budget tree；USD 预算依赖用户手填价格，时间预算只在 turn/tool 边界检查，不能抢占 in-flight provider/tool。
-- Mailbox 是 pull-based：消息不会唤醒 idle Agent/创建新 run；artifact 只有文本（≤100KB），没有 binary、GC、retention 或内容寻址存储；replay 暂不比较 mailbox/artifact 投影。
+- Mailbox 是 pull-based：消息不会唤醒 idle Agent/创建新 run；artifact binary 上限 5MiB，没有内容寻址 dedupe/压缩，GC oldest-first 无回收站；replay 暂不比较 mailbox/artifact 投影。
 - 没有 context compaction、checkpoint/resume；暂停状态只在内存中，daemon 重启会把 running/paused session 标为 failed。
 - 没有终端、逐 hunk review、真实 Collab 节点、MCP/ACP、web search。
 - Shell 只做写入隔离与常见 credential read-deny；项目 policy 只能收窄不能放宽、只对后续 run 生效，且不随 session bundle 导出；不是完整 read jail，network allow 下仍可外发，`sandbox-exec` 是废弃 API；task worktree/branch/shell scratch 暂无自动清理。
@@ -106,6 +106,7 @@
 - **M3 第十八切片**：daemon-wide session admission（queued sessions）+ 跨 session Worker/Labour write-scope locks。
 - **M3 第十九切片**：分角色模型覆盖 + per-role USD pricing + session USD/wall-clock budgets。
 - **M3 第二十切片**：session-scoped typed mailbox + text artifact store + agent tools/UI/CLI/bundle。
+- **M3 第二十一切片**：binary file artifacts（≤5MiB）+ SHA-256/path + project retention policy + manual/auto GC + bundle base64。
 
 ## 如何运行
 

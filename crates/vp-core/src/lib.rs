@@ -10,10 +10,10 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    AgentMessage, AgentRecord, Approval, Artifact, Event, IntegrationPolicy, MergeQueueEntry,
-    Project, PullRequestResult, Session, SessionBundle, SessionCommit, SessionDiff,
-    SessionImportResult, SessionLandResult, SessionRehydrateResult, SessionReplayReport,
-    ShellPolicy, StoredMessage, TeamPlan, TodoItem,
+    AgentMessage, AgentRecord, Approval, Artifact, ArtifactGcResult, ArtifactPolicy, Event,
+    IntegrationPolicy, MergeQueueEntry, Project, PullRequestResult, Session, SessionBundle,
+    SessionCommit, SessionDiff, SessionImportResult, SessionLandResult, SessionRehydrateResult,
+    SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -39,6 +39,11 @@ pub struct Engine {
     events: broadcast::Sender<Event>,
     approval_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     git_lock: Arc<Mutex<()>>,
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(data))
 }
 
 fn normalize_shell_policy(mut policy: ShellPolicy) -> Result<ShellPolicy> {
@@ -891,6 +896,8 @@ impl Engine {
         let kind = kind.to_string();
         let mime_type = mime_type.to_string();
         let content = content.to_string();
+        let size_bytes = content.len() as u64;
+        let sha256 = sha256_hex(content.as_bytes());
         let (artifact, event) = tokio::task::spawn_blocking(move || {
             store.create_artifact_with_event(
                 &session_id,
@@ -901,11 +908,190 @@ impl Engine {
                 &kind,
                 &mime_type,
                 &content,
+                "inline",
+                size_bytes,
+                &sha256,
+                None,
             )
         })
         .await??;
         let _ = self.events.send(event);
+        self.auto_gc_restarted_artifact(&artifact.session_id).await;
         Ok(artifact)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_artifact_file(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<String>,
+        name: &str,
+        kind: &str,
+        mime_type: &str,
+        source_path: &Path,
+        allowed_root: &Path,
+    ) -> Result<Artifact> {
+        let root = allowed_root.canonicalize()?;
+        let source = source_path.canonicalize()?;
+        if !source.starts_with(&root) {
+            anyhow::bail!("artifact source is outside the agent worktree");
+        }
+        let data = tokio::fs::read(&source).await?;
+        if data.len() > 5 * 1024 * 1024 {
+            anyhow::bail!("binary artifact exceeds 5 MiB");
+        }
+        let name = name.trim();
+        if name.is_empty() || name.len() > 200 {
+            anyhow::bail!("artifact name must be 1-200 characters");
+        }
+        let sha256 = sha256_hex(&data);
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+        let agent_name = agent_name.to_string();
+        let name = name.to_string();
+        let kind = kind.to_string();
+        let mime_type = mime_type.to_string();
+        let (artifact, event) = tokio::task::spawn_blocking(move || {
+            store.create_artifact_file_with_event(
+                &session_id,
+                &agent_id,
+                &agent_name,
+                task_id.as_deref(),
+                &name,
+                &kind,
+                &mime_type,
+                &data,
+                &sha256,
+            )
+        })
+        .await??;
+        let _ = self.events.send(event);
+        self.auto_gc_restarted_artifact(&artifact.session_id).await;
+        Ok(artifact)
+    }
+
+    async fn auto_gc_restarted_artifact(&self, session_id: &str) {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let project_id =
+            match tokio::task::spawn_blocking(move || store.get_session(&session_id)).await {
+                Ok(Ok(Some(session))) => session.project_id,
+                _ => return,
+            };
+        let policy = match self.get_artifact_policy(&project_id).await {
+            Ok(policy) if policy.auto_gc => policy,
+            _ => return,
+        };
+        let _ = self.gc_artifacts(&project_id, &policy).await;
+    }
+
+    pub async fn get_artifact_policy(&self, project_id: &str) -> Result<ArtifactPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_artifact_policy(&project_id)).await?
+    }
+
+    pub async fn set_artifact_policy(
+        &self,
+        project_id: &str,
+        policy: ArtifactPolicy,
+    ) -> Result<ArtifactPolicy> {
+        if policy.max_bytes.is_some_and(|value| value == 0) {
+            anyhow::bail!("max_bytes must be greater than zero");
+        }
+        if policy.max_age_secs.is_some_and(|value| value == 0) {
+            anyhow::bail!("max_age_secs must be greater than zero");
+        }
+        if policy.max_count.is_some_and(|value| value == 0) {
+            anyhow::bail!("max_count must be greater than zero");
+        }
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let for_store = policy.clone();
+        tokio::task::spawn_blocking(move || store.set_artifact_policy(&project_id, &for_store))
+            .await??;
+        Ok(policy)
+    }
+
+    pub async fn gc_artifacts(
+        &self,
+        project_id: &str,
+        policy: &ArtifactPolicy,
+    ) -> Result<ArtifactGcResult> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        let artifacts = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.list_artifacts_for_project(&project_id)
+        })
+        .await??;
+        let now = time::OffsetDateTime::now_utc();
+        let mut remove = Vec::new();
+        let mut total_bytes: u64 = artifacts.iter().map(|artifact| artifact.size_bytes).sum();
+        if let Some(max_age) = policy.max_age_secs {
+            for artifact in &artifacts {
+                if let Ok(created) = time::OffsetDateTime::parse(
+                    &artifact.created_at,
+                    &time::format_description::well_known::Rfc3339,
+                ) && (now - created).whole_seconds().max(0) as u64 > max_age
+                {
+                    remove.push(artifact.id.clone());
+                }
+            }
+        }
+        if let Some(max_count) = policy.max_count
+            && artifacts.len() as u64 > max_count
+        {
+            let keep = artifacts.len() - max_count as usize;
+            remove.extend(
+                artifacts
+                    .iter()
+                    .take(keep)
+                    .map(|artifact| artifact.id.clone()),
+            );
+        }
+        if let Some(max_bytes) = policy.max_bytes {
+            for artifact in &artifacts {
+                if total_bytes <= max_bytes {
+                    break;
+                }
+                if !remove.contains(&artifact.id) {
+                    remove.push(artifact.id.clone());
+                    total_bytes = total_bytes.saturating_sub(artifact.size_bytes);
+                } else {
+                    total_bytes = total_bytes.saturating_sub(artifact.size_bytes);
+                }
+            }
+        }
+        remove.sort();
+        remove.dedup();
+        let mut bytes_freed = 0u64;
+        for id in &remove {
+            if let Some(artifact) = artifacts.iter().find(|artifact| &artifact.id == id) {
+                if let Some(path) = &artifact.path {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                bytes_freed = bytes_freed.saturating_add(artifact.size_bytes);
+            }
+            let store = self.store.clone();
+            let id = id.clone();
+            let _ = tokio::task::spawn_blocking(move || store.delete_artifact(&id)).await?;
+        }
+        Ok(ArtifactGcResult {
+            removed: remove.len(),
+            bytes_freed,
+        })
     }
 
     pub async fn list_artifacts(&self, session_id: &str) -> Result<Vec<Artifact>> {
@@ -1582,9 +1768,18 @@ impl Engine {
         .await??;
         let artifact_store = store;
         let artifacts_session = session_id;
-        let artifacts =
+        let mut artifacts =
             tokio::task::spawn_blocking(move || artifact_store.list_artifacts(&artifacts_session))
                 .await??;
+        for artifact in &mut artifacts {
+            if artifact.storage == "file"
+                && let Some(path) = &artifact.path
+                && let Ok(data) = tokio::fs::read(path).await
+            {
+                use base64::Engine as _;
+                artifact.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(data));
+            }
+        }
         let team_plan = data
             .plan
             .as_deref()
@@ -2158,6 +2353,101 @@ mod tests {
                 .create_session_with_limits(project.id, "bad time".into(), None, None, Some(0),)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_artifacts_and_gc_retention() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("artifacts".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "artifacts".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        std::fs::write(worktree.join("binary.bin"), b"\x00\x01\x02").unwrap();
+        let first = engine
+            .publish_artifact_file(
+                &session.id,
+                "agent-a",
+                "Worker",
+                Some("T1".into()),
+                "binary.bin",
+                "binary",
+                "application/octet-stream",
+                &worktree.join("binary.bin"),
+                &worktree,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.storage, "file");
+        assert_eq!(first.size_bytes, 3);
+        assert!(!first.sha256.is_empty());
+        assert!(std::path::Path::new(first.path.as_ref().unwrap()).is_file());
+
+        std::fs::write(worktree.join("second.bin"), b"second").unwrap();
+        let second = engine
+            .publish_artifact_file(
+                &session.id,
+                "agent-a",
+                "Worker",
+                None,
+                "second.bin",
+                "binary",
+                "application/octet-stream",
+                &worktree.join("second.bin"),
+                &worktree,
+            )
+            .await
+            .unwrap();
+        let policy = engine
+            .set_artifact_policy(
+                &project.id,
+                ArtifactPolicy {
+                    auto_gc: false,
+                    max_bytes: None,
+                    max_age_secs: None,
+                    max_count: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get_artifact_policy(&project.id).await.unwrap(),
+            policy
+        );
+        assert!(
+            engine
+                .set_artifact_policy(
+                    &project.id,
+                    ArtifactPolicy {
+                        auto_gc: false,
+                        max_bytes: None,
+                        max_age_secs: None,
+                        max_count: Some(0),
+                    },
+                )
+                .await
+                .is_err()
+        );
+        let gc = engine.gc_artifacts(&project.id, &policy).await.unwrap();
+        assert_eq!(gc.removed, 1);
+        let remaining = engine.list_artifacts(&session.id).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        let kept = &remaining[0];
+        assert!(kept.id == first.id || kept.id == second.id);
+        assert!(
+            std::path::Path::new(first.path.as_ref().unwrap()).exists()
+                || std::path::Path::new(second.path.as_ref().unwrap()).exists()
         );
     }
 
@@ -2784,6 +3074,22 @@ mod tests {
             )
             .await
             .unwrap();
+        let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+        std::fs::write(session_worktree.join("bundle.bin"), b"binary bundle").unwrap();
+        engine
+            .publish_artifact_file(
+                &session.id,
+                &agent.id,
+                &agent.name,
+                Some("T1".into()),
+                "bundle.bin",
+                "binary",
+                "application/octet-stream",
+                &session_worktree.join("bundle.bin"),
+                &session_worktree,
+            )
+            .await
+            .unwrap();
 
         let bundle = engine.export_session(&session.id).await.unwrap();
         assert_eq!(bundle.version, 1);
@@ -2795,7 +3101,7 @@ mod tests {
         assert_eq!(bundle.approvals[0].status, "approved");
         assert_eq!(bundle.merge_queue.len(), 1);
         assert_eq!(bundle.agent_messages.len(), 1);
-        assert_eq!(bundle.artifacts.len(), 1);
+        assert_eq!(bundle.artifacts.len(), 2);
         assert!(bundle.team_plan.is_some());
         assert!(!bundle.events.is_empty());
         let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
@@ -2822,14 +3128,15 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(
-            imported_engine
-                .list_artifacts(&session.id)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        let imported_artifacts = imported_engine.list_artifacts(&session.id).await.unwrap();
+        assert_eq!(imported_artifacts.len(), 2);
+        let imported_binary = imported_artifacts
+            .iter()
+            .find(|artifact| artifact.name == "bundle.bin")
+            .unwrap();
+        assert_eq!(imported_binary.storage, "file");
+        let imported_bytes = std::fs::read(imported_binary.path.as_ref().unwrap()).unwrap();
+        assert_eq!(imported_bytes, b"binary bundle");
         let imported_sessions = imported_engine
             .list_sessions(Some(imported.project_id.clone()))
             .await
