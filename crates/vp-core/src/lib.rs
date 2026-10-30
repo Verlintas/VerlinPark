@@ -27,6 +27,7 @@ struct ReplayData {
     plan: Option<String>,
     todos: Vec<TodoItem>,
     agents: Vec<AgentRecord>,
+    approvals: Vec<Approval>,
     queue: Vec<MergeQueueEntry>,
     events: Vec<Event>,
 }
@@ -725,6 +726,7 @@ impl Engine {
             let plan = store.get_team_plan(&id)?;
             let todos = store.list_todos(&id)?;
             let agents = store.list_agents(&id)?;
+            let approvals = store.list_approvals(Some(&id))?;
             let queue = store.list_merge_queue(&id)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
@@ -733,6 +735,7 @@ impl Engine {
                 plan,
                 todos,
                 agents,
+                approvals,
                 queue,
                 events,
             })
@@ -1205,6 +1208,7 @@ impl Engine {
             messages: data.messages,
             team_plan,
             todos: data.todos,
+            approvals: data.approvals,
             merge_queue: data.queue,
         })
     }
@@ -2089,6 +2093,17 @@ mod tests {
             .append_message(&session.id, "user", "hello", serde_json::json!([]), None)
             .await
             .unwrap();
+        let (approval, _approval_rx) = engine
+            .request_approval(
+                &session.id,
+                "call-approval",
+                "shell",
+                serde_json::json!({"command": "true"}),
+                None,
+            )
+            .await
+            .unwrap();
+        engine.resolve_approval(&approval.id, true).await.unwrap();
         let agent = engine
             .create_agent(&session.id, "worker", "Worker", None, None, "test")
             .await
@@ -2155,6 +2170,8 @@ mod tests {
         assert_eq!(bundle.agents.len(), 1);
         assert_eq!(bundle.messages.len(), 1);
         assert_eq!(bundle.todos.len(), 1);
+        assert_eq!(bundle.approvals.len(), 1);
+        assert_eq!(bundle.approvals[0].status, "approved");
         assert_eq!(bundle.merge_queue.len(), 1);
         assert!(bundle.team_plan.is_some());
         assert!(!bundle.events.is_empty());
@@ -2184,6 +2201,12 @@ mod tests {
         assert_eq!(imported_agents.len(), 1);
         let imported_messages = imported_engine.list_messages(&session.id).await.unwrap();
         assert_eq!(imported_messages.len(), 1);
+        let imported_approvals = imported_engine
+            .list_approvals(Some(session.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(imported_approvals.len(), 1);
+        assert_eq!(imported_approvals[0].status, "approved");
         let imported_report = imported_engine.replay_session(&session.id).await.unwrap();
         assert!(
             imported_report.consistent,

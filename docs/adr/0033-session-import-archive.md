@@ -44,7 +44,7 @@ would make an old session look runnable while its history no longer matches.
   resumed.
 - Working import still requires a separate rehydrate step; this is deliberate.
 - Rehydrate needs the target project/repository to be reachable; approvals are
-  not yet imported as a projection.
+  imported, but imported agent task-worktrees are not remapped.
 - Projects with the same ID but a different local root are rejected.
 
 ## Alternatives considered

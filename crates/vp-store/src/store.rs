@@ -1544,6 +1544,23 @@ impl Store {
                 ],
             )?;
         }
+        for approval in &bundle.approvals {
+            tx.execute(
+                "INSERT INTO approvals
+                 (id, session_id, tool_call_id, tool, input, status, created_at, resolved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    approval.id,
+                    approval.session_id,
+                    approval.tool_call_id,
+                    approval.tool,
+                    serde_json::to_string(&approval.input)?,
+                    approval.status,
+                    approval.created_at,
+                    approval.resolved_at
+                ],
+            )?;
+        }
         for entry in &bundle.merge_queue {
             tx.execute(
                 "INSERT INTO merge_queue

@@ -398,6 +398,8 @@ pub struct SessionBundle {
     #[serde(default)]
     pub team_plan: Option<TeamPlan>,
     pub todos: Vec<TodoItem>,
+    #[serde(default)]
+    pub approvals: Vec<Approval>,
     pub merge_queue: Vec<MergeQueueEntry>,
 }
 
