@@ -306,7 +306,10 @@ actor CoreClient {
         projectID: String,
         policy: MailboxPolicy
     ) async throws -> MailboxPolicy {
-        var value: [String: JSONValue] = ["delete_unread": .bool(policy.deleteUnread)]
+        var value: [String: JSONValue] = [
+            "delete_unread": .bool(policy.deleteUnread),
+            "auto_gc": .bool(policy.autoGc),
+        ]
         value["max_age_secs"] = policy.maxAgeSecs.map { .number(Double($0)) } ?? .null
         value["max_count"] = policy.maxCount.map { .number(Double($0)) } ?? .null
         let params: [String: JSONValue] = [

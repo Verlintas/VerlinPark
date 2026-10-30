@@ -56,6 +56,7 @@ final class AppModel {
     var mailboxMaxAgeText = ""
     var mailboxMaxCountText = ""
     var mailboxDeleteUnread = false
+    var mailboxAutoGc = false
     var mailboxPolicyBusy = false
     var mailboxPolicyStatus: String?
     var teamPlan: TeamPlan?
@@ -176,6 +177,7 @@ final class AppModel {
             mailboxMaxAgeText = ""
             mailboxMaxCountText = ""
             mailboxDeleteUnread = false
+            mailboxAutoGc = false
             mailboxPolicyStatus = nil
             teamPlan = nil
             planTaskStatuses = [:]
@@ -479,6 +481,7 @@ final class AppModel {
             mailboxMaxAgeText = ""
             mailboxMaxCountText = ""
             mailboxDeleteUnread = false
+            mailboxAutoGc = false
             mailboxPolicyStatus = nil
             return
         }
@@ -491,6 +494,7 @@ final class AppModel {
             mailboxMaxAgeText = policy.maxAgeSecs.map(String.init) ?? ""
             mailboxMaxCountText = policy.maxCount.map(String.init) ?? ""
             mailboxDeleteUnread = policy.deleteUnread
+            mailboxAutoGc = policy.autoGc
             mailboxPolicyStatus = nil
         } catch {
             handle(error)
@@ -522,7 +526,8 @@ final class AppModel {
                 policy: MailboxPolicy(
                     maxAgeSecs: maxAge,
                     maxCount: maxCount,
-                    deleteUnread: mailboxDeleteUnread
+                    deleteUnread: mailboxDeleteUnread,
+                    autoGc: mailboxAutoGc
                 )
             )
             guard projectID == selectedProjectID else { return }
@@ -538,6 +543,7 @@ final class AppModel {
         mailboxMaxAgeText = ""
         mailboxMaxCountText = ""
         mailboxDeleteUnread = false
+        mailboxAutoGc = false
         await saveMailboxPolicy()
     }
 
@@ -567,6 +573,7 @@ final class AppModel {
             mailboxMaxAgeText = ""
             mailboxMaxCountText = ""
             mailboxDeleteUnread = false
+            mailboxAutoGc = false
             mailboxPolicyStatus = nil
             return
         }

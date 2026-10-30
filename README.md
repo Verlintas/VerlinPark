@@ -157,7 +157,7 @@ just cli artifact-policy <project-id>
 just cli artifact-policy-set <project-id> --max-count 20 --auto-gc
 just cli gc <project-id>
 just cli mailbox-policy <project-id>
-just cli mailbox-policy-set <project-id> --max-count 50
+just cli mailbox-policy-set <project-id> --max-count 50 --auto-gc
 just cli mailbox-gc <project-id>
 just cli queue <session-id>
 just cli retry <queue-entry-id>

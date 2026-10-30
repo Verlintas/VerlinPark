@@ -17,8 +17,10 @@ message may contain an instruction that has not been consumed.
 
 1. **Project policy.** `MailboxPolicy` has optional `max_age_secs` and
    `max_count`, plus `delete_unread` (default false). Zero limits are rejected.
-2. **Manual GC only.** `mailbox.gc` / `vp mailbox-gc` applies the policy.
-   There is no background or send-triggered deletion in this slice.
+2. **Manual and optional auto GC.** `mailbox.gc` / `vp mailbox-gc` applies the
+   policy manually. `auto_gc` (default false) runs the same policy after a
+   message is sent or marked read. The trigger is deterministic and uses the
+   same unread protection; there is no background timer.
 3. **Oldest first.** Candidates are ordered by `created_at`, then ID. Both the
    age rule and the count rule collect the oldest first; duplicates are removed.
 4. **Unread protection.** Unless `delete_unread` is true, an unread message is
@@ -39,7 +41,8 @@ message may contain an instruction that has not been consumed.
 - Users can bound mailbox storage deliberately without silently losing unread
   instructions.
 - `max_count` is a target, not a guarantee, when unread messages are protected.
-- Automatic retention would need a safe trigger; it is not implemented yet.
+- Auto GC runs only at message send/read boundaries; a project with no further
+  mailbox activity keeps its last state until a manual GC or the next event.
 - Mailbox rows are deleted with the session; exported bundles still contain the
   messages present at export time.
 

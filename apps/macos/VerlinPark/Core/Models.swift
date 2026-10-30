@@ -65,17 +65,20 @@ struct MailboxPolicy: Codable, Hashable, Sendable {
     var maxAgeSecs: Int?
     var maxCount: Int?
     var deleteUnread: Bool
+    var autoGc: Bool
 
     static let disabled = MailboxPolicy(
         maxAgeSecs: nil,
         maxCount: nil,
-        deleteUnread: false
+        deleteUnread: false,
+        autoGc: false
     )
 
     enum CodingKeys: String, CodingKey {
         case maxAgeSecs = "max_age_secs"
         case maxCount = "max_count"
         case deleteUnread = "delete_unread"
+        case autoGc = "auto_gc"
     }
 }
 

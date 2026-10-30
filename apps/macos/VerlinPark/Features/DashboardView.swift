@@ -401,13 +401,16 @@ private struct MailboxPolicyCard: View {
                 if model.mailboxPolicyBusy {
                     ProgressView().controlSize(.small)
                 }
+                Toggle("Auto GC", isOn: $model.mailboxAutoGc)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
                 Toggle("Delete unread", isOn: $model.mailboxDeleteUnread)
                     .toggleStyle(.switch)
                     .controlSize(.small)
             }
 
             Text(
-                "Mailbox GC removes oldest messages first. Unread messages are protected unless Delete unread is enabled. Limits are optional."
+                "Mailbox GC removes oldest messages first. Auto GC runs after sending or marking a message read. Unread messages are protected unless Delete unread is enabled. Limits are optional."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)

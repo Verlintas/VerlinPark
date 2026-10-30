@@ -202,15 +202,16 @@ impl Store {
                 max_bytes    INTEGER,
                 max_age_secs INTEGER,
                 max_count    INTEGER,
-                delete_unread INTEGER NOT NULL DEFAULT 0,
                 updated_at   TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_mailbox_policies (
-                project_id   TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-                max_age_secs INTEGER,
-                max_count    INTEGER,
-                updated_at   TEXT NOT NULL
+                project_id    TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                max_age_secs  INTEGER,
+                max_count     INTEGER,
+                delete_unread INTEGER NOT NULL DEFAULT 0,
+                auto_gc       INTEGER NOT NULL DEFAULT 0,
+                updated_at    TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS approvals (
@@ -295,6 +296,12 @@ impl Store {
             &conn,
             "project_mailbox_policies",
             "delete_unread",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "project_mailbox_policies",
+            "auto_gc",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
@@ -1051,7 +1058,7 @@ impl Store {
         let conn = self.lock()?;
         let stored = conn
             .query_row(
-                "SELECT max_age_secs, max_count, delete_unread
+                "SELECT max_age_secs, max_count, delete_unread, auto_gc
                  FROM project_mailbox_policies WHERE project_id = ?1",
                 params![project_id],
                 |row| {
@@ -1059,6 +1066,7 @@ impl Store {
                         max_age_secs: row.get::<_, Option<i64>>(0)?.map(|value| value as u64),
                         max_count: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
                         delete_unread: row.get::<_, i64>(2)? != 0,
+                        auto_gc: row.get::<_, i64>(3)? != 0,
                     })
                 },
             )
@@ -1070,18 +1078,20 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO project_mailbox_policies
-                (project_id, max_age_secs, max_count, delete_unread, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                (project_id, max_age_secs, max_count, delete_unread, auto_gc, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(project_id) DO UPDATE SET
                 max_age_secs = excluded.max_age_secs,
                 max_count = excluded.max_count,
                 delete_unread = excluded.delete_unread,
+                auto_gc = excluded.auto_gc,
                 updated_at = excluded.updated_at",
             params![
                 project_id,
                 policy.max_age_secs.map(|value| value as i64),
                 policy.max_count.map(|value| value as i64),
                 if policy.delete_unread { 1 } else { 0 },
+                if policy.auto_gc { 1 } else { 0 },
                 now_rfc3339()
             ],
         )?;
@@ -3582,6 +3592,39 @@ mod tests {
         let loaded = store.get_session(&session.id).unwrap().unwrap();
         assert_eq!(loaded.worktree.as_deref(), Some("/tmp/worktree"));
         assert_eq!(loaded.branch.as_deref(), Some("verlinpark/test"));
+    }
+
+    #[test]
+    fn fresh_schema_keeps_artifact_and_mailbox_policy_columns_distinct() {
+        let (_data, store, _repo) = test_store();
+        let conn = store.lock().unwrap();
+        let columns = |table: &str| {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        };
+        let artifact = columns("project_artifact_policies");
+        assert_eq!(
+            artifact
+                .iter()
+                .filter(|column| column.as_str() == "auto_gc")
+                .count(),
+            1
+        );
+        assert!(!artifact.iter().any(|column| column == "delete_unread"));
+        let mailbox = columns("project_mailbox_policies");
+        assert_eq!(
+            mailbox
+                .iter()
+                .filter(|column| column.as_str() == "auto_gc")
+                .count(),
+            1
+        );
+        assert!(mailbox.iter().any(|column| column == "delete_unread"));
     }
 
     #[test]

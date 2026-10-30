@@ -344,6 +344,8 @@ pub struct MailboxPolicy {
     pub max_count: Option<u64>,
     #[serde(default)]
     pub delete_unread: bool,
+    #[serde(default)]
+    pub auto_gc: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

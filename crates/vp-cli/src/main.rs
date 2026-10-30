@@ -141,6 +141,9 @@ enum Command {
         /// Also delete unread messages (default: read messages only).
         #[arg(long)]
         delete_unread: bool,
+        /// Run mailbox GC after sending or marking a message read.
+        #[arg(long)]
+        auto_gc: bool,
     },
     /// Run mailbox retention GC for a project.
     MailboxGc { project: String },
@@ -420,6 +423,7 @@ async fn main() -> Result<()> {
             max_age_secs,
             max_count,
             delete_unread,
+            auto_gc,
         } => {
             rpc(
                 &discovery,
@@ -430,6 +434,7 @@ async fn main() -> Result<()> {
                         "max_age_secs": max_age_secs,
                         "max_count": max_count,
                         "delete_unread": delete_unread,
+                        "auto_gc": auto_gc,
                     }
                 }),
             )
@@ -662,11 +667,12 @@ fn print_human(value: &Value) {
     if let Some(policy) = value.get("policy") {
         if policy.get("delete_unread").is_some() {
             println!(
-                "project {}  mailbox-max-age={}  mailbox-max-count={}  delete-unread={}",
+                "project {}  mailbox-max-age={}  mailbox-max-count={}  delete-unread={}  auto-gc={}",
                 value["project_id"].as_str().unwrap_or("?"),
                 policy["max_age_secs"].as_u64().unwrap_or(0),
                 policy["max_count"].as_u64().unwrap_or(0),
-                policy["delete_unread"].as_bool().unwrap_or(false)
+                policy["delete_unread"].as_bool().unwrap_or(false),
+                policy["auto_gc"].as_bool().unwrap_or(false)
             );
             return;
         }

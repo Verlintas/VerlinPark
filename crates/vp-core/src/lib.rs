@@ -966,6 +966,7 @@ impl Engine {
         }
         let store = self.store.clone();
         let session_id = session_id.to_string();
+        let gc_session_id = session_id.clone();
         let from_agent_id = from_agent_id.to_string();
         let from_name = from_name.to_string();
         let to_agent_id = to_agent_id.to_string();
@@ -986,6 +987,7 @@ impl Engine {
         })
         .await??;
         let _ = self.events.send(event);
+        self.auto_gc_mailbox_for_session(&gc_session_id).await;
         Ok(message)
     }
 
@@ -1014,6 +1016,7 @@ impl Engine {
                 if let Some(event) = event {
                     let _ = self.events.send(event);
                 }
+                self.auto_gc_mailbox_for_session(&message.session_id).await;
                 Ok(Some(message))
             }
             None => Ok(None),
@@ -2800,6 +2803,22 @@ impl Engine {
         Ok(policy)
     }
 
+    async fn auto_gc_mailbox_for_session(&self, session_id: &str) {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let project_id = match tokio::task::spawn_blocking(move || store.get_session(&id)).await {
+            Ok(Ok(Some(session))) => session.project_id,
+            Ok(Ok(None)) | Err(_) | Ok(Err(_)) => return,
+        };
+        let policy = match self.get_mailbox_policy(&project_id).await {
+            Ok(policy) if policy.auto_gc => policy,
+            _ => return,
+        };
+        if let Err(error) = self.gc_mailbox(&project_id, &policy).await {
+            tracing::warn!(%error, project_id, "automatic mailbox GC failed");
+        }
+    }
+
     pub async fn gc_mailbox(
         &self,
         project_id: &str,
@@ -3295,6 +3314,7 @@ mod tests {
                     max_age_secs: None,
                     max_count: Some(2),
                     delete_unread: false,
+                    auto_gc: false,
                 },
             )
             .await
@@ -3330,6 +3350,7 @@ mod tests {
                     max_age_secs: None,
                     max_count: Some(1),
                     delete_unread: true,
+                    auto_gc: false,
                 },
             )
             .await
@@ -3352,10 +3373,115 @@ mod tests {
                         max_age_secs: None,
                         max_count: Some(0),
                         delete_unread: false,
+                        auto_gc: false,
                     },
                 )
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_auto_gc_respects_unread_protection() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("auto-mailbox".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "auto-mailbox".into(), None)
+            .await
+            .unwrap();
+        engine
+            .set_mailbox_policy(
+                &project.id,
+                MailboxPolicy {
+                    max_age_secs: None,
+                    max_count: Some(1),
+                    delete_unread: true,
+                    auto_gc: true,
+                },
+            )
+            .await
+            .unwrap();
+        for index in 0..2 {
+            engine
+                .send_agent_message(
+                    &session.id,
+                    "sender",
+                    "Sender",
+                    "receiver",
+                    "Receiver",
+                    "note",
+                    &format!("auto {index}"),
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+        }
+        let messages = engine
+            .list_agent_messages(&session.id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "auto GC should trim to max_count");
+
+        engine
+            .set_mailbox_policy(
+                &project.id,
+                MailboxPolicy {
+                    max_age_secs: None,
+                    max_count: Some(2),
+                    delete_unread: false,
+                    auto_gc: true,
+                },
+            )
+            .await
+            .unwrap();
+        for index in 0..2 {
+            engine
+                .send_agent_message(
+                    &session.id,
+                    "sender",
+                    "Sender",
+                    "receiver",
+                    "Receiver",
+                    "note",
+                    &format!("protected {index}"),
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+        }
+        let messages = engine
+            .list_agent_messages(&session.id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 3, "unread messages must not be deleted");
+        engine
+            .mark_agent_message_read(&messages[0].id)
+            .await
+            .unwrap();
+        let messages = engine
+            .list_agent_messages(&session.id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2, "auto GC should trim after a read");
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.kind == "mailbox.pruned")
+                .count()
+                >= 2
         );
     }
 
@@ -3435,6 +3561,7 @@ mod tests {
                     max_age_secs: None,
                     max_count: Some(1),
                     delete_unread: false,
+                    auto_gc: false,
                 },
             )
             .await
