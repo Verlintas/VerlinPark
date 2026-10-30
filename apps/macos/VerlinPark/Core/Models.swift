@@ -81,6 +81,94 @@ struct ArtifactGcResult: Codable, Sendable {
     }
 }
 
+struct UsageEntry: Codable, Sendable, Identifiable {
+    let id: String
+    let sessionId: String
+    let agentId: String
+    let agentName: String
+    let role: String
+    let taskId: String?
+    let model: String
+    let inputTokens: Int
+    let outputTokens: Int
+    let estimated: Bool
+    let costUsd: Double
+    let createdAt: String
+
+    var totalTokens: Int {
+        inputTokens + outputTokens
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case role
+        case taskId = "task_id"
+        case model
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case estimated
+        case costUsd = "cost_usd"
+        case createdAt = "created_at"
+    }
+}
+
+struct UsageBucket: Codable, Sendable, Identifiable {
+    let key: String
+    let calls: Int
+    let inputTokens: Int
+    let outputTokens: Int
+    let costUsd: Double
+
+    var id: String {
+        key
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case calls
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case costUsd = "cost_usd"
+    }
+}
+
+struct UsageTotals: Codable, Sendable {
+    let calls: Int
+    let inputTokens: Int
+    let outputTokens: Int
+    let costUsd: Double
+    let byRole: [UsageBucket]
+    let byModel: [UsageBucket]
+    let byAgent: [UsageBucket]
+    let byTask: [UsageBucket]
+
+    enum CodingKeys: String, CodingKey {
+        case calls
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case costUsd = "cost_usd"
+        case byRole = "by_role"
+        case byModel = "by_model"
+        case byAgent = "by_agent"
+        case byTask = "by_task"
+    }
+}
+
+struct UsageLedgerResult: Codable, Sendable {
+    let sessionId: String
+    let entries: [UsageEntry]
+    let totals: UsageTotals
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case entries
+        case totals
+    }
+}
+
 struct ShellPolicyResult: Codable, Sendable {
     let projectId: String
     let policy: ShellPolicy

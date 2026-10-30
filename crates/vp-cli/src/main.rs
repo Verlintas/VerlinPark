@@ -95,6 +95,8 @@ enum Command {
     Resume { session: String },
     /// Show the session plan/todo list.
     Todos { session: String },
+    /// Show the per-call usage/cost ledger.
+    Usage { session: String },
     /// Show the validated team plan.
     TeamPlan { session: String },
     /// List the agents spawned for a session.
@@ -326,6 +328,9 @@ async fn main() -> Result<()> {
         Command::TeamPlan { session } => {
             rpc(&discovery, "team_plan.get", json!({"session_id": session})).await?
         }
+        Command::Usage { session } => {
+            rpc(&discovery, "session.usage", json!({"session_id": session})).await?
+        }
         Command::Agents { session } => {
             rpc(&discovery, "agent.list", json!({"session_id": session})).await?
         }
@@ -543,6 +548,36 @@ fn print_json(value: &Value) -> Result<()> {
 }
 
 fn print_human(value: &Value) {
+    if let Some(totals) = value.get("totals")
+        && value.get("entries").is_some()
+    {
+        println!(
+            "session {}  calls={}  in={}  out={}  cost=${:.4}",
+            value["session_id"].as_str().unwrap_or("?"),
+            totals["calls"].as_u64().unwrap_or(0),
+            totals["input_tokens"].as_u64().unwrap_or(0),
+            totals["output_tokens"].as_u64().unwrap_or(0),
+            totals["cost_usd"].as_f64().unwrap_or(0.0)
+        );
+        for (label, field) in [
+            ("role", "by_role"),
+            ("task", "by_task"),
+            ("agent", "by_agent"),
+            ("model", "by_model"),
+        ] {
+            for bucket in totals[field].as_array().into_iter().flatten() {
+                println!(
+                    "  {label:5} {:<20} calls={:<3} in={:<7} out={:<7} ${:.4}",
+                    bucket["key"].as_str().unwrap_or("?"),
+                    bucket["calls"].as_u64().unwrap_or(0),
+                    bucket["input_tokens"].as_u64().unwrap_or(0),
+                    bucket["output_tokens"].as_u64().unwrap_or(0),
+                    bucket["cost_usd"].as_f64().unwrap_or(0.0)
+                );
+            }
+        }
+        return;
+    }
     if value.get("session_id").is_some()
         && value.get("worktree").is_some()
         && value.get("commit").is_some()

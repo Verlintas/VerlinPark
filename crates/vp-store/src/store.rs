@@ -10,6 +10,7 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
     MergeQueueEntry, Project, Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem,
+    UsageEntry,
 };
 
 use crate::paths;
@@ -172,6 +173,24 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_artifacts_session
                 ON artifacts(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS usage_ledger (
+                id            TEXT PRIMARY KEY,
+                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                agent_id      TEXT NOT NULL,
+                agent_name    TEXT NOT NULL,
+                role          TEXT NOT NULL,
+                task_id       TEXT,
+                model         TEXT NOT NULL,
+                input_tokens  INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                estimated     INTEGER NOT NULL,
+                cost_usd      REAL NOT NULL,
+                created_at    TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_usage_ledger_session
+                ON usage_ledger(session_id, created_at);
 
             CREATE TABLE IF NOT EXISTS project_artifact_policies (
                 project_id   TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -1025,6 +1044,142 @@ impl Store {
             tracing::warn!(%error, "failed to append event mirror");
         }
         Ok(event)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_usage_entry_with_events(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        role: &str,
+        task_id: Option<&str>,
+        model: &str,
+        input: u64,
+        output: u64,
+        estimated: bool,
+        cost_usd: f64,
+    ) -> Result<(UsageEntry, Vec<Event>)> {
+        let entry = UsageEntry {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.to_string(),
+            agent_name: agent_name.to_string(),
+            role: role.to_string(),
+            task_id: task_id.map(str::to_string),
+            model: model.to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            estimated,
+            cost_usd,
+            created_at: now_rfc3339(),
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions
+             SET tokens_in = tokens_in + ?1,
+                 tokens_out = tokens_out + ?2,
+                 cost_spent_usd = cost_spent_usd + ?3
+             WHERE id = ?4",
+            params![input as i64, output as i64, cost_usd, session_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        tx.execute(
+            "INSERT INTO usage_ledger
+             (id, session_id, agent_id, agent_name, role, task_id, model,
+              input_tokens, output_tokens, estimated, cost_usd, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                entry.id,
+                entry.session_id,
+                entry.agent_id,
+                entry.agent_name,
+                entry.role,
+                entry.task_id,
+                entry.model,
+                entry.input_tokens as i64,
+                entry.output_tokens as i64,
+                if entry.estimated { 1 } else { 0 },
+                entry.cost_usd,
+                entry.created_at
+            ],
+        )?;
+        let usage_event = insert_event_tx(
+            &tx,
+            session_id,
+            "agent.usage",
+            serde_json::json!({
+                "input_tokens": input,
+                "output_tokens": output,
+                "estimated": estimated,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "agent_role": role,
+                "task_id": task_id,
+                "model": model,
+                "cost_usd": cost_usd,
+            }),
+        )?;
+        let mut events = vec![usage_event];
+        if cost_usd > 0.0 {
+            let total = tx.query_row(
+                "SELECT cost_spent_usd FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, f64>(0),
+            )?;
+            events.push(insert_event_tx(
+                &tx,
+                session_id,
+                "agent.cost",
+                serde_json::json!({
+                    "amount_usd": cost_usd,
+                    "total_usd": total,
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "agent_role": role,
+                    "task_id": task_id,
+                    "model": model,
+                }),
+            )?);
+        }
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((entry, events))
+    }
+
+    pub fn list_usage_entries(&self, session_id: &str) -> Result<Vec<UsageEntry>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, agent_id, agent_name, role, task_id, model,
+                    input_tokens, output_tokens, estimated, cost_usd, created_at
+             FROM usage_ledger
+             WHERE session_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(UsageEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                agent_name: row.get(3)?,
+                role: row.get(4)?,
+                task_id: row.get(5)?,
+                model: row.get(6)?,
+                input_tokens: row.get::<_, i64>(7)? as u64,
+                output_tokens: row.get::<_, i64>(8)? as u64,
+                estimated: row.get::<_, i64>(9)? != 0,
+                cost_usd: row.get(10)?,
+                created_at: row.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn add_session_usage_with_event(

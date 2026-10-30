@@ -404,6 +404,58 @@ pub struct Approval {
     pub resolved_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageEntry {
+    pub id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub role: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub estimated: bool,
+    #[serde(default)]
+    pub cost_usd: f64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageBucket {
+    pub key: String,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageTotals {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    pub by_role: Vec<UsageBucket>,
+    pub by_model: Vec<UsageBucket>,
+    pub by_agent: Vec<UsageBucket>,
+    pub by_task: Vec<UsageBucket>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageLedgerParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageLedgerResult {
+    pub session_id: String,
+    pub entries: Vec<UsageEntry>,
+    pub totals: UsageTotals,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityInfo {
     #[serde(default)]

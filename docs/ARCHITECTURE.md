@@ -428,7 +428,7 @@ loop {
 
 - 预算检查点：LLM 请求前、工具调用前、流式响应中（按 token 增量）。
 - 计数：
-  - LLM input/output tokens（provider usage 优先；否则估算并标记）。
+  - LLM input/output tokens（provider usage 优先；否则估算并标记）；当前实现按 provider call 写入 `usage_ledger`（agent/role/task/model/tokens/estimated/cost）。
   - 工具调用次数。
   - wall-clock。
   - 可选：美元（按模型价格表）。
@@ -955,7 +955,7 @@ pub struct ModelCapabilities {
 - 优先 provider usage。
 - 无 usage：用模型 tokenizer 估算（tiktoken 兼容 / HF tokenizer）；标记 `estimated: true`。
 - 成本 = input × price + output × price + cache 读写。
-- 每事件记录 usage；session 汇总。
+- 每事件记录 usage；session 汇总；已实现 per-call `usage_ledger` 与 role/task/agent/model 分组。
 - 预算硬停以“较保守”的估算为准（宁可早停）。
 
 ### 11.7 密钥

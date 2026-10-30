@@ -355,6 +355,12 @@ actor CoreClient {
             .items
     }
 
+    func usageLedger(sessionID: String) async throws -> UsageLedgerResult {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.usage", params: params)
+            .decode(UsageLedgerResult.self)
+    }
+
     func sessionDiff(sessionID: String) async throws -> SessionDiff {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.diff", params: params)

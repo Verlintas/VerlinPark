@@ -32,6 +32,8 @@ final class AppModel {
     var mergeQueue: [MergeQueueEntry] = []
     var mailbox: [AgentMessage] = []
     var artifacts: [Artifact] = []
+    var usageLedger: UsageLedgerResult?
+    var usageStatus: String?
     var shellPolicy = ShellPolicy.allow
     var shellPolicyNetwork = "allow"
     var shellPolicyReadDenyText = ""
@@ -146,6 +148,8 @@ final class AppModel {
             mergeQueue = []
             mailbox = []
             artifacts = []
+            usageLedger = nil
+            usageStatus = nil
             shellPolicy = .allow
             shellPolicyNetwork = "allow"
             shellPolicyReadDenyText = ""
@@ -180,6 +184,8 @@ final class AppModel {
         mergeQueue = []
         mailbox = []
         artifacts = []
+        usageLedger = nil
+        usageStatus = nil
         Task { await loadShellPolicy() }
         Task { await loadIntegrationPolicy() }
         Task { await loadArtifactPolicy() }
@@ -723,6 +729,8 @@ final class AppModel {
         guard let sessionID = selectedSessionID else {
             mailbox = []
             artifacts = []
+            usageLedger = nil
+            usageStatus = nil
             return
         }
         do {
@@ -733,6 +741,24 @@ final class AppModel {
             artifacts = published
         } catch {
             // The event stream will retry on mailbox/artifact events.
+        }
+    }
+
+    func loadUsage() async {
+        guard let sessionID = selectedSessionID else {
+            usageLedger = nil
+            usageStatus = nil
+            return
+        }
+        do {
+            let ledger = try await core.usageLedger(sessionID: sessionID)
+            guard sessionID == selectedSessionID else { return }
+            usageLedger = ledger
+            usageStatus = nil
+        } catch {
+            if sessionID == selectedSessionID {
+                usageStatus = error.localizedDescription
+            }
         }
     }
 
@@ -950,6 +976,10 @@ final class AppModel {
                 tokensOut: old.tokensOut + output,
                 createdAt: old.createdAt
             )
+        }
+
+        if event.type == "agent.usage" || event.type == "agent.cost" {
+            Task { await loadUsage() }
         }
 
         if event.type == "agent.cost",

@@ -721,6 +721,8 @@ struct PreviewPanelView: View {
                     queue
                 case .mailbox:
                     mailbox
+                case .cost:
+                    cost
                 case .trace:
                     trace
                 }
@@ -736,6 +738,7 @@ struct PreviewPanelView: View {
             if model.selectedSessionID != nil {
                 await model.loadDiff()
                 await model.loadMailbox()
+                await model.loadUsage()
             }
         }
         .alert("Commit worktree", isPresented: $showingCommit) {
@@ -854,6 +857,8 @@ struct PreviewPanelView: View {
                             await model.loadMergeQueue()
                         case .mailbox:
                             await model.loadMailbox()
+                        case .cost:
+                            await model.loadUsage()
                         default:
                             await model.loadDiff()
                         }
@@ -863,8 +868,10 @@ struct PreviewPanelView: View {
                         .font(.system(size: 10, weight: .semibold))
                 }
                 .buttonStyle(.plain)
-                .help(mode == .queue ? "Refresh queue" : mode == .mailbox ? "Refresh mailbox" :
-                    "Refresh diff")
+                .help(
+                    mode == .queue ? "Refresh queue" : mode == .mailbox ? "Refresh mailbox" :
+                        mode == .cost ? "Refresh usage" : "Refresh diff"
+                )
                 .disabled(model.diffLoading)
             }
             Picker("", selection: $mode) {
@@ -1052,6 +1059,62 @@ struct PreviewPanelView: View {
                 }
                 .padding(12)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var cost: some View {
+        if let ledger = model.usageLedger {
+            if ledger.entries.isEmpty {
+                StudioEmptyView(
+                    icon: "dollarsign.circle",
+                    title: "No usage yet",
+                    detail: "Provider calls record per-agent, per-task token and USD usage here."
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 10) {
+                            UsageMetric(
+                                title: "Calls",
+                                value: "\(ledger.totals.calls)"
+                            )
+                            UsageMetric(
+                                title: "Tokens",
+                                value: "\(ledger.totals.inputTokens + ledger.totals.outputTokens)"
+                            )
+                            UsageMetric(
+                                title: "Cost",
+                                value: String(format: "$%.4f", ledger.totals.costUsd)
+                            )
+                        }
+
+                        UsageBucketSection(title: "BY ROLE", buckets: ledger.totals.byRole)
+                        UsageBucketSection(title: "BY TASK", buckets: ledger.totals.byTask)
+                        UsageBucketSection(title: "BY AGENT", buckets: ledger.totals.byAgent)
+                        UsageBucketSection(title: "BY MODEL", buckets: ledger.totals.byModel)
+
+                        Text("CALLS")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .padding(.top, 2)
+                        ForEach(ledger.entries.reversed()) { entry in
+                            UsageEntryRow(entry: entry)
+                        }
+                    }
+                    .padding(12)
+                }
+            }
+        } else if let status = model.usageStatus {
+            StudioEmptyView(
+                icon: "exclamationmark.triangle",
+                title: "Usage unavailable",
+                detail: status
+            )
+        } else {
+            ProgressView()
+                .controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -1286,11 +1349,107 @@ private struct ArtifactRow: View {
     }
 }
 
+private struct UsageMetric: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
+    }
+}
+
+private struct UsageBucketSection: View {
+    let title: String
+    let buckets: [UsageBucket]
+
+    var body: some View {
+        if !buckets.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                ForEach(buckets) { bucket in
+                    HStack(spacing: 6) {
+                        Text(bucket.key)
+                            .font(.system(size: 9, design: .monospaced))
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(bucket.calls) calls")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        Text("\(bucket.inputTokens + bucket.outputTokens) tok")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Text(String(format: "$%.4f", bucket.costUsd))
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 7))
+                }
+            }
+        }
+    }
+}
+
+private struct UsageEntryRow: View {
+    let entry: UsageEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(entry.role)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                if let task = entry.taskId {
+                    Text(task)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Text(entry.agentName)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if entry.estimated {
+                    Text("est")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.orange)
+                }
+                Text(String(format: "$%.4f", entry.costUsd))
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 8) {
+                Text(entry.model)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Text("in \(entry.inputTokens) · out \(entry.outputTokens)")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(8)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
 private enum PreviewMode: String, CaseIterable, Identifiable {
     case changes
     case plan
     case queue
     case mailbox
+    case cost
     case trace
 
     var id: String {
@@ -1303,6 +1462,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .plan: "Plan"
         case .queue: "Queue"
         case .mailbox: "Mailbox"
+        case .cost: "Cost"
         case .trace: "Trace"
         }
     }

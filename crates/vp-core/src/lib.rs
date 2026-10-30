@@ -13,7 +13,8 @@ use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactGcResult, ArtifactPolicy, Event,
     IntegrationPolicy, MergeQueueEntry, Project, PullRequestResult, Session, SessionBundle,
     SessionCommit, SessionDiff, SessionImportResult, SessionLandResult, SessionRehydrateResult,
-    SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
+    SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageEntry,
+    UsageLedgerResult, UsageTotals,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -39,6 +40,30 @@ pub struct Engine {
     events: broadcast::Sender<Event>,
     approval_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     git_lock: Arc<Mutex<()>>,
+}
+
+fn add_usage_bucket(buckets: &mut HashMap<String, UsageBucket>, key: &str, entry: &UsageEntry) {
+    let bucket = buckets
+        .entry(key.to_string())
+        .or_insert_with(|| UsageBucket {
+            key: key.to_string(),
+            ..UsageBucket::default()
+        });
+    bucket.calls = bucket.calls.saturating_add(1);
+    bucket.input_tokens = bucket.input_tokens.saturating_add(entry.input_tokens);
+    bucket.output_tokens = bucket.output_tokens.saturating_add(entry.output_tokens);
+    bucket.cost_usd += entry.cost_usd;
+}
+
+fn sorted_usage_buckets(buckets: HashMap<String, UsageBucket>) -> Vec<UsageBucket> {
+    let mut values: Vec<_> = buckets.into_values().collect();
+    values.sort_by(|left, right| {
+        right
+            .cost_usd
+            .total_cmp(&left.cost_usd)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    values
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -774,6 +799,88 @@ impl Engine {
     pub async fn record_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
         self.record_usage_with_source(session_id, input, output, false)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_agent_usage(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        role: &str,
+        task_id: Option<String>,
+        model: &str,
+        input: u64,
+        output: u64,
+        estimated: bool,
+        cost_usd: f64,
+    ) -> Result<UsageEntry> {
+        let cost_usd = if cost_usd.is_finite() && cost_usd > 0.0 {
+            cost_usd
+        } else {
+            0.0
+        };
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+        let agent_name = agent_name.to_string();
+        let role = role.to_string();
+        let model = model.to_string();
+        let (entry, events) = tokio::task::spawn_blocking(move || {
+            store.add_usage_entry_with_events(
+                &session_id,
+                &agent_id,
+                &agent_name,
+                &role,
+                task_id.as_deref(),
+                &model,
+                input,
+                output,
+                estimated,
+                cost_usd,
+            )
+        })
+        .await??;
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        Ok(entry)
+    }
+
+    pub async fn usage_ledger(&self, session_id: &str) -> Result<UsageLedgerResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let entries = tokio::task::spawn_blocking(move || store.list_usage_entries(&id)).await??;
+        let mut totals = UsageTotals {
+            calls: entries.len() as u64,
+            ..UsageTotals::default()
+        };
+        let mut by_role = HashMap::new();
+        let mut by_model = HashMap::new();
+        let mut by_agent = HashMap::new();
+        let mut by_task = HashMap::new();
+        for entry in &entries {
+            totals.input_tokens = totals.input_tokens.saturating_add(entry.input_tokens);
+            totals.output_tokens = totals.output_tokens.saturating_add(entry.output_tokens);
+            totals.cost_usd += entry.cost_usd;
+            add_usage_bucket(&mut by_role, &entry.role, entry);
+            add_usage_bucket(&mut by_model, &entry.model, entry);
+            add_usage_bucket(&mut by_agent, &entry.agent_name, entry);
+            add_usage_bucket(
+                &mut by_task,
+                entry.task_id.as_deref().unwrap_or("(unassigned)"),
+                entry,
+            );
+        }
+        totals.by_role = sorted_usage_buckets(by_role);
+        totals.by_model = sorted_usage_buckets(by_model);
+        totals.by_agent = sorted_usage_buckets(by_agent);
+        totals.by_task = sorted_usage_buckets(by_task);
+        Ok(UsageLedgerResult {
+            session_id: session_id.to_string(),
+            entries,
+            totals,
+        })
     }
 
     pub async fn record_cost(&self, session_id: &str, cost_usd: f64) -> Result<()> {

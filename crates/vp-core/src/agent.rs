@@ -3055,20 +3055,22 @@ async fn run_loop(
             );
             (input, output, true)
         };
-        if estimated {
-            engine
-                .record_estimated_usage(&session.id, input_tokens, output_tokens)
-                .await?;
-        } else {
-            engine
-                .record_usage(&session.id, input_tokens, output_tokens)
-                .await?;
-        }
         let (input_price, output_price) = role_price(config, spec.role);
         let cost = usage_cost(input_tokens, output_tokens, input_price, output_price);
-        if cost > 0.0 {
-            engine.record_cost(&session.id, cost).await?;
-        }
+        engine
+            .record_agent_usage(
+                &session.id,
+                &spec.id,
+                &spec.name,
+                spec.role.as_str(),
+                spec.task_id.clone(),
+                &request.model,
+                input_tokens,
+                output_tokens,
+                estimated,
+                cost,
+            )
+            .await?;
         let actual_usage = input_tokens.saturating_add(output_tokens);
         if token_reservation
             .take()
@@ -7796,6 +7798,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions[0].status, "idle");
+    }
+
+    #[tokio::test]
+    async fn usage_ledger_groups_by_role_agent_and_task() {
+        let dir = TempDir::new().unwrap();
+        let (engine, _service, project) = test_service(&dir);
+        let session = engine
+            .create_session(project.id, "cost ledger".into(), None)
+            .await
+            .unwrap();
+        engine
+            .record_agent_usage(
+                &session.id,
+                "worker-1",
+                "Worker One",
+                "worker",
+                Some("T1".into()),
+                "worker-model",
+                100,
+                50,
+                false,
+                0.25,
+            )
+            .await
+            .unwrap();
+        engine
+            .record_agent_usage(
+                &session.id,
+                "worker-2",
+                "Worker Two",
+                "worker",
+                Some("T2".into()),
+                "worker-model",
+                40,
+                20,
+                true,
+                0.10,
+            )
+            .await
+            .unwrap();
+        let ledger = engine.usage_ledger(&session.id).await.unwrap();
+        assert_eq!(ledger.entries.len(), 2);
+        assert_eq!(ledger.totals.calls, 2);
+        assert_eq!(ledger.totals.input_tokens, 140);
+        assert_eq!(ledger.totals.output_tokens, 70);
+        assert!((ledger.totals.cost_usd - 0.35).abs() < 1e-9);
+        assert_eq!(ledger.totals.by_role.len(), 1);
+        assert_eq!(ledger.totals.by_role[0].key, "worker");
+        assert_eq!(ledger.totals.by_role[0].calls, 2);
+        assert_eq!(ledger.totals.by_task.len(), 2);
+        assert_eq!(ledger.totals.by_agent.len(), 2);
+        assert!(ledger.entries[1].estimated);
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].tokens_in, 140);
+        assert_eq!(sessions[0].tokens_out, 70);
+        assert!((sessions[0].cost_spent_usd - 0.35).abs() < 1e-9);
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "agent.usage")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "agent.cost")
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.usage"
+                && event.payload["agent_role"] == "worker"
+                && event.payload["task_id"] == "T1"
+                && event.payload["model"] == "worker-model"
+        }));
     }
 
     #[tokio::test]

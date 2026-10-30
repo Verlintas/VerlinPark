@@ -36,7 +36,7 @@ use vp_protocol::types::{
     SessionImportParams, SessionListResult, SessionPauseParams, SessionPauseResult,
     SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
     SetArtifactPolicyParams, SetIntegrationPolicyParams, SetShellPolicyParams, ShellPolicyParams,
-    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
+    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -565,6 +565,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                         items,
                     },
                 ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.usage" => match parse_params::<UsageLedgerParams>(request.params) {
+            Ok(params) => match state.engine.usage_ledger(&params.session_id).await {
+                Ok(ledger) => RpcResponse::success(id, ledger),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
