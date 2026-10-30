@@ -771,13 +771,14 @@ fn print_human(value: &Value) {
     }
     if let Some(consistent) = value.get("consistent").and_then(Value::as_bool) {
         println!(
-            "{}  events={}  status={} usage={} ledger={} mailbox={} plan={} todos={} messages={} agents={} queue={}",
+            "{}  events={}  status={} usage={} ledger={} mailbox={} artifacts={} plan={} todos={} messages={} agents={} queue={}",
             if consistent { "consistent" } else { "MISMATCH" },
             value["event_count"].as_u64().unwrap_or(0),
             value["status_matches"].as_bool().unwrap_or(false),
             value["usage_matches"].as_bool().unwrap_or(false),
             value["ledger_matches"].as_bool().unwrap_or(false),
             value["mailbox_matches"].as_bool().unwrap_or(false),
+            value["artifacts_matches"].as_bool().unwrap_or(false),
             value["plan_matches"].as_bool().unwrap_or(false),
             value["todos_matches"].as_bool().unwrap_or(false),
             value["messages_matches"].as_bool().unwrap_or(false),

@@ -30,6 +30,8 @@ pub struct SessionRepair {
     pub agent_messages: Option<Vec<AgentMessage>>,
     pub agents: Option<Vec<AgentRecord>>,
     pub queue: Option<Vec<MergeQueueEntry>>,
+    pub artifacts: Option<Vec<Artifact>>,
+    pub artifact_warnings: Vec<String>,
 }
 
 /// SQLite-backed metadata store plus an append-only JSONL event mirror.
@@ -2522,6 +2524,36 @@ impl Store {
                         entry.detail,
                         entry.created_at,
                         entry.updated_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(artifacts) = &repair.artifacts {
+            tx.execute(
+                "DELETE FROM artifacts WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for artifact in artifacts {
+                tx.execute(
+                    "INSERT INTO artifacts
+                     (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
+                      content, storage, size_bytes, sha256, path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        artifact.id,
+                        artifact.session_id,
+                        artifact.agent_id,
+                        artifact.agent_name,
+                        artifact.task_id,
+                        artifact.name,
+                        artifact.kind,
+                        artifact.mime_type,
+                        artifact.content,
+                        artifact.storage,
+                        artifact.size_bytes as i64,
+                        artifact.sha256,
+                        artifact.path,
+                        artifact.created_at
                     ],
                 )?;
             }

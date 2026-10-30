@@ -822,6 +822,8 @@ pub struct SessionReplayReport {
     #[serde(default)]
     pub mailbox_matches: bool,
     #[serde(default)]
+    pub artifacts_matches: bool,
+    #[serde(default)]
     pub ledger_matches: bool,
     pub consistent: bool,
     #[serde(default)]

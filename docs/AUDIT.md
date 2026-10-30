@@ -240,7 +240,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 96 个 Rust 测试 + 12 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、text/binary artifacts 与 GC。仍缺：
+已有 96 个 Rust 测试 + 12 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC。仍缺：
 
 - plan 自动派发的 scope overlap / cap 回归
 - 并发预算超调上界
@@ -295,7 +295,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 2. replay/export、worktree 清理、断线重连。
 
 **M4 — 平台化**
-1. artifact 压缩/内容级 replay/rebuild 与自动 mailbox retention（content-addressed dedupe 已实现）。
+1. artifact 压缩、legacy artifact content backfill 与自动 mailbox retention（content-addressed dedupe、artifact replay/repair 已实现）。
 2. cross-session shared budget pools（session 内 task/department 已有原子 reservation；跨 session 共享池未实现）。
 3. 持久化 global Task-DAG scheduler / 公平队列 / 跨进程 capacity；auto-expansion。
 4. MCP/ACP、终端、hunk review、非 GitHub PR adapter。
@@ -344,7 +344,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 96 passed after the 10-31 artifact-sha slice
+cargo test --workspace     # 96 passed after the 10-31 artifact-replay slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

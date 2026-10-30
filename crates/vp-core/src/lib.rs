@@ -35,8 +35,16 @@ struct ReplayData {
     approvals: Vec<Approval>,
     queue: Vec<MergeQueueEntry>,
     agent_messages: Vec<AgentMessage>,
+    artifacts: Vec<Artifact>,
     usage: Vec<UsageEntry>,
     events: Vec<Event>,
+}
+
+struct ExpectedArtifact {
+    artifact: Artifact,
+    full: bool,
+    has_storage: bool,
+    has_size: bool,
 }
 
 #[derive(Clone)]
@@ -1368,6 +1376,7 @@ impl Engine {
             let approvals = store.list_approvals(Some(&id))?;
             let queue = store.list_merge_queue(&id)?;
             let agent_messages = store.list_agent_messages(&id, None, false)?;
+            let artifacts = store.list_artifacts(&id)?;
             let usage = store.list_usage_entries(&id)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
@@ -1379,11 +1388,150 @@ impl Engine {
                 approvals,
                 queue,
                 agent_messages,
+                artifacts,
                 usage,
                 events,
             })
         })
         .await?
+    }
+
+    fn expected_artifacts(data: &ReplayData) -> Vec<ExpectedArtifact> {
+        let mut artifacts = HashMap::<String, ExpectedArtifact>::new();
+        for event in &data.events {
+            match event.kind.as_str() {
+                "artifact.published" => {
+                    let Some(id) = event
+                        .payload
+                        .get("artifact_id")
+                        .and_then(serde_json::Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let full = event.payload.get("mime_type").is_some()
+                        && event.payload.get("sha256").is_some()
+                        && event.payload.get("content").is_some();
+                    let has_storage = event.payload.get("storage").is_some();
+                    let has_size = event.payload.get("size_bytes").is_some();
+                    let artifact = Artifact {
+                        id: id.to_string(),
+                        session_id: data.session.id.clone(),
+                        agent_id: event
+                            .payload
+                            .get("agent_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        agent_name: event
+                            .payload
+                            .get("agent_name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        task_id: event
+                            .payload
+                            .get("task_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        name: event
+                            .payload
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        kind: event
+                            .payload
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        mime_type: event
+                            .payload
+                            .get("mime_type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        content: event
+                            .payload
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        storage: event
+                            .payload
+                            .get("storage")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("inline")
+                            .to_string(),
+                        size_bytes: event
+                            .payload
+                            .get("size_bytes")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                        sha256: event
+                            .payload
+                            .get("sha256")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        path: event
+                            .payload
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        data_base64: None,
+                        created_at: event.created_at.clone(),
+                    };
+                    artifacts.insert(
+                        id.to_string(),
+                        ExpectedArtifact {
+                            artifact,
+                            full,
+                            has_storage,
+                            has_size,
+                        },
+                    );
+                }
+                "artifact.pruned" => {
+                    if let Some(id) = event
+                        .payload
+                        .get("artifact_id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        artifacts.remove(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut values = artifacts.into_values().collect::<Vec<_>>();
+        values.sort_by(|left, right| {
+            left.artifact
+                .created_at
+                .cmp(&right.artifact.created_at)
+                .then_with(|| left.artifact.id.cmp(&right.artifact.id))
+        });
+        values
+    }
+
+    fn same_expected_artifact(expected: &ExpectedArtifact, projected: &Artifact) -> bool {
+        let full = expected.full;
+        let has_storage = expected.has_storage;
+        let has_size = expected.has_size;
+        let expected = &expected.artifact;
+        expected.id == projected.id
+            && expected.session_id == projected.session_id
+            && expected.agent_id == projected.agent_id
+            && expected.agent_name == projected.agent_name
+            && expected.name == projected.name
+            && expected.kind == projected.kind
+            && (!has_storage || expected.storage == projected.storage)
+            && (!has_size || expected.size_bytes == projected.size_bytes)
+            && (!full
+                || (expected.task_id == projected.task_id
+                    && expected.mime_type == projected.mime_type
+                    && expected.content == projected.content
+                    && expected.sha256 == projected.sha256))
     }
 
     fn expected_agent_messages(data: &ReplayData) -> Vec<AgentMessage> {
@@ -1610,6 +1758,26 @@ impl Engine {
             ));
         }
 
+        let expected_artifacts = Self::expected_artifacts(data);
+        let projected_artifacts = data
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.id.clone(), artifact))
+            .collect::<HashMap<_, _>>();
+        let artifacts_matches = expected_artifacts.len() == data.artifacts.len()
+            && expected_artifacts.iter().all(|expected| {
+                projected_artifacts
+                    .get(&expected.artifact.id)
+                    .is_some_and(|projected| Self::same_expected_artifact(expected, projected))
+            });
+        if !artifacts_matches {
+            mismatches.push(format!(
+                "artifacts: projection={}, replay={}",
+                data.artifacts.len(),
+                expected_artifacts.len()
+            ));
+        }
+
         let replay_plan = data
             .events
             .iter()
@@ -1719,6 +1887,7 @@ impl Engine {
             && usage_matches
             && ledger_matches
             && mailbox_matches
+            && artifacts_matches
             && plan_matches
             && todos_matches
             && messages_matches
@@ -1735,6 +1904,7 @@ impl Engine {
             agents_matches,
             queue_matches,
             mailbox_matches,
+            artifacts_matches,
             ledger_matches,
             consistent,
             repaired,
@@ -1892,6 +2062,45 @@ impl Engine {
             }
         };
 
+        let expected_artifacts = Self::expected_artifacts(data);
+        let all_full = expected_artifacts.iter().all(|expected| expected.full);
+        let mut artifact_warnings = Vec::new();
+        let artifacts = if all_full {
+            Some(
+                expected_artifacts
+                    .iter()
+                    .map(|expected| {
+                        let artifact = expected.artifact.clone();
+                        if artifact.storage == "file"
+                            && artifact
+                                .path
+                                .as_deref()
+                                .is_some_and(|path| !Path::new(path).is_file())
+                        {
+                            artifact_warnings.push(format!(
+                                "artifact {} blob is missing at {}",
+                                artifact.id,
+                                artifact.path.as_deref().unwrap_or("(no path)")
+                            ));
+                        }
+                        artifact
+                    })
+                    .collect(),
+            )
+        } else {
+            artifact_warnings.extend(
+                expected_artifacts
+                    .iter()
+                    .filter(|expected| !expected.full)
+                    .map(|expected| {
+                        format!(
+                            "artifact {} predates full publish metadata and was not rebuilt",
+                            expected.artifact.id
+                        )
+                    }),
+            );
+            None
+        };
         Ok(SessionRepair {
             status,
             tokens_in,
@@ -1903,6 +2112,8 @@ impl Engine {
             agent_messages: Some(Self::expected_agent_messages(data)),
             agents,
             queue,
+            artifacts,
+            artifact_warnings,
         })
     }
 
@@ -2156,6 +2367,9 @@ impl Engine {
     pub async fn rebuild_session(&self, session_id: &str) -> Result<SessionReplayReport> {
         let data = self.load_replay_data(session_id).await?;
         let repair = Self::build_session_repair(&data)?;
+        for warning in &repair.artifact_warnings {
+            tracing::warn!(session_id, %warning, "artifact replay warning");
+        }
         let store = self.store.clone();
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || store.repair_session_projections(&id, &repair))
@@ -3925,6 +4139,31 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let artifacts = engine.list_artifacts(&session.id).await.unwrap();
+        let note = artifacts
+            .iter()
+            .find(|artifact| artifact.name == "bundle-note.md")
+            .unwrap();
+        let note_id = note.id.clone();
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.consistent, "{:?}", report.mismatches);
+        assert!(report.artifacts_matches);
+        engine.store().delete_artifact(&note_id).unwrap();
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(!report.artifacts_matches);
+        let repaired = engine.repair_session(&session.id).await.unwrap();
+        assert!(repaired.consistent, "{:?}", repaired.mismatches);
+        assert!(repaired.artifacts_matches);
+        let restored = engine
+            .list_artifacts(&session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|artifact| artifact.id == note_id)
+            .unwrap();
+        assert_eq!(restored.content, "artifact content");
+        assert_eq!(restored.mime_type, "text/markdown");
 
         let bundle = engine.export_session(&session.id).await.unwrap();
         assert_eq!(bundle.version, 1);
