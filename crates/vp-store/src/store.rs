@@ -25,6 +25,7 @@ pub struct SessionRepair {
     pub plan: Option<String>,
     pub todos: Option<Vec<TodoItem>>,
     pub messages: Option<Vec<StoredMessage>>,
+    pub agents: Option<Vec<AgentRecord>>,
     pub queue: Option<Vec<MergeQueueEntry>>,
 }
 
@@ -604,6 +605,127 @@ impl Store {
         Ok(agent)
     }
 
+    pub fn create_agent_with_snapshot(
+        &self,
+        session_id: &str,
+        role: &str,
+        name: &str,
+        title: Option<&str>,
+        parent_id: Option<&str>,
+        model: &str,
+    ) -> Result<(AgentRecord, Event)> {
+        let agent = AgentRecord {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            name: name.to_string(),
+            title: title.map(ToOwned::to_owned),
+            profile: None,
+            parent_id: parent_id.map(ToOwned::to_owned),
+            worktree: None,
+            branch: None,
+            status: "running".to_string(),
+            model: model.to_string(),
+            created_at: now_rfc3339(),
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO agents
+             (id, session_id, role, name, title, parent_id, worktree, branch, status, model, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                agent.id,
+                agent.session_id,
+                agent.role,
+                agent.name,
+                agent.title,
+                agent.parent_id,
+                agent.worktree,
+                agent.branch,
+                agent.status,
+                agent.model,
+                agent.created_at
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &agent.session_id,
+            "agent.snapshot",
+            serde_json::to_value(&agent)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((agent, event))
+    }
+
+    pub fn create_leader_agent_with_snapshot(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<(AgentRecord, Event)> {
+        self.create_agent_with_snapshot(session_id, "leader", "Leader", None, None, model)
+    }
+
+    pub fn set_agent_worktree_with_snapshot(
+        &self,
+        id: &str,
+        worktree: &str,
+        branch: &str,
+    ) -> Result<Option<(AgentRecord, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE agents SET worktree = ?1, branch = ?2 WHERE id = ?3",
+            params![worktree, branch, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let agent = get_agent_tx(&tx, id)?;
+        let event = insert_event_tx(
+            &tx,
+            &agent.session_id,
+            "agent.snapshot",
+            serde_json::to_value(&agent)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((agent, event)))
+    }
+
+    pub fn set_agent_profile_with_snapshot(
+        &self,
+        id: &str,
+        profile: &str,
+    ) -> Result<Option<(AgentRecord, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE agents SET profile = ?1 WHERE id = ?2",
+            params![profile, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let agent = get_agent_tx(&tx, id)?;
+        let event = insert_event_tx(
+            &tx,
+            &agent.session_id,
+            "agent.snapshot",
+            serde_json::to_value(&agent)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((agent, event)))
+    }
+
     pub fn set_agent_worktree(&self, id: &str, worktree: &str, branch: &str) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
@@ -646,11 +768,12 @@ impl Store {
             "UPDATE agents SET status = ?1 WHERE id = ?2",
             params![status, id],
         )?;
+        let agent = get_agent_tx(&tx, id)?;
         let event = insert_event_tx(
             &tx,
             &session_id,
             "agent.updated",
-            serde_json::json!({"agent_id": id, "status": status}),
+            serde_json::json!({"agent_id": id, "status": status, "agent": agent}),
         )?;
         tx.commit()?;
         if let Err(error) = self.append_event_mirror(&event) {
@@ -1202,6 +1325,33 @@ impl Store {
                 )?;
             }
         }
+        if let Some(agents) = &repair.agents {
+            tx.execute(
+                "DELETE FROM agents WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for agent in agents {
+                tx.execute(
+                    "INSERT INTO agents
+                     (id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        agent.id,
+                        agent.session_id,
+                        agent.role,
+                        agent.name,
+                        agent.title,
+                        agent.profile,
+                        agent.parent_id,
+                        agent.worktree,
+                        agent.branch,
+                        agent.status,
+                        agent.model,
+                        agent.created_at
+                    ],
+                )?;
+            }
+        }
         if let Some(queue) = &repair.queue {
             tx.execute(
                 "DELETE FROM merge_queue WHERE session_id = ?1",
@@ -1551,6 +1701,34 @@ impl Store {
         }
         Ok(approvals)
     }
+}
+
+fn get_agent_tx(tx: &Transaction<'_>, id: &str) -> Result<AgentRecord> {
+    tx.query_row(
+        "SELECT id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at
+         FROM agents WHERE id = ?1",
+        params![id],
+        map_agent_record,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("agent not found: {id}"))
+}
+
+fn map_agent_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
+    Ok(AgentRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        role: row.get(2)?,
+        name: row.get(3)?,
+        title: row.get(4)?,
+        profile: row.get(5)?,
+        parent_id: row.get(6)?,
+        worktree: row.get(7)?,
+        branch: row.get(8)?,
+        status: row.get(9)?,
+        model: row.get(10)?,
+        created_at: row.get(11)?,
+    })
 }
 
 fn insert_event_tx(

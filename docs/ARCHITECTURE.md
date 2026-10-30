@@ -13,7 +13,7 @@
 VerlinPark 的架构围绕一组**不变量**设计。任何实现都不能破坏它们：
 
 1. **Daemon 拥有状态。** UI 是客户端，不是 source of truth；App 退出不终止会话。
-2. **所有状态变更都是事件。** 可回放、可审计、可恢复。当前 session status / usage / agent status / team plan / todos / messages / merge queue / recovery 已使用原子 event+projection 事务；`session.replay` 可检查投影漂移，`--repair` 可重建覆盖的投影；agent roster/完整 rebuild 仍未统一。
+2. **所有状态变更都是事件。** 可回放、可审计、可恢复。当前 session status / usage / agent status / team plan / todos / messages / merge queue / recovery 已使用原子 event+projection 事务；`session.replay` 可检查投影漂移，`--repair` 可重建覆盖的投影和 agent roster；完整 export/从零 rebuild 仍未统一。
 3. **Agent 不能越界写。** 写操作限制在自己的 worktree；只读操作限制在项目根 + 显式 allowlist。
 4. **没有隐藏的模型切换。** 每个 Agent 的模型由用户显式配置；运行时只校验能力，不自动路由。
 5. **没有跳过验证的合并。** 目标状态是 Verifier + Integrator；人最终批准 land。当前已有 Verifier gate + 确定性 Integrator（merge queue、diff check、失败回滚、冲突记录、rebase+retry）、显式本地 landing 和显式 push/PR；可选 LLM Integrator、自动冲突解决和非 GitHub PR adapter 仍是设计目标。

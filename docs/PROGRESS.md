@@ -31,7 +31,7 @@
 | 预算 / 取消 | ✅ | token reservation + provider usage 结算；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复 |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；UI Approve/Deny |
 | 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR 事件；Collab roster；Preview Plan/Changes/Queue/Trace |
-| Event consistency | ⚠️ | session status / usage / agent status / team plan / todos / messages / merge queue / recovery 使用 event+projection 原子事务；`session.replay` / `vp replay` 可校验并 `--repair` 关键投影，agent roster/完整 rebuild 仍未实现 |
+| Event consistency | ⚠️ | session status / usage / agent status / team plan / todos / messages / merge queue / agent roster / recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可校验并修复已覆盖投影；完整 export/从零 rebuild 仍未实现 |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
 | Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
 | CLI | ✅ | ping/info/projects/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/todos/agents/team-plan/queue/retry/land/pr/replay [--repair] |
@@ -49,7 +49,7 @@
 第一轮硬化（2026-10-30）已修复 plan scope/caps、token reservation 和 fetch_url 的 DNS 绕过。仍然存在的：
 
 1. **Verifier 只读**：只是 prompt 约束；`shell` 工具没有被沙箱限制。审批卡会提示，但 runtime 不阻止写操作。见 AUDIT P1-3。
-2. **事件溯源**：关键状态已改为原子事件+投影；`session.replay` / `vp replay --repair` 可发现并修复覆盖的投影；agent roster/完整 rebuild 尚未实现。见 AUDIT P1-5。
+2. **事件溯源**：关键状态已改为原子事件+投影；`session.replay` / `vp replay --repair` 可发现并修复覆盖的投影；agent roster 已可通过 `agent.snapshot` 重建；完整 export/从零 rebuild 尚未实现。见 AUDIT P1-5。
 3. **batch abort 状态一致性**：同批 task 在预算/取消中止时可能残留 `running` UI 状态；见 AUDIT P2-7。
 
 ## 当前限制（明确未实现）
@@ -81,6 +81,7 @@
 - **M3 第四切片**：daemon 重启后的 in-flight merge queue recovery。
 - **M3 第五切片**：关键状态 event+projection 原子写与事件重建测试。
 - **M3 第六切片**：team plan / todos / messages / recovery 原子化，`session.replay` / `vp replay` 一致性检查与 `--repair`。
+- **M3 第七切片**：`agent.snapshot` 完整 roster 事件与 agent 表 repair。
 
 ## 如何运行
 

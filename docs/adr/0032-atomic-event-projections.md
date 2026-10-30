@@ -25,9 +25,10 @@ milestone, but the critical paths can be made transactional now.
    commit. There is no separate append call that can be forgotten.
 3. **The JSONL mirror remains best-effort.** It is written after commit and a
    failure is logged; SQLite remains authoritative for recovery.
-4. **This is not full event sourcing.** `create_session`, team-plan/todo writes,
-   messages, and some recovery-only updates still have separate paths. Those
-   remain explicit debt until a replay/rebuild design lands.
+4. **This is not full event sourcing.** Session creation metadata and some
+   auxiliary rows still have separate paths. The covered critical projections can
+   be checked/repaired from events, but a from-scratch database rebuild is still
+   future work.
 5. **Test the audit surface.** A regression test reconstructs critical
    projections from the event stream: latest session status, token usage sum,
    latest agent status, and latest merge queue status.
@@ -35,11 +36,12 @@ milestone, but the critical paths can be made transactional now.
 ## Replay check (2026-10-30)
 
 `session.replay` / `vp replay` compares the event stream with the current
-projections for session status, usage, team plan, todos, message count, and merge
-queue status/IDs. `--repair` / `session.replay {repair:true}` explicitly rebuilds
+projections for session status, usage, team plan, todos, messages, agent roster,
+and merge queue status/IDs. `--repair` / `session.replay {repair:true}` explicitly rebuilds
 the covered projections in one SQLite transaction: status/usage, plan, todos,
-messages (when every projected message has an event), and queue entries. It does
-**not** repair the agent roster or session creation metadata. A deliberate
+messages (when every projected message has an event), agent roster snapshots
+(`agent.snapshot`), and queue entries. It does **not** repair session creation
+metadata or export/rebuild the whole database from zero. A deliberate
 out-of-band projection write in the replay test proves that drift is detected and
 that repair restores the covered fields.
 

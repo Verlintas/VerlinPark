@@ -18,7 +18,7 @@ This file is for coding agents working in this repository. Read it before changi
 ## Invariants
 
 1. The Rust daemon owns state; the SwiftUI app is a client.
-2. Every state change is an event; append events before updating projections. Session status, usage, agent status, team plan, todos, messages, merge queue, and recovery now use atomic event+projection transactions. `session.replay` checks critical projection drift and `session.replay {repair:true}` / `vp replay --repair` rebuilds covered projections (status/usage, plan, todos, messages when event-covered, queue); agent roster and full rebuild/export are still not implemented. Do not claim full event sourcing (see AUDIT P1-5).
+2. Every state change is an event; append events before updating projections. Session status, usage, agent status, team plan, todos, messages, merge queue, and recovery now use atomic event+projection transactions. `session.replay` checks critical projection drift and `session.replay {repair:true}` / `vp replay --repair` rebuilds covered projections (status/usage, plan, todos, messages when event-covered, agent roster via `agent.snapshot`, queue); full export/from-scratch rebuild is still not implemented. Do not claim full event sourcing (see AUDIT P1-5).
 3. Do not add hidden model routing. Models and budgets are user-configured.
 4. Do not add an agent write path outside its worktree. The shell tool is not sandboxed yet; do not claim this is enforced for arbitrary commands.
 5. Do not log API keys or full secrets. Keychain is for secrets.

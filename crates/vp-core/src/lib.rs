@@ -26,6 +26,7 @@ struct ReplayData {
     messages: Vec<StoredMessage>,
     plan: Option<String>,
     todos: Vec<TodoItem>,
+    agents: Vec<AgentRecord>,
     queue: Vec<MergeQueueEntry>,
     events: Vec<Event>,
 }
@@ -691,6 +692,7 @@ impl Engine {
             let messages = store.list_messages(&id)?;
             let plan = store.get_team_plan(&id)?;
             let todos = store.list_todos(&id)?;
+            let agents = store.list_agents(&id)?;
             let queue = store.list_merge_queue(&id)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
@@ -698,6 +700,7 @@ impl Engine {
                 messages,
                 plan,
                 todos,
+                agents,
                 queue,
                 events,
             })
@@ -799,6 +802,35 @@ impl Engine {
             ));
         }
 
+        let replay_agents = data
+            .events
+            .iter()
+            .filter_map(|event| {
+                let agent = if event.kind == "agent.snapshot" {
+                    serde_json::from_value::<AgentRecord>(event.payload.clone()).ok()?
+                } else if event.kind == "agent.updated" {
+                    serde_json::from_value::<AgentRecord>(event.payload.get("agent")?.clone())
+                        .ok()?
+                } else {
+                    return None;
+                };
+                Some((agent.id.clone(), serde_json::to_value(agent).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_agents = data
+            .agents
+            .iter()
+            .filter_map(|agent| Some((agent.id.clone(), serde_json::to_value(agent).ok()?)))
+            .collect::<HashMap<_, _>>();
+        let agents_matches = replay_agents == projected_agents;
+        if !agents_matches {
+            mismatches.push(format!(
+                "agents: projection={}, replay={}",
+                projected_agents.len(),
+                replay_agents.len()
+            ));
+        }
+
         let replay_queue = data
             .events
             .iter()
@@ -828,6 +860,7 @@ impl Engine {
             && plan_matches
             && todos_matches
             && messages_matches
+            && agents_matches
             && queue_matches;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
@@ -837,6 +870,7 @@ impl Engine {
             plan_matches,
             todos_matches,
             messages_matches,
+            agents_matches,
             queue_matches,
             consistent,
             repaired,
@@ -919,6 +953,51 @@ impl Engine {
             (valid && projected_ids.is_subset(&event_ids)).then_some(event_messages)
         };
 
+        let agents = {
+            let mut event_agents = HashMap::new();
+            let mut valid = true;
+            for event in data
+                .events
+                .iter()
+                .filter(|event| event.kind == "agent.snapshot" || event.kind == "agent.updated")
+            {
+                let agent = if event.kind == "agent.snapshot" {
+                    serde_json::from_value::<AgentRecord>(event.payload.clone())
+                } else {
+                    serde_json::from_value::<AgentRecord>(event.payload["agent"].clone())
+                };
+                match agent {
+                    Ok(agent) => {
+                        event_agents.insert(agent.id.clone(), agent);
+                    }
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            let projected_ids = data
+                .agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let event_ids = event_agents
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            if valid && projected_ids.is_subset(&event_ids) {
+                let mut agents = event_agents.into_values().collect::<Vec<_>>();
+                agents.sort_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                Some(agents)
+            } else {
+                None
+            }
+        };
+
         let queue = {
             let mut entries = HashMap::new();
             let mut valid = true;
@@ -956,6 +1035,7 @@ impl Engine {
             plan,
             todos,
             messages,
+            agents,
             queue,
         })
     }
@@ -1015,8 +1095,8 @@ impl Engine {
         let role = role.to_string();
         let name = name.to_string();
         let model = model.to_string();
-        tokio::task::spawn_blocking(move || {
-            store.create_agent(
+        let (agent, event) = tokio::task::spawn_blocking(move || {
+            store.create_agent_with_snapshot(
                 &session_id,
                 &role,
                 &name,
@@ -1025,7 +1105,9 @@ impl Engine {
                 &model,
             )
         })
-        .await?
+        .await??;
+        let _ = self.events.send(event);
+        Ok(agent)
     }
 
     pub async fn create_task_worktree(
@@ -1069,15 +1151,28 @@ impl Engine {
         let id = agent_id.to_string();
         let worktree = worktree.to_string();
         let branch = branch.to_string();
-        tokio::task::spawn_blocking(move || store.set_agent_worktree(&id, &worktree, &branch))
-            .await?
+        let updated = tokio::task::spawn_blocking(move || {
+            store.set_agent_worktree_with_snapshot(&id, &worktree, &branch)
+        })
+        .await??;
+        if let Some((_, event)) = updated {
+            let _ = self.events.send(event);
+        }
+        Ok(())
     }
 
     pub async fn set_agent_profile(&self, agent_id: &str, profile: &str) -> Result<()> {
         let store = self.store.clone();
         let id = agent_id.to_string();
         let profile = profile.to_string();
-        tokio::task::spawn_blocking(move || store.set_agent_profile(&id, &profile)).await?
+        let updated = tokio::task::spawn_blocking(move || {
+            store.set_agent_profile_with_snapshot(&id, &profile)
+        })
+        .await??;
+        if let Some((_, event)) = updated {
+            let _ = self.events.send(event);
+        }
+        Ok(())
     }
 
     pub async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<()> {
@@ -1191,7 +1286,12 @@ impl Engine {
         let store = self.store.clone();
         let session_id = session_id.to_string();
         let model = model.to_string();
-        tokio::task::spawn_blocking(move || store.create_leader_agent(&session_id, &model)).await?
+        let (agent, event) = tokio::task::spawn_blocking(move || {
+            store.create_leader_agent_with_snapshot(&session_id, &model)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(agent.id)
     }
 
     pub async fn append_message(
@@ -1849,6 +1949,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions[0].status, "running");
+
+        engine
+            .store()
+            .update_agent_status(&agent.id, "cancelled")
+            .unwrap();
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(!report.agents_matches);
+        let repaired = engine.repair_session(&session.id).await.unwrap();
+        assert!(repaired.consistent, "{:?}", repaired.mismatches);
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        assert_eq!(agents[0].status, "running");
     }
 
     #[tokio::test]

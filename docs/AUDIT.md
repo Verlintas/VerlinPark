@@ -15,7 +15,7 @@
 - **P1-3 部分缓解**：Verifier shell 的审批卡会明确警告 “not sandboxed”；runtime 沙箱仍未实现。
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 和 `gh` PR flow 可用。仍缺自动冲突解决、LLM Integrator、非 GitHub PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
-- **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster/完整 rebuild 仍未实现。
+- **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；完整 export/从零 rebuild 仍未实现。
 - **仍未解决**：shell 沙箱、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
 当前测试：Rust 61（core 44 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
@@ -157,7 +157,7 @@
 
 - 修复前事件日志是审计流 + UI 增量来源，不是可完整 replay 的 event sourcing。
 - 修复后 session status / usage / agent status / merge queue 已同事务写事件；关键投影可由事件重建（有测试）。
-- team plan / todos / messages / recovery 已原子化；`session.replay` 校验关键投影，`--repair` 可修复覆盖字段，完整 rebuild/export 仍未完成。
+- team plan / todos / messages / recovery 已原子化；`session.replay` 校验关键投影，`--repair` 可修复覆盖字段（含 agent roster），完整 rebuild/export 仍未完成。
 
 **后续**
 

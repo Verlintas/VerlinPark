@@ -366,7 +366,7 @@ fn print_human(value: &Value) {
     }
     if let Some(consistent) = value.get("consistent").and_then(Value::as_bool) {
         println!(
-            "{}  events={}  status={} usage={} plan={} todos={} messages={} queue={}",
+            "{}  events={}  status={} usage={} plan={} todos={} messages={} agents={} queue={}",
             if consistent { "consistent" } else { "MISMATCH" },
             value["event_count"].as_u64().unwrap_or(0),
             value["status_matches"].as_bool().unwrap_or(false),
@@ -374,6 +374,7 @@ fn print_human(value: &Value) {
             value["plan_matches"].as_bool().unwrap_or(false),
             value["todos_matches"].as_bool().unwrap_or(false),
             value["messages_matches"].as_bool().unwrap_or(false),
+            value["agents_matches"].as_bool().unwrap_or(false),
             value["queue_matches"].as_bool().unwrap_or(false)
         );
         if value["repaired"].as_bool().unwrap_or(false) {

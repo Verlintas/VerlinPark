@@ -359,6 +359,7 @@ pub struct SessionReplayReport {
     pub plan_matches: bool,
     pub todos_matches: bool,
     pub messages_matches: bool,
+    pub agents_matches: bool,
     pub queue_matches: bool,
     pub consistent: bool,
     #[serde(default)]
