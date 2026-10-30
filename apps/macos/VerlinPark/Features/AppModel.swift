@@ -619,7 +619,10 @@ final class AppModel {
             )
         }
 
-        if event.type == "session.created" || event.type == "session.worktree" {
+        if event.type == "session.created"
+            || event.type == "session.worktree"
+            || event.type == "session.imported"
+        {
             Task { await self.loadSessions() }
         }
 

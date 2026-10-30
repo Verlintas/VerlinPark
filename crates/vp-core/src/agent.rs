@@ -683,6 +683,12 @@ impl AgentService {
                 "agent provider is not configured; set VERLINPARK_BASE_URL and VERLINPARK_MODEL"
             ));
         };
+        let (session, _) = load_session_project(self.engine.store().clone(), session_id).await?;
+        if session.status == "imported" {
+            anyhow::bail!(
+                "imported sessions are read-only archives; create a new session to continue"
+            );
+        }
 
         let control = Arc::new(RunControl::new());
         {

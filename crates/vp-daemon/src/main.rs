@@ -29,8 +29,8 @@ use vp_protocol::types::{
     MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectListResult, PromptParams,
     PromptResult, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
     RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams,
-    SessionListResult, SessionTodosParams, SessionTodosResult, SubscribeParams, TeamPlanParams,
-    TeamPlanResult,
+    SessionImportParams, SessionListResult, SessionTodosParams, SessionTodosResult,
+    SubscribeParams, TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -495,6 +495,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.export" => match parse_params::<SessionExportParams>(request.params) {
             Ok(params) => match state.engine.export_session(&params.session_id).await {
                 Ok(bundle) => RpcResponse::success(id, bundle),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.import" => match parse_params::<SessionImportParams>(request.params) {
+            Ok(params) => match state.engine.import_session(params.bundle).await {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

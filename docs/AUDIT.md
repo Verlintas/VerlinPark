@@ -15,7 +15,7 @@
 - **P1-3 部分缓解**：Verifier shell 的审批卡会明确警告 “not sandboxed”；runtime 沙箱仍未实现。
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 和 `gh` PR flow 可用。仍缺自动冲突解决、LLM Integrator、非 GitHub PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
-- **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` 和 `--rebuild` 已实现；数据库项目/会话创建元数据的从零导入仍未实现。
+- **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 目前是只读 archive，工作区 rehydrate 仍未实现。
 - **仍未解决**：shell 沙箱、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
 当前测试：Rust 61（core 44 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
@@ -333,7 +333,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 - session status / usage / agent status / merge queue 的 event+projection 原子事务。
 - team plan / todos / messages / recovery 原子化。
 - `session.replay` / `vp replay` 投影一致性检查、`--repair` 与 `--rebuild`。
-- `session.export` / `vp export` bundle。
+- `session.export` / `vp export` bundle 与 `session.import` / `vp import` 只读 archive。
 - 事件流重建关键投影的回归测试。
 
 ---

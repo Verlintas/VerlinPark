@@ -78,6 +78,8 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Import an archived session bundle into the local daemon.
+    Import { bundle: PathBuf },
     /// Replay the event stream and check projection consistency.
     Replay {
         session: String,
@@ -216,6 +218,12 @@ async fn main() -> Result<()> {
             }
             value
         }
+        Command::Import { bundle } => {
+            let data =
+                std::fs::read(&bundle).with_context(|| format!("reading {}", bundle.display()))?;
+            let parsed: Value = serde_json::from_slice(&data).context("parsing session bundle")?;
+            rpc(&discovery, "session.import", json!({"bundle": parsed})).await?
+        }
         Command::Replay {
             session,
             repair,
@@ -324,6 +332,16 @@ fn print_json(value: &Value) -> Result<()> {
 }
 
 fn print_human(value: &Value) {
+    if value.get("session_id").is_some() && value.get("events").is_some() {
+        println!(
+            "imported session {} into project {} · events={} · status={}",
+            value["session_id"].as_str().unwrap_or("?"),
+            value["project_id"].as_str().unwrap_or("?"),
+            value["events"].as_u64().unwrap_or(0),
+            value["status"].as_str().unwrap_or("?")
+        );
+        return;
+    }
     if value.get("version").is_some() && value.get("exported_at").is_some() {
         println!(
             "session {}  events={}  agents={}  messages={}  queue={}",

@@ -349,6 +349,19 @@ pub struct SessionExportParams {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SessionImportParams {
+    pub bundle: SessionBundle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionImportResult {
+    pub project_id: String,
+    pub session_id: String,
+    pub events: usize,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ReplaySessionParams {
     pub session_id: String,
     #[serde(default)]

@@ -8,7 +8,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AgentRecord, Approval, Event, MergeQueueEntry, Project, Session, StoredMessage, TodoItem,
+    AgentRecord, Approval, Event, MergeQueueEntry, Project, Session, SessionBundle, StoredMessage,
+    TodoItem,
 };
 
 use crate::paths;
@@ -1382,6 +1383,194 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn import_session_bundle(&self, bundle: &SessionBundle) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        let existing_root: Option<String> = tx
+            .query_row(
+                "SELECT root FROM projects WHERE id = ?1",
+                params![bundle.project.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing_root {
+            Some(root) if root != bundle.project.root => {
+                return Err(anyhow!(
+                    "project {} already exists with a different root",
+                    bundle.project.id
+                ));
+            }
+            Some(_) => {}
+            None => {
+                tx.execute(
+                    "INSERT INTO projects (id, name, root, default_branch, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        bundle.project.id,
+                        bundle.project.name,
+                        bundle.project.root,
+                        bundle.project.default_branch,
+                        bundle.project.created_at
+                    ],
+                )?;
+            }
+        }
+
+        let session_exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                params![bundle.session.id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if session_exists {
+            return Err(anyhow!("session already exists: {}", bundle.session.id));
+        }
+
+        let plan_json = bundle
+            .team_plan
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        tx.execute(
+            "INSERT INTO sessions
+             (id, project_id, goal, status, worktree, branch, token_budget, base_commit, team_plan, tokens_in, tokens_out, created_at)
+             VALUES (?1, ?2, ?3, 'imported', NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                bundle.session.id,
+                bundle.session.project_id,
+                bundle.session.goal,
+                bundle.session.branch,
+                bundle.session.token_budget,
+                bundle.session.base_commit,
+                plan_json,
+                bundle.session.tokens_in as i64,
+                bundle.session.tokens_out as i64,
+                bundle.session.created_at
+            ],
+        )?;
+        for agent in &bundle.agents {
+            tx.execute(
+                "INSERT INTO agents
+                 (id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    agent.id,
+                    agent.session_id,
+                    agent.role,
+                    agent.name,
+                    agent.title,
+                    agent.profile,
+                    agent.parent_id,
+                    agent.worktree,
+                    agent.branch,
+                    agent.status,
+                    agent.model,
+                    agent.created_at
+                ],
+            )?;
+        }
+        for message in &bundle.messages {
+            tx.execute(
+                "INSERT INTO messages
+                 (id, session_id, role, content, tool_calls, tool_call_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    message.id,
+                    message.session_id,
+                    message.role,
+                    message.content,
+                    serde_json::to_string(&message.tool_calls)?,
+                    message.tool_call_id,
+                    message.created_at
+                ],
+            )?;
+        }
+        for (position, item) in bundle.todos.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO todos (session_id, position, title, status, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    bundle.session.id,
+                    position as i64,
+                    item.title,
+                    item.status,
+                    bundle.exported_at
+                ],
+            )?;
+        }
+        for entry in &bundle.merge_queue {
+            tx.execute(
+                "INSERT INTO merge_queue
+                 (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    entry.id,
+                    entry.session_id,
+                    entry.agent_id,
+                    entry.agent_name,
+                    entry.task_id,
+                    entry.branch,
+                    entry.commit,
+                    entry.base_commit,
+                    entry.status,
+                    entry.attempt as i64,
+                    entry.detail,
+                    entry.created_at,
+                    entry.updated_at
+                ],
+            )?;
+        }
+        for event in &bundle.events {
+            if event.session_id != bundle.session.id {
+                return Err(anyhow!(
+                    "bundle event belongs to a different session: {}",
+                    event.session_id
+                ));
+            }
+            tx.execute(
+                "INSERT INTO events (session_id, seq, type, payload, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    event.session_id,
+                    event.seq as i64,
+                    event.kind,
+                    serde_json::to_string(&event.payload)?,
+                    event.created_at
+                ],
+            )?;
+        }
+        let status_event = insert_event_tx(
+            &tx,
+            &bundle.session.id,
+            "session.updated",
+            serde_json::json!({"status": "imported"}),
+        )?;
+        let imported_event = insert_event_tx(
+            &tx,
+            &bundle.session.id,
+            "session.imported",
+            serde_json::json!({
+                "exported_at": bundle.exported_at,
+                "source_project_id": bundle.project.id,
+            }),
+        )?;
+        tx.commit()?;
+        for event in &bundle.events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        for event in [&status_event, &imported_event] {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok(imported_event)
     }
 
     pub fn interrupt_running_sessions(&self) -> Result<Vec<String>> {

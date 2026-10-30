@@ -31,10 +31,11 @@
 | 预算 / 取消 | ✅ | token reservation + provider usage 结算；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复 |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；UI Approve/Deny |
 | 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR 事件；Collab roster；Preview Plan/Changes/Queue/Trace |
-| Event consistency | ✅ | session status / usage / agent status / team plan / todos / messages / merge queue / agent roster / recovery 使用 event+projection 原子事务；`session.replay` / `--repair` / `--rebuild` 可校验并重建覆盖投影；`session.export` 导出 bundle |
+| Event consistency | ✅ | session status / usage / agent status / team plan / todos / messages / merge queue / agent roster / recovery 使用 event+projection 原子事务；`session.replay` / `--repair` / `--rebuild` 可校验并重建覆盖投影；`session.export` / `session.import` 支持 bundle 迁移 |
+| Import archive | ✅ | `vp import <bundle>` 保留 session/project/事件与投影；导入 session 为只读 archive，不创建 worktree |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
 | Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
-| CLI | ✅ | ping/info/projects/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/todos/agents/team-plan/queue/retry/land/pr/replay [--repair|--rebuild]/export |
+| CLI | ✅ | ping/info/projects/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/todos/agents/team-plan/queue/retry/land/pr/replay [--repair|--rebuild]/export/import |
 
 ## 验证
 
@@ -83,6 +84,7 @@
 - **M3 第六切片**：team plan / todos / messages / recovery 原子化，`session.replay` / `vp replay` 一致性检查与 `--repair`。
 - **M3 第七切片**：`agent.snapshot` 完整 roster 事件与 agent 表 repair。
 - **M3 第八切片**：`session.export` bundle 与 `--rebuild` 强制投影重建。
+- **M3 第九切片**：`session.import` bundle archive 导入（只读、不自动创建 worktree）。
 
 ## 如何运行
 

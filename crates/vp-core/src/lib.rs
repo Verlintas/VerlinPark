@@ -11,8 +11,8 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
     AgentRecord, Approval, Event, MergeQueueEntry, Project, PullRequestResult, Session,
-    SessionBundle, SessionCommit, SessionDiff, SessionLandResult, SessionReplayReport,
-    StoredMessage, TeamPlan, TodoItem,
+    SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
+    SessionReplayReport, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -265,7 +265,22 @@ impl Engine {
         Ok(sessions.len())
     }
 
+    async fn reject_imported_session(&self, session_id: &str) -> Result<()> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!(
+                "imported sessions are read-only archives; create a new session to continue"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn discard_session(&self, session_id: &str) -> Result<()> {
+        self.reject_imported_session(session_id).await?;
         let session = self.ensure_session_worktree(session_id).await?;
         let worktree = session
             .worktree
@@ -284,6 +299,7 @@ impl Engine {
     }
 
     pub async fn commit_session(&self, session_id: &str, message: &str) -> Result<SessionCommit> {
+        self.reject_imported_session(session_id).await?;
         let message = message.trim().to_string();
         if message.is_empty() {
             return Err(anyhow::anyhow!("commit message is required"));
@@ -341,6 +357,7 @@ impl Engine {
     }
 
     pub async fn land_session(&self, session_id: &str) -> Result<SessionLandResult> {
+        self.reject_imported_session(session_id).await?;
         let session = self.ensure_session_worktree(session_id).await?;
         let session_branch = session
             .branch
@@ -426,6 +443,7 @@ impl Engine {
     }
 
     pub async fn open_pull_request(&self, session_id: &str) -> Result<PullRequestResult> {
+        self.reject_imported_session(session_id).await?;
         let gh = std::env::var("VERLINPARK_GH_BIN").unwrap_or_else(|_| "gh".to_string());
         self.open_pull_request_with_gh(session_id, &gh).await
     }
@@ -631,6 +649,20 @@ impl Engine {
     }
 
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        if let Some(session) = tokio::task::spawn_blocking(move || store.get_session(&id)).await??
+            && session.status == "imported"
+        {
+            return Ok(SessionDiff {
+                session_id: session.id,
+                branch: session.branch.unwrap_or_default(),
+                worktree: session.worktree.unwrap_or_default(),
+                base_commit: session.base_commit,
+                status: "imported archive · worktree not restored".to_string(),
+                patch: String::new(),
+            });
+        }
         let session = self.ensure_session_worktree(session_id).await?;
         let worktree = session
             .worktree
@@ -1038,6 +1070,32 @@ impl Engine {
             messages,
             agents,
             queue,
+        })
+    }
+
+    pub async fn import_session(&self, bundle: SessionBundle) -> Result<SessionImportResult> {
+        let root = PathBuf::from(&bundle.project.root);
+        if !root.is_dir() {
+            anyhow::bail!(
+                "bundle project root does not exist locally: {}",
+                bundle.project.root
+            );
+        }
+        if bundle.session.project_id != bundle.project.id {
+            anyhow::bail!("bundle session/project ids do not match");
+        }
+        let project_id = bundle.project.id.clone();
+        let session_id = bundle.session.id.clone();
+        let event_count = bundle.events.len() + 2;
+        let store = self.store.clone();
+        let event =
+            tokio::task::spawn_blocking(move || store.import_session_bundle(&bundle)).await??;
+        let _ = self.events.send(event);
+        Ok(SessionImportResult {
+            project_id,
+            session_id,
+            events: event_count,
+            status: "imported".to_string(),
         })
     }
 
@@ -2023,6 +2081,36 @@ mod tests {
             .await
             .unwrap();
         assert!(events.iter().any(|event| event.kind == "session.rebuilt"));
+
+        let import_data = TempDir::new().unwrap();
+        let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
+        let imported = imported_engine.import_session(bundle).await.unwrap();
+        assert_eq!(imported.session_id, session.id);
+        assert_eq!(imported.status, "imported");
+        let imported_sessions = imported_engine
+            .list_sessions(Some(imported.project_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(imported_sessions[0].status, "imported");
+        assert!(imported_sessions[0].worktree.is_none());
+        let imported_agents = imported_engine.list_agents(&session.id).await.unwrap();
+        assert_eq!(imported_agents.len(), 1);
+        let imported_messages = imported_engine.list_messages(&session.id).await.unwrap();
+        assert_eq!(imported_messages.len(), 1);
+        let imported_report = imported_engine.replay_session(&session.id).await.unwrap();
+        assert!(
+            imported_report.consistent,
+            "{:?}",
+            imported_report.mismatches
+        );
+        let imported_diff = imported_engine.session_diff(&session.id).await.unwrap();
+        assert!(imported_diff.status.contains("imported archive"));
+        assert!(imported_diff.worktree.is_empty());
+        let error = imported_engine
+            .discard_session(&session.id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("read-only"));
     }
 
     #[tokio::test]
