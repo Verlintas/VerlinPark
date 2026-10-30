@@ -19,7 +19,10 @@ use vp_protocol::types::{
 use vp_store::Store;
 use vp_store::store::SessionRepair;
 
+use crate::budget::BudgetRegistry;
+
 pub mod agent;
+pub mod budget;
 pub mod tools;
 pub mod worktree;
 
@@ -42,6 +45,7 @@ pub struct Engine {
     events: broadcast::Sender<Event>,
     approval_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     git_lock: Arc<Mutex<()>>,
+    budget_registry: Arc<BudgetRegistry>,
 }
 
 fn add_usage_bucket(buckets: &mut HashMap<String, UsageBucket>, key: &str, entry: &UsageEntry) {
@@ -122,7 +126,12 @@ impl Engine {
             events,
             approval_waiters: Arc::new(Mutex::new(HashMap::new())),
             git_lock: Arc::new(Mutex::new(())),
+            budget_registry: Arc::new(BudgetRegistry::new()),
         }
+    }
+
+    pub fn budget_registry(&self) -> &Arc<BudgetRegistry> {
+        &self.budget_registry
     }
 
     pub fn store(&self) -> &Store {

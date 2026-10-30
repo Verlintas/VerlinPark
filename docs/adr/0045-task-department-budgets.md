@@ -35,11 +35,10 @@ task DAG, which is the natural place to declare narrower budgets.
 6. **Scope-aware failure.** Budget stops carry a scope (`session`, `task`,
    `department`). A task/department stop blocks or fails that task and allows
    the plan to continue. A session stop still aborts the session.
-7. **One-call overshoot.** Cost cannot be known before a provider call, and
-   concurrent tasks in one department share a ledger but not a reservation.
-   A department can overshoot by up to one call per concurrently running task.
-   This is deliberate; per-scope reservations would need a shared atomic budget
-   registry and are not implemented.
+7. **Atomic reservations.** ADR-0047 adds a daemon-wide in-flight reservation
+   registry. Concurrent task/department calls reserve the tightest affordable
+   output budget atomically, so they no longer each pass the same ledger check.
+   The post-call ledger check remains authoritative.
 8. **Warning threshold.** The session budget emits one `agent.budget_warning`
    at 80% of tokens, cost, or time. Task/department warning thresholds are not
    emitted separately; their blocked/failed events carry the scope.
@@ -55,7 +54,8 @@ task DAG, which is the natural place to declare narrower budgets.
 - Manual delegation tasks without a plan task ID are only covered by the
   session budget.
 - The ledger query adds a small SQLite read per turn when task/department
-  budgets are active; agents with no scope budget skip it.
+  budgets are active; agents with no scope budget skip it. ADR-0047 adds a
+  process-local reservation on top of that read.
 - Task/department budget failures are visible as `agent.budget_exceeded` with
   `scope`, `id`, `limit`, and `spent`, and as blocked `plan_task.finished`
   events.
@@ -67,5 +67,6 @@ task DAG, which is the natural place to declare narrower budgets.
   department across parallel tasks.
 - **Abort the whole plan on any task budget stop:** wastes unaffected work and
   makes one bad task take down the session.
-- **Shared atomic department reservations:** correct but requires a new
-  daemon-wide budget registry, persistence, and recovery semantics.
+- **Shared atomic department reservations:** implemented in ADR-0047 with a
+  process-local registry; durable reservation recovery is still not needed
+  because in-flight calls die with the daemon.

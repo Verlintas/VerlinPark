@@ -22,6 +22,7 @@ use vp_providers::{
 use vp_store::Store;
 
 use crate::Engine;
+use crate::budget::{BudgetReason, Rejection, ScopeRequest, Spend};
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::worktree;
 
@@ -238,6 +239,7 @@ impl RunControl {
     ) -> Result<()> {
         let mut finalized = self.finalized.lock().await;
         *finalized = Some(status.to_string());
+        engine.budget_registry().clear_session(session_id);
         engine.update_session_status(session_id, status).await
     }
 
@@ -728,6 +730,8 @@ struct BudgetStop {
     spent_tokens: u64,
     limit_cost: Option<f64>,
     spent_cost: f64,
+    reserved_tokens: u64,
+    reserved_cost: f64,
     elapsed_secs: Option<u64>,
 }
 
@@ -741,7 +745,28 @@ impl BudgetStop {
             spent_tokens: budget.spent(),
             limit_cost: budget.cost_limit,
             spent_cost: budget.cost_spent(),
+            reserved_tokens: 0,
+            reserved_cost: 0.0,
             elapsed_secs: Some(budget.elapsed_secs()),
+        }
+    }
+
+    fn from_rejection(rejection: Rejection) -> Self {
+        Self {
+            scope: rejection.scope.to_string(),
+            reason: match rejection.reason {
+                BudgetReason::Tokens => "tokens",
+                BudgetReason::Cost => "cost",
+            }
+            .to_string(),
+            id: Some(rejection.id),
+            limit_tokens: rejection.limit_tokens,
+            spent_tokens: rejection.spent_tokens,
+            limit_cost: rejection.limit_cost,
+            spent_cost: rejection.spent_cost,
+            reserved_tokens: rejection.reserved_tokens,
+            reserved_cost: rejection.reserved_cost,
+            elapsed_secs: None,
         }
     }
 
@@ -765,6 +790,8 @@ impl BudgetStop {
             "spent": self.spent_tokens,
             "cost_limit_usd": self.limit_cost,
             "cost_spent_usd": self.spent_cost,
+            "reserved_tokens": self.reserved_tokens,
+            "reserved_cost_usd": self.reserved_cost,
             "elapsed_secs": self.elapsed_secs,
         })
     }
@@ -3047,87 +3074,53 @@ impl PlanBudgetScope {
             spent_tokens: spent.0,
             limit_cost,
             spent_cost: spent.1,
+            reserved_tokens: 0,
+            reserved_cost: 0.0,
             elapsed_secs: None,
         }
     }
 
-    fn precheck(
+    fn requests(
         &self,
         task: (u64, f64),
         department: (u64, f64),
-        input_estimate: u64,
-        min_output: u64,
-    ) -> Option<BudgetStop> {
-        if let Some(limit) = self.task_cost
-            && task.1 >= limit
+        input_price: f64,
+        output_price: f64,
+    ) -> Vec<ScopeRequest> {
+        let mut requests = Vec::new();
+        if (self.task_tokens.is_some() || self.task_cost.is_some())
+            && let Some(id) = &self.task_id
         {
-            return Some(self.stop(
-                "task",
-                self.task_id.as_deref().unwrap_or("?"),
-                "cost",
-                self.task_tokens,
-                task,
-                Some(limit),
-            ));
+            requests.push(ScopeRequest {
+                scope: "task",
+                id: id.clone(),
+                limit_tokens: self.task_tokens,
+                limit_cost: self.task_cost,
+                observed: Spend {
+                    tokens: task.0,
+                    cost_usd: task.1,
+                },
+                input_price_per_m: input_price,
+                output_price_per_m: output_price,
+            });
         }
-        if let Some(limit) = self.department_cost
-            && department.1 >= limit
+        if (self.department_tokens.is_some() || self.department_cost.is_some())
+            && let Some(id) = &self.department
         {
-            return Some(self.stop(
-                "department",
-                self.department.as_deref().unwrap_or("?"),
-                "cost",
-                self.department_tokens,
-                department,
-                Some(limit),
-            ));
+            requests.push(ScopeRequest {
+                scope: "department",
+                id: id.clone(),
+                limit_tokens: self.department_tokens,
+                limit_cost: self.department_cost,
+                observed: Spend {
+                    tokens: department.0,
+                    cost_usd: department.1,
+                },
+                input_price_per_m: input_price,
+                output_price_per_m: output_price,
+            });
         }
-        if let Some(limit) = self.task_tokens {
-            let remaining = limit.saturating_sub(task.0);
-            if remaining <= input_estimate.saturating_add(min_output) {
-                return Some(self.stop(
-                    "task",
-                    self.task_id.as_deref().unwrap_or("?"),
-                    "tokens",
-                    Some(limit),
-                    task,
-                    self.task_cost,
-                ));
-            }
-        }
-        if let Some(limit) = self.department_tokens {
-            let remaining = limit.saturating_sub(department.0);
-            if remaining <= input_estimate.saturating_add(min_output) {
-                return Some(self.stop(
-                    "department",
-                    self.department.as_deref().unwrap_or("?"),
-                    "tokens",
-                    Some(limit),
-                    department,
-                    self.department_cost,
-                ));
-            }
-        }
-        None
-    }
-
-    fn output_limit(&self, task: (u64, f64), department: (u64, f64), input_estimate: u64) -> u64 {
-        let mut limit = u64::MAX;
-        if let Some(limit_tokens) = self.task_tokens {
-            limit = limit.min(
-                limit_tokens
-                    .saturating_sub(task.0)
-                    .saturating_sub(input_estimate),
-            );
-        }
-        if let Some(limit_tokens) = self.department_tokens {
-            limit = limit.min(
-                limit_tokens
-                    .saturating_sub(department.0)
-                    .saturating_sub(input_estimate),
-            );
-        }
-        limit
+        requests
     }
 
     fn after(&self, task: (u64, f64), department: (u64, f64)) -> Option<BudgetStop> {
@@ -3340,6 +3333,7 @@ async fn run_loop(
         const MIN_OUTPUT_TOKENS: u64 = 64;
         let configured_output = config.max_tokens.unwrap_or(4096).max(1) as u64;
         let input_estimate = estimate_request_tokens(&request);
+        let (input_price, output_price) = role_price(config, spec.role);
         let scope_spent = if plan_budget.active() {
             Some(
                 engine
@@ -3359,32 +3353,40 @@ async fn run_loop(
         let department_spent = scope_spent
             .map(|(_, _, tokens, cost)| (tokens, cost))
             .unwrap_or((0, 0.0));
-        if let Some(stop) = plan_budget.precheck(
-            task_spent,
-            department_spent,
-            input_estimate,
-            MIN_OUTPUT_TOKENS,
-        ) {
-            emit_scope_budget_stop(engine, &session.id, spec, &stop).await?;
-            return Ok(LoopOutcome::BudgetExceeded(stop));
-        }
-        let mut output_budget = configured_output;
-        if plan_budget.active() {
-            output_budget = output_budget.min(plan_budget.output_limit(
-                task_spent,
-                department_spent,
-                input_estimate,
-            ));
-        }
-        if budget.limit.is_some() {
+        let desired_output = if budget.limit.is_some() {
             let remaining = budget.available_tokens().unwrap_or(0);
             if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
                 return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session_tokens(
                     budget,
                 )));
             }
-            output_budget = output_budget.min(remaining - input_estimate);
-        }
+            configured_output.min(remaining - input_estimate)
+        } else {
+            configured_output
+        };
+        let scope_lease = if plan_budget.active() {
+            let requests =
+                plan_budget.requests(task_spent, department_spent, input_price, output_price);
+            match engine.budget_registry().grant(
+                &session.id,
+                &requests,
+                input_estimate,
+                desired_output,
+                MIN_OUTPUT_TOKENS,
+            ) {
+                Ok(lease) => Some(lease),
+                Err(rejection) => {
+                    let stop = BudgetStop::from_rejection(rejection);
+                    emit_scope_budget_stop(engine, &session.id, spec, &stop).await?;
+                    return Ok(LoopOutcome::BudgetExceeded(stop));
+                }
+            }
+        } else {
+            None
+        };
+        let output_budget = scope_lease
+            .as_ref()
+            .map_or(desired_output, |lease| lease.granted_output_tokens());
         let mut token_reservation = None;
         if budget.limit.is_some() {
             let Some(reservation) =
@@ -3399,6 +3401,7 @@ async fn run_loop(
         if output_budget < configured_output {
             request.max_tokens = Some(output_budget.min(u32::MAX as u64) as u32);
         }
+        let _scope_lease = scope_lease;
         let mut stream = config
             .provider
             .stream_chat(request.clone())
@@ -3468,7 +3471,6 @@ async fn run_loop(
             );
             (input, output, true)
         };
-        let (input_price, output_price) = role_price(config, spec.role);
         let cost = usage_cost(input_tokens, output_tokens, input_price, output_price);
         engine
             .record_agent_usage(

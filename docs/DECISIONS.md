@@ -56,6 +56,7 @@
 | [0044](adr/0044-per-call-usage-ledger.md) | Per-call usage ledger | Accepted | 成本/预算/可观测性 |
 | [0045](adr/0045-task-department-budgets.md) | Task and department budgets | Accepted | 预算/调度/失败语义 |
 | [0046](adr/0046-mailbox-retention-gc.md) | Mailbox retention GC | Accepted | 邮箱/磁盘/保留策略 |
+| [0047](adr/0047-budget-reservations.md) | In-flight task/department budget reservations | Accepted | 预算/并发/正确性 |
 
 ---
 
