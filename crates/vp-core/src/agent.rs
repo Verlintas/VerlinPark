@@ -560,9 +560,9 @@ impl AgentService {
             .get_merge_queue_entry(entry_id)
             .await?
             .ok_or_else(|| anyhow!("merge queue entry not found: {entry_id}"))?;
-        if !matches!(entry.status.as_str(), "conflict" | "failed") {
+        if !matches!(entry.status.as_str(), "conflict" | "failed" | "interrupted") {
             return Err(anyhow!(
-                "merge queue entry is {}, only conflict/failed can be retried",
+                "merge queue entry is {}, only conflict/failed/interrupted can be retried",
                 entry.status
             ));
         }

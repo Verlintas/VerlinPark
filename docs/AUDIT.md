@@ -14,9 +14,10 @@
 - **P1-4 已修复**：`fetch_url` 在连接前解析并固定已校验的 IP，阻止解析到 loopback/private/link-local/文档/benchmark 等地址；补充了 IPv4-mapped IPv6 与特殊段检查。
 - **P1-3 部分缓解**：Verifier shell 的审批卡会明确警告 “not sandboxed”；runtime 沙箱仍未实现。
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 和 `gh` PR flow 可用。仍缺自动冲突解决、LLM Integrator、非 GitHub PR adapter。
-- **仍未解决**：shell 沙箱、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree 清理、P2 batch abort 状态一致性。
+- **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
+- **仍未解决**：shell 沙箱、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 58（core 42 / store 11 / providers 5），Swift 9。CI 以最新提交为准。
+当前测试：Rust 59（core 42 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
 
 ---
 
@@ -46,7 +47,7 @@
 | 隔离与安全 | C+ | 路径 jail、loopback token、fetch_url DNS 固定做得不错；shell 仍无沙箱 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
-| 测试 | B− | 58 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing/PR 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 59 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing/PR/recovery 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -320,12 +321,18 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 - 本地 landing（clean + default branch 检查，`--no-ff`）。
 - 显式 push + `gh pr create`（preflight、no fake success）。
 
+第四轮（2026-10-30）做恢复：
+
+- daemon 重启把 queued/merging/checking entry 标为 interrupted，并补事件。
+- interrupted entry 可走同一条 rebase+retry 路径。
+- daemon 重启后的 in-flight merge queue recovery。
+
 ---
 
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 58 passed after the 10-30 retry/landing/PR slices
+cargo test --workspace     # 59 passed after the 10-30 retry/landing/PR/recovery slices
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```

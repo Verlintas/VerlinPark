@@ -1092,7 +1092,7 @@ private struct MergeQueueRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
             }
-            if entry.status == "conflict" || entry.status == "failed" {
+            if entry.status == "conflict" || entry.status == "failed" || entry.status == "interrupted" {
                 Button {
                     retrying = true
                     Task {
@@ -1119,7 +1119,7 @@ private struct MergeQueueRow: View {
     private var color: Color {
         switch entry.status {
         case "merged": .green
-        case "conflict", "failed": .red
+        case "conflict", "failed", "interrupted": .red
         case "merging", "checking": .orange
         default: .secondary
         }
@@ -1129,7 +1129,7 @@ private struct MergeQueueRow: View {
         switch entry.status {
         case "merged": "checkmark.circle.fill"
         case "conflict": "exclamationmark.triangle.fill"
-        case "failed": "xmark.circle.fill"
+        case "failed", "interrupted": "xmark.circle.fill"
         case "merging", "checking": "arrow.triangle.2.circlepath"
         default: "clock"
         }

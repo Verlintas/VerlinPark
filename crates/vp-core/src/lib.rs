@@ -252,9 +252,10 @@ impl Engine {
 
     pub async fn recover_interrupted_sessions(&self) -> Result<usize> {
         let store = self.store.clone();
-        let (sessions, approvals, _agents) = tokio::task::spawn_blocking(move || {
+        let (sessions, approvals, _agents, queue) = tokio::task::spawn_blocking(move || {
             let sessions = store.interrupt_running_sessions()?;
             let agents = store.interrupt_running_agents()?;
+            let queue = store.interrupt_merge_queue()?;
             let pending = store
                 .list_approvals(None)?
                 .into_iter()
@@ -266,7 +267,7 @@ impl Engine {
                     denied.push(approval);
                 }
             }
-            Ok::<_, anyhow::Error>((sessions, denied, agents))
+            Ok::<_, anyhow::Error>((sessions, denied, agents, queue))
         })
         .await??;
 
@@ -297,6 +298,15 @@ impl Engine {
                         "approval_id": approval.id,
                         "approved": false,
                     }),
+                )
+                .await;
+        }
+        for entry in &queue {
+            let _ = self
+                .append_event(
+                    &entry.session_id,
+                    "merge_queue.updated",
+                    serde_json::json!({"entry": entry}),
                 )
                 .await;
         }
@@ -1360,6 +1370,23 @@ mod tests {
             )
             .await
             .unwrap();
+        let queue_entry = engine
+            .enqueue_merge(
+                &session.id,
+                "agent-1",
+                "Worker 1",
+                Some("T1".into()),
+                "verlinpark/task",
+                "abc123",
+                "def456",
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .update_merge_queue_entry(&queue_entry.id, "merging", None)
+            .await
+            .unwrap();
         let recovered = engine.recover_interrupted_sessions().await.unwrap();
         assert_eq!(recovered, 1);
         let sessions = engine
@@ -1372,10 +1399,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(approvals[0].status, "denied");
-        let events = engine.list_events(session.id, 0, 100).await.unwrap();
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
         assert!(events.iter().any(|event| event.kind == "agent.failed"));
         assert!(events.iter().any(|event| event.kind == "approval.resolved"
             && event.payload["approval_id"] == approval.id));
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue[0].status, "interrupted");
+        assert!(events.iter().any(|event| {
+            event.kind == "merge_queue.updated"
+                && event.payload["entry"]["id"] == queue_entry.id
+                && event.payload["entry"]["status"] == "interrupted"
+        }));
     }
 
     #[tokio::test]

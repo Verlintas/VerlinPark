@@ -926,11 +926,43 @@ impl Store {
             "UPDATE merge_queue
              SET status = 'queued', attempt = attempt + 1, commit_hash = ?1,
                  base_commit = ?2, detail = ?3, updated_at = ?4
-             WHERE id = ?5 AND status IN ('conflict', 'failed')",
+             WHERE id = ?5 AND status IN ('conflict', 'failed', 'interrupted')",
             params![commit, base_commit, detail, now_rfc3339(), id],
         )?;
         drop(conn);
         self.get_merge_queue_entry(id)
+    }
+
+    pub fn interrupt_merge_queue(&self) -> Result<Vec<MergeQueueEntry>> {
+        let conn = self.lock()?;
+        let ids = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM merge_queue WHERE status IN ('queued', 'merging', 'checking')",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        conn.execute(
+            "UPDATE merge_queue
+             SET status = 'interrupted',
+                 detail = 'daemon restarted during integration',
+                 updated_at = ?1
+             WHERE status IN ('queued', 'merging', 'checking')",
+            params![now_rfc3339()],
+        )?;
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in ids {
+            entries.push(conn.query_row(
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+                 FROM merge_queue WHERE id = ?1",
+                params![id],
+                map_merge_queue_entry,
+            )?);
+        }
+        Ok(entries)
     }
 
     pub fn list_approvals(&self, session_id: Option<&str>) -> Result<Vec<Approval>> {
@@ -1295,6 +1327,34 @@ mod tests {
         let listed = store.list_merge_queue(&session.id).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, entry.id);
+    }
+
+    #[test]
+    fn interrupts_in_flight_merge_queue_entries() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "recover").unwrap();
+        let entry = store
+            .enqueue_merge(
+                &session.id,
+                "agent_1",
+                "Worker 1",
+                None,
+                "verlinpark/task",
+                "abc123",
+                "def456",
+                None,
+            )
+            .unwrap();
+        store
+            .update_merge_queue_entry(&entry.id, "merging", None)
+            .unwrap();
+        let interrupted = store.interrupt_merge_queue().unwrap();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].status, "interrupted");
+        assert!(store.interrupt_merge_queue().unwrap().is_empty());
     }
 
     #[test]

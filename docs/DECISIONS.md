@@ -40,6 +40,7 @@
 | [0028](adr/0028-merge-queue-integrator.md) | 持久 merge queue + 确定性 Integrator gate | Accepted | 集成/质量/回滚 |
 | [0029](adr/0029-local-landing.md) | 显式本地 landing；PR 后置 | Accepted | 交付/安全/UX |
 | [0030](adr/0030-push-pr-flow.md) | 显式 push + GitHub PR（gh） | Accepted | 交付/集成/安全 |
+| [0031](adr/0031-queue-recovery.md) | daemon 重启恢复 in-flight merge queue entry | Accepted | 可靠性/恢复/审计 |
 
 ---
 
