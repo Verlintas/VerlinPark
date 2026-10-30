@@ -146,6 +146,7 @@ just cli queue <session-id>
 just cli retry <queue-entry-id>
 just cli land <session-id>
 just cli pr <session-id>
+just cli replay <session-id>
 just cli approvals
 just cli approve <approval-id>
 ```

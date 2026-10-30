@@ -32,6 +32,14 @@ milestone, but the critical paths can be made transactional now.
    projections from the event stream: latest session status, token usage sum,
    latest agent status, and latest merge queue status.
 
+## Replay check (2026-10-30)
+
+`session.replay` / `vp replay` now compares the event stream with the current
+projections for session status, usage, team plan, todos, message count, and merge
+queue status/IDs. It reports mismatches but does **not** mutate or rebuild the
+projection. A deliberate out-of-band projection write in the replay test proves
+that drift is detected.
+
 ## Consequences
 
 - A crash cannot leave one of the critical status projections updated without a

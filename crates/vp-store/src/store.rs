@@ -483,6 +483,25 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_all_events(&self, session_id: &str) -> Result<Vec<Event>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT session_id, seq, type, payload, created_at
+             FROM events WHERE session_id = ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            let payload: String = row.get(3)?;
+            Ok(Event {
+                session_id: row.get(0)?,
+                seq: row.get::<_, i64>(1)? as u64,
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn list_events(&self, session_id: &str, since_seq: u64, limit: u32) -> Result<Vec<Event>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -686,6 +705,52 @@ impl Store {
         Ok(event)
     }
 
+    pub fn append_message_with_event(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls: &serde_json::Value,
+        tool_call_id: Option<&str>,
+    ) -> Result<(StoredMessage, Event)> {
+        let message = StoredMessage {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: tool_calls.clone(),
+            tool_call_id: tool_call_id.map(ToOwned::to_owned),
+            created_at: now_rfc3339(),
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO messages
+             (id, session_id, role, content, tool_calls, tool_call_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                message.id,
+                message.session_id,
+                message.role,
+                message.content,
+                serde_json::to_string(&message.tool_calls)?,
+                message.tool_call_id,
+                message.created_at
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "message.created",
+            serde_json::to_value(&message)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((message, event))
+    }
+
     pub fn append_message(
         &self,
         session_id: &str,
@@ -829,6 +894,25 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_team_plan_with_event(&self, session_id: &str, plan: &str) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET team_plan = ?1 WHERE id = ?2",
+            params![plan, session_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let payload = serde_json::from_str(plan).unwrap_or(serde_json::Value::Null);
+        let event = insert_event_tx(&tx, session_id, "team_plan.submitted", payload)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
     pub fn get_team_plan(&self, session_id: &str) -> Result<Option<String>> {
         let conn = self.lock()?;
         conn.query_row(
@@ -869,6 +953,51 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_todos_with_event(&self, session_id: &str, items: &[TodoItem]) -> Result<Event> {
+        let updated_at = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                params![session_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        tx.execute(
+            "DELETE FROM todos WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for (position, item) in items.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO todos (session_id, position, title, status, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    session_id,
+                    position as i64,
+                    item.title,
+                    item.status,
+                    updated_at
+                ],
+            )?;
+        }
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "todo.updated",
+            serde_json::json!({"items": items}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
     pub fn list_todos(&self, session_id: &str) -> Result<Vec<TodoItem>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -881,6 +1010,118 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Atomically repair all in-flight state after a daemon restart and return
+    /// the session ids plus the events that must be broadcast.
+    pub fn recover_state(&self) -> Result<(Vec<String>, Vec<Event>)> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let sessions = {
+            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE status = 'running'")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "UPDATE sessions SET status = 'failed' WHERE status = 'running'",
+            [],
+        )?;
+        let agents = {
+            let mut stmt =
+                tx.prepare("SELECT id, session_id FROM agents WHERE status = 'running'")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "UPDATE agents SET status = 'failed' WHERE status = 'running'",
+            [],
+        )?;
+        let approvals = {
+            let mut stmt =
+                tx.prepare("SELECT id, session_id FROM approvals WHERE status = 'pending'")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "UPDATE approvals SET status = 'denied', resolved_at = ?1
+             WHERE status = 'pending'",
+            params![now],
+        )?;
+        let queue_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM merge_queue WHERE status IN ('queued', 'merging', 'checking')",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "UPDATE merge_queue
+             SET status = 'interrupted',
+                 detail = 'daemon restarted during integration',
+                 updated_at = ?1
+             WHERE status IN ('queued', 'merging', 'checking')",
+            params![now],
+        )?;
+
+        let mut events = Vec::new();
+        for session_id in &sessions {
+            events.push(insert_event_tx(
+                &tx,
+                session_id,
+                "session.updated",
+                serde_json::json!({"status": "failed"}),
+            )?);
+            events.push(insert_event_tx(
+                &tx,
+                session_id,
+                "agent.failed",
+                serde_json::json!({
+                    "error": "The daemon restarted while this run was active."
+                }),
+            )?);
+        }
+        for (agent_id, session_id) in &agents {
+            events.push(insert_event_tx(
+                &tx,
+                session_id,
+                "agent.updated",
+                serde_json::json!({"agent_id": agent_id, "status": "failed"}),
+            )?);
+        }
+        for (approval_id, session_id) in &approvals {
+            events.push(insert_event_tx(
+                &tx,
+                session_id,
+                "approval.resolved",
+                serde_json::json!({"approval_id": approval_id, "approved": false}),
+            )?);
+        }
+        for id in &queue_ids {
+            let entry = tx.query_row(
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+                 FROM merge_queue WHERE id = ?1",
+                params![id],
+                map_merge_queue_entry,
+            )?;
+            events.push(insert_event_tx(
+                &tx,
+                &entry.session_id,
+                "merge_queue.updated",
+                serde_json::json!({"entry": entry}),
+            )?);
+        }
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((sessions, events))
     }
 
     pub fn interrupt_running_sessions(&self) -> Result<Vec<String>> {

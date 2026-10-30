@@ -27,9 +27,9 @@ use vp_protocol::types::{
     CreateSessionParams, DiscardSessionParams, EventListResult, LandSessionParams,
     ListApprovalsParams, ListEventsParams, ListSessionsParams, MergeQueueListParams,
     MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectListResult, PromptParams,
-    PromptResult, ResolveApprovalParams, ResolveApprovalResult, RetryMergeParams, RetryMergeResult,
-    ServerInfo, SessionDiffParams, SessionListResult, SessionTodosParams, SessionTodosResult,
-    SubscribeParams, TeamPlanParams, TeamPlanResult,
+    PromptResult, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
+    RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams, SessionListResult,
+    SessionTodosParams, SessionTodosResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -487,6 +487,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.pr" => match parse_params::<OpenPullRequestParams>(request.params) {
             Ok(params) => match state.engine.open_pull_request(&params.session_id).await {
                 Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.replay" => match parse_params::<ReplaySessionParams>(request.params) {
+            Ok(params) => match state.engine.replay_session(&params.session_id).await {
+                Ok(report) => RpcResponse::success(id, report),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

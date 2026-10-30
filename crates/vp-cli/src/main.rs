@@ -72,6 +72,8 @@ enum Command {
     Land { session: String },
     /// Push the session branch and open a GitHub pull request with gh.
     Pr { session: String },
+    /// Replay the event stream and check projection consistency.
+    Replay { session: String },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
     /// Commit the session worktree.
@@ -192,6 +194,9 @@ async fn main() -> Result<()> {
         }
         Command::Pr { session } => {
             rpc(&discovery, "session.pr", json!({"session_id": session})).await?
+        }
+        Command::Replay { session } => {
+            rpc(&discovery, "session.replay", json!({"session_id": session})).await?
         }
         Command::Discard { session } => {
             rpc(
@@ -347,6 +352,25 @@ fn print_human(value: &Value) {
         );
         if let Some(detail) = entry["detail"].as_str() {
             println!("{detail}");
+        }
+        return;
+    }
+    if let Some(consistent) = value.get("consistent").and_then(Value::as_bool) {
+        println!(
+            "{}  events={}  status={} usage={} plan={} todos={} messages={} queue={}",
+            if consistent { "consistent" } else { "MISMATCH" },
+            value["event_count"].as_u64().unwrap_or(0),
+            value["status_matches"].as_bool().unwrap_or(false),
+            value["usage_matches"].as_bool().unwrap_or(false),
+            value["plan_matches"].as_bool().unwrap_or(false),
+            value["todos_matches"].as_bool().unwrap_or(false),
+            value["messages_matches"].as_bool().unwrap_or(false),
+            value["queue_matches"].as_bool().unwrap_or(false)
+        );
+        for mismatch in value["mismatches"].as_array().into_iter().flatten() {
+            if let Some(mismatch) = mismatch.as_str() {
+                println!("  - {mismatch}");
+            }
         }
         return;
     }

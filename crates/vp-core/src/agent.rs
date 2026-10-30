@@ -700,19 +700,8 @@ impl AgentService {
             self.engine
                 .update_session_status(session_id, "running")
                 .await?;
-            let user_message = self
-                .engine
-                .append_message(session_id, "user", prompt, serde_json::json!([]), None)
-                .await?;
             self.engine
-                .append_event(
-                    session_id,
-                    "message.created",
-                    serde_json::json!({
-                        "role": "user",
-                        "content": user_message.content,
-                    }),
-                )
+                .append_message(session_id, "user", prompt, serde_json::json!([]), None)
                 .await?;
             Ok(())
         }

@@ -11,7 +11,8 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
     AgentRecord, Approval, Event, MergeQueueEntry, Project, PullRequestResult, Session,
-    SessionCommit, SessionDiff, SessionLandResult, StoredMessage, TeamPlan, TodoItem,
+    SessionCommit, SessionDiff, SessionLandResult, SessionReplayReport, StoredMessage, TeamPlan,
+    TodoItem,
 };
 use vp_store::Store;
 
@@ -213,13 +214,9 @@ impl Engine {
         let store = self.store.clone();
         let id = session_id.to_string();
         let json = serde_json::to_string(plan)?;
-        tokio::task::spawn_blocking(move || store.set_team_plan(&id, &json)).await??;
-        self.append_event(
-            session_id,
-            "team_plan.submitted",
-            serde_json::to_value(plan)?,
-        )
-        .await?;
+        let event = tokio::task::spawn_blocking(move || store.set_team_plan_with_event(&id, &json))
+            .await??;
+        let _ = self.events.send(event);
         Ok(())
     }
 
@@ -234,13 +231,10 @@ impl Engine {
         let store = self.store.clone();
         let id = session_id.to_string();
         let items_for_store = items.clone();
-        tokio::task::spawn_blocking(move || store.set_todos(&id, &items_for_store)).await??;
-        self.append_event(
-            session_id,
-            "todo.updated",
-            serde_json::json!({"items": items}),
-        )
-        .await?;
+        let event =
+            tokio::task::spawn_blocking(move || store.set_todos_with_event(&id, &items_for_store))
+                .await??;
+        let _ = self.events.send(event);
         Ok(())
     }
 
@@ -252,63 +246,10 @@ impl Engine {
 
     pub async fn recover_interrupted_sessions(&self) -> Result<usize> {
         let store = self.store.clone();
-        let (sessions, approvals, _agents, queue) = tokio::task::spawn_blocking(move || {
-            let sessions = store.interrupt_running_sessions()?;
-            let agents = store.interrupt_running_agents()?;
-            let queue = store.interrupt_merge_queue()?;
-            let pending = store
-                .list_approvals(None)?
-                .into_iter()
-                .filter(|approval| approval.status == "pending")
-                .collect::<Vec<_>>();
-            let mut denied = Vec::new();
-            for approval in pending {
-                if let Some(approval) = store.resolve_approval(&approval.id, false)? {
-                    denied.push(approval);
-                }
-            }
-            Ok::<_, anyhow::Error>((sessions, denied, agents, queue))
-        })
-        .await??;
-
-        for session_id in &sessions {
-            let _ = self
-                .append_event(
-                    session_id,
-                    "session.updated",
-                    serde_json::json!({"status": "failed"}),
-                )
-                .await;
-            let _ = self
-                .append_event(
-                    session_id,
-                    "agent.failed",
-                    serde_json::json!({
-                        "error": "The daemon restarted while this run was active."
-                    }),
-                )
-                .await;
-        }
-        for approval in &approvals {
-            let _ = self
-                .append_event(
-                    &approval.session_id,
-                    "approval.resolved",
-                    serde_json::json!({
-                        "approval_id": approval.id,
-                        "approved": false,
-                    }),
-                )
-                .await;
-        }
-        for entry in &queue {
-            let _ = self
-                .append_event(
-                    &entry.session_id,
-                    "merge_queue.updated",
-                    serde_json::json!({"entry": entry}),
-                )
-                .await;
+        let (sessions, events) =
+            tokio::task::spawn_blocking(move || store.recover_state()).await??;
+        for event in events {
+            let _ = self.events.send(event);
         }
         Ok(sessions.len())
     }
@@ -730,6 +671,140 @@ impl Engine {
             .await?
     }
 
+    pub async fn replay_session(&self, session_id: &str) -> Result<SessionReplayReport> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (session, messages, plan, todos, queue, events) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let session = store
+                    .get_session(&id)?
+                    .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+                let messages = store.list_messages(&id)?;
+                let plan = store.get_team_plan(&id)?;
+                let todos = store.list_todos(&id)?;
+                let queue = store.list_merge_queue(&id)?;
+                let events = store.list_all_events(&id)?;
+                Ok((session, messages, plan, todos, queue, events))
+            })
+            .await??;
+
+        let mut mismatches = Vec::new();
+        let replay_status = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "session.updated")
+            .and_then(|event| event.payload.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                events
+                    .iter()
+                    .any(|event| event.kind == "session.created")
+                    .then_some("draft")
+            });
+        let status_matches = replay_status == Some(session.status.as_str());
+        if !status_matches {
+            mismatches.push(format!(
+                "session status: projection={}, replay={:?}",
+                session.status, replay_status
+            ));
+        }
+
+        let (replay_in, replay_out) = events
+            .iter()
+            .filter(|event| event.kind == "agent.usage")
+            .fold((0u64, 0u64), |(input, output), event| {
+                (
+                    input.saturating_add(event.payload["input_tokens"].as_u64().unwrap_or(0)),
+                    output.saturating_add(event.payload["output_tokens"].as_u64().unwrap_or(0)),
+                )
+            });
+        let usage_matches = replay_in == session.tokens_in && replay_out == session.tokens_out;
+        if !usage_matches {
+            mismatches.push(format!(
+                "usage: projection={}/{}, replay={replay_in}/{replay_out}",
+                session.tokens_in, session.tokens_out
+            ));
+        }
+
+        let replay_plan = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "team_plan.submitted")
+            .map(|event| event.payload.clone());
+        let projected_plan = plan
+            .as_deref()
+            .and_then(|plan| serde_json::from_str::<serde_json::Value>(plan).ok());
+        let plan_matches = replay_plan == projected_plan;
+        if !plan_matches {
+            mismatches.push("team plan projection differs from event stream".to_string());
+        }
+
+        let replay_todos = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "todo.updated")
+            .map(|event| event.payload["items"].clone())
+            .unwrap_or_else(|| serde_json::json!([]));
+        let projected_todos = serde_json::to_value(&todos)?;
+        let todos_matches = replay_todos == projected_todos;
+        if !todos_matches {
+            mismatches.push("todo projection differs from event stream".to_string());
+        }
+
+        let replay_messages = events
+            .iter()
+            .filter(|event| event.kind == "message.created")
+            .count();
+        let messages_matches = replay_messages == messages.len();
+        if !messages_matches {
+            mismatches.push(format!(
+                "messages: projection={}, replay={replay_messages}",
+                messages.len()
+            ));
+        }
+
+        let replay_queue = events
+            .iter()
+            .filter_map(|event| {
+                let entry = event.payload.get("entry")?;
+                Some((
+                    entry.get("id")?.as_str()?.to_string(),
+                    entry.get("status")?.as_str()?.to_string(),
+                ))
+            })
+            .fold(HashMap::new(), |mut map, (id, status)| {
+                map.insert(id, status);
+                map
+            });
+        let projected_queue = queue
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.status.clone()))
+            .collect::<HashMap<_, _>>();
+        let queue_matches = replay_queue == projected_queue;
+        if !queue_matches {
+            mismatches.push("merge queue projection differs from event stream".to_string());
+        }
+
+        let consistent = status_matches
+            && usage_matches
+            && plan_matches
+            && todos_matches
+            && messages_matches
+            && queue_matches;
+        Ok(SessionReplayReport {
+            session_id: session.id,
+            event_count: events.len(),
+            status_matches,
+            usage_matches,
+            plan_matches,
+            todos_matches,
+            messages_matches,
+            queue_matches,
+            consistent,
+            mismatches,
+        })
+    }
+
     pub async fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
         let store = self.store.clone();
         let id = session_id.to_string();
@@ -948,8 +1023,8 @@ impl Engine {
         let session_id = session_id.to_string();
         let role = role.to_string();
         let content = content.to_string();
-        tokio::task::spawn_blocking(move || {
-            store.append_message(
+        let (message, event) = tokio::task::spawn_blocking(move || {
+            store.append_message_with_event(
                 &session_id,
                 &role,
                 &content,
@@ -957,7 +1032,9 @@ impl Engine {
                 tool_call_id.as_deref(),
             )
         })
-        .await?
+        .await??;
+        let _ = self.events.send(event);
+        Ok(message)
     }
 
     pub async fn list_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
@@ -1487,6 +1564,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_checks_critical_projections() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("demo".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "replay".into(), None)
+            .await
+            .unwrap();
+        engine
+            .update_session_status(&session.id, "running")
+            .await
+            .unwrap();
+        engine.record_usage(&session.id, 7, 3).await.unwrap();
+        let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+            "goal": "replay",
+            "departments": [{
+                "name": "impl",
+                "manager_title": "Implementation",
+                "profile": "coding",
+                "objective": "build"
+            }],
+            "tasks": [{
+                "id": "T1",
+                "department": "impl",
+                "title": "Build",
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["done"]
+            }]
+        }))
+        .unwrap();
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .set_todos(
+                &session.id,
+                vec![TodoItem {
+                    title: "Build".into(),
+                    status: "in_progress".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        engine
+            .append_message(&session.id, "user", "hello", serde_json::json!([]), None)
+            .await
+            .unwrap();
+        let agent = engine
+            .create_agent(&session.id, "worker", "Worker", None, None, "test")
+            .await
+            .unwrap();
+        let entry = engine
+            .enqueue_merge(
+                &session.id,
+                &agent.id,
+                &agent.name,
+                Some("T1".into()),
+                "verlinpark/task",
+                "abc123",
+                "def456",
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .update_merge_queue_entry(&entry.id, "merged", None)
+            .await
+            .unwrap();
+
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.consistent, "{:?}", report.mismatches);
+        assert!(report.status_matches);
+        assert!(report.usage_matches);
+        assert!(report.plan_matches);
+        assert!(report.todos_matches);
+        assert!(report.messages_matches);
+        assert!(report.queue_matches);
+
+        // Bypass the event path deliberately: replay must expose the drift.
+        engine
+            .store()
+            .update_session_status(&session.id, "idle")
+            .unwrap();
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(!report.consistent);
+        assert!(!report.status_matches);
+    }
+
+    #[tokio::test]
     async fn creates_session_and_broadcasts_event() {
         let data = TempDir::new().unwrap();
         let repo = TempDir::new().unwrap();
@@ -1516,6 +1689,8 @@ mod tests {
         let diff = engine.session_diff(&session.id).await.unwrap();
         assert!(diff.patch.contains("-hello"));
         assert!(diff.patch.contains("+changed"));
+        let replay = engine.replay_session(&session.id).await.unwrap();
+        assert!(replay.consistent, "{:?}", replay.mismatches);
 
         let events = engine.list_events(session.id, 0, 10).await.unwrap();
         assert_eq!(events.len(), 1);

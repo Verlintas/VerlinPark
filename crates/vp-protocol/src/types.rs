@@ -343,6 +343,26 @@ pub struct PullRequestResult {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplaySessionParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionReplayReport {
+    pub session_id: String,
+    pub event_count: usize,
+    pub status_matches: bool,
+    pub usage_matches: bool,
+    pub plan_matches: bool,
+    pub todos_matches: bool,
+    pub messages_matches: bool,
+    pub queue_matches: bool,
+    pub consistent: bool,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub id: String,

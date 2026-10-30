@@ -15,10 +15,10 @@
 - **P1-3 部分缓解**：Verifier shell 的审批卡会明确警告 “not sandboxed”；runtime 沙箱仍未实现。
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 和 `gh` PR flow 可用。仍缺自动冲突解决、LLM Integrator、非 GitHub PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
-- **P1-5 部分修复**：session status、usage、agent status、merge queue 使用 event+projection 原子事务；team plan/todos/messages/recovery 仍是分离写。
+- **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay` 可检查关键投影漂移，完整 rebuild 仍未实现。
 - **仍未解决**：shell 沙箱、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 60（core 43 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
+当前测试：Rust 61（core 44 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
 
 ---
 
@@ -48,7 +48,7 @@
 | 隔离与安全 | C+ | 路径 jail、loopback token、fetch_url DNS 固定做得不错；shell 仍无沙箱 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
-| 测试 | B− | 60 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing/PR/recovery/event replay 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 61 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -157,7 +157,7 @@
 
 - 修复前事件日志是审计流 + UI 增量来源，不是可完整 replay 的 event sourcing。
 - 修复后 session status / usage / agent status / merge queue 已同事务写事件；关键投影可由事件重建（有测试）。
-- team plan / todos / messages / recovery 仍是分离写，完整 replay/export 仍未完成。
+- team plan / todos / messages / recovery 已原子化；`session.replay` 校验关键投影，完整 rebuild/export 仍未完成。
 
 **后续**
 
@@ -331,6 +331,8 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 第五轮（2026-10-30）做审计一致性：
 
 - session status / usage / agent status / merge queue 的 event+projection 原子事务。
+- team plan / todos / messages / recovery 原子化。
+- `session.replay` / `vp replay` 投影一致性检查。
 - 事件流重建关键投影的回归测试。
 
 ---
@@ -338,7 +340,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 60 passed after the 10-30 retry/landing/PR/recovery/event slices
+cargo test --workspace     # 61 passed after the 10-30 retry/landing/PR/recovery/replay slices
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```
