@@ -19,8 +19,9 @@ entitlements.
 ## Decision
 
 1. **Seatbelt write confinement.** The shell tool invokes
-   `/usr/bin/sandbox-exec` with a profile that allows normal reads, process
-   execution, and network access but denies file writes outside an allowlist.
+   `/usr/bin/sandbox-exec` with a profile that allows normal reads (except
+   explicit credential/state denials), process execution, and network access,
+   but denies file writes outside an allowlist.
 2. **Allowlist.** Writes are allowed to:
    - the agent worktree;
    - the worktree's Git directory and the project's common Git directory, so
@@ -49,9 +50,17 @@ entitlements.
    explicitly.
 7. **Fail closed.** If `sandbox-exec` is unavailable, the shell tool refuses to
    run the command instead of silently falling back to an unsandboxed shell.
-8. **Approval remains required.** The sandbox is a write boundary, not an
-   approval bypass. The UI states that reads, network, and daemon-mediated
-   writes are not confined.
+8. **Credential/state read denials.** Common credential and local-state paths
+   are denied for reads: `~/.ssh`, `~/.gnupg`, cloud/gh/kube/docker credential
+   directories, Keychains, shell/package credential files, and the VerlinPark
+   database/run/session/log directories. This is a denylist, not a complete read
+   jail; custom secret locations may still be readable.
+9. **Process group cleanup.** Each shell runs in its own process group. Timeout,
+   cancellation, or dropping the tool future sends `SIGKILL` to the whole group,
+   so background processes do not outlive the call.
+10. **Approval remains required.** The sandbox is a write boundary, not an
+    approval bypass. The UI states that reads, network, and daemon-mediated
+    writes are not confined.
 
 ## Consequences
 
@@ -65,9 +74,13 @@ entitlements.
 - Project-specific environment variables are not inherited. A command that needs
   one must set it inline or load it from a project file; this is intentional so
   provider/cloud secrets do not appear in shell output or traces.
-- Reads, network access, process execution, and writes mediated by another
-  daemon (for example Docker's socket) are not confined. Apple Events are denied,
-  but this is not a complete defense against GUI/launch-service mediated writes.
+- Common credential/state paths are read-denied, but arbitrary reads and network
+  access are not confined; custom secret locations may still be readable. Writes
+  mediated by another daemon (for example Docker's socket) are not confined.
+  Apple Events are denied, but this is not a complete defense against
+  GUI/launch-service mediated writes.
+- Shell commands that expect to leave a background daemon running will have that
+  process group killed when the tool call ends.
 - The shared Git directory is writable so commits and fetches work. An approved
   shell can therefore modify Git refs or metadata for the project (not project
   source files); hooks/config are denied, and destructive Git commands still

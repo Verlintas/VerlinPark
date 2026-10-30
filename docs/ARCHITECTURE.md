@@ -823,8 +823,10 @@ pub fn classify(cmd: &str) -> CommandClass;
 - 进程组 kill：`setsid`/`setpgid`；取消时 `kill(-pgid, SIGTERM)`，宽限后 `SIGKILL`。
 - **实现状态（2026-10-30）**：shell 已用 macOS Seatbelt 做写入隔离
   （worktree + Git 元数据 + per-agent scratch；common hooks/config 受保护；
-  `sandbox-exec` 缺失时 fail closed），并使用 env allowlist。读取、网络、
-  进程组和 Docker/GUI 等外部介导写入仍是后续工作；不能宣称 shell 已完整沙箱化。
+  `sandbox-exec` 缺失时 fail closed），使用 env allowlist，read-deny 常见
+  credential/state 路径，并在 timeout/cancel 时清理整个 process group。
+  任意读取、网络和 Docker/GUI 等外部介导写入仍是后续工作；不能宣称 shell
+  已完整沙箱化。
 
 ### 10.5 apply_patch
 

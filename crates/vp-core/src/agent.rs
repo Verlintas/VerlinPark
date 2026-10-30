@@ -1794,6 +1794,42 @@ async fn finish_worker(
     }
 }
 
+fn shell_secret_roots(data_dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut roots = vec![
+        data_dir.join("verlinpark.db"),
+        data_dir.join("run"),
+        data_dir.join("sessions"),
+        data_dir.join("logs"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        for relative in [
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".azure",
+            ".config/gh",
+            ".config/gcloud",
+            ".config/op",
+            ".config/1Password",
+            ".kube",
+            ".docker",
+            ".password-store",
+            "Library/Keychains",
+            ".local/share/keyrings",
+            ".netrc",
+            ".git-credentials",
+            ".npmrc",
+            ".pypirc",
+            ".cargo/credentials",
+            ".cargo/credentials.toml",
+        ] {
+            roots.push(home.join(relative));
+        }
+    }
+    roots
+}
+
 #[allow(clippy::too_many_arguments)]
 #[async_recursion]
 async fn run_loop(
@@ -1817,6 +1853,7 @@ async fn run_loop(
             .join("sandbox")
             .join(&session.id)
             .join(&spec.id),
+        secret_roots: shell_secret_roots(engine.store().data_dir()),
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
     let tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);

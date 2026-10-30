@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,8 @@ pub struct ToolContext {
     pub project_root: PathBuf,
     /// Runtime-owned scratch space for shell caches and temporary files.
     pub sandbox_root: PathBuf,
+    /// Credential/state paths that shell commands must not read.
+    pub secret_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -699,6 +702,17 @@ impl AgentTool for Shell {
             .canonicalize()
             .unwrap_or_else(|_| root.clone());
         let (git_dir, common_dir) = git_metadata_dirs(&root, &project_root);
+        let mut profile = String::from(SHELL_SANDBOX_PROFILE);
+        let secret_roots = context
+            .secret_roots
+            .iter()
+            .map(|secret| secret.canonicalize().unwrap_or_else(|_| secret.clone()))
+            .collect::<Vec<_>>();
+        for (index, _) in secret_roots.iter().enumerate() {
+            profile.push_str(&format!(
+                "(deny file-read* (subpath (param \"SECRET{index}\")))\n"
+            ));
+        }
         let mut process = Command::new(SANDBOX_EXEC);
         process.env_clear();
         for key in SHELL_ENV_PASSTHROUGH {
@@ -729,13 +743,22 @@ impl AgentTool for Shell {
             .arg(format!(
                 "WORKTREE_CONFIG={}",
                 git_dir.join("config.worktree").display()
-            ))
+            ));
+        for (index, secret) in secret_roots.iter().enumerate() {
+            process
+                .arg("-D")
+                .arg(format!("SECRET{index}={}", secret.display()));
+        }
+        process
             .arg("-p")
-            .arg(SHELL_SANDBOX_PROFILE)
+            .arg(&profile)
             .arg("/bin/sh")
             .arg("-c")
             .arg(command)
             .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .env("TMPDIR", &tmp)
             .env("TMP", &tmp)
             .env("TEMP", &tmp)
@@ -752,7 +775,11 @@ impl AgentTool for Shell {
             .env("GIT_CONFIG_KEY_0", "gc.auto")
             .env("GIT_CONFIG_VALUE_0", "0")
             .kill_on_drop(true);
-        let output = timeout(Duration::from_secs(timeout_secs), process.output())
+        #[cfg(unix)]
+        process.process_group(0);
+        let child = process.spawn().context("spawning sandboxed shell")?;
+        let _group = ProcessGroupGuard::new(child.id());
+        let output = timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
             .await
             .map_err(|_| anyhow!("command timed out after {timeout_secs}s"))??;
 
@@ -772,6 +799,31 @@ impl AgentTool for Shell {
             Ok(ToolOutput::ok(result))
         } else {
             Ok(ToolOutput::error(result))
+        }
+    }
+}
+
+/// Kills the command's process group when dropped. `kill_on_drop` only kills the
+/// direct sandbox-exec child; a shell can spawn background processes that would
+/// otherwise survive cancellation or timeout.
+struct ProcessGroupGuard(Option<i32>);
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid.and_then(|pid| i32::try_from(pid).ok()))
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            // SAFETY: kill(2) with a negative pid targets the process group we
+            // created with process_group(0). ESRCH is the expected no-op when
+            // the group has already exited.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
         }
     }
 }
@@ -925,6 +977,7 @@ mod tests {
                 root: root.clone(),
                 project_root: root,
                 sandbox_root,
+                secret_roots: Vec::new(),
             },
         )
     }
@@ -1085,6 +1138,7 @@ mod tests {
             root: root.clone(),
             project_root: root.clone(),
             sandbox_root: dir.path().join("sandbox"),
+            secret_roots: Vec::new(),
         };
         let inside = Shell
             .execute(&context, json!({"command": "echo inside > inside.txt"}))
@@ -1117,6 +1171,34 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    async fn shell_timeout_kills_background_processes() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("worktree");
+        std::fs::create_dir(&root).unwrap();
+        let context = ToolContext {
+            root: root.clone(),
+            project_root: root.clone(),
+            sandbox_root: dir.path().join("sandbox"),
+            secret_roots: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        let result = Shell
+            .execute(
+                &context,
+                json!({
+                    "command": "(sleep 2; echo survived > marker) & wait",
+                    "timeout_secs": 1
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!root.join("marker").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     async fn shell_allows_git_writes_in_a_linked_worktree() {
         let dir = TempDir::new().unwrap();
         let repo = dir.path().join("repo");
@@ -1143,6 +1225,7 @@ mod tests {
             root: worktree.clone(),
             project_root: repo.clone(),
             sandbox_root: dir.path().join("sandbox"),
+            secret_roots: Vec::new(),
         };
         let output = Shell
             .execute(
@@ -1197,6 +1280,7 @@ mod tests {
             root: worktree,
             project_root: repo,
             sandbox_root: dir.path().join("sandbox"),
+            secret_roots: Vec::new(),
         };
         let output = Shell
             .execute(
