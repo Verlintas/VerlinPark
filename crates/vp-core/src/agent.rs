@@ -254,6 +254,9 @@ struct AgentSpec {
     task_id: Option<String>,
     profile: AgentProfile,
     allow_delegation: bool,
+    /// Skip per-tool approvals for an explicitly authorized internal run.
+    /// The shell sandbox still applies.
+    auto_approve: bool,
     worktree: PathBuf,
     branch: String,
     session_worktree: PathBuf,
@@ -701,6 +704,7 @@ impl AgentService {
             task_id: entry.task_id.clone(),
             profile,
             allow_delegation: true,
+            auto_approve: false,
             worktree: agent_worktree,
             branch: entry.branch.clone(),
             session_worktree,
@@ -720,6 +724,524 @@ impl AgentService {
             .get_merge_queue_entry(&entry.id)
             .await?
             .ok_or_else(|| anyhow!("merge queue entry disappeared after retry"))
+    }
+
+    /// Resolve a merge conflict with an internal coding agent, re-verify the
+    /// rebased branch, then integrate it. This is an explicit user action: it
+    /// bypasses per-tool approval for the resolver and verifier because the user
+    /// already chose auto-resolution, but the shell sandbox still applies.
+    pub async fn resolve_merge(&self, entry_id: &str) -> Result<MergeQueueEntry> {
+        let entry = self
+            .engine
+            .get_merge_queue_entry(entry_id)
+            .await?
+            .ok_or_else(|| anyhow!("merge queue entry not found: {entry_id}"))?;
+        if entry.status != "conflict" {
+            return Err(anyhow!(
+                "merge queue entry is {}, only conflict entries can be auto-resolved",
+                entry.status
+            ));
+        }
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned())
+            .ok_or_else(|| anyhow!("agent provider is not configured"))?;
+        let (session, project) =
+            load_session_project(self.engine.store().clone(), &entry.session_id).await?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let control = Arc::new(RunControl::new());
+        {
+            let mut runs = self
+                .runs
+                .lock()
+                .map_err(|_| anyhow!("agent run mutex poisoned"))?;
+            if runs.contains_key(&session.id) {
+                return Err(anyhow!(
+                    "session is running; stop or wait before auto-resolving a merge"
+                ));
+            }
+            runs.insert(session.id.clone(), control.clone());
+        }
+        self.engine
+            .update_session_status(&session.id, "running")
+            .await?;
+        let result = self
+            .resolve_merge_inner(&config, &session, &project, &entry, &control)
+            .await;
+        if let Ok(mut runs) = self.runs.lock() {
+            runs.remove(&session.id);
+        }
+        let _ = self.engine.update_session_status(&session.id, "idle").await;
+        result
+    }
+
+    async fn resolve_merge_inner(
+        &self,
+        config: &AgentConfig,
+        session: &Session,
+        project: &Project,
+        entry: &MergeQueueEntry,
+        control: &RunControl,
+    ) -> Result<MergeQueueEntry> {
+        let agents = self.engine.list_agents(&session.id).await?;
+        let worker = agents
+            .iter()
+            .find(|agent| agent.id == entry.agent_id)
+            .ok_or_else(|| anyhow!("worker agent not found: {}", entry.agent_id))?;
+        let worker_worktree = worker
+            .worktree
+            .clone()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("worker has no worktree: {}", entry.agent_id))?;
+        let session_worktree = session
+            .worktree
+            .clone()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("session has no worktree"))?;
+        let session_branch = session
+            .branch
+            .clone()
+            .ok_or_else(|| anyhow!("session has no branch"))?;
+
+        let clean_worktree = session_worktree.clone();
+        let clean = tokio::task::spawn_blocking(move || {
+            worktree::git_output(&clean_worktree, &["status", "--porcelain"])
+        })
+        .await??;
+        if !clean.trim().is_empty() {
+            anyhow::bail!("session worktree has uncommitted changes; commit or discard them first");
+        }
+        let clean_worker = worker_worktree.clone();
+        let clean = tokio::task::spawn_blocking(move || {
+            worktree::git_output(&clean_worker, &["status", "--porcelain"])
+        })
+        .await??;
+        if !clean.trim().is_empty() {
+            anyhow::bail!("worker worktree has uncommitted changes; resolve them first");
+        }
+        let base_worktree = session_worktree.clone();
+        let base_commit =
+            tokio::task::spawn_blocking(move || worktree::head_commit(&base_worktree)).await??;
+
+        let rebase_worktree = worker_worktree.clone();
+        let rebase_onto = session_branch.clone();
+        let rebase = tokio::task::spawn_blocking(move || {
+            worktree::rebase_onto_keep_conflicts(&rebase_worktree, &rebase_onto)
+        })
+        .await?;
+        if let Err(error) = rebase {
+            let paths_worktree = worker_worktree.clone();
+            let paths =
+                tokio::task::spawn_blocking(move || worktree::conflicted_paths(&paths_worktree))
+                    .await??;
+            let in_progress_worktree = worker_worktree.clone();
+            let in_progress = tokio::task::spawn_blocking(move || {
+                worktree::rebase_in_progress(&in_progress_worktree)
+            })
+            .await?;
+            if paths.is_empty() || !in_progress {
+                let detail = truncate(&format!("rebase failed: {error:#}"));
+                self.engine
+                    .update_merge_queue_entry(&entry.id, "conflict", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+            let detail = truncate(&format!(
+                "rebase conflict in {} path(s): {}",
+                paths.len(),
+                paths.join(", ")
+            ));
+            self.engine
+                .update_merge_queue_entry(&entry.id, "conflict", Some(detail.clone()))
+                .await?;
+        }
+
+        let paths_worktree = worker_worktree.clone();
+        let conflict_paths =
+            tokio::task::spawn_blocking(move || worktree::conflicted_paths(&paths_worktree))
+                .await??;
+        let resolver = self
+            .engine
+            .create_agent(
+                &session.id,
+                AgentRole::Worker.as_str(),
+                "Conflict Resolver",
+                Some("Integration".to_string()),
+                worker.parent_id.clone(),
+                &config.model,
+            )
+            .await?;
+        self.engine
+            .set_agent_worktree(
+                &resolver.id,
+                &worker_worktree.to_string_lossy(),
+                &entry.branch,
+            )
+            .await?;
+        self.engine
+            .set_agent_profile(&resolver.id, AgentProfile::Coding.as_str())
+            .await?;
+        let resolver_spec = AgentSpec {
+            id: resolver.id.clone(),
+            role: AgentRole::Worker,
+            name: resolver.name.clone(),
+            depth: 2,
+            parent_name: worker.parent_id.clone(),
+            title: Some("Integration".to_string()),
+            task_id: entry.task_id.clone(),
+            profile: AgentProfile::Coding,
+            allow_delegation: false,
+            auto_approve: true,
+            worktree: worker_worktree.clone(),
+            branch: entry.branch.clone(),
+            session_worktree: session_worktree.clone(),
+            session_branch: session_branch.clone(),
+            write_scope: Vec::new(),
+            base_commit: base_commit.clone(),
+        };
+        emit(
+            &self.engine,
+            &session.id,
+            &resolver_spec,
+            "agent.spawned",
+            serde_json::json!({
+                "parent_id": resolver.parent_id,
+                "parent_name": worker.parent_id,
+                "objective": "Resolve a merge conflict",
+                "conflict_paths": conflict_paths,
+            }),
+        )
+        .await?;
+        emit(
+            &self.engine,
+            &session.id,
+            &resolver_spec,
+            "integrator.conflict_resolution_started",
+            serde_json::json!({
+                "entry_id": entry.id,
+                "branch": entry.branch,
+                "base_commit": base_commit,
+                "conflict_paths": conflict_paths,
+            }),
+        )
+        .await?;
+
+        let budget = SessionBudget::new(
+            session.token_budget,
+            session.tokens_in + session.tokens_out,
+            AgentCaps {
+                managers: config.max_managers,
+                workers: config.max_workers,
+                labour: config.max_labour,
+            },
+        );
+        let prompt = format!(
+            "You are resolving a Git rebase conflict for integration queue entry {}.              The worktree is {} on branch {}. The rebase target is session branch {} at commit {}.              Conflicted paths: {}.              Resolve the conflicts in place, preserving the intent of both sides. Do not abort the rebase.              Do not commit manually; leave the resolved files in the worktree. Run relevant tests if possible.              The runtime will stage resolved files, continue the rebase, verify the result, and merge it.              Reply with a concise summary of the resolution.",
+            entry.id,
+            worker_worktree.to_string_lossy(),
+            entry.branch,
+            session_branch,
+            base_commit,
+            conflict_paths.join(", ")
+        );
+        let mut conversation = vec![ChatMessage::user(prompt.clone())];
+        let result = run_loop(
+            &self.engine,
+            config,
+            session,
+            project,
+            control,
+            &budget,
+            &resolver_spec,
+            &prompt,
+            &mut conversation,
+            false,
+        )
+        .await;
+        let outcome = match result {
+            Ok(LoopOutcome::Final(summary)) => summary,
+            Ok(LoopOutcome::Cancelled) => {
+                let wt = worker_worktree.clone();
+                tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
+                self.engine
+                    .update_agent_status(&resolver.id, "cancelled")
+                    .await?;
+                self.engine
+                    .update_merge_queue_entry(
+                        &entry.id,
+                        "conflict",
+                        Some("auto-resolution cancelled".into()),
+                    )
+                    .await?;
+                return Err(anyhow!("auto-resolution cancelled"));
+            }
+            Ok(LoopOutcome::BudgetExceeded) => {
+                let wt = worker_worktree.clone();
+                tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
+                self.engine
+                    .update_agent_status(&resolver.id, "failed")
+                    .await?;
+                self.engine
+                    .update_merge_queue_entry(
+                        &entry.id,
+                        "conflict",
+                        Some("token budget exhausted during auto-resolution".into()),
+                    )
+                    .await?;
+                return Err(anyhow!("token budget exhausted during auto-resolution"));
+            }
+            Ok(LoopOutcome::Verdict(_)) => {
+                let wt = worker_worktree.clone();
+                tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
+                self.engine
+                    .update_agent_status(&resolver.id, "failed")
+                    .await?;
+                return Err(anyhow!("resolver returned a verdict unexpectedly"));
+            }
+            Err(error) => {
+                let wt = worker_worktree.clone();
+                tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
+                self.engine
+                    .update_agent_status(&resolver.id, "failed")
+                    .await?;
+                let detail = truncate(&format!("auto-resolution failed: {error:#}"));
+                self.engine
+                    .update_merge_queue_entry(&entry.id, "conflict", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+        };
+
+        let paths_worktree = worker_worktree.clone();
+        let remaining = tokio::task::spawn_blocking(move || {
+            if worktree::rebase_in_progress(&paths_worktree) {
+                worktree::stage_all(&paths_worktree)?;
+            }
+            worktree::conflicted_paths(&paths_worktree)
+        })
+        .await??;
+        if !remaining.is_empty() {
+            let wt = worker_worktree.clone();
+            tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
+            self.engine
+                .update_agent_status(&resolver.id, "failed")
+                .await?;
+            let detail = truncate(&format!(
+                "auto-resolution left {} conflicted path(s): {}",
+                remaining.len(),
+                remaining.join(", ")
+            ));
+            self.engine
+                .update_merge_queue_entry(&entry.id, "conflict", Some(detail.clone()))
+                .await?;
+            return Err(anyhow!(detail));
+        }
+
+        let marker_worktree = worker_worktree.clone();
+        let markers =
+            tokio::task::spawn_blocking(move || worktree::conflict_markers(&marker_worktree))
+                .await??;
+        if !markers.is_empty() {
+            let wt = worker_worktree.clone();
+            tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
+            self.engine
+                .update_agent_status(&resolver.id, "failed")
+                .await?;
+            let detail = truncate(&format!(
+                "auto-resolution left conflict markers in: {}",
+                markers.join(", ")
+            ));
+            self.engine
+                .update_merge_queue_entry(&entry.id, "conflict", Some(detail.clone()))
+                .await?;
+            return Err(anyhow!(detail));
+        }
+
+        let continue_worktree = worker_worktree.clone();
+        let continued = tokio::task::spawn_blocking(move || -> Result<()> {
+            if worktree::rebase_in_progress(&continue_worktree) {
+                worktree::continue_rebase(&continue_worktree)?;
+            }
+            Ok(())
+        })
+        .await?;
+        if let Err(error) = continued {
+            let wt = worker_worktree.clone();
+            tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
+            self.engine
+                .update_agent_status(&resolver.id, "failed")
+                .await?;
+            let detail = truncate(&format!("could not complete rebase: {error:#}"));
+            self.engine
+                .update_merge_queue_entry(&entry.id, "conflict", Some(detail.clone()))
+                .await?;
+            return Err(anyhow!(detail));
+        }
+
+        let commit_worktree = worker_worktree.clone();
+        let commit =
+            tokio::task::spawn_blocking(move || worktree::head_commit(&commit_worktree)).await??;
+        self.engine
+            .update_agent_status(&resolver.id, "idle")
+            .await?;
+        emit(
+            &self.engine,
+            &session.id,
+            &resolver_spec,
+            "agent.finished",
+            serde_json::json!({
+                "status": "idle",
+                "summary": truncate(&outcome),
+                "resolved": true,
+                "commit": commit,
+                "worktree": worker_worktree,
+                "branch": entry.branch,
+            }),
+        )
+        .await?;
+
+        let manager_spec = AgentSpec {
+            id: worker
+                .parent_id
+                .clone()
+                .unwrap_or_else(|| "integrator".to_string()),
+            role: AgentRole::Manager,
+            name: "Integrator".to_string(),
+            depth: 1,
+            parent_name: None,
+            title: Some("Integration".to_string()),
+            task_id: None,
+            profile: AgentProfile::Generic,
+            allow_delegation: false,
+            auto_approve: true,
+            worktree: session_worktree.clone(),
+            branch: session_branch.clone(),
+            session_worktree: session_worktree.clone(),
+            session_branch: session_branch.clone(),
+            write_scope: Vec::new(),
+            base_commit: base_commit.clone(),
+        };
+        let worker_spec = AgentSpec {
+            id: worker.id.clone(),
+            role: AgentRole::Worker,
+            name: worker.name.clone(),
+            depth: 2,
+            parent_name: Some("Integrator".to_string()),
+            title: worker.title.clone(),
+            task_id: entry.task_id.clone(),
+            profile: AgentProfile::Coding,
+            allow_delegation: false,
+            auto_approve: true,
+            worktree: worker_worktree.clone(),
+            branch: entry.branch.clone(),
+            session_worktree: session_worktree.clone(),
+            session_branch: session_branch.clone(),
+            write_scope: Vec::new(),
+            base_commit: base_commit.clone(),
+        };
+        let verification = verify_worker(
+            &self.engine,
+            config,
+            session,
+            project,
+            control,
+            &budget,
+            &manager_spec,
+            &worker_spec,
+            &format!("Resolve integration conflict for queue entry {}", entry.id),
+            &outcome,
+            Some("No conflict markers; both sides' intent is preserved; relevant tests pass"),
+            true,
+        )
+        .await?;
+        let verdict = match verification {
+            VerificationOutcome::Approved(verdict) => verdict,
+            VerificationOutcome::Rejected(verdict) => {
+                let detail = truncate(&format!(
+                    "auto-resolution rejected by Verifier: {}",
+                    verdict.summary
+                ));
+                self.engine
+                    .update_merge_queue_entry(&entry.id, "conflict", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+            VerificationOutcome::Cancelled => {
+                self.engine
+                    .update_merge_queue_entry(
+                        &entry.id,
+                        "conflict",
+                        Some("auto-resolution verification cancelled".into()),
+                    )
+                    .await?;
+                return Err(anyhow!("auto-resolution verification cancelled"));
+            }
+            VerificationOutcome::BudgetExceeded => {
+                self.engine
+                    .update_merge_queue_entry(
+                        &entry.id,
+                        "conflict",
+                        Some("token budget exhausted during auto-resolution verification".into()),
+                    )
+                    .await?;
+                return Err(anyhow!("token budget exhausted during verification"));
+            }
+            VerificationOutcome::Error(error) => {
+                let detail = truncate(&format!("auto-resolution verification failed: {error}"));
+                self.engine
+                    .update_merge_queue_entry(&entry.id, "conflict", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+        };
+
+        let Some(entry) = self
+            .engine
+            .retry_merge_queue_entry(
+                &entry.id,
+                &commit,
+                &base_commit,
+                Some(format!(
+                    "auto-resolved rebase conflict; verifier: {}",
+                    truncate(&verdict.summary)
+                )),
+            )
+            .await?
+        else {
+            return Err(anyhow!("merge queue entry can no longer be resolved"));
+        };
+        emit(
+            &self.engine,
+            &session.id,
+            &resolver_spec,
+            "integrator.conflict_resolution_finished",
+            serde_json::json!({
+                "entry_id": entry.id,
+                "commit": commit,
+                "verdict": truncate(&verdict.summary),
+            }),
+        )
+        .await?;
+        let integration_spec = AgentSpec {
+            auto_approve: true,
+            ..resolver_spec
+        };
+        let _ = process_merge_entry(
+            &self.engine,
+            session,
+            &integration_spec,
+            &entry,
+            config.integration_command.as_deref(),
+        )
+        .await?;
+        self.engine
+            .get_merge_queue_entry(&entry.id)
+            .await?
+            .ok_or_else(|| anyhow!("merge queue entry disappeared after auto-resolution"))
     }
 
     pub async fn start(&self, session_id: &str, prompt: &str) -> Result<()> {
@@ -912,6 +1434,7 @@ async fn run_agent(
         task_id: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        auto_approve: false,
         worktree: worktree.clone(),
         branch: session_branch.clone(),
         session_worktree: worktree.clone(),
@@ -1345,6 +1868,7 @@ async fn verify_worker(
     objective: &str,
     worker_summary: &str,
     acceptance: Option<&str>,
+    auto_approve: bool,
 ) -> Result<VerificationOutcome> {
     let Some((ordinal, _verifier_slot)) = budget.reserve_slot(AgentRole::Verifier) else {
         return Ok(VerificationOutcome::Error(
@@ -1382,6 +1906,7 @@ async fn verify_worker(
         task_id: None,
         profile: AgentProfile::Verification,
         allow_delegation: false,
+        auto_approve,
         worktree: worker_spec.worktree.clone(),
         branch: worker_spec.branch.clone(),
         session_worktree: manager_spec.session_worktree.clone(),
@@ -1620,6 +2145,7 @@ async fn finish_worker(
         objective,
         summary,
         acceptance,
+        false,
     )
     .await?;
     match verification {
@@ -2070,20 +2596,21 @@ async fn run_loop(
                 .tools
                 .get(&call.name)
                 .filter(|_| spec.role.allows_tool(spec.profile, &call.name));
-            let requires_approval = if is_delegate
-                || is_delegate_many
-                || is_verdict
-                || is_team_plan
-                || is_run_plan
-                || is_todo
-            {
-                false
-            } else {
-                registry_tool
-                    .as_ref()
-                    .map(|tool| tool.requires_approval())
-                    .unwrap_or(false)
-            };
+            let requires_approval = !spec.auto_approve
+                && if is_delegate
+                    || is_delegate_many
+                    || is_verdict
+                    || is_team_plan
+                    || is_run_plan
+                    || is_todo
+                {
+                    false
+                } else {
+                    registry_tool
+                        .as_ref()
+                        .map(|tool| tool.requires_approval())
+                        .unwrap_or(false)
+                };
 
             let mut approved = true;
             if requires_approval {
@@ -2368,6 +2895,7 @@ async fn run_loop(
                                     task_id: None,
                                     profile: child_profile,
                                     allow_delegation: role.child_role().is_some(),
+                                    auto_approve: false,
                                     worktree: child_worktree,
                                     branch: child_branch,
                                     session_worktree: spec.session_worktree.clone(),
@@ -3079,6 +3607,7 @@ async fn run_parallel_workers(
             task_id: None,
             profile: task.profile,
             allow_delegation: true,
+            auto_approve: false,
             worktree: info.path,
             branch: info.branch,
             session_worktree: spec.session_worktree.clone(),
@@ -3656,6 +4185,7 @@ async fn ensure_plan_manager(
         task_id: None,
         profile,
         allow_delegation: false,
+        auto_approve: false,
         worktree: session_worktree.clone(),
         branch: session_branch.clone(),
         session_worktree,
@@ -3897,6 +4427,7 @@ async fn execute_team_plan(
                 task_id: Some(task.id.clone()),
                 profile,
                 allow_delegation: true,
+                auto_approve: false,
                 worktree: info.path,
                 branch: info.branch,
                 session_worktree: manager_spec.session_worktree.clone(),
@@ -5213,6 +5744,7 @@ mod tests {
             task_id: Some("T1".into()),
             profile: AgentProfile::Coding,
             allow_delegation: true,
+            auto_approve: false,
             worktree: task.path.clone(),
             branch: task.branch.clone(),
             session_worktree: session_worktree.clone(),
@@ -5276,6 +5808,7 @@ mod tests {
             task_id: Some("T1".into()),
             profile: AgentProfile::Coding,
             allow_delegation: true,
+            auto_approve: false,
             worktree: task.path.clone(),
             branch: task.branch.clone(),
             session_worktree: session_worktree.clone(),
@@ -5299,6 +5832,111 @@ mod tests {
             std::fs::read_to_string(session_worktree.join("README.md")).unwrap(),
             "worker\n"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_resolves_a_conflicted_merge_with_an_agent() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "resolve_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "README.md",
+                            "content": "resolved\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("resolved the README conflict".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "resolve_verdict".into(),
+                        name: "submit_verdict".into(),
+                        arguments: serde_json::json!({
+                            "approved": true,
+                            "summary": "conflict resolved cleanly"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id.clone(), "resolve conflict".into(), None)
+            .await
+            .unwrap();
+        let worker = engine
+            .create_agent(&session.id, "worker", "Worker resolve", None, None, "test")
+            .await
+            .unwrap();
+        let branch = session.branch.clone().unwrap();
+        let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let task = engine
+            .create_task_worktree(&project.root, &project.id, &session.id, "T1", &branch)
+            .await
+            .unwrap();
+        engine
+            .set_agent_worktree(&worker.id, &task.path.to_string_lossy(), &task.branch)
+            .await
+            .unwrap();
+        std::fs::write(task.path.join("README.md"), "worker\n").unwrap();
+        let commit = worktree::commit_all(&task.path, "worker change")
+            .unwrap()
+            .unwrap();
+        std::fs::write(session_worktree.join("README.md"), "session\n").unwrap();
+        worktree::commit_all(&session_worktree, "session change").unwrap();
+
+        let spec = AgentSpec {
+            id: worker.id.clone(),
+            role: AgentRole::Worker,
+            name: worker.name.clone(),
+            depth: 2,
+            parent_name: None,
+            title: None,
+            task_id: Some("T1".into()),
+            profile: AgentProfile::Coding,
+            allow_delegation: true,
+            auto_approve: false,
+            worktree: task.path.clone(),
+            branch: task.branch.clone(),
+            session_worktree: session_worktree.clone(),
+            session_branch: branch,
+            write_scope: vec!["README.md".into()],
+            base_commit: task.base_commit.clone(),
+        };
+        integrate_worker(&engine, &session, &spec, &commit, "verified", None)
+            .await
+            .unwrap_err();
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue[0].status, "conflict");
+
+        let resolved = service.resolve_merge(&queue[0].id).await.unwrap();
+        assert_eq!(resolved.status, "merged", "{:?}", resolved.detail);
+        assert_eq!(resolved.attempt, 2);
+        assert_eq!(
+            std::fs::read_to_string(session_worktree.join("README.md")).unwrap(),
+            "resolved\n"
+        );
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        assert!(
+            agents
+                .iter()
+                .any(|agent| { agent.name == "Conflict Resolver" && agent.status == "idle" })
+        );
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "idle");
     }
 
     #[tokio::test]

@@ -28,11 +28,11 @@ use vp_protocol::types::{
     ListApprovalsParams, ListEventsParams, ListSessionsParams, MergeQueueListParams,
     MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectListResult, PromptParams,
     PromptResult, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
-    ResolveApprovalResult, RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams,
-    SessionExportParams, SessionImportParams, SessionListResult, SessionPauseParams,
-    SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
-    SessionTodosResult, SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TeamPlanParams, TeamPlanResult,
+    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
+    RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams, SessionImportParams,
+    SessionListResult, SessionPauseParams, SessionPauseResult, SessionResumeParams,
+    SessionResumeResult, SessionTodosParams, SessionTodosResult, SetShellPolicyParams,
+    ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -532,6 +532,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "merge_queue.retry" => match parse_params::<RetryMergeParams>(request.params) {
             Ok(params) => match state.agent.retry_merge(&params.entry_id).await {
                 Ok(entry) => RpcResponse::success(id, RetryMergeResult { entry }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "merge_queue.resolve" => match parse_params::<ResolveMergeParams>(request.params) {
+            Ok(params) => match state.agent.resolve_merge(&params.entry_id).await {
+                Ok(entry) => RpcResponse::success(id, ResolveMergeResult { entry }),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

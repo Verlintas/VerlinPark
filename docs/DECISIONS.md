@@ -46,6 +46,7 @@
 | [0034](adr/0034-cooperative-pause-resume.md) | Session 协作式 pause/resume | Accepted | 控制/恢复/UX |
 | [0035](adr/0035-shell-write-sandbox.md) | macOS Seatbelt shell 写入沙箱 | Accepted | 安全/隔离/工具执行 |
 | [0036](adr/0036-project-shell-policy.md) | 项目级 shell permission policy | Accepted | 权限/网络/项目配置 |
+| [0037](adr/0037-agent-assisted-conflict-resolution.md) | Merge queue agent-assisted conflict resolution | Accepted | 集成/冲突/恢复 |
 
 ---
 

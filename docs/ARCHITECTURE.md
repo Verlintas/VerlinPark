@@ -16,7 +16,7 @@ VerlinPark 的架构围绕一组**不变量**设计。任何实现都不能破�
 2. **所有状态变更都是事件。** 可回放、可审计、可恢复。当前 session status / usage / agent status / team plan / todos / messages / merge queue / recovery 已使用原子 event+projection 事务；`session.replay` 可检查投影漂移，`--repair` 可重建覆盖的投影和 agent roster；完整 export/从零 rebuild 仍未统一。
 3. **Agent 不能越界写。** 写操作限制在自己的 worktree；只读操作限制在项目根 + 显式 allowlist。
 4. **没有隐藏的模型切换。** 每个 Agent 的模型由用户显式配置；运行时只校验能力，不自动路由。
-5. **没有跳过验证的合并。** 目标状态是 Verifier + Integrator；人最终批准 land。当前已有 Verifier gate + 确定性 Integrator（merge queue、diff check、失败回滚、冲突记录、rebase+retry）、显式本地 landing 和显式 push/PR；可选 LLM Integrator、自动冲突解决和非 GitHub PR adapter 仍是设计目标。
+5. **没有跳过验证的合并。** 目标状态是 Verifier + Integrator；人最终批准 land。当前已有 Verifier gate + 确定性 Integrator（merge queue、diff check、失败回滚、冲突记录、rebase+retry）、显式本地 landing 和显式 push/PR；可选 LLM Integrator、静默自动冲突解决和非 GitHub PR adapter 仍是设计目标。
 6. **副作用必须可审计。** 每个工具调用、审批、命令、diff 都有事件记录。
 7. **大产物不进消息。** 消息只传 artifact 引用，避免上下文爆炸。
 8. **协议向后兼容。** 同一 major 版本内，旧客户端可以连接新 daemon（或明确拒绝并提示升级）。
@@ -468,7 +468,7 @@ loop {
 
 ## 7. Agent Runtime
 
-> **实现状态（M3 第一切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建；Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由 Verifier 审查（只读是 prompt 约束；shell 写入被限制在其 worktree，但仍可修改该 worktree），approve 才 merge；Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–10 个 Worker；手动 `delegate_many` 和 plan batch 都校验不重叠 write scope，空 scope/重叠 task 串行执行；每个 Worker 有独立 task worktree；Verifier approve 后进入持久 merge queue，由确定性 Integrator 串行 merge，执行 `git diff --check` 和可选 `VERLINPARK_INTEGRATION_COMMAND`，失败回滚，冲突记录；conflict/failed/interrupted 可 rebase+retry；clean project checkout 可显式 land 到默认分支，或显式 push 并用 `gh` 开 PR；daemon 重启把 in-flight queue entry 标为 interrupted；关键状态使用 atomic event+projection 事务；`session.replay` / `--repair/--rebuild` 可检查并重建覆盖的投影；session diff 从 base commit 起算。**已实现：** session 内 TeamPlan DAG 调度、Verifier gate、merge queue、确定性 Integrator、人工 retry、本地 landing、GitHub PR flow、queue recovery、replay 一致性检查、覆盖字段 repair/rebuild 与 session bundle export。**仍是设计目标：** 全局跨 session 调度器、全局写锁、自动冲突解决、可选 LLM Integrator、非 GitHub PR adapter、typed mailbox/artifact store：
+> **实现状态（M3 第一切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建；Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由 Verifier 审查（只读是 prompt 约束；shell 写入被限制在其 worktree，但仍可修改该 worktree），approve 才 merge；Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–10 个 Worker；手动 `delegate_many` 和 plan batch 都校验不重叠 write scope，空 scope/重叠 task 串行执行；每个 Worker 有独立 task worktree；Verifier approve 后进入持久 merge queue，由确定性 Integrator 串行 merge，执行 `git diff --check` 和可选 `VERLINPARK_INTEGRATION_COMMAND`，失败回滚，冲突记录；conflict/failed/interrupted 可 rebase+retry；clean project checkout 可显式 land 到默认分支，或显式 push 并用 `gh` 开 PR；daemon 重启把 in-flight queue entry 标为 interrupted；关键状态使用 atomic event+projection 事务；`session.replay` / `--repair/--rebuild` 可检查并重建覆盖的投影；session diff 从 base commit 起算。**已实现：** session 内 TeamPlan DAG 调度、Verifier gate、merge queue、确定性 Integrator、人工 retry、显式 agent-assisted 冲突解决、本地 landing、GitHub PR flow、queue recovery、replay 一致性检查、覆盖字段 repair/rebuild 与 session bundle export。**仍是设计目标：** 全局跨 session 调度器、全局写锁、静默自动冲突解决、可选 LLM Integrator、非 GitHub PR adapter、typed mailbox/artifact store：
 > `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`、`crates/vp-core/src/worktree.rs`。
 > 四层 Actor 模型、并行只读工具、上下文压缩和 checkpoint/resume 仍是设计目标；session 预算已实现 reservation-based enforcement（输入用保守估算，provider usage 结算）。
 > 见 [ADR-0015](adr/0015-m1-leader-loop.md)、[ADR-0016](adr/0016-session-worktree.md)、[ADR-0019](adr/0019-four-tier-delegation.md)。
@@ -706,7 +706,7 @@ stateDiagram-v2
 - 队列按依赖/优先级排序；一次只合并一个（避免 refs 竞争）。
 - rebase 到 integration 最新；冲突 → 生成 `conflict` artifact（文件、hunk、base/ours/theirs）。
 - Integrator 可以：
-  - 自动解决简单冲突（如 import 排序）？v0.1 不做自动；只生成报告。
+  - 显式调用 resolver agent 解决 rebase 冲突（`merge_queue.resolve`），再用独立 Verifier 复核；不静默自动运行。
   - 让 Builder 在自己的 worktree 解决，再重新提交。
   - 升级给用户。
 - 合并后跑集成测试；失败 → 回滚 merge commit（`git reset --hard` 到 merge 前），发回。

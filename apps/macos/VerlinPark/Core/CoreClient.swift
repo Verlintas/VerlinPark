@@ -210,6 +210,13 @@ actor CoreClient {
             .entry
     }
 
+    func resolveMerge(entryID: String) async throws -> MergeQueueEntry {
+        let params: [String: JSONValue] = ["entry_id": .string(entryID)]
+        return try await request(method: "merge_queue.resolve", params: params)
+            .decode(MergeQueueRetryResult.self)
+            .entry
+    }
+
     func landSession(sessionID: String) async throws -> SessionLandResult {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.land", params: params)

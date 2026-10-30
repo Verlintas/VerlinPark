@@ -84,6 +84,8 @@ enum Command {
     Queue { session: String },
     /// Retry a conflicted or failed merge queue entry after rebasing it.
     Retry { entry: String },
+    /// Resolve a merge conflict with an internal agent, verify, and merge.
+    Resolve { entry: String },
     /// Land the session branch into the project default branch.
     Land { session: String },
     /// Push the session branch and open a GitHub pull request with gh.
@@ -256,6 +258,14 @@ async fn main() -> Result<()> {
         }
         Command::Retry { entry } => {
             rpc(&discovery, "merge_queue.retry", json!({"entry_id": entry})).await?
+        }
+        Command::Resolve { entry } => {
+            rpc(
+                &discovery,
+                "merge_queue.resolve",
+                json!({"entry_id": entry}),
+            )
+            .await?
         }
         Command::Land { session } => {
             rpc(&discovery, "session.land", json!({"session_id": session})).await?

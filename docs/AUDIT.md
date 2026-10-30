@@ -13,12 +13,12 @@
 - **P0-2 已修复**：provider 请求前做 token reservation，按保守输入估算 + 动态 output budget 预留；provider 返回 usage 后结算，缺少 usage 的本地端点会以 `estimated: true` 的估算用量持久化。并发批次不再共用同一个 pre-flight 窗口。
 - **P1-4 已修复**：`fetch_url` 在连接前解析并固定已校验的 IP，阻止解析到 loopback/private/link-local/文档/benchmark 等地址；补充了 IPv4-mapped IPv6 与特殊段检查。
 - **P1-3 部分修复**：shell 现在通过 macOS Seatbelt 拒绝 worktree/Git 元数据/scratch 之外的写入，并保护 common hooks/config；sandbox 不可用时 fail closed。常见 credential/state 路径已 read-deny，timeout/cancel 会清理整个 process group，项目级 policy 可 deny network 或追加 read-deny（只能收窄）；任意读取、network allow 下的外发、进程执行策略和 Docker 等 daemon 介导写入仍未隔离，Verifier 仍可修改自己的 worktree。
-- **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 和 `gh` PR flow 可用。仍缺自动冲突解决、LLM Integrator、非 GitHub PR adapter。
+- **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，冲突可显式调用 resolver agent 解决并重新验证；本地 landing 和 `gh` PR flow 可用。仍缺静默自动冲突解决、LLM Integrator、非 GitHub PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
-- **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree/scratch 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
+- **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、worktree/scratch 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 68（core 51 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
+当前测试：Rust 71（core 54 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
 
 ---
 
@@ -48,7 +48,7 @@
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
-| 测试 | B− | 68 Rust + 9 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 71 Rust + 9 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -170,7 +170,7 @@
 
 ---
 
-### P1-6（已修复第一版 2026-10-30）：没有 merge queue / Integrator，串行合并的失败不可恢复
+### P1-6（已修复，含显式 auto-resolve 2026-10-30）：没有 merge queue / Integrator，串行合并的失败不可恢复
 
 **证据**
 
@@ -182,11 +182,11 @@
 
 - 一个 task 的合并失败会阻塞其 dependents，但没有重新排队/重新验证机制；用户只能手动处理。
 - Verifier 审查的是 task branch，不是“合并后的集成结果”；跨 task 的语义冲突不会被发现。
-- 修复后：持久 queue、确定性 merge、diff check、可选 integration command、失败回滚、冲突记录、rebase+retry、本地 landing、显式 push/PR。仍缺自动冲突解决、LLM Integrator、非 GitHub PR。
+- 修复后：持久 queue、确定性 merge、diff check、可选 integration command、失败回滚、冲突记录、rebase+retry、显式 agent-assisted conflict resolution、本地 landing、显式 push/PR。仍缺静默自动冲突解决、LLM Integrator、非 GitHub PR。
 
 **后续**
 
-- queue retry 与 GitHub PR flow 已支持；下一步是自动冲突建议与非 GitHub PR adapter。
+- queue retry、显式 auto-resolve 与 GitHub PR flow 已支持；下一步是静默自动冲突策略与非 GitHub PR adapter。
 - 可选 LLM Integrator 只做语义 review/冲突建议，不替代确定性 merge 和 rollback。
 - 增加跨 entry 的 blocking/backpressure 和 post-merge 集成分支，避免后续 entry 基于旧 base。
 
@@ -240,7 +240,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 68 个 Rust 测试 + 9 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、预算、恢复、pause/resume、shell 沙箱/policy 与 process group 清理。仍缺：
+已有 71 个 Rust 测试 + 9 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、预算、恢复、pause/resume、shell 沙箱/policy、process group 清理与 agent-assisted conflict resolution。仍缺：
 
 - plan 自动派发的 scope overlap / cap 回归
 - 并发预算超调上界
@@ -344,7 +344,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 68 passed after the 10-30 delivery/recovery/pause/sandbox/policy slices
+cargo test --workspace     # 71 passed after the 10-30 delivery/recovery/pause/sandbox/policy/resolve slices
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```

@@ -1058,6 +1058,7 @@ private struct MergeQueueRow: View {
     @Environment(AppModel.self) private var model
     let entry: MergeQueueEntry
     @State private var retrying = false
+    @State private var resolving = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1093,19 +1094,40 @@ private struct MergeQueueRow: View {
                     .lineLimit(4)
             }
             if entry.status == "conflict" || entry.status == "failed" || entry.status == "interrupted" {
-                Button {
-                    retrying = true
-                    Task {
-                        await model.retryMergeEntry(entry.id)
-                        retrying = false
+                HStack(spacing: 6) {
+                    if entry.status == "conflict" {
+                        Button {
+                            resolving = true
+                            Task {
+                                await model.resolveMergeEntry(entry.id)
+                                resolving = false
+                            }
+                        } label: {
+                            Label("Auto-resolve", systemImage: "wand.and.stars")
+                                .font(.system(size: 9, weight: .medium))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .tint(.orange)
+                        .disabled(resolving || retrying)
+                        .help(
+                            "Run an internal resolver agent without per-tool approvals (shell sandbox still applies), verify, then merge"
+                        )
                     }
-                } label: {
-                    Label("Rebase & retry", systemImage: "arrow.clockwise")
-                        .font(.system(size: 9, weight: .medium))
+                    Button {
+                        retrying = true
+                        Task {
+                            await model.retryMergeEntry(entry.id)
+                            retrying = false
+                        }
+                    } label: {
+                        Label("Rebase & retry", systemImage: "arrow.clockwise")
+                            .font(.system(size: 9, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(retrying || resolving)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(retrying)
             }
         }
         .padding(10)

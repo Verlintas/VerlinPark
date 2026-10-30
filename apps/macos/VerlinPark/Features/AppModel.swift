@@ -512,6 +512,16 @@ final class AppModel {
         }
     }
 
+    func resolveMergeEntry(_ entryID: String) async {
+        do {
+            _ = try await core.resolveMerge(entryID: entryID)
+            await loadMergeQueue()
+            await loadDiff()
+        } catch {
+            handle(error)
+        }
+    }
+
     func landSession() async {
         guard let sessionID = selectedSessionID else { return }
         landingBusy = true

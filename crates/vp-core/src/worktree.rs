@@ -217,6 +217,83 @@ pub fn rebase_onto(worktree: &Path, onto: &str) -> Result<()> {
     }
 }
 
+/// Start a rebase and leave conflicts in the worktree for an agent to resolve.
+pub fn rebase_onto_keep_conflicts(worktree: &Path, onto: &str) -> Result<()> {
+    run_git(worktree, &["rebase", onto]).context("rebasing task branch")
+}
+
+pub fn rebase_in_progress(worktree: &Path) -> bool {
+    for name in ["rebase-merge", "rebase-apply"] {
+        if let Ok(path) = git_output(worktree, &["rev-parse", "--git-path", name]) {
+            let path = PathBuf::from(path.trim());
+            let path = if path.is_absolute() {
+                path
+            } else {
+                worktree.join(path)
+            };
+            if path.is_dir() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn conflicted_paths(worktree: &Path) -> Result<Vec<String>> {
+    let output = git_output(worktree, &["diff", "--name-only", "--diff-filter=U"])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+pub fn stage_all(worktree: &Path) -> Result<()> {
+    run_git(worktree, &["add", "-A"])
+}
+
+/// Detect leftover conflict markers in files staged for the in-progress rebase.
+pub fn conflict_markers(worktree: &Path) -> Result<Vec<String>> {
+    let output = git_output(worktree, &["diff", "--cached", "--name-only"])?;
+    let mut markers = Vec::new();
+    for path in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let file = worktree.join(path);
+        let Ok(metadata) = std::fs::metadata(&file) else {
+            continue;
+        };
+        if metadata.len() > 2 * 1024 * 1024 {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let has_start = content.lines().any(|line| line.starts_with("<<<<<<<"));
+        let has_sep = content.lines().any(|line| line.starts_with("======="));
+        let has_end = content.lines().any(|line| line.starts_with(">>>>>>>"));
+        if has_start && has_sep && has_end {
+            markers.push(path.to_string());
+        }
+    }
+    Ok(markers)
+}
+
+pub fn continue_rebase(worktree: &Path) -> Result<()> {
+    run_git(
+        worktree,
+        &["-c", "core.editor=true", "rebase", "--continue"],
+    )
+    .context("continuing rebase")
+}
+
+pub fn abort_rebase(worktree: &Path) {
+    let _ = run_git(worktree, &["rebase", "--abort"]);
+}
+
 pub fn head_commit(worktree: &Path) -> Result<String> {
     git_output(worktree, &["rev-parse", "HEAD"])
 }
@@ -257,7 +334,7 @@ pub fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
     Ok(status.success())
 }
 
-fn git_output(root: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -358,6 +435,73 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(session.path.join("worker.txt")).unwrap(),
             "from worker\n"
+        );
+    }
+
+    #[test]
+    fn resolves_a_rebase_conflict_with_staged_files() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let session = create(repo.path(), data.path(), "project-1", "session-1").unwrap();
+        let task = create_task(
+            repo.path(),
+            data.path(),
+            "project-1",
+            "session-1",
+            "task-1",
+            &session.branch,
+        )
+        .unwrap();
+        std::fs::write(task.path.join("README.md"), "worker\n").unwrap();
+        commit_all(&task.path, "worker change").unwrap();
+        std::fs::write(session.path.join("README.md"), "session\n").unwrap();
+        commit_all(&session.path, "session change").unwrap();
+
+        assert!(rebase_onto_keep_conflicts(&task.path, &session.branch).is_err());
+        assert!(rebase_in_progress(&task.path));
+        assert_eq!(
+            conflicted_paths(&task.path).unwrap(),
+            vec!["README.md".to_string()]
+        );
+
+        std::fs::write(task.path.join("README.md"), "resolved\n").unwrap();
+        stage_all(&task.path).unwrap();
+        assert!(conflict_markers(&task.path).unwrap().is_empty());
+        continue_rebase(&task.path).unwrap();
+        assert!(!rebase_in_progress(&task.path));
+        assert_eq!(
+            std::fs::read_to_string(task.path.join("README.md")).unwrap(),
+            "resolved\n"
+        );
+    }
+
+    #[test]
+    fn detects_conflict_markers_in_staged_files() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let session = create(repo.path(), data.path(), "project-1", "session-1").unwrap();
+        let task = create_task(
+            repo.path(),
+            data.path(),
+            "project-1",
+            "session-1",
+            "task-1",
+            &session.branch,
+        )
+        .unwrap();
+        std::fs::write(task.path.join("conflict.txt"), "before\n").unwrap();
+        commit_all(&task.path, "add conflict file").unwrap();
+        std::fs::write(
+            task.path.join("conflict.txt"),
+            "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> task\n",
+        )
+        .unwrap();
+        stage_all(&task.path).unwrap();
+        assert_eq!(
+            conflict_markers(&task.path).unwrap(),
+            vec!["conflict.txt".to_string()]
         );
     }
 

@@ -374,6 +374,16 @@ pub struct RetryMergeResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ResolveMergeParams {
+    pub entry_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolveMergeResult {
+    pub entry: MergeQueueEntry,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LandSessionParams {
     pub session_id: String,
 }
