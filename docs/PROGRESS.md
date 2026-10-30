@@ -35,7 +35,7 @@
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；UI Approve/Deny |
 | 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR/mailbox/artifact 事件；Collab roster；Preview Plan/Changes/Queue/Mailbox/Cost/Trace |
 | Mailbox / artifacts | ✅ | session-scoped typed messages（unread/read、sender/receiver、kind、body、JSON payload）+ text artifacts（≤100KB）+ binary file artifacts（≤5MiB，SHA-256/path）；agent tools `send_message`/`read_mailbox`/`publish_artifact`/`list_artifacts`/`read_artifact`；RPC/CLI/Preview Mailbox；bundle export/import（binary base64）；项目 artifact policy（max bytes/age/count、auto GC）+ manual GC；项目 mailbox policy（max age/count、delete_unread）+ manual oldest-first GC，默认保护 unread |
-| Event consistency | ✅ | session status / usage / agent status / team plan / todos / messages / merge queue / agent roster / usage ledger / recovery 使用 event+projection 原子事务；`session.replay` 比较 usage ledger，`--repair` / `--rebuild` 从 `agent.usage` 事件重建 ledger；`session.export` / `session.import` bundle 包含 usage ledger |
+| Event consistency | ✅ | session status / usage / agent status / team plan / todos / messages / merge queue / agent roster / usage ledger / mailbox / recovery 使用 event+projection 原子事务；`session.replay` 比较 usage ledger 与 mailbox，`--repair` / `--rebuild` 从 `agent.usage` 和 `mailbox.*` 事件重建投影；artifact/mailbox GC 发出 `artifact.pruned` / `mailbox.pruned`；`session.export` / `session.import` bundle 包含 usage ledger |
 | Import archive | ✅ | `vp import <bundle>` 保留 session/project/事件/approvals/投影；导入 session 为只读 archive，不创建 worktree |
 | Rehydrate | ✅ | `vp rehydrate <session> [--worktree path]`：only imported；校验 project/base commit；创建/attach session worktree；按 branch 分组重建 imported agent task worktrees；状态回到 idle；返回 warnings/remapped count |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
@@ -46,7 +46,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：88 个测试通过（core 70、store 13、providers 5）。
+- `cargo test --workspace`：89 个测试通过（core 71、store 13、providers 5）。
 - `xcodebuild test`：9 个 Swift 测试通过。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -71,7 +71,7 @@
 - 没有完整全局 Task-DAG 调度器/公平队列、task retry UI、单 task cancel/pause；daemon-wide session admission 与 Worker/Labour scope locks 已实现。
 - 没有 auto-expansion；Manager/Worker 上限是固定 caps，不是按预算自动扩编。
 - 没有 per-role token budget / task/department budget tree；USD 预算依赖用户手填价格，时间预算只在 turn/tool 边界检查，不能抢占 in-flight provider/tool。
-- Mailbox 是 pull-based：消息不会唤醒 idle Agent/创建新 run；mailbox GC 无自动触发/回收站，且 unread 保护可能使 max_count 无法立即满足；artifact binary 上限 5MiB，没有内容寻址 dedupe/压缩，GC oldest-first 无回收站；replay 暂不比较 mailbox/artifact 投影。
+- Mailbox 是 pull-based：消息不会唤醒 idle Agent/创建新 run；mailbox GC 无自动触发/回收站，且 unread 保护可能使 max_count 无法立即满足；artifact binary 上限 5MiB，没有内容寻址 dedupe/压缩，GC oldest-first 无回收站；replay 已比较 mailbox 投影；artifact 仍只记录 prune audit event，没有内容级 replay/rebuild。
 - Global capacity 是进程内 semaphore，非持久、无优先级/公平队列；等待 permit 的 Worker 仍显示 `running`，没有独立的 `capacity_wait` 事件。
 - Task/department budget 不共享原子 reservation：并行任务可能各自超出一次 provider call；手动 delegate 任务没有 plan task id 时只受 session budget 约束。
 - 历史 session 只有在新事件带 `usage_id` 后才会被 replay 比较；repair 可用 legacy event 的 synthetic id 回填 ledger。
@@ -114,6 +114,7 @@
 - **M3 第二十三切片**：per-call usage ledger（agent/role/task/model/tokens/estimated/cost）+ `session.usage` / `vp usage` / Preview → Cost 分组汇总。
 - **M3 第二十四切片**：TeamPlan department/task token/USD budget 树 + scope-aware 失败语义 + usage ledger replay/repair/export/import + capacity wait 观测。
 - **M3 第二十五切片**：项目级 mailbox retention policy + oldest-first GC + unread 保护 + CLI/Manage Dash。
+- **M3 第二十六切片**：mailbox replay/repair（sent/read/pruned）+ artifact/mailbox GC audit events。
 
 ## 如何运行
 

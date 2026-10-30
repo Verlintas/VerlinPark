@@ -27,6 +27,7 @@ pub struct SessionRepair {
     pub plan: Option<String>,
     pub todos: Option<Vec<TodoItem>>,
     pub messages: Option<Vec<StoredMessage>>,
+    pub agent_messages: Option<Vec<AgentMessage>>,
     pub agents: Option<Vec<AgentRecord>>,
     pub queue: Option<Vec<MergeQueueEntry>>,
 }
@@ -763,7 +764,11 @@ impl Store {
             &tx,
             &message.session_id,
             "mailbox.message_read",
-            serde_json::json!({"message_id": message.id, "to_agent_id": message.to_agent_id}),
+            serde_json::json!({
+                "message_id": message.id,
+                "to_agent_id": message.to_agent_id,
+                "read_at": message.read_at,
+            }),
         )?;
         tx.commit()?;
         if let Err(error) = self.append_event_mirror(&event) {
@@ -1082,6 +1087,100 @@ impl Store {
             params![message_id],
         )?;
         Ok(changed > 0)
+    }
+
+    pub fn delete_agent_message_with_event(&self, message_id: &str) -> Result<Option<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let message = tx
+            .query_row(
+                "SELECT session_id, from_agent_id, from_name, to_agent_id, to_name, kind
+                 FROM agent_messages WHERE id = ?1",
+                params![message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((session_id, from_agent_id, from_name, to_agent_id, to_name, kind)) = message
+        else {
+            return Ok(None);
+        };
+        tx.execute(
+            "DELETE FROM agent_messages WHERE id = ?1",
+            params![message_id],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &session_id,
+            "mailbox.pruned",
+            serde_json::json!({
+                "message_id": message_id,
+                "from_agent_id": from_agent_id,
+                "from_name": from_name,
+                "to_agent_id": to_agent_id,
+                "to_name": to_name,
+                "kind": kind,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
+    pub fn delete_artifact_with_event(&self, artifact_id: &str) -> Result<Option<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let artifact = tx
+            .query_row(
+                "SELECT session_id, name, kind, storage, size_bytes, sha256, path
+                 FROM artifacts WHERE id = ?1",
+                params![artifact_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((session_id, name, kind, storage, size_bytes, sha256, path)) = artifact else {
+            return Ok(None);
+        };
+        tx.execute("DELETE FROM artifacts WHERE id = ?1", params![artifact_id])?;
+        let event = insert_event_tx(
+            &tx,
+            &session_id,
+            "artifact.pruned",
+            serde_json::json!({
+                "artifact_id": artifact_id,
+                "name": name,
+                "kind": kind,
+                "storage": storage,
+                "size_bytes": size_bytes,
+                "sha256": sha256,
+                "path": path,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
     }
 
     pub fn add_session_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
@@ -2307,6 +2406,34 @@ impl Store {
                         serde_json::to_string(&message.tool_calls)?,
                         message.tool_call_id,
                         message.created_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(agent_messages) = &repair.agent_messages {
+            tx.execute(
+                "DELETE FROM agent_messages WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for message in agent_messages {
+                tx.execute(
+                    "INSERT INTO agent_messages
+                     (id, session_id, from_agent_id, from_name, to_agent_id, to_name,
+                      kind, body, payload, status, created_at, read_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        message.id,
+                        message.session_id,
+                        message.from_agent_id,
+                        message.from_name,
+                        message.to_agent_id,
+                        message.to_name,
+                        message.kind,
+                        message.body,
+                        serde_json::to_string(&message.payload)?,
+                        message.status,
+                        message.created_at,
+                        message.read_at
                     ],
                 )?;
             }

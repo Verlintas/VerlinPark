@@ -51,8 +51,9 @@ outside their worktree.
 - Export/import is portable but can be large for binary artifacts.
 - `artifact.path` is machine-local and is not a stable user-facing identity; use
   the artifact ID.
-- GC events are not yet a dedicated per-artifact audit event; the remaining
-  artifact rows/events reflect the deletion only by absence and the GC result.
+- Each artifact deletion now emits `artifact.pruned` with the artifact ID and
+  metadata. Artifact content replay/rebuild is still not implemented; the event
+  is an audit record, not a content store.
 
 ## Alternatives considered
 

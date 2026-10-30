@@ -31,6 +31,7 @@ struct ReplayData {
     agents: Vec<AgentRecord>,
     approvals: Vec<Approval>,
     queue: Vec<MergeQueueEntry>,
+    agent_messages: Vec<AgentMessage>,
     usage: Vec<UsageEntry>,
     events: Vec<Event>,
 }
@@ -1219,7 +1220,11 @@ impl Engine {
             }
             let store = self.store.clone();
             let id = id.clone();
-            let _ = tokio::task::spawn_blocking(move || store.delete_artifact(&id)).await?;
+            if let Some(event) =
+                tokio::task::spawn_blocking(move || store.delete_artifact_with_event(&id)).await??
+            {
+                let _ = self.events.send(event);
+            }
         }
         Ok(ArtifactGcResult {
             removed: remove.len(),
@@ -1345,6 +1350,7 @@ impl Engine {
             let agents = store.list_agents(&id)?;
             let approvals = store.list_approvals(Some(&id))?;
             let queue = store.list_merge_queue(&id)?;
+            let agent_messages = store.list_agent_messages(&id, None, false)?;
             let usage = store.list_usage_entries(&id)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
@@ -1355,11 +1361,60 @@ impl Engine {
                 agents,
                 approvals,
                 queue,
+                agent_messages,
                 usage,
                 events,
             })
         })
         .await?
+    }
+
+    fn expected_agent_messages(data: &ReplayData) -> Vec<AgentMessage> {
+        let mut mailbox = HashMap::<String, AgentMessage>::new();
+        for event in &data.events {
+            match event.kind.as_str() {
+                "mailbox.message_sent" => {
+                    if let Ok(message) =
+                        serde_json::from_value::<AgentMessage>(event.payload.clone())
+                    {
+                        mailbox.insert(message.id.clone(), message);
+                    }
+                }
+                "mailbox.message_read" => {
+                    if let Some(message_id) = event
+                        .payload
+                        .get("message_id")
+                        .and_then(serde_json::Value::as_str)
+                        && let Some(message) = mailbox.get_mut(message_id)
+                    {
+                        message.status = "read".to_string();
+                        message.read_at = event
+                            .payload
+                            .get("read_at")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .or_else(|| Some(event.created_at.clone()));
+                    }
+                }
+                "mailbox.pruned" => {
+                    if let Some(message_id) = event
+                        .payload
+                        .get("message_id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        mailbox.remove(message_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut messages = mailbox.into_values().collect::<Vec<_>>();
+        messages.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        messages
     }
 
     fn expected_usage_entries(data: &ReplayData) -> Vec<UsageEntry> {
@@ -1519,6 +1574,25 @@ impl Engine {
             ));
         }
 
+        let expected_mailbox = Self::expected_agent_messages(data);
+        let expected_mailbox_values = expected_mailbox
+            .iter()
+            .filter_map(|message| Some((message.id.clone(), serde_json::to_value(message).ok()?)))
+            .collect::<HashMap<_, _>>();
+        let projected_mailbox_values = data
+            .agent_messages
+            .iter()
+            .filter_map(|message| Some((message.id.clone(), serde_json::to_value(message).ok()?)))
+            .collect::<HashMap<_, _>>();
+        let mailbox_matches = expected_mailbox_values == projected_mailbox_values;
+        if !mailbox_matches {
+            mismatches.push(format!(
+                "mailbox: projection={}, replay={}",
+                projected_mailbox_values.len(),
+                expected_mailbox_values.len()
+            ));
+        }
+
         let replay_plan = data
             .events
             .iter()
@@ -1627,6 +1701,7 @@ impl Engine {
         let consistent = status_matches
             && usage_matches
             && ledger_matches
+            && mailbox_matches
             && plan_matches
             && todos_matches
             && messages_matches
@@ -1642,6 +1717,7 @@ impl Engine {
             messages_matches,
             agents_matches,
             queue_matches,
+            mailbox_matches,
             ledger_matches,
             consistent,
             repaired,
@@ -1807,6 +1883,7 @@ impl Engine {
             plan,
             todos,
             messages,
+            agent_messages: Some(Self::expected_agent_messages(data)),
             agents,
             queue,
         })
@@ -2535,7 +2612,11 @@ impl Engine {
                 continue;
             }
             let store = self.store.clone();
-            if tokio::task::spawn_blocking(move || store.delete_agent_message(&id)).await?? {
+            let event =
+                tokio::task::spawn_blocking(move || store.delete_agent_message_with_event(&id))
+                    .await??;
+            if let Some(event) = event {
+                let _ = self.events.send(event);
                 removed += 1;
             }
         }
@@ -2803,6 +2884,18 @@ mod tests {
             std::path::Path::new(first.path.as_ref().unwrap()).exists()
                 || std::path::Path::new(second.path.as_ref().unwrap()).exists()
         );
+        let pruned_id = if kept.id == first.id {
+            &second.id
+        } else {
+            &first.id
+        };
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "artifact.pruned" && event.payload["artifact_id"] == *pruned_id
+        }));
     }
 
     #[tokio::test]
@@ -2912,6 +3005,100 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn mailbox_replay_tracks_reads_prunes_and_repairs() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("mailbox replay".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "mailbox replay".into(), None)
+            .await
+            .unwrap();
+        let first = engine
+            .send_agent_message(
+                &session.id,
+                "sender",
+                "Sender",
+                "receiver",
+                "Receiver",
+                "note",
+                "first",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        engine
+            .send_agent_message(
+                &session.id,
+                "sender",
+                "Sender",
+                "receiver",
+                "Receiver",
+                "note",
+                "second",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        engine.mark_agent_message_read(&first.id).await.unwrap();
+
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.mailbox_matches, "{:?}", report.mismatches);
+
+        // Bypass the event path: replay must expose the missing row.
+        engine.store().delete_agent_message(&first.id).unwrap();
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(!report.mailbox_matches);
+        let repaired = engine.repair_session(&session.id).await.unwrap();
+        assert!(repaired.consistent, "{:?}", repaired.mismatches);
+        assert!(repaired.mailbox_matches);
+        let messages = engine
+            .list_agent_messages(&session.id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .find(|message| message.id == first.id)
+                .unwrap()
+                .status,
+            "read"
+        );
+
+        let policy = engine
+            .set_mailbox_policy(
+                &project.id,
+                MailboxPolicy {
+                    max_age_secs: None,
+                    max_count: Some(1),
+                    delete_unread: false,
+                },
+            )
+            .await
+            .unwrap();
+        let gc = engine.gc_mailbox(&project.id, &policy).await.unwrap();
+        assert_eq!(gc.removed, 1);
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "mailbox.pruned" && event.payload["message_id"] == first.id
+        }));
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.consistent, "{:?}", report.mismatches);
+        assert!(report.mailbox_matches);
     }
 
     #[tokio::test]

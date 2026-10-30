@@ -28,17 +28,18 @@ message may contain an instruction that has not been consumed.
 5. **APIs and UI.** RPC `mailbox.policy.get/set` and `mailbox.gc`; CLI
    `mailbox-policy`, `mailbox-policy-set`, `mailbox-gc`; Manage Dash has a
    Mailbox retention card with a Delete unread toggle and GC now.
-6. **No event per deletion.** GC does not emit a `mailbox.deleted` event, in
-   keeping with artifact GC. The count is returned to the caller; the remaining
-   messages are the projection.
+6. **Audit events.** Each deletion emits `mailbox.pruned` with the message ID,
+   sender/receiver, and kind in the same transaction as the row delete. The
+   count is also returned to the caller. `session.replay` reconstructs the
+   mailbox from `mailbox.message_sent`, `mailbox.message_read`, and
+   `mailbox.pruned`; `--repair` rewrites the mailbox projection.
 
 ## Consequences
 
 - Users can bound mailbox storage deliberately without silently losing unread
   instructions.
 - `max_count` is a target, not a guarantee, when unread messages are protected.
-- Automatic retention would need a safe trigger and an audit event; it is not
-  implemented yet.
+- Automatic retention would need a safe trigger; it is not implemented yet.
 - Mailbox rows are deleted with the session; exported bundles still contain the
   messages present at export time.
 

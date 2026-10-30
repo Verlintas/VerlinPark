@@ -820,6 +820,8 @@ pub struct SessionReplayReport {
     pub agents_matches: bool,
     pub queue_matches: bool,
     #[serde(default)]
+    pub mailbox_matches: bool,
+    #[serde(default)]
     pub ledger_matches: bool,
     pub consistent: bool,
     #[serde(default)]
