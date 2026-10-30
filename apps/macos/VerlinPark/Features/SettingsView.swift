@@ -404,6 +404,19 @@ struct ProvidersSettingsView: View {
                 }
             }
 
+            Section("Role model overrides") {
+                Text(
+                    "Blank uses the base Leader model. Prices are USD per 1M tokens and are only used when a USD session budget is set."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                RoleModelRow(title: "Leader", config: $model.roleModels.leader)
+                RoleModelRow(title: "Manager", config: $model.roleModels.manager)
+                RoleModelRow(title: "Worker", config: $model.roleModels.worker)
+                RoleModelRow(title: "Verifier", config: $model.roleModels.verifier)
+                RoleModelRow(title: "Labour", config: $model.roleModels.labour)
+            }
+
             Section("Local endpoints") {
                 LabeledContent("LM Studio", value: "http://127.0.0.1:1234/v1")
                 LabeledContent("Ollama", value: "http://127.0.0.1:11434/v1")
@@ -434,6 +447,52 @@ struct ProvidersSettingsView: View {
         }
         .formStyle(.grouped)
         .padding(24)
+    }
+}
+
+private struct RoleModelRow: View {
+    let title: String
+    @Binding var config: RoleModelConfig
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium))
+                .frame(width: 64, alignment: .leading)
+            TextField("base model", text: modelBinding)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+            TextField("in $/1M", text: priceBinding(\.inputUsdPerMillion))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+                .frame(width: 80)
+            TextField("out $/1M", text: priceBinding(\.outputUsdPerMillion))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+                .frame(width: 80)
+        }
+    }
+
+    private var modelBinding: Binding<String> {
+        Binding(
+            get: { config.model ?? "" },
+            set: { config.model = $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+        )
+    }
+
+    private func priceBinding(
+        _ keyPath: WritableKeyPath<RoleModelConfig, Double?>
+    ) -> Binding<String> {
+        Binding(
+            get: {
+                guard let value = config[keyPath: keyPath] else { return "" }
+                return String(format: "%.6g", value)
+            },
+            set: {
+                let trimmed = $0.trimmingCharacters(in: .whitespaces)
+                config[keyPath: keyPath] = trimmed.isEmpty ? nil : Double(trimmed)
+            }
+        )
     }
 }
 

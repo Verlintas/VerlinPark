@@ -12,8 +12,8 @@ use futures_util::StreamExt;
 use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
-    AgentInfo, ConfigureAgentParams, MergeQueueEntry, PlanDepartment, PlanTask, Project, Session,
-    StoredMessage, TeamPlan, TodoItem,
+    AgentInfo, ConfigureAgentParams, MergeQueueEntry, PlanDepartment, PlanTask, Project,
+    RoleModels, Session, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, StreamEvent,
@@ -38,6 +38,7 @@ pub struct AgentConfig {
     pub provider: Arc<dyn Provider>,
     pub provider_name: String,
     pub model: String,
+    pub role_models: RoleModels,
     pub base_url: Option<String>,
     pub max_turns: u32,
     pub max_tokens: Option<u32>,
@@ -375,6 +376,9 @@ struct AgentSpec {
 
 struct SessionBudget {
     limit: Option<u64>,
+    cost_limit: Option<f64>,
+    time_limit: Option<Duration>,
+    started: std::time::Instant,
     caps: AgentCaps,
     state: Mutex<BudgetState>,
 }
@@ -392,6 +396,7 @@ struct BudgetState {
     /// limit before the request starts, so concurrent agents cannot all pass
     /// the same pre-flight check and overshoot by a full batch.
     reserved_tokens: u64,
+    cost_spent: f64,
     managers: usize,
     workers: usize,
     verifiers: usize,
@@ -418,10 +423,14 @@ impl SessionBudget {
     fn new(limit: Option<u64>, spent: u64, caps: AgentCaps) -> Self {
         Self {
             limit,
+            cost_limit: None,
+            time_limit: None,
+            started: std::time::Instant::now(),
             caps,
             state: Mutex::new(BudgetState {
                 spent,
                 reserved_tokens: 0,
+                cost_spent: 0.0,
                 managers: 0,
                 workers: 0,
                 verifiers: 0,
@@ -430,12 +439,67 @@ impl SessionBudget {
         }
     }
 
+    fn with_cost(mut self, limit: Option<f64>, spent: f64) -> Self {
+        self.cost_limit = limit;
+        if let Ok(mut state) = self.state.lock() {
+            state.cost_spent = spent;
+        }
+        self
+    }
+
+    fn with_time(mut self, seconds: Option<u64>) -> Self {
+        self.time_limit = seconds.map(Duration::from_secs);
+        self.started = std::time::Instant::now();
+        self
+    }
+
+    fn add_cost(&self, cost: f64) -> bool {
+        if let Ok(mut state) = self.state.lock() {
+            state.cost_spent += cost.max(0.0);
+            return self
+                .cost_limit
+                .is_some_and(|limit| state.cost_spent >= limit);
+        }
+        true
+    }
+
+    fn exceeded_reason(&self) -> Option<&'static str> {
+        if self.limit.is_some_and(|limit| self.spent() >= limit) {
+            return Some("tokens");
+        }
+        if let Ok(state) = self.state.lock()
+            && self
+                .cost_limit
+                .is_some_and(|limit| state.cost_spent >= limit)
+        {
+            return Some("cost");
+        }
+        if self
+            .time_limit
+            .is_some_and(|limit| self.started.elapsed() >= limit)
+        {
+            return Some("time");
+        }
+        None
+    }
+
     fn spent(&self) -> u64 {
         self.state.lock().map(|state| state.spent).unwrap_or(0)
     }
 
     fn exhausted(&self) -> bool {
-        self.limit.is_some_and(|limit| self.spent() >= limit)
+        self.exceeded_reason().is_some()
+    }
+
+    fn cost_spent(&self) -> f64 {
+        self.state
+            .lock()
+            .map(|state| state.cost_spent)
+            .unwrap_or(0.0)
+    }
+
+    fn elapsed_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
     }
 
     fn available_tokens(&self) -> Option<u64> {
@@ -609,6 +673,7 @@ impl AgentService {
                 provider,
                 provider_name: "openai-compatible".to_string(),
                 model,
+                role_models: RoleModels::default(),
                 base_url: Some(base_url),
                 max_turns: env::var("VERLINPARK_MAX_TURNS")
                     .ok()
@@ -691,6 +756,7 @@ impl AgentService {
             provider,
             provider_name: params.provider,
             model,
+            role_models: params.role_models.unwrap_or_default(),
             base_url: Some(base_url),
             max_turns: params.max_turns.unwrap_or(20).clamp(1, 200),
             max_tokens: params.max_tokens.or(Some(4096)),
@@ -723,12 +789,14 @@ impl AgentService {
                 provider: Some(config.provider_name.clone()),
                 model: Some(config.model.clone()),
                 base_url: config.base_url.clone(),
+                role_models: config.role_models.clone(),
             },
             None => AgentInfo {
                 configured: false,
                 provider: None,
                 model: None,
                 base_url: None,
+                role_models: RoleModels::default(),
             },
         }
     }
@@ -1028,7 +1096,7 @@ impl AgentService {
                 "Conflict Resolver",
                 Some("Integration".to_string()),
                 worker.parent_id.clone(),
-                &config.model,
+                &model_for(config, AgentRole::Worker),
             )
             .await?;
         self.engine
@@ -1101,7 +1169,9 @@ impl AgentService {
                 workers: config.max_workers,
                 labour: config.max_labour,
             },
-        );
+        )
+        .with_cost(session.cost_budget_usd, session.cost_spent_usd)
+        .with_time(session.time_budget_secs);
         let prompt = format!(
             "You are resolving a Git rebase conflict for integration queue entry {}.              The worktree is {} on branch {}. The rebase target is session branch {} at commit {}.              Conflicted paths: {}.              Resolve the conflicts in place, preserving the intent of both sides. Do not abort the rebase.              Do not commit manually; leave the resolved files in the worktree. Run relevant tests if possible.              The runtime will stage resolved files, continue the rebase, verify the result, and merge it.              Reply with a concise summary of the resolution.",
             entry.id,
@@ -1826,7 +1896,9 @@ async fn run_agent(
             workers: config.max_workers,
             labour: config.max_labour,
         },
-    );
+    )
+    .with_cost(session.cost_budget_usd, session.cost_spent_usd)
+    .with_time(session.time_budget_secs);
     if budget.exhausted() {
         emit(
             &engine,
@@ -1834,8 +1906,13 @@ async fn run_agent(
             &spec,
             "agent.budget_exceeded",
             serde_json::json!({
+                "reason": budget.exceeded_reason().unwrap_or("tokens"),
                 "limit": session.token_budget,
                 "spent": budget.spent(),
+                "cost_limit_usd": session.cost_budget_usd,
+                "cost_spent_usd": budget.cost_spent(),
+                "time_budget_secs": session.time_budget_secs,
+                "elapsed_secs": budget.elapsed_secs(),
             }),
         )
         .await?;
@@ -1854,7 +1931,7 @@ async fn run_agent(
         serde_json::json!({
             "goal": session.goal,
             "prompt": prompt,
-            "model": config.model,
+            "model": model_for(&config, spec.role),
             "provider": config.provider_name,
             "worktree": session.worktree,
             "branch": session.branch,
@@ -1911,8 +1988,13 @@ async fn run_agent(
                 &spec,
                 "agent.budget_exceeded",
                 serde_json::json!({
+                    "reason": budget.exceeded_reason().unwrap_or("tokens"),
                     "limit": session.token_budget,
                     "spent": budget.spent(),
+                    "cost_limit_usd": session.cost_budget_usd,
+                    "cost_spent_usd": budget.cost_spent(),
+                    "time_budget_secs": session.time_budget_secs,
+                    "elapsed_secs": budget.elapsed_secs(),
                 }),
             )
             .await?;
@@ -2259,7 +2341,7 @@ async fn verify_worker(
             &verifier_name,
             Some("Verification".to_string()),
             Some(manager_spec.id.clone()),
-            &config.model,
+            &model_for(config, AgentRole::Verifier),
         )
         .await?;
     engine
@@ -2795,7 +2877,7 @@ async fn run_loop(
             return Ok(LoopOutcome::BudgetExceeded);
         }
         let mut request = ChatRequest {
-            model: config.model.clone(),
+            model: model_for(config, spec.role),
             messages: conversation.clone(),
             system: Some(system.clone()),
             max_tokens: config.max_tokens,
@@ -2874,11 +2956,8 @@ async fn run_loop(
         if cancelled {
             return Ok(LoopOutcome::Cancelled);
         }
-        let actual_usage = if usage != (0, 0) {
-            engine
-                .record_usage(&session.id, usage.0 as u64, usage.1 as u64)
-                .await?;
-            usage.0 as u64 + usage.1 as u64
+        let (input_tokens, output_tokens, estimated) = if usage != (0, 0) {
+            (usage.0 as u64, usage.1 as u64, false)
         } else {
             // Some local endpoints omit usage. Persist a conservative estimate
             // so the budget still survives across turns and daemon restarts;
@@ -2890,14 +2969,27 @@ async fn run_loop(
                     .map(|calls| estimate_text_tokens(&calls))
                     .unwrap_or(0),
             );
-            engine
-                .record_estimated_usage(&session.id, input, output)
-                .await?;
-            input.saturating_add(output)
+            (input, output, true)
         };
+        if estimated {
+            engine
+                .record_estimated_usage(&session.id, input_tokens, output_tokens)
+                .await?;
+        } else {
+            engine
+                .record_usage(&session.id, input_tokens, output_tokens)
+                .await?;
+        }
+        let (input_price, output_price) = role_price(config, spec.role);
+        let cost = usage_cost(input_tokens, output_tokens, input_price, output_price);
+        if cost > 0.0 {
+            engine.record_cost(&session.id, cost).await?;
+        }
+        let actual_usage = input_tokens.saturating_add(output_tokens);
         if token_reservation
             .take()
             .is_some_and(|reservation| reservation.settle(actual_usage))
+            || budget.add_cost(cost)
         {
             return Ok(LoopOutcome::BudgetExceeded);
         }
@@ -3227,7 +3319,7 @@ async fn run_loop(
                                         &child_name,
                                         title.clone(),
                                         Some(spec.id.clone()),
-                                        &config.model,
+                                        &model_for(config, role),
                                     )
                                     .await?;
                                 engine
@@ -3530,6 +3622,30 @@ async fn run_loop(
     }
 
     Err(anyhow!("maximum turns reached"))
+}
+
+fn model_for(config: &AgentConfig, role: AgentRole) -> String {
+    config
+        .role_models
+        .for_role(role.as_str())
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(&config.model)
+        .to_string()
+}
+
+fn role_price(config: &AgentConfig, role: AgentRole) -> (f64, f64) {
+    let price = config.role_models.for_role(role.as_str());
+    (
+        price.input_usd_per_million.unwrap_or(0.0),
+        price.output_usd_per_million.unwrap_or(0.0),
+    )
+}
+
+fn usage_cost(input: u64, output: u64, input_price: f64, output_price: f64) -> f64 {
+    (input as f64 / 1_000_000.0) * input_price + (output as f64 / 1_000_000.0) * output_price
 }
 
 fn tool_schemas(
@@ -3977,7 +4093,7 @@ async fn run_parallel_workers(
                 &child_name,
                 None,
                 Some(spec.id.clone()),
-                &config.model,
+                &model_for(config, AgentRole::Worker),
             )
             .await?;
         let info = engine
@@ -4554,7 +4670,7 @@ async fn ensure_plan_manager(
                     &department.manager_title,
                     Some(department.manager_title.clone()),
                     Some(leader_spec.id.clone()),
-                    &config.model,
+                    &model_for(config, AgentRole::Manager),
                 )
                 .await?;
             engine
@@ -4794,7 +4910,7 @@ async fn execute_team_plan(
                     &worker_name,
                     None,
                     Some(manager_spec.id.clone()),
-                    &config.model,
+                    &model_for(config, AgentRole::Worker),
                 )
                 .await?;
             engine
@@ -5368,6 +5484,7 @@ mod tests {
             provider,
             provider_name: "queue".into(),
             model: "test".into(),
+            role_models: RoleModels::default(),
             base_url: None,
             max_turns: 4,
             max_tokens: Some(1024),
@@ -5434,6 +5551,7 @@ mod tests {
                 provider: "openai-compatible".to_string(),
                 base_url: Some("http://127.0.0.1:1234/v1/".to_string()),
                 model: "local-model".to_string(),
+                role_models: None,
                 api_key: Some("secret".to_string()),
                 max_turns: None,
                 max_tokens: None,
@@ -5451,6 +5569,7 @@ mod tests {
                 provider: "openai-compatible".to_string(),
                 base_url: None,
                 model: "   ".to_string(),
+                role_models: None,
                 api_key: None,
                 max_turns: None,
                 max_tokens: None,
@@ -7460,6 +7579,25 @@ mod tests {
     }
 
     #[test]
+    fn session_budget_tracks_cost_and_time() {
+        let caps = AgentCaps {
+            managers: 5,
+            workers: 10,
+            labour: 20,
+        };
+        let cost_budget = SessionBudget::new(None, 0, caps)
+            .with_cost(Some(0.01), 0.0)
+            .with_time(Some(60));
+        assert!(!cost_budget.exhausted());
+        assert!(cost_budget.add_cost(0.02));
+        assert_eq!(cost_budget.exceeded_reason(), Some("cost"));
+
+        let time_budget = SessionBudget::new(None, 0, caps).with_time(Some(0));
+        assert_eq!(time_budget.exceeded_reason(), Some("time"));
+        assert_eq!(usage_cost(1_000_000, 500_000, 2.0, 4.0), 4.0);
+    }
+
+    #[test]
     fn token_reservations_bound_concurrent_requests() {
         let budget = SessionBudget::new(
             Some(1000),
@@ -7522,6 +7660,19 @@ mod tests {
                 ])))
             }
         }
+    }
+
+    #[tokio::test]
+    async fn role_models_override_the_base_model() {
+        let dir = TempDir::new().unwrap();
+        let (_engine, service, _project) = test_service(&dir);
+        let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+        config.role_models.worker.model = Some("worker-model".into());
+        config.role_models.worker.input_usd_per_million = Some(2.0);
+        config.role_models.worker.output_usd_per_million = Some(4.0);
+        assert_eq!(model_for(&config, AgentRole::Worker), "worker-model");
+        assert_eq!(model_for(&config, AgentRole::Manager), "test");
+        assert_eq!(role_price(&config, AgentRole::Worker), (2.0, 4.0));
     }
 
     #[tokio::test]

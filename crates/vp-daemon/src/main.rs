@@ -434,14 +434,23 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.create" => match parse_params::<CreateSessionParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .create_session(params.project_id, params.goal.clone(), params.token_budget)
+                .create_session_with_limits(
+                    params.project_id,
+                    params.goal.clone(),
+                    params.token_budget,
+                    params.cost_budget_usd,
+                    params.time_budget_secs,
+                )
                 .await
             {
                 Ok(session) => {
-                    let model = state
-                        .agent
-                        .info()
+                    let info = state.agent.info();
+                    let model = info
+                        .role_models
+                        .leader
                         .model
+                        .clone()
+                        .or(info.model)
                         .unwrap_or_else(|| "unconfigured".to_string());
                     let _ = state.engine.create_leader_agent(&session.id, &model).await;
                     if let Err(error) = state.agent.start(&session.id, &params.goal).await {

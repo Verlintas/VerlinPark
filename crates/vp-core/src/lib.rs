@@ -203,6 +203,24 @@ impl Engine {
         goal: String,
         token_budget: Option<u64>,
     ) -> Result<Session> {
+        self.create_session_with_limits(project_id, goal, token_budget, None, None)
+            .await
+    }
+
+    pub async fn create_session_with_limits(
+        &self,
+        project_id: String,
+        goal: String,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+    ) -> Result<Session> {
+        if cost_budget_usd.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+            anyhow::bail!("cost budget must be a positive finite number");
+        }
+        if time_budget_secs == Some(0) {
+            anyhow::bail!("time budget must be greater than zero");
+        }
         let store = self.store.clone();
         let project_id_for_load = project_id.clone();
         let project = tokio::task::spawn_blocking(move || store.get_project(&project_id_for_load))
@@ -247,6 +265,8 @@ impl Engine {
                     &worktree_path,
                     &branch,
                     token_budget,
+                    cost_budget_usd,
+                    time_budget_secs,
                     &base_commit,
                 )
             }
@@ -748,6 +768,19 @@ impl Engine {
     pub async fn record_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
         self.record_usage_with_source(session_id, input, output, false)
             .await
+    }
+
+    pub async fn record_cost(&self, session_id: &str, cost_usd: f64) -> Result<()> {
+        if !cost_usd.is_finite() || cost_usd <= 0.0 {
+            return Ok(());
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let event =
+            tokio::task::spawn_blocking(move || store.add_session_cost_with_event(&id, cost_usd))
+                .await??;
+        let _ = self.events.send(event);
+        Ok(())
     }
 
     pub async fn record_estimated_usage(
@@ -1906,6 +1939,71 @@ mod tests {
                         read_deny: vec!["relative/path".into()],
                     },
                 )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_budgets_round_trip() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("budgets".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session_with_limits(
+                project.id.clone(),
+                "budgeted".into(),
+                Some(1_000),
+                Some(2.5),
+                Some(120),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.token_budget, Some(1_000));
+        assert_eq!(session.cost_budget_usd, Some(2.5));
+        assert_eq!(session.time_budget_secs, Some(120));
+        assert_eq!(session.cost_spent_usd, 0.0);
+        let stored = engine
+            .list_sessions(Some(project.id.clone()))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == session.id)
+            .unwrap();
+        assert_eq!(stored.cost_budget_usd, Some(2.5));
+        assert_eq!(stored.time_budget_secs, Some(120));
+        engine.record_cost(&session.id, 1.25).await.unwrap();
+        let stored = engine
+            .list_sessions(Some(project.id.clone()))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == session.id)
+            .unwrap();
+        assert_eq!(stored.cost_spent_usd, 1.25);
+        assert!(
+            engine
+                .create_session_with_limits(
+                    project.id.clone(),
+                    "bad cost".into(),
+                    None,
+                    Some(0.0),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .create_session_with_limits(project.id, "bad time".into(), None, None, Some(0),)
                 .await
                 .is_err()
         );

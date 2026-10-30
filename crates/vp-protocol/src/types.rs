@@ -55,6 +55,42 @@ fn default_auto_resolve_attempts() -> u32 {
     1
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RoleModelConfig {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub input_usd_per_million: Option<f64>,
+    #[serde(default)]
+    pub output_usd_per_million: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RoleModels {
+    #[serde(default)]
+    pub leader: RoleModelConfig,
+    #[serde(default)]
+    pub manager: RoleModelConfig,
+    #[serde(default)]
+    pub worker: RoleModelConfig,
+    #[serde(default)]
+    pub verifier: RoleModelConfig,
+    #[serde(default)]
+    pub labour: RoleModelConfig,
+}
+
+impl RoleModels {
+    pub fn for_role(&self, role: &str) -> &RoleModelConfig {
+        match role {
+            "manager" => &self.manager,
+            "worker" => &self.worker,
+            "verifier" => &self.verifier,
+            "labour" => &self.labour,
+            _ => &self.leader,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -67,6 +103,12 @@ pub struct Session {
     pub branch: Option<String>,
     #[serde(default)]
     pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    #[serde(default)]
+    pub cost_spent_usd: f64,
     #[serde(default)]
     pub base_commit: Option<String>,
     #[serde(default)]
@@ -157,6 +199,10 @@ pub struct CreateSessionParams {
     pub goal: String,
     #[serde(default)]
     pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -236,6 +282,8 @@ pub struct AgentInfo {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub role_models: RoleModels,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,6 +325,8 @@ pub struct ConfigureAgentParams {
     #[serde(default)]
     pub base_url: Option<String>,
     pub model: String,
+    #[serde(default)]
+    pub role_models: Option<RoleModels>,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]

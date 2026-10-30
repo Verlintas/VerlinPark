@@ -5,6 +5,8 @@ struct NewSessionSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var goal = ""
     @State private var budget = 200_000
+    @State private var costBudget = ""
+    @State private var timeBudget = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -40,6 +42,31 @@ struct NewSessionSheet: View {
                 .foregroundStyle(.tertiary)
             }
 
+            HStack(alignment: .top, spacing: 18) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("USD budget")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    TextField("optional", text: $costBudget)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 130)
+                    Text("Requires per-role prices in Providers.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Wall-clock budget")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    TextField("seconds", text: $timeBudget)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 130)
+                    Text("Checked between turns/tools.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
             HStack {
                 if let project = model.selectedProject {
                     Label(project.name, systemImage: "folder")
@@ -54,7 +81,12 @@ struct NewSessionSheet: View {
 
                 Button("Create") {
                     Task {
-                        await model.createSession(goal: goal, tokenBudget: budget)
+                        await model.createSession(
+                            goal: goal,
+                            tokenBudget: budget,
+                            costBudgetUSD: Double(costBudget),
+                            timeBudgetSecs: Int(timeBudget)
+                        )
                         dismiss()
                     }
                 }

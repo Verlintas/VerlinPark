@@ -1,6 +1,6 @@
 # VerlinPark 决策记录
 
-> 最后更新：2026-10-30
+> 最后更新：2026-10-31
 > 格式：Architecture Decision Record（ADR）  
 > 规则：已接受的决策不删除；如果改变，新增一条“Supersedes”记录。
 
@@ -49,6 +49,7 @@
 | [0037](adr/0037-agent-assisted-conflict-resolution.md) | Merge queue agent-assisted conflict resolution | Accepted | 集成/冲突/恢复 |
 | [0038](adr/0038-policy-gated-auto-resolve.md) | 项目级 opt-in 自动冲突解决 + caps | Accepted | 自动化/成本/审计 |
 | [0039](adr/0039-global-session-cap-scope-locks.md) | 全局 session admission + 跨 session 写作用域锁 | Accepted | 调度/并发/隔离 |
+| [0040](adr/0040-per-role-models-usd-time-budgets.md) | 分角色模型 + USD/时间预算 | Accepted | 模型/成本/控制 |
 
 ---
 

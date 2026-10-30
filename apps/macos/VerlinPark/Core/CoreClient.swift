@@ -169,7 +169,9 @@ actor CoreClient {
     func createSession(
         projectID: String,
         goal: String,
-        tokenBudget: Int?
+        tokenBudget: Int?,
+        costBudgetUSD: Double? = nil,
+        timeBudgetSecs: Int? = nil
     ) async throws -> Session {
         var params: [String: JSONValue] = [
             "project_id": .string(projectID),
@@ -177,6 +179,12 @@ actor CoreClient {
         ]
         if let tokenBudget, tokenBudget > 0 {
             params["token_budget"] = .number(Double(tokenBudget))
+        }
+        if let costBudgetUSD, costBudgetUSD > 0 {
+            params["cost_budget_usd"] = .number(costBudgetUSD)
+        }
+        if let timeBudgetSecs, timeBudgetSecs > 0 {
+            params["time_budget_secs"] = .number(Double(timeBudgetSecs))
         }
         return try await request(method: "session.create", params: params)
             .decode(Session.self)
@@ -326,6 +334,7 @@ actor CoreClient {
         kind: String,
         baseURL: String,
         model: String,
+        roleModels: RoleModels? = nil,
         apiKey: String,
         maxManagers: Int,
         maxWorkers: Int,
@@ -339,11 +348,37 @@ actor CoreClient {
             "max_workers": .number(Double(maxWorkers)),
             "max_labour": .number(Double(maxLabour)),
         ]
+        if let roleModels {
+            params["role_models"] = Self.roleModelsValue(roleModels)
+        }
         if !apiKey.isEmpty {
             params["api_key"] = .string(apiKey)
         }
         return try await request(method: "agent.configure", params: params)
             .decode(AgentInfo.self)
+    }
+
+    private static func roleModelsValue(_ models: RoleModels) -> JSONValue {
+        func value(_ role: RoleModelConfig) -> JSONValue {
+            var object: [String: JSONValue] = [:]
+            if let model = role.model, !model.isEmpty {
+                object["model"] = .string(model)
+            }
+            if let price = role.inputUsdPerMillion, price > 0 {
+                object["input_usd_per_million"] = .number(price)
+            }
+            if let price = role.outputUsdPerMillion, price > 0 {
+                object["output_usd_per_million"] = .number(price)
+            }
+            return .object(object)
+        }
+        return .object([
+            "leader": value(models.leader),
+            "manager": value(models.manager),
+            "worker": value(models.worker),
+            "verifier": value(models.verifier),
+            "labour": value(models.labour),
+        ])
     }
 
     private func request(

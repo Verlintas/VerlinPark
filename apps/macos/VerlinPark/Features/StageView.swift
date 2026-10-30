@@ -262,14 +262,23 @@ struct SessionChatView: View {
                     ?? "The agent stopped."
                 result.append(.error(id: event.id, text: message))
             case "agent.budget_exceeded":
-                let limit = event.payload.objectValue?["limit"]?.intValue ?? 0
-                let spent = event.payload.objectValue?["spent"]?.intValue ?? 0
-                result.append(
-                    .notice(
-                        id: event.id,
-                        text: "Token budget exhausted (\(spent) / \(limit))."
-                    )
-                )
+                let reason = event.payload.objectValue?["reason"]?.stringValue ?? "tokens"
+                let text: String
+                switch reason {
+                case "cost":
+                    let limit = event.payload.objectValue?["cost_limit_usd"]?.doubleValue ?? 0
+                    let spent = event.payload.objectValue?["cost_spent_usd"]?.doubleValue ?? 0
+                    text = "USD budget exhausted ($\(String(format: "%.4f", spent)) / $"
+                        + String(format: "%.2f", limit) + ")."
+                case "time":
+                    let limit = event.payload.objectValue?["time_budget_secs"]?.intValue ?? 0
+                    text = "Wall-clock budget exhausted (\(limit)s)."
+                default:
+                    let limit = event.payload.objectValue?["limit"]?.intValue ?? 0
+                    let spent = event.payload.objectValue?["spent"]?.intValue ?? 0
+                    text = "Token budget exhausted (\(spent) / \(limit))."
+                }
+                result.append(.notice(id: event.id, text: text))
             case "agent.cancelled":
                 result.append(.notice(id: event.id, text: "Run cancelled."))
             default:
@@ -427,10 +436,24 @@ struct SessionChatView: View {
 
     private var tokenUsageLabel: String {
         let used = tokenLabel(session.tokensUsed)
-        guard let budget = session.tokenBudget, budget > 0 else {
-            return "\(used) tokens"
+        var parts: [String] = []
+        if let budget = session.tokenBudget, budget > 0 {
+            parts.append("\(used) / \(tokenLabel(budget)) tokens")
+        } else {
+            parts.append("\(used) tokens")
         }
-        return "\(used) / \(tokenLabel(budget)) tokens"
+        if session.costSpentUsd > 0 || session.costBudgetUsd != nil {
+            let spent = String(format: "$%.4f", session.costSpentUsd)
+            if let budget = session.costBudgetUsd {
+                parts.append("\(spent) / \(String(format: "$%.2f", budget))")
+            } else {
+                parts.append(spent)
+            }
+        }
+        if let seconds = session.timeBudgetSecs, seconds > 0 {
+            parts.append("≤ \(seconds)s")
+        }
+        return parts.joined(separator: " · ")
     }
 
     private func tokenLabel(_ value: Int) -> String {

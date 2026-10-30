@@ -74,6 +74,9 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
     let worktree: String?
     let branch: String?
     let tokenBudget: Int?
+    let costBudgetUsd: Double?
+    let timeBudgetSecs: Int?
+    let costSpentUsd: Double
     let baseCommit: String?
     let tokensIn: Int
     let tokensOut: Int
@@ -87,6 +90,9 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         case worktree
         case branch
         case tokenBudget = "token_budget"
+        case costBudgetUsd = "cost_budget_usd"
+        case timeBudgetSecs = "time_budget_secs"
+        case costSpentUsd = "cost_spent_usd"
         case baseCommit = "base_commit"
         case tokensIn = "tokens_in"
         case tokensOut = "tokens_out"
@@ -219,17 +225,47 @@ struct ApprovalListResult: Codable, Sendable {
     let approvals: [Approval]
 }
 
+struct RoleModelConfig: Codable, Hashable, Sendable {
+    var model: String? = nil
+    var inputUsdPerMillion: Double? = nil
+    var outputUsdPerMillion: Double? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case model
+        case inputUsdPerMillion = "input_usd_per_million"
+        case outputUsdPerMillion = "output_usd_per_million"
+    }
+}
+
+struct RoleModels: Codable, Hashable, Sendable {
+    var leader = RoleModelConfig()
+    var manager = RoleModelConfig()
+    var worker = RoleModelConfig()
+    var verifier = RoleModelConfig()
+    var labour = RoleModelConfig()
+
+    enum CodingKeys: String, CodingKey {
+        case leader
+        case manager
+        case worker
+        case verifier
+        case labour
+    }
+}
+
 struct AgentInfo: Codable, Sendable {
     let configured: Bool
     let provider: String?
     let model: String?
     let baseUrl: String?
+    let roleModels: RoleModels
 
     enum CodingKeys: String, CodingKey {
         case configured
         case provider
         case model
         case baseUrl = "base_url"
+        case roleModels = "role_models"
     }
 }
 

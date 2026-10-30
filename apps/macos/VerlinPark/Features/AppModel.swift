@@ -58,9 +58,19 @@ final class AppModel {
         UserDefaults.standard.string(forKey: "provider.baseURL")
             ?? "https://api.openai.com/v1"
     var providerModel = UserDefaults.standard.string(forKey: "provider.model") ?? ""
+    var roleModels = AppModel.loadRoleModels()
     var providerAPIKey = Keychain.read(account: "provider.apiKey") ?? ""
     var providerStatus: String?
     var providerBusy = false
+
+    private static func loadRoleModels() -> RoleModels {
+        guard let data = UserDefaults.standard.data(forKey: "provider.roleModels"),
+              let models = try? JSONDecoder().decode(RoleModels.self, from: data)
+        else {
+            return RoleModels()
+        }
+        return models
+    }
 
     private let core = CoreClient()
     private let daemon = DaemonController()
@@ -85,6 +95,9 @@ final class AppModel {
             connection = .connected
             await configureStoredProvider()
             agentInfo = try? await core.agentInfo()
+            if let info = agentInfo {
+                roleModels = info.roleModels
+            }
             consumeEvents()
             await refresh()
         } catch {
@@ -219,7 +232,12 @@ final class AppModel {
             ?? 200_000
     }
 
-    func createSession(goal: String, tokenBudget: Int? = nil) async {
+    func createSession(
+        goal: String,
+        tokenBudget: Int? = nil,
+        costBudgetUSD: Double? = nil,
+        timeBudgetSecs: Int? = nil
+    ) async {
         guard let projectID = selectedProjectID else {
             lastError = "Choose a project first."
             return
@@ -235,7 +253,9 @@ final class AppModel {
             let session = try await core.createSession(
                 projectID: projectID,
                 goal: trimmed,
-                tokenBudget: budget
+                tokenBudget: budget,
+                costBudgetUSD: costBudgetUSD,
+                timeBudgetSecs: timeBudgetSecs
             )
             sessions = try await core.listSessions(projectID: projectID)
             selectedSessionID = session.id
@@ -455,15 +475,20 @@ final class AppModel {
                 kind: providerKind,
                 baseURL: baseURL,
                 model: model,
+                roleModels: roleModels,
                 apiKey: providerAPIKey,
                 maxManagers: caps.managers,
                 maxWorkers: caps.workers,
                 maxLabour: caps.labour
             )
             agentInfo = info
+            roleModels = info.roleModels
             UserDefaults.standard.set(providerKind, forKey: "provider.kind")
             UserDefaults.standard.set(baseURL, forKey: "provider.baseURL")
             UserDefaults.standard.set(model, forKey: "provider.model")
+            if let data = try? JSONEncoder().encode(roleModels) {
+                UserDefaults.standard.set(data, forKey: "provider.roleModels")
+            }
             if providerAPIKey.isEmpty {
                 Keychain.delete(account: "provider.apiKey")
             } else {
@@ -485,6 +510,7 @@ final class AppModel {
                 kind: providerKind,
                 baseURL: baseURL,
                 model: model,
+                roleModels: roleModels,
                 apiKey: providerAPIKey,
                 maxManagers: caps.managers,
                 maxWorkers: caps.workers,
@@ -771,9 +797,35 @@ final class AppModel {
                 worktree: old.worktree,
                 branch: old.branch,
                 tokenBudget: old.tokenBudget,
+                costBudgetUsd: old.costBudgetUsd,
+                timeBudgetSecs: old.timeBudgetSecs,
+                costSpentUsd: old.costSpentUsd,
                 baseCommit: old.baseCommit,
                 tokensIn: old.tokensIn + input,
                 tokensOut: old.tokensOut + output,
+                createdAt: old.createdAt
+            )
+        }
+
+        if event.type == "agent.cost",
+           let total = event.payload.objectValue?["total_usd"]?.doubleValue,
+           let index = sessions.firstIndex(where: { $0.id == event.sessionId })
+        {
+            let old = sessions[index]
+            sessions[index] = Session(
+                id: old.id,
+                projectId: old.projectId,
+                goal: old.goal,
+                status: old.status,
+                worktree: old.worktree,
+                branch: old.branch,
+                tokenBudget: old.tokenBudget,
+                costBudgetUsd: old.costBudgetUsd,
+                timeBudgetSecs: old.timeBudgetSecs,
+                costSpentUsd: total,
+                baseCommit: old.baseCommit,
+                tokensIn: old.tokensIn,
+                tokensOut: old.tokensOut,
                 createdAt: old.createdAt
             )
         }
@@ -791,6 +843,9 @@ final class AppModel {
                 worktree: old.worktree,
                 branch: old.branch,
                 tokenBudget: old.tokenBudget,
+                costBudgetUsd: old.costBudgetUsd,
+                timeBudgetSecs: old.timeBudgetSecs,
+                costSpentUsd: old.costSpentUsd,
                 baseCommit: old.baseCommit,
                 tokensIn: old.tokensIn,
                 tokensOut: old.tokensOut,

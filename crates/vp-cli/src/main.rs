@@ -72,6 +72,10 @@ enum Command {
         goal: String,
         #[arg(long)]
         token_budget: Option<u64>,
+        #[arg(long)]
+        cost_budget_usd: Option<f64>,
+        #[arg(long)]
+        time_budget_secs: Option<u64>,
     },
     /// List events for a session.
     Events {
@@ -241,6 +245,8 @@ async fn main() -> Result<()> {
             project,
             goal,
             token_budget,
+            cost_budget_usd,
+            time_budget_secs,
         } => {
             rpc(
                 &discovery,
@@ -249,6 +255,8 @@ async fn main() -> Result<()> {
                     "project_id": project,
                     "goal": goal,
                     "token_budget": token_budget,
+                    "cost_budget_usd": cost_budget_usd,
+                    "time_budget_secs": time_budget_secs,
                 }),
             )
             .await?
