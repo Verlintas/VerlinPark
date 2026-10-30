@@ -7931,7 +7931,30 @@ mod tests {
             .await
             .unwrap();
         service.start(&session.id, "estimate").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let sessions = engine
+                .list_sessions(Some(session.project_id.clone()))
+                .await
+                .unwrap();
+            if sessions[0].status == "idle" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "estimated usage run did not finish: {}",
+                sessions[0].status
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let ledger = engine.usage_ledger(&session.id).await.unwrap();
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].role, "leader");
+        assert_eq!(ledger.entries[0].model, "test");
+        assert!(ledger.entries[0].estimated);
+        assert!(ledger.entries[0].input_tokens > 0);
+        assert!(ledger.entries[0].output_tokens > 0);
 
         let session = engine
             .list_sessions(Some(session.project_id))
