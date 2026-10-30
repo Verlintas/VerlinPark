@@ -39,6 +39,7 @@
 | [0027](adr/0027-manager-roundtable.md) | Manager 圆桌商讨（1–3 轮、只读） | Accepted | 组织协作/计划质量 |
 | [0028](adr/0028-merge-queue-integrator.md) | 持久 merge queue + 确定性 Integrator gate | Accepted | 集成/质量/回滚 |
 | [0029](adr/0029-local-landing.md) | 显式本地 landing；PR 后置 | Accepted | 交付/安全/UX |
+| [0030](adr/0030-push-pr-flow.md) | 显式 push + GitHub PR（gh） | Accepted | 交付/集成/安全 |
 
 ---
 

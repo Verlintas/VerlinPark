@@ -26,10 +26,10 @@ use vp_protocol::types::{
     CancelSessionParams, CancelSessionResult, CommitSessionParams, ConfigureAgentParams,
     CreateSessionParams, DiscardSessionParams, EventListResult, LandSessionParams,
     ListApprovalsParams, ListEventsParams, ListSessionsParams, MergeQueueListParams,
-    MergeQueueListResult, PingResult, ProjectListResult, PromptParams, PromptResult,
-    ResolveApprovalParams, ResolveApprovalResult, RetryMergeParams, RetryMergeResult, ServerInfo,
-    SessionDiffParams, SessionListResult, SessionTodosParams, SessionTodosResult, SubscribeParams,
-    TeamPlanParams, TeamPlanResult,
+    MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectListResult, PromptParams,
+    PromptResult, ResolveApprovalParams, ResolveApprovalResult, RetryMergeParams, RetryMergeResult,
+    ServerInfo, SessionDiffParams, SessionListResult, SessionTodosParams, SessionTodosResult,
+    SubscribeParams, TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -479,6 +479,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "session.land" => match parse_params::<LandSessionParams>(request.params) {
             Ok(params) => match state.engine.land_session(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.pr" => match parse_params::<OpenPullRequestParams>(request.params) {
+            Ok(params) => match state.engine.open_pull_request(&params.session_id).await {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },

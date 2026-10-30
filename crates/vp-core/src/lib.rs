@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    AgentRecord, Approval, Event, MergeQueueEntry, Project, Session, SessionCommit, SessionDiff,
-    SessionLandResult, StoredMessage, TeamPlan, TodoItem,
+    AgentRecord, Approval, Event, MergeQueueEntry, Project, PullRequestResult, Session,
+    SessionCommit, SessionDiff, SessionLandResult, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
 
@@ -460,6 +460,179 @@ impl Engine {
             target_branch,
             commit,
             detail: "landed into the project default branch".to_string(),
+        })
+    }
+
+    pub async fn open_pull_request(&self, session_id: &str) -> Result<PullRequestResult> {
+        let gh = std::env::var("VERLINPARK_GH_BIN").unwrap_or_else(|_| "gh".to_string());
+        self.open_pull_request_with_gh(session_id, &gh).await
+    }
+
+    async fn open_pull_request_with_gh(
+        &self,
+        session_id: &str,
+        gh_bin: &str,
+    ) -> Result<PullRequestResult> {
+        let session = self.ensure_session_worktree(session_id).await?;
+        if session.status == "running" {
+            anyhow::bail!("cannot open a PR while the session is running");
+        }
+        let branch = session
+            .branch
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session has no branch"))?;
+        let session_worktree = PathBuf::from(
+            session
+                .worktree
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?,
+        );
+        let status = tokio::task::spawn_blocking(move || {
+            git_output(&session_worktree, &["status", "--porcelain"])
+        })
+        .await??;
+        if !status.is_empty() {
+            anyhow::bail!("session worktree has uncommitted changes; commit or discard them first");
+        }
+
+        let store = self.store.clone();
+        let project_id = session.project_id.clone();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let project_root = PathBuf::from(&project.root);
+        let base_branch = project.default_branch.clone();
+        let branch_for_push = branch.clone();
+        let base_for_check = base_branch.clone();
+        let gh_bin = gh_bin.to_string();
+        let title = session
+            .goal
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("VerlinPark change")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        let body = format!(
+            "Opened from VerlinPark session {}.\n\nGoal: {}",
+            session.id, session.goal
+        );
+        let title_for_gh = title.clone();
+        let body_for_gh = body.clone();
+        let gh_bin_for_pr = gh_bin.clone();
+        let git_lock = self.git_lock.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            git_output(&project_root, &["remote", "get-url", "origin"])
+                .context("a git origin remote is required to open a PR")?;
+            let ahead = git_output(
+                &project_root,
+                &[
+                    "rev-list",
+                    "--count",
+                    &format!("{base_for_check}..{branch_for_push}"),
+                ],
+            )?;
+            if ahead.trim() == "0" {
+                anyhow::bail!("session branch has no commits ahead of {base_for_check}");
+            }
+            let auth = std::process::Command::new(&gh_bin)
+                .args(["auth", "status"])
+                .current_dir(&project_root)
+                .output()
+                .context("running gh auth status")?;
+            if !auth.status.success() {
+                anyhow::bail!(
+                    "gh is not authenticated: {}",
+                    String::from_utf8_lossy(&auth.stderr).trim()
+                );
+            }
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project_root)
+                .args(["push", "-u", "origin", &branch_for_push])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .context("running git push")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "git push failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(())
+        })
+        .await??;
+
+        self.append_event(
+            &session.id,
+            "session.pushed",
+            serde_json::json!({
+                "branch": branch,
+                "base_branch": base_branch,
+            }),
+        )
+        .await?;
+
+        let project_root_for_gh = PathBuf::from(&project.root);
+        let branch_for_pr = branch.clone();
+        let base_for_pr = base_branch.clone();
+        let url = tokio::task::spawn_blocking(move || -> Result<String> {
+            let output = std::process::Command::new(&gh_bin_for_pr)
+                .args([
+                    "pr",
+                    "create",
+                    "--base",
+                    &base_for_pr,
+                    "--head",
+                    &branch_for_pr,
+                    "--title",
+                    &title_for_gh,
+                    "--body",
+                    &body_for_gh,
+                ])
+                .current_dir(&project_root_for_gh)
+                .output()
+                .context("running gh pr create")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "branch pushed, but gh pr create failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let url = stdout
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("http"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("gh pr create succeeded but did not return a URL: {stdout}")
+                })?
+                .to_string();
+            Ok(url)
+        })
+        .await??;
+
+        self.append_event(
+            &session.id,
+            "session.pr_opened",
+            serde_json::json!({
+                "branch": branch,
+                "base_branch": base_branch,
+                "url": url,
+            }),
+        )
+        .await?;
+        Ok(PullRequestResult {
+            session_id: session.id,
+            branch,
+            base_branch,
+            pushed: true,
+            url: Some(url.clone()),
+            detail: format!("branch pushed and PR opened at {url}"),
         })
     }
 
@@ -1080,6 +1253,76 @@ mod tests {
         assert_eq!(sessions[0].status, "landed");
         let events = engine.list_events(session.id, 0, 100).await.unwrap();
         assert!(events.iter().any(|event| event.kind == "session.landed"));
+    }
+
+    #[tokio::test]
+    async fn pushes_a_branch_and_opens_a_pull_request() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let remote = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let status = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(remote.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["remote", "add", "origin", remote.path().to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("demo".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "PR me".into(), None)
+            .await
+            .unwrap();
+        let worktree = session.worktree.clone().unwrap();
+        std::fs::write(Path::new(&worktree).join("README.md"), "pr\n").unwrap();
+        engine
+            .commit_session(&session.id, "session change")
+            .await
+            .unwrap();
+
+        let gh = data.path().join("fake-gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then exit 0; fi\nif [ \"$1\" = \"pr\" ]; then echo https://example.test/pr/1; exit 0; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&gh, permissions).unwrap();
+
+        let result = engine
+            .open_pull_request_with_gh(&session.id, gh.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(result.pushed);
+        assert_eq!(result.url.as_deref(), Some("https://example.test/pr/1"));
+        let branch = session.branch.clone().unwrap();
+        let remote_ref = Command::new("git")
+            .arg("--git-dir")
+            .arg(remote.path())
+            .args(["rev-parse", &format!("refs/heads/{branch}")])
+            .output()
+            .unwrap();
+        assert!(remote_ref.status.success());
+        let events = engine.list_events(session.id, 0, 100).await.unwrap();
+        assert!(events.iter().any(|event| event.kind == "session.pushed"));
+        assert!(events.iter().any(|event| event.kind == "session.pr_opened"));
     }
 
     #[tokio::test]

@@ -3,6 +3,9 @@
 - **Status:** Accepted
 - **Date:** 2026-10-30
 
+> **Follow-up:** ADR-0030 adds an explicit `session.pr` push/PR flow. This ADR
+> remains the local landing path; it is not replaced.
+
 ## Context
 
 The session branch was reviewable but had no final landing action. The UI literally

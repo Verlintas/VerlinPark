@@ -70,6 +70,8 @@ enum Command {
     Retry { entry: String },
     /// Land the session branch into the project default branch.
     Land { session: String },
+    /// Push the session branch and open a GitHub pull request with gh.
+    Pr { session: String },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
     /// Commit the session worktree.
@@ -187,6 +189,9 @@ async fn main() -> Result<()> {
         }
         Command::Land { session } => {
             rpc(&discovery, "session.land", json!({"session_id": session})).await?
+        }
+        Command::Pr { session } => {
+            rpc(&discovery, "session.pr", json!({"session_id": session})).await?
         }
         Command::Discard { session } => {
             rpc(
@@ -343,6 +348,14 @@ fn print_human(value: &Value) {
         if let Some(detail) = entry["detail"].as_str() {
             println!("{detail}");
         }
+        return;
+    }
+    if let Some(url) = value.get("url").and_then(Value::as_str) {
+        println!(
+            "PR opened: {url}  ({} → {})",
+            value["branch"].as_str().unwrap_or("?"),
+            value["base_branch"].as_str().unwrap_or("?")
+        );
         return;
     }
     if let Some(target) = value.get("target_branch").and_then(Value::as_str) {

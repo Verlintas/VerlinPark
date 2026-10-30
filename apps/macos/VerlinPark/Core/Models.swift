@@ -334,6 +334,24 @@ struct MergeQueueRetryResult: Codable, Sendable {
     let entry: MergeQueueEntry
 }
 
+struct PullRequestResult: Codable, Sendable {
+    let sessionId: String
+    let branch: String
+    let baseBranch: String
+    let pushed: Bool
+    let url: String?
+    let detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case branch
+        case baseBranch = "base_branch"
+        case pushed
+        case url
+        case detail
+    }
+}
+
 struct SessionLandResult: Codable, Sendable {
     let sessionId: String
     let branch: String

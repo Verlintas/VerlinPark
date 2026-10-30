@@ -3,7 +3,7 @@
 > 审计日期：2026-10-29  
 > 审计基线：`cbef2e6`（`main`，Manager roundtable 已合入）  
 > 范围：Rust runtime、SwiftUI app、协议/存储、Git 集成、权限与预算、文档与仓库卫生  
-> 结论先行：**M2 的功能闭环已经成立，但仍是一个强原型，不是可靠的多 Agent 平台。** P0 约束、merge queue、确定性 Integrator、queue retry 和本地 landing 已经补上；下一步是 PR flow、event sourcing 与 shell sandbox。
+> 结论先行：**M2 的功能闭环已经成立，但仍是一个强原型，不是可靠的多 Agent 平台。** P0 约束、merge queue、确定性 Integrator、queue retry、本地 landing 和 GitHub PR flow 已经补上；下一步是 event sourcing、shell sandbox 与非 GitHub PR adapter。
 
 ## 0. 2026-10-30 跟进
 
@@ -13,10 +13,10 @@
 - **P0-2 已修复**：provider 请求前做 token reservation，按保守输入估算 + 动态 output budget 预留；provider 返回 usage 后结算，缺少 usage 的本地端点会以 `estimated: true` 的估算用量持久化。并发批次不再共用同一个 pre-flight 窗口。
 - **P1-4 已修复**：`fetch_url` 在连接前解析并固定已校验的 IP，阻止解析到 loopback/private/link-local/文档/benchmark 等地址；补充了 IPv4-mapped IPv6 与特殊段检查。
 - **P1-3 部分缓解**：Verifier shell 的审批卡会明确警告 “not sandboxed”；runtime 沙箱仍未实现。
-- **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 可用。仍缺自动冲突解决、LLM Integrator、PR flow。
-- **仍未解决**：shell 沙箱、完整 event sourcing、PR flow、worktree 清理、P2 batch abort 状态一致性。
+- **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 和 `gh` PR flow 可用。仍缺自动冲突解决、LLM Integrator、非 GitHub PR adapter。
+- **仍未解决**：shell 沙箱、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree 清理、P2 batch abort 状态一致性。
 
-当前测试：Rust 57（core 41 / store 11 / providers 5），Swift 9。CI 以最新提交为准。
+当前测试：Rust 58（core 42 / store 11 / providers 5），Swift 9。CI 以最新提交为准。
 
 ---
 
@@ -41,12 +41,12 @@
 
 | 维度 | 评分 | 说明 |
 |---|---|---|
-| 功能完整度（M3 第二切片） | B | 主链路真实可跑；merge queue、确定性 Integrator、rebase+retry、本地 landing 已有；缺 PR flow、artifact、mailbox |
+| 功能完整度（M3 第三切片） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、本地 landing、`gh` PR 已有；缺 artifact、mailbox、自动冲突解决 |
 | 正确性/一致性 | B− | P0 的 plan scope/caps 与预算 reservation 已在 10-30 修复；事件溯源仍只做了一半 |
 | 隔离与安全 | C+ | 路径 jail、loopback token、fetch_url DNS 固定做得不错；shell 仍无沙箱 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
-| 测试 | B− | 57 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 58 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing/PR 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -177,11 +177,11 @@
 
 - 一个 task 的合并失败会阻塞其 dependents，但没有重新排队/重新验证机制；用户只能手动处理。
 - Verifier 审查的是 task branch，不是“合并后的集成结果”；跨 task 的语义冲突不会被发现。
-- 修复后：持久 queue、确定性 merge、diff check、可选 integration command、失败回滚、冲突记录、rebase+retry、本地 landing。仍缺自动冲突解决、LLM Integrator、PR flow。
+- 修复后：持久 queue、确定性 merge、diff check、可选 integration command、失败回滚、冲突记录、rebase+retry、本地 landing、显式 push/PR。仍缺自动冲突解决、LLM Integrator、非 GitHub PR。
 
 **后续**
 
-- queue retry 已支持人工 rebase+retry；下一步是自动冲突建议和 PR flow。
+- queue retry 与 GitHub PR flow 已支持；下一步是自动冲突建议与非 GitHub PR adapter。
 - 可选 LLM Integrator 只做语义 review/冲突建议，不替代确定性 merge 和 rollback。
 - 增加跨 entry 的 blocking/backpressure 和 post-merge 集成分支，避免后续 entry 基于旧 base。
 
@@ -240,7 +240,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 - plan 自动派发的 scope overlap / cap 回归
 - 并发预算超调上界
 - `fetch_url` 的 DNS/私网/IPv6 SSRF
-- PR flow / 自动冲突解决 / 真正的 post-merge 集成分支
+- 非 GitHub PR adapter / 自动冲突解决 / 真正的 post-merge 集成分支
 - WebSocket 断线重连
 - 真实 Anthropic 工具调用（目前只有 mock/SSE 解析测试）
 - UI 的 event → plan status / roundtable 渲染
@@ -266,7 +266,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 **“组织层很热闹，交付链没有闭合。”**
 
-- 用户可以看见 Managers、Workers、Plan board、圆桌、merge queue，并可本地 landing；仍缺 PR flow 与自动冲突解决。
+- 用户可以看见 Managers、Workers、Plan board、圆桌、merge queue，并可本地 landing 或 push/PR；仍缺自动冲突解决与非 GitHub PR。
 - 并行 task 的 scope/caps 与预算已经收紧；剩下的是 Verifier shell 不是沙箱、事件链不是完整 replay、冲突需要人工处理。
 - 这些会让“更少限制、更高效率”的主张反噬：限制少了，但失败模式更多。
 
@@ -280,7 +280,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 5. 清理过期 UI 文案（本次已做一部分）。
 
 **M3 — Merge Queue + Integrator + Landing（已跑通第一版）**
-1. queue 状态机、冲突 rebase/retry、集成检查、本地 landing 已实现。
+1. queue 状态机、冲突 rebase/retry、集成检查、本地 landing、显式 push/PR 已实现。
 2. 确定性 Integrator 事件 + Queue UI 已实现；可选 LLM Integrator 仍待做。
 3. 下一步：一条真实 fixture 的端到端 demo：Leader plan → 多 Worker → Verifier → queue → 集成测试 → 人类 review → land/PR。
 4. 没有这个 demo，不建议继续加 auto-expansion、per-role models、mailbox。
@@ -293,7 +293,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 1. typed mailbox + artifact store。
 2. per-role model / USD/time budget。
 3. auto-expansion / capacity controller。
-4. MCP/ACP、终端、hunk review、PR flow。
+4. MCP/ACP、终端、hunk review、非 GitHub PR adapter。
 
 ---
 
@@ -314,12 +314,18 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 - 新增 plan scope/cap、token reservation、IP 分类的回归测试。
 - merge queue、确定性 Integrator、失败回滚和冲突记录。
 
+第三轮（2026-10-30）做交付闭环：
+
+- queue rebase/retry（人工触发）。
+- 本地 landing（clean + default branch 检查，`--no-ff`）。
+- 显式 push + `gh pr create`（preflight、no fake success）。
+
 ---
 
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 57 passed after the 10-30 retry/landing slice
+cargo test --workspace     # 58 passed after the 10-30 retry/landing/PR slices
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```

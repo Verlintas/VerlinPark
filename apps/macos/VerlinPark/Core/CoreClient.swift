@@ -196,6 +196,12 @@ actor CoreClient {
             .decode(SessionLandResult.self)
     }
 
+    func openPullRequest(sessionID: String) async throws -> PullRequestResult {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.pr", params: params)
+            .decode(PullRequestResult.self)
+    }
+
     func sessionTodos(sessionID: String) async throws -> [TodoItem] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.todos", params: params)

@@ -703,6 +703,7 @@ struct PreviewPanelView: View {
     @State private var showingCommit = false
     @State private var showingDiscard = false
     @State private var showingLand = false
+    @State private var showingPR = false
     @State private var commitMessage = ""
 
     var body: some View {
@@ -757,6 +758,19 @@ struct PreviewPanelView: View {
         } message: {
             Text(
                 "This resets tracked files and removes untracked files in the session worktree. Commits are kept."
+            )
+        }
+        .confirmationDialog(
+            "Open a pull request?",
+            isPresented: $showingPR
+        ) {
+            Button("Push branch & open PR") {
+                Task { await model.openPullRequest() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Pushes the session branch to origin and runs gh pr create. gh must be installed and authenticated; no merge is performed locally."
             )
         }
         .confirmationDialog(
@@ -815,6 +829,12 @@ struct PreviewPanelView: View {
                     .controlSize(.small)
                     .disabled(model.commitBusy)
                 } else if mode == .changes, canLand(session) {
+                    Button("Open PR") {
+                        showingPR = true
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.pullRequestBusy)
                     Button("Land") {
                         showingLand = true
                     }
@@ -911,6 +931,16 @@ struct PreviewPanelView: View {
                             systemImage: "arrow.up.to.line"
                         )
                         .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.green)
+                    }
+                    if let pr = model.lastPullRequest,
+                       let urlString = pr.url,
+                       let url = URL(string: urlString)
+                    {
+                        Link(destination: url) {
+                            Label("Pull request opened", systemImage: "arrow.up.right.square")
+                                .font(.system(size: 9, design: .monospaced))
+                        }
                         .foregroundStyle(.green)
                     }
 

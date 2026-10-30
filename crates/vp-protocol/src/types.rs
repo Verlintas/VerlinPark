@@ -327,6 +327,22 @@ pub struct SessionLandResult {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenPullRequestParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestResult {
+    pub session_id: String,
+    pub branch: String,
+    pub base_branch: String,
+    pub pushed: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub id: String,

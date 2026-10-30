@@ -39,6 +39,8 @@ final class AppModel {
     var commitBusy = false
     var landingBusy = false
     var lastLanding: SessionLandResult?
+    var pullRequestBusy = false
+    var lastPullRequest: PullRequestResult?
     var providerKind =
         UserDefaults.standard.string(forKey: "provider.kind") ?? "openai-compatible"
     var providerBaseURL =
@@ -110,6 +112,7 @@ final class AppModel {
             planTaskStatuses = [:]
             lastCommit = nil
             lastLanding = nil
+            lastPullRequest = nil
             mode = .resident
             return
         }
@@ -126,6 +129,7 @@ final class AppModel {
         planTaskStatuses = [:]
         lastCommit = nil
         lastLanding = nil
+        lastPullRequest = nil
         Task { await loadSessions() }
     }
 
@@ -146,6 +150,7 @@ final class AppModel {
         planTaskStatuses = [:]
         lastCommit = nil
         lastLanding = nil
+        lastPullRequest = nil
         Task {
             await loadEvents()
             await loadTodos()
@@ -431,6 +436,18 @@ final class AppModel {
             await loadSessions()
             await loadDiff()
             await loadMergeQueue()
+        } catch {
+            handle(error)
+        }
+    }
+
+    func openPullRequest() async {
+        guard let sessionID = selectedSessionID else { return }
+        pullRequestBusy = true
+        defer { pullRequestBusy = false }
+        do {
+            lastPullRequest = try await core.openPullRequest(sessionID: sessionID)
+            await loadSessions()
         } catch {
             handle(error)
         }
