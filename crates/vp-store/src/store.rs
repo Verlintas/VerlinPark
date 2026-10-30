@@ -844,6 +844,13 @@ impl Store {
                 "kind": artifact.kind,
                 "agent_id": artifact.agent_id,
                 "agent_name": artifact.agent_name,
+                "task_id": artifact.task_id,
+                "mime_type": artifact.mime_type,
+                "storage": artifact.storage,
+                "size_bytes": artifact.size_bytes,
+                "sha256": artifact.sha256,
+                "path": artifact.path,
+                "content": artifact.content,
             }),
         )?;
         tx.commit()?;
@@ -867,12 +874,15 @@ impl Store {
         sha256: &str,
     ) -> Result<(Artifact, Event)> {
         let id = Uuid::now_v7().to_string();
-        let dir = self.data_dir.join("artifacts").join(session_id);
+        let dir = self.data_dir.join("artifacts").join("blobs");
         paths::ensure_private_dir(&dir)?;
-        let path = dir.join(&id);
-        std::fs::write(&path, data)
-            .with_context(|| format!("writing artifact file {}", path.display()))?;
-        paths::ensure_private_file(&path)?;
+        let path = dir.join(sha256);
+        let created_file = !path.is_file();
+        if created_file {
+            std::fs::write(&path, data)
+                .with_context(|| format!("writing artifact blob {}", path.display()))?;
+            paths::ensure_private_file(&path)?;
+        }
         let artifact = Artifact {
             id: id.clone(),
             session_id: session_id.to_string(),
@@ -922,12 +932,19 @@ impl Store {
                 "kind": artifact.kind,
                 "agent_id": artifact.agent_id,
                 "agent_name": artifact.agent_name,
+                "task_id": artifact.task_id,
+                "mime_type": artifact.mime_type,
                 "storage": artifact.storage,
                 "size_bytes": artifact.size_bytes,
+                "sha256": artifact.sha256,
+                "path": artifact.path,
+                "content": "",
             }),
         )?;
         if let Err(error) = tx.commit() {
-            let _ = std::fs::remove_file(&path);
+            if created_file {
+                let _ = std::fs::remove_file(&path);
+            }
             return Err(error.into());
         }
         if let Err(error) = self.append_event_mirror(&event) {
@@ -1137,7 +1154,10 @@ impl Store {
         Ok(Some(event))
     }
 
-    pub fn delete_artifact_with_event(&self, artifact_id: &str) -> Result<Option<Event>> {
+    pub fn delete_artifact_with_event(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<(Event, Option<String>)>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let artifact = tx
@@ -1162,6 +1182,16 @@ impl Store {
             return Ok(None);
         };
         tx.execute("DELETE FROM artifacts WHERE id = ?1", params![artifact_id])?;
+        let remove_path = if let Some(path) = &path {
+            let remaining: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )?;
+            (remaining == 0).then(|| path.clone())
+        } else {
+            None
+        };
         let event = insert_event_tx(
             &tx,
             &session_id,
@@ -1180,7 +1210,7 @@ impl Store {
         if let Err(error) = self.append_event_mirror(&event) {
             tracing::warn!(%error, "failed to append event mirror");
         }
-        Ok(Some(event))
+        Ok(Some((event, remove_path)))
     }
 
     pub fn add_session_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
@@ -2688,16 +2718,24 @@ impl Store {
                     let data = base64::engine::general_purpose::STANDARD
                         .decode(encoded)
                         .context("decoding artifact data")?;
-                    let dir = self.data_dir.join("artifacts").join(&bundle.session.id);
+                    use sha2::{Digest, Sha256};
+                    let sha256 = if artifact.sha256.is_empty() {
+                        format!("{:x}", Sha256::digest(&data))
+                    } else {
+                        artifact.sha256.clone()
+                    };
+                    let dir = self.data_dir.join("artifacts").join("blobs");
                     paths::ensure_private_dir(&dir)?;
-                    let file = dir.join(&artifact.id);
-                    std::fs::write(&file, &data)?;
-                    paths::ensure_private_file(&file)?;
+                    let file = dir.join(&sha256);
+                    if !file.is_file() {
+                        std::fs::write(&file, &data)?;
+                        paths::ensure_private_file(&file)?;
+                    }
                     (
                         String::new(),
                         "file".to_string(),
                         data.len() as u64,
-                        artifact.sha256.clone(),
+                        sha256,
                         Some(file.to_string_lossy().to_string()),
                     )
                 } else {

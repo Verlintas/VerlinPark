@@ -1221,18 +1221,26 @@ impl Engine {
         remove.dedup();
         let mut bytes_freed = 0u64;
         for id in &remove {
-            if let Some(artifact) = artifacts.iter().find(|artifact| &artifact.id == id) {
-                if let Some(path) = &artifact.path {
-                    let _ = tokio::fs::remove_file(path).await;
-                }
-                bytes_freed = bytes_freed.saturating_add(artifact.size_bytes);
-            }
+            let logical_size = artifacts
+                .iter()
+                .find(|artifact| &artifact.id == id)
+                .map(|artifact| artifact.size_bytes)
+                .unwrap_or(0);
             let store = self.store.clone();
             let id = id.clone();
-            if let Some(event) =
-                tokio::task::spawn_blocking(move || store.delete_artifact_with_event(&id)).await??
-            {
+            let pruned = tokio::task::spawn_blocking(move || store.delete_artifact_with_event(&id))
+                .await??;
+            if let Some((event, remove_path)) = pruned {
                 let _ = self.events.send(event);
+                if let Some(path) = remove_path {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => bytes_freed = bytes_freed.saturating_add(logical_size),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            tracing::warn!(%error, path, "failed to remove artifact blob");
+                        }
+                    }
+                }
             }
         }
         Ok(ArtifactGcResult {
@@ -2905,6 +2913,85 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.kind == "artifact.pruned" && event.payload["artifact_id"] == *pruned_id
         }));
+    }
+
+    #[tokio::test]
+    async fn artifact_blobs_dedupe_and_keep_a_reference_count() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("blobs".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "blobs".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        std::fs::write(worktree.join("same.bin"), b"same bytes").unwrap();
+        let first = engine
+            .publish_artifact_file(
+                &session.id,
+                "agent-a",
+                "Worker",
+                Some("T1".into()),
+                "first.bin",
+                "binary",
+                "application/octet-stream",
+                &worktree.join("same.bin"),
+                &worktree,
+            )
+            .await
+            .unwrap();
+        let second = engine
+            .publish_artifact_file(
+                &session.id,
+                "agent-a",
+                "Worker",
+                Some("T1".into()),
+                "second.bin",
+                "binary",
+                "application/octet-stream",
+                &worktree.join("same.bin"),
+                &worktree,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.path, second.path);
+        assert_eq!(first.sha256, second.sha256);
+        let blob = std::path::PathBuf::from(first.path.as_ref().unwrap());
+        assert!(blob.is_file());
+        assert_eq!(blob.file_name().unwrap().to_string_lossy(), first.sha256);
+
+        let policy = ArtifactPolicy {
+            auto_gc: false,
+            max_bytes: None,
+            max_age_secs: None,
+            max_count: Some(1),
+        };
+        let gc = engine.gc_artifacts(&project.id, &policy).await.unwrap();
+        assert_eq!(gc.removed, 1);
+        assert_eq!(gc.bytes_freed, 0, "a shared blob must not be freed early");
+        assert!(blob.is_file());
+        let remaining = engine.list_artifacts(&session.id).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        let (event, remove_path) = engine
+            .store()
+            .delete_artifact_with_event(&remaining[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.kind, "artifact.pruned");
+        assert_eq!(
+            remove_path.as_deref(),
+            Some(blob.to_string_lossy().as_ref())
+        );
+        std::fs::remove_file(&blob).unwrap();
+        assert!(!blob.exists());
     }
 
     #[tokio::test]
