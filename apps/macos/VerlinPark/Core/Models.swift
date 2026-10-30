@@ -1,5 +1,27 @@
 import Foundation
 
+struct ShellPolicy: Codable, Hashable, Sendable {
+    var network: String
+    var readDeny: [String]
+
+    static let allow = ShellPolicy(network: "allow", readDeny: [])
+
+    enum CodingKeys: String, CodingKey {
+        case network
+        case readDeny = "read_deny"
+    }
+}
+
+struct ShellPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: ShellPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
 struct Project: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let name: String

@@ -10,6 +10,27 @@ pub struct Project {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellPolicy {
+    #[serde(default = "default_shell_network")]
+    pub network: String,
+    #[serde(default)]
+    pub read_deny: Vec<String>,
+}
+
+impl Default for ShellPolicy {
+    fn default() -> Self {
+        Self {
+            network: default_shell_network(),
+            read_deny: Vec::new(),
+        }
+    }
+}
+
+fn default_shell_network() -> String {
+    "allow".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -70,6 +91,23 @@ pub struct AddProjectParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectListResult {
     pub projects: Vec<Project>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShellPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetShellPolicyParams {
+    pub project_id: String,
+    pub policy: ShellPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShellPolicyResult {
+    pub project_id: String,
+    pub policy: ShellPolicy,
 }
 
 #[derive(Debug, Clone, Deserialize)]

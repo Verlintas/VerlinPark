@@ -12,7 +12,7 @@ use uuid::Uuid;
 use vp_protocol::types::{
     AgentRecord, Approval, Event, MergeQueueEntry, Project, PullRequestResult, Session,
     SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
-    SessionRehydrateResult, SessionReplayReport, StoredMessage, TeamPlan, TodoItem,
+    SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -38,6 +38,47 @@ pub struct Engine {
     events: broadcast::Sender<Event>,
     approval_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     git_lock: Arc<Mutex<()>>,
+}
+
+fn normalize_shell_policy(mut policy: ShellPolicy) -> Result<ShellPolicy> {
+    let network = policy.network.trim().to_ascii_lowercase();
+    if network != "allow" && network != "deny" {
+        anyhow::bail!("shell policy network must be 'allow' or 'deny'");
+    }
+    if policy.read_deny.len() > 64 {
+        anyhow::bail!("shell policy supports at most 64 read-deny paths");
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut normalized = Vec::new();
+    for raw in policy.read_deny {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.len() > 4096 {
+            anyhow::bail!("shell read-deny path is too long");
+        }
+        let path = if raw == "~" {
+            home.clone()
+                .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot expand ~"))?
+        } else if let Some(rest) = raw.strip_prefix("~/") {
+            home.clone()
+                .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot expand ~"))?
+                .join(rest)
+        } else if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            anyhow::bail!("shell read-deny paths must be absolute or start with ~/: {raw}");
+        };
+        let path = path.canonicalize().unwrap_or(path);
+        let path = path.to_string_lossy().to_string();
+        if !normalized.contains(&path) {
+            normalized.push(path);
+        }
+    }
+    policy.network = network;
+    policy.read_deny = normalized;
+    Ok(policy)
 }
 
 impl Engine {
@@ -67,6 +108,40 @@ impl Engine {
     pub async fn list_projects(&self) -> Result<Vec<Project>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.list_projects()).await?
+    }
+
+    pub async fn get_shell_policy(&self, project_id: &str) -> Result<ShellPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        tokio::task::spawn_blocking(move || store.get_shell_policy(&project_id)).await?
+    }
+
+    pub async fn set_shell_policy(
+        &self,
+        project_id: &str,
+        policy: ShellPolicy,
+    ) -> Result<ShellPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let policy = normalize_shell_policy(policy)?;
+        let policy_for_store = policy.clone();
+        tokio::task::spawn_blocking(move || store.set_shell_policy(&project_id, &policy_for_store))
+            .await??;
+        Ok(policy)
     }
 
     pub async fn create_session(
@@ -1724,6 +1799,63 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+    }
+
+    #[tokio::test]
+    async fn shell_policy_round_trips_and_validates() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("policy".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get_shell_policy(&project.id).await.unwrap(),
+            ShellPolicy::default()
+        );
+        assert!(engine.get_shell_policy("missing-project").await.is_err());
+        let deny_path = data.path().join("secret.txt");
+        let saved = engine
+            .set_shell_policy(
+                &project.id,
+                ShellPolicy {
+                    network: "deny".into(),
+                    read_deny: vec![deny_path.to_string_lossy().to_string()],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.network, "deny");
+        assert_eq!(engine.get_shell_policy(&project.id).await.unwrap(), saved);
+        assert!(
+            engine
+                .set_shell_policy(
+                    &project.id,
+                    ShellPolicy {
+                        network: "sometimes".into(),
+                        read_deny: Vec::new(),
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .set_shell_policy(
+                    &project.id,
+                    ShellPolicy {
+                        network: "allow".into(),
+                        read_deny: vec!["relative/path".into()],
+                    },
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

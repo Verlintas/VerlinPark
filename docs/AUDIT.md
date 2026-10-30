@@ -12,13 +12,13 @@
 - **P0-1 已修复**：TeamPlan 自动派发按 `write_scope` 选择可并行批次；空 scope / 重叠 scope 的任务串行执行。Worker 使用可释放的 active slot，Manager 继续按 run 计数；`available(Worker)` 限制 batch 大小。
 - **P0-2 已修复**：provider 请求前做 token reservation，按保守输入估算 + 动态 output budget 预留；provider 返回 usage 后结算，缺少 usage 的本地端点会以 `estimated: true` 的估算用量持久化。并发批次不再共用同一个 pre-flight 窗口。
 - **P1-4 已修复**：`fetch_url` 在连接前解析并固定已校验的 IP，阻止解析到 loopback/private/link-local/文档/benchmark 等地址；补充了 IPv4-mapped IPv6 与特殊段检查。
-- **P1-3 部分修复**：shell 现在通过 macOS Seatbelt 拒绝 worktree/Git 元数据/scratch 之外的写入，并保护 common hooks/config；sandbox 不可用时 fail closed。常见 credential/state 路径已 read-deny，timeout/cancel 会清理整个 process group；任意读取、网络、进程执行策略和 Docker 等 daemon 介导写入仍未隔离，Verifier 仍可修改自己的 worktree。
+- **P1-3 部分修复**：shell 现在通过 macOS Seatbelt 拒绝 worktree/Git 元数据/scratch 之外的写入，并保护 common hooks/config；sandbox 不可用时 fail closed。常见 credential/state 路径已 read-deny，timeout/cancel 会清理整个 process group，项目级 policy 可 deny network 或追加 read-deny（只能收窄）；任意读取、network allow 下的外发、进程执行策略和 Docker 等 daemon 介导写入仍未隔离，Verifier 仍可修改自己的 worktree。
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 和 `gh` PR flow 可用。仍缺自动冲突解决、LLM Integrator、非 GitHub PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree/scratch 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 66（core 49 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
+当前测试：Rust 68（core 51 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
 
 ---
 
@@ -45,10 +45,10 @@
 |---|---|---|
 | 功能完整度（M3 第三切片） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、本地 landing、`gh` PR 已有；缺 artifact、mailbox、自动冲突解决 |
 | 正确性/一致性 | B | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影；从零数据库重建仍未完成 |
-| 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、常见 credential read-deny、process group 清理已具备；任意读取/网络/daemon 介导写入仍未隔离 |
+| 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
-| 测试 | B− | 66 Rust + 9 Swift 全绿；并发/scope/SSRF/shell sandbox/queue retry/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 68 Rust + 9 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -109,6 +109,7 @@
 - 常见 credential/state 路径已 read-deny（SSH/GPG/cloud/gh/kube/docker/Keychain、VerlinPark DB/run/session/log），但不是完整 read jail；自定义 secret 路径仍可能被读取并带进上下文或通过网络发送。
 - 网络、进程执行没有策略；Docker socket、GUI/launch service 等 daemon 或外部应用介导的写入可以绕过文件写入沙箱。已 deny Apple Events，但不是完整隔离。
 - shell 使用独立 process group；timeout/cancel/drop 会 kill 整组，后台进程不再遗留。
+- 项目级 `ShellPolicy` 可设 `network=deny` 或追加 read-deny；它只能收窄，不能关闭写入沙箱、env allowlist 或内置 credential read-deny。
 - `AgentRole::Verifier` 的 tool policy 仍允许 `shell`；prompt 里说“read-only”，但 shell 仍可修改 Verifier 自己的 worktree 后给出 approve。
 - `kill_on_drop` 只保证直接子进程被清理；shell 已用 process group 补齐 timeout/cancel 清理。
 
@@ -119,8 +120,8 @@
 
 **建议**
 
-- 短期：保持 Verifier 警告；把 credential read-denylist 扩展为项目可配置策略，并补网络策略。
-- 中期：迁移到 App Sandbox helper/容器/VM；env allowlist、常见 credential read-deny 与 process group 清理已实现，继续明确禁止 Docker socket 等逃逸路径。
+- 短期：保持 Verifier 警告；继续把 read-deny 扩展为更完整的授权模型（目前仍是 denylist）。
+- 中期：迁移到 App Sandbox helper/容器/VM；env allowlist、credential read-deny、process group 清理与项目级 network/read-deny policy 已实现，继续明确禁止 Docker socket 等逃逸路径。
 - 在宣传“agent team 自动合并”之前，Verifier 只读仍必须保持 prompt-level 的诚实表述。
 
 ---
@@ -239,7 +240,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 66 个 Rust 测试 + 9 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、预算、恢复、pause/resume、shell 写入沙箱与 process group 清理。仍缺：
+已有 68 个 Rust 测试 + 9 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、预算、恢复、pause/resume、shell 沙箱/policy 与 process group 清理。仍缺：
 
 - plan 自动派发的 scope overlap / cap 回归
 - 并发预算超调上界
@@ -343,7 +344,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 66 passed after the 10-30 delivery/recovery/pause/sandbox slices
+cargo test --workspace     # 68 passed after the 10-30 delivery/recovery/pause/sandbox/policy slices
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```

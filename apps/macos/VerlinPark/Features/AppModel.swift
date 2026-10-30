@@ -30,6 +30,11 @@ final class AppModel {
     var todos: [TodoItem] = []
     var agents: [AgentRecord] = []
     var mergeQueue: [MergeQueueEntry] = []
+    var shellPolicy = ShellPolicy.allow
+    var shellPolicyNetwork = "allow"
+    var shellPolicyReadDenyText = ""
+    var shellPolicyBusy = false
+    var shellPolicyStatus: String?
     var teamPlan: TeamPlan?
     var planTaskStatuses: [String: String] = [:]
     var sessionDiff: SessionDiff?
@@ -94,6 +99,7 @@ final class AppModel {
                 selectedProjectID = projects.first?.id
             }
             await loadSessions()
+            await loadShellPolicy()
         } catch {
             handle(error)
         }
@@ -108,6 +114,10 @@ final class AppModel {
             todos = []
             agents = []
             mergeQueue = []
+            shellPolicy = .allow
+            shellPolicyNetwork = "allow"
+            shellPolicyReadDenyText = ""
+            shellPolicyStatus = nil
             teamPlan = nil
             planTaskStatuses = [:]
             lastCommit = nil
@@ -125,6 +135,7 @@ final class AppModel {
         todos = []
         agents = []
         mergeQueue = []
+        Task { await loadShellPolicy() }
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -266,6 +277,62 @@ final class AppModel {
         } catch {
             handle(error)
         }
+    }
+
+    func loadShellPolicy() async {
+        guard let projectID = selectedProjectID else {
+            shellPolicy = .allow
+            shellPolicyNetwork = "allow"
+            shellPolicyReadDenyText = ""
+            shellPolicyStatus = nil
+            return
+        }
+        shellPolicyBusy = true
+        defer { shellPolicyBusy = false }
+        do {
+            let policy = try await core.shellPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            shellPolicy = policy
+            shellPolicyNetwork = policy.network
+            shellPolicyReadDenyText = policy.readDeny.joined(separator: "\n")
+            shellPolicyStatus = nil
+        } catch {
+            handle(error)
+        }
+    }
+
+    func saveShellPolicy() async {
+        guard let projectID = selectedProjectID else {
+            shellPolicyStatus = "Select a project first."
+            return
+        }
+        let readDeny = shellPolicyReadDenyText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        shellPolicyBusy = true
+        defer { shellPolicyBusy = false }
+        do {
+            let policy = try await core.setShellPolicy(
+                projectID: projectID,
+                policy: ShellPolicy(network: shellPolicyNetwork, readDeny: readDeny)
+            )
+            guard projectID == selectedProjectID else { return }
+            shellPolicy = policy
+            shellPolicyNetwork = policy.network
+            shellPolicyReadDenyText = policy.readDeny.joined(separator: "\n")
+            shellPolicyStatus =
+                "Saved · network \(policy.network) · \(policy.readDeny.count) read-deny paths"
+        } catch {
+            shellPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func resetShellPolicy() async {
+        shellPolicyNetwork = "allow"
+        shellPolicyReadDenyText = ""
+        await saveShellPolicy()
     }
 
     func resolveApproval(_ id: String, approved: Bool) async {

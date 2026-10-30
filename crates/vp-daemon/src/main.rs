@@ -31,7 +31,8 @@ use vp_protocol::types::{
     ResolveApprovalResult, RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams,
     SessionExportParams, SessionImportParams, SessionListResult, SessionPauseParams,
     SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
-    SessionTodosResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
+    SessionTodosResult, SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -350,6 +351,36 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "project.list" => match state.engine.list_projects().await {
             Ok(projects) => RpcResponse::success(id, ProjectListResult { projects }),
             Err(error) => internal_error(id, error),
+        },
+        "project.shell_policy.get" => match parse_params::<ShellPolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_shell_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    ShellPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.shell_policy.set" => match parse_params::<SetShellPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_shell_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    ShellPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
         },
         "session.create" => match parse_params::<CreateSessionParams>(request.params) {
             Ok(params) => match state

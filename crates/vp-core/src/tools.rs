@@ -26,6 +26,8 @@ pub struct ToolContext {
     pub sandbox_root: PathBuf,
     /// Credential/state paths that shell commands must not read.
     pub secret_roots: Vec<PathBuf>,
+    /// Whether shell commands may open network connections.
+    pub network_allowed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -703,6 +705,9 @@ impl AgentTool for Shell {
             .unwrap_or_else(|_| root.clone());
         let (git_dir, common_dir) = git_metadata_dirs(&root, &project_root);
         let mut profile = String::from(SHELL_SANDBOX_PROFILE);
+        if !context.network_allowed {
+            profile.push_str("(deny network*)\n");
+        }
         let secret_roots = context
             .secret_roots
             .iter()
@@ -978,6 +983,7 @@ mod tests {
                 project_root: root,
                 sandbox_root,
                 secret_roots: Vec::new(),
+                network_allowed: true,
             },
         )
     }
@@ -1139,6 +1145,7 @@ mod tests {
             project_root: root.clone(),
             sandbox_root: dir.path().join("sandbox"),
             secret_roots: Vec::new(),
+            network_allowed: true,
         };
         let inside = Shell
             .execute(&context, json!({"command": "echo inside > inside.txt"}))
@@ -1171,6 +1178,29 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    async fn shell_network_policy_can_deny_access() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("worktree");
+        std::fs::create_dir(&root).unwrap();
+        let context = ToolContext {
+            root: root.clone(),
+            project_root: root,
+            sandbox_root: dir.path().join("sandbox"),
+            secret_roots: Vec::new(),
+            network_allowed: false,
+        };
+        let output = Shell
+            .execute(
+                &context,
+                json!({"command": "curl -sS --max-time 2 https://example.com >/dev/null"}),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error, "{}", output.content);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     async fn shell_timeout_kills_background_processes() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("worktree");
@@ -1180,6 +1210,7 @@ mod tests {
             project_root: root.clone(),
             sandbox_root: dir.path().join("sandbox"),
             secret_roots: Vec::new(),
+            network_allowed: true,
         };
         let started = std::time::Instant::now();
         let result = Shell
@@ -1226,6 +1257,7 @@ mod tests {
             project_root: repo.clone(),
             sandbox_root: dir.path().join("sandbox"),
             secret_roots: Vec::new(),
+            network_allowed: true,
         };
         let output = Shell
             .execute(
@@ -1281,6 +1313,7 @@ mod tests {
             project_root: repo,
             sandbox_root: dir.path().join("sandbox"),
             secret_roots: Vec::new(),
+            network_allowed: true,
         };
         let output = Shell
             .execute(

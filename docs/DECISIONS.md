@@ -45,6 +45,7 @@
 | [0033](adr/0033-session-import-archive.md) | Session bundle 导入为只读 archive | Accepted | 迁移/恢复/安全 |
 | [0034](adr/0034-cooperative-pause-resume.md) | Session 协作式 pause/resume | Accepted | 控制/恢复/UX |
 | [0035](adr/0035-shell-write-sandbox.md) | macOS Seatbelt shell 写入沙箱 | Accepted | 安全/隔离/工具执行 |
+| [0036](adr/0036-project-shell-policy.md) | 项目级 shell permission policy | Accepted | 权限/网络/项目配置 |
 
 ---
 

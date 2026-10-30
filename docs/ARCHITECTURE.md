@@ -825,8 +825,9 @@ pub fn classify(cmd: &str) -> CommandClass;
   （worktree + Git 元数据 + per-agent scratch；common hooks/config 受保护；
   `sandbox-exec` 缺失时 fail closed），使用 env allowlist，read-deny 常见
   credential/state 路径，并在 timeout/cancel 时清理整个 process group。
-  任意读取、网络和 Docker/GUI 等外部介导写入仍是后续工作；不能宣称 shell
-  已完整沙箱化。
+  项目级 `ShellPolicy` 可拒绝网络或追加 read-deny，且只能收窄权限。
+  任意读取、network allow 下的外发和 Docker/GUI 等外部介导写入仍是后续工作；
+  不能宣称 shell 已完整沙箱化。
 
 ### 10.5 apply_patch
 

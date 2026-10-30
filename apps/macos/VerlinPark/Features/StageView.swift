@@ -657,7 +657,7 @@ struct ApprovalCard: View {
                 .lineLimit(6)
             if approval.tool == "shell" {
                 Text(
-                    "Write sandbox: worktree, Git metadata, and runtime scratch. Common credential/state paths are read-denied; other reads, network, and daemon-mediated writes are not confined."
+                    "Shell policy: network \(model.shellPolicy.network) · \(model.shellPolicy.readDeny.count) extra read-deny paths. Writes stay confined to the worktree, Git metadata, and runtime scratch; common credential/state paths are read-denied."
                 )
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundStyle(.secondary)

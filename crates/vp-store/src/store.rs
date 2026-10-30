@@ -8,8 +8,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AgentRecord, Approval, Event, MergeQueueEntry, Project, Session, SessionBundle, StoredMessage,
-    TodoItem,
+    AgentRecord, Approval, Event, MergeQueueEntry, Project, Session, SessionBundle, ShellPolicy,
+    StoredMessage, TodoItem,
 };
 
 use crate::paths;
@@ -61,6 +61,13 @@ impl Store {
                 root          TEXT NOT NULL UNIQUE,
                 default_branch TEXT NOT NULL,
                 created_at    TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_shell_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                network    TEXT NOT NULL,
+                read_deny  TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -281,6 +288,41 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn get_shell_policy(&self, project_id: &str) -> Result<ShellPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT network, read_deny FROM project_shell_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        match stored {
+            Some((network, read_deny)) => Ok(ShellPolicy {
+                network,
+                read_deny: serde_json::from_str(&read_deny)
+                    .context("parsing stored shell read-deny policy")?,
+            }),
+            None => Ok(ShellPolicy::default()),
+        }
+    }
+
+    pub fn set_shell_policy(&self, project_id: &str, policy: &ShellPolicy) -> Result<()> {
+        let read_deny = serde_json::to_string(&policy.read_deny)
+            .context("serializing shell read-deny policy")?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_shell_policies (project_id, network, read_deny, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id) DO UPDATE SET
+                network = excluded.network,
+                read_deny = excluded.read_deny,
+                updated_at = excluded.updated_at",
+            params![project_id, policy.network, read_deny, now_rfc3339()],
+        )?;
+        Ok(())
     }
 
     pub fn create_session(&self, project_id: &str, goal: &str) -> Result<Session> {

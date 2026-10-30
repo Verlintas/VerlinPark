@@ -65,6 +65,24 @@ struct DashboardView: View {
                 }
                 .padding(18)
 
+                if let project = model.selectedProject {
+                    ShellPolicyCard(project: project)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        SectionLabel(title: "Shell policy")
+                        Text("Select a project to configure its shell permission policy.")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+                    .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 12)
+                }
+
                 VStack(alignment: .leading, spacing: 8) {
                     SectionLabel(title: "Next runtime")
                     HStack(spacing: 10) {
@@ -108,6 +126,86 @@ struct DashboardView: View {
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+}
+
+private struct ShellPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Shell policy")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.shellPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Picker("", selection: $model.shellPolicyNetwork) {
+                    Text("Allow network").tag("allow")
+                    Text("Deny network").tag("deny")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 210)
+            }
+
+            Text(
+                "Writes remain confined to the worktree, Git metadata, and runtime scratch. Network deny blocks outbound sockets. Read-deny paths are additive and must be absolute or start with ~/."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            TextEditor(text: $model.shellPolicyReadDenyText)
+                .font(.system(size: 10, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .frame(height: 74)
+                .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+                }
+
+            HStack(spacing: 8) {
+                Text("One read-deny path per line · empty means no extra denials")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button("Reset") {
+                    Task { await model.resetShellPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.shellPolicyBusy)
+                Button("Save policy") {
+                    Task { await model.saveShellPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.shellPolicyBusy)
+            }
+
+            if let status = model.shellPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadShellPolicy()
         }
     }
 }

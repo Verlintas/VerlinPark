@@ -91,6 +91,8 @@ entitlements.
   helper, container, or VM without weakening the write allowlist.
 - Shell scratch directories currently persist under the data directory and need
   a cleanup policy.
+- Projects may narrow access with the policy in
+  [ADR-0036](0036-project-shell-policy.md); they cannot widen it.
 
 ## Alternatives considered
 

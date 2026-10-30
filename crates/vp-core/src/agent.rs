@@ -1844,6 +1844,9 @@ async fn run_loop(
     conversation: &mut Vec<ChatMessage>,
     top_level: bool,
 ) -> Result<LoopOutcome> {
+    let shell_policy = engine.get_shell_policy(&project.id).await?;
+    let mut secret_roots = shell_secret_roots(engine.store().data_dir());
+    secret_roots.extend(shell_policy.read_deny.iter().map(PathBuf::from));
     let tool_context = ToolContext {
         root: spec.worktree.clone(),
         project_root: PathBuf::from(&project.root),
@@ -1853,7 +1856,8 @@ async fn run_loop(
             .join("sandbox")
             .join(&session.id)
             .join(&spec.id),
-        secret_roots: shell_secret_roots(engine.store().data_dir()),
+        secret_roots,
+        network_allowed: shell_policy.network != "deny",
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
     let tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);

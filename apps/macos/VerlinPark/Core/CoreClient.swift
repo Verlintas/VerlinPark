@@ -99,6 +99,26 @@ actor CoreClient {
             .projects
     }
 
+    func shellPolicy(projectID: String) async throws -> ShellPolicy {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "project.shell_policy.get", params: params)
+            .decode(ShellPolicyResult.self)
+            .policy
+    }
+
+    func setShellPolicy(projectID: String, policy: ShellPolicy) async throws -> ShellPolicy {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object([
+                "network": .string(policy.network),
+                "read_deny": .array(policy.readDeny.map(JSONValue.string)),
+            ]),
+        ]
+        return try await request(method: "project.shell_policy.set", params: params)
+            .decode(ShellPolicyResult.self)
+            .policy
+    }
+
     func addProject(root: String, name: String?) async throws -> Project {
         let params: [String: JSONValue] = [
             "root": .string(root),

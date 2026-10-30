@@ -34,6 +34,18 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Show the project's shell permission policy.
+    ShellPolicy { project: String },
+    /// Update the project's shell network/read-deny policy.
+    ShellPolicySet {
+        project: String,
+        /// Network access for shell commands: allow or deny.
+        #[arg(long, default_value = "allow")]
+        network: String,
+        /// Additional absolute (or ~/...) path to deny for reads.
+        #[arg(long = "read-deny")]
+        read_deny: Vec<String>,
+    },
     /// List sessions, optionally scoped to a project.
     Sessions {
         #[arg(long)]
@@ -148,6 +160,32 @@ async fn main() -> Result<()> {
                 &discovery,
                 "project.add",
                 json!({"root": root, "name": name}),
+            )
+            .await?
+        }
+        Command::ShellPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.shell_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ShellPolicySet {
+            project,
+            network,
+            read_deny,
+        } => {
+            rpc(
+                &discovery,
+                "project.shell_policy.set",
+                json!({
+                    "project_id": project,
+                    "policy": {
+                        "network": network,
+                        "read_deny": read_deny,
+                    }
+                }),
             )
             .await?
         }
@@ -388,6 +426,22 @@ fn print_human(value: &Value) {
             value["messages"].as_array().map_or(0, Vec::len),
             value["merge_queue"].as_array().map_or(0, Vec::len)
         );
+        return;
+    }
+    if let Some(policy) = value.get("policy") {
+        println!(
+            "project {}  network={}",
+            value["project_id"].as_str().unwrap_or("?"),
+            policy["network"].as_str().unwrap_or("?")
+        );
+        let paths = policy["read_deny"].as_array();
+        if paths.is_none_or(|paths| paths.is_empty()) {
+            println!("read-deny: none");
+        } else {
+            for path in paths.into_iter().flatten() {
+                println!("read-deny: {}", path.as_str().unwrap_or("?"));
+            }
+        }
         return;
     }
     if let Some(projects) = value.get("projects").and_then(Value::as_array) {
