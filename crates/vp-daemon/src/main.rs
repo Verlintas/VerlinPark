@@ -492,10 +492,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "session.replay" => match parse_params::<ReplaySessionParams>(request.params) {
-            Ok(params) => match state.engine.replay_session(&params.session_id).await {
-                Ok(report) => RpcResponse::success(id, report),
-                Err(error) => internal_error(id, error),
-            },
+            Ok(params) => {
+                let result = if params.repair {
+                    state.engine.repair_session(&params.session_id).await
+                } else {
+                    state.engine.replay_session(&params.session_id).await
+                };
+                match result {
+                    Ok(report) => RpcResponse::success(id, report),
+                    Err(error) => internal_error(id, error),
+                }
+            }
             Err(response) => response_with_id(id, response),
         },
         "agent.configure" => match parse_params::<ConfigureAgentParams>(request.params) {

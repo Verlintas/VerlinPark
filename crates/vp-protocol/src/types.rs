@@ -346,6 +346,8 @@ pub struct PullRequestResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReplaySessionParams {
     pub session_id: String,
+    #[serde(default)]
+    pub repair: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +361,8 @@ pub struct SessionReplayReport {
     pub messages_matches: bool,
     pub queue_matches: bool,
     pub consistent: bool,
+    #[serde(default)]
+    pub repaired: bool,
     #[serde(default)]
     pub mismatches: Vec<String>,
 }

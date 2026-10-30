@@ -73,7 +73,11 @@ enum Command {
     /// Push the session branch and open a GitHub pull request with gh.
     Pr { session: String },
     /// Replay the event stream and check projection consistency.
-    Replay { session: String },
+    Replay {
+        session: String,
+        #[arg(long)]
+        repair: bool,
+    },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
     /// Commit the session worktree.
@@ -195,8 +199,13 @@ async fn main() -> Result<()> {
         Command::Pr { session } => {
             rpc(&discovery, "session.pr", json!({"session_id": session})).await?
         }
-        Command::Replay { session } => {
-            rpc(&discovery, "session.replay", json!({"session_id": session})).await?
+        Command::Replay { session, repair } => {
+            rpc(
+                &discovery,
+                "session.replay",
+                json!({"session_id": session, "repair": repair}),
+            )
+            .await?
         }
         Command::Discard { session } => {
             rpc(
@@ -367,6 +376,9 @@ fn print_human(value: &Value) {
             value["messages_matches"].as_bool().unwrap_or(false),
             value["queue_matches"].as_bool().unwrap_or(false)
         );
+        if value["repaired"].as_bool().unwrap_or(false) {
+            println!("repaired projections from the event stream.");
+        }
         for mismatch in value["mismatches"].as_array().into_iter().flatten() {
             if let Some(mismatch) = mismatch.as_str() {
                 println!("  - {mismatch}");

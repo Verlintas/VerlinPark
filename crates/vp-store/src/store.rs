@@ -13,6 +13,21 @@ use vp_protocol::types::{
 
 use crate::paths;
 
+/// Explicit projection repair derived from the event stream. Fields set to
+/// `None` are left untouched; `replace_plan` distinguishes "clear the plan"
+/// from "leave it alone".
+#[derive(Debug, Clone)]
+pub struct SessionRepair {
+    pub status: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub replace_plan: bool,
+    pub plan: Option<String>,
+    pub todos: Option<Vec<TodoItem>>,
+    pub messages: Option<Vec<StoredMessage>>,
+    pub queue: Option<Vec<MergeQueueEntry>>,
+}
+
 /// SQLite-backed metadata store plus an append-only JSONL event mirror.
 ///
 /// The event log is the long-term source of truth; SQLite is the fast query
@@ -1122,6 +1137,101 @@ impl Store {
             }
         }
         Ok((sessions, events))
+    }
+
+    pub fn repair_session_projections(
+        &self,
+        session_id: &str,
+        repair: &SessionRepair,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions
+             SET status = ?1, tokens_in = ?2, tokens_out = ?3
+             WHERE id = ?4",
+            params![
+                repair.status,
+                repair.tokens_in as i64,
+                repair.tokens_out as i64,
+                session_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        if repair.replace_plan {
+            tx.execute(
+                "UPDATE sessions SET team_plan = ?1 WHERE id = ?2",
+                params![repair.plan, session_id],
+            )?;
+        }
+        if let Some(todos) = &repair.todos {
+            tx.execute(
+                "DELETE FROM todos WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for (position, item) in todos.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO todos (session_id, position, title, status, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![session_id, position as i64, item.title, item.status, now],
+                )?;
+            }
+        }
+        if let Some(messages) = &repair.messages {
+            tx.execute(
+                "DELETE FROM messages WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for message in messages {
+                tx.execute(
+                    "INSERT INTO messages
+                     (id, session_id, role, content, tool_calls, tool_call_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        message.id,
+                        message.session_id,
+                        message.role,
+                        message.content,
+                        serde_json::to_string(&message.tool_calls)?,
+                        message.tool_call_id,
+                        message.created_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(queue) = &repair.queue {
+            tx.execute(
+                "DELETE FROM merge_queue WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for entry in queue {
+                tx.execute(
+                    "INSERT INTO merge_queue
+                     (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        entry.id,
+                        entry.session_id,
+                        entry.agent_id,
+                        entry.agent_name,
+                        entry.task_id,
+                        entry.branch,
+                        entry.commit,
+                        entry.base_commit,
+                        entry.status,
+                        entry.attempt as i64,
+                        entry.detail,
+                        entry.created_at,
+                        entry.updated_at
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn interrupt_running_sessions(&self) -> Result<Vec<String>> {

@@ -15,10 +15,20 @@ use vp_protocol::types::{
     TodoItem,
 };
 use vp_store::Store;
+use vp_store::store::SessionRepair;
 
 pub mod agent;
 pub mod tools;
 pub mod worktree;
+
+struct ReplayData {
+    session: Session,
+    messages: Vec<StoredMessage>,
+    plan: Option<String>,
+    todos: Vec<TodoItem>,
+    queue: Vec<MergeQueueEntry>,
+    events: Vec<Event>,
+}
 
 #[derive(Clone)]
 pub struct Engine {
@@ -671,45 +681,55 @@ impl Engine {
             .await?
     }
 
-    pub async fn replay_session(&self, session_id: &str) -> Result<SessionReplayReport> {
+    async fn load_replay_data(&self, session_id: &str) -> Result<ReplayData> {
         let store = self.store.clone();
         let id = session_id.to_string();
-        let (session, messages, plan, todos, queue, events) =
-            tokio::task::spawn_blocking(move || -> Result<_> {
-                let session = store
-                    .get_session(&id)?
-                    .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
-                let messages = store.list_messages(&id)?;
-                let plan = store.get_team_plan(&id)?;
-                let todos = store.list_todos(&id)?;
-                let queue = store.list_merge_queue(&id)?;
-                let events = store.list_all_events(&id)?;
-                Ok((session, messages, plan, todos, queue, events))
+        tokio::task::spawn_blocking(move || -> Result<ReplayData> {
+            let session = store
+                .get_session(&id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+            let messages = store.list_messages(&id)?;
+            let plan = store.get_team_plan(&id)?;
+            let todos = store.list_todos(&id)?;
+            let queue = store.list_merge_queue(&id)?;
+            let events = store.list_all_events(&id)?;
+            Ok(ReplayData {
+                session,
+                messages,
+                plan,
+                todos,
+                queue,
+                events,
             })
-            .await??;
+        })
+        .await?
+    }
 
+    fn replay_report(data: &ReplayData, repaired: bool) -> Result<SessionReplayReport> {
         let mut mismatches = Vec::new();
-        let replay_status = events
+        let replay_status = data
+            .events
             .iter()
             .rev()
             .find(|event| event.kind == "session.updated")
             .and_then(|event| event.payload.get("status"))
             .and_then(serde_json::Value::as_str)
             .or_else(|| {
-                events
+                data.events
                     .iter()
                     .any(|event| event.kind == "session.created")
                     .then_some("draft")
             });
-        let status_matches = replay_status == Some(session.status.as_str());
+        let status_matches = replay_status == Some(data.session.status.as_str());
         if !status_matches {
             mismatches.push(format!(
                 "session status: projection={}, replay={:?}",
-                session.status, replay_status
+                data.session.status, replay_status
             ));
         }
 
-        let (replay_in, replay_out) = events
+        let (replay_in, replay_out) = data
+            .events
             .iter()
             .filter(|event| event.kind == "agent.usage")
             .fold((0u64, 0u64), |(input, output), event| {
@@ -718,20 +738,23 @@ impl Engine {
                     output.saturating_add(event.payload["output_tokens"].as_u64().unwrap_or(0)),
                 )
             });
-        let usage_matches = replay_in == session.tokens_in && replay_out == session.tokens_out;
+        let usage_matches =
+            replay_in == data.session.tokens_in && replay_out == data.session.tokens_out;
         if !usage_matches {
             mismatches.push(format!(
                 "usage: projection={}/{}, replay={replay_in}/{replay_out}",
-                session.tokens_in, session.tokens_out
+                data.session.tokens_in, data.session.tokens_out
             ));
         }
 
-        let replay_plan = events
+        let replay_plan = data
+            .events
             .iter()
             .rev()
             .find(|event| event.kind == "team_plan.submitted")
             .map(|event| event.payload.clone());
-        let projected_plan = plan
+        let projected_plan = data
+            .plan
             .as_deref()
             .and_then(|plan| serde_json::from_str::<serde_json::Value>(plan).ok());
         let plan_matches = replay_plan == projected_plan;
@@ -739,31 +762,45 @@ impl Engine {
             mismatches.push("team plan projection differs from event stream".to_string());
         }
 
-        let replay_todos = events
+        let replay_todos = data
+            .events
             .iter()
             .rev()
             .find(|event| event.kind == "todo.updated")
             .map(|event| event.payload["items"].clone())
             .unwrap_or_else(|| serde_json::json!([]));
-        let projected_todos = serde_json::to_value(&todos)?;
+        let projected_todos = serde_json::to_value(&data.todos)?;
         let todos_matches = replay_todos == projected_todos;
         if !todos_matches {
             mismatches.push("todo projection differs from event stream".to_string());
         }
 
-        let replay_messages = events
+        let replay_messages = data
+            .events
             .iter()
             .filter(|event| event.kind == "message.created")
-            .count();
-        let messages_matches = replay_messages == messages.len();
+            .filter_map(|event| {
+                let message =
+                    serde_json::from_value::<StoredMessage>(event.payload.clone()).ok()?;
+                Some((message.id.clone(), serde_json::to_value(message).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_messages = data
+            .messages
+            .iter()
+            .filter_map(|message| Some((message.id.clone(), serde_json::to_value(message).ok()?)))
+            .collect::<HashMap<_, _>>();
+        let messages_matches = replay_messages == projected_messages;
         if !messages_matches {
             mismatches.push(format!(
-                "messages: projection={}, replay={replay_messages}",
-                messages.len()
+                "messages: projection={}, replay={}",
+                projected_messages.len(),
+                replay_messages.len()
             ));
         }
 
-        let replay_queue = events
+        let replay_queue = data
+            .events
             .iter()
             .filter_map(|event| {
                 let entry = event.payload.get("entry")?;
@@ -776,7 +813,8 @@ impl Engine {
                 map.insert(id, status);
                 map
             });
-        let projected_queue = queue
+        let projected_queue = data
+            .queue
             .iter()
             .map(|entry| (entry.id.clone(), entry.status.clone()))
             .collect::<HashMap<_, _>>();
@@ -792,8 +830,8 @@ impl Engine {
             && messages_matches
             && queue_matches;
         Ok(SessionReplayReport {
-            session_id: session.id,
-            event_count: events.len(),
+            session_id: data.session.id.clone(),
+            event_count: data.events.len(),
             status_matches,
             usage_matches,
             plan_matches,
@@ -801,8 +839,153 @@ impl Engine {
             messages_matches,
             queue_matches,
             consistent,
+            repaired,
             mismatches,
         })
+    }
+
+    fn build_session_repair(data: &ReplayData) -> Result<SessionRepair> {
+        let status = data
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "session.updated")
+            .and_then(|event| event.payload.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                data.events
+                    .iter()
+                    .any(|event| event.kind == "session.created")
+                    .then_some("draft")
+            })
+            .unwrap_or(data.session.status.as_str())
+            .to_string();
+        let (tokens_in, tokens_out) = data
+            .events
+            .iter()
+            .filter(|event| event.kind == "agent.usage")
+            .fold((0u64, 0u64), |(input, output), event| {
+                (
+                    input.saturating_add(event.payload["input_tokens"].as_u64().unwrap_or(0)),
+                    output.saturating_add(event.payload["output_tokens"].as_u64().unwrap_or(0)),
+                )
+            });
+
+        let plan_event = data
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "team_plan.submitted");
+        let replace_plan = plan_event.is_some() || data.plan.is_none();
+        let plan = plan_event
+            .map(|event| serde_json::to_string(&event.payload))
+            .transpose()?
+            .or_else(|| data.plan.clone());
+
+        let todos = data
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "todo.updated")
+            .map(|event| serde_json::from_value::<Vec<TodoItem>>(event.payload["items"].clone()))
+            .transpose()?
+            .or_else(|| data.todos.is_empty().then(Vec::new));
+
+        let messages = {
+            let mut event_messages = Vec::new();
+            let mut valid = true;
+            for event in data
+                .events
+                .iter()
+                .filter(|event| event.kind == "message.created")
+            {
+                match serde_json::from_value::<StoredMessage>(event.payload.clone()) {
+                    Ok(message) => event_messages.push(message),
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            let projected_ids = data
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let event_ids = event_messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            (valid && projected_ids.is_subset(&event_ids)).then_some(event_messages)
+        };
+
+        let queue = {
+            let mut entries = HashMap::new();
+            let mut valid = true;
+            for event in data.events.iter().filter(|event| {
+                event.kind == "merge_queue.enqueued" || event.kind == "merge_queue.updated"
+            }) {
+                match serde_json::from_value::<MergeQueueEntry>(event.payload["entry"].clone()) {
+                    Ok(entry) => {
+                        entries.insert(entry.id.clone(), entry);
+                    }
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid && (!entries.is_empty() || data.queue.is_empty()) {
+                let mut entries = entries.into_values().collect::<Vec<_>>();
+                entries.sort_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                Some(entries)
+            } else {
+                None
+            }
+        };
+
+        Ok(SessionRepair {
+            status,
+            tokens_in,
+            tokens_out,
+            replace_plan,
+            plan,
+            todos,
+            messages,
+            queue,
+        })
+    }
+
+    pub async fn replay_session(&self, session_id: &str) -> Result<SessionReplayReport> {
+        let data = self.load_replay_data(session_id).await?;
+        Self::replay_report(&data, false)
+    }
+
+    pub async fn repair_session(&self, session_id: &str) -> Result<SessionReplayReport> {
+        let data = self.load_replay_data(session_id).await?;
+        let report = Self::replay_report(&data, false)?;
+        if report.consistent {
+            return Ok(report);
+        }
+        let repair = Self::build_session_repair(&data)?;
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.repair_session_projections(&id, &repair))
+            .await??;
+        self.append_event(
+            session_id,
+            "session.repaired",
+            serde_json::json!({
+                "mismatches": report.mismatches,
+            }),
+        )
+        .await?;
+        let data = self.load_replay_data(session_id).await?;
+        Self::replay_report(&data, true)
     }
 
     pub async fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
@@ -1657,6 +1840,15 @@ mod tests {
         let report = engine.replay_session(&session.id).await.unwrap();
         assert!(!report.consistent);
         assert!(!report.status_matches);
+
+        let repaired = engine.repair_session(&session.id).await.unwrap();
+        assert!(repaired.repaired);
+        assert!(repaired.consistent, "{:?}", repaired.mismatches);
+        let sessions = engine
+            .list_sessions(Some(session.project_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "running");
     }
 
     #[tokio::test]

@@ -34,11 +34,14 @@ milestone, but the critical paths can be made transactional now.
 
 ## Replay check (2026-10-30)
 
-`session.replay` / `vp replay` now compares the event stream with the current
+`session.replay` / `vp replay` compares the event stream with the current
 projections for session status, usage, team plan, todos, message count, and merge
-queue status/IDs. It reports mismatches but does **not** mutate or rebuild the
-projection. A deliberate out-of-band projection write in the replay test proves
-that drift is detected.
+queue status/IDs. `--repair` / `session.replay {repair:true}` explicitly rebuilds
+the covered projections in one SQLite transaction: status/usage, plan, todos,
+messages (when every projected message has an event), and queue entries. It does
+**not** repair the agent roster or session creation metadata. A deliberate
+out-of-band projection write in the replay test proves that drift is detected and
+that repair restores the covered fields.
 
 ## Consequences
 
