@@ -9,7 +9,7 @@ use async_recursion::async_recursion;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
     AgentInfo, ConfigureAgentParams, MergeQueueEntry, PlanDepartment, PlanTask, Project, Session,
@@ -25,6 +25,14 @@ use crate::Engine;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::worktree;
 
+fn global_session_cap() -> usize {
+    env::var("VERLINPARK_GLOBAL_SESSION_CAP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4)
+        .clamp(1, 32)
+}
+
 #[derive(Clone)]
 pub struct AgentConfig {
     pub provider: Arc<dyn Provider>,
@@ -38,6 +46,91 @@ pub struct AgentConfig {
     pub max_labour: usize,
     pub integration_command: Option<String>,
     pub tools: ToolRegistry,
+    /// Maximum number of session runs active across the whole daemon.
+    pub max_active_sessions: usize,
+    /// Cross-session write-scope locks for Worker/Labour runs.
+    pub scope_locks: Arc<ScopeLocks>,
+}
+
+/// A daemon-wide registry of active task write scopes. Tasks in different
+/// sessions that overlap wait for each other; tasks in the same session are
+/// allowed to share (their own scheduler already serializes them).
+#[derive(Default)]
+pub struct ScopeLocks {
+    entries: Mutex<Vec<ScopeLockEntry>>,
+    changed: tokio::sync::Notify,
+}
+
+struct ScopeLockEntry {
+    project_id: String,
+    session_id: String,
+    agent_id: String,
+    scopes: Vec<String>,
+}
+
+pub struct ScopeLockGuard {
+    locks: Arc<ScopeLocks>,
+    project_id: String,
+    agent_id: String,
+}
+
+impl ScopeLocks {
+    async fn acquire(
+        self: &Arc<Self>,
+        project_id: &str,
+        session_id: &str,
+        agent_id: &str,
+        scopes: &[String],
+        control: &RunControl,
+    ) -> Result<Option<ScopeLockGuard>> {
+        loop {
+            if control.is_cancelled() {
+                return Ok(None);
+            }
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut entries = self
+                    .entries
+                    .lock()
+                    .map_err(|_| anyhow!("scope lock mutex poisoned"))?;
+                let conflict = entries.iter().find(|entry| {
+                    entry.project_id == project_id
+                        && entry.session_id != session_id
+                        && scopes_overlap(&entry.scopes, scopes)
+                });
+                if conflict.is_none() {
+                    entries.push(ScopeLockEntry {
+                        project_id: project_id.to_string(),
+                        session_id: session_id.to_string(),
+                        agent_id: agent_id.to_string(),
+                        scopes: scopes.to_vec(),
+                    });
+                    return Ok(Some(ScopeLockGuard {
+                        locks: self.clone(),
+                        project_id: project_id.to_string(),
+                        agent_id: agent_id.to_string(),
+                    }));
+                }
+            }
+            tokio::select! {
+                _ = &mut changed => {}
+                _ = wait_for_cancel(control) => return Ok(None),
+            }
+        }
+    }
+}
+
+impl Drop for ScopeLockGuard {
+    fn drop(&mut self) {
+        if let Ok(mut entries) = self.locks.entries.lock() {
+            entries.retain(|entry| {
+                !(entry.project_id == self.project_id && entry.agent_id == self.agent_id)
+            });
+        }
+        self.locks.changed.notify_waiters();
+    }
 }
 
 #[derive(Clone)]
@@ -46,6 +139,7 @@ pub struct AgentService {
     config: Arc<RwLock<Option<AgentConfig>>>,
     runs: Arc<Mutex<HashMap<String, Arc<RunControl>>>>,
     auto_resolver_started: Arc<AtomicBool>,
+    global_slots: Arc<Semaphore>,
 }
 
 struct RunControl {
@@ -126,6 +220,18 @@ async fn wait_for_resume(control: &RunControl) -> bool {
                     return false;
                 }
             }
+        }
+    }
+}
+
+async fn wait_for_cancel(control: &RunControl) {
+    if control.is_cancelled() {
+        return;
+    }
+    let mut cancelled = control.subscribe();
+    loop {
+        if cancelled.changed().await.is_err() || control.is_cancelled() {
+            return;
         }
     }
 }
@@ -528,6 +634,8 @@ impl AgentService {
                     .ok()
                     .filter(|command| !command.trim().is_empty()),
                 tools: ToolRegistry::default_tools(),
+                max_active_sessions: global_session_cap(),
+                scope_locks: Arc::new(ScopeLocks::default()),
             },
         )
     }
@@ -538,15 +646,18 @@ impl AgentService {
             config: Arc::new(RwLock::new(None)),
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
+            global_slots: Arc::new(Semaphore::new(global_session_cap())),
         }
     }
 
     pub fn configured(engine: Engine, config: AgentConfig) -> Self {
+        let global_cap = config.max_active_sessions.max(1);
         Self {
             engine,
             config: Arc::new(RwLock::new(Some(config))),
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
+            global_slots: Arc::new(Semaphore::new(global_cap)),
         }
     }
 
@@ -590,6 +701,8 @@ impl AgentService {
                 .ok()
                 .filter(|command| !command.trim().is_empty()),
             tools: ToolRegistry::default_tools(),
+            max_active_sessions: global_session_cap(),
+            scope_locks: Arc::new(ScopeLocks::default()),
         };
         *self
             .config
@@ -777,6 +890,29 @@ impl AgentService {
                 ));
             }
             runs.insert(session.id.clone(), control.clone());
+        }
+        self.engine
+            .update_session_status(&session.id, "queued")
+            .await?;
+        let permit = tokio::select! {
+            permit = self.global_slots.clone().acquire_owned() => permit.ok(),
+            _ = wait_for_cancel(&control) => None,
+        };
+        let Some(_permit) = permit else {
+            if let Ok(mut runs) = self.runs.lock() {
+                runs.remove(&session.id);
+            }
+            let _ = self.engine.update_session_status(&session.id, "idle").await;
+            return Err(anyhow!(
+                "auto-resolution cancelled while waiting for a global slot"
+            ));
+        };
+        if control.is_cancelled() {
+            if let Ok(mut runs) = self.runs.lock() {
+                runs.remove(&session.id);
+            }
+            let _ = self.engine.update_session_status(&session.id, "idle").await;
+            return Err(anyhow!("auto-resolution cancelled"));
         }
         self.engine
             .update_session_status(&session.id, "running")
@@ -1479,10 +1615,17 @@ impl AgentService {
 
         let prepared: Result<()> = async {
             self.engine
-                .update_session_status(session_id, "running")
+                .update_session_status(session_id, "queued")
                 .await?;
             self.engine
                 .append_message(session_id, "user", prompt, serde_json::json!([]), None)
+                .await?;
+            self.engine
+                .append_event(
+                    session_id,
+                    "agent.queued",
+                    serde_json::json!({"prompt": prompt}),
+                )
                 .await?;
             Ok(())
         }
@@ -1491,6 +1634,10 @@ impl AgentService {
             if let Ok(mut runs) = self.runs.lock() {
                 runs.remove(session_id);
             }
+            let _ = self
+                .engine
+                .update_session_status(session_id, "failed")
+                .await;
             return Err(error);
         }
 
@@ -1498,7 +1645,42 @@ impl AgentService {
         let session_id = session_id.to_string();
         let prompt = prompt.to_string();
         let runs = self.runs.clone();
+        let global_slots = self.global_slots.clone();
         tokio::spawn(async move {
+            let permit = tokio::select! {
+                permit = global_slots.acquire_owned() => permit.ok(),
+                _ = wait_for_cancel(&control) => None,
+            };
+            let Some(_permit) = permit else {
+                let _ = engine
+                    .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
+                    .await;
+                let _ = control
+                    .finalize_session(&engine, &session_id, "cancelled")
+                    .await;
+                if let Ok(mut runs) = runs.lock() {
+                    runs.remove(&session_id);
+                }
+                return;
+            };
+            if control.is_cancelled() {
+                let _ = engine
+                    .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
+                    .await;
+                let _ = control
+                    .finalize_session(&engine, &session_id, "cancelled")
+                    .await;
+                if let Ok(mut runs) = runs.lock() {
+                    runs.remove(&session_id);
+                }
+                return;
+            }
+            let status = if control.is_paused() {
+                "paused"
+            } else {
+                "running"
+            };
+            let _ = engine.update_session_status(&session_id, status).await;
             let result = run_agent(
                 engine.clone(),
                 config,
@@ -2564,6 +2746,25 @@ async fn run_loop(
     conversation: &mut Vec<ChatMessage>,
     top_level: bool,
 ) -> Result<LoopOutcome> {
+    let _scope_guard =
+        if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
+            match config
+                .scope_locks
+                .acquire(
+                    &project.id,
+                    &session.id,
+                    &spec.id,
+                    &spec.write_scope,
+                    control,
+                )
+                .await?
+            {
+                Some(guard) => Some(guard),
+                None => return Ok(LoopOutcome::Cancelled),
+            }
+        } else {
+            None
+        };
     let shell_policy = engine.get_shell_policy(&project.id).await?;
     let mut secret_roots = shell_secret_roots(engine.store().data_dir());
     secret_roots.extend(shell_policy.read_deny.iter().map(PathBuf::from));
@@ -5145,6 +5346,14 @@ mod tests {
         dir: &TempDir,
         provider: Arc<dyn Provider>,
     ) -> (Engine, AgentService, vp_protocol::types::Project) {
+        test_service_with_provider_cap(dir, provider, 4)
+    }
+
+    fn test_service_with_provider_cap(
+        dir: &TempDir,
+        provider: Arc<dyn Provider>,
+        max_active_sessions: usize,
+    ) -> (Engine, AgentService, vp_protocol::types::Project) {
         let store = Store::open(dir.path()).unwrap();
         let engine = Engine::new(store);
         let project_dir = dir.path().join("repo");
@@ -5167,6 +5376,8 @@ mod tests {
             max_labour: 20,
             integration_command: None,
             tools: ToolRegistry::default_tools(),
+            max_active_sessions,
+            scope_locks: Arc::new(ScopeLocks::default()),
         };
         let service = AgentService::configured(engine.clone(), config);
         (engine, service, project)
@@ -7310,6 +7521,155 @@ mod tests {
                     Ok(StreamEvent::Done),
                 ])))
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_locks_serialize_overlapping_sessions() {
+        let locks = Arc::new(ScopeLocks::default());
+        let control_a = RunControl::new();
+        let guard_a = locks
+            .acquire(
+                "project",
+                "session-a",
+                "agent-a",
+                &["src/**".into()],
+                &control_a,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let same_session = locks
+            .acquire(
+                "project",
+                "session-a",
+                "agent-b",
+                &["src/api/**".into()],
+                &control_a,
+            )
+            .await
+            .unwrap();
+        assert!(same_session.is_some());
+        drop(same_session);
+
+        let locks_b = locks.clone();
+        let control_b = RunControl::new();
+        let mut waiter = tokio::spawn(async move {
+            locks_b
+                .acquire(
+                    "project",
+                    "session-b",
+                    "agent-c",
+                    &["src/api/**".into()],
+                    &control_b,
+                )
+                .await
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(guard_a);
+        let acquired = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(acquired.is_some());
+    }
+
+    struct BlockingProvider {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for BlockingProvider {
+        fn id(&self) -> &str {
+            "blocking"
+        }
+
+        async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("done".into())),
+                Ok(StreamEvent::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn global_session_cap_queues_second_run() {
+        let dir = TempDir::new().unwrap();
+        let provider = Arc::new(BlockingProvider {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (engine, service, project) = test_service_with_provider_cap(&dir, provider.clone(), 1);
+        let first = engine
+            .create_session(project.id.clone(), "first".into(), None)
+            .await
+            .unwrap();
+        let second = engine
+            .create_session(project.id.clone(), "second".into(), None)
+            .await
+            .unwrap();
+        engine.create_leader_agent(&first.id, "test").await.unwrap();
+        engine
+            .create_leader_agent(&second.id, "test")
+            .await
+            .unwrap();
+        service.start(&first.id, "first").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), provider.started.notified())
+            .await
+            .unwrap();
+        service.start(&second.id, "second").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let sessions = engine
+            .list_sessions(Some(project.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.id == first.id)
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.id == second.id)
+                .unwrap()
+                .status,
+            "queued"
+        );
+        provider.release.notify_one();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let sessions = engine
+                .list_sessions(Some(project.id.clone()))
+                .await
+                .unwrap();
+            if sessions.iter().all(|session| session.status == "idle") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queued session did not run: {:?}",
+                sessions
+                    .iter()
+                    .map(|session| (&session.id, &session.status))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 

@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-10-30
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
 
@@ -38,12 +38,13 @@
 | Import archive | ✅ | `vp import <bundle>` 保留 session/project/事件/approvals/投影；导入 session 为只读 archive，不创建 worktree |
 | Rehydrate | ✅ | `vp rehydrate <session> [--worktree path]`：only imported；校验 project/base commit；创建/attach session worktree；按 branch 分组重建 imported agent task worktrees；状态回到 idle；返回 warnings/remapped count |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
+| Global scheduling | ✅ | daemon-wide session semaphore：`VERLINPARK_GLOBAL_SESSION_CAP` 默认 4（1–32）；超出时 session 状态 `queued`，`agent.queued`，可 cancel；跨 session Worker/Labour write-scope 锁按 project 串行等待，同 session 共享，空 scope 视为 wildcard |
 | Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
 | CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/export/import/rehydrate |
 
 ## 验证
 
-- `cargo test --workspace`：73 个测试通过（core 56、store 12、providers 5）。
+- `cargo test --workspace`：75 个测试通过（core 58、store 12、providers 5）。
 - `xcodebuild test`：9 个 Swift 测试通过。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -62,9 +63,10 @@
 
 - PR flow 依赖本机 `gh` 且只覆盖 GitHub；其他 host/PR provider 还没有 adapter。
 - merge queue 目前是 session 内、逐条 drain；显式 retry/auto-resolve 是人工触发；自动触发必须由项目 policy 显式开启，并有 attempt/token cap；没有 LLM Integrator。
+- Global session cap 是进程内 semaphore，不是持久队列/公平调度器；scope locks 只覆盖 Worker/Labour，daemon 重启会失败 in-flight runs；Leader/Manager/Verifier 写入不在全局 scope 锁内。
 - 如果 daemon 在 git merge 过程中崩溃，session worktree 可能仍需人工检查/abort；recovery 不会猜测部分 merge 的结果。
 - 自动派发中的 Manager 是确定性部门节点；LLM 圆桌只在 `deliberate_team_plan` 中运行。
-- 没有全局跨 session 调度器、task retry UI、单 task cancel/pause。
+- 没有完整全局 Task-DAG 调度器/公平队列、task retry UI、单 task cancel/pause；daemon-wide session admission 与 Worker/Labour scope locks 已实现。
 - 没有 auto-expansion；Manager/Worker 上限是固定 caps，不是按预算自动扩编。
 - 没有 per-role 模型/预算；所有 profile 共用同一模型和 session token budget。
 - 没有 typed message bus / artifact store；Agent 之间仍是委派调用 + 事件记录，没有异步 mailbox。
@@ -99,6 +101,7 @@
 - **M3 第十五切片**：项目级 shell policy（network allow/deny、额外 read-deny、RPC/CLI/Manage Dash）。
 - **M3 第十六切片**：Queue 冲突的 agent-assisted auto-resolve（rebase、marker 检查、独立 Verifier、重新 Integrator）。
 - **M3 第十七切片**：项目级 opt-in auto-resolve policy + persisted attempt cap + per-resolution token cap。
+- **M3 第十八切片**：daemon-wide session admission（queued sessions）+ 跨 session Worker/Labour write-scope locks。
 
 ## 如何运行
 

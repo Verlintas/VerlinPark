@@ -48,6 +48,7 @@
 | [0036](adr/0036-project-shell-policy.md) | 项目级 shell permission policy | Accepted | 权限/网络/项目配置 |
 | [0037](adr/0037-agent-assisted-conflict-resolution.md) | Merge queue agent-assisted conflict resolution | Accepted | 集成/冲突/恢复 |
 | [0038](adr/0038-policy-gated-auto-resolve.md) | 项目级 opt-in 自动冲突解决 + caps | Accepted | 自动化/成本/审计 |
+| [0039](adr/0039-global-session-cap-scope-locks.md) | 全局 session admission + 跨 session 写作用域锁 | Accepted | 调度/并发/隔离 |
 
 ---
 

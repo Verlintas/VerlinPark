@@ -189,7 +189,7 @@ private struct ProjectStageView: View {
     private var sendDisabled: Bool {
         let textEmpty = draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let status = model.selectedSession?.status
-        let running = status == "running" || status == "paused"
+        let running = status == "running" || status == "paused" || status == "queued"
         return textEmpty || model.isBusy || running
     }
 
@@ -329,7 +329,9 @@ struct SessionChatView: View {
                             .controlSize(.small)
                             .tint(.green)
                         }
-                        if session.status == "running" || session.status == "paused" {
+                        if session.status == "running" || session.status == "paused"
+                            || session.status == "queued"
+                        {
                             Button {
                                 Task { await model.cancelSession() }
                             } label: {
@@ -368,6 +370,15 @@ struct SessionChatView: View {
                             HStack(spacing: 8) {
                                 ProgressView().controlSize(.small)
                                 Text("Leader is thinking…")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                        } else if session.status == "queued" {
+                            HStack(spacing: 8) {
+                                Image(systemName: "clock")
+                                    .foregroundStyle(.yellow)
+                                Text("Queued for a global session slot")
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundStyle(.secondary)
                             }
