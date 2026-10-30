@@ -2995,6 +2995,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundle_import_rejects_artifact_sha_mismatch() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("bundle-sha".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "bundle-sha".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        std::fs::write(worktree.join("payload.bin"), b"payload").unwrap();
+        engine
+            .publish_artifact_file(
+                &session.id,
+                "agent-a",
+                "Worker",
+                Some("T1".into()),
+                "payload.bin",
+                "binary",
+                "application/octet-stream",
+                &worktree.join("payload.bin"),
+                &worktree,
+            )
+            .await
+            .unwrap();
+        let mut bundle = engine.export_session(&session.id).await.unwrap();
+        assert_eq!(bundle.artifacts.len(), 1);
+        bundle.artifacts[0].sha256 = "deadbeef".to_string();
+        let import_data = TempDir::new().unwrap();
+        let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
+        let error = imported_engine.import_session(bundle).await.unwrap_err();
+        assert!(error.to_string().contains("sha256"), "{error}");
+    }
+
+    #[tokio::test]
     async fn mailbox_retention_protects_unread_messages() {
         let data = TempDir::new().unwrap();
         let repo = TempDir::new().unwrap();

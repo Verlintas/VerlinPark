@@ -2722,11 +2722,13 @@ impl Store {
                         .decode(encoded)
                         .context("decoding artifact data")?;
                     use sha2::{Digest, Sha256};
-                    let sha256 = if artifact.sha256.is_empty() {
-                        format!("{:x}", Sha256::digest(&data))
-                    } else {
-                        artifact.sha256.clone()
-                    };
+                    let sha256 = format!("{:x}", Sha256::digest(&data));
+                    if !artifact.sha256.is_empty() && artifact.sha256 != sha256 {
+                        return Err(anyhow!(
+                            "artifact {} sha256 does not match its bundle content",
+                            artifact.id
+                        ));
+                    }
                     let dir = self.data_dir.join("artifacts").join("blobs");
                     paths::ensure_private_dir(&dir)?;
                     let file = dir.join(&sha256);
