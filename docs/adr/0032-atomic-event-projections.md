@@ -37,13 +37,15 @@ milestone, but the critical paths can be made transactional now.
 
 `session.replay` / `vp replay` compares the event stream with the current
 projections for session status, usage, team plan, todos, messages, agent roster,
-and merge queue status/IDs. `--repair` / `session.replay {repair:true}` explicitly rebuilds
+and merge queue status/IDs. `--repair` / `session.replay {repair:true}` repairs
 the covered projections in one SQLite transaction: status/usage, plan, todos,
 messages (when every projected message has an event), agent roster snapshots
-(`agent.snapshot`), and queue entries. It does **not** repair session creation
-metadata or export/rebuild the whole database from zero. A deliberate
-out-of-band projection write in the replay test proves that drift is detected and
-that repair restores the covered fields.
+(`agent.snapshot`), and queue entries. `--rebuild` forces the same reconstruction
+even when the projections look consistent. `session.export` writes a portable
+bundle of events and projections. It does **not** implement bundle import or
+rebuild session/project creation metadata from zero. A deliberate out-of-band
+projection write in the replay test proves that drift is detected and that repair
+restores the covered fields.
 
 ## Consequences
 

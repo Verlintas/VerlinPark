@@ -72,11 +72,19 @@ enum Command {
     Land { session: String },
     /// Push the session branch and open a GitHub pull request with gh.
     Pr { session: String },
+    /// Export a portable session bundle (events + projections).
+    Export {
+        session: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Replay the event stream and check projection consistency.
     Replay {
         session: String,
         #[arg(long)]
         repair: bool,
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
@@ -199,11 +207,24 @@ async fn main() -> Result<()> {
         Command::Pr { session } => {
             rpc(&discovery, "session.pr", json!({"session_id": session})).await?
         }
-        Command::Replay { session, repair } => {
+        Command::Export { session, output } => {
+            let value = rpc(&discovery, "session.export", json!({"session_id": session})).await?;
+            if let Some(path) = output {
+                std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
+                println!("exported {}", path.display());
+                return Ok(());
+            }
+            value
+        }
+        Command::Replay {
+            session,
+            repair,
+            rebuild,
+        } => {
             rpc(
                 &discovery,
                 "session.replay",
-                json!({"session_id": session, "repair": repair}),
+                json!({"session_id": session, "repair": repair, "rebuild": rebuild}),
             )
             .await?
         }
@@ -303,6 +324,17 @@ fn print_json(value: &Value) -> Result<()> {
 }
 
 fn print_human(value: &Value) {
+    if value.get("version").is_some() && value.get("exported_at").is_some() {
+        println!(
+            "session {}  events={}  agents={}  messages={}  queue={}",
+            value["session"]["id"].as_str().unwrap_or("?"),
+            value["events"].as_array().map_or(0, Vec::len),
+            value["agents"].as_array().map_or(0, Vec::len),
+            value["messages"].as_array().map_or(0, Vec::len),
+            value["merge_queue"].as_array().map_or(0, Vec::len)
+        );
+        return;
+    }
     if let Some(projects) = value.get("projects").and_then(Value::as_array) {
         if projects.is_empty() {
             println!("No projects. Add one with: vp project-add <path>");
@@ -377,7 +409,9 @@ fn print_human(value: &Value) {
             value["agents_matches"].as_bool().unwrap_or(false),
             value["queue_matches"].as_bool().unwrap_or(false)
         );
-        if value["repaired"].as_bool().unwrap_or(false) {
+        if value["rebuilt"].as_bool().unwrap_or(false) {
+            println!("rebuilt projections from the event stream.");
+        } else if value["repaired"].as_bool().unwrap_or(false) {
             println!("repaired projections from the event stream.");
         }
         for mismatch in value["mismatches"].as_array().into_iter().flatten() {

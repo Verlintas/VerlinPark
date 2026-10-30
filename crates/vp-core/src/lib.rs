@@ -11,8 +11,8 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
     AgentRecord, Approval, Event, MergeQueueEntry, Project, PullRequestResult, Session,
-    SessionCommit, SessionDiff, SessionLandResult, SessionReplayReport, StoredMessage, TeamPlan,
-    TodoItem,
+    SessionBundle, SessionCommit, SessionDiff, SessionLandResult, SessionReplayReport,
+    StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -874,6 +874,7 @@ impl Engine {
             queue_matches,
             consistent,
             repaired,
+            rebuilt: false,
             mismatches,
         })
     }
@@ -1038,6 +1039,50 @@ impl Engine {
             agents,
             queue,
         })
+    }
+
+    pub async fn export_session(&self, session_id: &str) -> Result<SessionBundle> {
+        let data = self.load_replay_data(session_id).await?;
+        let store = self.store.clone();
+        let project_id = data.session.project_id.clone();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let team_plan = data
+            .plan
+            .as_deref()
+            .and_then(|plan| serde_json::from_str::<TeamPlan>(plan).ok());
+        Ok(SessionBundle {
+            version: 1,
+            exported_at: vp_protocol::now_rfc3339(),
+            project,
+            session: data.session,
+            events: data.events,
+            agents: data.agents,
+            messages: data.messages,
+            team_plan,
+            todos: data.todos,
+            merge_queue: data.queue,
+        })
+    }
+
+    pub async fn rebuild_session(&self, session_id: &str) -> Result<SessionReplayReport> {
+        let data = self.load_replay_data(session_id).await?;
+        let repair = Self::build_session_repair(&data)?;
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.repair_session_projections(&id, &repair))
+            .await??;
+        self.append_event(
+            session_id,
+            "session.rebuilt",
+            serde_json::json!({"event_count": data.events.len()}),
+        )
+        .await?;
+        let data = self.load_replay_data(session_id).await?;
+        let mut report = Self::replay_report(&data, true)?;
+        report.rebuilt = true;
+        Ok(report)
     }
 
     pub async fn replay_session(&self, session_id: &str) -> Result<SessionReplayReport> {
@@ -1960,6 +2005,24 @@ mod tests {
         assert!(repaired.consistent, "{:?}", repaired.mismatches);
         let agents = engine.list_agents(&session.id).await.unwrap();
         assert_eq!(agents[0].status, "running");
+
+        let bundle = engine.export_session(&session.id).await.unwrap();
+        assert_eq!(bundle.version, 1);
+        assert_eq!(bundle.session.id, session.id);
+        assert_eq!(bundle.agents.len(), 1);
+        assert_eq!(bundle.messages.len(), 1);
+        assert_eq!(bundle.todos.len(), 1);
+        assert_eq!(bundle.merge_queue.len(), 1);
+        assert!(bundle.team_plan.is_some());
+        assert!(!bundle.events.is_empty());
+        let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
+        assert!(rebuilt.repaired);
+        assert!(rebuilt.consistent, "{:?}", rebuilt.mismatches);
+        let events = engine
+            .list_events(session.id.clone(), 0, 1000)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| event.kind == "session.rebuilt"));
     }
 
     #[tokio::test]

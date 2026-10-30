@@ -28,8 +28,9 @@ use vp_protocol::types::{
     ListApprovalsParams, ListEventsParams, ListSessionsParams, MergeQueueListParams,
     MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectListResult, PromptParams,
     PromptResult, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
-    RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams, SessionListResult,
-    SessionTodosParams, SessionTodosResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
+    RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams,
+    SessionListResult, SessionTodosParams, SessionTodosResult, SubscribeParams, TeamPlanParams,
+    TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -491,9 +492,18 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "session.export" => match parse_params::<SessionExportParams>(request.params) {
+            Ok(params) => match state.engine.export_session(&params.session_id).await {
+                Ok(bundle) => RpcResponse::success(id, bundle),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "session.replay" => match parse_params::<ReplaySessionParams>(request.params) {
             Ok(params) => {
-                let result = if params.repair {
+                let result = if params.rebuild {
+                    state.engine.rebuild_session(&params.session_id).await
+                } else if params.repair {
                     state.engine.repair_session(&params.session_id).await
                 } else {
                     state.engine.replay_session(&params.session_id).await

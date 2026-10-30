@@ -344,10 +344,32 @@ pub struct PullRequestResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SessionExportParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ReplaySessionParams {
     pub session_id: String,
     #[serde(default)]
     pub repair: bool,
+    #[serde(default)]
+    pub rebuild: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionBundle {
+    pub version: u32,
+    pub exported_at: String,
+    pub project: Project,
+    pub session: Session,
+    pub events: Vec<Event>,
+    pub agents: Vec<AgentRecord>,
+    pub messages: Vec<StoredMessage>,
+    #[serde(default)]
+    pub team_plan: Option<TeamPlan>,
+    pub todos: Vec<TodoItem>,
+    pub merge_queue: Vec<MergeQueueEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +386,8 @@ pub struct SessionReplayReport {
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
+    #[serde(default)]
+    pub rebuilt: bool,
     #[serde(default)]
     pub mismatches: Vec<String>,
 }
