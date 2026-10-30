@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
@@ -376,6 +376,41 @@ impl Store {
         Ok(())
     }
 
+    pub fn add_session_usage_with_event(
+        &self,
+        session_id: &str,
+        input: u64,
+        output: u64,
+        estimated: bool,
+    ) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions
+             SET tokens_in = tokens_in + ?1, tokens_out = tokens_out + ?2
+             WHERE id = ?3",
+            params![input as i64, output as i64, session_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "agent.usage",
+            serde_json::json!({
+                "input_tokens": input,
+                "output_tokens": output,
+                "estimated": estimated,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
     pub fn list_sessions(&self, project_id: Option<&str>) -> Result<Vec<Session>> {
         let conn = self.lock()?;
         let mut sessions = Vec::new();
@@ -426,29 +461,7 @@ impl Store {
         let event = {
             let mut conn = self.lock()?;
             let tx = conn.transaction()?;
-            let seq: u64 = tx.query_row(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
-                params![session_id],
-                |row| row.get(0),
-            )?;
-            let event = Event {
-                session_id: session_id.to_string(),
-                seq,
-                kind: kind.to_string(),
-                payload,
-                created_at: now_rfc3339(),
-            };
-            tx.execute(
-                "INSERT INTO events (session_id, seq, type, payload, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    event.session_id,
-                    event.seq as i64,
-                    event.kind,
-                    serde_json::to_string(&event.payload)?,
-                    event.created_at
-                ],
-            )?;
+            let event = insert_event_tx(&tx, session_id, kind, payload)?;
             tx.commit()?;
             event
         };
@@ -584,6 +597,34 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_agent_status_with_event(&self, id: &str, status: &str) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let session_id: String = tx
+            .query_row(
+                "SELECT session_id FROM agents WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("agent not found: {id}"))?;
+        tx.execute(
+            "UPDATE agents SET status = ?1 WHERE id = ?2",
+            params![status, id],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &session_id,
+            "agent.updated",
+            serde_json::json!({"agent_id": id, "status": status}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
     pub fn list_agents(&self, session_id: &str) -> Result<Vec<AgentRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -616,6 +657,33 @@ impl Store {
             params![status, session_id],
         )?;
         Ok(())
+    }
+
+    pub fn update_session_status_with_event(
+        &self,
+        session_id: &str,
+        status: &str,
+    ) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET status = ?1 WHERE id = ?2",
+            params![status, session_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "session.updated",
+            serde_json::json!({"status": status}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
     }
 
     pub fn append_message(
@@ -892,6 +960,142 @@ impl Store {
         .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_merge_with_event(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<&str>,
+        branch: &str,
+        commit: &str,
+        base_commit: &str,
+        detail: Option<&str>,
+    ) -> Result<(MergeQueueEntry, Event)> {
+        let id = Uuid::now_v7().to_string();
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO merge_queue
+             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 1, ?9, ?10, ?10)",
+            params![
+                id,
+                session_id,
+                agent_id,
+                agent_name,
+                task_id,
+                branch,
+                commit,
+                base_commit,
+                detail,
+                now
+            ],
+        )?;
+        let entry = tx.query_row(
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+             FROM merge_queue WHERE id = ?1",
+            params![id],
+            map_merge_queue_entry,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "merge_queue.enqueued",
+            serde_json::json!({"entry": entry}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((entry, event))
+    }
+
+    pub fn update_merge_queue_entry_with_event(
+        &self,
+        id: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<Option<(MergeQueueEntry, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE merge_queue
+             SET status = ?1, detail = COALESCE(?2, detail), updated_at = ?3
+             WHERE id = ?4",
+            params![status, detail, now_rfc3339(), id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let entry = tx
+            .query_row(
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+                 FROM merge_queue WHERE id = ?1",
+                params![id],
+                map_merge_queue_entry,
+            )
+            .optional()?;
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let event = insert_event_tx(
+            &tx,
+            &entry.session_id,
+            "merge_queue.updated",
+            serde_json::json!({"entry": entry}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((entry, event)))
+    }
+
+    pub fn retry_merge_queue_entry_with_event(
+        &self,
+        id: &str,
+        commit: &str,
+        base_commit: &str,
+        detail: Option<&str>,
+    ) -> Result<Option<(MergeQueueEntry, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE merge_queue
+             SET status = 'queued', attempt = attempt + 1, commit_hash = ?1,
+                 base_commit = ?2, detail = ?3, updated_at = ?4
+             WHERE id = ?5 AND status IN ('conflict', 'failed', 'interrupted')",
+            params![commit, base_commit, detail, now_rfc3339(), id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let entry = tx
+            .query_row(
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+                 FROM merge_queue WHERE id = ?1",
+                params![id],
+                map_merge_queue_entry,
+            )
+            .optional()?;
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let event = insert_event_tx(
+            &tx,
+            &entry.session_id,
+            "merge_queue.updated",
+            serde_json::json!({"entry": entry}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((entry, event)))
+    }
+
     pub fn list_merge_queue(&self, session_id: &str) -> Result<Vec<MergeQueueEntry>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -996,6 +1200,38 @@ impl Store {
         }
         Ok(approvals)
     }
+}
+
+fn insert_event_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<Event> {
+    let seq: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    let event = Event {
+        session_id: session_id.to_string(),
+        seq,
+        kind: kind.to_string(),
+        payload,
+        created_at: now_rfc3339(),
+    };
+    tx.execute(
+        "INSERT INTO events (session_id, seq, type, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            event.session_id,
+            event.seq as i64,
+            event.kind,
+            serde_json::to_string(&event.payload)?,
+            event.created_at
+        ],
+    )?;
+    Ok(event)
 }
 
 fn map_merge_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueEntry> {

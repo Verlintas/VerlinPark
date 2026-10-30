@@ -31,13 +31,14 @@
 | 预算 / 取消 | ✅ | token reservation + provider usage 结算；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复 |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；UI Approve/Deny |
 | 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR 事件；Collab roster；Preview Plan/Changes/Queue/Trace |
+| Event consistency | ⚠️ | session status / usage / agent status / merge queue 使用 event+projection 原子事务；team plan / todos / messages / recovery 仍是分离写，尚未完整 replay |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
 | Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
 | CLI | ✅ | ping/info/projects/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/todos/agents/team-plan/queue/retry/land/pr |
 
 ## 验证
 
-- `cargo test --workspace`：59 个测试通过（core 42、store 12、providers 5）。
+- `cargo test --workspace`：60 个测试通过（core 43、store 12、providers 5）。
 - `xcodebuild test`：9 个 Swift 测试通过。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -48,7 +49,7 @@
 第一轮硬化（2026-10-30）已修复 plan scope/caps、token reservation 和 fetch_url 的 DNS 绕过。仍然存在的：
 
 1. **Verifier 只读**：只是 prompt 约束；`shell` 工具没有被沙箱限制。审批卡会提示，但 runtime 不阻止写操作。见 AUDIT P1-3。
-2. **事件溯源**：部分状态先写 SQLite 再 append event，部分状态没有事件；事件日志目前是审计流，不是完整 replay 的 source of truth。见 AUDIT P1-5。
+2. **事件溯源**：session status / usage / agent status / merge queue 已改为原子事件+投影；team plan / todos / messages / recovery 仍有分离写，尚未完整 replay。见 AUDIT P1-5。
 3. **batch abort 状态一致性**：同批 task 在预算/取消中止时可能残留 `running` UI 状态；见 AUDIT P2-7。
 
 ## 当前限制（明确未实现）
@@ -78,6 +79,7 @@
 - **M3 第二切片**：queue rebase/retry、显式本地 landing。
 - **M3 第三切片**：显式 push + `gh` PR flow（preflight、no fake success、事件/CLI/UI）。
 - **M3 第四切片**：daemon 重启后的 in-flight merge queue recovery。
+- **M3 第五切片**：关键状态 event+projection 原子写与事件重建测试。
 
 ## 如何运行
 

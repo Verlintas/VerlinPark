@@ -624,7 +624,7 @@ final class AppModel {
         }
 
         if event.sessionId == selectedSessionID,
-           ["agent.spawned", "agent.finished"].contains(event.type)
+           ["agent.spawned", "agent.finished", "agent.updated"].contains(event.type)
         {
             Task { await self.loadAgents() }
         }

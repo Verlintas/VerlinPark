@@ -15,9 +15,10 @@
 - **P1-3 部分缓解**：Verifier shell 的审批卡会明确警告 “not sandboxed”；runtime 沙箱仍未实现。
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，本地 landing 和 `gh` PR flow 可用。仍缺自动冲突解决、LLM Integrator、非 GitHub PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
+- **P1-5 部分修复**：session status、usage、agent status、merge queue 使用 event+projection 原子事务；team plan/todos/messages/recovery 仍是分离写。
 - **仍未解决**：shell 沙箱、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 59（core 42 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
+当前测试：Rust 60（core 43 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
 
 ---
 
@@ -43,11 +44,11 @@
 | 维度 | 评分 | 说明 |
 |---|---|---|
 | 功能完整度（M3 第三切片） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、本地 landing、`gh` PR 已有；缺 artifact、mailbox、自动冲突解决 |
-| 正确性/一致性 | B− | P0 的 plan scope/caps 与预算 reservation 已在 10-30 修复；事件溯源仍只做了一半 |
+| 正确性/一致性 | B | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，完整 replay 仍未完成 |
 | 隔离与安全 | C+ | 路径 jail、loopback token、fetch_url DNS 固定做得不错；shell 仍无沙箱 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
-| 测试 | B− | 59 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing/PR/recovery 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 60 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing/PR/recovery/event replay 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -143,7 +144,7 @@
 
 ---
 
-### P1-5：事件溯源只做了一半，事件不是 source of truth
+### P1-5（部分修复 2026-10-30）：事件溯源只做了一半，事件不是 source of truth
 
 **证据**
 
@@ -154,15 +155,15 @@
 
 **影响**
 
-- 当前“事件日志”是审计流 + UI 增量来源，不是可完整 replay 的 event sourcing；`ARCHITECTURE.md` 的不变量 2 与实际实现不一致。
-- 崩溃恢复只能把 running session 标成 failed，不能从事件重建状态。
-- 以后做 replay/export/审计时会出现“UI 看到的”和“日志记录的”不一致。
+- 修复前事件日志是审计流 + UI 增量来源，不是可完整 replay 的 event sourcing。
+- 修复后 session status / usage / agent status / merge queue 已同事务写事件；关键投影可由事件重建（有测试）。
+- team plan / todos / messages / recovery 仍是分离写，完整 replay/export 仍未完成。
 
-**建议**
+**后续**
 
-1. 明确二选一：要么把事件作为唯一写入口（append event + 同事务 projection），要么把文档改为“事件审计日志 + 投影”而不是 event sourcing。
-2. 如果选前者：给 `Store` 加 `append_event_with` 事务 API，所有状态变更走同一个入口；加 replay 测试。
-3. 短期至少给 `update_agent_status` 补事件，并统一“先事件后投影”的顺序。
+1. 把 team plan / todos / messages / recovery 搬到同一套 event+projection 事务。
+2. 增加真正的 replay/rebuild 命令，而不只是关键投影的重建测试。
+3. 保持文档明确区分“关键状态已原子化”和“完整 event sourcing 未完成”。
 
 ---
 
@@ -327,12 +328,17 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 - interrupted entry 可走同一条 rebase+retry 路径。
 - daemon 重启后的 in-flight merge queue recovery。
 
+第五轮（2026-10-30）做审计一致性：
+
+- session status / usage / agent status / merge queue 的 event+projection 原子事务。
+- 事件流重建关键投影的回归测试。
+
 ---
 
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 59 passed after the 10-30 retry/landing/PR/recovery slices
+cargo test --workspace     # 60 passed after the 10-30 retry/landing/PR/recovery/event slices
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```

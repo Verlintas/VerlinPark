@@ -18,7 +18,7 @@ This file is for coding agents working in this repository. Read it before changi
 ## Invariants
 
 1. The Rust daemon owns state; the SwiftUI app is a client.
-2. Every state change is an event; append events before updating projections. This is the target; current code has projection-first and eventless paths (see AUDIT P1-5), so do not claim full event sourcing.
+2. Every state change is an event; append events before updating projections. Session status, usage, agent status, and merge-queue writes now use atomic event+projection transactions; session/plan/todo/message paths still need the same treatment. Do not claim full event sourcing (see AUDIT P1-5).
 3. Do not add hidden model routing. Models and budgets are user-configured.
 4. Do not add an agent write path outside its worktree. The shell tool is not sandboxed yet; do not claim this is enforced for arbitrary commands.
 5. Do not log API keys or full secrets. Keychain is for secrets.

@@ -670,17 +670,11 @@ impl Engine {
     ) -> Result<()> {
         let store = self.store.clone();
         let id = session_id.to_string();
-        tokio::task::spawn_blocking(move || store.add_session_usage(&id, input, output)).await??;
-        self.append_event(
-            session_id,
-            "agent.usage",
-            serde_json::json!({
-                "input_tokens": input,
-                "output_tokens": output,
-                "estimated": estimated,
-            }),
-        )
-        .await?;
+        let event = tokio::task::spawn_blocking(move || {
+            store.add_session_usage_with_event(&id, input, output, estimated)
+        })
+        .await??;
+        let _ = self.events.send(event);
         Ok(())
     }
 
@@ -738,20 +732,13 @@ impl Engine {
 
     pub async fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
         let store = self.store.clone();
-        let session_id = session_id.to_string();
-        let id_for_store = session_id.clone();
+        let id = session_id.to_string();
         let status = status.to_string();
-        let status_for_store = status.clone();
-        tokio::task::spawn_blocking(move || {
-            store.update_session_status(&id_for_store, &status_for_store)
+        let event = tokio::task::spawn_blocking(move || {
+            store.update_session_status_with_event(&id, &status)
         })
         .await??;
-        self.append_event(
-            &session_id,
-            "session.updated",
-            serde_json::json!({"status": status}),
-        )
-        .await?;
+        let _ = self.events.send(event);
         Ok(())
     }
 
@@ -839,7 +826,11 @@ impl Engine {
         let store = self.store.clone();
         let id = agent_id.to_string();
         let status = status.to_string();
-        tokio::task::spawn_blocking(move || store.update_agent_status(&id, &status)).await?
+        let event =
+            tokio::task::spawn_blocking(move || store.update_agent_status_with_event(&id, &status))
+                .await??;
+        let _ = self.events.send(event);
+        Ok(())
     }
 
     pub async fn list_agents(&self, session_id: &str) -> Result<Vec<AgentRecord>> {
@@ -867,8 +858,8 @@ impl Engine {
         let branch = branch.to_string();
         let commit = commit.to_string();
         let base_commit = base_commit.to_string();
-        let entry = tokio::task::spawn_blocking(move || {
-            store.enqueue_merge(
+        let (entry, event) = tokio::task::spawn_blocking(move || {
+            store.enqueue_merge_with_event(
                 &session_id,
                 &agent_id,
                 &agent_name,
@@ -880,12 +871,7 @@ impl Engine {
             )
         })
         .await??;
-        self.append_event(
-            &entry.session_id,
-            "merge_queue.enqueued",
-            serde_json::json!({"entry": entry}),
-        )
-        .await?;
+        let _ = self.events.send(event);
         Ok(entry)
     }
 
@@ -898,18 +884,14 @@ impl Engine {
         let store = self.store.clone();
         let id = id.to_string();
         let status = status.to_string();
-        let entry = tokio::task::spawn_blocking(move || {
-            store.update_merge_queue_entry(&id, &status, detail.as_deref())
+        let updated = tokio::task::spawn_blocking(move || {
+            store.update_merge_queue_entry_with_event(&id, &status, detail.as_deref())
         })
         .await??;
-        if let Some(entry) = &entry {
-            self.append_event(
-                &entry.session_id,
-                "merge_queue.updated",
-                serde_json::json!({"entry": entry}),
-            )
-            .await?;
-        }
+        let entry = updated.map(|(entry, event)| {
+            let _ = self.events.send(event);
+            entry
+        });
         Ok(entry)
     }
 
@@ -936,18 +918,14 @@ impl Engine {
         let id = id.to_string();
         let commit = commit.to_string();
         let base_commit = base_commit.to_string();
-        let entry = tokio::task::spawn_blocking(move || {
-            store.retry_merge_queue_entry(&id, &commit, &base_commit, detail.as_deref())
+        let updated = tokio::task::spawn_blocking(move || {
+            store.retry_merge_queue_entry_with_event(&id, &commit, &base_commit, detail.as_deref())
         })
         .await??;
-        if let Some(entry) = &entry {
-            self.append_event(
-                &entry.session_id,
-                "merge_queue.updated",
-                serde_json::json!({"entry": entry}),
-            )
-            .await?;
-        }
+        let entry = updated.map(|(entry, event)| {
+            let _ = self.events.send(event);
+            entry
+        });
         Ok(entry)
     }
 
@@ -1413,6 +1391,99 @@ mod tests {
                 && event.payload["entry"]["id"] == queue_entry.id
                 && event.payload["entry"]["status"] == "interrupted"
         }));
+    }
+
+    #[tokio::test]
+    async fn events_cover_critical_state_transitions() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("demo".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "events".into(), None)
+            .await
+            .unwrap();
+        engine
+            .update_session_status(&session.id, "running")
+            .await
+            .unwrap();
+        engine.record_usage(&session.id, 10, 5).await.unwrap();
+        let agent = engine
+            .create_agent(&session.id, "worker", "Worker 1", None, None, "test")
+            .await
+            .unwrap();
+        engine
+            .update_agent_status(&agent.id, "running")
+            .await
+            .unwrap();
+        let entry = engine
+            .enqueue_merge(
+                &session.id,
+                &agent.id,
+                &agent.name,
+                Some("T1".into()),
+                "verlinpark/task",
+                "abc123",
+                "def456",
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .update_merge_queue_entry(&entry.id, "merged", Some("ok".into()))
+            .await
+            .unwrap();
+
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        let last_status = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "session.updated")
+            .and_then(|event| event.payload["status"].as_str());
+        assert_eq!(last_status, Some("running"));
+        let usage = events
+            .iter()
+            .filter(|event| event.kind == "agent.usage")
+            .map(|event| {
+                event.payload["input_tokens"].as_u64().unwrap_or(0)
+                    + event.payload["output_tokens"].as_u64().unwrap_or(0)
+            })
+            .sum::<u64>();
+        assert_eq!(usage, 15);
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.updated"
+                && event.payload["agent_id"] == agent.id
+                && event.payload["status"] == "running"
+        }));
+        let queue_status = events
+            .iter()
+            .filter(|event| {
+                event.kind == "merge_queue.enqueued" || event.kind == "merge_queue.updated"
+            })
+            .filter_map(|event| {
+                Some((
+                    event.payload["entry"]["id"].as_str()?.to_string(),
+                    event.payload["entry"]["status"].as_str()?.to_string(),
+                ))
+            })
+            .fold(std::collections::HashMap::new(), |mut map, (id, status)| {
+                map.insert(id, status);
+                map
+            });
+        assert_eq!(
+            queue_status.get(&entry.id).map(String::as_str),
+            Some("merged")
+        );
     }
 
     #[tokio::test]

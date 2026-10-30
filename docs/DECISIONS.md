@@ -41,6 +41,7 @@
 | [0029](adr/0029-local-landing.md) | 显式本地 landing；PR 后置 | Accepted | 交付/安全/UX |
 | [0030](adr/0030-push-pr-flow.md) | 显式 push + GitHub PR（gh） | Accepted | 交付/集成/安全 |
 | [0031](adr/0031-queue-recovery.md) | daemon 重启恢复 in-flight merge queue entry | Accepted | 可靠性/恢复/审计 |
+| [0032](adr/0032-atomic-event-projections.md) | 关键状态 event + projection 原子写 | Accepted | 存储/审计/恢复 |
 
 ---
 

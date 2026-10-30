@@ -13,7 +13,7 @@
 VerlinPark 的架构围绕一组**不变量**设计。任何实现都不能破坏它们：
 
 1. **Daemon 拥有状态。** UI 是客户端，不是 source of truth；App 退出不终止会话。
-2. **所有状态变更都是事件。** 可回放、可审计、可恢复。
+2. **所有状态变更都是事件。** 可回放、可审计、可恢复。当前 session status / usage / agent status / merge queue 已使用原子 event+projection 事务；team plan/todos/messages/recovery 仍未完全统一。
 3. **Agent 不能越界写。** 写操作限制在自己的 worktree；只读操作限制在项目根 + 显式 allowlist。
 4. **没有隐藏的模型切换。** 每个 Agent 的模型由用户显式配置；运行时只校验能力，不自动路由。
 5. **没有跳过验证的合并。** 目标状态是 Verifier + Integrator；人最终批准 land。当前已有 Verifier gate + 确定性 Integrator（merge queue、diff check、失败回滚、冲突记录、rebase+retry）、显式本地 landing 和显式 push/PR；可选 LLM Integrator、自动冲突解决和非 GitHub PR adapter 仍是设计目标。
@@ -467,7 +467,7 @@ loop {
 
 ## 7. Agent Runtime
 
-> **实现状态（M3 第一切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建；Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由 Verifier 审查（只读是 prompt 约束，shell 未沙箱），approve 才 merge；Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–10 个 Worker；手动 `delegate_many` 和 plan batch 都校验不重叠 write scope，空 scope/重叠 task 串行执行；每个 Worker 有独立 task worktree；Verifier approve 后进入持久 merge queue，由确定性 Integrator 串行 merge，执行 `git diff --check` 和可选 `VERLINPARK_INTEGRATION_COMMAND`，失败回滚，冲突记录；conflict/failed/interrupted 可 rebase+retry；clean project checkout 可显式 land 到默认分支，或显式 push 并用 `gh` 开 PR；daemon 重启把 in-flight queue entry 标为 interrupted；session diff 从 base commit 起算。**已实现：** session 内 TeamPlan DAG 调度、Verifier gate、merge queue、确定性 Integrator、人工 retry、本地 landing、GitHub PR flow、queue recovery。**仍是设计目标：** 全局跨 session 调度器、全局写锁、自动冲突解决、可选 LLM Integrator、非 GitHub PR adapter、typed mailbox/artifact store：
+> **实现状态（M3 第一切片）：** Leader 可先用 `deliberate_team_plan` 让 Manager 进行 1–3 轮只读圆桌，再用 `run_team_plan` 按依赖批次自动派发 TeamPlan；Manager 按 ready task 懒创建；Leader 提交并校验 TeamPlan（departments / Manager titles / profiles / task DAG），profile 决定工具集；Worker 完成后由 Verifier 审查（只读是 prompt 约束，shell 未沙箱），approve 才 merge；Leader → Manager → Worker → Labour 委派；Manager 必须有部门 title；Manager 可用 `delegate_many` 并行启动 1–10 个 Worker；手动 `delegate_many` 和 plan batch 都校验不重叠 write scope，空 scope/重叠 task 串行执行；每个 Worker 有独立 task worktree；Verifier approve 后进入持久 merge queue，由确定性 Integrator 串行 merge，执行 `git diff --check` 和可选 `VERLINPARK_INTEGRATION_COMMAND`，失败回滚，冲突记录；conflict/failed/interrupted 可 rebase+retry；clean project checkout 可显式 land 到默认分支，或显式 push 并用 `gh` 开 PR；daemon 重启把 in-flight queue entry 标为 interrupted；关键状态使用 atomic event+projection 事务；session diff 从 base commit 起算。**已实现：** session 内 TeamPlan DAG 调度、Verifier gate、merge queue、确定性 Integrator、人工 retry、本地 landing、GitHub PR flow、queue recovery、关键事件重建测试。**仍是设计目标：** 全局跨 session 调度器、全局写锁、自动冲突解决、可选 LLM Integrator、非 GitHub PR adapter、typed mailbox/artifact store：
 > `crates/vp-core/src/agent.rs`、`crates/vp-core/src/tools.rs`、`crates/vp-core/src/worktree.rs`。
 > 四层 Actor 模型、并行只读工具、上下文压缩和 checkpoint/resume 仍是设计目标；session 预算已实现 reservation-based enforcement（输入用保守估算，provider usage 结算）。
 > 见 [ADR-0015](adr/0015-m1-leader-loop.md)、[ADR-0016](adr/0016-session-worktree.md)、[ADR-0019](adr/0019-four-tier-delegation.md)。
