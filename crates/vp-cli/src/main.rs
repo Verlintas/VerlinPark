@@ -46,6 +46,21 @@ enum Command {
         #[arg(long = "read-deny")]
         read_deny: Vec<String>,
     },
+    /// Show the project's merge/integration policy.
+    IntegrationPolicy { project: String },
+    /// Update automatic conflict resolution and its caps.
+    IntegrationPolicySet {
+        project: String,
+        /// Enable automatic conflict resolution for this project.
+        #[arg(long)]
+        auto_resolve: bool,
+        /// Maximum automatic attempts per conflict entry (0-5).
+        #[arg(long, default_value_t = 1)]
+        max_auto_attempts: u32,
+        /// Token cap for each automatic resolution (resolver + verifier).
+        #[arg(long)]
+        max_resolve_tokens: Option<u64>,
+    },
     /// List sessions, optionally scoped to a project.
     Sessions {
         #[arg(long)]
@@ -186,6 +201,34 @@ async fn main() -> Result<()> {
                     "policy": {
                         "network": network,
                         "read_deny": read_deny,
+                    }
+                }),
+            )
+            .await?
+        }
+        Command::IntegrationPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.integration_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::IntegrationPolicySet {
+            project,
+            auto_resolve,
+            max_auto_attempts,
+            max_resolve_tokens,
+        } => {
+            rpc(
+                &discovery,
+                "project.integration_policy.set",
+                json!({
+                    "project_id": project,
+                    "policy": {
+                        "auto_resolve": auto_resolve,
+                        "max_auto_attempts": max_auto_attempts,
+                        "max_resolve_tokens": max_resolve_tokens,
                     }
                 }),
             )
@@ -439,6 +482,18 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(policy) = value.get("policy") {
+        if policy.get("auto_resolve").is_some() {
+            println!(
+                "project {}  auto-resolve={}  max-attempts={}  max-tokens={}",
+                value["project_id"].as_str().unwrap_or("?"),
+                policy["auto_resolve"].as_bool().unwrap_or(false),
+                policy["max_auto_attempts"].as_u64().unwrap_or(0),
+                policy["max_resolve_tokens"]
+                    .as_u64()
+                    .map_or_else(|| "session budget".to_string(), |value| value.to_string())
+            );
+            return;
+        }
         println!(
             "project {}  network={}",
             value["project_id"].as_str().unwrap_or("?"),

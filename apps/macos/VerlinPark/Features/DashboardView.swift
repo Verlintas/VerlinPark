@@ -69,6 +69,9 @@ struct DashboardView: View {
                     ShellPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    IntegrationPolicyCard(project: project)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         SectionLabel(title: "Shell policy")
@@ -206,6 +209,88 @@ private struct ShellPolicyCard: View {
         }
         .task(id: project.id) {
             await model.loadShellPolicy()
+        }
+    }
+}
+
+private struct IntegrationPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Integration policy")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.integrationPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Toggle("Auto-resolve conflicts", isOn: $model.integrationAutoResolve)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+
+            Text(
+                "When enabled, a conflict re-enters an internal resolver + Verifier without per-tool approvals. The shell sandbox still applies. Attempts and tokens are capped; manual Auto-resolve remains available."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 14) {
+                HStack(spacing: 6) {
+                    Text("Max automatic attempts")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Stepper(
+                        "\(model.integrationMaxAutoAttempts)",
+                        value: $model.integrationMaxAutoAttempts,
+                        in: 0 ... 5
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                }
+                HStack(spacing: 6) {
+                    Text("Max tokens / resolution")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    TextField("session budget", text: $model.integrationMaxTokensText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 120)
+                        .font(.system(size: 9, design: .monospaced))
+                }
+                Spacer()
+                Button("Reset") {
+                    Task { await model.resetIntegrationPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.integrationPolicyBusy)
+                Button("Save policy") {
+                    Task { await model.saveIntegrationPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.integrationPolicyBusy)
+            }
+
+            if let status = model.integrationPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadIntegrationPolicy()
         }
     }
 }

@@ -119,6 +119,35 @@ actor CoreClient {
             .policy
     }
 
+    func integrationPolicy(projectID: String) async throws -> IntegrationPolicy {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "project.integration_policy.get", params: params)
+            .decode(IntegrationPolicyResult.self)
+            .policy
+    }
+
+    func setIntegrationPolicy(
+        projectID: String,
+        policy: IntegrationPolicy
+    ) async throws -> IntegrationPolicy {
+        var policyValue: [String: JSONValue] = [
+            "auto_resolve": .bool(policy.autoResolve),
+            "max_auto_attempts": .number(Double(policy.maxAutoAttempts)),
+        ]
+        if let tokens = policy.maxResolveTokens {
+            policyValue["max_resolve_tokens"] = .number(Double(tokens))
+        } else {
+            policyValue["max_resolve_tokens"] = .null
+        }
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object(policyValue),
+        ]
+        return try await request(method: "project.integration_policy.set", params: params)
+            .decode(IntegrationPolicyResult.self)
+            .policy
+    }
+
     func addProject(root: String, name: String?) async throws -> Project {
         let params: [String: JSONValue] = [
             "root": .string(root),

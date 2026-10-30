@@ -8,8 +8,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AgentRecord, Approval, Event, MergeQueueEntry, Project, Session, SessionBundle, ShellPolicy,
-    StoredMessage, TodoItem,
+    AgentRecord, Approval, Event, IntegrationPolicy, MergeQueueEntry, Project, Session,
+    SessionBundle, ShellPolicy, StoredMessage, TodoItem,
 };
 
 use crate::paths;
@@ -68,6 +68,14 @@ impl Store {
                 network    TEXT NOT NULL,
                 read_deny  TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_integration_policies (
+                project_id         TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                auto_resolve       INTEGER NOT NULL,
+                max_auto_attempts  INTEGER NOT NULL,
+                max_resolve_tokens INTEGER,
+                updated_at         TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -167,6 +175,11 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_merge_queue_session
                 ON merge_queue(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS merge_auto_attempts (
+                entry_id TEXT PRIMARY KEY REFERENCES merge_queue(id) ON DELETE CASCADE,
+                attempts INTEGER NOT NULL DEFAULT 0
+            );
             "#,
         )?;
         ensure_column(&conn, "sessions", "worktree", "TEXT")?;
@@ -323,6 +336,79 @@ impl Store {
             params![project_id, policy.network, read_deny, now_rfc3339()],
         )?;
         Ok(())
+    }
+
+    pub fn get_integration_policy(&self, project_id: &str) -> Result<IntegrationPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT auto_resolve, max_auto_attempts, max_resolve_tokens
+                 FROM project_integration_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(IntegrationPolicy {
+                        auto_resolve: row.get::<_, i64>(0)? != 0,
+                        max_auto_attempts: row.get::<_, i64>(1)? as u32,
+                        max_resolve_tokens: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn set_integration_policy(
+        &self,
+        project_id: &str,
+        policy: &IntegrationPolicy,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_integration_policies
+                (project_id, auto_resolve, max_auto_attempts, max_resolve_tokens, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id) DO UPDATE SET
+                auto_resolve = excluded.auto_resolve,
+                max_auto_attempts = excluded.max_auto_attempts,
+                max_resolve_tokens = excluded.max_resolve_tokens,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                if policy.auto_resolve { 1 } else { 0 },
+                policy.max_auto_attempts as i64,
+                policy.max_resolve_tokens.map(|value| value as i64),
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn auto_resolve_attempts(&self, entry_id: &str) -> Result<u32> {
+        let conn = self.lock()?;
+        let attempts = conn
+            .query_row(
+                "SELECT attempts FROM merge_auto_attempts WHERE entry_id = ?1",
+                params![entry_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        Ok(attempts as u32)
+    }
+
+    pub fn bump_auto_resolve_attempts(&self, entry_id: &str) -> Result<u32> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO merge_auto_attempts (entry_id, attempts) VALUES (?1, 1)
+             ON CONFLICT(entry_id) DO UPDATE SET attempts = attempts + 1",
+            params![entry_id],
+        )?;
+        let attempts = conn.query_row(
+            "SELECT attempts FROM merge_auto_attempts WHERE entry_id = ?1",
+            params![entry_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(attempts as u32)
     }
 
     pub fn create_session(&self, project_id: &str, goal: &str) -> Result<Session> {

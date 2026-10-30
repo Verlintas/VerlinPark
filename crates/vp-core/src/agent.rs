@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -44,6 +45,7 @@ pub struct AgentService {
     engine: Engine,
     config: Arc<RwLock<Option<AgentConfig>>>,
     runs: Arc<Mutex<HashMap<String, Arc<RunControl>>>>,
+    auto_resolver_started: Arc<AtomicBool>,
 }
 
 struct RunControl {
@@ -535,6 +537,7 @@ impl AgentService {
             engine,
             config: Arc::new(RwLock::new(None)),
             runs: Arc::new(Mutex::new(HashMap::new())),
+            auto_resolver_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -543,6 +546,7 @@ impl AgentService {
             engine,
             config: Arc::new(RwLock::new(Some(config))),
             runs: Arc::new(Mutex::new(HashMap::new())),
+            auto_resolver_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -731,6 +735,14 @@ impl AgentService {
     /// bypasses per-tool approval for the resolver and verifier because the user
     /// already chose auto-resolution, but the shell sandbox still applies.
     pub async fn resolve_merge(&self, entry_id: &str) -> Result<MergeQueueEntry> {
+        self.resolve_merge_with_limit(entry_id, None).await
+    }
+
+    async fn resolve_merge_with_limit(
+        &self,
+        entry_id: &str,
+        max_resolve_tokens: Option<u64>,
+    ) -> Result<MergeQueueEntry> {
         let entry = self
             .engine
             .get_merge_queue_entry(entry_id)
@@ -770,7 +782,14 @@ impl AgentService {
             .update_session_status(&session.id, "running")
             .await?;
         let result = self
-            .resolve_merge_inner(&config, &session, &project, &entry, &control)
+            .resolve_merge_inner(
+                &config,
+                &session,
+                &project,
+                &entry,
+                &control,
+                max_resolve_tokens,
+            )
             .await;
         if let Ok(mut runs) = self.runs.lock() {
             runs.remove(&session.id);
@@ -786,6 +805,7 @@ impl AgentService {
         project: &Project,
         entry: &MergeQueueEntry,
         control: &RunControl,
+        max_resolve_tokens: Option<u64>,
     ) -> Result<MergeQueueEntry> {
         let agents = self.engine.list_agents(&session.id).await?;
         let worker = agents
@@ -930,9 +950,16 @@ impl AgentService {
         )
         .await?;
 
+        let spent = session.tokens_in + session.tokens_out;
+        let limit = match (session.token_budget, max_resolve_tokens) {
+            (Some(session_limit), Some(cap)) => Some(session_limit.min(spent.saturating_add(cap))),
+            (None, Some(cap)) => Some(spent.saturating_add(cap)),
+            (Some(session_limit), None) => Some(session_limit),
+            (None, None) => None,
+        };
         let budget = SessionBudget::new(
-            session.token_budget,
-            session.tokens_in + session.tokens_out,
+            limit,
+            spent,
             AgentCaps {
                 managers: config.max_managers,
                 workers: config.max_workers,
@@ -1242,6 +1269,173 @@ impl AgentService {
             .get_merge_queue_entry(&entry.id)
             .await?
             .ok_or_else(|| anyhow!("merge queue entry disappeared after auto-resolution"))
+    }
+
+    /// Start the daemon-side watcher that auto-resolves conflicts when a
+    /// project opts in. Safe to call more than once.
+    pub fn start_auto_resolver(&self) {
+        if self.auto_resolver_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut events = service.engine.subscribe();
+            service.scan_auto_resolve().await;
+            loop {
+                match events.recv().await {
+                    Ok(event)
+                        if event.kind == "session.updated" && event.payload["status"] == "idle" =>
+                    {
+                        service.auto_resolve_session(&event.session_id).await;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    pub async fn auto_resolve_project(&self, project_id: &str) {
+        let sessions = match self
+            .engine
+            .list_sessions(Some(project_id.to_string()))
+            .await
+        {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "auto-resolve could not list project sessions");
+                return;
+            }
+        };
+        for session in sessions {
+            self.auto_resolve_session(&session.id).await;
+        }
+    }
+
+    pub async fn auto_resolve_all(&self) {
+        self.scan_auto_resolve().await;
+    }
+
+    async fn scan_auto_resolve(&self) {
+        let sessions = match self.engine.list_sessions(None).await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "auto-resolve could not list sessions");
+                return;
+            }
+        };
+        for session in sessions {
+            self.auto_resolve_session(&session.id).await;
+        }
+    }
+
+    async fn auto_resolve_session(&self, session_id: &str) {
+        let Ok((session, _)) = load_session_project(self.engine.store().clone(), session_id).await
+        else {
+            return;
+        };
+        if session.status != "idle" {
+            return;
+        }
+        let policy = match self
+            .engine
+            .get_integration_policy(&session.project_id)
+            .await
+        {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(%error, session_id, "auto-resolve could not load policy");
+                return;
+            }
+        };
+        if !policy.auto_resolve || policy.max_auto_attempts == 0 {
+            return;
+        }
+        if !self.info().configured {
+            return;
+        }
+        if self
+            .runs
+            .lock()
+            .map(|runs| runs.contains_key(session_id))
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let queue = match self.engine.list_merge_queue(session_id).await {
+            Ok(queue) => queue,
+            Err(error) => {
+                tracing::warn!(%error, session_id, "auto-resolve could not list queue");
+                return;
+            }
+        };
+        for entry in queue.into_iter().filter(|entry| entry.status == "conflict") {
+            let attempted = self
+                .engine
+                .auto_resolve_attempts(&entry.id)
+                .await
+                .unwrap_or(policy.max_auto_attempts);
+            if attempted >= policy.max_auto_attempts {
+                continue;
+            }
+            let attempted = match self.engine.bump_auto_resolve_attempts(&entry.id).await {
+                Ok(attempted) => attempted,
+                Err(error) => {
+                    tracing::warn!(%error, entry_id = %entry.id, "auto-resolve could not record attempt");
+                    continue;
+                }
+            };
+            if attempted > policy.max_auto_attempts {
+                continue;
+            }
+            let _ = self
+                .engine
+                .append_event(
+                    session_id,
+                    "merge_queue.auto_resolve_started",
+                    serde_json::json!({
+                        "entry_id": entry.id,
+                        "attempt": attempted,
+                        "max_auto_attempts": policy.max_auto_attempts,
+                        "max_resolve_tokens": policy.max_resolve_tokens,
+                    }),
+                )
+                .await;
+            match self
+                .resolve_merge_with_limit(&entry.id, policy.max_resolve_tokens)
+                .await
+            {
+                Ok(resolved) => {
+                    let _ = self
+                        .engine
+                        .append_event(
+                            session_id,
+                            "merge_queue.auto_resolve_finished",
+                            serde_json::json!({
+                                "entry_id": entry.id,
+                                "status": resolved.status,
+                                "detail": resolved.detail,
+                            }),
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    let _ = self
+                        .engine
+                        .append_event(
+                            session_id,
+                            "merge_queue.auto_resolve_finished",
+                            serde_json::json!({
+                                "entry_id": entry.id,
+                                "status": "failed",
+                                "detail": error.to_string(),
+                            }),
+                        )
+                        .await;
+                }
+            }
+        }
     }
 
     pub async fn start(&self, session_id: &str, prompt: &str) -> Result<()> {
@@ -5937,6 +6131,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions[0].status, "idle");
+    }
+
+    #[tokio::test]
+    async fn auto_resolver_policy_resolves_pending_conflicts() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "auto_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "README.md",
+                            "content": "resolved by policy\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("policy resolver done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "auto_verdict".into(),
+                        name: "submit_verdict".into(),
+                        arguments: serde_json::json!({
+                            "approved": true,
+                            "summary": "policy resolution verified"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id.clone(), "policy resolve".into(), None)
+            .await
+            .unwrap();
+        let worker = engine
+            .create_agent(&session.id, "worker", "Worker policy", None, None, "test")
+            .await
+            .unwrap();
+        let branch = session.branch.clone().unwrap();
+        let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let task = engine
+            .create_task_worktree(&project.root, &project.id, &session.id, "T1", &branch)
+            .await
+            .unwrap();
+        engine
+            .set_agent_worktree(&worker.id, &task.path.to_string_lossy(), &task.branch)
+            .await
+            .unwrap();
+        std::fs::write(task.path.join("README.md"), "worker\n").unwrap();
+        let commit = worktree::commit_all(&task.path, "worker change")
+            .unwrap()
+            .unwrap();
+        std::fs::write(session_worktree.join("README.md"), "session\n").unwrap();
+        worktree::commit_all(&session_worktree, "session change").unwrap();
+
+        let spec = AgentSpec {
+            id: worker.id.clone(),
+            role: AgentRole::Worker,
+            name: worker.name.clone(),
+            depth: 2,
+            parent_name: None,
+            title: None,
+            task_id: Some("T1".into()),
+            profile: AgentProfile::Coding,
+            allow_delegation: true,
+            auto_approve: false,
+            worktree: task.path.clone(),
+            branch: task.branch.clone(),
+            session_worktree: session_worktree.clone(),
+            session_branch: branch,
+            write_scope: vec!["README.md".into()],
+            base_commit: task.base_commit.clone(),
+        };
+        integrate_worker(&engine, &session, &spec, &commit, "verified", None)
+            .await
+            .unwrap_err();
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue[0].status, "conflict");
+        engine
+            .set_integration_policy(
+                &project.id,
+                vp_protocol::types::IntegrationPolicy {
+                    auto_resolve: true,
+                    max_auto_attempts: 1,
+                    max_resolve_tokens: Some(200_000),
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .update_session_status(&session.id, "idle")
+            .await
+            .unwrap();
+
+        service.auto_resolve_project(&project.id).await;
+
+        let resolved = engine
+            .get_merge_queue_entry(&queue[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.status, "merged", "{:?}", resolved.detail);
+        assert_eq!(resolved.attempt, 2);
+        assert_eq!(engine.auto_resolve_attempts(&queue[0].id).await.unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(session_worktree.join("README.md")).unwrap(),
+            "resolved by policy\n"
+        );
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "merge_queue.auto_resolve_started")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "merge_queue.auto_resolve_finished")
+        );
     }
 
     #[tokio::test]

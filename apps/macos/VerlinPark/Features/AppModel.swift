@@ -35,6 +35,12 @@ final class AppModel {
     var shellPolicyReadDenyText = ""
     var shellPolicyBusy = false
     var shellPolicyStatus: String?
+    var integrationPolicy = IntegrationPolicy.disabled
+    var integrationAutoResolve = false
+    var integrationMaxAutoAttempts = 1
+    var integrationMaxTokensText = ""
+    var integrationPolicyBusy = false
+    var integrationPolicyStatus: String?
     var teamPlan: TeamPlan?
     var planTaskStatuses: [String: String] = [:]
     var sessionDiff: SessionDiff?
@@ -100,6 +106,7 @@ final class AppModel {
             }
             await loadSessions()
             await loadShellPolicy()
+            await loadIntegrationPolicy()
         } catch {
             handle(error)
         }
@@ -118,6 +125,11 @@ final class AppModel {
             shellPolicyNetwork = "allow"
             shellPolicyReadDenyText = ""
             shellPolicyStatus = nil
+            integrationPolicy = .disabled
+            integrationAutoResolve = false
+            integrationMaxAutoAttempts = 1
+            integrationMaxTokensText = ""
+            integrationPolicyStatus = nil
             teamPlan = nil
             planTaskStatuses = [:]
             lastCommit = nil
@@ -136,6 +148,7 @@ final class AppModel {
         agents = []
         mergeQueue = []
         Task { await loadShellPolicy() }
+        Task { await loadIntegrationPolicy() }
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -333,6 +346,77 @@ final class AppModel {
         shellPolicyNetwork = "allow"
         shellPolicyReadDenyText = ""
         await saveShellPolicy()
+    }
+
+    func loadIntegrationPolicy() async {
+        guard let projectID = selectedProjectID else {
+            integrationPolicy = .disabled
+            integrationAutoResolve = false
+            integrationMaxAutoAttempts = 1
+            integrationMaxTokensText = ""
+            integrationPolicyStatus = nil
+            return
+        }
+        integrationPolicyBusy = true
+        defer { integrationPolicyBusy = false }
+        do {
+            let policy = try await core.integrationPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            integrationPolicy = policy
+            integrationAutoResolve = policy.autoResolve
+            integrationMaxAutoAttempts = policy.maxAutoAttempts
+            integrationMaxTokensText = policy.maxResolveTokens.map(String.init) ?? ""
+            integrationPolicyStatus = nil
+        } catch {
+            handle(error)
+        }
+    }
+
+    func saveIntegrationPolicy() async {
+        guard let projectID = selectedProjectID else {
+            integrationPolicyStatus = "Select a project first."
+            return
+        }
+        let rawTokens = integrationMaxTokensText.trimmingCharacters(in: .whitespaces)
+        let tokens: Int?
+        if rawTokens.isEmpty {
+            tokens = nil
+        } else if let value = Int(rawTokens), value > 0 {
+            tokens = value
+        } else {
+            integrationPolicyStatus = "Max tokens must be empty or a positive integer."
+            return
+        }
+        integrationPolicyBusy = true
+        defer { integrationPolicyBusy = false }
+        do {
+            let policy = try await core.setIntegrationPolicy(
+                projectID: projectID,
+                policy: IntegrationPolicy(
+                    autoResolve: integrationAutoResolve,
+                    maxAutoAttempts: integrationMaxAutoAttempts,
+                    maxResolveTokens: tokens
+                )
+            )
+            guard projectID == selectedProjectID else { return }
+            integrationPolicy = policy
+            integrationAutoResolve = policy.autoResolve
+            integrationMaxAutoAttempts = policy.maxAutoAttempts
+            integrationMaxTokensText = policy.maxResolveTokens.map(String.init) ?? ""
+            integrationPolicyStatus = policy.autoResolve
+                ? "Auto-resolve enabled · attempts \(policy.maxAutoAttempts)"
+                : "Auto-resolve disabled"
+        } catch {
+            integrationPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func resetIntegrationPolicy() async {
+        integrationAutoResolve = false
+        integrationMaxAutoAttempts = 1
+        integrationMaxTokensText = ""
+        await saveIntegrationPolicy()
     }
 
     func resolveApproval(_ id: String, approved: Bool) async {

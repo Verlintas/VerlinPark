@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    AgentRecord, Approval, Event, MergeQueueEntry, Project, PullRequestResult, Session,
-    SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
+    AgentRecord, Approval, Event, IntegrationPolicy, MergeQueueEntry, Project, PullRequestResult,
+    Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
     SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
@@ -142,6 +142,59 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.set_shell_policy(&project_id, &policy_for_store))
             .await??;
         Ok(policy)
+    }
+
+    pub async fn get_integration_policy(&self, project_id: &str) -> Result<IntegrationPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        tokio::task::spawn_blocking(move || store.get_integration_policy(&project_id)).await?
+    }
+
+    pub async fn set_integration_policy(
+        &self,
+        project_id: &str,
+        policy: IntegrationPolicy,
+    ) -> Result<IntegrationPolicy> {
+        if policy.max_auto_attempts > 5 {
+            anyhow::bail!("max_auto_attempts must be between 0 and 5");
+        }
+        if let Some(tokens) = policy.max_resolve_tokens
+            && !(1_000..=10_000_000).contains(&tokens)
+        {
+            anyhow::bail!("max_resolve_tokens must be between 1000 and 10000000");
+        }
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let for_store = policy.clone();
+        tokio::task::spawn_blocking(move || store.set_integration_policy(&project_id, &for_store))
+            .await??;
+        Ok(policy)
+    }
+
+    pub async fn auto_resolve_attempts(&self, entry_id: &str) -> Result<u32> {
+        let store = self.store.clone();
+        let entry_id = entry_id.to_string();
+        tokio::task::spawn_blocking(move || store.auto_resolve_attempts(&entry_id)).await?
+    }
+
+    pub async fn bump_auto_resolve_attempts(&self, entry_id: &str) -> Result<u32> {
+        let store = self.store.clone();
+        let entry_id = entry_id.to_string();
+        tokio::task::spawn_blocking(move || store.bump_auto_resolve_attempts(&entry_id)).await?
     }
 
     pub async fn create_session(
@@ -1851,6 +1904,67 @@ mod tests {
                     ShellPolicy {
                         network: "allow".into(),
                         read_deny: vec!["relative/path".into()],
+                    },
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_policy_round_trips_and_validates() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("integration-policy".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get_integration_policy(&project.id).await.unwrap(),
+            IntegrationPolicy::default()
+        );
+        let saved = engine
+            .set_integration_policy(
+                &project.id,
+                IntegrationPolicy {
+                    auto_resolve: true,
+                    max_auto_attempts: 3,
+                    max_resolve_tokens: Some(25_000),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(saved.auto_resolve);
+        assert_eq!(
+            engine.get_integration_policy(&project.id).await.unwrap(),
+            saved
+        );
+        assert!(
+            engine
+                .set_integration_policy(
+                    &project.id,
+                    IntegrationPolicy {
+                        auto_resolve: true,
+                        max_auto_attempts: 6,
+                        max_resolve_tokens: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .set_integration_policy(
+                    &project.id,
+                    IntegrationPolicy {
+                        auto_resolve: true,
+                        max_auto_attempts: 1,
+                        max_resolve_tokens: Some(10),
                     },
                 )
                 .await

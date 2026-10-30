@@ -24,15 +24,16 @@ use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes
 use vp_protocol::types::{
     AddProjectParams, AgentListParams, AgentListResult, ApprovalListResult, AuthParams, AuthResult,
     CancelSessionParams, CancelSessionResult, CommitSessionParams, ConfigureAgentParams,
-    CreateSessionParams, DiscardSessionParams, EventListResult, LandSessionParams,
-    ListApprovalsParams, ListEventsParams, ListSessionsParams, MergeQueueListParams,
-    MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectListResult, PromptParams,
-    PromptResult, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
-    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
-    RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams, SessionImportParams,
-    SessionListResult, SessionPauseParams, SessionPauseResult, SessionResumeParams,
-    SessionResumeResult, SessionTodosParams, SessionTodosResult, SetShellPolicyParams,
-    ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
+    CreateSessionParams, DiscardSessionParams, EventListResult, IntegrationPolicyParams,
+    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
+    ListSessionsParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
+    PingResult, ProjectListResult, PromptParams, PromptResult, RehydrateSessionParams,
+    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
+    ResolveMergeResult, RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams,
+    SessionExportParams, SessionImportParams, SessionListResult, SessionPauseParams,
+    SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
+    SessionTodosResult, SetIntegrationPolicyParams, SetShellPolicyParams, ShellPolicyParams,
+    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -97,6 +98,7 @@ async fn main() -> Result<()> {
         started: Instant::now(),
         pid: std::process::id(),
     };
+    state.agent.start_auto_resolver();
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
     let addr = listener.local_addr()?;
@@ -382,6 +384,53 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "project.integration_policy.get" => {
+            match parse_params::<IntegrationPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .get_integration_policy(&params.project_id)
+                    .await
+                {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        IntegrationPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "project.integration_policy.set" => {
+            match parse_params::<SetIntegrationPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_integration_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(policy) => {
+                        let project_id = params.project_id.clone();
+                        if policy.auto_resolve {
+                            let agent = state.agent.clone();
+                            tokio::spawn(async move {
+                                agent.auto_resolve_project(&project_id).await;
+                            });
+                        }
+                        RpcResponse::success(
+                            id,
+                            IntegrationPolicyResult {
+                                project_id: params.project_id,
+                                policy,
+                            },
+                        )
+                    }
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.create" => match parse_params::<CreateSessionParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -600,7 +649,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "agent.configure" => match parse_params::<ConfigureAgentParams>(request.params) {
             Ok(params) => match state.agent.configure(params) {
-                Ok(info) => RpcResponse::success(id, info),
+                Ok(info) => {
+                    let agent = state.agent.clone();
+                    tokio::spawn(async move {
+                        agent.auto_resolve_all().await;
+                    });
+                    RpcResponse::success(id, info)
+                }
                 Err(error) => {
                     RpcResponse::error(id, RpcError::new(codes::INVALID_PARAMS, error.to_string()))
                 }

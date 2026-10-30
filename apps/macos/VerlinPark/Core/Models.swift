@@ -12,6 +12,34 @@ struct ShellPolicy: Codable, Hashable, Sendable {
     }
 }
 
+struct IntegrationPolicy: Codable, Hashable, Sendable {
+    var autoResolve: Bool
+    var maxAutoAttempts: Int
+    var maxResolveTokens: Int?
+
+    static let disabled = IntegrationPolicy(
+        autoResolve: false,
+        maxAutoAttempts: 1,
+        maxResolveTokens: nil
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case autoResolve = "auto_resolve"
+        case maxAutoAttempts = "max_auto_attempts"
+        case maxResolveTokens = "max_resolve_tokens"
+    }
+}
+
+struct IntegrationPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: IntegrationPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
 struct ShellPolicyResult: Codable, Sendable {
     let projectId: String
     let policy: ShellPolicy

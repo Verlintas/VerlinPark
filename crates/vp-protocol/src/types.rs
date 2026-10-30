@@ -31,6 +31,30 @@ fn default_shell_network() -> String {
     "allow".to_string()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationPolicy {
+    #[serde(default)]
+    pub auto_resolve: bool,
+    #[serde(default = "default_auto_resolve_attempts")]
+    pub max_auto_attempts: u32,
+    #[serde(default)]
+    pub max_resolve_tokens: Option<u64>,
+}
+
+impl Default for IntegrationPolicy {
+    fn default() -> Self {
+        Self {
+            auto_resolve: false,
+            max_auto_attempts: default_auto_resolve_attempts(),
+            max_resolve_tokens: None,
+        }
+    }
+}
+
+fn default_auto_resolve_attempts() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -108,6 +132,23 @@ pub struct SetShellPolicyParams {
 pub struct ShellPolicyResult {
     pub project_id: String,
     pub policy: ShellPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IntegrationPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetIntegrationPolicyParams {
+    pub project_id: String,
+    pub policy: IntegrationPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IntegrationPolicyResult {
+    pub project_id: String,
+    pub policy: IntegrationPolicy,
 }
 
 #[derive(Debug, Clone, Deserialize)]
