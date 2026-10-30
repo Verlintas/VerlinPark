@@ -1,0 +1,52 @@
+# ADR-0046: Mailbox retention GC
+
+- **Status:** Accepted
+- **Date:** 2026-10-31
+
+## Context
+
+ADR-0041 introduced the session-scoped typed mailbox. Messages are pull-based and
+persist indefinitely. Long-running sessions with busy Workers can accumulate
+thousands of messages, while there was no way to bound storage or apply a
+project-level retention policy.
+
+Mailbox deletion is more sensitive than artifact deletion because an unread
+message may contain an instruction that has not been consumed.
+
+## Decision
+
+1. **Project policy.** `MailboxPolicy` has optional `max_age_secs` and
+   `max_count`, plus `delete_unread` (default false). Zero limits are rejected.
+2. **Manual GC only.** `mailbox.gc` / `vp mailbox-gc` applies the policy.
+   There is no background or send-triggered deletion in this slice.
+3. **Oldest first.** Candidates are ordered by `created_at`, then ID. Both the
+   age rule and the count rule collect the oldest first; duplicates are removed.
+4. **Unread protection.** Unless `delete_unread` is true, an unread message is
+   skipped even when it is a candidate. GC can therefore leave the mailbox above
+   the configured count when unread messages dominate. It reports only actual
+   deletions.
+5. **APIs and UI.** RPC `mailbox.policy.get/set` and `mailbox.gc`; CLI
+   `mailbox-policy`, `mailbox-policy-set`, `mailbox-gc`; Manage Dash has a
+   Mailbox retention card with a Delete unread toggle and GC now.
+6. **No event per deletion.** GC does not emit a `mailbox.deleted` event, in
+   keeping with artifact GC. The count is returned to the caller; the remaining
+   messages are the projection.
+
+## Consequences
+
+- Users can bound mailbox storage deliberately without silently losing unread
+  instructions.
+- `max_count` is a target, not a guarantee, when unread messages are protected.
+- Automatic retention would need a safe trigger and an audit event; it is not
+  implemented yet.
+- Mailbox rows are deleted with the session; exported bundles still contain the
+  messages present at export time.
+
+## Alternatives considered
+
+- **Delete unread by default:** risks losing instructions; unacceptable for a
+  pull-based mailbox.
+- **Auto GC on every send:** could delete messages before an idle agent reads
+  them; surprising and hard to audit.
+- **Delete by sender or role:** adds policy complexity without solving the
+  storage bound as directly.

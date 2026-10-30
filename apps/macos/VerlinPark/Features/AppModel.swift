@@ -52,6 +52,12 @@ final class AppModel {
     var artifactMaxCountText = ""
     var artifactPolicyBusy = false
     var artifactPolicyStatus: String?
+    var mailboxPolicy = MailboxPolicy.disabled
+    var mailboxMaxAgeText = ""
+    var mailboxMaxCountText = ""
+    var mailboxDeleteUnread = false
+    var mailboxPolicyBusy = false
+    var mailboxPolicyStatus: String?
     var teamPlan: TeamPlan?
     var planTaskStatuses: [String: String] = [:]
     var sessionDiff: SessionDiff?
@@ -132,6 +138,7 @@ final class AppModel {
             await loadShellPolicy()
             await loadIntegrationPolicy()
             await loadArtifactPolicy()
+            await loadMailboxPolicy()
         } catch {
             handle(error)
         }
@@ -165,6 +172,11 @@ final class AppModel {
             artifactMaxAgeText = ""
             artifactMaxCountText = ""
             artifactPolicyStatus = nil
+            mailboxPolicy = .disabled
+            mailboxMaxAgeText = ""
+            mailboxMaxCountText = ""
+            mailboxDeleteUnread = false
+            mailboxPolicyStatus = nil
             teamPlan = nil
             planTaskStatuses = [:]
             lastCommit = nil
@@ -189,6 +201,7 @@ final class AppModel {
         Task { await loadShellPolicy() }
         Task { await loadIntegrationPolicy() }
         Task { await loadArtifactPolicy() }
+        Task { await loadMailboxPolicy() }
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -460,6 +473,88 @@ final class AppModel {
         }
     }
 
+    func loadMailboxPolicy() async {
+        guard let projectID = selectedProjectID else {
+            mailboxPolicy = .disabled
+            mailboxMaxAgeText = ""
+            mailboxMaxCountText = ""
+            mailboxDeleteUnread = false
+            mailboxPolicyStatus = nil
+            return
+        }
+        mailboxPolicyBusy = true
+        defer { mailboxPolicyBusy = false }
+        do {
+            let policy = try await core.mailboxPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            mailboxPolicy = policy
+            mailboxMaxAgeText = policy.maxAgeSecs.map(String.init) ?? ""
+            mailboxMaxCountText = policy.maxCount.map(String.init) ?? ""
+            mailboxDeleteUnread = policy.deleteUnread
+            mailboxPolicyStatus = nil
+        } catch {
+            handle(error)
+        }
+    }
+
+    func saveMailboxPolicy() async {
+        guard let projectID = selectedProjectID else {
+            mailboxPolicyStatus = "Select a project first."
+            return
+        }
+        func optionalInt(_ text: String) -> Int? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty ? nil : Int(trimmed)
+        }
+        let maxAge = optionalInt(mailboxMaxAgeText)
+        let maxCount = optionalInt(mailboxMaxCountText)
+        if (!mailboxMaxAgeText.trimmingCharacters(in: .whitespaces).isEmpty && maxAge == nil)
+            || (!mailboxMaxCountText.trimmingCharacters(in: .whitespaces).isEmpty && maxCount == nil)
+        {
+            mailboxPolicyStatus = "Limits must be empty or positive integers."
+            return
+        }
+        mailboxPolicyBusy = true
+        defer { mailboxPolicyBusy = false }
+        do {
+            let policy = try await core.setMailboxPolicy(
+                projectID: projectID,
+                policy: MailboxPolicy(
+                    maxAgeSecs: maxAge,
+                    maxCount: maxCount,
+                    deleteUnread: mailboxDeleteUnread
+                )
+            )
+            guard projectID == selectedProjectID else { return }
+            mailboxPolicy = policy
+            mailboxPolicyStatus = "Mailbox policy saved"
+        } catch {
+            mailboxPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func resetMailboxPolicy() async {
+        mailboxMaxAgeText = ""
+        mailboxMaxCountText = ""
+        mailboxDeleteUnread = false
+        await saveMailboxPolicy()
+    }
+
+    func gcMailbox() async {
+        guard let projectID = selectedProjectID else { return }
+        mailboxPolicyBusy = true
+        defer { mailboxPolicyBusy = false }
+        do {
+            let result = try await core.gcMailbox(projectID: projectID)
+            mailboxPolicyStatus = "Removed \(result.removed) message(s)"
+            await loadMailbox()
+        } catch {
+            mailboxPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
     func loadArtifactPolicy() async {
         guard let projectID = selectedProjectID else {
             artifactPolicy = .disabled
@@ -468,6 +563,11 @@ final class AppModel {
             artifactMaxAgeText = ""
             artifactMaxCountText = ""
             artifactPolicyStatus = nil
+            mailboxPolicy = .disabled
+            mailboxMaxAgeText = ""
+            mailboxMaxCountText = ""
+            mailboxDeleteUnread = false
+            mailboxPolicyStatus = nil
             return
         }
         artifactPolicyBusy = true

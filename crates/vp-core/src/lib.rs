@@ -11,10 +11,10 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactGcResult, ArtifactPolicy, Event,
-    IntegrationPolicy, MergeQueueEntry, Project, PullRequestResult, Session, SessionBundle,
-    SessionCommit, SessionDiff, SessionImportResult, SessionLandResult, SessionRehydrateResult,
-    SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageEntry,
-    UsageLedgerResult, UsageTotals,
+    IntegrationPolicy, MailboxGcResult, MailboxPolicy, MergeQueueEntry, Project, PullRequestResult,
+    Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
+    SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
+    UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -2459,6 +2459,88 @@ impl Engine {
         let _ = self.events.send(event.clone());
         Ok(event)
     }
+
+    pub async fn get_mailbox_policy(&self, project_id: &str) -> Result<MailboxPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_mailbox_policy(&project_id)).await?
+    }
+
+    pub async fn set_mailbox_policy(
+        &self,
+        project_id: &str,
+        policy: MailboxPolicy,
+    ) -> Result<MailboxPolicy> {
+        if policy.max_age_secs.is_some_and(|value| value == 0) {
+            anyhow::bail!("max_age_secs must be greater than zero");
+        }
+        if policy.max_count.is_some_and(|value| value == 0) {
+            anyhow::bail!("max_count must be greater than zero");
+        }
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let for_store = policy.clone();
+        tokio::task::spawn_blocking(move || store.set_mailbox_policy(&project_id, &for_store))
+            .await??;
+        Ok(policy)
+    }
+
+    pub async fn gc_mailbox(
+        &self,
+        project_id: &str,
+        policy: &MailboxPolicy,
+    ) -> Result<MailboxGcResult> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        let messages = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.list_agent_messages_for_project(&project_id)
+        })
+        .await??;
+        let now = time::OffsetDateTime::now_utc();
+        let mut remove = Vec::new();
+        if let Some(max_age) = policy.max_age_secs {
+            for message in &messages {
+                if let Ok(created) = time::OffsetDateTime::parse(
+                    &message.created_at,
+                    &time::format_description::well_known::Rfc3339,
+                ) && (now - created).whole_seconds().max(0) as u64 > max_age
+                {
+                    remove.push(message.id.clone());
+                }
+            }
+        }
+        if let Some(max_count) = policy.max_count
+            && messages.len() as u64 > max_count
+        {
+            let keep = messages.len() - max_count as usize;
+            remove.extend(messages.iter().take(keep).map(|message| message.id.clone()));
+        }
+        remove.sort();
+        remove.dedup();
+        let mut removed = 0usize;
+        for id in remove {
+            let Some(message) = messages.iter().find(|message| message.id == id) else {
+                continue;
+            };
+            if !policy.delete_unread && message.status == "unread" {
+                continue;
+            }
+            let store = self.store.clone();
+            if tokio::task::spawn_blocking(move || store.delete_agent_message(&id)).await?? {
+                removed += 1;
+            }
+        }
+        Ok(MailboxGcResult { removed })
+    }
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
@@ -2720,6 +2802,115 @@ mod tests {
         assert!(
             std::path::Path::new(first.path.as_ref().unwrap()).exists()
                 || std::path::Path::new(second.path.as_ref().unwrap()).exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_retention_protects_unread_messages() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("mailbox".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "mailbox".into(), None)
+            .await
+            .unwrap();
+        for index in 0..3 {
+            engine
+                .send_agent_message(
+                    &session.id,
+                    "sender",
+                    "Sender",
+                    "receiver",
+                    "Receiver",
+                    "note",
+                    &format!("message {index}"),
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+        }
+        let messages = engine
+            .list_agent_messages(&session.id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 3);
+
+        let policy = engine
+            .set_mailbox_policy(
+                &project.id,
+                MailboxPolicy {
+                    max_age_secs: None,
+                    max_count: Some(2),
+                    delete_unread: false,
+                },
+            )
+            .await
+            .unwrap();
+        let gc = engine.gc_mailbox(&project.id, &policy).await.unwrap();
+        assert_eq!(gc.removed, 0);
+        assert_eq!(
+            engine
+                .list_agent_messages(&session.id, None, false)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+
+        engine
+            .mark_agent_message_read(&messages[0].id)
+            .await
+            .unwrap();
+        let gc = engine.gc_mailbox(&project.id, &policy).await.unwrap();
+        assert_eq!(gc.removed, 1);
+        let remaining = engine
+            .list_agent_messages(&session.id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(!remaining.iter().any(|message| message.id == messages[0].id));
+
+        let policy = engine
+            .set_mailbox_policy(
+                &project.id,
+                MailboxPolicy {
+                    max_age_secs: None,
+                    max_count: Some(1),
+                    delete_unread: true,
+                },
+            )
+            .await
+            .unwrap();
+        let gc = engine.gc_mailbox(&project.id, &policy).await.unwrap();
+        assert_eq!(gc.removed, 1);
+        assert_eq!(
+            engine
+                .list_agent_messages(&session.id, None, false)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            engine
+                .set_mailbox_policy(
+                    &project.id,
+                    MailboxPolicy {
+                        max_age_secs: None,
+                        max_count: Some(0),
+                        delete_unread: false,
+                    },
+                )
+                .await
+                .is_err()
         );
     }
 

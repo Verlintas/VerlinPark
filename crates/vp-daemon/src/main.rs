@@ -28,15 +28,16 @@ use vp_protocol::types::{
     CancelSessionParams, CancelSessionResult, CommitSessionParams, ConfigureAgentParams,
     CreateSessionParams, DiscardSessionParams, EventListResult, IntegrationPolicyParams,
     IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
-    ListSessionsParams, MailboxListParams, MailboxListResult, MarkMessageReadParams,
-    MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams, PingResult,
-    ProjectListResult, PromptParams, PromptResult, RehydrateSessionParams, ReplaySessionParams,
-    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
-    RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams,
-    SessionImportParams, SessionListResult, SessionPauseParams, SessionPauseResult,
-    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
-    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetShellPolicyParams, ShellPolicyParams,
-    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
+    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
+    MailboxPolicyResult, MarkMessageReadParams, MergeQueueListParams, MergeQueueListResult,
+    OpenPullRequestParams, PingResult, ProjectListResult, PromptParams, PromptResult,
+    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
+    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, ServerInfo,
+    SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
+    SessionPauseParams, SessionPauseResult, SessionResumeParams, SessionResumeResult,
+    SessionTodosParams, SessionTodosResult, SetArtifactPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -621,6 +622,49 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Ok(artifacts) => RpcResponse::success(id, ArtifactListResult { artifacts }),
                 Err(error) => internal_error(id, error),
             },
+            Err(response) => response_with_id(id, response),
+        },
+        "mailbox.policy.get" => match parse_params::<MailboxPolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_mailbox_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    MailboxPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mailbox.policy.set" => match parse_params::<SetMailboxPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_mailbox_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    MailboxPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mailbox.gc" => match parse_params::<MailboxGcParams>(request.params) {
+            Ok(params) => {
+                let policy = match state.engine.get_mailbox_policy(&params.project_id).await {
+                    Ok(policy) => policy,
+                    Err(error) => return internal_error(id, error),
+                };
+                match state.engine.gc_mailbox(&params.project_id, &policy).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                }
+            }
             Err(response) => response_with_id(id, response),
         },
         "artifact.policy.get" => match parse_params::<ArtifactPolicyParams>(request.params) {

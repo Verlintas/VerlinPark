@@ -295,6 +295,35 @@ actor CoreClient {
             .policy
     }
 
+    func mailboxPolicy(projectID: String) async throws -> MailboxPolicy {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "mailbox.policy.get", params: params)
+            .decode(MailboxPolicyResult.self)
+            .policy
+    }
+
+    func setMailboxPolicy(
+        projectID: String,
+        policy: MailboxPolicy
+    ) async throws -> MailboxPolicy {
+        var value: [String: JSONValue] = ["delete_unread": .bool(policy.deleteUnread)]
+        value["max_age_secs"] = policy.maxAgeSecs.map { .number(Double($0)) } ?? .null
+        value["max_count"] = policy.maxCount.map { .number(Double($0)) } ?? .null
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object(value),
+        ]
+        return try await request(method: "mailbox.policy.set", params: params)
+            .decode(MailboxPolicyResult.self)
+            .policy
+    }
+
+    func gcMailbox(projectID: String) async throws -> MailboxGcResult {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "mailbox.gc", params: params)
+            .decode(MailboxGcResult.self)
+    }
+
     func gcArtifacts(projectID: String) async throws -> ArtifactGcResult {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "artifact.gc", params: params)

@@ -9,8 +9,8 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
-    MergeQueueEntry, Project, Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem,
-    UsageEntry,
+    MailboxPolicy, MergeQueueEntry, Project, Session, SessionBundle, ShellPolicy, StoredMessage,
+    TodoItem, UsageEntry,
 };
 
 use crate::paths;
@@ -199,6 +199,14 @@ impl Store {
                 max_bytes    INTEGER,
                 max_age_secs INTEGER,
                 max_count    INTEGER,
+                delete_unread INTEGER NOT NULL DEFAULT 0,
+                updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_mailbox_policies (
+                project_id   TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                max_age_secs INTEGER,
+                max_count    INTEGER,
                 updated_at   TEXT NOT NULL
             );
 
@@ -280,6 +288,12 @@ impl Store {
         ensure_column(&conn, "artifacts", "sha256", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "artifacts", "path", "TEXT")?;
         ensure_column(&conn, "usage_ledger", "department", "TEXT")?;
+        ensure_column(
+            &conn,
+            "project_mailbox_policies",
+            "delete_unread",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(
             &conn,
@@ -1003,6 +1017,70 @@ impl Store {
     pub fn delete_artifact(&self, artifact_id: &str) -> Result<bool> {
         let conn = self.lock()?;
         let changed = conn.execute("DELETE FROM artifacts WHERE id = ?1", params![artifact_id])?;
+        Ok(changed > 0)
+    }
+
+    pub fn get_mailbox_policy(&self, project_id: &str) -> Result<MailboxPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT max_age_secs, max_count, delete_unread
+                 FROM project_mailbox_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(MailboxPolicy {
+                        max_age_secs: row.get::<_, Option<i64>>(0)?.map(|value| value as u64),
+                        max_count: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
+                        delete_unread: row.get::<_, i64>(2)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn set_mailbox_policy(&self, project_id: &str, policy: &MailboxPolicy) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_mailbox_policies
+                (project_id, max_age_secs, max_count, delete_unread, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id) DO UPDATE SET
+                max_age_secs = excluded.max_age_secs,
+                max_count = excluded.max_count,
+                delete_unread = excluded.delete_unread,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                policy.max_age_secs.map(|value| value as i64),
+                policy.max_count.map(|value| value as i64),
+                if policy.delete_unread { 1 } else { 0 },
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_agent_messages_for_project(&self, project_id: &str) -> Result<Vec<AgentMessage>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.from_agent_id, m.from_name, m.to_agent_id,
+                    m.to_name, m.kind, m.body, m.payload, m.status, m.created_at, m.read_at
+             FROM agent_messages m
+             JOIN sessions s ON s.id = m.session_id
+             WHERE s.project_id = ?1
+             ORDER BY m.created_at ASC, m.id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], map_agent_message)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn delete_agent_message(&self, message_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "DELETE FROM agent_messages WHERE id = ?1",
+            params![message_id],
+        )?;
         Ok(changed > 0)
     }
 

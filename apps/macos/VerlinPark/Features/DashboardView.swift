@@ -75,6 +75,9 @@ struct DashboardView: View {
                     ArtifactPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    MailboxPolicyCard(project: project)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         SectionLabel(title: "Shell policy")
@@ -365,6 +368,88 @@ private struct ArtifactPolicyCard: View {
         }
         .task(id: project.id) {
             await model.loadArtifactPolicy()
+        }
+    }
+
+    private func limitField(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            TextField("unlimited", text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 9, design: .monospaced))
+                .frame(width: 90)
+        }
+    }
+}
+
+private struct MailboxPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Mailbox retention")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.mailboxPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Toggle("Delete unread", isOn: $model.mailboxDeleteUnread)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+
+            Text(
+                "Mailbox GC removes oldest messages first. Unread messages are protected unless Delete unread is enabled. Limits are optional."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                limitField("Max age secs", text: $model.mailboxMaxAgeText)
+                limitField("Max count", text: $model.mailboxMaxCountText)
+                Spacer()
+                Button("GC now") {
+                    Task { await model.gcMailbox() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.mailboxPolicyBusy)
+                Button("Reset") {
+                    Task { await model.resetMailboxPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.mailboxPolicyBusy)
+                Button("Save policy") {
+                    Task { await model.saveMailboxPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.mailboxPolicyBusy)
+            }
+
+            if let status = model.mailboxPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadMailboxPolicy()
         }
     }
 

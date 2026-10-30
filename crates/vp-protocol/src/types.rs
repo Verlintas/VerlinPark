@@ -336,6 +336,43 @@ pub struct ArtifactPolicyResult {
     pub policy: ArtifactPolicy,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxPolicy {
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+    #[serde(default)]
+    pub max_count: Option<u64>,
+    #[serde(default)]
+    pub delete_unread: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MailboxPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetMailboxPolicyParams {
+    pub project_id: String,
+    pub policy: MailboxPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MailboxPolicyResult {
+    pub project_id: String,
+    pub policy: MailboxPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MailboxGcParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MailboxGcResult {
+    pub removed: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArtifactGcParams {
     pub project_id: String,

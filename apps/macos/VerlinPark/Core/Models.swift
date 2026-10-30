@@ -61,6 +61,38 @@ struct ArtifactPolicy: Codable, Hashable, Sendable {
     }
 }
 
+struct MailboxPolicy: Codable, Hashable, Sendable {
+    var maxAgeSecs: Int?
+    var maxCount: Int?
+    var deleteUnread: Bool
+
+    static let disabled = MailboxPolicy(
+        maxAgeSecs: nil,
+        maxCount: nil,
+        deleteUnread: false
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case maxAgeSecs = "max_age_secs"
+        case maxCount = "max_count"
+        case deleteUnread = "delete_unread"
+    }
+}
+
+struct MailboxPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: MailboxPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
+struct MailboxGcResult: Codable, Sendable {
+    let removed: Int
+}
+
 struct ArtifactPolicyResult: Codable, Sendable {
     let projectId: String
     let policy: ArtifactPolicy

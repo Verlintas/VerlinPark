@@ -129,6 +129,21 @@ enum Command {
     },
     /// Run artifact retention GC for a project.
     Gc { project: String },
+    /// Show the project mailbox retention policy.
+    MailboxPolicy { project: String },
+    /// Update mailbox retention limits.
+    MailboxPolicySet {
+        project: String,
+        #[arg(long)]
+        max_age_secs: Option<u64>,
+        #[arg(long)]
+        max_count: Option<u64>,
+        /// Also delete unread messages (default: read messages only).
+        #[arg(long)]
+        delete_unread: bool,
+    },
+    /// Run mailbox retention GC for a project.
+    MailboxGc { project: String },
     /// Read an artifact by id.
     Artifact { artifact: String },
     /// Show the session merge queue and Integrator results.
@@ -392,6 +407,37 @@ async fn main() -> Result<()> {
         Command::Gc { project } => {
             rpc(&discovery, "artifact.gc", json!({"project_id": project})).await?
         }
+        Command::MailboxPolicy { project } => {
+            rpc(
+                &discovery,
+                "mailbox.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::MailboxPolicySet {
+            project,
+            max_age_secs,
+            max_count,
+            delete_unread,
+        } => {
+            rpc(
+                &discovery,
+                "mailbox.policy.set",
+                json!({
+                    "project_id": project,
+                    "policy": {
+                        "max_age_secs": max_age_secs,
+                        "max_count": max_count,
+                        "delete_unread": delete_unread,
+                    }
+                }),
+            )
+            .await?
+        }
+        Command::MailboxGc { project } => {
+            rpc(&discovery, "mailbox.gc", json!({"project_id": project})).await?
+        }
         Command::Queue { session } => {
             rpc(
                 &discovery,
@@ -614,6 +660,16 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(policy) = value.get("policy") {
+        if policy.get("delete_unread").is_some() {
+            println!(
+                "project {}  mailbox-max-age={}  mailbox-max-count={}  delete-unread={}",
+                value["project_id"].as_str().unwrap_or("?"),
+                policy["max_age_secs"].as_u64().unwrap_or(0),
+                policy["max_count"].as_u64().unwrap_or(0),
+                policy["delete_unread"].as_bool().unwrap_or(false)
+            );
+            return;
+        }
         if policy.get("auto_gc").is_some() {
             println!(
                 "project {}  auto-gc={}  max-bytes={}  max-age={}  max-count={}",
@@ -757,6 +813,13 @@ fn print_human(value: &Value) {
         if let Some(detail) = value["detail"].as_str() {
             println!("{detail}");
         }
+        return;
+    }
+    if value.get("removed").is_some() && value.get("bytes_freed").is_none() {
+        println!(
+            "mailbox GC removed {} message(s)",
+            value["removed"].as_u64().unwrap_or(0)
+        );
         return;
     }
     if value.get("removed").is_some() && value.get("bytes_freed").is_some() {
