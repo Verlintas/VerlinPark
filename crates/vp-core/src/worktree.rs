@@ -246,7 +246,7 @@ pub fn remove(project_root: &Path, worktree: &Path, branch: &str) {
     }
 }
 
-fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
+pub fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
     let reference = format!("refs/heads/{branch}");
     let status = Command::new("git")
         .arg("-C")

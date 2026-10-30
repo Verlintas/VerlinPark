@@ -375,6 +375,10 @@ pub struct SessionRehydrateResult {
     pub branch: String,
     pub commit: String,
     pub status: String,
+    #[serde(default)]
+    pub agents_remapped: usize,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

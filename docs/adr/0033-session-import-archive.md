@@ -33,8 +33,10 @@ would make an old session look runnable while its history no longer matches.
 6. **No automatic rehydration.** Import never creates a worktree silently.
    `session.rehydrate` / `vp rehydrate` is the explicit follow-up: it verifies the
    imported state, creates or attaches the session branch at the stored base
-   commit, updates the worktree path, appends `session.rehydrated`, and returns
-   the session to `idle`.
+   commit, groups imported agent branches and attaches each existing task branch
+   to a new worktree, updates paths, appends `session.rehydrated` and agent
+   snapshots, and returns the session to `idle`. Missing/checked-out branches are
+   reported as warnings and skipped.
 
 ## Consequences
 
@@ -43,8 +45,9 @@ would make an old session look runnable while its history no longer matches.
 - An imported session is inspectable/replayable but not silently mutated or
   resumed.
 - Working import still requires a separate rehydrate step; this is deliberate.
-- Rehydrate needs the target project/repository to be reachable; approvals are
-  imported, but imported agent task-worktrees are not remapped.
+- Rehydrate needs the target project/repository to be reachable; imported agent
+  task-worktrees are remapped when their branches exist and are not checked out
+  elsewhere.
 - Projects with the same ID but a different local root are rejected.
 
 ## Alternatives considered

@@ -1152,12 +1152,92 @@ impl Engine {
         for event in events {
             let _ = self.events.send(event);
         }
+
+        let agents = self.list_agents(&session.id).await?;
+        let data_dir = self.store.data_dir().to_path_buf();
+        let project_root_for_agents = PathBuf::from(&project.root);
+        let canonical_root_for_agents = project_root_for_agents.canonicalize()?;
+        let session_worktree = target_abs.clone();
+        let session_branch = branch.clone();
+        let session_id_for_agents = session.id.clone();
+        let project_id_for_agents = project.id.clone();
+        let mut branch_paths: HashMap<String, PathBuf> = HashMap::new();
+        let mut agents_remapped = 0usize;
+        let mut warnings = Vec::new();
+
+        for agent in agents {
+            let desired = if agent.role == "leader" || agent.role == "manager" {
+                Some((session_worktree.clone(), session_branch.clone()))
+            } else {
+                let Some(agent_branch) = agent.branch.clone() else {
+                    warnings.push(format!(
+                        "{} has no branch; task worktree not remapped",
+                        agent.name
+                    ));
+                    continue;
+                };
+                if agent_branch == session_branch {
+                    Some((session_worktree.clone(), session_branch.clone()))
+                } else if let Some(path) = branch_paths.get(&agent_branch) {
+                    Some((path.clone(), agent_branch))
+                } else {
+                    let target = data_dir
+                        .join("worktrees")
+                        .join(&project_id_for_agents)
+                        .join(&session_id_for_agents)
+                        .join("agents")
+                        .join(&agent.id);
+                    if target.starts_with(&canonical_root_for_agents) {
+                        warnings.push(format!(
+                            "{} task worktree target is inside the project root; skipped",
+                            agent.name
+                        ));
+                        continue;
+                    }
+                    let root = project_root_for_agents.clone();
+                    let branch_for_worktree = agent_branch.clone();
+                    let target_for_worktree = target.clone();
+                    let git_lock = self.git_lock.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _guard = git_lock
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+                        if !worktree::branch_exists(&root, &branch_for_worktree)? {
+                            anyhow::bail!("branch does not exist: {branch_for_worktree}");
+                        }
+                        worktree::rehydrate(&root, &target_for_worktree, &branch_for_worktree, "")
+                    })
+                    .await?;
+                    match result {
+                        Ok(()) => {
+                            branch_paths.insert(agent_branch.clone(), target.clone());
+                            Some((target, agent_branch))
+                        }
+                        Err(error) => {
+                            warnings.push(format!(
+                                "{} task worktree not remapped: {error:#}",
+                                agent.name
+                            ));
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some((worktree_path, branch_name)) = desired {
+                self.set_agent_worktree(&agent.id, &worktree_path.to_string_lossy(), &branch_name)
+                    .await?;
+                agents_remapped += 1;
+            }
+        }
+
         Ok(SessionRehydrateResult {
             session_id: session.id,
             worktree: target_abs.to_string_lossy().to_string(),
             branch,
             commit,
             status: "idle".to_string(),
+            agents_remapped,
+            warnings,
         })
     }
 
@@ -2052,7 +2132,7 @@ mod tests {
             .await
             .unwrap();
         let session = engine
-            .create_session(project.id, "replay".into(), None)
+            .create_session(project.id.clone(), "replay".into(), None)
             .await
             .unwrap();
         engine
@@ -2106,6 +2186,24 @@ mod tests {
         engine.resolve_approval(&approval.id, true).await.unwrap();
         let agent = engine
             .create_agent(&session.id, "worker", "Worker", None, None, "test")
+            .await
+            .unwrap();
+        let agent_task = engine
+            .create_task_worktree(
+                &project.root,
+                &project.id,
+                &session.id,
+                "agent-task",
+                session.branch.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+        engine
+            .set_agent_worktree(
+                &agent.id,
+                &agent_task.path.to_string_lossy(),
+                &agent_task.branch,
+            )
             .await
             .unwrap();
         let entry = engine
@@ -2222,6 +2320,18 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("read-only"));
 
+        let task_remove = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                agent_task.path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(task_remove.status.success());
         worktree::remove(
             repo.path(),
             std::path::Path::new(&original_worktree),
@@ -2238,6 +2348,15 @@ mod tests {
         assert_eq!(rehydrated.status, "idle");
         assert_eq!(rehydrated.worktree, rehydrated_worktree.to_string_lossy());
         assert!(rehydrated_worktree.join(".git").is_file());
+        assert!(rehydrated.agents_remapped >= 1, "{:?}", rehydrated.warnings);
+        let remapped_agents = imported_engine.list_agents(&session.id).await.unwrap();
+        let remapped_agent = remapped_agents
+            .iter()
+            .find(|candidate| candidate.id == agent.id)
+            .unwrap();
+        let remapped_path = remapped_agent.worktree.clone().unwrap();
+        assert_ne!(remapped_path, agent_task.path.to_string_lossy().to_string());
+        assert!(std::path::Path::new(&remapped_path).join(".git").is_file());
         let rehydrated_report = imported_engine.replay_session(&session.id).await.unwrap();
         assert!(
             rehydrated_report.consistent,
