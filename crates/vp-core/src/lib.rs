@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    AgentRecord, Approval, Event, IntegrationPolicy, MergeQueueEntry, Project, PullRequestResult,
-    Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
-    SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
+    AgentMessage, AgentRecord, Approval, Artifact, Event, IntegrationPolicy, MergeQueueEntry,
+    Project, PullRequestResult, Session, SessionBundle, SessionCommit, SessionDiff,
+    SessionImportResult, SessionLandResult, SessionRehydrateResult, SessionReplayReport,
+    ShellPolicy, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -783,6 +784,142 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_agent_message(
+        &self,
+        session_id: &str,
+        from_agent_id: &str,
+        from_name: &str,
+        to_agent_id: &str,
+        to_name: &str,
+        kind: &str,
+        body: &str,
+        payload: serde_json::Value,
+    ) -> Result<AgentMessage> {
+        if kind.trim().is_empty() || kind.len() > 64 {
+            anyhow::bail!("message kind must be 1-64 characters");
+        }
+        if body.len() > 20_000 {
+            anyhow::bail!("message body exceeds 20000 bytes");
+        }
+        if serde_json::to_string(&payload)
+            .map(|encoded| encoded.len() > 20_000)
+            .unwrap_or(true)
+        {
+            anyhow::bail!("message payload exceeds 20000 bytes");
+        }
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let from_agent_id = from_agent_id.to_string();
+        let from_name = from_name.to_string();
+        let to_agent_id = to_agent_id.to_string();
+        let to_name = to_name.to_string();
+        let kind = kind.to_string();
+        let body = body.to_string();
+        let (message, event) = tokio::task::spawn_blocking(move || {
+            store.create_agent_message_with_event(
+                &session_id,
+                &from_agent_id,
+                &from_name,
+                &to_agent_id,
+                &to_name,
+                &kind,
+                &body,
+                &payload,
+            )
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(message)
+    }
+
+    pub async fn list_agent_messages(
+        &self,
+        session_id: &str,
+        to_agent_id: Option<String>,
+        unread_only: bool,
+    ) -> Result<Vec<AgentMessage>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            store.list_agent_messages(&session_id, to_agent_id.as_deref(), unread_only)
+        })
+        .await?
+    }
+
+    pub async fn mark_agent_message_read(&self, message_id: &str) -> Result<Option<AgentMessage>> {
+        let store = self.store.clone();
+        let message_id = message_id.to_string();
+        let marked =
+            tokio::task::spawn_blocking(move || store.mark_agent_message_read(&message_id))
+                .await??;
+        match marked {
+            Some((message, event)) => {
+                if let Some(event) = event {
+                    let _ = self.events.send(event);
+                }
+                Ok(Some(message))
+            }
+            None => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_artifact(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<String>,
+        name: &str,
+        kind: &str,
+        mime_type: &str,
+        content: &str,
+    ) -> Result<Artifact> {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 200 {
+            anyhow::bail!("artifact name must be 1-200 characters");
+        }
+        if content.len() > 100_000 {
+            anyhow::bail!("artifact content exceeds 100000 bytes");
+        }
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+        let agent_name = agent_name.to_string();
+        let name = name.to_string();
+        let kind = kind.to_string();
+        let mime_type = mime_type.to_string();
+        let content = content.to_string();
+        let (artifact, event) = tokio::task::spawn_blocking(move || {
+            store.create_artifact_with_event(
+                &session_id,
+                &agent_id,
+                &agent_name,
+                task_id.as_deref(),
+                &name,
+                &kind,
+                &mime_type,
+                &content,
+            )
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(artifact)
+    }
+
+    pub async fn list_artifacts(&self, session_id: &str) -> Result<Vec<Artifact>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_artifacts(&session_id)).await?
+    }
+
+    pub async fn get_artifact(&self, artifact_id: &str) -> Result<Option<Artifact>> {
+        let store = self.store.clone();
+        let artifact_id = artifact_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_artifact(&artifact_id)).await?
+    }
+
     pub async fn record_estimated_usage(
         &self,
         session_id: &str,
@@ -1432,9 +1569,22 @@ impl Engine {
         let data = self.load_replay_data(session_id).await?;
         let store = self.store.clone();
         let project_id = data.session.project_id.clone();
-        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+        let project_store = store.clone();
+        let project = tokio::task::spawn_blocking(move || project_store.get_project(&project_id))
             .await??
             .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let session_id = data.session.id.clone();
+        let message_store = store.clone();
+        let messages_session = session_id.clone();
+        let agent_messages = tokio::task::spawn_blocking(move || {
+            message_store.list_agent_messages(&messages_session, None, false)
+        })
+        .await??;
+        let artifact_store = store;
+        let artifacts_session = session_id;
+        let artifacts =
+            tokio::task::spawn_blocking(move || artifact_store.list_artifacts(&artifacts_session))
+                .await??;
         let team_plan = data
             .plan
             .as_deref()
@@ -1451,6 +1601,8 @@ impl Engine {
             todos: data.todos,
             approvals: data.approvals,
             merge_queue: data.queue,
+            agent_messages,
+            artifacts,
         })
     }
 
@@ -2606,6 +2758,33 @@ mod tests {
         let agents = engine.list_agents(&session.id).await.unwrap();
         assert_eq!(agents[0].status, "running");
 
+        engine
+            .send_agent_message(
+                &session.id,
+                &agent.id,
+                &agent.name,
+                &agent.id,
+                &agent.name,
+                "note",
+                "bundle mailbox note",
+                serde_json::json!({"bundle": true}),
+            )
+            .await
+            .unwrap();
+        engine
+            .publish_artifact(
+                &session.id,
+                &agent.id,
+                &agent.name,
+                Some("T1".into()),
+                "bundle-note.md",
+                "note",
+                "text/markdown",
+                "artifact content",
+            )
+            .await
+            .unwrap();
+
         let bundle = engine.export_session(&session.id).await.unwrap();
         assert_eq!(bundle.version, 1);
         assert_eq!(bundle.session.id, session.id);
@@ -2615,6 +2794,8 @@ mod tests {
         assert_eq!(bundle.approvals.len(), 1);
         assert_eq!(bundle.approvals[0].status, "approved");
         assert_eq!(bundle.merge_queue.len(), 1);
+        assert_eq!(bundle.agent_messages.len(), 1);
+        assert_eq!(bundle.artifacts.len(), 1);
         assert!(bundle.team_plan.is_some());
         assert!(!bundle.events.is_empty());
         let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
@@ -2633,6 +2814,22 @@ mod tests {
         let imported = imported_engine.import_session(bundle).await.unwrap();
         assert_eq!(imported.session_id, session.id);
         assert_eq!(imported.status, "imported");
+        assert_eq!(
+            imported_engine
+                .list_agent_messages(&session.id, None, false)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            imported_engine
+                .list_artifacts(&session.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         let imported_sessions = imported_engine
             .list_sessions(Some(imported.project_id.clone()))
             .await

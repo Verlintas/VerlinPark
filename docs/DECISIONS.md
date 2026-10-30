@@ -50,6 +50,7 @@
 | [0038](adr/0038-policy-gated-auto-resolve.md) | 项目级 opt-in 自动冲突解决 + caps | Accepted | 自动化/成本/审计 |
 | [0039](adr/0039-global-session-cap-scope-locks.md) | 全局 session admission + 跨 session 写作用域锁 | Accepted | 调度/并发/隔离 |
 | [0040](adr/0040-per-role-models-usd-time-budgets.md) | 分角色模型 + USD/时间预算 | Accepted | 模型/成本/控制 |
+| [0041](adr/0041-typed-mailbox-artifact-store.md) | Session-scoped typed mailbox + text artifact store | Accepted | 协作/持久化/审计 |
 
 ---
 

@@ -3079,6 +3079,14 @@ async fn run_loop(
             let is_deliberate =
                 call.name == "deliberate_team_plan" && spec.role == AgentRole::Leader;
             let is_todo = call.name == "todo_write" && spec.role == AgentRole::Leader;
+            let is_mailbox_tool = matches!(
+                call.name.as_str(),
+                "send_message"
+                    | "read_mailbox"
+                    | "publish_artifact"
+                    | "list_artifacts"
+                    | "read_artifact"
+            );
             let registry_tool = config
                 .tools
                 .get(&call.name)
@@ -3090,6 +3098,7 @@ async fn run_loop(
                     || is_team_plan
                     || is_run_plan
                     || is_todo
+                    || is_mailbox_tool
                 {
                     false
                 } else {
@@ -3222,6 +3231,23 @@ async fn run_loop(
                         ToolOutput::ok(summary)
                     }
                     Err(error) => ToolOutput::error(error.to_string()),
+                }
+            } else if is_mailbox_tool {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_mailbox_tool(engine, session, spec, &call.name, input.clone()).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("mailbox error: {error}")),
                 }
             } else if is_verdict {
                 emit(
@@ -3624,6 +3650,157 @@ async fn run_loop(
     Err(anyhow!("maximum turns reached"))
 }
 
+async fn run_mailbox_tool(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<ToolOutput> {
+    match name {
+        "send_message" => {
+            let to = input
+                .get("to")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("to is required"))?;
+            let kind = input
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("kind is required"))?;
+            let body = input
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("body is required"))?;
+            let payload = input
+                .get("payload")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let agents = engine.list_agents(&session.id).await?;
+            let target = agents
+                .iter()
+                .find(|agent| {
+                    agent.id == to || agent.name == to || agent.name.eq_ignore_ascii_case(to)
+                })
+                .ok_or_else(|| anyhow!("agent not found in this session: {to}"))?;
+            let message = engine
+                .send_agent_message(
+                    &session.id,
+                    &spec.id,
+                    &spec.name,
+                    &target.id,
+                    &target.name,
+                    kind,
+                    body,
+                    payload,
+                )
+                .await?;
+            Ok(ToolOutput::ok(format!(
+                "message {} sent to {} ({})",
+                message.id, message.to_name, message.kind
+            )))
+        }
+        "read_mailbox" => {
+            let unread_only = input
+                .get("unread_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let messages = engine
+                .list_agent_messages(&session.id, Some(spec.id.clone()), unread_only)
+                .await?;
+            let mut text = String::new();
+            for message in &messages {
+                if message.status == "unread" {
+                    let _ = engine.mark_agent_message_read(&message.id).await;
+                }
+                text.push_str(&format!(
+                    "[{}] {} · {} · {}
+{}
+",
+                    message.id, message.from_name, message.kind, message.created_at, message.body
+                ));
+            }
+            if text.is_empty() {
+                text.push_str("No messages.");
+            }
+            Ok(ToolOutput::ok(text))
+        }
+        "publish_artifact" => {
+            let name = input
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("name is required"))?;
+            let content = input
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("content is required"))?;
+            let kind = input
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("note");
+            let mime_type = input
+                .get("mime_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("text/plain");
+            let artifact = engine
+                .publish_artifact(
+                    &session.id,
+                    &spec.id,
+                    &spec.name,
+                    spec.task_id.clone(),
+                    name,
+                    kind,
+                    mime_type,
+                    content,
+                )
+                .await?;
+            Ok(ToolOutput::ok(format!(
+                "artifact {} published: {}",
+                artifact.id, artifact.name
+            )))
+        }
+        "list_artifacts" => {
+            let artifacts = engine.list_artifacts(&session.id).await?;
+            if artifacts.is_empty() {
+                return Ok(ToolOutput::ok("No artifacts."));
+            }
+            let text = artifacts
+                .iter()
+                .map(|artifact| {
+                    format!(
+                        "{}  {}  {}  {} bytes  {}",
+                        artifact.id,
+                        artifact.name,
+                        artifact.kind,
+                        artifact.content.len(),
+                        artifact.agent_name
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
+            Ok(ToolOutput::ok(text))
+        }
+        "read_artifact" => {
+            let id = input
+                .get("artifact_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("artifact_id is required"))?;
+            let artifact = engine
+                .get_artifact(id)
+                .await?
+                .ok_or_else(|| anyhow!("artifact not found: {id}"))?;
+            Ok(ToolOutput::ok(format!(
+                "{} [{}]
+{}",
+                artifact.name, artifact.mime_type, artifact.content
+            )))
+        }
+        other => Err(anyhow!("unknown mailbox tool: {other}")),
+    }
+}
+
 fn model_for(config: &AgentConfig, role: AgentRole) -> String {
     config
         .role_models
@@ -3660,6 +3837,60 @@ fn tool_schemas(
         .into_iter()
         .filter(|tool| role.allows_tool(profile, &tool.name))
         .collect::<Vec<_>>();
+    tools.push(ToolSchema {
+        name: "send_message".to_string(),
+        description: "Send a typed message to another agent in this session.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Target agent id or unique name"},
+                "kind": {"type": "string", "description": "e.g. question, handoff, result, review"},
+                "body": {"type": "string"},
+                "payload": {"type": "object"}
+            },
+            "required": ["to", "kind", "body"]
+        }),
+    });
+    tools.push(ToolSchema {
+        name: "read_mailbox".to_string(),
+        description: "Read messages addressed to this agent. Marks returned unread messages read."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "unread_only": {"type": "boolean"}
+            }
+        }),
+    });
+    tools.push(ToolSchema {
+        name: "publish_artifact".to_string(),
+        description: "Publish a text artifact so other agents and the user can reference it."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "kind": {"type": "string"},
+                "mime_type": {"type": "string"},
+                "content": {"type": "string", "maxLength": 100000}
+            },
+            "required": ["name", "content"]
+        }),
+    });
+    tools.push(ToolSchema {
+        name: "list_artifacts".to_string(),
+        description: "List artifacts published in this session.".to_string(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    });
+    tools.push(ToolSchema {
+        name: "read_artifact".to_string(),
+        description: "Read one artifact by id.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"artifact_id": {"type": "string"}},
+            "required": ["artifact_id"]
+        }),
+    });
     if role == AgentRole::Leader {
         tools.push(ToolSchema {
             name: "todo_write".to_string(),
@@ -7660,6 +7891,100 @@ mod tests {
                 ])))
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mailbox_tools_send_read_and_publish() {
+        let dir = TempDir::new().unwrap();
+        let (engine, _service, project) = test_service(&dir);
+        let session = engine
+            .create_session(project.id.clone(), "mailbox".into(), None)
+            .await
+            .unwrap();
+        let leader = engine
+            .create_agent(&session.id, "leader", "Leader", None, None, "test")
+            .await
+            .unwrap();
+        let worker = engine
+            .create_agent(&session.id, "worker", "Worker", None, None, "test")
+            .await
+            .unwrap();
+        let spec = AgentSpec {
+            id: leader.id.clone(),
+            role: AgentRole::Leader,
+            name: leader.name.clone(),
+            depth: 0,
+            parent_name: None,
+            title: None,
+            task_id: None,
+            profile: AgentProfile::Generic,
+            allow_delegation: true,
+            auto_approve: false,
+            worktree: PathBuf::from(session.worktree.clone().unwrap()),
+            branch: session.branch.clone().unwrap(),
+            session_worktree: PathBuf::from(session.worktree.clone().unwrap()),
+            session_branch: session.branch.clone().unwrap(),
+            write_scope: Vec::new(),
+            base_commit: session.base_commit.clone().unwrap(),
+        };
+        let sent = run_mailbox_tool(
+            &engine,
+            &session,
+            &spec,
+            "send_message",
+            serde_json::json!({
+                "to": worker.name,
+                "kind": "handoff",
+                "body": "Please build the API",
+                "payload": {"task": "T1"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!sent.is_error, "{}", sent.content);
+        let worker_spec = AgentSpec {
+            id: worker.id.clone(),
+            name: worker.name.clone(),
+            ..spec.clone()
+        };
+        let read = run_mailbox_tool(
+            &engine,
+            &session,
+            &worker_spec,
+            "read_mailbox",
+            serde_json::json!({"unread_only": true}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            read.content.contains("Please build the API"),
+            "{}",
+            read.content
+        );
+        let published = run_mailbox_tool(
+            &engine,
+            &session,
+            &worker_spec,
+            "publish_artifact",
+            serde_json::json!({
+                "name": "worker-notes.md",
+                "kind": "note",
+                "content": "# notes"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!published.is_error, "{}", published.content);
+        let artifacts = run_mailbox_tool(
+            &engine,
+            &session,
+            &worker_spec,
+            "list_artifacts",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert!(artifacts.content.contains("worker-notes.md"));
     }
 
     #[tokio::test]

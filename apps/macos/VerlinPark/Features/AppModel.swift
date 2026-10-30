@@ -30,6 +30,8 @@ final class AppModel {
     var todos: [TodoItem] = []
     var agents: [AgentRecord] = []
     var mergeQueue: [MergeQueueEntry] = []
+    var mailbox: [AgentMessage] = []
+    var artifacts: [Artifact] = []
     var shellPolicy = ShellPolicy.allow
     var shellPolicyNetwork = "allow"
     var shellPolicyReadDenyText = ""
@@ -134,6 +136,8 @@ final class AppModel {
             todos = []
             agents = []
             mergeQueue = []
+            mailbox = []
+            artifacts = []
             shellPolicy = .allow
             shellPolicyNetwork = "allow"
             shellPolicyReadDenyText = ""
@@ -160,6 +164,8 @@ final class AppModel {
         todos = []
         agents = []
         mergeQueue = []
+        mailbox = []
+        artifacts = []
         Task { await loadShellPolicy() }
         Task { await loadIntegrationPolicy() }
         teamPlan = nil
@@ -193,6 +199,7 @@ final class AppModel {
             await loadTodos()
             await loadAgents()
             await loadMergeQueue()
+            await loadMailbox()
             await loadTeamPlan()
             await loadDiff()
         }
@@ -600,6 +607,32 @@ final class AppModel {
         }
     }
 
+    func loadMailbox() async {
+        guard let sessionID = selectedSessionID else {
+            mailbox = []
+            artifacts = []
+            return
+        }
+        do {
+            let messages = try await core.listMailbox(sessionID: sessionID)
+            let published = try await core.listArtifacts(sessionID: sessionID)
+            guard sessionID == selectedSessionID else { return }
+            mailbox = messages
+            artifacts = published
+        } catch {
+            // The event stream will retry on mailbox/artifact events.
+        }
+    }
+
+    func markMessageRead(_ messageID: String) async {
+        do {
+            _ = try await core.markMessageRead(messageID: messageID)
+            await loadMailbox()
+        } catch {
+            handle(error)
+        }
+    }
+
     func loadMergeQueue() async {
         guard let sessionID = selectedSessionID else {
             mergeQueue = []
@@ -890,6 +923,12 @@ final class AppModel {
                 await self.loadMergeQueue()
                 await self.loadDiff()
             }
+        }
+
+        if event.sessionId == selectedSessionID,
+           event.type.hasPrefix("mailbox.") || event.type.hasPrefix("artifact.")
+        {
+            Task { await self.loadMailbox() }
         }
 
         if event.sessionId == selectedSessionID,

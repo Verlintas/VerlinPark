@@ -22,11 +22,13 @@ use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
-    AddProjectParams, AgentListParams, AgentListResult, ApprovalListResult, AuthParams, AuthResult,
-    CancelSessionParams, CancelSessionResult, CommitSessionParams, ConfigureAgentParams,
-    CreateSessionParams, DiscardSessionParams, EventListResult, IntegrationPolicyParams,
-    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
-    ListSessionsParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
+    AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, ApprovalListResult,
+    ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactResult, AuthParams,
+    AuthResult, CancelSessionParams, CancelSessionResult, CommitSessionParams,
+    ConfigureAgentParams, CreateSessionParams, DiscardSessionParams, EventListResult,
+    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
+    ListEventsParams, ListSessionsParams, MailboxListParams, MailboxListResult,
+    MarkMessageReadParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
     PingResult, ProjectListResult, PromptParams, PromptResult, RehydrateSessionParams,
     ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
     ResolveMergeResult, RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams,
@@ -576,6 +578,50 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "agent.list" => match parse_params::<AgentListParams>(request.params) {
             Ok(params) => match state.engine.list_agents(&params.session_id).await {
                 Ok(agents) => RpcResponse::success(id, AgentListResult { agents }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mailbox.list" => match parse_params::<MailboxListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .list_agent_messages(&params.session_id, params.agent_id, params.unread_only)
+                .await
+            {
+                Ok(messages) => RpcResponse::success(id, MailboxListResult { messages }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mailbox.read" => match parse_params::<MarkMessageReadParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .mark_agent_message_read(&params.message_id)
+                .await
+            {
+                Ok(Some(message)) => RpcResponse::success(id, AgentMessageResult { message }),
+                Ok(None) => RpcResponse::error(
+                    id,
+                    RpcError::new(codes::INVALID_PARAMS, "message not found".to_string()),
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "artifact.list" => match parse_params::<ArtifactListParams>(request.params) {
+            Ok(params) => match state.engine.list_artifacts(&params.session_id).await {
+                Ok(artifacts) => RpcResponse::success(id, ArtifactListResult { artifacts }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "artifact.get" => match parse_params::<ArtifactGetParams>(request.params) {
+            Ok(params) => match state.engine.get_artifact(&params.artifact_id).await {
+                Ok(Some(artifact)) => RpcResponse::success(id, ArtifactResult { artifact }),
+                Ok(None) => RpcResponse::error(
+                    id,
+                    RpcError::new(codes::INVALID_PARAMS, "artifact not found".to_string()),
+                ),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

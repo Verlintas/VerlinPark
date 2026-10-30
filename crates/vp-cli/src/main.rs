@@ -99,6 +99,20 @@ enum Command {
     TeamPlan { session: String },
     /// List the agents spawned for a session.
     Agents { session: String },
+    /// List typed agent messages.
+    Mailbox {
+        session: String,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        unread: bool,
+    },
+    /// Mark a typed agent message as read.
+    ReadMessage { message: String },
+    /// List published artifacts.
+    Artifacts { session: String },
+    /// Read an artifact by id.
+    Artifact { artifact: String },
     /// Show the session merge queue and Integrator results.
     Queue { session: String },
     /// Retry a conflicted or failed merge queue entry after rebasing it.
@@ -298,6 +312,31 @@ async fn main() -> Result<()> {
         }
         Command::Agents { session } => {
             rpc(&discovery, "agent.list", json!({"session_id": session})).await?
+        }
+        Command::Mailbox {
+            session,
+            agent,
+            unread,
+        } => {
+            rpc(
+                &discovery,
+                "mailbox.list",
+                json!({
+                    "session_id": session,
+                    "agent_id": agent,
+                    "unread_only": unread,
+                }),
+            )
+            .await?
+        }
+        Command::ReadMessage { message } => {
+            rpc(&discovery, "mailbox.read", json!({"message_id": message})).await?
+        }
+        Command::Artifacts { session } => {
+            rpc(&discovery, "artifact.list", json!({"session_id": session})).await?
+        }
+        Command::Artifact { artifact } => {
+            rpc(&discovery, "artifact.get", json!({"artifact_id": artifact})).await?
         }
         Command::Queue { session } => {
             rpc(
@@ -621,6 +660,63 @@ fn print_human(value: &Value) {
         if let Some(detail) = value["detail"].as_str() {
             println!("{detail}");
         }
+        return;
+    }
+    if let Some(messages) = value.get("messages").and_then(Value::as_array) {
+        if messages.is_empty() {
+            println!("Mailbox is empty.");
+        }
+        for message in messages {
+            println!(
+                "{}  {} → {}  {}  [{}]",
+                message["id"].as_str().unwrap_or("?"),
+                message["from_name"].as_str().unwrap_or("?"),
+                message["to_name"].as_str().unwrap_or("?"),
+                message["kind"].as_str().unwrap_or("?"),
+                message["status"].as_str().unwrap_or("?")
+            );
+            if let Some(body) = message["body"].as_str() {
+                println!("  {body}");
+            }
+        }
+        return;
+    }
+    if let Some(message) = value.get("message") {
+        println!(
+            "{} → {}  {}  [{}]",
+            message["from_name"].as_str().unwrap_or("?"),
+            message["to_name"].as_str().unwrap_or("?"),
+            message["kind"].as_str().unwrap_or("?"),
+            message["status"].as_str().unwrap_or("?")
+        );
+        if let Some(body) = message["body"].as_str() {
+            println!("{body}");
+        }
+        return;
+    }
+    if let Some(artifacts) = value.get("artifacts").and_then(Value::as_array) {
+        if artifacts.is_empty() {
+            println!("No artifacts.");
+        }
+        for artifact in artifacts {
+            println!(
+                "{}  {:<24} {:<10} {}",
+                artifact["id"].as_str().unwrap_or("?"),
+                artifact["name"].as_str().unwrap_or("?"),
+                artifact["kind"].as_str().unwrap_or("?"),
+                artifact["agent_name"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if let Some(artifact) = value.get("artifact") {
+        println!(
+            "{}  {}  [{}]",
+            artifact["name"].as_str().unwrap_or("?"),
+            artifact["kind"].as_str().unwrap_or("?"),
+            artifact["mime_type"].as_str().unwrap_or("?")
+        );
+        println!("{}", artifact["content"].as_str().unwrap_or(""));
         return;
     }
     if let Some(entries) = value.get("entries").and_then(Value::as_array) {

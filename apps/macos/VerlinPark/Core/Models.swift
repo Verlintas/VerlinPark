@@ -193,6 +193,78 @@ struct RPCEnvelope: Codable, Sendable {
     let params: JSONValue?
 }
 
+struct AgentMessage: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    let fromAgentId: String
+    let fromName: String
+    let toAgentId: String
+    let toName: String
+    let kind: String
+    let body: String
+    let payload: JSONValue
+    let status: String
+    let createdAt: String
+    let readAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case fromAgentId = "from_agent_id"
+        case fromName = "from_name"
+        case toAgentId = "to_agent_id"
+        case toName = "to_name"
+        case kind
+        case body
+        case payload
+        case status
+        case createdAt = "created_at"
+        case readAt = "read_at"
+    }
+}
+
+struct Artifact: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    let agentId: String
+    let agentName: String
+    let taskId: String?
+    let name: String
+    let kind: String
+    let mimeType: String
+    let content: String
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case taskId = "task_id"
+        case name
+        case kind
+        case mimeType = "mime_type"
+        case content
+        case createdAt = "created_at"
+    }
+}
+
+struct MailboxListResult: Codable, Sendable {
+    let messages: [AgentMessage]
+}
+
+struct ArtifactListResult: Codable, Sendable {
+    let artifacts: [Artifact]
+}
+
+struct ArtifactResult: Codable, Sendable {
+    let artifact: Artifact
+}
+
+struct AgentMessageResult: Codable, Sendable {
+    let message: AgentMessage
+}
+
 struct Approval: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let sessionId: String

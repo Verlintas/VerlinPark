@@ -264,6 +264,83 @@ pub struct StoredMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMessage {
+    pub id: String,
+    pub session_id: String,
+    pub from_agent_id: String,
+    pub from_name: String,
+    pub to_agent_id: String,
+    pub to_name: String,
+    pub kind: String,
+    pub body: String,
+    #[serde(default)]
+    pub payload: Value,
+    pub status: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub read_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Artifact {
+    pub id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    pub name: String,
+    pub kind: String,
+    pub mime_type: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MailboxListParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub unread_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MailboxListResult {
+    pub messages: Vec<AgentMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarkMessageReadParams {
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentMessageResult {
+    pub message: AgentMessage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactListParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactListResult {
+    pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactGetParams {
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactResult {
+    pub artifact: Artifact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Approval {
     pub id: String,
     pub session_id: String,
@@ -566,6 +643,10 @@ pub struct SessionBundle {
     #[serde(default)]
     pub approvals: Vec<Approval>,
     pub merge_queue: Vec<MergeQueueEntry>,
+    #[serde(default)]
+    pub agent_messages: Vec<AgentMessage>,
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

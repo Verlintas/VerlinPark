@@ -233,6 +233,44 @@ actor CoreClient {
             .agents
     }
 
+    func listMailbox(
+        sessionID: String,
+        agentID: String? = nil,
+        unreadOnly: Bool = false
+    ) async throws -> [AgentMessage] {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "unread_only": .bool(unreadOnly),
+        ]
+        if let agentID {
+            params["agent_id"] = .string(agentID)
+        }
+        return try await request(method: "mailbox.list", params: params)
+            .decode(MailboxListResult.self)
+            .messages
+    }
+
+    func markMessageRead(messageID: String) async throws -> AgentMessage {
+        let params: [String: JSONValue] = ["message_id": .string(messageID)]
+        return try await request(method: "mailbox.read", params: params)
+            .decode(AgentMessageResult.self)
+            .message
+    }
+
+    func listArtifacts(sessionID: String) async throws -> [Artifact] {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "artifact.list", params: params)
+            .decode(ArtifactListResult.self)
+            .artifacts
+    }
+
+    func getArtifact(artifactID: String) async throws -> Artifact {
+        let params: [String: JSONValue] = ["artifact_id": .string(artifactID)]
+        return try await request(method: "artifact.get", params: params)
+            .decode(ArtifactResult.self)
+            .artifact
+    }
+
     func listMergeQueue(sessionID: String) async throws -> [MergeQueueEntry] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "merge_queue.list", params: params)

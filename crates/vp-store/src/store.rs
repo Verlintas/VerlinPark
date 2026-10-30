@@ -8,8 +8,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AgentRecord, Approval, Event, IntegrationPolicy, MergeQueueEntry, Project, Session,
-    SessionBundle, ShellPolicy, StoredMessage, TodoItem,
+    AgentMessage, AgentRecord, Approval, Artifact, Event, IntegrationPolicy, MergeQueueEntry,
+    Project, Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem,
 };
 
 use crate::paths;
@@ -134,6 +134,40 @@ impl Store {
                 tool_call_id TEXT,
                 created_at   TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS agent_messages (
+                id            TEXT PRIMARY KEY,
+                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                from_agent_id TEXT NOT NULL,
+                from_name     TEXT NOT NULL,
+                to_agent_id   TEXT NOT NULL,
+                to_name       TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                body          TEXT NOT NULL,
+                payload       TEXT NOT NULL DEFAULT '{}',
+                status        TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                read_at       TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_messages_session
+                ON agent_messages(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id         TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                agent_id   TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                task_id    TEXT,
+                name       TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                mime_type  TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_artifacts_session
+                ON artifacts(session_id, created_at);
 
             CREATE TABLE IF NOT EXISTS approvals (
                 id           TEXT PRIMARY KEY,
@@ -545,6 +579,221 @@ impl Store {
             params![worktree, branch, session_id],
         )?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_agent_message_with_event(
+        &self,
+        session_id: &str,
+        from_agent_id: &str,
+        from_name: &str,
+        to_agent_id: &str,
+        to_name: &str,
+        kind: &str,
+        body: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(AgentMessage, Event)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let message = AgentMessage {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            from_agent_id: from_agent_id.to_string(),
+            from_name: from_name.to_string(),
+            to_agent_id: to_agent_id.to_string(),
+            to_name: to_name.to_string(),
+            kind: kind.to_string(),
+            body: body.to_string(),
+            payload: payload.clone(),
+            status: "unread".to_string(),
+            created_at: now_rfc3339(),
+            read_at: None,
+        };
+        tx.execute(
+            "INSERT INTO agent_messages
+             (id, session_id, from_agent_id, from_name, to_agent_id, to_name,
+              kind, body, payload, status, created_at, read_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL)",
+            params![
+                message.id,
+                message.session_id,
+                message.from_agent_id,
+                message.from_name,
+                message.to_agent_id,
+                message.to_name,
+                message.kind,
+                message.body,
+                serde_json::to_string(&message.payload)?,
+                message.status,
+                message.created_at
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "mailbox.message_sent",
+            serde_json::to_value(&message)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((message, event))
+    }
+
+    pub fn list_agent_messages(
+        &self,
+        session_id: &str,
+        to_agent_id: Option<&str>,
+        unread_only: bool,
+    ) -> Result<Vec<AgentMessage>> {
+        let conn = self.lock()?;
+        let mut sql = String::from(
+            "SELECT id, session_id, from_agent_id, from_name, to_agent_id, to_name,
+                    kind, body, payload, status, created_at, read_at
+             FROM agent_messages WHERE session_id = ?1",
+        );
+        if to_agent_id.is_some() {
+            sql.push_str(" AND to_agent_id = ?2");
+        }
+        if unread_only {
+            sql.push_str(" AND status = 'unread'");
+        }
+        sql.push_str(" ORDER BY created_at ASC, id ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = match to_agent_id {
+            Some(agent_id) => stmt.query_map(params![session_id, agent_id], map_agent_message)?,
+            None => stmt.query_map(params![session_id], map_agent_message)?,
+        };
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn mark_agent_message_read(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<(AgentMessage, Option<Event>)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let now = now_rfc3339();
+        let changed = tx.execute(
+            "UPDATE agent_messages SET status = 'read', read_at = ?1
+             WHERE id = ?2 AND status = 'unread'",
+            params![now, message_id],
+        )?;
+        let message = tx
+            .query_row(
+                "SELECT id, session_id, from_agent_id, from_name, to_agent_id, to_name,
+                        kind, body, payload, status, created_at, read_at
+                 FROM agent_messages WHERE id = ?1",
+                params![message_id],
+                map_agent_message,
+            )
+            .optional()?;
+        let Some(message) = message else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(Some((message, None)));
+        }
+        let event = insert_event_tx(
+            &tx,
+            &message.session_id,
+            "mailbox.message_read",
+            serde_json::json!({"message_id": message.id, "to_agent_id": message.to_agent_id}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((message, Some(event))))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_artifact_with_event(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<&str>,
+        name: &str,
+        kind: &str,
+        mime_type: &str,
+        content: &str,
+    ) -> Result<(Artifact, Event)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let artifact = Artifact {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.to_string(),
+            agent_name: agent_name.to_string(),
+            task_id: task_id.map(str::to_string),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            mime_type: mime_type.to_string(),
+            content: content.to_string(),
+            created_at: now_rfc3339(),
+        };
+        tx.execute(
+            "INSERT INTO artifacts
+             (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type, content, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                artifact.id,
+                artifact.session_id,
+                artifact.agent_id,
+                artifact.agent_name,
+                artifact.task_id,
+                artifact.name,
+                artifact.kind,
+                artifact.mime_type,
+                artifact.content,
+                artifact.created_at
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "artifact.published",
+            serde_json::json!({
+                "artifact_id": artifact.id,
+                "name": artifact.name,
+                "kind": artifact.kind,
+                "agent_id": artifact.agent_id,
+                "agent_name": artifact.agent_name,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((artifact, event))
+    }
+
+    pub fn list_artifacts(&self, session_id: &str) -> Result<Vec<Artifact>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
+                    mime_type, content, created_at
+             FROM artifacts WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], map_artifact)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_artifact(&self, artifact_id: &str) -> Result<Option<Artifact>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
+                    mime_type, content, created_at
+             FROM artifacts WHERE id = ?1",
+            params![artifact_id],
+            map_artifact,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn add_session_usage(&self, session_id: &str, input: u64, output: u64) -> Result<()> {
@@ -1786,6 +2035,48 @@ impl Store {
                 ],
             )?;
         }
+        for message in &bundle.agent_messages {
+            tx.execute(
+                "INSERT INTO agent_messages
+                 (id, session_id, from_agent_id, from_name, to_agent_id, to_name,
+                  kind, body, payload, status, created_at, read_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    message.id,
+                    message.session_id,
+                    message.from_agent_id,
+                    message.from_name,
+                    message.to_agent_id,
+                    message.to_name,
+                    message.kind,
+                    message.body,
+                    serde_json::to_string(&message.payload)?,
+                    message.status,
+                    message.created_at,
+                    message.read_at
+                ],
+            )?;
+        }
+        for artifact in &bundle.artifacts {
+            tx.execute(
+                "INSERT INTO artifacts
+                 (id, session_id, agent_id, agent_name, task_id, name, kind,
+                  mime_type, content, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    artifact.id,
+                    artifact.session_id,
+                    artifact.agent_id,
+                    artifact.agent_name,
+                    artifact.task_id,
+                    artifact.name,
+                    artifact.kind,
+                    artifact.mime_type,
+                    artifact.content,
+                    artifact.created_at
+                ],
+            )?;
+        }
         for event in &bundle.events {
             if event.session_id != bundle.session.id {
                 return Err(anyhow!(
@@ -2232,6 +2523,39 @@ fn map_merge_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueue
     })
 }
 
+fn map_agent_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentMessage> {
+    let payload: String = row.get(8)?;
+    Ok(AgentMessage {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        from_agent_id: row.get(2)?,
+        from_name: row.get(3)?,
+        to_agent_id: row.get(4)?,
+        to_name: row.get(5)?,
+        kind: row.get(6)?,
+        body: row.get(7)?,
+        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        status: row.get(9)?,
+        created_at: row.get(10)?,
+        read_at: row.get(11)?,
+    })
+}
+
+fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
+    Ok(Artifact {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        agent_name: row.get(3)?,
+        task_id: row.get(4)?,
+        name: row.get(5)?,
+        kind: row.get(6)?,
+        mime_type: row.get(7)?,
+        content: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
 fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
@@ -2497,6 +2821,64 @@ mod tests {
         let loaded = store.get_session(&session.id).unwrap().unwrap();
         assert_eq!(loaded.worktree.as_deref(), Some("/tmp/worktree"));
         assert_eq!(loaded.branch.as_deref(), Some("verlinpark/test"));
+    }
+
+    #[test]
+    fn persists_mailbox_and_artifacts() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "mailbox").unwrap();
+        let (message, event) = store
+            .create_agent_message_with_event(
+                &session.id,
+                "agent-a",
+                "Leader",
+                "agent-b",
+                "Worker",
+                "handoff",
+                "Please implement the API",
+                &serde_json::json!({"task": "T1"}),
+            )
+            .unwrap();
+        assert_eq!(message.status, "unread");
+        assert_eq!(event.kind, "mailbox.message_sent");
+        let messages = store
+            .list_agent_messages(&session.id, Some("agent-b"), true)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].body, "Please implement the API");
+        let (read, event) = store.mark_agent_message_read(&message.id).unwrap().unwrap();
+        assert_eq!(read.status, "read");
+        assert_eq!(event.unwrap().kind, "mailbox.message_read");
+        assert!(
+            store
+                .list_agent_messages(&session.id, Some("agent-b"), true)
+                .unwrap()
+                .is_empty()
+        );
+
+        let (artifact, event) = store
+            .create_artifact_with_event(
+                &session.id,
+                "agent-b",
+                "Worker",
+                Some("T1"),
+                "api-notes.md",
+                "note",
+                "text/markdown",
+                "# API notes\n",
+            )
+            .unwrap();
+        assert_eq!(event.kind, "artifact.published");
+        let artifacts = store.list_artifacts(&session.id).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "api-notes.md");
+        assert_eq!(
+            store.get_artifact(&artifact.id).unwrap().unwrap().content,
+            "# API notes\n"
+        );
     }
 
     #[test]
