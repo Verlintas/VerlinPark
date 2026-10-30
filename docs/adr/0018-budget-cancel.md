@@ -3,6 +3,11 @@
 - **Status:** Accepted
 - **Date:** 2026-10-25
 
+> **Implementation note (2026-10-30):** Session-level cooperative pause/resume is
+> now implemented in [ADR-0034](0034-cooperative-pause-resume.md). The statement
+> below that pause/resume is not claimed is superseded; cancellation remains
+> terminal and unchanged.
+
 > **Implementation note (2026-10-30):** Before a provider call the runtime
 > reserves a conservative input estimate plus a dynamic output budget. Provider
 > usage settles the reservation; endpoints without usage are charged a persisted

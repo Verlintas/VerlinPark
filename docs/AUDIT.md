@@ -18,7 +18,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：shell 沙箱、完整 event sourcing、自动冲突解决、非 GitHub PR、worktree 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 61（core 44 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
+当前测试：Rust 62（core 45 / store 12 / providers 5），Swift 9。CI 以最新提交为准。
 
 ---
 
@@ -35,7 +35,7 @@
 | Verifier gate | 独立 Verifier；`submit_verdict`；approve 才合并（只读是 prompt 约束，shell 未沙箱） |
 | TeamPlan | 结构化部门/task DAG/acceptance/write_scope；runtime 校验、持久化、自动派发 |
 | Manager 圆桌 | 1–3 轮、并发、peer positions 跨轮共享、只读、事件可追踪 |
-| 审批 / 预算 / 取消 | 写与 shell 审批；session token budget；Stop / CLI cancel；崩溃后标记失败 |
+| 审批 / 预算 / 取消 / 暂停 | 写与 shell 审批；session token budget；Stop / CLI cancel；session 级协作式 pause/resume；崩溃后标记失败 |
 | 原生 UI | Glass Park 三栏、品牌/旗帜、Collab、Preview、Plan board、Trace |
 | CI | Rust fmt/clippy/test + Swift format/build/test；当前 CI 绿 |
 
@@ -48,7 +48,7 @@
 | 隔离与安全 | C+ | 路径 jail、loopback token、fetch_url DNS 固定做得不错；shell 仍无沙箱 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C | `agent.rs` 5,060 行、`StudioView.swift` 1,145 行；文档状态与实现漂移 |
-| 测试 | B− | 61 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 62 Rust + 9 Swift 全绿；并发/scope/SSRF/queue retry/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -237,7 +237,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 45 个 Rust 测试 + 9 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、预算、恢复。仍缺：
+已有 62 个 Rust 测试 + 9 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、预算、恢复。仍缺：
 
 - plan 自动派发的 scope overlap / cap 回归
 - 并发预算超调上界
@@ -341,7 +341,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 61 passed after the 10-30 retry/landing/PR/recovery/replay slices
+cargo test --workspace     # 62 passed after the 10-30 delivery/recovery/pause slices
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (9 Swift tests)
 ```

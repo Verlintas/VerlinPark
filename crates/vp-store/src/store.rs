@@ -1199,12 +1199,13 @@ impl Store {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let sessions = {
-            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE status = 'running'")?;
+            let mut stmt =
+                tx.prepare("SELECT id FROM sessions WHERE status IN ('running', 'paused')")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
-            "UPDATE sessions SET status = 'failed' WHERE status = 'running'",
+            "UPDATE sessions SET status = 'failed' WHERE status IN ('running', 'paused')",
             [],
         )?;
         let agents = {
@@ -1633,12 +1634,13 @@ impl Store {
 
     pub fn interrupt_running_sessions(&self) -> Result<Vec<String>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare("SELECT id FROM sessions WHERE status = 'running'")?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM sessions WHERE status IN ('running', 'paused')")?;
         let ids = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         conn.execute(
-            "UPDATE sessions SET status = 'failed' WHERE status = 'running'",
+            "UPDATE sessions SET status = 'failed' WHERE status IN ('running', 'paused')",
             [],
         )?;
         Ok(ids)
@@ -2237,10 +2239,17 @@ mod tests {
             .unwrap();
         let session = store.create_session(&project.id, "run").unwrap();
         store.update_session_status(&session.id, "running").unwrap();
+        let paused = store.create_session(&project.id, "pause").unwrap();
+        store.update_session_status(&paused.id, "paused").unwrap();
         let interrupted = store.interrupt_running_sessions().unwrap();
-        assert_eq!(interrupted, vec![session.id.clone()]);
+        assert!(interrupted.contains(&session.id));
+        assert!(interrupted.contains(&paused.id));
         assert_eq!(
             store.get_session(&session.id).unwrap().unwrap().status,
+            "failed"
+        );
+        assert_eq!(
+            store.get_session(&paused.id).unwrap().unwrap().status,
             "failed"
         );
         assert!(store.interrupt_running_sessions().unwrap().is_empty());

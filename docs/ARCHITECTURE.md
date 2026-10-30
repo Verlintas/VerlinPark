@@ -447,6 +447,7 @@ loop {
   - `fatal`（panic/崩溃）：标记，升级。
 - 每次重试写事件；保留失败产物。
 - 取消：`CancellationToken` 传播到 provider stream、工具进程组、子 Agent。
+- 暂停：session 级协作式 pause 在每个 turn 前和每个 tool 前检查；进行中的 stream/tool 先结束，再阻塞；resume 继续同一个 run。daemon 重启不保留 paused 状态。
 - 超时：task wall-clock；到点先发 `status` 询问，宽限期后取消。
 
 ### 6.7 死锁检测

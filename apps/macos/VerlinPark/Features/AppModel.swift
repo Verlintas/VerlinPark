@@ -250,6 +250,24 @@ final class AppModel {
         }
     }
 
+    func pauseSession() async {
+        guard let sessionID = selectedSessionID else { return }
+        do {
+            _ = try await core.pauseSession(sessionID: sessionID)
+        } catch {
+            handle(error)
+        }
+    }
+
+    func resumeSession() async {
+        guard let sessionID = selectedSessionID else { return }
+        do {
+            _ = try await core.resumeSession(sessionID: sessionID)
+        } catch {
+            handle(error)
+        }
+    }
+
     func resolveApproval(_ id: String, approved: Bool) async {
         do {
             try await core.resolveApproval(id: id, approved: approved)

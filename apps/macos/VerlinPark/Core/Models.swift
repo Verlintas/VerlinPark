@@ -368,6 +368,26 @@ struct SessionLandResult: Codable, Sendable {
     }
 }
 
+struct SessionPauseResult: Codable, Sendable {
+    let sessionId: String
+    let paused: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case paused
+    }
+}
+
+struct SessionResumeResult: Codable, Sendable {
+    let sessionId: String
+    let resumed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case resumed
+    }
+}
+
 struct PlanDepartment: Codable, Identifiable, Hashable, Sendable {
     let name: String
     let managerTitle: String

@@ -257,6 +257,28 @@ pub struct CancelSessionResult {
     pub cancelled: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionPauseParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionPauseResult {
+    pub session_id: String,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionResumeParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionResumeResult {
+    pub session_id: String,
+    pub resumed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
     pub title: String,

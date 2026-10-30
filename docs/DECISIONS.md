@@ -43,6 +43,7 @@
 | [0031](adr/0031-queue-recovery.md) | daemon 重启恢复 in-flight merge queue entry | Accepted | 可靠性/恢复/审计 |
 | [0032](adr/0032-atomic-event-projections.md) | 关键状态 event + projection 原子写 | Accepted | 存储/审计/恢复 |
 | [0033](adr/0033-session-import-archive.md) | Session bundle 导入为只读 archive | Accepted | 迁移/恢复/安全 |
+| [0034](adr/0034-cooperative-pause-resume.md) | Session 协作式 pause/resume | Accepted | 控制/恢复/UX |
 
 ---
 

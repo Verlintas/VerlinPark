@@ -188,7 +188,8 @@ private struct ProjectStageView: View {
 
     private var sendDisabled: Bool {
         let textEmpty = draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let running = model.selectedSession?.status == "running"
+        let status = model.selectedSession?.status
+        let running = status == "running" || status == "paused"
         return textEmpty || model.isBusy || running
     }
 
@@ -309,6 +310,27 @@ struct SessionChatView: View {
                     HStack(spacing: 8) {
                         if session.status == "running" {
                             Button {
+                                Task { await model.pauseSession() }
+                            } label: {
+                                Label("Pause", systemImage: "pause.fill")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                        if session.status == "paused" {
+                            Button {
+                                Task { await model.resumeSession() }
+                            } label: {
+                                Label("Resume", systemImage: "play.fill")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .tint(.green)
+                        }
+                        if session.status == "running" || session.status == "paused" {
+                            Button {
                                 Task { await model.cancelSession() }
                             } label: {
                                 Label("Stop", systemImage: "stop.fill")
@@ -346,6 +368,15 @@ struct SessionChatView: View {
                             HStack(spacing: 8) {
                                 ProgressView().controlSize(.small)
                                 Text("Leader is thinking…")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                        } else if session.status == "paused" {
+                            HStack(spacing: 8) {
+                                Image(systemName: "pause.circle")
+                                    .foregroundStyle(.yellow)
+                                Text("Leader is paused")
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundStyle(.secondary)
                             }

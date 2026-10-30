@@ -4,7 +4,7 @@
 
 VerlinPark runs a hierarchy of coding agents in isolated Git worktrees, lets Managers compare plans before work starts, and makes every plan, tool call, diff, token, and permission decision inspectable and traceable. A typed peer mailbox and shared artifact store are planned, not implemented yet.
 
-> **Status: M2 four-tier delegation + M3 merge queue/landing/PR.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A session Leader can plan and delegate through Manager → Worker → Labour, convene a read-only Manager roundtable, auto-dispatch a validated TeamPlan in dependency batches, isolate Workers in Git worktrees, gate merges on a Verifier verdict, and pass approved commits through a persisted merge queue and a deterministic Integrator (merge, diff check, optional project check, rollback on failure). Conflict/failed/interrupted entries can be rebased and retried; a clean checkout can be explicitly landed into the default branch, or pushed and opened as a GitHub PR via `gh`. Sessions have approvals, cancellation, a live diff, and an event trace. Typed mailbox/artifact store, automatic conflict resolution, global cross-session scheduling, per-role models, and a true tool sandbox are **not** implemented yet — see [PROGRESS](docs/PROGRESS.md) and [AUDIT](docs/AUDIT.md).
+> **Status: M2 four-tier delegation + M3 merge queue/landing/PR/pause-resume.** The daemon, CLI, SQLite event log, provider adapters, and native SwiftUI shell run end-to-end. A session Leader can plan and delegate through Manager → Worker → Labour, convene a read-only Manager roundtable, auto-dispatch a validated TeamPlan in dependency batches, isolate Workers in Git worktrees, gate merges on a Verifier verdict, and pass approved commits through a persisted merge queue and a deterministic Integrator (merge, diff check, optional project check, rollback on failure). Conflict/failed/interrupted entries can be rebased and retried; a clean checkout can be explicitly landed into the default branch, or pushed and opened as a GitHub PR via `gh`. Sessions have approvals, cooperative pause/resume, cancellation, a live diff, and an event trace. Typed mailbox/artifact store, automatic conflict resolution, global cross-session scheduling, per-role models, and a true tool sandbox are **not** implemented yet — see [PROGRESS](docs/PROGRESS.md) and [AUDIT](docs/AUDIT.md).
 
 ---
 
@@ -140,6 +140,8 @@ just cli prompt <session-id> "Now add tests"
 just cli diff <session-id>
 just cli commit <session-id> -m "Add tests"
 just cli discard <session-id>
+just cli pause <session-id>
+just cli resume <session-id>
 just cli cancel <session-id>
 just cli todos <session-id>
 just cli queue <session-id>
@@ -207,7 +209,7 @@ VerlinPark learns from, and is not affiliated with:
 - **Glass Box（玻璃盒）**：完整事件日志、Trace、成本账本、Checkpoint、逐 hunk review，不做黑盒。
 - **Open Bench（开放工作台）**：SwiftUI 原生 UI + Rust Core，本地/云端模型，MCP/ACP，CLI，GPL-3.0。
 
-当前处于 **M2 四层委派 + M3 Merge Queue / Landing / PR**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经可用；Leader 可以委派给 Manager → Worker → Labour，召集 1–3 轮只读 Manager 圆桌，提交并自动派发 TeamPlan，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果。Worker 拥有独立 task worktree；Verifier 审查通过后进入持久 merge queue，由确定性 Integrator 串行合并、做 diff check 和可选项目检查，失败则回滚；session diff 从 base commit 起算。用户可以把 session branch 本地 land，或显式 push 并用 `gh` 开 PR。Leader 必须给每个 Manager 分配部门角色；`delegate_many` 会校验不重叠写作用域；research profile 可读取公网 URL。当前限制：PR 依赖本机 `gh` 且只支持 GitHub；自动冲突解决没有实现；shell 没有沙箱；事件日志已能校验/重建关键投影和 agent roster，并支持 session bundle export/import 与显式 rehydrate；跨环境 approvals 已随 bundle 恢复；imported agent task-worktree 会按 branch 分组重建，缺失 branch 会 warning 跳过。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md) 和 [docs/AUDIT.md](docs/AUDIT.md)。
+当前处于 **M2 四层委派 + M3 Merge Queue / Landing / PR / Pause-Resume**：daemon、CLI、SQLite 事件日志、Provider 适配、Glass Park 三栏界面、可配置品牌 Mark、248 地区旗 + 20 Pride 旗、Collab/Preview、Manage Dash 已经可用；Leader 可以委派给 Manager → Worker → Labour，召集 1–3 轮只读 Manager 圆桌，提交并自动派发 TeamPlan，维护可见的 todo 计划，在 Preview 中查看 worktree diff，提交或丢弃审阅后的结果。Worker 拥有独立 task worktree；Verifier 审查通过后进入持久 merge queue，由确定性 Integrator 串行合并、做 diff check 和可选项目检查，失败则回滚；session diff 从 base commit 起算。用户可以把 session branch 本地 land，或显式 push 并用 `gh` 开 PR。Leader 必须给每个 Manager 分配部门角色；`delegate_many` 会校验不重叠写作用域；research profile 可读取公网 URL。当前限制：pause 是 turn/tool 边界的协作式暂停，不会中断进行中的 provider stream 或 shell；PR 依赖本机 `gh` 且只支持 GitHub；自动冲突解决没有实现；shell 没有沙箱；事件日志已能校验/重建关键投影和 agent roster，并支持 session bundle export/import 与显式 rehydrate；跨环境 approvals 已随 bundle 恢复；imported agent task-worktree 会按 branch 分组重建，缺失 branch 会 warning 跳过。Aviiya 是 NovaBAIC 的外部常驻 Agent，本仓库只保留桥接占位。详见 [docs/PROGRESS.md](docs/PROGRESS.md) 和 [docs/AUDIT.md](docs/AUDIT.md)。
 
 ## 许可
 

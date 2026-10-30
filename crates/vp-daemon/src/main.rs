@@ -29,7 +29,8 @@ use vp_protocol::types::{
     MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectListResult, PromptParams,
     PromptResult, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
     ResolveApprovalResult, RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams,
-    SessionExportParams, SessionImportParams, SessionListResult, SessionTodosParams,
+    SessionExportParams, SessionImportParams, SessionListResult, SessionPauseParams,
+    SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
     SessionTodosResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
@@ -417,6 +418,32 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     cancelled: state.agent.cancel(&params.session_id),
                 },
             ),
+            Err(response) => response_with_id(id, response),
+        },
+        "session.pause" => match parse_params::<SessionPauseParams>(request.params) {
+            Ok(params) => match state.agent.pause(&params.session_id).await {
+                Ok(paused) => RpcResponse::success(
+                    id,
+                    SessionPauseResult {
+                        session_id: params.session_id,
+                        paused,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.resume" => match parse_params::<SessionResumeParams>(request.params) {
+            Ok(params) => match state.agent.resume(&params.session_id).await {
+                Ok(resumed) => RpcResponse::success(
+                    id,
+                    SessionResumeResult {
+                        session_id: params.session_id,
+                        resumed,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
             Err(response) => response_with_id(id, response),
         },
         "session.commit" => match parse_params::<CommitSessionParams>(request.params) {

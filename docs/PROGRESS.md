@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-10-30
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Landing/PR 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Landing/PR + Session 协作式 Pause/Resume 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
 
@@ -28,7 +28,7 @@
 | PR flow | ✅ | `session.pr` / `vp pr` / Preview → Open PR：preflight origin + `gh auth status`，push session branch，`gh pr create`；gh 失败会明确报告 branch 已 push |
 | Queue recovery | ✅ | daemon 重启把 queued/merging/checking entry 标为 interrupted 并补事件；interrupted 可 rebase+retry |
 | Diff / commit | ✅ | base..worktree diff、显式 commit、discard、session committed 事件 |
-| 预算 / 取消 | ✅ | token reservation + provider usage 结算；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复 |
+| 预算 / 取消 / 暂停 | ✅ | token reservation + provider usage 结算；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复；`session.pause` / `session.resume` / `vp pause` / `vp resume` 在 turn/tool 边界协作式暂停并继续同一 run |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；UI Approve/Deny |
 | 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR 事件；Collab roster；Preview Plan/Changes/Queue/Trace |
 | Event consistency | ✅ | session status / usage / agent status / team plan / todos / messages / merge queue / agent roster / recovery 使用 event+projection 原子事务；`session.replay` / `--repair` / `--rebuild` 可校验并重建覆盖投影；`session.export` / `session.import` 支持 bundle 迁移 |
@@ -36,15 +36,15 @@
 | Rehydrate | ✅ | `vp rehydrate <session> [--worktree path]`：only imported；校验 project/base commit；创建/attach session worktree；按 branch 分组重建 imported agent task worktrees；状态回到 idle；返回 warnings/remapped count |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
 | Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
-| CLI | ✅ | ping/info/projects/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/todos/agents/team-plan/queue/retry/land/pr/replay [--repair|--rebuild]/export/import/rehydrate |
+| CLI | ✅ | ping/info/projects/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/queue/retry/land/pr/replay [--repair|--rebuild]/export/import/rehydrate |
 
 ## 验证
 
-- `cargo test --workspace`：61 个测试通过（core 44、store 12、providers 5）。
+- `cargo test --workspace`：62 个测试通过（core 45、store 12、providers 5）。
 - `xcodebuild test`：9 个 Swift 测试通过。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
-- 手工 E2E 已覆盖：Leader/Manager/Worker/Labour 委派、task worktree、并行 Worker、Verifier approve/reject、TeamPlan 自动派发、Manager 圆桌、审批、diff、commit/discard、预算/取消。
+- 手工 E2E 已覆盖：Leader/Manager/Worker/Labour 委派、task worktree、并行 Worker、Verifier approve/reject、TeamPlan 自动派发、Manager 圆桌、审批、diff、commit/discard、预算/取消/暂停恢复。
 
 ## 已知 enforcement 缺口
 
@@ -64,7 +64,7 @@
 - 没有 auto-expansion；Manager/Worker 上限是固定 caps，不是按预算自动扩编。
 - 没有 per-role 模型/预算；所有 profile 共用同一模型和 session token budget。
 - 没有 typed message bus / artifact store；Agent 之间仍是委派调用 + 事件记录，没有异步 mailbox。
-- 没有 context compaction、checkpoint/resume；daemon 重启会把运行中 session 标为 failed。
+- 没有 context compaction、checkpoint/resume；暂停状态只在内存中，daemon 重启会把 running/paused session 标为 failed。
 - 没有终端、逐 hunk review、真实 Collab 节点、MCP/ACP、web search。
 - Verifier 的 Shell 不是沙箱；task worktree/branch 暂无自动清理。
 - Aviiya 仍是 NovaBAIC 外部桥接占位，不在本仓库实现人格/记忆。
@@ -88,6 +88,7 @@
 - **M3 第九切片**：`session.import` bundle archive 导入（只读、不自动创建 worktree）。
 - **M3 第十切片**：`session.rehydrate` 将 imported session 的 worktree/branch 重建并恢复可运行状态；import 同时恢复 approvals 投影。
 - **M3 第十一切片**：rehydrate 按 branch 分组重建 imported agent task worktrees。
+- **M3 第十二切片**：session 级协作式 pause/resume（turn/tool 边界、同一 run 继续、terminal 状态不可覆盖），CLI + app 控制。
 
 ## 如何运行
 

@@ -196,6 +196,20 @@ actor CoreClient {
             .decode(SessionLandResult.self)
     }
 
+    func pauseSession(sessionID: String) async throws -> Bool {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.pause", params: params)
+            .decode(SessionPauseResult.self)
+            .paused
+    }
+
+    func resumeSession(sessionID: String) async throws -> Bool {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.resume", params: params)
+            .decode(SessionResumeResult.self)
+            .resumed
+    }
+
     func openPullRequest(sessionID: String) async throws -> PullRequestResult {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.pr", params: params)

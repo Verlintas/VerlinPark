@@ -57,6 +57,7 @@ struct StatusPill: View {
         case "done", "completed", "connected": .green
         case "failed", "cancelled", "offline": .red
         case "running", "verifying", "merging", "thinking": .orange
+        case "paused": .yellow
         case "waiting", "idle": .secondary
         default: .secondary
         }

@@ -58,6 +58,10 @@ enum Command {
     Prompt { session: String, content: String },
     /// Ask the running Leader to stop.
     Cancel { session: String },
+    /// Pause the running Leader between turns/tools.
+    Pause { session: String },
+    /// Resume a paused Leader.
+    Resume { session: String },
     /// Show the session plan/todo list.
     Todos { session: String },
     /// Show the validated team plan.
@@ -188,6 +192,12 @@ async fn main() -> Result<()> {
         }
         Command::Cancel { session } => {
             rpc(&discovery, "session.cancel", json!({"session_id": session})).await?
+        }
+        Command::Pause { session } => {
+            rpc(&discovery, "session.pause", json!({"session_id": session})).await?
+        }
+        Command::Resume { session } => {
+            rpc(&discovery, "session.resume", json!({"session_id": session})).await?
         }
         Command::Todos { session } => {
             rpc(&discovery, "session.todos", json!({"session_id": session})).await?
@@ -546,6 +556,28 @@ fn print_human(value: &Value) {
                 status
             );
         }
+        return;
+    }
+    if let Some(paused) = value.get("paused").and_then(Value::as_bool) {
+        println!(
+            "{}",
+            if paused {
+                "paused the active run."
+            } else {
+                "no active run to pause."
+            }
+        );
+        return;
+    }
+    if let Some(resumed) = value.get("resumed").and_then(Value::as_bool) {
+        println!(
+            "{}",
+            if resumed {
+                "resumed the active run."
+            } else {
+                "no paused run to resume."
+            }
+        );
         return;
     }
     if let Some(cancelled) = value.get("cancelled").and_then(Value::as_bool) {

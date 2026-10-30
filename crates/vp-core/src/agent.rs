@@ -48,24 +48,83 @@ pub struct AgentService {
 
 struct RunControl {
     cancelled: watch::Sender<bool>,
+    paused: watch::Sender<bool>,
+    finalized: tokio::sync::Mutex<Option<String>>,
 }
 
 impl RunControl {
     fn new() -> Self {
         let (cancelled, _) = watch::channel(false);
-        Self { cancelled }
+        let (paused, _) = watch::channel(false);
+        Self {
+            cancelled,
+            paused,
+            finalized: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn finalize_session(
+        &self,
+        engine: &Engine,
+        session_id: &str,
+        status: &str,
+    ) -> Result<()> {
+        let mut finalized = self.finalized.lock().await;
+        *finalized = Some(status.to_string());
+        engine.update_session_status(session_id, status).await
     }
 
     fn cancel(&self) {
-        let _ = self.cancelled.send(true);
+        self.cancelled.send_replace(true);
+    }
+
+    fn pause(&self) {
+        self.paused.send_replace(true);
+    }
+
+    fn resume(&self) {
+        self.paused.send_replace(false);
     }
 
     fn is_cancelled(&self) -> bool {
         *self.cancelled.borrow()
     }
 
+    fn is_paused(&self) -> bool {
+        *self.paused.borrow()
+    }
+
     fn subscribe(&self) -> watch::Receiver<bool> {
         self.cancelled.subscribe()
+    }
+
+    fn subscribe_paused(&self) -> watch::Receiver<bool> {
+        self.paused.subscribe()
+    }
+}
+
+async fn wait_for_resume(control: &RunControl) -> bool {
+    let mut paused = control.subscribe_paused();
+    let mut cancelled = control.subscribe();
+    loop {
+        if control.is_cancelled() {
+            return false;
+        }
+        if !*paused.borrow() {
+            return true;
+        }
+        tokio::select! {
+            changed = paused.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+            changed = cancelled.changed() => {
+                if changed.is_err() || *cancelled.borrow() {
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -740,7 +799,9 @@ impl AgentService {
                         serde_json::json!({"error": error.to_string()}),
                     )
                     .await;
-                let _ = engine.update_session_status(&session_id, "failed").await;
+                let _ = control
+                    .finalize_session(&engine, &session_id, "failed")
+                    .await;
             }
             if let Ok(mut runs) = runs.lock() {
                 runs.remove(&session_id);
@@ -757,6 +818,62 @@ impl AgentService {
             return true;
         }
         false
+    }
+
+    pub async fn pause(&self, session_id: &str) -> Result<bool> {
+        let control = self
+            .runs
+            .lock()
+            .map_err(|_| anyhow!("agent run mutex poisoned"))?
+            .get(session_id)
+            .cloned();
+        let Some(control) = control else {
+            return Ok(false);
+        };
+        if control.is_paused() {
+            return Ok(true);
+        }
+        let finalized = control.finalized.lock().await;
+        if finalized.is_some() {
+            return Ok(false);
+        }
+        control.pause();
+        self.engine
+            .update_session_status(session_id, "paused")
+            .await?;
+        self.engine
+            .append_event(session_id, "agent.paused", serde_json::json!({}))
+            .await?;
+        drop(finalized);
+        Ok(true)
+    }
+
+    pub async fn resume(&self, session_id: &str) -> Result<bool> {
+        let control = self
+            .runs
+            .lock()
+            .map_err(|_| anyhow!("agent run mutex poisoned"))?
+            .get(session_id)
+            .cloned();
+        let Some(control) = control else {
+            return Ok(false);
+        };
+        if !control.is_paused() {
+            return Ok(true);
+        }
+        let finalized = control.finalized.lock().await;
+        if finalized.is_some() {
+            return Ok(false);
+        }
+        control.resume();
+        self.engine
+            .update_session_status(session_id, "running")
+            .await?;
+        self.engine
+            .append_event(session_id, "agent.resumed", serde_json::json!({}))
+            .await?;
+        drop(finalized);
+        Ok(true)
     }
 }
 
@@ -870,13 +987,20 @@ async fn run_agent(
             if let Some(agent_id) = &leader_id {
                 engine.update_agent_status(agent_id, "idle").await?;
             }
-            engine.update_session_status(session_id, "idle").await?;
+            control
+                .finalize_session(&engine, session_id, "idle")
+                .await?;
         }
         LoopOutcome::Cancelled => {
             if let Some(agent_id) = &leader_id {
                 engine.update_agent_status(agent_id, "cancelled").await?;
             }
-            finish_cancelled(&engine, session_id).await?;
+            engine
+                .append_event(session_id, "agent.cancelled", serde_json::json!({}))
+                .await?;
+            control
+                .finalize_session(&engine, session_id, "cancelled")
+                .await?;
         }
         LoopOutcome::BudgetExceeded => {
             if let Some(agent_id) = &leader_id {
@@ -893,7 +1017,9 @@ async fn run_agent(
                 }),
             )
             .await?;
-            engine.update_session_status(session_id, "failed").await?;
+            control
+                .finalize_session(&engine, session_id, "failed")
+                .await?;
         }
         LoopOutcome::Verdict(_) => {
             emit(
@@ -904,7 +1030,9 @@ async fn run_agent(
                 serde_json::json!({"error": "a verdict was submitted outside a verification run"}),
             )
             .await?;
-            engine.update_session_status(session_id, "failed").await?;
+            control
+                .finalize_session(&engine, session_id, "failed")
+                .await?;
         }
     }
     Ok(())
@@ -1688,6 +1816,9 @@ async fn run_loop(
     let mut team_plan = engine.get_team_plan(&session.id).await?;
 
     for turn in 0..config.max_turns {
+        if !wait_for_resume(control).await {
+            return Ok(LoopOutcome::Cancelled);
+        }
         if control.is_cancelled() {
             return Ok(LoopOutcome::Cancelled);
         }
@@ -1861,6 +1992,9 @@ async fn run_loop(
         }
 
         for (index, call) in tool_calls.into_iter().enumerate() {
+            if !wait_for_resume(control).await {
+                return Ok(LoopOutcome::Cancelled);
+            }
             if control.is_cancelled() {
                 return Ok(LoopOutcome::Cancelled);
             }
@@ -4146,16 +4280,6 @@ fn parse_todos(input: &serde_json::Value) -> Result<Vec<TodoItem>> {
     Ok(todos)
 }
 
-async fn finish_cancelled(engine: &Engine, session_id: &str) -> Result<()> {
-    engine
-        .append_event(session_id, "agent.cancelled", serde_json::json!({}))
-        .await?;
-    engine
-        .update_session_status(session_id, "cancelled")
-        .await?;
-    Ok(())
-}
-
 enum ApprovalOutcome {
     Approved,
     Denied,
@@ -6140,6 +6264,100 @@ mod tests {
         assert!(second.settle(700));
         assert_eq!(budget.spent(), 1000);
         assert!(budget.reserve_tokens(1).is_none());
+    }
+
+    struct PausingProvider {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for PausingProvider {
+        fn id(&self) -> &str {
+            "pausing"
+        }
+
+        async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::ToolCall(ToolCall {
+                        id: "pause-todo".into(),
+                        name: "todo_write".into(),
+                        arguments: serde_json::json!({
+                            "items": [{"title": "Resume", "status": "in_progress"}]
+                        })
+                        .to_string(),
+                    })),
+                    Ok(StreamEvent::Done),
+                ])))
+            } else {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta("resumed".into())),
+                    Ok(StreamEvent::Done),
+                ])))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pauses_and_resumes_between_turns() {
+        let dir = TempDir::new().unwrap();
+        let provider = Arc::new(PausingProvider {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let provider_trait: Arc<dyn Provider> = provider.clone();
+        let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+        let session = engine
+            .create_session(project.id, "pause".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "pause").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), provider.started.notified())
+            .await
+            .unwrap();
+        assert!(service.pause(&session.id).await.unwrap());
+        provider.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sessions = engine
+            .list_sessions(Some(session.project_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "paused");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(service.resume(&session.id).await.unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let sessions = engine
+                .list_sessions(Some(session.project_id.clone()))
+                .await
+                .unwrap();
+            if sessions[0].status == "idle" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session did not resume: {}",
+                sessions[0].status
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| event.kind == "agent.paused"));
+        assert!(events.iter().any(|event| event.kind == "agent.resumed"));
+        assert!(!service.pause(&session.id).await.unwrap());
     }
 
     #[tokio::test]
