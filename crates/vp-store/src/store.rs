@@ -181,6 +181,7 @@ impl Store {
                 agent_name    TEXT NOT NULL,
                 role          TEXT NOT NULL,
                 task_id       TEXT,
+                department    TEXT,
                 model         TEXT NOT NULL,
                 input_tokens  INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
@@ -278,6 +279,7 @@ impl Store {
         )?;
         ensure_column(&conn, "artifacts", "sha256", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "artifacts", "path", "TEXT")?;
+        ensure_column(&conn, "usage_ledger", "department", "TEXT")?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(
             &conn,
@@ -1054,6 +1056,7 @@ impl Store {
         agent_name: &str,
         role: &str,
         task_id: Option<&str>,
+        department: Option<&str>,
         model: &str,
         input: u64,
         output: u64,
@@ -1067,6 +1070,7 @@ impl Store {
             agent_name: agent_name.to_string(),
             role: role.to_string(),
             task_id: task_id.map(str::to_string),
+            department: department.map(str::to_string),
             model: model.to_string(),
             input_tokens: input,
             output_tokens: output,
@@ -1089,9 +1093,9 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO usage_ledger
-             (id, session_id, agent_id, agent_name, role, task_id, model,
+             (id, session_id, agent_id, agent_name, role, task_id, department, model,
               input_tokens, output_tokens, estimated, cost_usd, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 entry.id,
                 entry.session_id,
@@ -1099,6 +1103,7 @@ impl Store {
                 entry.agent_name,
                 entry.role,
                 entry.task_id,
+                entry.department,
                 entry.model,
                 entry.input_tokens as i64,
                 entry.output_tokens as i64,
@@ -1118,7 +1123,9 @@ impl Store {
                 "agent_id": agent_id,
                 "agent_name": agent_name,
                 "agent_role": role,
+                "usage_id": entry.id,
                 "task_id": task_id,
+                "department": department,
                 "model": model,
                 "cost_usd": cost_usd,
             }),
@@ -1141,6 +1148,7 @@ impl Store {
                     "agent_name": agent_name,
                     "agent_role": role,
                     "task_id": task_id,
+                    "department": department,
                     "model": model,
                 }),
             )?);
@@ -1154,11 +1162,43 @@ impl Store {
         Ok((entry, events))
     }
 
+    pub fn usage_spent(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        department: Option<&str>,
+    ) -> Result<(u64, f64, u64, f64)> {
+        let conn = self.lock()?;
+        let (task_tokens, task_cost) = if let Some(task_id) = task_id {
+            conn.query_row(
+                "SELECT COALESCE(SUM(input_tokens + output_tokens), 0),
+                        COALESCE(SUM(cost_usd), 0)
+                 FROM usage_ledger WHERE session_id = ?1 AND task_id = ?2",
+                params![session_id, task_id],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?)),
+            )?
+        } else {
+            (0, 0.0)
+        };
+        let (department_tokens, department_cost) = if let Some(department) = department {
+            conn.query_row(
+                "SELECT COALESCE(SUM(input_tokens + output_tokens), 0),
+                        COALESCE(SUM(cost_usd), 0)
+                 FROM usage_ledger WHERE session_id = ?1 AND department = ?2",
+                params![session_id, department],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?)),
+            )?
+        } else {
+            (0, 0.0)
+        };
+        Ok((task_tokens, task_cost, department_tokens, department_cost))
+    }
+
     pub fn list_usage_entries(&self, session_id: &str) -> Result<Vec<UsageEntry>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, agent_id, agent_name, role, task_id, model,
-                    input_tokens, output_tokens, estimated, cost_usd, created_at
+            "SELECT id, session_id, agent_id, agent_name, role, task_id, department,
+                    model, input_tokens, output_tokens, estimated, cost_usd, created_at
              FROM usage_ledger
              WHERE session_id = ?1
              ORDER BY created_at ASC, id ASC",
@@ -1171,15 +1211,50 @@ impl Store {
                 agent_name: row.get(3)?,
                 role: row.get(4)?,
                 task_id: row.get(5)?,
-                model: row.get(6)?,
-                input_tokens: row.get::<_, i64>(7)? as u64,
-                output_tokens: row.get::<_, i64>(8)? as u64,
-                estimated: row.get::<_, i64>(9)? != 0,
-                cost_usd: row.get(10)?,
-                created_at: row.get(11)?,
+                department: row.get(6)?,
+                model: row.get(7)?,
+                input_tokens: row.get::<_, i64>(8)? as u64,
+                output_tokens: row.get::<_, i64>(9)? as u64,
+                estimated: row.get::<_, i64>(10)? != 0,
+                cost_usd: row.get(11)?,
+                created_at: row.get(12)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn replace_usage_ledger(&self, session_id: &str, entries: &[UsageEntry]) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM usage_ledger WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for entry in entries {
+            tx.execute(
+                "INSERT INTO usage_ledger
+                 (id, session_id, agent_id, agent_name, role, task_id, department, model,
+                  input_tokens, output_tokens, estimated, cost_usd, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    entry.id,
+                    session_id,
+                    entry.agent_id,
+                    entry.agent_name,
+                    entry.role,
+                    entry.task_id,
+                    entry.department,
+                    entry.model,
+                    entry.input_tokens as i64,
+                    entry.output_tokens as i64,
+                    if entry.estimated { 1 } else { 0 },
+                    entry.cost_usd,
+                    entry.created_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn add_session_usage_with_event(
@@ -2468,6 +2543,29 @@ impl Store {
                     event.kind,
                     serde_json::to_string(&event.payload)?,
                     event.created_at
+                ],
+            )?;
+        }
+        for entry in &bundle.usage {
+            tx.execute(
+                "INSERT INTO usage_ledger
+                 (id, session_id, agent_id, agent_name, role, task_id, department, model,
+                  input_tokens, output_tokens, estimated, cost_usd, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    entry.id,
+                    bundle.session.id,
+                    entry.agent_id,
+                    entry.agent_name,
+                    entry.role,
+                    entry.task_id,
+                    entry.department,
+                    entry.model,
+                    entry.input_tokens as i64,
+                    entry.output_tokens as i64,
+                    if entry.estimated { 1 } else { 0 },
+                    entry.cost_usd,
+                    entry.created_at
                 ],
             )?;
         }

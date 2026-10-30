@@ -14,8 +14,8 @@ trees.
 ## Decision
 
 1. **One row per provider call.** `usage_ledger` stores session, agent ID/name,
-   role, optional task ID, model, input/output tokens, `estimated`, USD cost, and
-   timestamp.
+   role, optional task ID and department, model, input/output tokens,
+   `estimated`, USD cost, and timestamp.
 2. **Atomic projection plus events.** The store updates `sessions.tokens_in`,
    `tokens_out`, and `cost_spent_usd`, inserts the ledger row, and emits the
    `agent.usage` and (when cost is positive) `agent.cost` events in one
@@ -29,19 +29,23 @@ trees.
 5. **Read API.** `session.usage` / `vp usage <session>` returns entries plus
    deterministic totals grouped by role, model, agent, and task. Buckets sort by
    cost descending, then key.
-6. **Preview.** The Cost tab in Preview shows session totals, grouped buckets,
-   and the newest calls first, including the estimated marker.
-7. **No budget enforcement yet.** The ledger is accounting only. Per-task and
-   per-department budget limits are not enforced by this slice.
+6. **Preview.** The Cost tab in Preview shows session totals, grouped buckets
+   (including department), and the newest calls first, including the estimated
+   marker.
+7. **Replay and bundles.** New `agent.usage` events carry `usage_id`; replay
+   compares the ledger and `--repair`/`--rebuild` regenerate it from events.
+   Bundles include ledger rows and import restores them.
+8. **Budget enforcement.** ADR-0045 adds plan task/department limits on top of
+   this ledger.
 
 ## Consequences
 
 - Budget spend is attributable without parsing free-form messages.
 - The extra row write shares the existing event transaction, so it does not add
   a separate failure point after usage is committed.
-- Old sessions have no historical ledger rows; only new provider calls appear.
-- Ledger rows are session-scoped and deleted with the session. They are not yet
-  included in `session.replay` or export/import bundles.
+- Old sessions have no historical ledger rows; replay repair can backfill them
+  from legacy `agent.usage` events with synthetic IDs.
+- Ledger rows are session-scoped and deleted with the session.
 - The ledger is not content-addressed or compacted; high-frequency sessions will
   grow it linearly with provider calls.
 

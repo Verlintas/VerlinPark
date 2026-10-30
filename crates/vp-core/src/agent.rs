@@ -101,6 +101,14 @@ impl CapacityController {
         }
     }
 
+    fn try_acquire(&self, role: AgentRole) -> Option<OwnedSemaphorePermit> {
+        match role {
+            AgentRole::Worker => self.workers.clone().try_acquire_owned().ok(),
+            AgentRole::Labour => self.labour.clone().try_acquire_owned().ok(),
+            _ => None,
+        }
+    }
+
     async fn acquire(&self, role: AgentRole, control: &RunControl) -> Option<OwnedSemaphorePermit> {
         let semaphore = match role {
             AgentRole::Worker => self.workers.clone(),
@@ -423,6 +431,7 @@ struct AgentSpec {
     parent_name: Option<String>,
     title: Option<String>,
     task_id: Option<String>,
+    department: Option<String>,
     profile: AgentProfile,
     allow_delegation: bool,
     /// Skip per-tool approvals for an explicitly authorized internal run.
@@ -675,7 +684,67 @@ enum LoopOutcome {
     Final(String),
     Verdict(VerifierVerdict),
     Cancelled,
-    BudgetExceeded,
+    BudgetExceeded(BudgetStop),
+}
+
+#[derive(Debug, Clone)]
+struct BudgetStop {
+    scope: String,
+    reason: String,
+    id: Option<String>,
+    limit_tokens: Option<u64>,
+    spent_tokens: u64,
+    limit_cost: Option<f64>,
+    spent_cost: f64,
+    elapsed_secs: Option<u64>,
+}
+
+impl BudgetStop {
+    fn session(budget: &SessionBudget) -> Self {
+        Self {
+            scope: "session".to_string(),
+            reason: budget.exceeded_reason().unwrap_or("tokens").to_string(),
+            id: None,
+            limit_tokens: budget.limit,
+            spent_tokens: budget.spent(),
+            limit_cost: budget.cost_limit,
+            spent_cost: budget.cost_spent(),
+            elapsed_secs: Some(budget.elapsed_secs()),
+        }
+    }
+
+    fn session_tokens(budget: &SessionBudget) -> Self {
+        Self {
+            reason: "tokens".to_string(),
+            ..Self::session(budget)
+        }
+    }
+
+    fn is_session(&self) -> bool {
+        self.scope == "session"
+    }
+
+    fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scope": self.scope,
+            "reason": self.reason,
+            "id": self.id,
+            "limit": self.limit_tokens,
+            "spent": self.spent_tokens,
+            "cost_limit_usd": self.limit_cost,
+            "cost_spent_usd": self.spent_cost,
+            "elapsed_secs": self.elapsed_secs,
+        })
+    }
+
+    fn summary(&self) -> String {
+        let scope = match (&self.scope[..], &self.id) {
+            ("session", _) => "session".to_string(),
+            (kind, Some(id)) => format!("{kind} {id}"),
+            (kind, None) => kind.to_string(),
+        };
+        format!("{scope} {} budget exhausted", self.reason)
+    }
 }
 
 fn agent_fields(payload: &mut serde_json::Value, spec: &AgentSpec) {
@@ -962,6 +1031,7 @@ impl AgentService {
             parent_name: None,
             title: agent.title.clone(),
             task_id: entry.task_id.clone(),
+            department: None,
             profile,
             allow_delegation: true,
             auto_approve: false,
@@ -1192,6 +1262,7 @@ impl AgentService {
             parent_name: worker.parent_id.clone(),
             title: Some("Integration".to_string()),
             task_id: entry.task_id.clone(),
+            department: None,
             profile: AgentProfile::Coding,
             allow_delegation: false,
             auto_approve: true,
@@ -1287,20 +1358,16 @@ impl AgentService {
                     .await?;
                 return Err(anyhow!("auto-resolution cancelled"));
             }
-            Ok(LoopOutcome::BudgetExceeded) => {
+            Ok(LoopOutcome::BudgetExceeded(stop)) => {
                 let wt = worker_worktree.clone();
                 tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
                 self.engine
                     .update_agent_status(&resolver.id, "failed")
                     .await?;
                 self.engine
-                    .update_merge_queue_entry(
-                        &entry.id,
-                        "conflict",
-                        Some("token budget exhausted during auto-resolution".into()),
-                    )
+                    .update_merge_queue_entry(&entry.id, "conflict", Some(stop.summary()))
                     .await?;
-                return Err(anyhow!("token budget exhausted during auto-resolution"));
+                return Err(anyhow!("{} during auto-resolution", stop.summary()));
             }
             Ok(LoopOutcome::Verdict(_)) => {
                 let wt = worker_worktree.clone();
@@ -1423,6 +1490,7 @@ impl AgentService {
             parent_name: None,
             title: Some("Integration".to_string()),
             task_id: None,
+            department: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
             auto_approve: true,
@@ -1441,6 +1509,7 @@ impl AgentService {
             parent_name: Some("Integrator".to_string()),
             title: worker.title.clone(),
             task_id: entry.task_id.clone(),
+            department: None,
             profile: AgentProfile::Coding,
             allow_delegation: false,
             auto_approve: true,
@@ -1488,15 +1557,15 @@ impl AgentService {
                     .await?;
                 return Err(anyhow!("auto-resolution verification cancelled"));
             }
-            VerificationOutcome::BudgetExceeded => {
+            VerificationOutcome::BudgetExceeded(stop) => {
                 self.engine
                     .update_merge_queue_entry(
                         &entry.id,
                         "conflict",
-                        Some("token budget exhausted during auto-resolution verification".into()),
+                        Some(format!("{} during verification", stop.summary())),
                     )
                     .await?;
-                return Err(anyhow!("token budget exhausted during verification"));
+                return Err(anyhow!("{} during verification", stop.summary()));
             }
             VerificationOutcome::Error(error) => {
                 let detail = truncate(&format!("auto-resolution verification failed: {error}"));
@@ -1953,6 +2022,7 @@ async fn run_agent(
         parent_name: None,
         title: None,
         task_id: None,
+        department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         auto_approve: false,
@@ -2053,26 +2123,18 @@ async fn run_agent(
                 .finalize_session(&engine, session_id, "cancelled")
                 .await?;
         }
-        LoopOutcome::BudgetExceeded => {
+        LoopOutcome::BudgetExceeded(stop) => {
             if let Some(agent_id) = &leader_id {
                 engine.update_agent_status(agent_id, "failed").await?;
             }
-            emit(
-                &engine,
-                session_id,
-                &spec,
-                "agent.budget_exceeded",
-                serde_json::json!({
-                    "reason": budget.exceeded_reason().unwrap_or("tokens"),
-                    "limit": session.token_budget,
-                    "spent": budget.spent(),
-                    "cost_limit_usd": session.cost_budget_usd,
-                    "cost_spent_usd": budget.cost_spent(),
-                    "time_budget_secs": session.time_budget_secs,
-                    "elapsed_secs": budget.elapsed_secs(),
-                }),
-            )
-            .await?;
+            let mut payload = stop.payload();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "time_budget_secs".into(),
+                    serde_json::json!(session.time_budget_secs),
+                );
+            }
+            emit(&engine, session_id, &spec, "agent.budget_exceeded", payload).await?;
             control
                 .finalize_session(&engine, session_id, "failed")
                 .await?;
@@ -2384,7 +2446,7 @@ enum VerificationOutcome {
     Approved(VerifierVerdict),
     Rejected(VerifierVerdict),
     Cancelled,
-    BudgetExceeded,
+    BudgetExceeded(BudgetStop),
     Error(String),
 }
 
@@ -2436,7 +2498,8 @@ async fn verify_worker(
         depth: manager_spec.depth.saturating_add(1),
         parent_name: Some(manager_spec.name.clone()),
         title: Some("Verification".to_string()),
-        task_id: None,
+        task_id: worker_spec.task_id.clone(),
+        department: worker_spec.department.clone(),
         profile: AgentProfile::Verification,
         allow_delegation: false,
         auto_approve,
@@ -2560,7 +2623,7 @@ async fn verify_worker(
             .await?;
             Ok(VerificationOutcome::Cancelled)
         }
-        Ok(LoopOutcome::BudgetExceeded) => {
+        Ok(LoopOutcome::BudgetExceeded(stop)) => {
             engine.update_agent_status(&verifier.id, "failed").await?;
             emit(
                 engine,
@@ -2569,12 +2632,12 @@ async fn verify_worker(
                 "agent.finished",
                 serde_json::json!({
                     "status": "failed",
-                    "summary": "token budget exhausted",
+                    "summary": stop.summary(),
                     "verified_worker": worker_spec.name,
                 }),
             )
             .await?;
-            Ok(VerificationOutcome::BudgetExceeded)
+            Ok(VerificationOutcome::BudgetExceeded(stop))
         }
         Err(error) => {
             engine.update_agent_status(&verifier.id, "failed").await?;
@@ -2599,7 +2662,7 @@ async fn verify_worker(
 enum WorkerFinish {
     Done { report: String, success: bool },
     Cancelled,
-    BudgetExceeded,
+    BudgetExceeded(BudgetStop),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2831,7 +2894,7 @@ async fn finish_worker(
             .await?;
             Ok(WorkerFinish::Cancelled)
         }
-        VerificationOutcome::BudgetExceeded => {
+        VerificationOutcome::BudgetExceeded(stop) => {
             engine
                 .update_agent_status(&worker_spec.id, "failed")
                 .await?;
@@ -2842,13 +2905,20 @@ async fn finish_worker(
                 "agent.finished",
                 serde_json::json!({
                     "status": "failed",
-                    "summary": "token budget exhausted during verification",
+                    "summary": format!("{} during verification", stop.summary()),
                     "commit": commit,
                     "merged": false,
                 }),
             )
             .await?;
-            Ok(WorkerFinish::BudgetExceeded)
+            if stop.is_session() {
+                Ok(WorkerFinish::BudgetExceeded(stop))
+            } else {
+                Ok(WorkerFinish::Done {
+                    report: format!("verification stopped: {}", stop.summary()),
+                    success: false,
+                })
+            }
         }
     }
 }
@@ -2889,6 +2959,214 @@ fn shell_secret_roots(data_dir: &std::path::Path) -> Vec<PathBuf> {
     roots
 }
 
+#[derive(Debug, Default, Clone)]
+struct PlanBudgetScope {
+    task_id: Option<String>,
+    department: Option<String>,
+    task_tokens: Option<u64>,
+    task_cost: Option<f64>,
+    department_tokens: Option<u64>,
+    department_cost: Option<f64>,
+}
+
+impl PlanBudgetScope {
+    fn from_plan(plan: Option<&TeamPlan>, spec: &AgentSpec) -> Self {
+        let task = spec.task_id.as_deref().and_then(|task_id| {
+            plan.and_then(|plan| plan.tasks.iter().find(|task| task.id == task_id))
+        });
+        let department = spec.department.as_deref().and_then(|name| {
+            plan.and_then(|plan| {
+                plan.departments
+                    .iter()
+                    .find(|department| department.name == name)
+            })
+        });
+        Self {
+            task_id: spec.task_id.clone(),
+            department: spec.department.clone(),
+            task_tokens: task.and_then(|task| task.token_budget),
+            task_cost: task.and_then(|task| task.cost_budget_usd),
+            department_tokens: department.and_then(|department| department.token_budget),
+            department_cost: department.and_then(|department| department.cost_budget_usd),
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.task_tokens.is_some()
+            || self.task_cost.is_some()
+            || self.department_tokens.is_some()
+            || self.department_cost.is_some()
+    }
+
+    fn stop(
+        &self,
+        scope: &str,
+        id: &str,
+        reason: &str,
+        limit_tokens: Option<u64>,
+        spent: (u64, f64),
+        limit_cost: Option<f64>,
+    ) -> BudgetStop {
+        BudgetStop {
+            scope: scope.to_string(),
+            reason: reason.to_string(),
+            id: Some(id.to_string()),
+            limit_tokens,
+            spent_tokens: spent.0,
+            limit_cost,
+            spent_cost: spent.1,
+            elapsed_secs: None,
+        }
+    }
+
+    fn precheck(
+        &self,
+        task: (u64, f64),
+        department: (u64, f64),
+        input_estimate: u64,
+        min_output: u64,
+    ) -> Option<BudgetStop> {
+        if let Some(limit) = self.task_cost
+            && task.1 >= limit
+        {
+            return Some(self.stop(
+                "task",
+                self.task_id.as_deref().unwrap_or("?"),
+                "cost",
+                self.task_tokens,
+                task,
+                Some(limit),
+            ));
+        }
+        if let Some(limit) = self.department_cost
+            && department.1 >= limit
+        {
+            return Some(self.stop(
+                "department",
+                self.department.as_deref().unwrap_or("?"),
+                "cost",
+                self.department_tokens,
+                department,
+                Some(limit),
+            ));
+        }
+        if let Some(limit) = self.task_tokens {
+            let remaining = limit.saturating_sub(task.0);
+            if remaining <= input_estimate.saturating_add(min_output) {
+                return Some(self.stop(
+                    "task",
+                    self.task_id.as_deref().unwrap_or("?"),
+                    "tokens",
+                    Some(limit),
+                    task,
+                    self.task_cost,
+                ));
+            }
+        }
+        if let Some(limit) = self.department_tokens {
+            let remaining = limit.saturating_sub(department.0);
+            if remaining <= input_estimate.saturating_add(min_output) {
+                return Some(self.stop(
+                    "department",
+                    self.department.as_deref().unwrap_or("?"),
+                    "tokens",
+                    Some(limit),
+                    department,
+                    self.department_cost,
+                ));
+            }
+        }
+        None
+    }
+
+    fn output_limit(&self, task: (u64, f64), department: (u64, f64), input_estimate: u64) -> u64 {
+        let mut limit = u64::MAX;
+        if let Some(limit_tokens) = self.task_tokens {
+            limit = limit.min(
+                limit_tokens
+                    .saturating_sub(task.0)
+                    .saturating_sub(input_estimate),
+            );
+        }
+        if let Some(limit_tokens) = self.department_tokens {
+            limit = limit.min(
+                limit_tokens
+                    .saturating_sub(department.0)
+                    .saturating_sub(input_estimate),
+            );
+        }
+        limit
+    }
+
+    fn after(&self, task: (u64, f64), department: (u64, f64)) -> Option<BudgetStop> {
+        if let Some(limit) = self.task_tokens
+            && task.0 >= limit
+        {
+            return Some(self.stop(
+                "task",
+                self.task_id.as_deref().unwrap_or("?"),
+                "tokens",
+                Some(limit),
+                task,
+                self.task_cost,
+            ));
+        }
+        if let Some(limit) = self.task_cost
+            && task.1 >= limit
+        {
+            return Some(self.stop(
+                "task",
+                self.task_id.as_deref().unwrap_or("?"),
+                "cost",
+                self.task_tokens,
+                task,
+                Some(limit),
+            ));
+        }
+        if let Some(limit) = self.department_tokens
+            && department.0 >= limit
+        {
+            return Some(self.stop(
+                "department",
+                self.department.as_deref().unwrap_or("?"),
+                "tokens",
+                Some(limit),
+                department,
+                self.department_cost,
+            ));
+        }
+        if let Some(limit) = self.department_cost
+            && department.1 >= limit
+        {
+            return Some(self.stop(
+                "department",
+                self.department.as_deref().unwrap_or("?"),
+                "cost",
+                self.department_tokens,
+                department,
+                Some(limit),
+            ));
+        }
+        None
+    }
+}
+
+async fn emit_scope_budget_stop(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+    stop: &BudgetStop,
+) -> Result<()> {
+    emit(
+        engine,
+        session_id,
+        spec,
+        "agent.budget_exceeded",
+        stop.payload(),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 #[async_recursion]
 async fn run_loop(
@@ -2905,9 +3183,49 @@ async fn run_loop(
 ) -> Result<LoopOutcome> {
     let _capacity_permit =
         if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
-            match config.capacity.acquire(spec.role, control).await {
+            match config.capacity.try_acquire(spec.role) {
                 Some(permit) => Some(permit),
-                None => return Ok(LoopOutcome::Cancelled),
+                None => {
+                    let snapshot = config.capacity.snapshot();
+                    emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "agent.capacity_wait",
+                        serde_json::json!({
+                            "role": spec.role.as_str(),
+                            "limit": if spec.role == AgentRole::Worker {
+                                snapshot.worker_limit
+                            } else {
+                                snapshot.labour_limit
+                            },
+                            "available": if spec.role == AgentRole::Worker {
+                                snapshot.worker_available
+                            } else {
+                                snapshot.labour_available
+                            },
+                        }),
+                    )
+                    .await?;
+                    engine.update_agent_status(&spec.id, "queued").await?;
+                    let permit = match config.capacity.acquire(spec.role, control).await {
+                        Some(permit) => permit,
+                        None => return Ok(LoopOutcome::Cancelled),
+                    };
+                    engine.update_agent_status(&spec.id, "running").await?;
+                    emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "agent.capacity_ready",
+                        serde_json::json!({
+                            "role": spec.role.as_str(),
+                            "waited": true,
+                        }),
+                    )
+                    .await?;
+                    Some(permit)
+                }
             }
         } else {
             None
@@ -2949,6 +3267,7 @@ async fn run_loop(
     let system = role_system_prompt(spec.role, project, session, spec, objective);
     let tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
     let mut team_plan = engine.get_team_plan(&session.id).await?;
+    let plan_budget = PlanBudgetScope::from_plan(team_plan.as_ref(), spec);
 
     for turn in 0..config.max_turns {
         if !wait_for_resume(control).await {
@@ -2958,7 +3277,7 @@ async fn run_loop(
             return Ok(LoopOutcome::Cancelled);
         }
         if budget.exhausted() {
-            return Ok(LoopOutcome::BudgetExceeded);
+            return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
         }
         let mut request = ChatRequest {
             model: model_for(config, spec.role),
@@ -2968,23 +3287,67 @@ async fn run_loop(
             temperature: Some(0.2),
             tools: tools.clone(),
         };
+        const MIN_OUTPUT_TOKENS: u64 = 64;
+        let configured_output = config.max_tokens.unwrap_or(4096).max(1) as u64;
+        let input_estimate = estimate_request_tokens(&request);
+        let scope_spent = if plan_budget.active() {
+            Some(
+                engine
+                    .usage_spent(
+                        &session.id,
+                        spec.task_id.as_deref(),
+                        spec.department.as_deref(),
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let task_spent = scope_spent
+            .map(|(tokens, cost, _, _)| (tokens, cost))
+            .unwrap_or((0, 0.0));
+        let department_spent = scope_spent
+            .map(|(_, _, tokens, cost)| (tokens, cost))
+            .unwrap_or((0, 0.0));
+        if let Some(stop) = plan_budget.precheck(
+            task_spent,
+            department_spent,
+            input_estimate,
+            MIN_OUTPUT_TOKENS,
+        ) {
+            emit_scope_budget_stop(engine, &session.id, spec, &stop).await?;
+            return Ok(LoopOutcome::BudgetExceeded(stop));
+        }
+        let mut output_budget = configured_output;
+        if plan_budget.active() {
+            output_budget = output_budget.min(plan_budget.output_limit(
+                task_spent,
+                department_spent,
+                input_estimate,
+            ));
+        }
+        if budget.limit.is_some() {
+            let remaining = budget.available_tokens().unwrap_or(0);
+            if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
+                return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session_tokens(
+                    budget,
+                )));
+            }
+            output_budget = output_budget.min(remaining - input_estimate);
+        }
         let mut token_reservation = None;
         if budget.limit.is_some() {
-            let input_estimate = estimate_request_tokens(&request);
-            let remaining = budget.available_tokens().unwrap_or(0);
-            const MIN_OUTPUT_TOKENS: u64 = 64;
-            if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
-                return Ok(LoopOutcome::BudgetExceeded);
-            }
-            let configured = config.max_tokens.unwrap_or(4096).max(1) as u64;
-            let output_budget = configured.min(remaining - input_estimate);
             let Some(reservation) =
                 budget.reserve_tokens(input_estimate.saturating_add(output_budget))
             else {
-                return Ok(LoopOutcome::BudgetExceeded);
+                return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session_tokens(
+                    budget,
+                )));
             };
-            request.max_tokens = Some(output_budget.min(u32::MAX as u64) as u32);
             token_reservation = Some(reservation);
+        }
+        if output_budget < configured_output {
+            request.max_tokens = Some(output_budget.min(u32::MAX as u64) as u32);
         }
         let mut stream = config
             .provider
@@ -3064,6 +3427,7 @@ async fn run_loop(
                 &spec.name,
                 spec.role.as_str(),
                 spec.task_id.clone(),
+                spec.department.clone(),
                 &request.model,
                 input_tokens,
                 output_tokens,
@@ -3077,7 +3441,23 @@ async fn run_loop(
             .is_some_and(|reservation| reservation.settle(actual_usage))
             || budget.add_cost(cost)
         {
-            return Ok(LoopOutcome::BudgetExceeded);
+            return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
+        }
+        if plan_budget.active() {
+            let (task_tokens, task_cost, department_tokens, department_cost) = engine
+                .usage_spent(
+                    &session.id,
+                    spec.task_id.as_deref(),
+                    spec.department.as_deref(),
+                )
+                .await?;
+            if let Some(stop) = plan_budget.after(
+                (task_tokens, task_cost),
+                (department_tokens, department_cost),
+            ) {
+                emit_scope_budget_stop(engine, &session.id, spec, &stop).await?;
+                return Ok(LoopOutcome::BudgetExceeded(stop));
+            }
         }
 
         if text.is_empty() && tool_calls.is_empty() {
@@ -3146,7 +3526,7 @@ async fn run_loop(
                 return Ok(LoopOutcome::Cancelled);
             }
             if budget.exhausted() {
-                return Ok(LoopOutcome::BudgetExceeded);
+                return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
             }
             let call_id = if call.id.is_empty() {
                 format!("call_{}_{}", turn, index)
@@ -3253,8 +3633,8 @@ async fn run_loop(
                             RoundtableResult::Cancelled => {
                                 return Ok(LoopOutcome::Cancelled);
                             }
-                            RoundtableResult::BudgetExceeded => {
-                                return Ok(LoopOutcome::BudgetExceeded);
+                            RoundtableResult::BudgetExceeded(stop) => {
+                                return Ok(LoopOutcome::BudgetExceeded(stop));
                             }
                         }
                     }
@@ -3281,8 +3661,8 @@ async fn run_loop(
                     {
                         PlanRunResult::Done(report) => ToolOutput::ok(report),
                         PlanRunResult::Cancelled => return Ok(LoopOutcome::Cancelled),
-                        PlanRunResult::BudgetExceeded => {
-                            return Ok(LoopOutcome::BudgetExceeded);
+                        PlanRunResult::BudgetExceeded(stop) => {
+                            return Ok(LoopOutcome::BudgetExceeded(stop));
                         }
                     },
                 }
@@ -3387,8 +3767,8 @@ async fn run_loop(
                 {
                     ParallelResult::Output(output) => output,
                     ParallelResult::Cancelled => return Ok(LoopOutcome::Cancelled),
-                    ParallelResult::BudgetExceeded => {
-                        return Ok(LoopOutcome::BudgetExceeded);
+                    ParallelResult::BudgetExceeded(stop) => {
+                        return Ok(LoopOutcome::BudgetExceeded(stop));
                     }
                 }
             } else if is_delegate {
@@ -3491,7 +3871,12 @@ async fn run_loop(
                                     depth: spec.depth.saturating_add(1),
                                     parent_name: Some(spec.name.clone()),
                                     title: title.clone(),
-                                    task_id: None,
+                                    task_id: if role == AgentRole::Labour {
+                                        spec.task_id.clone()
+                                    } else {
+                                        None
+                                    },
+                                    department: spec.department.clone(),
                                     profile: child_profile,
                                     allow_delegation: role.child_role().is_some(),
                                     auto_approve: false,
@@ -3564,8 +3949,13 @@ async fn run_loop(
                                                 WorkerFinish::Cancelled => {
                                                     return Ok(LoopOutcome::Cancelled);
                                                 }
-                                                WorkerFinish::BudgetExceeded => {
-                                                    return Ok(LoopOutcome::BudgetExceeded);
+                                                WorkerFinish::BudgetExceeded(stop) => {
+                                                    if stop.is_session() {
+                                                        return Ok(LoopOutcome::BudgetExceeded(
+                                                            stop,
+                                                        ));
+                                                    }
+                                                    ToolOutput::error(stop.summary())
                                                 }
                                             }
                                         } else {
@@ -3603,7 +3993,7 @@ async fn run_loop(
                                         .await?;
                                         return Ok(LoopOutcome::Cancelled);
                                     }
-                                    Ok(LoopOutcome::BudgetExceeded) => {
+                                    Ok(LoopOutcome::BudgetExceeded(stop)) => {
                                         engine.update_agent_status(&child.id, "failed").await?;
                                         emit(
                                             engine,
@@ -3612,11 +4002,11 @@ async fn run_loop(
                                             "agent.finished",
                                             serde_json::json!({
                                                 "status": "failed",
-                                                "summary": "token budget exhausted",
+                                                "summary": stop.summary(),
                                             }),
                                         )
                                         .await?;
-                                        return Ok(LoopOutcome::BudgetExceeded);
+                                        return Ok(LoopOutcome::BudgetExceeded(stop));
                                     }
                                     Err(error) => {
                                         engine.update_agent_status(&child.id, "failed").await?;
@@ -4059,7 +4449,9 @@ fn tool_schemas(
                                 "name": {"type": "string"},
                                 "manager_title": {"type": "string"},
                                 "profile": {"type": "string", "enum": ["coding", "research", "verification", "generic"]},
-                                "objective": {"type": "string"}
+                                "objective": {"type": "string"},
+                                "token_budget": {"type": "integer", "minimum": 1, "description": "Optional department token cap across all tasks"},
+                                "cost_budget_usd": {"type": "number", "exclusiveMinimum": 0, "description": "Optional department USD cap across all tasks"}
                             },
                             "required": ["name", "manager_title", "profile", "objective"]
                         }
@@ -4080,7 +4472,9 @@ fn tool_schemas(
                                 },
                                 "deps": {"type": "array", "items": {"type": "string"}},
                                 "write_scope": {"type": "array", "items": {"type": "string"}},
-                                "acceptance": {"type": "array", "items": {"type": "string"}}
+                                "acceptance": {"type": "array", "items": {"type": "string"}},
+                                "token_budget": {"type": "integer", "minimum": 1, "description": "Optional task token cap"},
+                                "cost_budget_usd": {"type": "number", "exclusiveMinimum": 0, "description": "Optional task USD cap"}
                             },
                             "required": ["id", "department", "title", "kind", "acceptance"]
                         }
@@ -4302,7 +4696,7 @@ struct ParallelTask {
 enum ParallelResult {
     Output(ToolOutput),
     Cancelled,
-    BudgetExceeded,
+    BudgetExceeded(BudgetStop),
 }
 
 fn parse_parallel_tasks(
@@ -4433,6 +4827,7 @@ async fn run_parallel_workers(
             parent_name: Some(spec.name.clone()),
             title: None,
             task_id: None,
+            department: spec.department.clone(),
             profile: task.profile,
             allow_delegation: true,
             auto_approve: false,
@@ -4500,8 +4895,10 @@ async fn run_parallel_workers(
                 .await?;
             }
             Ok(LoopOutcome::Verdict(_)) => {}
-            Ok(LoopOutcome::BudgetExceeded) => {
-                budget_exceeded = true;
+            Ok(LoopOutcome::BudgetExceeded(stop)) => {
+                if stop.is_session() {
+                    budget_exceeded = true;
+                }
                 let (child_spec, _, _) = &prepared[index];
                 engine.update_agent_status(&child_spec.id, "failed").await?;
                 emit(
@@ -4511,7 +4908,7 @@ async fn run_parallel_workers(
                     "agent.finished",
                     serde_json::json!({
                         "status": "failed",
-                        "summary": "token budget exhausted",
+                        "summary": stop.summary(),
                     }),
                 )
                 .await?;
@@ -4541,7 +4938,7 @@ async fn run_parallel_workers(
         return if cancelled {
             Ok(ParallelResult::Cancelled)
         } else {
-            Ok(ParallelResult::BudgetExceeded)
+            Ok(ParallelResult::BudgetExceeded(BudgetStop::session(budget)))
         };
     }
 
@@ -4583,7 +4980,7 @@ async fn run_parallel_workers(
                         }
                         return Ok(ParallelResult::Cancelled);
                     }
-                    WorkerFinish::BudgetExceeded => {
+                    WorkerFinish::BudgetExceeded(stop) => {
                         for (_, (remaining, _, _)) in prepared.iter().enumerate().skip(index + 1) {
                             engine.update_agent_status(&remaining.id, "failed").await?;
                             emit(
@@ -4598,13 +4995,16 @@ async fn run_parallel_workers(
                             )
                             .await?;
                         }
-                        return Ok(ParallelResult::BudgetExceeded);
+                        return Ok(ParallelResult::BudgetExceeded(stop));
                     }
                 }
             }
-            Ok(LoopOutcome::Verdict(_))
-            | Ok(LoopOutcome::Cancelled)
-            | Ok(LoopOutcome::BudgetExceeded) => {}
+            Ok(LoopOutcome::Verdict(_)) | Ok(LoopOutcome::Cancelled) => {}
+            Ok(LoopOutcome::BudgetExceeded(stop)) => {
+                if !stop.is_session() {
+                    reports.push(format!("{}: {}", child_spec.name, stop.summary()));
+                }
+            }
             Err(error) => {
                 engine.update_agent_status(&child_spec.id, "failed").await?;
                 emit(
@@ -4659,6 +5059,21 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
         if department.objective.trim().is_empty() {
             return Err(anyhow!(
                 "department '{}' needs an objective",
+                department.name
+            ));
+        }
+        if department.token_budget == Some(0) {
+            return Err(anyhow!(
+                "department '{}' token budget must be greater than zero",
+                department.name
+            ));
+        }
+        if department
+            .cost_budget_usd
+            .is_some_and(|budget| !budget.is_finite() || budget <= 0.0)
+        {
+            return Err(anyhow!(
+                "department '{}' cost budget must be a positive finite number",
                 department.name
             ));
         }
@@ -4720,6 +5135,71 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
             }
             scopes.push(normalized);
         }
+        if task.token_budget == Some(0) {
+            return Err(anyhow!(
+                "task '{id}' token budget must be greater than zero"
+            ));
+        }
+        if task
+            .cost_budget_usd
+            .is_some_and(|budget| !budget.is_finite() || budget <= 0.0)
+        {
+            return Err(anyhow!(
+                "task '{id}' cost budget must be a positive finite number"
+            ));
+        }
+        if let Some(department) = plan
+            .departments
+            .iter()
+            .find(|department| department.name == task.department)
+        {
+            if let (Some(task_limit), Some(department_limit)) =
+                (task.token_budget, department.token_budget)
+                && task_limit > department_limit
+            {
+                return Err(anyhow!(
+                    "task '{id}' token budget exceeds its department budget"
+                ));
+            }
+            if let (Some(task_limit), Some(department_limit)) =
+                (task.cost_budget_usd, department.cost_budget_usd)
+                && task_limit > department_limit + f64::EPSILON
+            {
+                return Err(anyhow!(
+                    "task '{id}' cost budget exceeds its department budget"
+                ));
+            }
+        }
+    }
+    for department in &plan.departments {
+        let task_tokens: u64 = plan
+            .tasks
+            .iter()
+            .filter(|task| task.department == department.name)
+            .filter_map(|task| task.token_budget)
+            .fold(0, u64::saturating_add);
+        if let Some(limit) = department.token_budget
+            && task_tokens > limit
+        {
+            return Err(anyhow!(
+                "department '{}' task token budgets exceed the department cap",
+                department.name
+            ));
+        }
+        let task_cost: f64 = plan
+            .tasks
+            .iter()
+            .filter(|task| task.department == department.name)
+            .filter_map(|task| task.cost_budget_usd)
+            .sum();
+        if let Some(limit) = department.cost_budget_usd
+            && task_cost > limit + f64::EPSILON
+        {
+            return Err(anyhow!(
+                "department '{}' task cost budgets exceed the department cap",
+                department.name
+            ));
+        }
     }
     // Cycle detection over the task DAG.
     fn visit(
@@ -4751,7 +5231,16 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
 enum RoundtableResult {
     Done(String),
     Cancelled,
-    BudgetExceeded,
+    BudgetExceeded(BudgetStop),
+}
+
+fn plan_budget_text(tokens: Option<u64>, cost: Option<f64>) -> String {
+    match (tokens, cost) {
+        (None, None) => String::new(),
+        (Some(tokens), None) => format!(" budget={tokens} tokens"),
+        (None, Some(cost)) => format!(" budget=${cost:.4}"),
+        (Some(tokens), Some(cost)) => format!(" budget={tokens} tokens/${cost:.4}"),
+    }
 }
 
 fn plan_prompt(plan: &TeamPlan) -> String {
@@ -4759,9 +5248,14 @@ fn plan_prompt(plan: &TeamPlan) -> String {
         .departments
         .iter()
         .map(|department| {
+            let budget = plan_budget_text(department.token_budget, department.cost_budget_usd);
             format!(
-                "- {}: manager '{}' ({}) — {}",
-                department.name, department.manager_title, department.profile, department.objective
+                "- {}: manager '{}' ({}) — {}{}",
+                department.name,
+                department.manager_title,
+                department.profile,
+                department.objective,
+                budget
             )
         })
         .collect::<Vec<_>>()
@@ -4771,12 +5265,13 @@ fn plan_prompt(plan: &TeamPlan) -> String {
         .iter()
         .map(|task| {
             format!(
-                "- {} [{}] {} deps={} scope={}",
+                "- {} [{}] {} deps={} scope={}{}",
                 task.id,
                 task.department,
                 task.title,
                 task.deps.join(","),
-                task.write_scope.join(",")
+                task.write_scope.join(","),
+                plan_budget_text(task.token_budget, task.cost_budget_usd)
             )
         })
         .collect::<Vec<_>>()
@@ -4814,7 +5309,9 @@ async fn deliberate_team_plan(
             return Ok(RoundtableResult::Cancelled);
         }
         if budget.exhausted() {
-            return Ok(RoundtableResult::BudgetExceeded);
+            return Ok(RoundtableResult::BudgetExceeded(BudgetStop::session(
+                budget,
+            )));
         }
         let peer_context = positions
             .iter()
@@ -4893,8 +5390,8 @@ async fn deliberate_team_plan(
                     ));
                 }
                 Ok(LoopOutcome::Cancelled) => return Ok(RoundtableResult::Cancelled),
-                Ok(LoopOutcome::BudgetExceeded) => {
-                    return Ok(RoundtableResult::BudgetExceeded);
+                Ok(LoopOutcome::BudgetExceeded(stop)) => {
+                    return Ok(RoundtableResult::BudgetExceeded(stop));
                 }
                 Ok(LoopOutcome::Verdict(_)) => {}
                 Err(error) => {
@@ -4930,7 +5427,7 @@ async fn deliberate_team_plan(
 enum PlanRunResult {
     Done(String),
     Cancelled,
-    BudgetExceeded,
+    BudgetExceeded(BudgetStop),
 }
 
 fn task_profile(task: &PlanTask, department_profile: AgentProfile) -> AgentProfile {
@@ -5011,6 +5508,7 @@ async fn ensure_plan_manager(
         parent_name: Some(leader_spec.name.clone()),
         title: Some(department.manager_title.clone()),
         task_id: None,
+        department: Some(department.name.clone()),
         profile,
         allow_delegation: false,
         auto_approve: false,
@@ -5132,7 +5630,7 @@ async fn execute_team_plan(
                 )
                 .await?;
             }
-            return Ok(PlanRunResult::BudgetExceeded);
+            return Ok(PlanRunResult::BudgetExceeded(BudgetStop::session(budget)));
         }
         let ready = remaining
             .iter()
@@ -5253,6 +5751,7 @@ async fn execute_team_plan(
                 parent_name: Some(manager_spec.name.clone()),
                 title: None,
                 task_id: Some(task.id.clone()),
+                department: Some(task.department.clone()),
                 profile,
                 allow_delegation: true,
                 auto_approve: false,
@@ -5406,7 +5905,7 @@ async fn execute_team_plan(
                             }
                             return Ok(PlanRunResult::Cancelled);
                         }
-                        WorkerFinish::BudgetExceeded => {
+                        WorkerFinish::BudgetExceeded(stop) => {
                             statuses.insert(task.id.clone(), "blocked".to_string());
                             emit(
                                 engine,
@@ -5438,7 +5937,7 @@ async fn execute_team_plan(
                                 )
                                 .await?;
                             }
-                            return Ok(PlanRunResult::BudgetExceeded);
+                            return Ok(PlanRunResult::BudgetExceeded(stop));
                         }
                     }
                 }
@@ -5460,12 +5959,26 @@ async fn execute_team_plan(
                     .await?;
                     return Ok(PlanRunResult::Cancelled);
                 }
-                Ok(LoopOutcome::BudgetExceeded) => {
+                Ok(LoopOutcome::BudgetExceeded(stop)) => {
                     engine
                         .update_agent_status(&worker_spec.id, "failed")
                         .await?;
                     statuses.insert(task.id.clone(), "blocked".to_string());
-                    return Ok(PlanRunResult::BudgetExceeded);
+                    emit(
+                        engine,
+                        &session.id,
+                        worker_spec,
+                        "plan_task.finished",
+                        serde_json::json!({
+                            "task_id": task.id,
+                            "task_status": "blocked",
+                            "reason": stop.summary(),
+                        }),
+                    )
+                    .await?;
+                    if stop.is_session() {
+                        return Ok(PlanRunResult::BudgetExceeded(stop));
+                    }
                 }
                 Ok(LoopOutcome::Verdict(_)) => {}
                 Err(error) => {
@@ -6108,6 +6621,87 @@ mod tests {
         }
     }
 
+    struct BudgetPlanProvider {
+        department_tokens: Option<u64>,
+    }
+
+    #[async_trait]
+    impl Provider for BudgetPlanProvider {
+        fn id(&self) -> &str {
+            "budget-plan"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+            let last = request.messages.last();
+            let last_content = last
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let user_text = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let events = if user_text.contains("Execute plan task") {
+                vec![
+                    StreamEvent::TextDelta("worker should not run".into()),
+                    StreamEvent::Done,
+                ]
+            } else if last_content.contains("Plan complete") {
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ]
+            } else if last.map(|message| message.role.as_str()) == Some("tool") {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "run_plan".into(),
+                        name: "run_team_plan".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else {
+                let mut plan = serde_json::json!({
+                    "goal": "budget plan",
+                    "departments": [{
+                        "name": "impl",
+                        "manager_title": "Implementation",
+                        "profile": "coding",
+                        "objective": "build"
+                    }],
+                    "tasks": [
+                        {"id": "T1", "department": "impl", "title": "One", "kind": "coding", "acceptance": ["done"], "write_scope": ["src/t1"], "token_budget": 1},
+                        {"id": "T2", "department": "impl", "title": "Two", "kind": "coding", "acceptance": ["done"], "write_scope": ["src/t2"], "token_budget": 1}
+                    ]
+                });
+                if let Some(tokens) = self.department_tokens {
+                    plan["departments"][0]["token_budget"] = serde_json::json!(tokens);
+                    plan["tasks"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("token_budget");
+                    plan["tasks"][1]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("token_budget");
+                }
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "submit_plan".into(),
+                        name: "submit_team_plan".into(),
+                        arguments: plan.to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            };
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+
     struct RoundtableProvider;
 
     #[async_trait]
@@ -6587,6 +7181,7 @@ mod tests {
             parent_name: Some("Manager".into()),
             title: None,
             task_id: Some("T1".into()),
+            department: Some("impl".into()),
             profile: AgentProfile::Coding,
             allow_delegation: true,
             auto_approve: false,
@@ -6651,6 +7246,7 @@ mod tests {
             parent_name: None,
             title: None,
             task_id: Some("T1".into()),
+            department: Some("impl".into()),
             profile: AgentProfile::Coding,
             allow_delegation: true,
             auto_approve: false,
@@ -6748,6 +7344,7 @@ mod tests {
             parent_name: None,
             title: None,
             task_id: Some("T1".into()),
+            department: Some("impl".into()),
             profile: AgentProfile::Coding,
             allow_delegation: true,
             auto_approve: false,
@@ -6853,6 +7450,7 @@ mod tests {
             parent_name: None,
             title: None,
             task_id: Some("T1".into()),
+            department: Some("impl".into()),
             profile: AgentProfile::Coding,
             allow_delegation: true,
             auto_approve: false,
@@ -7564,6 +8162,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_budget_blocks_only_the_task_not_the_plan() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(BudgetPlanProvider {
+            department_tokens: None,
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "task budgets".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "task budgets").await.unwrap();
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "idle");
+        let events = engine
+            .list_events(session.id.clone(), 0, 400)
+            .await
+            .unwrap();
+        let budget_events = events
+            .iter()
+            .filter(|event| event.kind == "agent.budget_exceeded")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            budget_events
+                .iter()
+                .filter(|event| event.payload["scope"] == "task")
+                .count(),
+            2
+        );
+        assert!(budget_events.iter().all(|event| {
+            event.payload["reason"] == "tokens"
+                && event.payload["limit"] == 1
+                && event.payload["spent"] == 0
+        }));
+        let blocked = events
+            .iter()
+            .filter(|event| {
+                event.kind == "plan_task.finished"
+                    && event.payload["task_status"] == "blocked"
+                    && event.payload["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("task T"))
+            })
+            .count();
+        assert_eq!(blocked, 2);
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.updated"
+                && event.payload["agent"]["role"] == "leader"
+                && event.payload["status"] == "idle"
+        }));
+        let ledger = engine.usage_ledger(&session.id).await.unwrap();
+        assert!(
+            ledger.entries.iter().all(|entry| entry.task_id.is_none()),
+            "blocked tasks must not record usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn department_budget_aggregates_across_ready_tasks() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(BudgetPlanProvider {
+            department_tokens: Some(1),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "department budgets".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service
+            .start(&session.id, "department budgets")
+            .await
+            .unwrap();
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "idle");
+        let events = engine
+            .list_events(session.id.clone(), 0, 400)
+            .await
+            .unwrap();
+        let department_stops = events
+            .iter()
+            .filter(|event| {
+                event.kind == "agent.budget_exceeded"
+                    && event.payload["scope"] == "department"
+                    && event.payload["id"] == "impl"
+            })
+            .count();
+        assert_eq!(department_stops, 2);
+        assert!(events.iter().any(|event| {
+            event.kind == "plan_task.finished"
+                && event.payload["task_status"] == "blocked"
+                && event.payload["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("department impl"))
+        }));
+    }
+
+    async fn wait_until_idle(engine: &Engine, session: &Session) -> vp_protocol::types::Session {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let sessions = engine
+                .list_sessions(Some(session.project_id.clone()))
+                .await
+                .unwrap();
+            let current = sessions
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap();
+            if matches!(current.status.as_str(), "idle" | "failed" | "cancelled") {
+                return current;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session did not finish: {}",
+                current.status
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn auto_dispatches_a_team_plan_in_dependency_batches() {
         let dir = TempDir::new().unwrap();
         let provider = Arc::new(PlanRoutingProvider::new());
@@ -7815,6 +8540,7 @@ mod tests {
                 "Worker One",
                 "worker",
                 Some("T1".into()),
+                Some("impl".into()),
                 "worker-model",
                 100,
                 50,
@@ -7830,6 +8556,7 @@ mod tests {
                 "Worker Two",
                 "worker",
                 Some("T2".into()),
+                Some("impl".into()),
                 "worker-model",
                 40,
                 20,
@@ -7848,6 +8575,9 @@ mod tests {
         assert_eq!(ledger.totals.by_role[0].key, "worker");
         assert_eq!(ledger.totals.by_role[0].calls, 2);
         assert_eq!(ledger.totals.by_task.len(), 2);
+        assert_eq!(ledger.totals.by_department.len(), 1);
+        assert_eq!(ledger.totals.by_department[0].key, "impl");
+        assert_eq!(ledger.totals.by_department[0].calls, 2);
         assert_eq!(ledger.totals.by_agent.len(), 2);
         assert!(ledger.entries[1].estimated);
         let sessions = engine
@@ -7977,6 +8707,55 @@ mod tests {
     }
 
     #[test]
+    fn team_plan_validates_task_and_department_budgets() {
+        let base = serde_json::json!({
+            "goal": "budgets",
+            "departments": [{
+                "name": "impl",
+                "manager_title": "Implementation",
+                "profile": "coding",
+                "objective": "build",
+                "token_budget": 100,
+                "cost_budget_usd": 1.0
+            }],
+            "tasks": [{
+                "id": "T1",
+                "department": "impl",
+                "title": "Task",
+                "kind": "coding",
+                "acceptance": ["done"],
+                "token_budget": 40,
+                "cost_budget_usd": 0.4
+            }]
+        });
+        let plan: TeamPlan = serde_json::from_value(base.clone()).unwrap();
+        validate_team_plan(&plan, 5).unwrap();
+
+        let mut zero_department = base.clone();
+        zero_department["departments"][0]["token_budget"] = serde_json::json!(0);
+        assert!(validate_team_plan(&serde_json::from_value(zero_department).unwrap(), 5).is_err());
+
+        let mut zero_task = base.clone();
+        zero_task["tasks"][0]["cost_budget_usd"] = serde_json::json!(0);
+        assert!(validate_team_plan(&serde_json::from_value(zero_task).unwrap(), 5).is_err());
+
+        let mut task_over_department = base.clone();
+        task_over_department["tasks"][0]["token_budget"] = serde_json::json!(101);
+        assert!(
+            validate_team_plan(&serde_json::from_value(task_over_department).unwrap(), 5).is_err()
+        );
+
+        let mut sum_over_department = base;
+        sum_over_department["tasks"] = serde_json::json!([
+            {"id": "T1", "department": "impl", "title": "One", "kind": "coding", "acceptance": ["done"], "token_budget": 60},
+            {"id": "T2", "department": "impl", "title": "Two", "kind": "coding", "acceptance": ["done"], "token_budget": 60}
+        ]);
+        assert!(
+            validate_team_plan(&serde_json::from_value(sum_over_department).unwrap(), 5).is_err()
+        );
+    }
+
+    #[test]
     fn plan_batch_serializes_unscoped_and_overlapping_tasks() {
         fn task(id: &str, scope: &[&str]) -> PlanTask {
             PlanTask {
@@ -7988,6 +8767,8 @@ mod tests {
                 deps: Vec::new(),
                 write_scope: scope.iter().map(|scope| scope.to_string()).collect(),
                 acceptance: vec!["done".to_string()],
+                token_budget: None,
+                cost_budget_usd: None,
             }
         }
 
@@ -8128,6 +8909,7 @@ mod tests {
             parent_name: None,
             title: None,
             task_id: None,
+            department: None,
             profile: AgentProfile::Generic,
             allow_delegation: true,
             auto_approve: false,
@@ -8223,9 +9005,12 @@ mod tests {
                 labour_available: 1,
             }
         );
+        let probe = capacity.try_acquire(AgentRole::Worker).unwrap();
+        drop(probe);
         let control = RunControl::new();
         let first = capacity.acquire(AgentRole::Worker, &control).await.unwrap();
         assert_eq!(capacity.snapshot().worker_available, 0);
+        assert!(capacity.try_acquire(AgentRole::Worker).is_none());
         let second_capacity = capacity.clone();
         let second_control = Arc::new(RunControl::new());
         let mut waiter = tokio::spawn(async move {

@@ -54,6 +54,7 @@
 | [0042](adr/0042-binary-artifacts-gc-retention.md) | Binary artifacts + retention GC | Accepted | 产物/磁盘/保留策略 |
 | [0043](adr/0043-global-worker-labour-capacity.md) | Daemon-wide Worker/Labour capacity | Accepted | 调度/容量/可观测性 |
 | [0044](adr/0044-per-call-usage-ledger.md) | Per-call usage ledger | Accepted | 成本/预算/可观测性 |
+| [0045](adr/0045-task-department-budgets.md) | Task and department budgets | Accepted | 预算/调度/失败语义 |
 
 ---
 

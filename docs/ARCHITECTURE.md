@@ -427,6 +427,7 @@ loop {
 ### 6.5 预算
 
 - 预算检查点：LLM 请求前、工具调用前、流式响应中（按 token 增量）。
+- 预算树：session 为根；TeamPlan 的 department/task 可选 token/USD 上限。turn 前按 `usage_ledger` 剩余额度压低 `max_tokens`，turn 后复查；task/department 失败只 block 任务，session 失败终止会话。
 - 计数：
   - LLM input/output tokens（provider usage 优先；否则估算并标记）；当前实现按 provider call 写入 `usage_ledger`（agent/role/task/model/tokens/estimated/cost）。
   - 工具调用次数。

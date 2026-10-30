@@ -144,6 +144,7 @@ struct UsageTotals: Codable, Sendable {
     let byModel: [UsageBucket]
     let byAgent: [UsageBucket]
     let byTask: [UsageBucket]
+    let byDepartment: [UsageBucket]
 
     enum CodingKeys: String, CodingKey {
         case calls
@@ -154,6 +155,7 @@ struct UsageTotals: Codable, Sendable {
         case byModel = "by_model"
         case byAgent = "by_agent"
         case byTask = "by_task"
+        case byDepartment = "by_department"
     }
 }
 
@@ -704,6 +706,8 @@ struct PlanDepartment: Codable, Identifiable, Hashable, Sendable {
     let managerTitle: String
     let profile: String
     let objective: String
+    let tokenBudget: Int?
+    let costBudgetUsd: Double?
 
     var id: String {
         name
@@ -714,6 +718,8 @@ struct PlanDepartment: Codable, Identifiable, Hashable, Sendable {
         case managerTitle = "manager_title"
         case profile
         case objective
+        case tokenBudget = "token_budget"
+        case costBudgetUsd = "cost_budget_usd"
     }
 }
 
@@ -726,6 +732,8 @@ struct PlanTask: Codable, Identifiable, Hashable, Sendable {
     let deps: [String]
     let writeScope: [String]
     let acceptance: [String]
+    let tokenBudget: Int?
+    let costBudgetUsd: Double?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -736,6 +744,8 @@ struct PlanTask: Codable, Identifiable, Hashable, Sendable {
         case deps
         case writeScope = "write_scope"
         case acceptance
+        case tokenBudget = "token_budget"
+        case costBudgetUsd = "cost_budget_usd"
     }
 }
 

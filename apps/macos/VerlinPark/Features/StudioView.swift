@@ -219,6 +219,17 @@ struct CollabGraphView: View {
     }
 }
 
+private func planBudgetLabel(tokens: Int?, cost: Double?) -> String? {
+    var parts: [String] = []
+    if let tokens {
+        parts.append("\(tokens) tok")
+    }
+    if let cost {
+        parts.append(String(format: "$%.2f", cost))
+    }
+    return parts.isEmpty ? nil : parts.joined(separator: " / ")
+}
+
 private struct PlanTaskRow: View {
     let task: PlanTask
     let status: String
@@ -246,6 +257,12 @@ private struct PlanTaskRow: View {
                     }
                     if !task.deps.isEmpty {
                         Text("· deps \(task.deps.joined(separator: ","))")
+                    }
+                    if let budget = planBudgetLabel(
+                        tokens: task.tokenBudget,
+                        cost: task.costBudgetUsd
+                    ) {
+                        Text("· \(budget)")
                     }
                 }
                 .font(.system(size: 8, design: .monospaced))
@@ -1004,6 +1021,14 @@ struct PreviewPanelView: View {
                             Text("\(department.profile)")
                                 .font(.system(size: 8, design: .monospaced))
                                 .foregroundStyle(.tertiary)
+                            if let budget = planBudgetLabel(
+                                tokens: department.tokenBudget,
+                                cost: department.costBudgetUsd
+                            ) {
+                                Text(budget)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
                             Spacer()
                         }
                     }
@@ -1090,6 +1115,10 @@ struct PreviewPanelView: View {
                         }
 
                         UsageBucketSection(title: "BY ROLE", buckets: ledger.totals.byRole)
+                        UsageBucketSection(
+                            title: "BY DEPARTMENT",
+                            buckets: ledger.totals.byDepartment
+                        )
                         UsageBucketSection(title: "BY TASK", buckets: ledger.totals.byTask)
                         UsageBucketSection(title: "BY AGENT", buckets: ledger.totals.byAgent)
                         UsageBucketSection(title: "BY MODEL", buckets: ledger.totals.byModel)

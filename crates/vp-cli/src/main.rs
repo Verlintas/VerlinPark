@@ -561,6 +561,7 @@ fn print_human(value: &Value) {
         );
         for (label, field) in [
             ("role", "by_role"),
+            ("dept", "by_department"),
             ("task", "by_task"),
             ("agent", "by_agent"),
             ("model", "by_model"),
@@ -714,11 +715,12 @@ fn print_human(value: &Value) {
     }
     if let Some(consistent) = value.get("consistent").and_then(Value::as_bool) {
         println!(
-            "{}  events={}  status={} usage={} plan={} todos={} messages={} agents={} queue={}",
+            "{}  events={}  status={} usage={} ledger={} plan={} todos={} messages={} agents={} queue={}",
             if consistent { "consistent" } else { "MISMATCH" },
             value["event_count"].as_u64().unwrap_or(0),
             value["status_matches"].as_bool().unwrap_or(false),
             value["usage_matches"].as_bool().unwrap_or(false),
+            value["ledger_matches"].as_bool().unwrap_or(false),
             value["plan_matches"].as_bool().unwrap_or(false),
             value["todos_matches"].as_bool().unwrap_or(false),
             value["messages_matches"].as_bool().unwrap_or(false),

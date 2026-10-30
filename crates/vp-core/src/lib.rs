@@ -31,6 +31,7 @@ struct ReplayData {
     agents: Vec<AgentRecord>,
     approvals: Vec<Approval>,
     queue: Vec<MergeQueueEntry>,
+    usage: Vec<UsageEntry>,
     events: Vec<Event>,
 }
 
@@ -809,6 +810,7 @@ impl Engine {
         agent_name: &str,
         role: &str,
         task_id: Option<String>,
+        department: Option<String>,
         model: &str,
         input: u64,
         output: u64,
@@ -833,6 +835,7 @@ impl Engine {
                 &agent_name,
                 &role,
                 task_id.as_deref(),
+                department.as_deref(),
                 &model,
                 input,
                 output,
@@ -859,6 +862,7 @@ impl Engine {
         let mut by_model = HashMap::new();
         let mut by_agent = HashMap::new();
         let mut by_task = HashMap::new();
+        let mut by_department = HashMap::new();
         for entry in &entries {
             totals.input_tokens = totals.input_tokens.saturating_add(entry.input_tokens);
             totals.output_tokens = totals.output_tokens.saturating_add(entry.output_tokens);
@@ -871,16 +875,38 @@ impl Engine {
                 entry.task_id.as_deref().unwrap_or("(unassigned)"),
                 entry,
             );
+            add_usage_bucket(
+                &mut by_department,
+                entry.department.as_deref().unwrap_or("(unassigned)"),
+                entry,
+            );
         }
         totals.by_role = sorted_usage_buckets(by_role);
         totals.by_model = sorted_usage_buckets(by_model);
         totals.by_agent = sorted_usage_buckets(by_agent);
         totals.by_task = sorted_usage_buckets(by_task);
+        totals.by_department = sorted_usage_buckets(by_department);
         Ok(UsageLedgerResult {
             session_id: session_id.to_string(),
             entries,
             totals,
         })
+    }
+
+    pub async fn usage_spent(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        department: Option<&str>,
+    ) -> Result<(u64, f64, u64, f64)> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.map(str::to_string);
+        let department = department.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            store.usage_spent(&session_id, task_id.as_deref(), department.as_deref())
+        })
+        .await?
     }
 
     pub async fn record_cost(&self, session_id: &str, cost_usd: f64) -> Result<()> {
@@ -1319,6 +1345,7 @@ impl Engine {
             let agents = store.list_agents(&id)?;
             let approvals = store.list_approvals(Some(&id))?;
             let queue = store.list_merge_queue(&id)?;
+            let usage = store.list_usage_entries(&id)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -1328,10 +1355,96 @@ impl Engine {
                 agents,
                 approvals,
                 queue,
+                usage,
                 events,
             })
         })
         .await?
+    }
+
+    fn expected_usage_entries(data: &ReplayData) -> Vec<UsageEntry> {
+        data.events
+            .iter()
+            .filter(|event| event.kind == "agent.usage")
+            .map(|event| UsageEntry {
+                id: event
+                    .payload
+                    .get("usage_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("event-{}", event.seq)),
+                session_id: data.session.id.clone(),
+                agent_id: event
+                    .payload
+                    .get("agent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                agent_name: event
+                    .payload
+                    .get("agent_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                role: event
+                    .payload
+                    .get("agent_role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                task_id: event
+                    .payload
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                department: event
+                    .payload
+                    .get("department")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                model: event
+                    .payload
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                input_tokens: event
+                    .payload
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                output_tokens: event
+                    .payload
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                estimated: event
+                    .payload
+                    .get("estimated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                cost_usd: event
+                    .payload
+                    .get("cost_usd")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+                created_at: event.created_at.clone(),
+            })
+            .collect()
+    }
+
+    fn same_usage(left: &UsageEntry, right: &UsageEntry) -> bool {
+        left.id == right.id
+            && left.agent_id == right.agent_id
+            && left.agent_name == right.agent_name
+            && left.role == right.role
+            && left.task_id == right.task_id
+            && left.department == right.department
+            && left.model == right.model
+            && left.input_tokens == right.input_tokens
+            && left.output_tokens == right.output_tokens
+            && left.estimated == right.estimated
+            && left.cost_usd.to_bits() == right.cost_usd.to_bits()
     }
 
     fn replay_report(data: &ReplayData, repaired: bool) -> Result<SessionReplayReport> {
@@ -1373,6 +1486,36 @@ impl Engine {
             mismatches.push(format!(
                 "usage: projection={}/{}, replay={replay_in}/{replay_out}",
                 data.session.tokens_in, data.session.tokens_out
+            ));
+        }
+
+        let expected_usage = Self::expected_usage_entries(data);
+        let has_usage_id = data
+            .events
+            .iter()
+            .any(|event| event.kind == "agent.usage" && event.payload.get("usage_id").is_some());
+        let projected_usage = data
+            .usage
+            .iter()
+            .map(|entry| (entry.id.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        let ledger_matches = if data.usage.is_empty() && !has_usage_id {
+            // Legacy sessions predate the ledger; their events have no usage_id
+            // and no projection to compare against.
+            true
+        } else {
+            expected_usage.len() == data.usage.len()
+                && expected_usage.iter().all(|expected| {
+                    projected_usage
+                        .get(&expected.id)
+                        .is_some_and(|projected| Self::same_usage(projected, expected))
+                })
+        };
+        if !ledger_matches {
+            mismatches.push(format!(
+                "usage ledger: projection={}, replay={}",
+                data.usage.len(),
+                expected_usage.len()
             ));
         }
 
@@ -1483,6 +1626,7 @@ impl Engine {
 
         let consistent = status_matches
             && usage_matches
+            && ledger_matches
             && plan_matches
             && todos_matches
             && messages_matches
@@ -1498,6 +1642,7 @@ impl Engine {
             messages_matches,
             agents_matches,
             queue_matches,
+            ledger_matches,
             consistent,
             repaired,
             rebuilt: false,
@@ -1873,10 +2018,15 @@ impl Engine {
             message_store.list_agent_messages(&messages_session, None, false)
         })
         .await??;
-        let artifact_store = store;
-        let artifacts_session = session_id;
+        let artifact_store = store.clone();
+        let artifacts_session = session_id.clone();
         let mut artifacts =
             tokio::task::spawn_blocking(move || artifact_store.list_artifacts(&artifacts_session))
+                .await??;
+        let usage_store = store;
+        let usage_session = session_id;
+        let usage =
+            tokio::task::spawn_blocking(move || usage_store.list_usage_entries(&usage_session))
                 .await??;
         for artifact in &mut artifacts {
             if artifact.storage == "file"
@@ -1905,6 +2055,7 @@ impl Engine {
             merge_queue: data.queue,
             agent_messages,
             artifacts,
+            usage,
         })
     }
 
@@ -1915,6 +2066,13 @@ impl Engine {
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || store.repair_session_projections(&id, &repair))
             .await??;
+        let expected_usage = Self::expected_usage_entries(&data);
+        let usage_store = self.store.clone();
+        let usage_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            usage_store.replace_usage_ledger(&usage_id, &expected_usage)
+        })
+        .await??;
         self.append_event(
             session_id,
             "session.rebuilt",
@@ -1943,6 +2101,13 @@ impl Engine {
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || store.repair_session_projections(&id, &repair))
             .await??;
+        let expected_usage = Self::expected_usage_entries(&data);
+        let usage_store = self.store.clone();
+        let usage_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            usage_store.replace_usage_ledger(&usage_id, &expected_usage)
+        })
+        .await??;
         self.append_event(
             session_id,
             "session.repaired",
@@ -3032,7 +3197,22 @@ mod tests {
             .update_session_status(&session.id, "running")
             .await
             .unwrap();
-        engine.record_usage(&session.id, 7, 3).await.unwrap();
+        engine
+            .record_agent_usage(
+                &session.id,
+                "agent-1",
+                "Worker",
+                "worker",
+                Some("T1".into()),
+                Some("impl".into()),
+                "test",
+                7,
+                3,
+                false,
+                0.25,
+            )
+            .await
+            .unwrap();
         let plan: TeamPlan = serde_json::from_value(serde_json::json!({
             "goal": "replay",
             "departments": [{
@@ -3121,6 +3301,7 @@ mod tests {
         assert!(report.consistent, "{:?}", report.mismatches);
         assert!(report.status_matches);
         assert!(report.usage_matches);
+        assert!(report.ledger_matches);
         assert!(report.plan_matches);
         assert!(report.todos_matches);
         assert!(report.messages_matches);
@@ -3131,13 +3312,28 @@ mod tests {
             .store()
             .update_session_status(&session.id, "idle")
             .unwrap();
+        engine
+            .store()
+            .replace_usage_ledger(&session.id, &[])
+            .unwrap();
         let report = engine.replay_session(&session.id).await.unwrap();
         assert!(!report.consistent);
         assert!(!report.status_matches);
+        assert!(!report.ledger_matches);
 
         let repaired = engine.repair_session(&session.id).await.unwrap();
         assert!(repaired.repaired);
         assert!(repaired.consistent, "{:?}", repaired.mismatches);
+        assert!(repaired.ledger_matches);
+        assert_eq!(
+            engine
+                .usage_ledger(&session.id)
+                .await
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
         let sessions = engine
             .list_sessions(Some(session.project_id.clone()))
             .await
@@ -3197,6 +3393,22 @@ mod tests {
             )
             .await
             .unwrap();
+        engine
+            .record_agent_usage(
+                &session.id,
+                &agent.id,
+                &agent.name,
+                "worker",
+                Some("T1".into()),
+                Some("impl".into()),
+                "test",
+                11,
+                5,
+                false,
+                0.125,
+            )
+            .await
+            .unwrap();
 
         let bundle = engine.export_session(&session.id).await.unwrap();
         assert_eq!(bundle.version, 1);
@@ -3209,6 +3421,10 @@ mod tests {
         assert_eq!(bundle.merge_queue.len(), 1);
         assert_eq!(bundle.agent_messages.len(), 1);
         assert_eq!(bundle.artifacts.len(), 2);
+        assert_eq!(bundle.usage.len(), 2);
+        assert!(bundle.usage.iter().any(|usage| {
+            usage.agent_name == agent.name && usage.department.as_deref() == Some("impl")
+        }));
         assert!(bundle.team_plan.is_some());
         assert!(!bundle.events.is_empty());
         let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
@@ -3254,6 +3470,15 @@ mod tests {
         assert_eq!(imported_agents.len(), 1);
         let imported_messages = imported_engine.list_messages(&session.id).await.unwrap();
         assert_eq!(imported_messages.len(), 1);
+        let imported_usage = imported_engine.usage_ledger(&session.id).await.unwrap();
+        assert_eq!(imported_usage.entries.len(), 2);
+        assert!(
+            imported_usage
+                .entries
+                .iter()
+                .any(|entry| entry.cost_usd == 0.125)
+        );
+        assert_eq!(imported_usage.totals.input_tokens, 18);
         let imported_approvals = imported_engine
             .list_approvals(Some(session.id.clone()))
             .await

@@ -413,6 +413,8 @@ pub struct UsageEntry {
     pub role: String,
     #[serde(default)]
     pub task_id: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -442,6 +444,7 @@ pub struct UsageTotals {
     pub by_model: Vec<UsageBucket>,
     pub by_agent: Vec<UsageBucket>,
     pub by_task: Vec<UsageBucket>,
+    pub by_department: Vec<UsageBucket>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -764,6 +767,8 @@ pub struct SessionBundle {
     pub agent_messages: Vec<AgentMessage>,
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub usage: Vec<UsageEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -777,6 +782,8 @@ pub struct SessionReplayReport {
     pub messages_matches: bool,
     pub agents_matches: bool,
     pub queue_matches: bool,
+    #[serde(default)]
+    pub ledger_matches: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -822,6 +829,10 @@ pub struct PlanDepartment {
     pub manager_title: String,
     pub profile: String,
     pub objective: String,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -840,6 +851,10 @@ pub struct PlanTask {
     pub write_scope: Vec<String>,
     #[serde(default)]
     pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
