@@ -7081,11 +7081,25 @@ mod tests {
             }
         });
 
-        service.start(&session.id, "integrate").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        approver.abort();
-
         let worktree = session.worktree.clone().unwrap();
+        service.start(&session.id, "integrate").await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::fs::read_to_string(std::path::Path::new(&worktree).join("worker.txt"))
+                .ok()
+                .as_deref()
+                == Some("from worker\n")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker changes were not integrated"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = wait_until_idle(&engine, &session).await;
+        approver.abort();
         assert_eq!(
             std::fs::read_to_string(std::path::Path::new(&worktree).join("worker.txt")).unwrap(),
             "from worker\n"
@@ -7612,7 +7626,18 @@ mod tests {
             .start(&session.id, "integration failure")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let queue = loop {
+            let queue = engine.list_merge_queue(&session.id).await.unwrap();
+            if queue.len() == 1 && queue[0].status == "failed" {
+                break queue;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "integration failure was not recorded: {queue:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
         approver.abort();
 
         let worktree = session.worktree.clone().unwrap();
@@ -7620,9 +7645,7 @@ mod tests {
             !std::path::Path::new(&worktree).join("worker.txt").exists(),
             "a failed integration check must roll the merge back"
         );
-        let queue = engine.list_merge_queue(&session.id).await.unwrap();
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].status, "failed");
         assert!(
             queue[0]
                 .detail
