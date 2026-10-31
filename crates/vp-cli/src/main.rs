@@ -64,6 +64,9 @@ enum Command {
         /// Also delete the session branches.
         #[arg(long)]
         delete_branches: bool,
+        /// Keep worktrees for failed/cancelled sessions.
+        #[arg(long)]
+        keep_failed: bool,
     },
     /// Show the project's shell permission policy.
     ShellPolicy { project: String },
@@ -76,6 +79,22 @@ enum Command {
         /// Additional absolute (or ~/...) path to deny for reads.
         #[arg(long = "read-deny")]
         read_deny: Vec<String>,
+    },
+    /// Show the project's automatic worktree retention policy.
+    WorktreePolicy { project: String },
+    /// Update the project's automatic worktree retention policy.
+    WorktreePolicySet {
+        project: String,
+        /// Enable the background sweep (omitting this disables it).
+        #[arg(long)]
+        enabled: bool,
+        #[arg(long, default_value_t = 7)]
+        older_than_days: u64,
+        #[arg(long)]
+        delete_branches: bool,
+        /// Also remove failed/cancelled worktrees (default keeps them).
+        #[arg(long)]
+        drop_failed: bool,
     },
     /// Show the project's merge/integration policy.
     IntegrationPolicy { project: String },
@@ -323,6 +342,7 @@ async fn main() -> Result<()> {
             dry_run,
             force,
             delete_branches,
+            keep_failed,
         } => {
             rpc(
                 &discovery,
@@ -333,6 +353,7 @@ async fn main() -> Result<()> {
                     "dry_run": dry_run,
                     "force": force,
                     "delete_branches": delete_branches,
+                    "keep_failed": keep_failed,
                 }),
             )
             .await?
@@ -360,6 +381,34 @@ async fn main() -> Result<()> {
                         "read_deny": read_deny,
                     }
                 }),
+            )
+            .await?
+        }
+        Command::WorktreePolicy { project } => {
+            rpc(
+                &discovery,
+                "project.worktree_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::WorktreePolicySet {
+            project,
+            enabled,
+            older_than_days,
+            delete_branches,
+            drop_failed,
+        } => {
+            let policy = json!({
+                "enabled": enabled,
+                "older_than_secs": older_than_days.saturating_mul(86_400),
+                "delete_branches": delete_branches,
+                "keep_failed": !drop_failed
+            });
+            rpc(
+                &discovery,
+                "project.worktree_policy.set",
+                json!({"project_id": project, "policy": policy}),
             )
             .await?
         }
@@ -993,6 +1042,17 @@ fn print_human(value: &Value) {
                 policy["max_bytes"].as_u64().unwrap_or(0),
                 policy["max_age_secs"].as_u64().unwrap_or(0),
                 policy["max_count"].as_u64().unwrap_or(0)
+            );
+            return;
+        }
+        if policy.get("enabled").is_some() && policy.get("older_than_secs").is_some() {
+            println!(
+                "project {}  auto-cleanup={}  older-than={}d  delete-branches={}  keep-failed={}",
+                value["project_id"].as_str().unwrap_or("?"),
+                policy["enabled"].as_bool().unwrap_or(false),
+                policy["older_than_secs"].as_u64().unwrap_or(0) / 86_400,
+                policy["delete_branches"].as_bool().unwrap_or(false),
+                policy["keep_failed"].as_bool().unwrap_or(true)
             );
             return;
         }

@@ -937,6 +937,54 @@ pub struct SessionLogStatus {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeRetentionPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_worktree_retention_secs")]
+    pub older_than_secs: u64,
+    #[serde(default)]
+    pub delete_branches: bool,
+    #[serde(default = "default_true")]
+    pub keep_failed: bool,
+}
+
+impl Default for WorktreeRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            older_than_secs: default_worktree_retention_secs(),
+            delete_branches: false,
+            keep_failed: true,
+        }
+    }
+}
+
+fn default_worktree_retention_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorktreePolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetWorktreePolicyParams {
+    pub project_id: String,
+    pub policy: WorktreeRetentionPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreePolicyResult {
+    pub project_id: String,
+    pub policy: WorktreeRetentionPolicy,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CleanupWorktreesParams {
     pub project_id: String,
@@ -948,6 +996,8 @@ pub struct CleanupWorktreesParams {
     pub force: bool,
     #[serde(default)]
     pub delete_branches: bool,
+    #[serde(default)]
+    pub keep_failed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

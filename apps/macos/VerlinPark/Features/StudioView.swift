@@ -806,6 +806,7 @@ struct PreviewPanelView: View {
     @State private var showingLand = false
     @State private var showingPR = false
     @State private var commitMessage = ""
+    @State private var selectedDiffPath: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1059,11 +1060,47 @@ struct PreviewPanelView: View {
                         .foregroundStyle(.green)
                     }
 
-                    if !diff.patch.isEmpty {
+                    if !model.diffFiles.isEmpty {
+                        HStack(spacing: 8) {
+                            Text("FILES \(model.diffFiles.count)")
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                            Spacer()
+                            Picker("", selection: $selectedDiffPath) {
+                                Text("All changes").tag(String?.none)
+                                ForEach(model.diffFiles) { file in
+                                    Text("\(file.path)  +\(file.additions) -\(file.deletions)")
+                                        .tag(Optional(file.path))
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .controlSize(.small)
+                        }
+                    }
+
+                    if let file = selectedDiffFile {
+                        HStack {
+                            Text(file.path)
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Text("+\(file.additions) -\(file.deletions)")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                        DiffLines(text: file.patch)
+                    } else if !diff.patch.isEmpty {
                         DiffLines(text: diff.patch)
                     }
                 }
                 .padding(12)
+            }
+            .onChange(of: model.diffFiles.map(\.path)) { _, paths in
+                if let path = selectedDiffPath, !paths.contains(path) {
+                    selectedDiffPath = nil
+                }
             }
         } else if let commit = model.lastCommit {
             StudioEmptyView(
@@ -1078,6 +1115,11 @@ struct PreviewPanelView: View {
                 detail: "Edits from the Leader will appear in this worktree diff."
             )
         }
+    }
+
+    private var selectedDiffFile: SessionDiffFile? {
+        guard let path = selectedDiffPath else { return nil }
+        return model.diffFiles.first { $0.path == path }
     }
 
     @ViewBuilder

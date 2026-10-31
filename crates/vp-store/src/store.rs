@@ -11,6 +11,7 @@ use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
     MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectUsageSession, SearchHit,
     Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem, UsageEntry,
+    WorktreeRetentionPolicy,
 };
 
 use crate::paths;
@@ -197,6 +198,14 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_usage_ledger_session
                 ON usage_ledger(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS project_worktree_policies (
+                project_id       TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled          INTEGER NOT NULL DEFAULT 0,
+                older_than_secs  INTEGER NOT NULL DEFAULT 604800,
+                delete_branches  INTEGER NOT NULL DEFAULT 0,
+                keep_failed      INTEGER NOT NULL DEFAULT 1
+            );
 
             CREATE TABLE IF NOT EXISTS project_artifact_policies (
                 project_id   TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -1177,6 +1186,72 @@ impl Store {
                 output_tokens: row.get::<_, i64>(4)? as u64,
                 cost_usd: row.get(5)?,
             })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_worktree_policy(&self, project_id: &str) -> Result<WorktreeRetentionPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT enabled, older_than_secs, delete_branches, keep_failed
+                 FROM project_worktree_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(WorktreeRetentionPolicy {
+                        enabled: row.get::<_, i64>(0)? != 0,
+                        older_than_secs: row.get::<_, i64>(1)? as u64,
+                        delete_branches: row.get::<_, i64>(2)? != 0,
+                        keep_failed: row.get::<_, i64>(3)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn set_worktree_policy(
+        &self,
+        project_id: &str,
+        policy: &WorktreeRetentionPolicy,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_worktree_policies
+             (project_id, enabled, older_than_secs, delete_branches, keep_failed)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                older_than_secs = excluded.older_than_secs,
+                delete_branches = excluded.delete_branches,
+                keep_failed = excluded.keep_failed",
+            params![
+                project_id,
+                if policy.enabled { 1 } else { 0 },
+                policy.older_than_secs as i64,
+                if policy.delete_branches { 1 } else { 0 },
+                if policy.keep_failed { 1 } else { 0 }
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_enabled_worktree_policies(&self) -> Result<Vec<(String, WorktreeRetentionPolicy)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT project_id, enabled, older_than_secs, delete_branches, keep_failed
+             FROM project_worktree_policies WHERE enabled != 0",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                WorktreeRetentionPolicy {
+                    enabled: true,
+                    older_than_secs: row.get::<_, i64>(2)? as u64,
+                    delete_branches: row.get::<_, i64>(3)? != 0,
+                    keep_failed: row.get::<_, i64>(4)? != 0,
+                },
+            ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -4014,6 +4089,39 @@ mod tests {
         let session = store.get_session(&session.id).unwrap().unwrap();
         assert_eq!(session.tokens_in, 30);
         assert_eq!(session.tokens_out, 12);
+    }
+
+    #[test]
+    fn round_trips_worktree_retention_policy() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        assert_eq!(
+            store.get_worktree_policy(&project.id).unwrap(),
+            WorktreeRetentionPolicy::default()
+        );
+        let policy = WorktreeRetentionPolicy {
+            enabled: true,
+            older_than_secs: 86_400,
+            delete_branches: true,
+            keep_failed: false,
+        };
+        store.set_worktree_policy(&project.id, &policy).unwrap();
+        assert_eq!(store.get_worktree_policy(&project.id).unwrap(), policy);
+        let enabled = store.list_enabled_worktree_policies().unwrap();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].0, project.id);
+        store
+            .set_worktree_policy(
+                &project.id,
+                &WorktreeRetentionPolicy {
+                    enabled: false,
+                    ..policy
+                },
+            )
+            .unwrap();
+        assert!(store.list_enabled_worktree_policies().unwrap().is_empty());
     }
 
     #[test]

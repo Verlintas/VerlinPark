@@ -16,9 +16,9 @@
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，冲突可显式调用 resolver agent 解决并重新验证；项目级 opt-in policy 可在 session idle 时自动触发，带 attempt/token cap；本地 landing 和 `gh` PR flow 可用。仍缺默认开启的静默自动冲突解决、LLM Integrator、非 GitHub PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
-- **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、worktree/scratch 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
+- **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、shell scratch 回收、部分 merge 状态的人工检查。
 
-当前测试：Rust 121（core 95 / store 18 / providers 8），Swift 15。CI 以最新提交为准。
+当前测试：Rust 124（core 97 / store 19 / providers 8），Swift 19。CI 以最新提交为准。
 
 ### 0.1 2026-10-31 跟进
 
@@ -33,6 +33,8 @@
 - 新增 Homebrew cask 生成脚本和 release asset（`just cask`），仍不是 tap。
 - 新增 `project.usage` / `vp project-usage` / Manage Dash 按 session 用量汇总。
 - 新增 Manage Dash 跨 project pending approvals 卡片，可直接 Approve/Deny。
+- 新增 Preview Changes 文件选择（unified diff parser + 4 个 Swift 测试）。
+- 新增 opt-in worktree retention policy、`keep_failed` 和 daemon sweep（`VERLINPARK_WORKTREE_SWEEP_SECS`）。
 
 ---
 
@@ -60,9 +62,9 @@
 | 功能完整度（M3） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、显式/opt-in 自动冲突解决、本地 landing、`gh` PR、mailbox/artifacts/replay、search/transcript 已有；缺 default-on auto-resolution、global Task-DAG scheduler |
 | 正确性/一致性 | B | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影；从零数据库重建仍未完成 |
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
-| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage 可用；更早的 round 仍受已加载 event window 限制 |
+| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff 可用；更早的 round 仍受已加载 event window 限制 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
-| 测试 | B− | 121 Rust + 15 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/search/transcript/preview/plan batch abort/usage CSV/project usage/HTTP probe 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 124 Rust + 19 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/search/transcript/preview/plan batch abort/usage CSV/project usage/worktree retention/diff parser/HTTP probe 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | C | `just package` 生成 ad-hoc signed DMG + checksum，release workflow 同时生成并上传 Homebrew cask；仍无 Developer ID/公证、更新器和可持续升级的 Homebrew tap |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -212,9 +214,9 @@
 
 `execute_team_plan` 在某个 task 的 `finish_worker` 返回 `BudgetExceeded` 或 `Cancelled` 时，只标记当前 task 和“不在本 batch 的 remaining”，同一 batch 中尚未处理的兄弟 task 可能仍留在 `running` 状态。UI 的 Plan board 会显示一直运行。现在 abort 后会先结算整个 batch（cancelled/blocked + `plan_task.finished`），再返回；见 ADR-0065。
 
-### P2-8（部分修复 2026-10-31）：worktree / branch 生命周期没有自动清理
+### P2-8（已修复 2026-10-31）：worktree / branch 生命周期没有自动清理
 
-`worktree::remove` 原先只在 session 创建失败时调用；task worktree 和 `verlinpark/<session>--<task>` 分支在成功/失败/取消后都保留。现在有显式 `project.cleanup_worktrees` / `vp cleanup-worktrees`（terminal session、dry-run、dirty 保护、默认保留 branch）；仍没有自动/定时保留策略或统一 shell scratch 回收。“保留失败现场供审阅”仍是默认行为。
+`worktree::remove` 原先只在 session 创建失败时调用；task worktree 和 `verlinpark/<session>--<task>` 分支在成功/失败/取消后都保留。现在有显式 `project.cleanup_worktrees` / `vp cleanup-worktrees`，以及项目级 opt-in `WorktreeRetentionPolicy` + daemon sweep（默认 1 小时，`VERLINPARK_WORKTREE_SWEEP_SECS=0` 可关闭）。默认保留失败/取消现场和 branch；dirty worktree 仍跳过。shell scratch 没有统一回收，也没有全局磁盘上限。
 
 ### P2-9：Dashboard / Settings / Studio 有过期文案（审计时）
 
@@ -254,7 +256,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 121 个 Rust 测试 + 15 个 Swift 测试，覆盖 Leader loop、provider probe/retry、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、usage CSV、project usage、OpenAI-compatible HTTP probe。仍缺：
+已有 124 个 Rust 测试 + 19 个 Swift 测试，覆盖 Leader loop、provider probe/retry、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、usage CSV、project usage、worktree retention、diff parser、OpenAI-compatible HTTP probe。仍缺：
 
 - 并发预算超调上界与预算 abort 的 sibling 结算（当前只测取消 abort）
 - 非 GitHub PR adapter / 默认自动冲突解决策略 / 真正的 post-merge 集成分支
@@ -358,7 +360,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 121 passed after the 10-31 project-usage/approval-center slice
+cargo test --workspace     # 124 passed after the 10-31 diff-viewer/retention slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

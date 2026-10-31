@@ -653,10 +653,55 @@ private struct WorktreeCleanupCard: View {
                 }
             }
             Text(
-                "Removes worktrees for terminal sessions only. Branches are kept unless Delete branches is enabled. Dirty worktrees are skipped."
+                "Terminal-session worktrees only. Dirty worktrees are skipped; branches are kept unless explicitly deleted."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)
+
+            Divider().opacity(0.2)
+            Text("AUTOMATIC RETENTION")
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            HStack(spacing: 10) {
+                Toggle("Enabled", isOn: $model.worktreePolicyEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Older than days")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("7", text: $model.worktreePolicyOlderDaysText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 70)
+                }
+                Toggle("Delete branches", isOn: $model.worktreePolicyDeleteBranches)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Toggle("Keep failed", isOn: $model.worktreePolicyKeepFailed)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Spacer()
+                if model.worktreePolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Save policy") {
+                    Task { await model.saveWorktreePolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.worktreePolicyBusy)
+            }
+            if let status = model.worktreePolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider().opacity(0.2)
+            Text("MANUAL CLEANUP")
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Older than days")
@@ -671,6 +716,9 @@ private struct WorktreeCleanupCard: View {
                     .toggleStyle(.switch)
                     .controlSize(.small)
                 Toggle("Delete branches", isOn: $model.cleanupDeleteBranches)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Toggle("Keep failed", isOn: $model.cleanupKeepFailed)
                     .toggleStyle(.switch)
                     .controlSize(.small)
                 Spacer()

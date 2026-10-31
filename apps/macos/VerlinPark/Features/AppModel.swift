@@ -35,6 +35,7 @@ final class AppModel {
     var lastError: String?
     var agentInfo: AgentInfo?
     var streamingText = ""
+    var diffFiles: [SessionDiffFile] = []
     var searchQuery = ""
     var searchHits: [SearchHit] = []
     var searchTruncated = false
@@ -111,9 +112,17 @@ final class AppModel {
     var cleanupOlderDaysText = "7"
     var cleanupDryRun = true
     var cleanupDeleteBranches = false
+    var cleanupKeepFailed = false
     var cleanupBusy = false
     var cleanupStatus: String?
     var cleanupResult: WorktreeCleanupResult?
+    var worktreePolicy = WorktreeRetentionPolicy.disabled
+    var worktreePolicyEnabled = false
+    var worktreePolicyOlderDaysText = "7"
+    var worktreePolicyDeleteBranches = false
+    var worktreePolicyKeepFailed = true
+    var worktreePolicyBusy = false
+    var worktreePolicyStatus: String?
     var doctorReport: DoctorReport?
     var doctorBusy = false
     var doctorStatus: String?
@@ -264,6 +273,7 @@ final class AppModel {
         selectedSessionID = nil
         events = []
         sessionDiff = nil
+        diffFiles = []
         todos = []
         agents = []
         mergeQueue = []
@@ -277,6 +287,7 @@ final class AppModel {
         Task { await loadMailboxPolicy() }
         Task { await loadProjectBudget() }
         Task { await loadProjectUsage() }
+        Task { await loadWorktreePolicy() }
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -295,6 +306,7 @@ final class AppModel {
         selectedSessionID = id
         streamingText = ""
         sessionDiff = nil
+        diffFiles = []
         todos = []
         agents = []
         mergeQueue = []
@@ -1170,6 +1182,53 @@ final class AppModel {
         }
     }
 
+    func loadWorktreePolicy() async {
+        guard let projectID = selectedProjectID else {
+            worktreePolicy = .disabled
+            return
+        }
+        worktreePolicyBusy = true
+        defer { worktreePolicyBusy = false }
+        do {
+            let result = try await core.worktreePolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            worktreePolicy = result.policy
+            worktreePolicyEnabled = result.policy.enabled
+            worktreePolicyOlderDaysText = "\(max(0, result.policy.olderThanSecs / 86400))"
+            worktreePolicyDeleteBranches = result.policy.deleteBranches
+            worktreePolicyKeepFailed = result.policy.keepFailed
+            worktreePolicyStatus = nil
+        } catch {
+            worktreePolicyStatus = error.localizedDescription
+        }
+    }
+
+    func saveWorktreePolicy() async {
+        guard let projectID = selectedProjectID else {
+            worktreePolicyStatus = "Select a project first."
+            return
+        }
+        let days = Int(worktreePolicyOlderDaysText.trimmingCharacters(in: .whitespaces)) ?? 7
+        let policy = WorktreeRetentionPolicy(
+            enabled: worktreePolicyEnabled,
+            olderThanSecs: max(0, days) * 86400,
+            deleteBranches: worktreePolicyDeleteBranches,
+            keepFailed: worktreePolicyKeepFailed
+        )
+        worktreePolicyBusy = true
+        defer { worktreePolicyBusy = false }
+        do {
+            let result = try await core.setWorktreePolicy(projectID: projectID, policy: policy)
+            worktreePolicy = result.policy
+            worktreePolicyStatus = result.policy.enabled
+                ? "Automatic cleanup enabled"
+                : "Automatic cleanup disabled"
+        } catch {
+            worktreePolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
     func runWorktreeCleanup() async {
         guard let projectID = selectedProjectID else {
             cleanupStatus = "Select a project first."
@@ -1184,7 +1243,8 @@ final class AppModel {
                 olderThanDays: max(0, days),
                 dryRun: cleanupDryRun,
                 force: false,
-                deleteBranches: cleanupDeleteBranches
+                deleteBranches: cleanupDeleteBranches,
+                keepFailed: cleanupKeepFailed
             )
             cleanupResult = result
             cleanupStatus =
@@ -1358,6 +1418,7 @@ final class AppModel {
             let diff = try await core.sessionDiff(sessionID: sessionID)
             if sessionID == selectedSessionID {
                 sessionDiff = diff
+                diffFiles = SessionDiffParser.parse(diff.patch)
                 diffError = nil
             }
         } catch {

@@ -157,6 +157,37 @@ struct SearchResult: Codable, Sendable {
     let truncated: Bool
 }
 
+struct WorktreeRetentionPolicy: Codable, Hashable, Sendable {
+    var enabled: Bool
+    var olderThanSecs: Int
+    var deleteBranches: Bool
+    var keepFailed: Bool
+
+    static let disabled = WorktreeRetentionPolicy(
+        enabled: false,
+        olderThanSecs: 7 * 86400,
+        deleteBranches: false,
+        keepFailed: true
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case olderThanSecs = "older_than_secs"
+        case deleteBranches = "delete_branches"
+        case keepFailed = "keep_failed"
+    }
+}
+
+struct WorktreePolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: WorktreeRetentionPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
 struct WorktreeCleanupEntry: Codable, Sendable, Identifiable {
     let sessionId: String
     let status: String

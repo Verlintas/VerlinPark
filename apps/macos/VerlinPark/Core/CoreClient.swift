@@ -318,7 +318,8 @@ actor CoreClient {
         olderThanDays: Int,
         dryRun: Bool,
         force: Bool,
-        deleteBranches: Bool
+        deleteBranches: Bool,
+        keepFailed: Bool
     ) async throws -> WorktreeCleanupResult {
         let params: [String: JSONValue] = [
             "project_id": .string(projectID),
@@ -326,9 +327,33 @@ actor CoreClient {
             "dry_run": .bool(dryRun),
             "force": .bool(force),
             "delete_branches": .bool(deleteBranches),
+            "keep_failed": .bool(keepFailed),
         ]
         return try await request(method: "project.cleanup_worktrees", params: params)
             .decode(WorktreeCleanupResult.self)
+    }
+
+    func worktreePolicy(projectID: String) async throws -> WorktreePolicyResult {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "project.worktree_policy.get", params: params)
+            .decode(WorktreePolicyResult.self)
+    }
+
+    func setWorktreePolicy(
+        projectID: String,
+        policy: WorktreeRetentionPolicy
+    ) async throws -> WorktreePolicyResult {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object([
+                "enabled": .bool(policy.enabled),
+                "older_than_secs": .number(Double(policy.olderThanSecs)),
+                "delete_branches": .bool(policy.deleteBranches),
+                "keep_failed": .bool(policy.keepFailed),
+            ]),
+        ]
+        return try await request(method: "project.worktree_policy.set", params: params)
+            .decode(WorktreePolicyResult.self)
     }
 
     func doctor() async throws -> DoctorReport {

@@ -131,7 +131,7 @@ just package   # release app + DMG under dist/
 bundle, stages `verlinpadd`/`vp`/docs, and writes a `dist/*.dmg` plus SHA-256.
 It is direct distribution, not notarized with a Developer ID.
 
-Configure a model in **Settings → Providers** (any OpenAI-compatible endpoint, including LM Studio/Ollama/llama.cpp, or Anthropic). The API key is stored in Keychain and sent only to the local daemon. For headless runs, set `VERLINPARK_BASE_URL` and `VERLINPARK_MODEL` (plus `VERLINPARK_API_KEY` if needed). Set `VERLINPARK_INTEGRATION_COMMAND` to add a project-specific post-merge check (for example `cargo test`); without it the Integrator still runs `git diff --check`. `VERLINPARK_GLOBAL_SESSION_CAP` bounds concurrent session runs across the daemon (default 4, range 1–32); excess prompts queue as `queued`. `VERLINPARK_GLOBAL_WORKERS` (default 12) and `VERLINPARK_GLOBAL_LABOUR` (default 24) bound Worker/Labour runs across all sessions; the snapshot is available in Settings and `agent.info`. PR flow requires an `origin` remote and an authenticated GitHub CLI (`gh`); local landing does not.
+Configure a model in **Settings → Providers** (any OpenAI-compatible endpoint, including LM Studio/Ollama/llama.cpp, or Anthropic). The API key is stored in Keychain and sent only to the local daemon. For headless runs, set `VERLINPARK_BASE_URL` and `VERLINPARK_MODEL` (plus `VERLINPARK_API_KEY` if needed). Set `VERLINPARK_INTEGRATION_COMMAND` to add a project-specific post-merge check (for example `cargo test`); without it the Integrator still runs `git diff --check`. `VERLINPARK_GLOBAL_SESSION_CAP` bounds concurrent session runs across the daemon (default 4, range 1–32); excess prompts queue as `queued`. `VERLINPARK_GLOBAL_WORKERS` (default 12) and `VERLINPARK_GLOBAL_LABOUR` (default 24) bound Worker/Labour runs across all sessions; the snapshot is available in Settings and `agent.info`. `VERLINPARK_WORKTREE_SWEEP_SECS` (default 3600; 0 disables) controls the opt-in per-project worktree retention sweep. PR flow requires an `origin` remote and an authenticated GitHub CLI (`gh`); local landing does not.
 
 `just run` builds `verlinpadd` and the SwiftUI app, then opens it. The app launches the daemon on demand from `target/debug/verlinpadd` (debug builds). To run the daemon separately:
 
@@ -161,7 +161,9 @@ just cli usage <session-id>
 just cli log-status <session-id>
 just cli restore-log <session-id>
 just cli backfill-artifacts <session-id>
-just cli cleanup-worktrees <project-id> --older-than-days 7 --dry-run
+just cli cleanup-worktrees <project-id> --older-than-days 7 --dry-run --keep-failed
+just cli worktree-policy <project-id>
+just cli worktree-policy-set <project-id> --enabled --older-than-days 7 --drop-failed
 just cli project-budget <project-id>
 just cli project-budget-set <project-id> --token-budget 500000 --cost-budget-usd 5
 just cli doctor

@@ -17,7 +17,7 @@ use vp_protocol::types::{
     SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
     SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
     UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
-    WorktreeCleanupResult,
+    WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -3363,6 +3363,75 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn get_worktree_policy(&self, project_id: &str) -> Result<WorktreeRetentionPolicy> {
+        let store = self.store.clone();
+        let id = project_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            store
+                .get_project(&id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {id}"))?;
+            store.get_worktree_policy(&id)
+        })
+        .await?
+    }
+
+    pub async fn set_worktree_policy(
+        &self,
+        project_id: &str,
+        policy: &WorktreeRetentionPolicy,
+    ) -> Result<WorktreePolicyResult> {
+        if policy.older_than_secs > 365 * 24 * 60 * 60 {
+            anyhow::bail!("worktree retention must be at most 365 days");
+        }
+        let store = self.store.clone();
+        let id = project_id.to_string();
+        let policy = policy.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            store
+                .get_project(&id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {id}"))?;
+            store.set_worktree_policy(&id, &policy)?;
+            store.get_worktree_policy(&id)
+        })
+        .await??;
+        Ok(WorktreePolicyResult {
+            project_id: project_id.to_string(),
+            policy: saved,
+        })
+    }
+
+    /// Run the opt-in retention policy for every project with it enabled.
+    /// Returns the number of worktrees removed.
+    pub async fn sweep_worktree_retention(&self) -> Result<usize> {
+        let store = self.store.clone();
+        let policies =
+            tokio::task::spawn_blocking(move || store.list_enabled_worktree_policies()).await??;
+        let mut removed = 0;
+        for (project_id, policy) in policies {
+            match self
+                .cleanup_worktrees(
+                    &project_id,
+                    policy.older_than_secs,
+                    false,
+                    false,
+                    policy.delete_branches,
+                    policy.keep_failed,
+                )
+                .await
+            {
+                Ok(result) => removed += result.removed,
+                Err(error) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        error = %error,
+                        "automatic worktree retention failed"
+                    );
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     pub async fn cleanup_worktrees(
         &self,
         project_id: &str,
@@ -3370,6 +3439,7 @@ impl Engine {
         dry_run: bool,
         force: bool,
         delete_branches: bool,
+        keep_failed: bool,
     ) -> Result<WorktreeCleanupResult> {
         let store = self.store.clone();
         let project_store = store.clone();
@@ -3404,6 +3474,18 @@ impl Engine {
                 continue;
             };
             scanned += 1;
+            if keep_failed && matches!(session.status.as_str(), "failed" | "cancelled") {
+                skipped += 1;
+                entries.push(WorktreeCleanupEntry {
+                    session_id: session.id.clone(),
+                    status: session.status.clone(),
+                    worktree,
+                    branch,
+                    removed: false,
+                    reason: "kept failed/cancelled worktree".to_string(),
+                });
+                continue;
+            }
             let age = time::OffsetDateTime::parse(
                 &session.created_at,
                 &time::format_description::well_known::Rfc3339,
@@ -5241,7 +5323,7 @@ mod tests {
             .unwrap();
 
         let protected = engine
-            .cleanup_worktrees(&project.id, 0, false, false, false)
+            .cleanup_worktrees(&project.id, 0, false, false, false, false)
             .await
             .unwrap();
         assert_eq!(protected.removed, 0);
@@ -5249,7 +5331,7 @@ mod tests {
         assert!(worktree.exists());
 
         let dry = engine
-            .cleanup_worktrees(&project.id, 0, true, true, false)
+            .cleanup_worktrees(&project.id, 0, true, true, false, false)
             .await
             .unwrap();
         assert_eq!(dry.removed, 0);
@@ -5257,7 +5339,7 @@ mod tests {
         assert!(worktree.exists());
 
         let cleaned = engine
-            .cleanup_worktrees(&project.id, 0, false, true, false)
+            .cleanup_worktrees(&project.id, 0, false, true, false, false)
             .await
             .unwrap();
         assert_eq!(cleaned.scanned, 1, "active session must be skipped");
@@ -5269,6 +5351,89 @@ mod tests {
         );
         let active_worktree = active.worktree.clone().unwrap();
         assert!(std::path::Path::new(&active_worktree).exists());
+    }
+
+    #[tokio::test]
+    async fn keeps_failed_worktrees_when_requested() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("cleanup failed".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "failed cleanup".into(), None)
+            .await
+            .unwrap();
+        engine
+            .update_session_status(&session.id, "failed")
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+
+        let kept = engine
+            .cleanup_worktrees(&project.id, 0, false, false, false, true)
+            .await
+            .unwrap();
+        assert_eq!(kept.removed, 0);
+        assert_eq!(kept.skipped, 1);
+        assert_eq!(kept.entries[0].reason, "kept failed/cancelled worktree");
+        assert!(worktree.exists());
+
+        let removed = engine
+            .cleanup_worktrees(&project.id, 0, false, true, false, false)
+            .await
+            .unwrap();
+        assert_eq!(removed.removed, 1);
+        assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn worktree_policy_round_trips_and_validates() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("retention".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get_worktree_policy(&project.id).await.unwrap(),
+            WorktreeRetentionPolicy::default()
+        );
+        let policy = WorktreeRetentionPolicy {
+            enabled: true,
+            older_than_secs: 86_400,
+            delete_branches: true,
+            keep_failed: false,
+        };
+        let saved = engine
+            .set_worktree_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        assert_eq!(saved.policy, policy);
+        assert_eq!(
+            engine.get_worktree_policy(&project.id).await.unwrap(),
+            policy
+        );
+        let mut too_old = policy.clone();
+        too_old.older_than_secs = 366 * 86_400;
+        assert!(
+            engine
+                .set_worktree_policy(&project.id, &too_old)
+                .await
+                .is_err()
+        );
+        assert!(engine.get_worktree_policy("missing").await.is_err());
     }
 
     #[tokio::test]

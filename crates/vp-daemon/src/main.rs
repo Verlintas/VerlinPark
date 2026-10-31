@@ -39,8 +39,8 @@ use vp_protocol::types::{
     SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
     SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
     SetIntegrationPolicyParams, SetMailboxPolicyParams, SetProjectBudgetParams,
-    SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams,
-    TeamPlanResult, UsageLedgerParams,
+    SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -106,6 +106,7 @@ async fn main() -> Result<()> {
         pid: std::process::id(),
     };
     state.agent.start_auto_resolver();
+    spawn_worktree_sweeper(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
     let addr = listener.local_addr()?;
@@ -655,7 +656,35 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                         params.dry_run,
                         params.force,
                         params.delete_branches,
+                        params.keep_failed,
                     )
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "project.worktree_policy.get" => match parse_params::<WorktreePolicyParams>(request.params)
+        {
+            Ok(params) => match state.engine.get_worktree_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    vp_protocol::types::WorktreePolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.worktree_policy.set" => {
+            match parse_params::<SetWorktreePolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_worktree_policy(&params.project_id, &params.policy)
                     .await
                 {
                     Ok(result) => RpcResponse::success(id, result),
@@ -1008,6 +1037,32 @@ fn response_with_id(id: Option<Value>, error: RpcError) -> RpcResponse {
 
 fn internal_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(id, RpcError::new(codes::INTERNAL_ERROR, error.to_string()))
+}
+
+fn spawn_worktree_sweeper(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_WORKTREE_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3600);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine.sweep_worktree_retention().await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, "automatic worktree retention removed worktrees");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "automatic worktree retention failed");
+                }
+            }
+        }
+    });
 }
 
 async fn server_info(state: &AppState) -> Result<ServerInfo> {
