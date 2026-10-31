@@ -809,6 +809,16 @@ final class AppModel {
         }
     }
 
+    func artifactPreview(_ artifact: Artifact) async -> NSImage? {
+        guard artifact.mimeType.hasPrefix("image/") else { return nil }
+        do {
+            let materialized = try await core.materializeArtifact(artifactID: artifact.id)
+            return NSImage(contentsOfFile: materialized.path)
+        } catch {
+            return nil
+        }
+    }
+
     func openArtifact(_ artifact: Artifact) async {
         do {
             let materialized = try await core.materializeArtifact(artifactID: artifact.id)

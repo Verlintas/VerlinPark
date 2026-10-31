@@ -24,9 +24,9 @@ Users can open file artifacts directly, so compression must not expose raw
 4. **Export.** Bundles carry original bytes: export decompresses and verifies
    SHA-256 before base64 encoding. Import re-compresses and writes the
    content-addressed `.zst` blob.
-5. **GC.** Refcount deletion removes the compressed blob, not the materialized
-   cache. `bytes_freed` now reports the physical compressed bytes actually
-   removed. The materialized cache is disposable and may be cleaned manually.
+5. **GC.** Refcount deletion removes the compressed blob and the matching
+   materialized cache file. `bytes_freed` reports the physical compressed bytes
+   actually removed. The materialized cache is disposable in all cases.
 6. **Compatibility.** `compression` has a serde default of `"none"`; old
    artifacts and bundles remain readable. The file path changes for new blobs.
 
@@ -36,8 +36,9 @@ Users can open file artifacts directly, so compression must not expose raw
 - Opening an artifact may pay a one-time decompression cost.
 - A missing/corrupt compressed blob fails materialization with a SHA-256 error
   rather than returning wrong bytes.
-- The materialized cache is not GC'd yet; it is bounded by artifact content and
-  is safe to delete while the daemon is stopped.
+- Materialized files are removed when their artifact blob is pruned. Orphaned
+  cache files from older builds remain safe to delete while the daemon is
+  stopped.
 - Compression is not applied to inline text artifacts because they are already
   small and replay relies on inline content.
 

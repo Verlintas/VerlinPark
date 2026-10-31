@@ -1251,6 +1251,11 @@ impl Engine {
         remove.dedup();
         let mut bytes_freed = 0u64;
         for id in &remove {
+            let sha256 = artifacts
+                .iter()
+                .find(|artifact| &artifact.id == id)
+                .map(|artifact| artifact.sha256.clone())
+                .unwrap_or_default();
             let store = self.store.clone();
             let id = id.clone();
             let pruned = tokio::task::spawn_blocking(move || store.delete_artifact_with_event(&id))
@@ -1268,6 +1273,15 @@ impl Engine {
                         Err(error) => {
                             tracing::warn!(%error, path, "failed to remove artifact blob");
                         }
+                    }
+                    if !sha256.is_empty() {
+                        let materialized = self
+                            .store()
+                            .data_dir()
+                            .join("artifacts")
+                            .join("materialized")
+                            .join(&sha256);
+                        let _ = tokio::fs::remove_file(materialized).await;
                     }
                 }
             }
@@ -3323,7 +3337,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(std::fs::read(materialized.path).unwrap(), b"\x00\x01\x02");
+        assert_eq!(std::fs::read(&materialized.path).unwrap(), b"\x00\x01\x02");
 
         std::fs::write(worktree.join("second.bin"), b"second").unwrap();
         let second = engine
@@ -3372,6 +3386,10 @@ mod tests {
         );
         let gc = engine.gc_artifacts(&project.id, &policy).await.unwrap();
         assert_eq!(gc.removed, 1);
+        assert!(
+            !std::path::Path::new(&materialized.path).exists(),
+            "materialized cache must follow blob GC"
+        );
         let remaining = engine.list_artifacts(&session.id).await.unwrap();
         assert_eq!(remaining.len(), 1);
         let kept = &remaining[0];
