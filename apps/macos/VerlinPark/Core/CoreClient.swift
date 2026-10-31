@@ -327,6 +327,12 @@ actor CoreClient {
             .decode(MailboxGcResult.self)
     }
 
+    func materializeArtifact(artifactID: String) async throws -> ArtifactMaterialization {
+        let params: [String: JSONValue] = ["artifact_id": .string(artifactID)]
+        return try await request(method: "artifact.materialize", params: params)
+            .decode(ArtifactMaterialization.self)
+    }
+
     func gcArtifacts(projectID: String) async throws -> ArtifactGcResult {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "artifact.gc", params: params)

@@ -18,6 +18,7 @@ regex = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+zstd = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

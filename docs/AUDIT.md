@@ -295,7 +295,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 2. replay/export、worktree 清理、断线重连。
 
 **M4 — 平台化**
-1. artifact 压缩（content-addressed dedupe、artifact replay/repair、legacy backfill、mailbox auto GC 已实现）。
+1. binary artifact preview（content-addressed dedupe、zstd compression、artifact replay/repair、legacy backfill、mailbox auto GC 已实现）。
 2. cross-session shared budget pools（session 内 task/department 已有原子 reservation；跨 session 共享池未实现）。
 3. 持久化 global Task-DAG scheduler / 优先级与跨进程 capacity；capacity 层已做 session 间 fair round-robin，但仍是进程内队列。auto-expansion 未做。
 4. MCP/ACP、终端、hunk review、非 GitHub PR adapter。
@@ -344,7 +344,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 103 passed after the 10-31 fair-capacity slice
+cargo test --workspace     # 103 passed after the 10-31 artifact-compression slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

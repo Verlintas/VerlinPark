@@ -809,6 +809,15 @@ final class AppModel {
         }
     }
 
+    func openArtifact(_ artifact: Artifact) async {
+        do {
+            let materialized = try await core.materializeArtifact(artifactID: artifact.id)
+            NSWorkspace.shared.open(URL(fileURLWithPath: materialized.path))
+        } catch {
+            handle(error)
+        }
+    }
+
     func refreshAgentInfo() async {
         do {
             agentInfo = try await core.agentInfo()

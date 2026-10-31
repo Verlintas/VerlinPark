@@ -106,6 +106,16 @@ struct ArtifactPolicyResult: Codable, Sendable {
     }
 }
 
+struct ArtifactMaterialization: Codable, Sendable {
+    let artifactId: String
+    let path: String
+
+    enum CodingKeys: String, CodingKey {
+        case artifactId = "artifact_id"
+        case path
+    }
+}
+
 struct ArtifactGcResult: Codable, Sendable {
     let removed: Int
     let bytesFreed: Int
@@ -400,6 +410,7 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
     let mimeType: String
     let content: String
     let storage: String
+    let compression: String?
     let sizeBytes: Int
     let sha256: String
     let path: String?
@@ -416,6 +427,7 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
         case mimeType = "mime_type"
         case content
         case storage
+        case compression
         case sizeBytes = "size_bytes"
         case sha256
         case path

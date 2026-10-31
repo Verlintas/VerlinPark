@@ -169,6 +169,7 @@ impl Store {
                 mime_type  TEXT NOT NULL,
                 content    TEXT NOT NULL,
                 storage    TEXT NOT NULL DEFAULT 'inline',
+                compression TEXT NOT NULL DEFAULT 'none',
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 sha256     TEXT NOT NULL DEFAULT '',
                 path       TEXT,
@@ -292,6 +293,12 @@ impl Store {
         )?;
         ensure_column(&conn, "artifacts", "sha256", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "artifacts", "path", "TEXT")?;
+        ensure_column(
+            &conn,
+            "artifacts",
+            "compression",
+            "TEXT NOT NULL DEFAULT 'none'",
+        )?;
         ensure_column(&conn, "usage_ledger", "department", "TEXT")?;
         ensure_column(
             &conn,
@@ -816,6 +823,7 @@ impl Store {
             mime_type: mime_type.to_string(),
             content: content.to_string(),
             storage: storage.to_string(),
+            compression: "none".to_string(),
             size_bytes,
             sha256: sha256.to_string(),
             path: path.map(str::to_string),
@@ -825,8 +833,8 @@ impl Store {
         tx.execute(
             "INSERT INTO artifacts
              (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
-              content, storage, size_bytes, sha256, path, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              content, storage, compression, size_bytes, sha256, path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 artifact.id,
                 artifact.session_id,
@@ -838,6 +846,7 @@ impl Store {
                 artifact.mime_type,
                 artifact.content,
                 artifact.storage,
+                artifact.compression,
                 artifact.size_bytes as i64,
                 artifact.sha256,
                 artifact.path,
@@ -857,6 +866,7 @@ impl Store {
                 "task_id": artifact.task_id,
                 "mime_type": artifact.mime_type,
                 "storage": artifact.storage,
+                "compression": artifact.compression,
                 "size_bytes": artifact.size_bytes,
                 "sha256": artifact.sha256,
                 "path": artifact.path,
@@ -886,13 +896,12 @@ impl Store {
         let id = Uuid::now_v7().to_string();
         let dir = self.data_dir.join("artifacts").join("blobs");
         paths::ensure_private_dir(&dir)?;
-        let path = dir.join(sha256);
-        let reuse = std::fs::metadata(&path)
-            .map(|metadata| metadata.len() == data.len() as u64)
-            .unwrap_or(false);
-        let created_file = !reuse;
+        let path = dir.join(format!("{sha256}.zst"));
+        let created_file = !path.is_file();
         if created_file {
-            std::fs::write(&path, data)
+            let compressed = zstd::stream::encode_all(data, 3)
+                .with_context(|| format!("compressing artifact {}", id))?;
+            std::fs::write(&path, compressed)
                 .with_context(|| format!("writing artifact blob {}", path.display()))?;
             paths::ensure_private_file(&path)?;
         }
@@ -907,6 +916,7 @@ impl Store {
             mime_type: mime_type.to_string(),
             content: String::new(),
             storage: "file".to_string(),
+            compression: "zstd".to_string(),
             size_bytes: data.len() as u64,
             sha256: sha256.to_string(),
             path: Some(path.to_string_lossy().to_string()),
@@ -918,8 +928,8 @@ impl Store {
         tx.execute(
             "INSERT INTO artifacts
              (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
-              content, storage, size_bytes, sha256, path, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', 'file', ?9, ?10, ?11, ?12)",
+              content, storage, compression, size_bytes, sha256, path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', 'file', 'zstd', ?9, ?10, ?11, ?12)",
             params![
                 artifact.id,
                 artifact.session_id,
@@ -948,6 +958,7 @@ impl Store {
                 "task_id": artifact.task_id,
                 "mime_type": artifact.mime_type,
                 "storage": artifact.storage,
+                "compression": artifact.compression,
                 "size_bytes": artifact.size_bytes,
                 "sha256": artifact.sha256,
                 "path": artifact.path,
@@ -970,7 +981,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
-                    mime_type, content, storage, size_bytes, sha256, path, created_at
+                    mime_type, content, storage, compression, size_bytes, sha256, path, created_at
              FROM artifacts WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], map_artifact)?;
@@ -981,13 +992,48 @@ impl Store {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
-                    mime_type, content, storage, size_bytes, sha256, path, created_at
+                    mime_type, content, storage, compression, size_bytes, sha256, path, created_at
              FROM artifacts WHERE id = ?1",
             params![artifact_id],
             map_artifact,
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn materialize_artifact(&self, artifact_id: &str) -> Result<Option<std::path::PathBuf>> {
+        let Some(artifact) = self.get_artifact(artifact_id)? else {
+            return Ok(None);
+        };
+        if artifact.storage != "file" {
+            return Ok(None);
+        }
+        let Some(source) = artifact.path.as_deref() else {
+            return Err(anyhow!("artifact {artifact_id} has no stored path"));
+        };
+        if artifact.compression != "zstd" {
+            return Ok(Some(std::path::PathBuf::from(source)));
+        }
+        let compressed = std::fs::read(source)
+            .with_context(|| format!("reading compressed artifact {source}"))?;
+        let data = zstd::stream::decode_all(&compressed[..])
+            .with_context(|| format!("decompressing artifact {artifact_id}"))?;
+        use sha2::{Digest, Sha256};
+        let sha256 = format!("{:x}", Sha256::digest(&data));
+        if !artifact.sha256.is_empty() && sha256 != artifact.sha256 {
+            return Err(anyhow!(
+                "artifact {artifact_id} content does not match its SHA-256"
+            ));
+        }
+        let dir = self.data_dir.join("artifacts").join("materialized");
+        paths::ensure_private_dir(&dir)?;
+        let path = dir.join(&sha256);
+        if !path.is_file() {
+            std::fs::write(&path, data)
+                .with_context(|| format!("writing materialized artifact {}", path.display()))?;
+            paths::ensure_private_file(&path)?;
+        }
+        Ok(Some(path))
     }
 
     pub fn get_artifact_policy(&self, project_id: &str) -> Result<ArtifactPolicy> {
@@ -1038,8 +1084,8 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT a.id, a.session_id, a.agent_id, a.agent_name, a.task_id, a.name,
-                    a.kind, a.mime_type, a.content, a.storage, a.size_bytes, a.sha256,
-                    a.path, a.created_at
+                    a.kind, a.mime_type, a.content, a.storage, a.compression,
+                    a.size_bytes, a.sha256, a.path, a.created_at
              FROM artifacts a
              JOIN sessions s ON s.id = a.session_id
              WHERE s.project_id = ?1
@@ -2704,8 +2750,8 @@ impl Store {
                 tx.execute(
                     "INSERT INTO artifacts
                      (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
-                      content, storage, size_bytes, sha256, path, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                      content, storage, compression, size_bytes, sha256, path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         artifact.id,
                         artifact.session_id,
@@ -2717,6 +2763,7 @@ impl Store {
                         artifact.mime_type,
                         artifact.content,
                         artifact.storage,
+                        artifact.compression,
                         artifact.size_bytes as i64,
                         artifact.sha256,
                         artifact.path,
@@ -2937,7 +2984,7 @@ impl Store {
             )?;
         }
         for artifact in &bundle.artifacts {
-            let (content, storage, size_bytes, sha256, path) =
+            let (content, storage, compression, size_bytes, sha256, path) =
                 if let Some(encoded) = &artifact.data_base64 {
                     use base64::Engine as _;
                     let data = base64::engine::general_purpose::STANDARD
@@ -2953,17 +3000,16 @@ impl Store {
                     }
                     let dir = self.data_dir.join("artifacts").join("blobs");
                     paths::ensure_private_dir(&dir)?;
-                    let file = dir.join(&sha256);
-                    let reuse = std::fs::metadata(&file)
-                        .map(|metadata| metadata.len() == data.len() as u64)
-                        .unwrap_or(false);
-                    if !reuse {
-                        std::fs::write(&file, &data)?;
+                    let file = dir.join(format!("{sha256}.zst"));
+                    if !file.is_file() {
+                        let compressed = zstd::stream::encode_all(&data[..], 3)?;
+                        std::fs::write(&file, compressed)?;
                         paths::ensure_private_file(&file)?;
                     }
                     (
                         String::new(),
                         "file".to_string(),
+                        "zstd".to_string(),
                         data.len() as u64,
                         sha256,
                         Some(file.to_string_lossy().to_string()),
@@ -2972,6 +3018,7 @@ impl Store {
                     (
                         artifact.content.clone(),
                         artifact.storage.clone(),
+                        "none".to_string(),
                         artifact.size_bytes,
                         artifact.sha256.clone(),
                         None,
@@ -2980,8 +3027,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO artifacts
                  (id, session_id, agent_id, agent_name, task_id, name, kind,
-                  mime_type, content, storage, size_bytes, sha256, path, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  mime_type, content, storage, compression, size_bytes, sha256, path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     artifact.id,
                     artifact.session_id,
@@ -2993,6 +3040,7 @@ impl Store {
                     artifact.mime_type,
                     content,
                     storage,
+                    compression,
                     size_bytes as i64,
                     sha256,
                     path,
@@ -3499,11 +3547,12 @@ fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
         mime_type: row.get(7)?,
         content: row.get(8)?,
         storage: row.get(9)?,
-        size_bytes: row.get::<_, i64>(10)? as u64,
-        sha256: row.get(11)?,
-        path: row.get(12)?,
+        compression: row.get(10)?,
+        size_bytes: row.get::<_, i64>(11)? as u64,
+        sha256: row.get(12)?,
+        path: row.get(13)?,
         data_base64: None,
-        created_at: row.get(13)?,
+        created_at: row.get(14)?,
     })
 }
 

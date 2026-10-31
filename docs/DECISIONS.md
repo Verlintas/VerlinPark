@@ -63,6 +63,7 @@
 | [0051](adr/0051-event-mirror-restore.md) | Event mirror verification and restore | Accepted | 恢复/事件日志 |
 | [0052](adr/0052-artifact-backfill.md) | Legacy artifact event backfill | Accepted | 迁移/事件溯源 |
 | [0053](adr/0053-fair-capacity-queue.md) | Session-fair Worker/Labour capacity queue | Accepted | 调度/公平性 |
+| [0054](adr/0054-artifact-compression.md) | Compressed content-addressed artifact blobs | Accepted | 产物/磁盘/兼容性 |
 
 ---
 

@@ -1328,6 +1328,7 @@ private struct MailboxMessageRow: View {
 }
 
 private struct ArtifactRow: View {
+    @Environment(AppModel.self) private var model
     let artifact: Artifact
 
     var body: some View {
@@ -1341,6 +1342,11 @@ private struct ArtifactRow: View {
                 Text(artifact.storage)
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                if let compression = artifact.compression, compression != "none" {
+                    Text(compression)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
                 Spacer()
                 Text(artifact.agentName)
                     .font(.system(size: 8, design: .monospaced))
@@ -1356,9 +1362,9 @@ private struct ArtifactRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if let path = artifact.path {
+                    if artifact.path != nil {
                         Button("Open") {
-                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                            Task { await model.openArtifact(artifact) }
                         }
                         .buttonStyle(.plain)
                         .font(.system(size: 9))

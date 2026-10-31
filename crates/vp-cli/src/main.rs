@@ -381,7 +381,17 @@ async fn main() -> Result<()> {
             rpc(&discovery, "artifact.list", json!({"session_id": session})).await?
         }
         Command::Artifact { artifact } => {
-            rpc(&discovery, "artifact.get", json!({"artifact_id": artifact})).await?
+            let value = rpc(&discovery, "artifact.get", json!({"artifact_id": artifact})).await?;
+            if value["artifact"]["storage"].as_str() == Some("file") {
+                rpc(
+                    &discovery,
+                    "artifact.materialize",
+                    json!({"artifact_id": artifact}),
+                )
+                .await?
+            } else {
+                value
+            }
         }
         Command::BackfillArtifacts { session } => {
             rpc(
@@ -691,6 +701,14 @@ fn print_human(value: &Value) {
             value["agents"].as_array().map_or(0, Vec::len),
             value["messages"].as_array().map_or(0, Vec::len),
             value["merge_queue"].as_array().map_or(0, Vec::len)
+        );
+        return;
+    }
+    if value.get("artifact_id").is_some() && value.get("path").is_some() {
+        println!(
+            "materialized {} at {}",
+            value["artifact_id"].as_str().unwrap_or("?"),
+            value["path"].as_str().unwrap_or("?")
         );
         return;
     }

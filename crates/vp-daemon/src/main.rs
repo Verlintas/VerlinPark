@@ -24,21 +24,21 @@ use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes
 use vp_protocol::types::{
     AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, ApprovalListResult,
     ArtifactBackfillParams, ArtifactGcParams, ArtifactGetParams, ArtifactListParams,
-    ArtifactListResult, ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult, AuthParams,
-    AuthResult, CancelSessionParams, CancelSessionResult, CommitSessionParams,
-    ConfigureAgentParams, CreateSessionParams, DiscardSessionParams, EventListResult,
-    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
-    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, MergeQueueListParams,
-    MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectListResult, PromptParams,
-    PromptResult, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
-    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
-    RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams, SessionImportParams,
-    SessionListResult, SessionLogParams, SessionPauseParams, SessionPauseResult,
-    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
-    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
-    SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams,
-    TeamPlanResult, UsageLedgerParams,
+    ArtifactListResult, ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult,
+    ArtifactResult, AuthParams, AuthResult, CancelSessionParams, CancelSessionResult,
+    CommitSessionParams, ConfigureAgentParams, CreateSessionParams, DiscardSessionParams,
+    EventListResult, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
+    ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams,
+    MailboxListResult, MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams,
+    MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams, PingResult,
+    ProjectListResult, PromptParams, PromptResult, RehydrateSessionParams, ReplaySessionParams,
+    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
+    RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams,
+    SessionImportParams, SessionListResult, SessionLogParams, SessionPauseParams,
+    SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
+    SessionTodosResult, SetArtifactPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -693,6 +693,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     Err(error) => internal_error(id, error),
                 }
             }
+            Err(response) => response_with_id(id, response),
+        },
+        "artifact.materialize" => match parse_params::<ArtifactMaterializeParams>(request.params) {
+            Ok(params) => match state.engine.materialize_artifact(&params.artifact_id).await {
+                Ok(Some(materialized)) => RpcResponse::success(id, materialized),
+                Ok(None) => RpcResponse::error(
+                    id,
+                    RpcError::new(codes::INVALID_PARAMS, "artifact is not a file artifact"),
+                ),
+                Err(error) => internal_error(id, error),
+            },
             Err(response) => response_with_id(id, response),
         },
         "artifact.policy.get" => match parse_params::<ArtifactPolicyParams>(request.params) {

@@ -297,6 +297,8 @@ pub struct Artifact {
     #[serde(default)]
     pub storage: String,
     #[serde(default)]
+    pub compression: String,
+    #[serde(default)]
     pub size_bytes: u64,
     #[serde(default)]
     pub sha256: String,
@@ -430,6 +432,17 @@ pub struct ArtifactBackfillResult {
     pub session_id: String,
     pub scanned: usize,
     pub backfilled: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactMaterializeParams {
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactMaterialization {
+    pub artifact_id: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

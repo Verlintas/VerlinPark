@@ -4481,11 +4481,13 @@ async fn run_mailbox_tool(
                 .iter()
                 .map(|artifact| {
                     format!(
-                        "{}  {}  {}  {} bytes  {}",
+                        "{}  {}  {}  {}  {}  {} bytes  {}",
                         artifact.id,
                         artifact.name,
                         artifact.kind,
-                        artifact.content.len(),
+                        artifact.storage,
+                        artifact.compression,
+                        artifact.size_bytes,
                         artifact.agent_name
                     )
                 })
@@ -4505,11 +4507,27 @@ async fn run_mailbox_tool(
                 .get_artifact(id)
                 .await?
                 .ok_or_else(|| anyhow!("artifact not found: {id}"))?;
-            Ok(ToolOutput::ok(format!(
-                "{} [{}]
+            if artifact.storage == "file" {
+                let materialized = engine
+                    .materialize_artifact(id)
+                    .await?
+                    .ok_or_else(|| anyhow!("artifact {id} has no materialized file"))?;
+                Ok(ToolOutput::ok(format!(
+                    "{} [{}] · {} · {} · {} bytes · {}",
+                    artifact.name,
+                    artifact.mime_type,
+                    artifact.compression,
+                    artifact.storage,
+                    artifact.size_bytes,
+                    materialized.path
+                )))
+            } else {
+                Ok(ToolOutput::ok(format!(
+                    "{} [{}]
 {}",
-                artifact.name, artifact.mime_type, artifact.content
-            )))
+                    artifact.name, artifact.mime_type, artifact.content
+                )))
+            }
         }
         other => Err(anyhow!("unknown mailbox tool: {other}")),
     }

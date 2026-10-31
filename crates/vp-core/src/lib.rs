@@ -11,11 +11,11 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
-    ArtifactPolicy, Event, IntegrationPolicy, MailboxGcResult, MailboxPolicy, MergeQueueEntry,
-    Project, PullRequestResult, Session, SessionBundle, SessionCommit, SessionDiff,
-    SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
-    SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageEntry,
-    UsageLedgerResult, UsageTotals,
+    ArtifactMaterialization, ArtifactPolicy, Event, IntegrationPolicy, MailboxGcResult,
+    MailboxPolicy, MergeQueueEntry, Project, PullRequestResult, Session, SessionBundle,
+    SessionCommit, SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus,
+    SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
+    UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -67,6 +67,7 @@ fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
         "task_id": artifact.task_id,
         "mime_type": artifact.mime_type,
         "storage": artifact.storage,
+        "compression": artifact.compression,
         "size_bytes": artifact.size_bytes,
         "sha256": artifact.sha256,
         "path": artifact.path,
@@ -1250,11 +1251,6 @@ impl Engine {
         remove.dedup();
         let mut bytes_freed = 0u64;
         for id in &remove {
-            let logical_size = artifacts
-                .iter()
-                .find(|artifact| &artifact.id == id)
-                .map(|artifact| artifact.size_bytes)
-                .unwrap_or(0);
             let store = self.store.clone();
             let id = id.clone();
             let pruned = tokio::task::spawn_blocking(move || store.delete_artifact_with_event(&id))
@@ -1262,8 +1258,12 @@ impl Engine {
             if let Some((event, remove_path)) = pruned {
                 let _ = self.events.send(event);
                 if let Some(path) = remove_path {
+                    let physical_size = tokio::fs::metadata(&path)
+                        .await
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
                     match tokio::fs::remove_file(&path).await {
-                        Ok(()) => bytes_freed = bytes_freed.saturating_add(logical_size),
+                        Ok(()) => bytes_freed = bytes_freed.saturating_add(physical_size),
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => {
                             tracing::warn!(%error, path, "failed to remove artifact blob");
@@ -1334,6 +1334,19 @@ impl Engine {
         let store = self.store.clone();
         let artifact_id = artifact_id.to_string();
         tokio::task::spawn_blocking(move || store.get_artifact(&artifact_id)).await?
+    }
+
+    pub async fn materialize_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<ArtifactMaterialization>> {
+        let store = self.store.clone();
+        let id = artifact_id.to_string();
+        let path = tokio::task::spawn_blocking(move || store.materialize_artifact(&id)).await??;
+        Ok(path.map(|path| ArtifactMaterialization {
+            artifact_id: artifact_id.to_string(),
+            path: path.to_string_lossy().to_string(),
+        }))
     }
 
     pub async fn record_estimated_usage(
@@ -1576,6 +1589,12 @@ impl Engine {
                             .get("storage")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("inline")
+                            .to_string(),
+                        compression: event
+                            .payload
+                            .get("compression")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("none")
                             .to_string(),
                         size_bytes: event
                             .payload
@@ -2476,8 +2495,20 @@ impl Engine {
         for artifact in &mut artifacts {
             if artifact.storage == "file"
                 && let Some(path) = &artifact.path
-                && let Ok(data) = tokio::fs::read(path).await
             {
+                let mut data = tokio::fs::read(path)
+                    .await
+                    .with_context(|| format!("reading artifact blob {path}"))?;
+                if artifact.compression == "zstd" {
+                    data = zstd::stream::decode_all(&data[..])
+                        .with_context(|| format!("decompressing artifact {}", artifact.id))?;
+                }
+                if !artifact.sha256.is_empty() && sha256_hex(&data) != artifact.sha256 {
+                    anyhow::bail!(
+                        "artifact {} content does not match its SHA-256",
+                        artifact.id
+                    );
+                }
                 use base64::Engine as _;
                 artifact.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(data));
             }
@@ -3282,9 +3313,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.storage, "file");
+        assert_eq!(first.compression, "zstd");
         assert_eq!(first.size_bytes, 3);
         assert!(!first.sha256.is_empty());
-        assert!(std::path::Path::new(first.path.as_ref().unwrap()).is_file());
+        let compressed = std::fs::read(first.path.as_ref().unwrap()).unwrap();
+        assert_eq!(&compressed[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+        let materialized = engine
+            .materialize_artifact(&first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(materialized.path).unwrap(), b"\x00\x01\x02");
 
         std::fs::write(worktree.join("second.bin"), b"second").unwrap();
         let second = engine
@@ -3406,7 +3445,10 @@ mod tests {
         assert_eq!(first.sha256, second.sha256);
         let blob = std::path::PathBuf::from(first.path.as_ref().unwrap());
         assert!(blob.is_file());
-        assert_eq!(blob.file_name().unwrap().to_string_lossy(), first.sha256);
+        assert_eq!(
+            blob.file_name().unwrap().to_string_lossy(),
+            format!("{}.zst", first.sha256)
+        );
 
         let policy = ArtifactPolicy {
             auto_gc: false,
@@ -4719,7 +4761,13 @@ mod tests {
             .find(|artifact| artifact.name == "bundle.bin")
             .unwrap();
         assert_eq!(imported_binary.storage, "file");
-        let imported_bytes = std::fs::read(imported_binary.path.as_ref().unwrap()).unwrap();
+        assert_eq!(imported_binary.compression, "zstd");
+        let imported_materialized = imported_engine
+            .materialize_artifact(&imported_binary.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let imported_bytes = std::fs::read(imported_materialized.path).unwrap();
         assert_eq!(imported_bytes, b"binary bundle");
         let imported_sessions = imported_engine
             .list_sessions(Some(imported.project_id.clone()))
