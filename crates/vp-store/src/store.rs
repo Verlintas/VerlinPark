@@ -31,6 +31,7 @@ pub struct SessionRepair {
     pub agents: Option<Vec<AgentRecord>>,
     pub queue: Option<Vec<MergeQueueEntry>>,
     pub artifacts: Option<Vec<Artifact>>,
+    pub approvals: Option<Vec<Approval>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -2108,6 +2109,108 @@ impl Store {
         Ok(approval)
     }
 
+    pub fn create_approval_with_event(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool: &str,
+        input: &serde_json::Value,
+        agent: Option<&serde_json::Value>,
+    ) -> Result<(Approval, Event)> {
+        let approval = Approval {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            tool: tool.to_string(),
+            input: input.clone(),
+            status: "pending".to_string(),
+            created_at: now_rfc3339(),
+            resolved_at: None,
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO approvals
+             (id, session_id, tool_call_id, tool, input, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+            params![
+                approval.id,
+                approval.session_id,
+                approval.tool_call_id,
+                approval.tool,
+                serde_json::to_string(&approval.input)?,
+                approval.created_at
+            ],
+        )?;
+        let mut payload = serde_json::to_value(&approval)?;
+        if let (Some(payload), Some(agent)) = (payload.as_object_mut(), agent)
+            && let Some(agent) = agent.as_object()
+        {
+            for (key, value) in agent {
+                payload.insert(key.clone(), value.clone());
+            }
+        }
+        let event = insert_event_tx(&tx, session_id, "approval.requested", payload)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((approval, event))
+    }
+
+    pub fn resolve_approval_with_event(
+        &self,
+        approval_id: &str,
+        approved: bool,
+    ) -> Result<Option<(Approval, Event)>> {
+        let status = if approved { "approved" } else { "denied" };
+        let resolved_at = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE approvals SET status = ?1, resolved_at = ?2
+             WHERE id = ?3 AND status = 'pending'",
+            params![status, resolved_at, approval_id],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let approval = tx.query_row(
+            "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at
+             FROM approvals WHERE id = ?1",
+            params![approval_id],
+            |row| {
+                Ok(Approval {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    tool_call_id: row.get(2)?,
+                    tool: row.get(3)?,
+                    input: serde_json::from_str(&row.get::<_, String>(4)?)
+                        .unwrap_or(serde_json::Value::Null),
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    resolved_at: row.get(7)?,
+                })
+            },
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &approval.session_id,
+            "approval.resolved",
+            serde_json::json!({
+                "approval_id": approval.id,
+                "approved": approved,
+                "resolved_at": approval.resolved_at,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((approval, event)))
+    }
+
     pub fn resolve_approval(&self, approval_id: &str, approved: bool) -> Result<Option<Approval>> {
         let status = if approved { "approved" } else { "denied" };
         let resolved_at = now_rfc3339();
@@ -2564,6 +2667,29 @@ impl Store {
                         artifact.sha256,
                         artifact.path,
                         artifact.created_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(approvals) = &repair.approvals {
+            tx.execute(
+                "DELETE FROM approvals WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for approval in approvals {
+                tx.execute(
+                    "INSERT INTO approvals
+                     (id, session_id, tool_call_id, tool, input, status, created_at, resolved_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        approval.id,
+                        approval.session_id,
+                        approval.tool_call_id,
+                        approval.tool,
+                        serde_json::to_string(&approval.input)?,
+                        approval.status,
+                        approval.created_at,
+                        approval.resolved_at
                     ],
                 )?;
             }
@@ -3529,6 +3655,54 @@ mod tests {
         let session = store.get_session(&session.id).unwrap().unwrap();
         assert_eq!(session.tokens_in, 30);
         assert_eq!(session.tokens_out, 12);
+    }
+
+    #[test]
+    fn writes_approval_projections_and_events_atomically() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "approval").unwrap();
+        let (approval, requested) = store
+            .create_approval_with_event(
+                &session.id,
+                "call-1",
+                "shell",
+                &serde_json::json!({"command": "true"}),
+                Some(&serde_json::json!({"agent_id": "agent-1"})),
+            )
+            .unwrap();
+        assert_eq!(requested.kind, "approval.requested");
+        assert_eq!(requested.payload["agent_id"], "agent-1");
+        let (resolved, event) = store
+            .resolve_approval_with_event(&approval.id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.status, "approved");
+        assert_eq!(event.kind, "approval.resolved");
+        assert_eq!(event.payload["approved"], true);
+        assert!(
+            store
+                .resolve_approval_with_event(&approval.id, false)
+                .unwrap()
+                .is_none()
+        );
+        let events = store.list_all_events(&session.id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "approval.resolved")
+                .count(),
+            1
+        );
     }
 
     #[test]

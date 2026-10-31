@@ -1399,6 +1399,53 @@ impl Engine {
         .await?
     }
 
+    fn expected_approvals(data: &ReplayData) -> Vec<Approval> {
+        let mut approvals = HashMap::<String, Approval>::new();
+        for event in &data.events {
+            match event.kind.as_str() {
+                "approval.requested" => {
+                    if let Ok(approval) = serde_json::from_value::<Approval>(event.payload.clone())
+                    {
+                        approvals.insert(approval.id.clone(), approval);
+                    }
+                }
+                "approval.resolved" => {
+                    if let Some(approval_id) = event
+                        .payload
+                        .get("approval_id")
+                        .and_then(serde_json::Value::as_str)
+                        && let Some(approval) = approvals.get_mut(approval_id)
+                    {
+                        approval.status = if event
+                            .payload
+                            .get("approved")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            "approved".to_string()
+                        } else {
+                            "denied".to_string()
+                        };
+                        approval.resolved_at = event
+                            .payload
+                            .get("resolved_at")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .or_else(|| Some(event.created_at.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut approvals = approvals.into_values().collect::<Vec<_>>();
+        approvals.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        approvals
+    }
+
     fn expected_artifacts(data: &ReplayData) -> Vec<ExpectedArtifact> {
         let mut artifacts = HashMap::<String, ExpectedArtifact>::new();
         for event in &data.events {
@@ -1781,6 +1828,29 @@ impl Engine {
             ));
         }
 
+        let expected_approvals = Self::expected_approvals(data);
+        let expected_approval_values = expected_approvals
+            .iter()
+            .filter_map(|approval| {
+                Some((approval.id.clone(), serde_json::to_value(approval).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_approval_values = data
+            .approvals
+            .iter()
+            .filter_map(|approval| {
+                Some((approval.id.clone(), serde_json::to_value(approval).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let approvals_matches = expected_approval_values == projected_approval_values;
+        if !approvals_matches {
+            mismatches.push(format!(
+                "approvals: projection={}, replay={}",
+                projected_approval_values.len(),
+                expected_approval_values.len()
+            ));
+        }
+
         let replay_plan = data
             .events
             .iter()
@@ -1891,6 +1961,7 @@ impl Engine {
             && ledger_matches
             && mailbox_matches
             && artifacts_matches
+            && approvals_matches
             && plan_matches
             && todos_matches
             && messages_matches
@@ -1908,6 +1979,7 @@ impl Engine {
             queue_matches,
             mailbox_matches,
             artifacts_matches,
+            approvals_matches,
             ledger_matches,
             consistent,
             repaired,
@@ -2116,6 +2188,7 @@ impl Engine {
             agents,
             queue,
             artifacts,
+            approvals: Some(Self::expected_approvals(data)),
             artifact_warnings,
         })
     }
@@ -2706,8 +2779,14 @@ impl Engine {
         let session_id_owned = session_id.to_string();
         let tool_call_id = tool_call_id.to_string();
         let tool = tool.to_string();
-        let approval = tokio::task::spawn_blocking(move || {
-            store.create_approval(&session_id_owned, &tool_call_id, &tool, &input)
+        let (approval, event) = tokio::task::spawn_blocking(move || {
+            store.create_approval_with_event(
+                &session_id_owned,
+                &tool_call_id,
+                &tool,
+                &input,
+                agent.as_ref(),
+            )
         })
         .await??;
         let (sender, receiver) = oneshot::channel();
@@ -2715,42 +2794,26 @@ impl Engine {
             .lock()
             .map_err(|_| anyhow::anyhow!("approval mutex poisoned"))?
             .insert(approval.id.clone(), sender);
-        let mut payload = serde_json::to_value(&approval)?;
-        if let (Some(payload), Some(agent)) = (payload.as_object_mut(), agent)
-            && let Some(agent) = agent.as_object()
-        {
-            for (key, value) in agent {
-                payload.insert(key.clone(), value.clone());
-            }
-        }
-        self.append_event(session_id, "approval.requested", payload)
-            .await?;
+        let _ = self.events.send(event);
         Ok((approval, receiver))
     }
 
     pub async fn resolve_approval(&self, approval_id: &str, approved: bool) -> Result<()> {
         let store = self.store.clone();
         let id = approval_id.to_string();
-        let approval =
-            tokio::task::spawn_blocking(move || store.resolve_approval(&id, approved)).await??;
-        if let Some(approval) = approval {
+        let resolved =
+            tokio::task::spawn_blocking(move || store.resolve_approval_with_event(&id, approved))
+                .await??;
+        if let Some((approval, event)) = resolved {
             if let Some(sender) = self
                 .approval_waiters
                 .lock()
                 .ok()
-                .and_then(|mut waiters| waiters.remove(approval_id))
+                .and_then(|mut waiters| waiters.remove(&approval.id))
             {
                 let _ = sender.send(approved);
             }
-            self.append_event(
-                &approval.session_id,
-                "approval.resolved",
-                serde_json::json!({
-                    "approval_id": approval.id,
-                    "approved": approved,
-                }),
-            )
-            .await?;
+            let _ = self.events.send(event);
         }
         Ok(())
     }
@@ -4159,6 +4222,7 @@ mod tests {
         assert!(report.status_matches);
         assert!(report.usage_matches);
         assert!(report.ledger_matches);
+        assert!(report.approvals_matches);
         assert!(report.plan_matches);
         assert!(report.todos_matches);
         assert!(report.messages_matches);
@@ -4173,15 +4237,34 @@ mod tests {
             .store()
             .replace_usage_ledger(&session.id, &[])
             .unwrap();
+        engine
+            .store()
+            .create_approval(
+                &session.id,
+                "orphan-approval",
+                "shell",
+                &serde_json::json!({"command": "true"}),
+            )
+            .unwrap();
         let report = engine.replay_session(&session.id).await.unwrap();
         assert!(!report.consistent);
         assert!(!report.status_matches);
         assert!(!report.ledger_matches);
+        assert!(!report.approvals_matches);
 
         let repaired = engine.repair_session(&session.id).await.unwrap();
         assert!(repaired.repaired);
         assert!(repaired.consistent, "{:?}", repaired.mismatches);
         assert!(repaired.ledger_matches);
+        assert!(repaired.approvals_matches);
+        assert_eq!(
+            engine
+                .list_approvals(Some(session.id.clone()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(
             engine
                 .usage_ledger(&session.id)
