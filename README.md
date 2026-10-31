@@ -131,7 +131,7 @@ just package   # release app + DMG under dist/
 bundle, stages `verlinpadd`/`vp`/docs, and writes a `dist/*.dmg` plus SHA-256.
 It is direct distribution, not notarized with a Developer ID.
 
-Configure a model in **Settings → Providers** (any OpenAI-compatible endpoint, including LM Studio/Ollama/llama.cpp, or Anthropic). The API key is stored in Keychain and sent only to the local daemon. For headless runs, set `VERLINPARK_BASE_URL` and `VERLINPARK_MODEL` (plus `VERLINPARK_API_KEY` if needed). Set `VERLINPARK_INTEGRATION_COMMAND` to add a project-specific post-merge check (for example `cargo test`); without it the Integrator still runs `git diff --check`. `VERLINPARK_GLOBAL_SESSION_CAP` bounds concurrent session runs across the daemon (default 4, range 1–32); excess prompts queue as `queued`. `VERLINPARK_GLOBAL_WORKERS` (default 12) and `VERLINPARK_GLOBAL_LABOUR` (default 24) bound Worker/Labour runs across all sessions; the snapshot is available in Settings and `agent.info`. `VERLINPARK_WORKTREE_SWEEP_SECS` (default 3600; 0 disables) controls the opt-in per-project worktree retention sweep. `VERLINPARK_PROVIDER_IDLE_SECS` (default 300, range 10–3600) bounds the wait between provider stream events. PR flow requires an `origin` remote and an authenticated GitHub CLI (`gh`); local landing does not.
+Configure a model in **Settings → Providers** (any OpenAI-compatible endpoint, including LM Studio/Ollama/llama.cpp, or Anthropic). The API key is stored in Keychain and sent only to the local daemon. For headless runs, set `VERLINPARK_BASE_URL` and `VERLINPARK_MODEL` (plus `VERLINPARK_API_KEY` if needed). Set `VERLINPARK_INTEGRATION_COMMAND` to add a project-specific post-merge check (for example `cargo test`); without it the Integrator still runs `git diff --check`. `VERLINPARK_GLOBAL_SESSION_CAP` bounds concurrent session runs across the daemon (default 4, range 1–32); excess prompts queue as `queued`. `VERLINPARK_GLOBAL_WORKERS` (default 12) and `VERLINPARK_GLOBAL_LABOUR` (default 24) bound Worker/Labour runs across all sessions; the snapshot is available in Settings and `agent.info`. `VERLINPARK_WORKTREE_SWEEP_SECS` (default 3600; 0 disables) controls the opt-in per-project worktree retention sweep. `VERLINPARK_PROVIDER_IDLE_SECS` (default 300, range 10–3600) bounds the wait between provider stream events. `VERLINPARK_QUESTION_TIMEOUT_SECS` (default 1800, range 60–86400) bounds a blocking `ask_user` question. PR flow requires an `origin` remote and an authenticated GitHub CLI (`gh`); local landing does not.
 
 `just run` builds `verlinpadd` and the SwiftUI app, then opens it. The app launches the daemon on demand from `target/debug/verlinpadd` (debug builds). To run the daemon separately:
 
@@ -140,7 +140,7 @@ just daemon
 just cli ping
 just cli project-add /path/to/repo --name demo
 just cli shell-policy <project-id>
-just cli shell-policy-set <project-id> --network deny --read-deny ~/.secrets
+just cli shell-policy-set <project-id> --network deny --restrict-home --read-deny ~/.secrets
 just cli integration-policy <project-id>
 just cli integration-policy-set <project-id> --auto-resolve --max-auto-attempts 1 --max-resolve-tokens 50000
 just cli session-new <project-id> "Add team invitations" --cost-budget-usd 5 --time-budget-secs 1800

@@ -88,6 +88,9 @@ enum Command {
         /// Additional absolute (or ~/...) path to deny for reads.
         #[arg(long = "read-deny")]
         read_deny: Vec<String>,
+        /// Deny reads under HOME except worktree/scratch/Git metadata/toolchains.
+        #[arg(long)]
+        restrict_home: bool,
     },
     /// Show the project's automatic worktree retention policy.
     WorktreePolicy { project: String },
@@ -425,6 +428,7 @@ async fn main() -> Result<()> {
             project,
             network,
             read_deny,
+            restrict_home,
         } => {
             rpc(
                 &discovery,
@@ -434,6 +438,7 @@ async fn main() -> Result<()> {
                     "policy": {
                         "network": network,
                         "read_deny": read_deny,
+                        "restrict_home": restrict_home,
                     }
                 }),
             )
@@ -1263,9 +1268,10 @@ fn print_human(value: &Value) {
             return;
         }
         println!(
-            "project {}  network={}",
+            "project {}  network={}  restrict-home={}",
             value["project_id"].as_str().unwrap_or("?"),
-            policy["network"].as_str().unwrap_or("?")
+            policy["network"].as_str().unwrap_or("?"),
+            policy["restrict_home"].as_bool().unwrap_or(false)
         );
         let paths = policy["read_deny"].as_array();
         if paths.is_none_or(|paths| paths.is_empty()) {

@@ -113,10 +113,11 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS project_shell_policies (
-                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-                network    TEXT NOT NULL,
-                read_deny  TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                network         TEXT NOT NULL,
+                read_deny       TEXT NOT NULL,
+                restrict_home   INTEGER NOT NULL DEFAULT 0,
+                updated_at      TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_integration_policies (
@@ -396,6 +397,12 @@ impl Store {
         ensure_column(&conn, "usage_ledger", "department", "TEXT")?;
         ensure_column(
             &conn,
+            "project_shell_policies",
+            "restrict_home",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
             "project_mailbox_policies",
             "delete_unread",
             "INTEGER NOT NULL DEFAULT 0",
@@ -603,16 +610,24 @@ impl Store {
         let conn = self.lock()?;
         let stored = conn
             .query_row(
-                "SELECT network, read_deny FROM project_shell_policies WHERE project_id = ?1",
+                "SELECT network, read_deny, restrict_home
+                 FROM project_shell_policies WHERE project_id = ?1",
                 params![project_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
             )
             .optional()?;
         match stored {
-            Some((network, read_deny)) => Ok(ShellPolicy {
+            Some((network, read_deny, restrict_home)) => Ok(ShellPolicy {
                 network,
                 read_deny: serde_json::from_str(&read_deny)
                     .context("parsing stored shell read-deny policy")?,
+                restrict_home,
             }),
             None => Ok(ShellPolicy::default()),
         }
@@ -623,13 +638,21 @@ impl Store {
             .context("serializing shell read-deny policy")?;
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO project_shell_policies (project_id, network, read_deny, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO project_shell_policies
+             (project_id, network, read_deny, restrict_home, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(project_id) DO UPDATE SET
                 network = excluded.network,
                 read_deny = excluded.read_deny,
+                restrict_home = excluded.restrict_home,
                 updated_at = excluded.updated_at",
-            params![project_id, policy.network, read_deny, now_rfc3339()],
+            params![
+                project_id,
+                policy.network,
+                read_deny,
+                if policy.restrict_home { 1 } else { 0 },
+                now_rfc3339()
+            ],
         )?;
         Ok(())
     }
@@ -4784,6 +4807,7 @@ mod tests {
                 &ShellPolicy {
                     network: "deny".into(),
                     read_deny: vec!["~/secret".into()],
+                    restrict_home: true,
                 },
             )
             .unwrap();
@@ -4803,6 +4827,7 @@ mod tests {
                 &ShellPolicy {
                     network: "allow".into(),
                     read_deny: Vec::new(),
+                    restrict_home: false,
                 },
             )
             .unwrap();
@@ -4812,6 +4837,7 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].project.id, project.id);
         assert_eq!(snapshots[0].shell_policy.network, "allow");
+        assert!(!snapshots[0].shell_policy.restrict_home);
         assert_eq!(snapshots[0].budget.token_budget, Some(1234));
         assert_eq!(snapshots[0].budget.cost_budget_usd, Some(2.5));
     }

@@ -72,6 +72,8 @@ pub struct AgentConfig {
     pub capacity: Arc<CapacityController>,
     /// Maximum time to wait between provider stream events.
     pub provider_idle_timeout_secs: u64,
+    /// Maximum time a blocking user question may wait for an answer.
+    pub question_timeout_secs: u64,
 }
 
 /// Daemon-wide admission control for Worker/Labour runs. Per-session caps still
@@ -1045,6 +1047,11 @@ impl AgentService {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(300)
                     .clamp(10, 3600),
+                question_timeout_secs: env::var("VERLINPARK_QUESTION_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1800)
+                    .clamp(60, 86400),
             },
         )
     }
@@ -1125,6 +1132,11 @@ impl AgentService {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(300)
                 .clamp(10, 3600),
+            question_timeout_secs: env::var("VERLINPARK_QUESTION_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1800)
+                .clamp(60, 86400),
         };
         *self
             .config
@@ -3977,6 +3989,10 @@ async fn run_loop(
             .join(&spec.id),
         secret_roots,
         network_allowed: shell_policy.network != "deny",
+        home: std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+        restrict_home: shell_policy.restrict_home,
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
     let tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
@@ -4549,7 +4565,7 @@ async fn run_loop(
                     }),
                 )
                 .await?;
-                match wait_for_question(receiver, control).await {
+                match wait_for_question(receiver, control, config.question_timeout_secs).await {
                     QuestionOutcome::Answered(answer) => {
                         engine.update_session_status(&session.id, "running").await?;
                         engine.update_agent_status(&spec.id, "running").await?;
@@ -7347,6 +7363,7 @@ enum QuestionOutcome {
 async fn wait_for_question(
     receiver: oneshot::Receiver<String>,
     control: &RunControl,
+    timeout_secs: u64,
 ) -> QuestionOutcome {
     if control.is_cancelled() {
         return QuestionOutcome::Cancelled;
@@ -7354,7 +7371,7 @@ async fn wait_for_question(
     let mut cancel_rx = control.subscribe();
     tokio::select! {
         _ = cancel_rx.changed() => QuestionOutcome::Cancelled,
-        result = timeout(Duration::from_secs(1800), receiver) => match result {
+        result = timeout(Duration::from_secs(timeout_secs), receiver) => match result {
             Ok(Ok(answer)) => QuestionOutcome::Answered(answer),
             Ok(Err(_)) => QuestionOutcome::TimedOut,
             Err(_) => QuestionOutcome::TimedOut,
@@ -7485,6 +7502,7 @@ mod tests {
                 global_labour_cap(),
             )),
             provider_idle_timeout_secs: 300,
+            question_timeout_secs: 1800,
         };
         let service = AgentService::configured(engine.clone(), config);
         (engine, service, project)

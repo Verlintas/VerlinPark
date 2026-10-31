@@ -69,6 +69,10 @@ struct DashboardView: View {
                     .padding(.horizontal, 18)
                     .padding(.bottom, 12)
 
+                QuestionCenterCard()
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 12)
+
                 if let project = model.selectedProject {
                     ShellPolicyCard(project: project)
                         .padding(.horizontal, 18)
@@ -184,8 +188,15 @@ private struct ShellPolicyCard: View {
                 .frame(width: 210)
             }
 
+            Toggle("Restrict home reads", isOn: $model.shellPolicyRestrictHome)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .help(
+                    "Deny reads under HOME except the worktree, scratch, Git metadata, and known toolchain/cache paths."
+                )
+
             Text(
-                "Writes remain confined to the worktree, Git metadata, and runtime scratch. Network deny blocks outbound sockets. Read-deny paths are additive and must be absolute or start with ~/."
+                "Writes remain confined to the worktree, Git metadata, and runtime scratch. Network deny blocks outbound sockets. Restrict home reads denies HOME except the worktree, scratch, Git metadata, and known toolchains. Read-deny paths are additive and must be absolute or start with ~/."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)
@@ -1109,5 +1120,112 @@ private struct MemoryCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+    }
+}
+
+private struct QuestionCenterCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Questions")
+                    Text("Waiting for user input")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.questionCenterBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Text("\(model.pendingQuestions.count) pending")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Button("Refresh") {
+                    Task { await model.loadPendingQuestions() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.questionCenterBusy)
+            }
+            if model.pendingQuestions.isEmpty {
+                Text(model.questionCenterStatus ?? "No pending questions.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.pendingQuestions) { question in
+                    PendingQuestionRow(question: question)
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task {
+            await model.loadPendingQuestions()
+        }
+    }
+}
+
+private struct PendingQuestionRow: View {
+    @Environment(AppModel.self) private var model
+    let question: Question
+    @State private var draft = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Text(question.agentName)
+                    .font(.system(size: 9, weight: .medium))
+                Text(
+                    model.sessionDirectory[question.sessionId]?.goal
+                        ?? String(question.sessionId.prefix(8))
+                )
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                Spacer()
+            }
+            Text(question.question)
+                .font(.system(size: 10))
+                .fixedSize(horizontal: false, vertical: true)
+            if !question.options.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(question.options, id: \.self) { option in
+                        Button(option) {
+                            Task { await model.answerGlobalQuestion(question.id, answer: option) }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+            }
+            HStack(spacing: 6) {
+                TextField("Answer", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .onSubmit {
+                        submit()
+                    }
+                Button("Send") {
+                    submit()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(9)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
+    }
+
+    private func submit() {
+        let answer = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !answer.isEmpty else { return }
+        draft = ""
+        Task { await model.answerGlobalQuestion(question.id, answer: answer) }
     }
 }

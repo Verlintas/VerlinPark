@@ -112,6 +112,7 @@ actor CoreClient {
             "policy": .object([
                 "network": .string(policy.network),
                 "read_deny": .array(policy.readDeny.map(JSONValue.string)),
+                "restrict_home": .bool(policy.restrictHome),
             ]),
         ]
         return try await request(method: "project.shell_policy.set", params: params)
@@ -501,6 +502,12 @@ actor CoreClient {
     func listQuestions(sessionID: String) async throws -> [Question] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "question.list", params: params)
+            .decode(QuestionListResult.self)
+            .questions
+    }
+
+    func listAllQuestions() async throws -> [Question] {
+        try await request(method: "question.list", params: [:])
             .decode(QuestionListResult.self)
             .questions
     }

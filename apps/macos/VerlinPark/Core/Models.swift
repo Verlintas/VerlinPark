@@ -3,12 +3,27 @@ import Foundation
 struct ShellPolicy: Codable, Hashable, Sendable {
     var network: String
     var readDeny: [String]
+    var restrictHome: Bool
 
-    static let allow = ShellPolicy(network: "allow", readDeny: [])
+    static let allow = ShellPolicy(network: "allow", readDeny: [], restrictHome: false)
 
     enum CodingKeys: String, CodingKey {
         case network
         case readDeny = "read_deny"
+        case restrictHome = "restrict_home"
+    }
+
+    init(network: String, readDeny: [String], restrictHome: Bool) {
+        self.network = network
+        self.readDeny = readDeny
+        self.restrictHome = restrictHome
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        network = try container.decode(String.self, forKey: .network)
+        readDeny = try container.decodeIfPresent([String].self, forKey: .readDeny) ?? []
+        restrictHome = try container.decodeIfPresent(Bool.self, forKey: .restrictHome) ?? false
     }
 }
 

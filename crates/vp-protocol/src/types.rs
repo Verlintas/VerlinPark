@@ -16,6 +16,10 @@ pub struct ShellPolicy {
     pub network: String,
     #[serde(default)]
     pub read_deny: Vec<String>,
+    /// Deny reads under the user's home directory except the worktree, scratch,
+    /// Git metadata, and explicitly allowed toolchain/cache paths.
+    #[serde(default)]
+    pub restrict_home: bool,
 }
 
 impl Default for ShellPolicy {
@@ -23,6 +27,7 @@ impl Default for ShellPolicy {
         Self {
             network: default_shell_network(),
             read_deny: Vec::new(),
+            restrict_home: false,
         }
     }
 }

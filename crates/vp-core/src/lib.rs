@@ -4452,6 +4452,7 @@ mod tests {
                 ShellPolicy {
                     network: "deny".into(),
                     read_deny: vec![deny_path.to_string_lossy().to_string()],
+                    restrict_home: true,
                 },
             )
             .await
@@ -4465,6 +4466,7 @@ mod tests {
                     ShellPolicy {
                         network: "sometimes".into(),
                         read_deny: Vec::new(),
+                        restrict_home: false,
                     },
                 )
                 .await
@@ -4477,6 +4479,7 @@ mod tests {
                     ShellPolicy {
                         network: "allow".into(),
                         read_deny: vec!["relative/path".into()],
+                        restrict_home: false,
                     },
                 )
                 .await

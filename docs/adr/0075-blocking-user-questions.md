@@ -18,10 +18,12 @@ not product/architecture choices such as “migrate or keep the old schema?”.
    not Verifier. It creates `question.requested`, sets the session/agent to
    `waiting_input`, and waits for one answer.
 3. **Answer surface.** `question.answer` / `vp answer`, Chat question cards with
-   option buttons or free text, and `question.list` / `vp questions`.
+   option buttons or free text, `question.list` / `vp questions`, and a
+   Manage Dash cross-session inbox.
 4. **Resume semantics.** The answer becomes the tool result
-   (`User answered: …`); the same run continues. The 30-minute timeout marks the
-   question expired and returns an error tool result instead of hanging forever.
+   (`User answered: …`); the same run continues. `VERLINPARK_QUESTION_TIMEOUT_SECS`
+   (default 1800, range 60–86400) marks the question expired and returns an error
+   tool result instead of hanging forever.
 5. **Cancellation.** Cancel marks the question cancelled; daemon restart expires
    pending questions and fails `waiting_input` sessions (same recovery rule as
    active runs).
@@ -38,9 +40,9 @@ not product/architecture choices such as “migrate or keep the old schema?”.
   a way to free capacity.
 - Only one blocking answer per question; multi-question interviews require
   sequential calls.
-- The timeout is fixed at 30 minutes; it is not configurable yet.
-- Questions are visible in Chat and the notification center but not in a
-  dedicated inbox outside the session.
+- The timeout is configurable through an environment variable.
+- Questions are visible in Chat, the notification center, and a Manage Dash
+  cross-session inbox; the inbox is pull-based, not a task queue.
 
 ## Alternatives considered
 

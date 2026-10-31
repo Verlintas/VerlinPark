@@ -67,6 +67,14 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertNil(hit.role)
     }
 
+    func testShellPolicyWithoutRestrictHomeStillDecodes() throws {
+        let json = #"{"network":"allow","read_deny":["~/secret"]}"#
+        let policy = try JSONDecoder().decode(ShellPolicy.self, from: Data(json.utf8))
+        XCTAssertEqual(policy.network, "allow")
+        XCTAssertEqual(policy.readDeny, ["~/secret"])
+        XCTAssertFalse(policy.restrictHome)
+    }
+
     func testQuestionListDecodes() throws {
         let json = """
         {

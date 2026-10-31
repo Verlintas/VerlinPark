@@ -53,6 +53,7 @@ final class AppModel {
     var usageStatus: String?
     var shellPolicy = ShellPolicy.allow
     var shellPolicyNetwork = "allow"
+    var shellPolicyRestrictHome = false
     var shellPolicyReadDenyText = ""
     var shellPolicyBusy = false
     var shellPolicyStatus: String?
@@ -80,6 +81,9 @@ final class AppModel {
     var approvalCenterBusy = false
     var approvalCenterStatus: String?
     var questions: [Question] = []
+    var pendingQuestions: [Question] = []
+    var questionCenterBusy = false
+    var questionCenterStatus: String?
     var memories: [MemoryItem] = []
     var memoryQuery = ""
     var memoryBusy = false
@@ -251,6 +255,7 @@ final class AppModel {
             usageStatus = nil
             shellPolicy = .allow
             shellPolicyNetwork = "allow"
+            shellPolicyRestrictHome = false
             shellPolicyReadDenyText = ""
             shellPolicyStatus = nil
             integrationPolicy = .disabled
@@ -617,6 +622,7 @@ final class AppModel {
             guard projectID == selectedProjectID else { return }
             shellPolicy = policy
             shellPolicyNetwork = policy.network
+            shellPolicyRestrictHome = policy.restrictHome
             shellPolicyReadDenyText = policy.readDeny.joined(separator: "\n")
             shellPolicyStatus = nil
         } catch {
@@ -638,11 +644,16 @@ final class AppModel {
         do {
             let policy = try await core.setShellPolicy(
                 projectID: projectID,
-                policy: ShellPolicy(network: shellPolicyNetwork, readDeny: readDeny)
+                policy: ShellPolicy(
+                    network: shellPolicyNetwork,
+                    readDeny: readDeny,
+                    restrictHome: shellPolicyRestrictHome
+                )
             )
             guard projectID == selectedProjectID else { return }
             shellPolicy = policy
             shellPolicyNetwork = policy.network
+            shellPolicyRestrictHome = policy.restrictHome
             shellPolicyReadDenyText = policy.readDeny.joined(separator: "\n")
             shellPolicyStatus =
                 "Saved · network \(policy.network) · \(policy.readDeny.count) read-deny paths"
@@ -654,6 +665,7 @@ final class AppModel {
 
     func resetShellPolicy() async {
         shellPolicyNetwork = "allow"
+        shellPolicyRestrictHome = false
         shellPolicyReadDenyText = ""
         await saveShellPolicy()
     }
@@ -763,6 +775,34 @@ final class AppModel {
             }
         } catch {
             // The event stream will retry on question.requested.
+        }
+    }
+
+    func loadPendingQuestions() async {
+        questionCenterBusy = true
+        defer { questionCenterBusy = false }
+        do {
+            pendingQuestions = try await core.listAllQuestions().filter(\.isPending)
+            questionCenterStatus = pendingQuestions.isEmpty ? "No pending questions." : nil
+        } catch {
+            questionCenterStatus = error.localizedDescription
+        }
+    }
+
+    func answerGlobalQuestion(_ questionID: String, answer: String) async {
+        let answer = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !answer.isEmpty else { return }
+        questionCenterBusy = true
+        defer { questionCenterBusy = false }
+        do {
+            _ = try await core.answerQuestion(id: questionID, answer: answer)
+            await loadPendingQuestions()
+            if selectedSessionID == questions.first(where: { $0.id == questionID })?.sessionId {
+                await loadQuestions()
+            }
+        } catch {
+            questionCenterStatus = error.localizedDescription
+            handle(error)
         }
     }
 
@@ -1829,6 +1869,15 @@ final class AppModel {
                 questions[index] = question
             } else {
                 questions.append(question)
+            }
+            if let index = pendingQuestions.firstIndex(where: { $0.id == question.id }) {
+                if question.isPending {
+                    pendingQuestions[index] = question
+                } else {
+                    pendingQuestions.remove(at: index)
+                }
+            } else if question.isPending {
+                pendingQuestions.append(question)
             }
         }
 
