@@ -34,12 +34,13 @@ use vp_protocol::types::{
     OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectListResult, PromptParams,
     PromptResult, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
     ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
-    RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams, SessionImportParams,
-    SessionListResult, SessionLogParams, SessionPauseParams, SessionPauseResult,
-    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
-    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
-    SetProjectBudgetParams, SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
+    RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams, SessionExportParams,
+    SessionImportParams, SessionListResult, SessionLogParams, SessionPauseParams,
+    SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
+    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetProjectBudgetParams,
+    SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams,
+    TeamPlanResult, UsageLedgerParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -515,6 +516,28 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(events) => RpcResponse::success(id, EventListResult { events }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.transcript" => match parse_params::<SessionTranscriptParams>(request.params) {
+            Ok(params) => match state.engine.session_transcript(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.search" => match parse_params::<SearchParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .search(
+                    &params.query,
+                    params.project_id.as_deref(),
+                    params.limit.unwrap_or(50),
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

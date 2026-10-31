@@ -235,6 +235,52 @@ pub struct EventListResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SessionTranscriptParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionTranscriptResult {
+    pub session_id: String,
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchParams {
+    pub query: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchHit {
+    /// Stable record identifier: message ID, or `session:seq` for events.
+    pub id: String,
+    pub session_id: String,
+    pub project_id: String,
+    pub session_goal: String,
+    /// `message` or `event`.
+    pub source: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub seq: Option<u64>,
+    pub snippet: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResult {
+    pub query: String,
+    pub hits: Vec<SearchHit>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SubscribeParams {
     #[serde(default)]
     pub session_id: Option<String>,

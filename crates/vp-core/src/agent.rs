@@ -3400,6 +3400,34 @@ impl PlanBudgetScope {
         requests
     }
 
+    fn project_warning(&self, project: (u64, f64)) -> Option<BudgetStop> {
+        if let Some(limit) = self.project_tokens
+            && project.0 >= limit.saturating_mul(8) / 10
+        {
+            return Some(self.stop(
+                "project",
+                self.project_id.as_deref().unwrap_or("?"),
+                "tokens",
+                Some(limit),
+                project,
+                self.project_cost,
+            ));
+        }
+        if let Some(limit) = self.project_cost
+            && project.1 >= limit * 0.8
+        {
+            return Some(self.stop(
+                "project",
+                self.project_id.as_deref().unwrap_or("?"),
+                "cost",
+                self.project_tokens,
+                project,
+                Some(limit),
+            ));
+        }
+        None
+    }
+
     fn after(
         &self,
         task: (u64, f64),
@@ -3609,6 +3637,7 @@ async fn run_loop(
         Some(&project_budget.budget),
         &project.id,
     );
+    let mut warned_project = false;
 
     for turn in 0..config.max_turns {
         if !wait_for_resume(control).await {
@@ -3674,6 +3703,17 @@ async fn run_loop(
         } else {
             (0, 0.0)
         };
+        if !warned_project && let Some(warning) = plan_budget.project_warning(project_spent) {
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "agent.budget_warning",
+                warning.payload(),
+            )
+            .await?;
+            warned_project = true;
+        }
         let desired_output = if budget.limit.is_some() {
             let remaining = budget.available_tokens().unwrap_or(0);
             if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
@@ -8065,16 +8105,28 @@ mod tests {
                 .as_deref()
                 .is_some_and(|detail| detail.contains("integration command exited"))
         );
-        let agents = engine.list_agents(&session.id).await.unwrap();
-        let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
-        assert_eq!(worker.status, "failed");
-        let events = engine
-            .list_events(session.id.clone(), 0, 300)
-            .await
-            .unwrap();
-        assert!(events.iter().any(|event| {
-            event.kind == "integrator.finished" && event.payload["status"] == "failed"
-        }));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (worker_status, saw_integrator_failure) = loop {
+            let agents = engine.list_agents(&session.id).await.unwrap();
+            let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
+            let events = engine
+                .list_events(session.id.clone(), 0, 300)
+                .await
+                .unwrap();
+            let saw_integrator_failure = events.iter().any(|event| {
+                event.kind == "integrator.finished" && event.payload["status"] == "failed"
+            });
+            if worker.status == "failed" && saw_integrator_failure {
+                break (worker.status.clone(), saw_integrator_failure);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker/integrator failure projections did not settle: {worker:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(worker_status, "failed");
+        assert!(saw_integrator_failure);
     }
 
     #[tokio::test]

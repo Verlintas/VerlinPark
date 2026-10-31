@@ -133,6 +133,72 @@ pub enum ProviderError {
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;
 
+const PROVIDER_ATTEMPTS: u32 = 3;
+const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(4);
+
+pub(crate) fn provider_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn retry_after(response: &reqwest::Response) -> Option<std::time::Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
+fn backoff(attempt: u32) -> std::time::Duration {
+    RETRY_BASE_DELAY
+        .saturating_mul(1 << attempt.saturating_sub(1).min(4))
+        .min(RETRY_MAX_DELAY)
+}
+
+/// Send a provider request, retrying transient connection failures and
+/// rate-limit/server responses. The request body is rebuilt for every attempt.
+pub(crate) async fn send_with_retry<F>(mut build: F) -> Result<reqwest::Response, ProviderError>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match build().send().await {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if !retryable_status(status) || attempt >= PROVIDER_ATTEMPTS {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(ProviderError::Api { status, body });
+                }
+                let delay = retry_after(&response)
+                    .unwrap_or_else(|| backoff(attempt))
+                    .min(RETRY_MAX_DELAY);
+                drop(response);
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => {
+                if attempt >= PROVIDER_ATTEMPTS || !(error.is_timeout() || error.is_connect()) {
+                    return Err(ProviderError::Http(error));
+                }
+                tokio::time::sleep(backoff(attempt)).await;
+            }
+        }
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn id(&self) -> &str;

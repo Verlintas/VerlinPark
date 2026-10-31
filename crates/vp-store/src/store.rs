@@ -9,8 +9,8 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
-    MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, Session, SessionBundle, ShellPolicy,
-    StoredMessage, TodoItem, UsageEntry,
+    MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, SearchHit, Session, SessionBundle,
+    ShellPolicy, StoredMessage, TodoItem, UsageEntry,
 };
 
 use crate::paths;
@@ -1785,6 +1785,80 @@ impl Store {
             },
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Search session messages and event payloads. Returns up to `limit` rows,
+    /// newest first. Callers that need to know whether more rows exist should
+    /// pass `limit + 1`.
+    pub fn search(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>> {
+        let pattern = format!("%{}%", escape_like(query));
+        let limit = limit.clamp(1, 500) as i64;
+        let conn = self.lock()?;
+
+        let mut hits = Vec::new();
+
+        let mut message_stmt = conn.prepare(
+            "SELECT m.id, m.session_id, s.project_id, s.goal, m.role, m.content, m.created_at
+             FROM messages m JOIN sessions s ON s.id = m.session_id
+             WHERE m.content LIKE ?1 ESCAPE '\\'
+               AND (?2 IS NULL OR s.project_id = ?2)
+             ORDER BY m.created_at DESC LIMIT ?3",
+        )?;
+        let messages = message_stmt.query_map(params![pattern, project_id, limit], |row| {
+            let content: String = row.get(5)?;
+            Ok(SearchHit {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                project_id: row.get(2)?,
+                session_goal: row.get(3)?,
+                source: "message".to_string(),
+                role: Some(row.get(4)?),
+                kind: None,
+                seq: None,
+                snippet: search_snippet(&content, query),
+                created_at: row.get(6)?,
+            })
+        })?;
+        for hit in messages {
+            hits.push(hit?);
+        }
+
+        let mut event_stmt = conn.prepare(
+            "SELECT e.session_id, s.project_id, s.goal, e.type, e.payload, e.seq, e.created_at
+             FROM events e JOIN sessions s ON s.id = e.session_id
+             WHERE e.payload LIKE ?1 ESCAPE '\\'
+               AND (?2 IS NULL OR s.project_id = ?2)
+             ORDER BY e.created_at DESC LIMIT ?3",
+        )?;
+        let events = event_stmt.query_map(params![pattern, project_id, limit], |row| {
+            let payload: String = row.get(4)?;
+            let session_id: String = row.get(0)?;
+            let seq = row.get::<_, i64>(5)? as u64;
+            Ok(SearchHit {
+                id: format!("{session_id}:{seq}"),
+                session_id,
+                project_id: row.get(1)?,
+                session_goal: row.get(2)?,
+                source: "event".to_string(),
+                role: None,
+                kind: Some(row.get(3)?),
+                seq: Some(seq),
+                snippet: search_snippet(&payload, query),
+                created_at: row.get(6)?,
+            })
+        })?;
+        for hit in events {
+            hits.push(hit?);
+        }
+
+        hits.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        hits.truncate(limit as usize);
+        Ok(hits)
     }
 
     pub fn integrity_check(&self) -> Result<String> {
@@ -3670,6 +3744,34 @@ fn detect_default_branch(root: &Path) -> String {
     }
 }
 
+fn escape_like(query: &str) -> String {
+    query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn search_snippet(text: &str, query: &str) -> String {
+    let lower = text.to_lowercase();
+    let needle = query.to_lowercase();
+    let start = lower.find(&needle).unwrap_or(0);
+    let char_start = lower[..start].chars().count();
+    let chars = text.chars().collect::<Vec<_>>();
+    let from = char_start.saturating_sub(60).min(chars.len());
+    let to = (char_start + query.chars().count() + 120).min(chars.len());
+    let mut snippet = chars[from..to]
+        .iter()
+        .collect::<String>()
+        .replace(['\n', '\r', '\t'], " ");
+    if from > 0 {
+        snippet.insert(0, '…');
+    }
+    if to < chars.len() {
+        snippet.push('…');
+    }
+    snippet
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3740,6 +3842,72 @@ mod tests {
             .join("events.jsonl");
         let mirror = std::fs::read_to_string(path).unwrap();
         assert_eq!(mirror.lines().count(), 2);
+    }
+
+    #[test]
+    fn searches_messages_and_events_with_a_project_filter() {
+        let (_data, store, repo) = test_store();
+        let other_repo = TempDir::new().unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let other = store
+            .add_project(other_repo.path().to_str().unwrap(), Some("other"))
+            .unwrap();
+        let session = store
+            .create_session(&project.id, "add rate limiting")
+            .unwrap();
+        let other_session = store
+            .create_session(&other.id, "other rate limiting work")
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                "user",
+                "Implement rate limiting for the API",
+                &serde_json::json!([]),
+                None,
+            )
+            .unwrap();
+        store
+            .append_event(
+                &session.id,
+                "tool.finished",
+                serde_json::json!({"output": "rate limiting enabled"}),
+            )
+            .unwrap();
+        store
+            .append_message(
+                &other_session.id,
+                "user",
+                "rate limiting in another project",
+                &serde_json::json!([]),
+                None,
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                "user",
+                "progress is 100% done",
+                &serde_json::json!([]),
+                None,
+            )
+            .unwrap();
+
+        let all = store.search("rate limiting", None, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        let scoped = store
+            .search("rate limiting", Some(&project.id), 10)
+            .unwrap();
+        assert_eq!(scoped.len(), 2);
+        assert!(scoped.iter().all(|hit| hit.project_id == project.id));
+        assert!(scoped.iter().any(|hit| hit.source == "message"));
+        assert!(scoped.iter().any(|hit| hit.source == "event"));
+
+        let literal = store.search("100%", Some(&project.id), 10).unwrap();
+        assert_eq!(literal.len(), 1);
+        assert!(literal[0].snippet.contains("100%"));
     }
 
     #[test]

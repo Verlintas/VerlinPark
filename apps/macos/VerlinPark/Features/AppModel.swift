@@ -1,6 +1,14 @@
 import AppKit
 import Observation
 
+struct ArtifactPreviewData {
+    let path: String
+    let image: NSImage?
+    let text: String?
+    let hex: String?
+    let truncated: Bool
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -27,6 +35,10 @@ final class AppModel {
     var lastError: String?
     var agentInfo: AgentInfo?
     var streamingText = ""
+    var searchQuery = ""
+    var searchHits: [SearchHit] = []
+    var searchTruncated = false
+    var searchBusy = false
     var todos: [TodoItem] = []
     var agents: [AgentRecord] = []
     var mergeQueue: [MergeQueueEntry] = []
@@ -89,6 +101,15 @@ final class AppModel {
     var providerBusy = false
     var providerProbeBusy = false
     var providerProbeStatus: String?
+    var cleanupOlderDaysText = "7"
+    var cleanupDryRun = true
+    var cleanupDeleteBranches = false
+    var cleanupBusy = false
+    var cleanupStatus: String?
+    var cleanupResult: WorktreeCleanupResult?
+    var doctorReport: DoctorReport?
+    var doctorBusy = false
+    var doctorStatus: String?
 
     private static func loadRoleModels() -> RoleModels {
         guard let data = UserDefaults.standard.data(forKey: "provider.roleModels"),
@@ -255,6 +276,71 @@ final class AppModel {
             await loadMailbox()
             await loadTeamPlan()
             await loadDiff()
+        }
+    }
+
+    func exportTranscript() async {
+        guard let session = selectedSession else { return }
+        do {
+            let result = try await core.transcript(sessionID: session.id)
+            let panel = NSSavePanel()
+            panel.canCreateDirectories = true
+            let sanitized = session.goal
+                .replacingOccurrences(of: "/", with: "-")
+                .replacingOccurrences(of: ":", with: "-")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let stem = String(sanitized.prefix(60))
+            panel.nameFieldStringValue = (stem.isEmpty ? session.id : stem) + ".md"
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try result.markdown.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            handle(error)
+        }
+    }
+
+    func runSearch(projectID: String?) async {
+        let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            searchHits = []
+            searchTruncated = false
+            return
+        }
+        searchBusy = true
+        defer { searchBusy = false }
+        do {
+            let result = try await core.search(query: trimmed, projectID: projectID)
+            guard trimmed == searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                return
+            }
+            searchHits = result.hits
+            searchTruncated = result.truncated
+        } catch {
+            searchHits = []
+            searchTruncated = false
+            handle(error)
+        }
+    }
+
+    func openSearchHit(_ hit: SearchHit) async {
+        if selectedProjectID != hit.projectId {
+            selectProject(hit.projectId)
+        }
+        do {
+            let loaded = try await core.listSessions(projectID: hit.projectId)
+            if selectedProjectID == hit.projectId {
+                sessions = loaded
+            }
+        } catch {
+            handle(error)
+            return
+        }
+        guard sessions.contains(where: { $0.id == hit.sessionId }) else {
+            lastError = "That session is no longer available."
+            return
+        }
+        if selectedSessionID != hit.sessionId {
+            selectedSessionID = nil
+            selectSession(hit.sessionId)
         }
     }
 
@@ -909,14 +995,75 @@ final class AppModel {
         }
     }
 
-    func artifactPreview(_ artifact: Artifact) async -> NSImage? {
-        guard artifact.mimeType.hasPrefix("image/") else { return nil }
+    func artifactPreviewData(_ artifact: Artifact) async -> ArtifactPreviewData? {
         do {
             let materialized = try await core.materializeArtifact(artifactID: artifact.id)
-            return NSImage(contentsOfFile: materialized.path)
+            let data = try await Task.detached(priority: .userInitiated) {
+                try Data(
+                    contentsOf: URL(fileURLWithPath: materialized.path),
+                    options: [.mappedIfSafe]
+                )
+            }.value
+            let mime = artifact.mimeType.lowercased()
+            if mime.hasPrefix("image/"), let image = NSImage(data: data) {
+                return ArtifactPreviewData(
+                    path: materialized.path,
+                    image: image,
+                    text: nil,
+                    hex: nil,
+                    truncated: false
+                )
+            }
+            let limit = 64 * 1024
+            let truncated = data.count > limit
+            let slice = data.prefix(limit)
+            if isTextMime(mime) {
+                return ArtifactPreviewData(
+                    path: materialized.path,
+                    image: nil,
+                    text: String(decoding: slice, as: UTF8.self),
+                    hex: nil,
+                    truncated: truncated
+                )
+            }
+            return ArtifactPreviewData(
+                path: materialized.path,
+                image: nil,
+                text: nil,
+                hex: hexDump(Data(slice.prefix(1024))),
+                truncated: truncated
+            )
         } catch {
             return nil
         }
+    }
+
+    private func isTextMime(_ mime: String) -> Bool {
+        mime.hasPrefix("text/")
+            || mime.contains("json")
+            || mime.contains("xml")
+            || mime.contains("yaml")
+            || mime.contains("javascript")
+            || mime.contains("toml")
+            || mime.contains("csv")
+            || mime.contains("svg")
+            || mime.contains("sql")
+            || mime.contains("shellscript")
+    }
+
+    private func hexDump(_ data: Data) -> String {
+        let bytes = [UInt8](data)
+        return stride(from: 0, to: bytes.count, by: 16).map { offset in
+            let end = min(offset + 16, bytes.count)
+            let chunk = bytes[offset ..< end]
+            let hex = chunk.map { String(format: "%02x", $0) }.joined(separator: " ")
+            let ascii = chunk.map { byte in
+                (32 ... 126).contains(byte) ? String(UnicodeScalar(byte)) : "."
+            }.joined()
+            return String(format: "%08x  ", offset)
+                + hex.padding(toLength: 47, withPad: " ", startingAt: 0)
+                + "  " + ascii
+        }.joined(separator: "\n")
     }
 
     func openArtifact(_ artifact: Artifact) async {
@@ -924,6 +1071,43 @@ final class AppModel {
             let materialized = try await core.materializeArtifact(artifactID: artifact.id)
             NSWorkspace.shared.open(URL(fileURLWithPath: materialized.path))
         } catch {
+            handle(error)
+        }
+    }
+
+    func runWorktreeCleanup() async {
+        guard let projectID = selectedProjectID else {
+            cleanupStatus = "Select a project first."
+            return
+        }
+        let days = Int(cleanupOlderDaysText.trimmingCharacters(in: .whitespaces)) ?? 7
+        cleanupBusy = true
+        defer { cleanupBusy = false }
+        do {
+            let result = try await core.cleanupWorktrees(
+                projectID: projectID,
+                olderThanDays: max(0, days),
+                dryRun: cleanupDryRun,
+                force: false,
+                deleteBranches: cleanupDeleteBranches
+            )
+            cleanupResult = result
+            cleanupStatus =
+                "scanned \(result.scanned), removed \(result.removed), skipped \(result.skipped)"
+        } catch {
+            cleanupStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func runDoctor() async {
+        doctorBusy = true
+        defer { doctorBusy = false }
+        do {
+            doctorReport = try await core.doctor()
+            doctorStatus = doctorReport?.ok == true ? "All checks passed" : "Warnings or errors found"
+        } catch {
+            doctorStatus = error.localizedDescription
             handle(error)
         }
     }

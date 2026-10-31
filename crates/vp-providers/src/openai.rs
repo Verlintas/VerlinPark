@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     ChatMessage, ChatRequest, EventStream, Provider, ProviderError, StreamEvent, ToolCall,
-    openai_usage, provider_error_from_stream,
+    openai_usage, provider_client, provider_error_from_stream, send_with_retry,
 };
 
 /// Adapter for OpenAI's chat completions API and compatible endpoints:
@@ -29,7 +29,7 @@ impl OpenAiCompatibleProvider {
             id: id.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
-            client: reqwest::Client::new(),
+            client: provider_client(),
         }
     }
 
@@ -84,17 +84,14 @@ impl Provider for OpenAiCompatibleProvider {
             body["tool_choice"] = json!("auto");
         }
 
-        let mut builder = self.client.post(self.endpoint()).json(&body);
-        if let Some(api_key) = &self.api_key {
-            builder = builder.bearer_auth(api_key);
-        }
-
-        let response = builder.send().await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api { status, body });
-        }
+        let response = send_with_retry(|| {
+            let mut builder = self.client.post(self.endpoint()).json(&body);
+            if let Some(api_key) = &self.api_key {
+                builder = builder.bearer_auth(api_key);
+            }
+            builder
+        })
+        .await?;
 
         let stream = Box::pin(response.bytes_stream().eventsource());
         let mapped = async_stream::stream! {
@@ -317,6 +314,76 @@ mod tests {
             arguments: "{\"path\":\"README.md\"}".to_string(),
         })));
         assert_eq!(events.last(), Some(&StreamEvent::Done));
+    }
+
+    #[tokio::test]
+    async fn retries_transient_http_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "0")
+                    .set_body_string("busy"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "test-model",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("recovered".to_string()),
+                StreamEvent::Done,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_auth_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let error = match provider
+            .stream_chat(ChatRequest::new(
+                "test-model",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+        {
+            Ok(_) => panic!("expected HTTP error"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ProviderError::Api { status: 401, .. }));
     }
 
     #[tokio::test]

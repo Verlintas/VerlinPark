@@ -70,6 +70,10 @@
 | [0058](adr/0058-doctor-diagnostics.md) | Local doctor diagnostics | Accepted | 运维/诊断 |
 | [0059](adr/0059-provider-probe.md) | Live provider probe | Accepted | Provider/诊断 |
 | [0060](adr/0060-plan-task-priority.md) | Plan task priority | Accepted | 调度/规划 |
+| [0061](adr/0061-provider-retry.md) | Transient provider retry | Accepted | Provider/可靠性 |
+| [0062](adr/0062-session-search.md) | Session search | Accepted | 检索/UX |
+| [0063](adr/0063-markdown-transcript.md) | Markdown transcript export | Accepted | 导出/UX |
+| [0064](adr/0064-artifact-preview.md) | Artifact text and binary previews | Accepted | 产物/UX |
 
 ---
 

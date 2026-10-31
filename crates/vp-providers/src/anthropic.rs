@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     ChatMessage, ChatRequest, EventStream, Provider, ProviderError, StreamEvent, ToolCall,
-    provider_error_from_stream,
+    provider_client, provider_error_from_stream, send_with_retry,
 };
 
 /// Anthropic Messages API adapter.
@@ -32,7 +32,7 @@ impl AnthropicProvider {
             id: id.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
-            client: reqwest::Client::new(),
+            client: provider_client(),
         }
     }
 
@@ -114,20 +114,15 @@ impl Provider for AnthropicProvider {
             );
         }
 
-        let response = self
-            .client
-            .post(self.endpoint())
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api { status, body });
-        }
+        let response = send_with_retry(|| {
+            self.client
+                .post(self.endpoint())
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+        })
+        .await?;
 
         let stream = Box::pin(response.bytes_stream().eventsource());
         let mapped = async_stream::stream! {
@@ -300,6 +295,54 @@ mod tests {
         }));
         assert_eq!(events.last(), Some(&StreamEvent::Done));
     }
+    #[tokio::test]
+    async fn retries_rate_limits() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "0")
+                    .set_body_string("slow down"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "event: content_block_delta\n",
+                        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                        "event: message_stop\n",
+                        "data: {\"type\":\"message_stop\"}\n\n",
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::with_base_url(
+            "test",
+            format!("{}/v1", server.uri()),
+            Some("test-key".to_string()),
+        );
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "claude-test",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        assert!(events.contains(&StreamEvent::TextDelta("ok".to_string())));
+        assert_eq!(events.last(), Some(&StreamEvent::Done));
+    }
+
     #[tokio::test]
     async fn parses_streamed_tool_use() {
         let server = MockServer::start().await;

@@ -75,6 +75,12 @@ struct DashboardView: View {
                     ProjectBudgetCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    DoctorCard()
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
+                    WorktreeCleanupCard(project: project)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                     ArtifactPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
@@ -547,6 +553,156 @@ private struct ProjectBudgetCard: View {
         }
         .task(id: project.id) {
             await model.loadProjectBudget()
+        }
+    }
+}
+
+private struct DoctorCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Diagnostics")
+                    Text("Local doctor")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.doctorBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Run diagnostics") {
+                    Task { await model.runDoctor() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.doctorBusy)
+            }
+            Text(
+                "Checks SQLite integrity, data permissions, project roots, worktrees, event mirrors, sandbox availability, and provider configuration."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let report = model.doctorReport {
+                Text(report.ok ? "All checks passed" : "Warnings or errors found")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(report.ok ? Color.green : Color.orange)
+                ForEach(report.checks) { check in
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(check.status.uppercased())
+                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .foregroundStyle(color(for: check.status))
+                            .frame(width: 44, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(check.name)
+                                .font(.system(size: 9, weight: .medium))
+                            Text(check.detail)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            } else if let status = model.doctorStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private func color(for status: String) -> Color {
+        switch status {
+        case "ok": .green
+        case "warn": .orange
+        default: .red
+        }
+    }
+}
+
+private struct WorktreeCleanupCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Worktree cleanup")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.cleanupBusy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            Text(
+                "Removes worktrees for terminal sessions only. Branches are kept unless Delete branches is enabled. Dirty worktrees are skipped."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Older than days")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("7", text: $model.cleanupOlderDaysText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 70)
+                }
+                Toggle("Dry run", isOn: $model.cleanupDryRun)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Toggle("Delete branches", isOn: $model.cleanupDeleteBranches)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Spacer()
+                Button("Run cleanup") {
+                    Task { await model.runWorktreeCleanup() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.cleanupBusy)
+            }
+            if let status = model.cleanupStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            if let result = model.cleanupResult {
+                ForEach(result.entries) { entry in
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(entry.removed ? "removed" : "skipped")
+                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .foregroundStyle(entry.removed ? Color.green : Color.secondary)
+                            .frame(width: 52, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(entry.sessionId)
+                                .font(.system(size: 8, design: .monospaced))
+                            Text("\(entry.branch) · \(entry.reason)")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
     }
 }

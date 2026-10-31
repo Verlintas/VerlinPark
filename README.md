@@ -166,6 +166,8 @@ just cli project-budget <project-id>
 just cli project-budget-set <project-id> --token-budget 500000 --cost-budget-usd 5
 just cli doctor
 just cli provider-test
+just cli search "rate limit" --project <project-id>
+just cli transcript <session-id>
 just cli artifact-policy <project-id>
 just cli artifact-policy-set <project-id> --max-count 20 --auto-gc
 just cli gc <project-id>

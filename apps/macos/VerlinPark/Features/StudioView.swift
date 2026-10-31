@@ -1334,7 +1334,7 @@ private struct MailboxMessageRow: View {
 private struct ArtifactRow: View {
     @Environment(AppModel.self) private var model
     let artifact: Artifact
-    @State private var preview: NSImage?
+    @State private var preview: ArtifactPreviewData?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1360,21 +1360,48 @@ private struct ArtifactRow: View {
             Text("\(artifact.sizeBytes) bytes · \(artifact.mimeType)")
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(.tertiary)
-            if let preview {
-                Image(nsImage: preview)
+            if let image = preview?.image {
+                Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
                     .frame(maxHeight: 180)
                     .clipShape(RoundedRectangle(cornerRadius: 7))
             }
-            if artifact.storage == "file" {
+            if let text = preview?.text {
+                ScrollView {
+                    Text(text)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 180)
+                .padding(6)
+                .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
+            }
+            if let hex = preview?.hex {
+                ScrollView([.horizontal, .vertical]) {
+                    Text(hex)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .frame(maxHeight: 160)
+                .padding(6)
+                .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
+                Text("Binary preview · first 1 KB")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            if artifact.storage == "file" || preview != nil {
                 HStack(spacing: 8) {
-                    Text(artifact.path ?? "path unavailable")
+                    Text(preview?.path ?? artifact.path ?? "path unavailable")
                         .font(.system(size: 8, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if artifact.path != nil {
+                    if preview != nil || artifact.path != nil {
                         Button("Open") {
                             Task { await model.openArtifact(artifact) }
                         }
@@ -1390,11 +1417,16 @@ private struct ArtifactRow: View {
                     .lineLimit(8)
                     .textSelection(.enabled)
             }
+            if preview?.truncated == true {
+                Text("Preview truncated at 64 KB. Open the artifact for the full file.")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
         }
         .padding(9)
         .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
         .task(id: artifact.id) {
-            preview = await model.artifactPreview(artifact)
+            preview = await model.artifactPreviewData(artifact)
         }
     }
 }

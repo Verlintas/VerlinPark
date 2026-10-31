@@ -18,7 +18,15 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、worktree/scratch 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 110（core 89 / store 16 / providers 5），Swift 12。CI 以最新提交为准。
+当前测试：Rust 116（core 91 / store 17 / providers 8），Swift 13。CI 以最新提交为准。
+
+### 0.1 2026-10-31 跟进
+
+- Provider adapter 在 stream 建立前对 429/5xx/connection 错误做最多 3 次重试，支持 `Retry-After`、指数退避和 15s connect timeout；stream 中途断开仍不续传。
+- 新增 `session.search` / `vp search` / Stage `Cmd-F`：跨 session 搜索 message content 与 raw event payload，可按 project 过滤；LIKE 扫描，无 FTS。
+- 新增 `session.transcript` / `vp transcript` / Export Transcript：Markdown 记录 plan、conversation 和 tool calls，超长内容截断。
+- Preview 支持文本（64KB）与二进制 hex/ASCII（1KB）artifact 预览；Manage Dash 增加 Doctor 和 worktree cleanup 卡片；project pool 80% 也发 `agent.budget_warning`。
+- 修复 merge 回滚测试中 queue 投影先于 agent 状态可见导致的竞态。
 
 ---
 
@@ -43,12 +51,12 @@
 
 | 维度 | 评分 | 说明 |
 |---|---|---|
-| 功能完整度（M3） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、显式/opt-in 自动冲突解决、本地 landing、`gh` PR、mailbox/artifacts/replay 已有；缺 artifact compression、default-on auto-resolution、global Task-DAG scheduler |
+| 功能完整度（M3） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、显式/opt-in 自动冲突解决、本地 landing、`gh` PR、mailbox/artifacts/replay、search/transcript 已有；缺 default-on auto-resolution、global Task-DAG scheduler |
 | 正确性/一致性 | B | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影；从零数据库重建仍未完成 |
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
-| 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
+| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup 可用；圆桌仍主要出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
-| 测试 | B− | 110 Rust + 12 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 116 Rust + 13 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/search/transcript/preview 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | C− | `just package` 生成 ad-hoc signed DMG + checksum，tag 触发 Release workflow；仍无 Developer ID/公证、更新器和 Homebrew tap |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -240,7 +248,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 110 个 Rust 测试 + 12 个 Swift 测试，覆盖 Leader loop、provider probe、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore。仍缺：
+已有 116 个 Rust 测试 + 13 个 Swift 测试，覆盖 Leader loop、provider probe/retry、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript。仍缺：
 
 - plan 自动派发的 scope overlap / cap 回归
 - 并发预算超调上界
@@ -249,7 +257,9 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 - WebSocket 断线重连
 - 真实 Anthropic 工具调用（目前只有 mock/SSE 解析测试）
 - UI 的 event → plan status / roundtable 渲染
-- worktree/branch 清理
+- 真实 Provider 的工具调用/委派 E2E（当前只用 wiremock/SSE mock）
+- FTS/索引搜索与跨 session 相关性排序
+- transcript 的 event timeline 与增量导出
 
 ### P2-13：产品叙事大于实现
 
@@ -344,7 +354,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 110 passed after the 10-31 plan-priority slice
+cargo test --workspace     # 116 passed after the 10-31 search/transcript/retry slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

@@ -190,6 +190,24 @@ actor CoreClient {
             .decode(Session.self)
     }
 
+    func transcript(sessionID: String) async throws -> SessionTranscriptResult {
+        try await request(
+            method: "session.transcript",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionTranscriptResult.self)
+    }
+
+    func search(query: String, projectID: String?, limit: Int = 50) async throws -> SearchResult {
+        let params: [String: JSONValue] = [
+            "query": .string(query),
+            "project_id": projectID.map(JSONValue.string) ?? .null,
+            "limit": .number(Double(limit)),
+        ]
+        return try await request(method: "session.search", params: params)
+            .decode(SearchResult.self)
+    }
+
     func listEvents(
         sessionID: String,
         since: UInt64 = 0,
@@ -293,6 +311,29 @@ actor CoreClient {
         return try await request(method: "artifact.policy.set", params: params)
             .decode(ArtifactPolicyResult.self)
             .policy
+    }
+
+    func cleanupWorktrees(
+        projectID: String,
+        olderThanDays: Int,
+        dryRun: Bool,
+        force: Bool,
+        deleteBranches: Bool
+    ) async throws -> WorktreeCleanupResult {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "older_than_secs": .number(Double(olderThanDays) * 86400),
+            "dry_run": .bool(dryRun),
+            "force": .bool(force),
+            "delete_branches": .bool(deleteBranches),
+        ]
+        return try await request(method: "project.cleanup_worktrees", params: params)
+            .decode(WorktreeCleanupResult.self)
+    }
+
+    func doctor() async throws -> DoctorReport {
+        try await request(method: "server.doctor", params: [:])
+            .decode(DoctorReport.self)
     }
 
     func probeProvider() async throws -> AgentProbeResult {

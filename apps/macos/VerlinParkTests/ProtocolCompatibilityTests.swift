@@ -46,6 +46,27 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertNil(ledger.totals.byDepartment)
     }
 
+    func testSearchHitDecodesEventAndMessageShapes() throws {
+        let json = """
+        {
+          "id": "session-1:7",
+          "session_id": "session-1",
+          "project_id": "project-1",
+          "session_goal": "find it",
+          "source": "event",
+          "kind": "tool.finished",
+          "seq": 7,
+          "snippet": "needle",
+          "created_at": "2026-10-31T00:00:00Z"
+        }
+        """
+        let hit = try JSONDecoder().decode(SearchHit.self, from: Data(json.utf8))
+        XCTAssertEqual(hit.source, "event")
+        XCTAssertEqual(hit.detail, "tool.finished")
+        XCTAssertEqual(hit.seq, 7)
+        XCTAssertNil(hit.role)
+    }
+
     func testPlanTaskWithoutBudgetsStillDecodes() throws {
         let json = """
         {

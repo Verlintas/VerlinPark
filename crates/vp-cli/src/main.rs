@@ -106,6 +106,14 @@ enum Command {
         #[arg(long)]
         time_budget_secs: Option<u64>,
     },
+    /// Search messages and event payloads across sessions.
+    Search {
+        query: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        limit: u32,
+    },
     /// List events for a session.
     Events {
         session: String,
@@ -128,6 +136,8 @@ enum Command {
     Usage { session: String },
     /// Show the validated team plan.
     TeamPlan { session: String },
+    /// Print a Markdown transcript of the session's plan and messages.
+    Transcript { session: String },
     /// List the agents spawned for a session.
     Agents { session: String },
     /// List typed agent messages.
@@ -394,6 +404,18 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::Search {
+            query,
+            project,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "session.search",
+                json!({"query": query, "project_id": project, "limit": limit}),
+            )
+            .await?
+        }
         Command::Events {
             session,
             since,
@@ -428,6 +450,14 @@ async fn main() -> Result<()> {
         }
         Command::TeamPlan { session } => {
             rpc(&discovery, "team_plan.get", json!({"session_id": session})).await?
+        }
+        Command::Transcript { session } => {
+            rpc(
+                &discovery,
+                "session.transcript",
+                json!({"session_id": session}),
+            )
+            .await?
         }
         Command::Usage { session } => {
             rpc(&discovery, "session.usage", json!({"session_id": session})).await?
@@ -716,6 +746,41 @@ fn print_json(value: &Value) -> Result<()> {
 }
 
 fn print_human(value: &Value) {
+    if let Some(markdown) = value.get("markdown").and_then(Value::as_str) {
+        print!("{markdown}");
+        return;
+    }
+    if let Some(hits) = value.get("hits").and_then(Value::as_array)
+        && value.get("query").is_some()
+    {
+        if hits.is_empty() {
+            println!("No matches.");
+            return;
+        }
+        for hit in hits {
+            let source = hit["source"].as_str().unwrap_or("?");
+            let detail = hit["role"]
+                .as_str()
+                .or_else(|| hit["kind"].as_str())
+                .unwrap_or("");
+            println!(
+                "{} {:<18} {} · {}",
+                source,
+                detail,
+                hit["session_goal"].as_str().unwrap_or("?"),
+                hit["snippet"].as_str().unwrap_or("")
+            );
+            println!(
+                "  {} · session {}",
+                hit["created_at"].as_str().unwrap_or("?"),
+                hit["session_id"].as_str().unwrap_or("?")
+            );
+        }
+        if value["truncated"].as_bool().unwrap_or(false) {
+            println!("… more matches exist; increase --limit or narrow the query.");
+        }
+        return;
+    }
     if let Some(totals) = value.get("totals")
         && value.get("entries").is_some()
     {

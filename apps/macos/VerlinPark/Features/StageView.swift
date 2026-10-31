@@ -34,6 +34,7 @@ private struct ProjectStageView: View {
     let project: Project
     @Binding var showingNewSession: Bool
     @State private var draft = ""
+    @State private var showingSearch = false
     @FocusState private var composerFocused: Bool
 
     var body: some View {
@@ -46,6 +47,10 @@ private struct ProjectStageView: View {
                 emptyState
             }
             composer
+        }
+        .sheet(isPresented: $showingSearch) {
+            SearchSheet()
+                .environment(model)
         }
     }
 
@@ -73,6 +78,18 @@ private struct ProjectStageView: View {
 
             Spacer(minLength: 12)
 
+            Button {
+                showingSearch = true
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 26, height: 26)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut("f", modifiers: .command)
+            .help("Search messages and events")
+
             if !model.sessions.isEmpty {
                 Menu {
                     ForEach(model.sessions) { session in
@@ -89,6 +106,12 @@ private struct ProjectStageView: View {
                     Divider()
                     Button("New Session…") {
                         showingNewSession = true
+                    }
+                    if model.selectedSession != nil {
+                        Divider()
+                        Button("Export Transcript…") {
+                            Task { await model.exportTranscript() }
+                        }
                     }
                 } label: {
                     HStack(spacing: 6) {
@@ -261,6 +284,22 @@ struct SessionChatView: View {
                     ?? event.payload.objectValue?["message"]?.stringValue
                     ?? "The agent stopped."
                 result.append(.error(id: event.id, text: message))
+            case "agent.budget_warning":
+                let scope = event.payload.objectValue?["scope"]?.stringValue ?? "session"
+                let reason = event.payload.objectValue?["reason"]?.stringValue ?? "tokens"
+                let text: String
+                if reason == "cost" {
+                    let spent = event.payload.objectValue?["cost_spent_usd"]?.doubleValue ?? 0
+                    let limit = event.payload.objectValue?["cost_limit_usd"]?.doubleValue ?? 0
+                    text = "\(scope) USD budget is at 80% ($"
+                        + String(format: "%.4f", spent) + " / $"
+                        + String(format: "%.2f", limit) + ")."
+                } else {
+                    let spent = event.payload.objectValue?["spent"]?.intValue ?? 0
+                    let limit = event.payload.objectValue?["limit"]?.intValue ?? 0
+                    text = "\(scope) token budget is at 80% (\(spent) / \(limit))."
+                }
+                result.append(.notice(id: event.id, text: text))
             case "agent.budget_exceeded":
                 let reason = event.payload.objectValue?["reason"]?.stringValue ?? "tokens"
                 let text: String

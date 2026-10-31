@@ -61,6 +61,105 @@ struct ArtifactPolicy: Codable, Hashable, Sendable {
     }
 }
 
+struct SessionTranscriptResult: Codable, Sendable {
+    let sessionId: String
+    let markdown: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case markdown
+    }
+}
+
+struct SearchHit: Codable, Sendable, Identifiable {
+    let id: String
+    let sessionId: String
+    let projectId: String
+    let sessionGoal: String
+    let source: String
+    let role: String?
+    let kind: String?
+    let seq: Int?
+    let snippet: String
+    let createdAt: String
+
+    var detail: String {
+        role ?? kind ?? source
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case projectId = "project_id"
+        case sessionGoal = "session_goal"
+        case source
+        case role
+        case kind
+        case seq
+        case snippet
+        case createdAt = "created_at"
+    }
+}
+
+struct SearchResult: Codable, Sendable {
+    let query: String
+    let hits: [SearchHit]
+    let truncated: Bool
+}
+
+struct WorktreeCleanupEntry: Codable, Sendable, Identifiable {
+    let sessionId: String
+    let status: String
+    let worktree: String
+    let branch: String
+    let removed: Bool
+    let reason: String
+
+    var id: String {
+        sessionId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case status
+        case worktree
+        case branch
+        case removed
+        case reason
+    }
+}
+
+struct WorktreeCleanupResult: Codable, Sendable {
+    let projectId: String
+    let scanned: Int
+    let removed: Int
+    let skipped: Int
+    let entries: [WorktreeCleanupEntry]
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case scanned
+        case removed
+        case skipped
+        case entries
+    }
+}
+
+struct DoctorCheck: Codable, Sendable, Identifiable {
+    let name: String
+    let status: String
+    let detail: String
+
+    var id: String {
+        name
+    }
+}
+
+struct DoctorReport: Codable, Sendable {
+    let checks: [DoctorCheck]
+    let ok: Bool
+}
+
 struct AgentProbeResult: Codable, Sendable {
     let provider: String
     let model: String

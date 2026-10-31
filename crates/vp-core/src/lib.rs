@@ -13,10 +13,11 @@ use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
     ArtifactMaterialization, ArtifactPolicy, DoctorCheck, Event, IntegrationPolicy,
     MailboxGcResult, MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult,
-    PullRequestResult, Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult,
-    SessionLandResult, SessionLogStatus, SessionRehydrateResult, SessionReplayReport, ShellPolicy,
-    StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
-    WorktreeCleanupEntry, WorktreeCleanupResult,
+    PullRequestResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
+    SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
+    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
+    UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
+    WorktreeCleanupResult,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -1497,6 +1498,140 @@ impl Engine {
             base_commit,
             status,
             patch,
+        })
+    }
+
+    pub async fn session_transcript(&self, session_id: &str) -> Result<SessionTranscriptResult> {
+        use std::fmt::Write as _;
+
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (session, project, plan, messages) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let session = store
+                    .get_session(&id)?
+                    .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+                let project = store
+                    .get_project(&session.project_id)?
+                    .ok_or_else(|| anyhow::anyhow!("project not found: {}", session.project_id))?;
+                let plan = store
+                    .get_team_plan(&id)?
+                    .and_then(|raw| serde_json::from_str::<TeamPlan>(&raw).ok());
+                let messages = store.list_messages(&id)?;
+                Ok((session, project, plan, messages))
+            })
+            .await??;
+
+        let mut out = String::new();
+        let _ = writeln!(out, "# {}\n", session.goal);
+        let _ = writeln!(out, "- **Session:** `{}`", session.id);
+        let _ = writeln!(out, "- **Project:** {} (`{}`)", project.name, project.root);
+        let _ = writeln!(out, "- **Status:** {}", session.status);
+        let _ = writeln!(out, "- **Created:** {}", session.created_at);
+        if let Some(branch) = &session.branch {
+            let _ = writeln!(out, "- **Branch:** `{branch}`");
+        }
+        if let Some(worktree) = &session.worktree {
+            let _ = writeln!(out, "- **Worktree:** `{worktree}`");
+        }
+        let _ = writeln!(
+            out,
+            "- **Tokens:** {} in / {} out",
+            session.tokens_in, session.tokens_out
+        );
+        let _ = writeln!(out, "- **Cost:** ${:.4}", session.cost_spent_usd);
+
+        if let Some(plan) = &plan {
+            let _ = writeln!(out, "\n## Team Plan\n");
+            for department in &plan.departments {
+                let _ = writeln!(out, "### {} — {}", department.name, department.objective);
+                for task in plan
+                    .tasks
+                    .iter()
+                    .filter(|task| task.department == department.name)
+                {
+                    let mut details = vec![task.kind.clone()];
+                    if let Some(profile) = &task.profile {
+                        details.push(profile.clone());
+                    }
+                    if task.priority != 0 {
+                        details.push(format!("priority {}", task.priority));
+                    }
+                    if !task.deps.is_empty() {
+                        details.push(format!("deps: {}", task.deps.join(", ")));
+                    }
+                    if !task.write_scope.is_empty() {
+                        details.push(format!("scope: {}", task.write_scope.join(", ")));
+                    }
+                    let _ = writeln!(
+                        out,
+                        "- **{}** {} · {}",
+                        task.id,
+                        task.title,
+                        details.join(" · ")
+                    );
+                }
+            }
+        }
+
+        let _ = writeln!(out, "\n## Conversation\n");
+        if messages.is_empty() {
+            let _ = writeln!(out, "_No messages yet._");
+        }
+        for message in messages {
+            let _ = writeln!(out, "### {} · {}\n", message.role, message.created_at);
+            let _ = writeln!(out, "{}", clip_transcript(&message.content, 8_000));
+            if let Some(calls) = message.tool_calls.as_array() {
+                for call in calls {
+                    let name = call["name"].as_str().unwrap_or("tool");
+                    let arguments = call["arguments"].as_str().unwrap_or("");
+                    let _ = writeln!(
+                        out,
+                        "\n- `{}` `{}`",
+                        name,
+                        clip_transcript(arguments, 1_000)
+                    );
+                }
+            }
+            let _ = writeln!(out);
+        }
+        Ok(SessionTranscriptResult {
+            session_id: session.id,
+            markdown: out,
+        })
+    }
+
+    pub async fn search(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        limit: u32,
+    ) -> Result<SearchResult> {
+        let query = query.trim();
+        if query.is_empty() {
+            anyhow::bail!("search query is required");
+        }
+        if query.chars().count() > 200 {
+            anyhow::bail!("search query must be at most 200 characters");
+        }
+        let limit = limit.clamp(1, 100);
+        let store = self.store.clone();
+        let query_owned = query.to_string();
+        let project_owned = project_id.map(str::to_string);
+        let hits = tokio::task::spawn_blocking(move || {
+            store.search(
+                &query_owned,
+                project_owned.as_deref(),
+                limit.saturating_add(1),
+            )
+        })
+        .await??;
+        let truncated = hits.len() > limit as usize;
+        let hits = hits.into_iter().take(limit as usize).collect();
+        Ok(SearchResult {
+            query: query.to_string(),
+            hits,
+            truncated,
         })
     }
 
@@ -3461,6 +3596,14 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
         .to_string())
 }
 
+fn clip_transcript(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        text.to_string()
+    } else {
+        text.chars().take(limit).collect::<String>() + "\n… truncated"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3484,6 +3627,128 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+    }
+
+    #[tokio::test]
+    async fn searches_sessions_and_validates_the_query() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("search".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "find the needle".into(), None)
+            .await
+            .unwrap();
+        engine
+            .append_message(
+                &session.id,
+                "user",
+                "the needle is here",
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .append_message(
+                &session.id,
+                "assistant",
+                "needle found",
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(engine.search("   ", Some(&project.id), 10).await.is_err());
+        assert!(
+            engine
+                .search(&"x".repeat(201), Some(&project.id), 10)
+                .await
+                .is_err()
+        );
+        let result = engine.search("needle", Some(&project.id), 1).await.unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert!(result.truncated);
+        assert_eq!(result.hits[0].project_id, project.id);
+        assert!(
+            !engine
+                .search("needle", Some("missing-project"), 10)
+                .await
+                .unwrap()
+                .hits
+                .iter()
+                .any(|hit| hit.session_id == session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn exports_a_markdown_transcript() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("transcript".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "write the transcript".into(), None)
+            .await
+            .unwrap();
+        engine
+            .append_message(
+                &session.id,
+                "user",
+                "hello transcript",
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        let plan = TeamPlan {
+            goal: "write the transcript".into(),
+            departments: vec![vp_protocol::types::PlanDepartment {
+                name: "docs".into(),
+                manager_title: "Documentation".into(),
+                profile: "coding".into(),
+                objective: "document it".into(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: vec![vp_protocol::types::PlanTask {
+                id: "T1".into(),
+                department: "docs".into(),
+                title: "Write the file".into(),
+                kind: "coding".into(),
+                priority: 5,
+                profile: Some("coding".into()),
+                deps: Vec::new(),
+                write_scope: vec!["docs".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+        };
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+
+        let transcript = engine.session_transcript(&session.id).await.unwrap();
+        assert_eq!(transcript.session_id, session.id);
+        assert!(transcript.markdown.contains("# write the transcript"));
+        assert!(transcript.markdown.contains("## Team Plan"));
+        assert!(transcript.markdown.contains("**T1** Write the file"));
+        assert!(transcript.markdown.contains("hello transcript"));
+        assert!(engine.session_transcript("missing").await.is_err());
     }
 
     #[tokio::test]
