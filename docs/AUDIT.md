@@ -47,6 +47,7 @@
 - 新增 MCP stdio client：server config、tools list/call、agent `mcp` tool、Settings/CLI、approval 与超时；后续切片加入 per-server persistent process、idle 回收、config 失效、process group 清理、cursor 分页，以及 resources/templates/prompts list/read/get；见 ADR-0077。
 - 新增 memory retention + FTS5：`memory.delete` / `memory.prune`、`memory.deleted` 回放/修复、FTS5 外部内容索引与 LIKE fallback、Manage Dash 删除/30 天 prune；后续切片加入 opt-in per-project retention policy 与 daemon sweep；见 ADR-0078。
 - 新增 priority-aware session admission 与 Worker/Labour capacity：session priority -100..100，高优先级先准入，同优先级 session/project round-robin；见 ADR-0079。
+- 新增 macOS 本地系统通知：后台发送 approval/task/integration/session 通知，点击跳转 session，Settings 可开关和查看权限。
 
 ---
 
@@ -74,7 +75,7 @@
 | 功能完整度（M3） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、显式/opt-in 自动冲突解决、本地 landing、`gh` PR、mailbox/artifacts/replay、search/transcript 已有；缺 default-on auto-resolution、global Task-DAG scheduler |
 | 正确性/一致性 | B+ | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影（含 memory/question）；`vp db-rebuild` 可从 manifest + mirrors 从零重建，但 imported archive/blobs/worktree 需要原文件存在 |
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
-| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff、Rail 通知中心（历史持久化）可用；仍无系统通知，更早的 round 受已加载 event window 限制 |
+| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff、Rail 通知中心（历史持久化）可用；系统通知已支持（后台本地通知），更早的 round 受已加载 event window 限制 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
 | 测试 | B− | 160 Rust + 29 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/home read jail/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/project memory delete-prune-FTS-retention-policy/mid-run questions/MCP stdio persistent-pagination-resources-prompts/usage CSV/project usage/worktree retention/diff parser/OpenAI+Anthropic HTTP adapter E2E/queued recovery/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
 | 发布准备 | C | `just package` 生成 ad-hoc signed DMG + checksum，release workflow 同时生成并上传 Homebrew cask；仍无 Developer ID/公证、更新器和可持续升级的 Homebrew tap |

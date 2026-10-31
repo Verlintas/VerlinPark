@@ -216,6 +216,20 @@ final class AppModel {
             try await core.connect(to: discovery)
             connection = .connected
             loadNotices()
+            SystemNotifier.shared.requestAuthorization()
+            SystemNotifier.shared.onOpenSession = { [weak self] sessionID in
+                guard let self else { return }
+                Task { @MainActor in
+                    if let projectID = self.sessionDirectory[sessionID]?.projectId {
+                        await self.openSession(sessionID: sessionID, projectID: projectID)
+                    } else {
+                        await self.refresh()
+                        if let projectID = self.sessionDirectory[sessionID]?.projectId {
+                            await self.openSession(sessionID: sessionID, projectID: projectID)
+                        }
+                    }
+                }
+            }
             await configureStoredProvider()
             agentInfo = try? await core.agentInfo()
             if let info = agentInfo {
@@ -2180,24 +2194,26 @@ final class AppModel {
         createdAt: String
     ) {
         guard !notices.contains(where: { $0.id == id }) else { return }
-        notices.insert(
-            AppNotice(
-                id: id,
-                sessionId: event.sessionId,
-                projectId: projectId,
-                kind: kind,
-                title: title,
-                detail: detail,
-                createdAt: createdAt,
-                isRead: false
-            ),
-            at: 0
+        let notice = AppNotice(
+            id: id,
+            sessionId: event.sessionId,
+            projectId: projectId,
+            kind: kind,
+            title: title,
+            detail: detail,
+            createdAt: createdAt,
+            isRead: false
         )
+        notices.insert(notice, at: 0)
         if notices.count > 100 {
             notices.removeLast(notices.count - 100)
         }
         saveNotices()
         updateDockBadge()
+        SystemNotifier.shared.notify(
+            notice: notice,
+            sessionGoal: sessionDirectory[event.sessionId]?.goal
+        )
     }
 
     private func loadNotices() {

@@ -94,13 +94,13 @@
 - Roundtable 卡片只渲染当前已加载的 event window；更早的 round 需要扩大 Trace/事件加载。
 - Usage CSV 一次生成完整字符串，不支持流式导出；Homebrew cask 不是 tap，不能 `brew upgrade`。
 - `project.usage` 只按 session 汇总，没有按天/model 的时间序列；UI 只展示前 8 个 session。
-- 审批中心在打开 Manage Dash 时拉取；没有系统通知或后台推送，自动 resolve 的审批需要手动刷新。
+- 审批中心在打开 Manage Dash 时拉取；有 macOS 本地系统通知（后台时发送，点击回到 session），但没有远程推送；自动 resolve 的审批需要手动刷新。
 - Diff 文件选择基于 unified diff 文本；不处理 Git 的 quoted path，也不支持逐 hunk stage。
 - Worktree retention sweep 默认 1 小时一次、按 session 创建时间计算，不覆盖 shell scratch，也没有全局磁盘上限。
 - Plan resume 是显式操作，不会在 daemon 重启后自动继续；只重跑非 completed task，completed task 不重新验证；plan 版本只按最近一次 `team_plan.submitted` 区分；batch abort 只结算，不自动重跑 sibling task。
 - Provider idle timeout 只覆盖 stream 事件间隔，不限制总时长；超时不会重放已产生的 partial text/tool calls；外部真实 Provider 的 E2E 仍需 API key。
 - `db-rebuild` 依赖 `projects.jsonl`（daemon 至少启动/变更过一次）；旧 session 的 budget/base commit 可能回落默认值；imported archive 需要重新 `vp import`；worktree/artifact blobs 不重建；没有自动清理旧备份。
-- 通知历史通过 UserDefaults 持久化，内容包含 session goal/tool/agent；没有 macOS 系统通知或前台通知 delegate；同一个 session 的失败/取消可能各产生一条通知。
+- 通知历史通过 UserDefaults 持久化，内容包含 session goal/tool/agent；macOS 系统通知在 app 非 active 时发送，前台由 Rail 承担，点击通知打开对应 session；系统通知权限被拒时仅保留 in-app 通知；同一个 session 的失败/取消可能各产生一条通知。
 - Project memory 支持手动删除、`older_than_days` / `keep_latest` prune，以及 opt-in per-project retention policy；daemon 每小时（可配置/可关闭）sweep enabled policy；recall 先走 FTS5，无结果/失败时回退 LIKE；CJK 分词不完整，主要靠 fallback；无 embedding/语义检索；删除保留事件历史。
 - `ask_user` 等待时占用 session admission slot；超时可配（`VERLINPARK_QUESTION_TIMEOUT_SECS`，默认 1800s）；一个 question 只接受一个答案，不能做多问题访谈；inbox 只在 Manage Dash 拉取，不是持久任务队列。
 - `restrict_home` 只限制 HOME 内容；HOME metadata、其他用户目录、`/Volumes`、HOME 外任意路径、network allow 和 daemon 介导写入仍未隔离；allowlist 是启发式，可能需调整或关闭；`sandbox-exec` 已废弃。
@@ -192,6 +192,7 @@
 - **M3 第七十二切片**：MCP resources/prompts（list/read/get、模板、agent tool、CLI/RPC、Settings inspect、分页与只读重连）。
 - **M3 第七十三切片**：opt-in memory retention policy（per-project max items/max age、daemon sweep、CLI/Manage Dash、校验与测试）。
 - **M3 第七十四切片**：priority-aware session admission + Worker/Labour capacity（-100..100、priority queue、session/project tie-break、CLI/UI、测试）；见 ADR-0079。
+- **M3 第七十五切片**：macOS 本地系统通知（后台发送、点击跳转 session、权限请求、Settings 开关/状态）。
 
 ## 如何运行
 

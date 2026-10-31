@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UserNotifications
 
 struct SettingsView: View {
     @Environment(BrandStore.self) private var brand
@@ -15,6 +16,8 @@ struct SettingsView: View {
                 .tabItem { Label("Providers", systemImage: "network") }
             McpSettingsView()
                 .tabItem { Label("MCP", systemImage: "puzzlepiece.extension") }
+            NotificationsSettingsView()
+                .tabItem { Label("Notifications", systemImage: "bell") }
             AboutSettingsView()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
@@ -531,6 +534,73 @@ private struct RoleModelRow: View {
                 config[keyPath: keyPath] = trimmed.isEmpty ? nil : Double(trimmed)
             }
         )
+    }
+}
+
+struct NotificationsSettingsView: View {
+    @AppStorage(SystemNotificationPreference.key) private var enabled = true
+    @State private var authorization = "Not requested"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("macOS notifications")
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                Text(
+                    "Approvals, task failures, integration failures, and stopped sessions can also appear as local notifications while VerlinPark is in the background."
+                )
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            }
+            Toggle("Send system notifications", isOn: $enabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+            HStack(spacing: 10) {
+                Text("Permission: \(authorization)")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Button("Request permission") {
+                    Task {
+                        SystemNotifier.shared.requestAuthorization()
+                        try? await Task.sleep(for: .milliseconds(500))
+                        await refreshAuthorization()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Button("Open System Settings") {
+                    if let url = URL(
+                        string: "x-apple.systempreferences:com.apple.preference.notifications"
+                    ) {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            Text(
+                "The in-app Rail always records notifications. System notifications are suppressed while the app is active and are deduplicated by the same notice id."
+            )
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundStyle(.tertiary)
+            Spacer()
+        }
+        .padding(22)
+        .task {
+            await refreshAuthorization()
+        }
+    }
+
+    private func refreshAuthorization() async {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        authorization = switch settings.authorizationStatus {
+        case .authorized: "authorized"
+        case .denied: "denied"
+        case .notDetermined: "not determined"
+        case .provisional: "provisional"
+        case .ephemeral: "ephemeral"
+        @unknown default: "unknown"
+        }
     }
 }
 
