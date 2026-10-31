@@ -8999,7 +8999,7 @@ mod tests {
             |event| event.kind == "integrator.finished" && event.payload["status"] == "merged"
         ));
         let sessions = engine
-            .list_sessions(Some(session.project_id))
+            .list_sessions(Some(session.project_id.clone()))
             .await
             .unwrap();
         assert_eq!(sessions[0].status, "idle");
@@ -10832,18 +10832,43 @@ mod tests {
             .await
             .unwrap();
         service.start(&session.id, "deliberate").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(600)).await;
-
-        let agents = engine.list_agents(&session.id).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (agents, events, sessions) = loop {
+            let agents = engine.list_agents(&session.id).await.unwrap();
+            let managers = agents
+                .iter()
+                .filter(|agent| agent.role == "manager")
+                .count();
+            let events = engine
+                .list_events(session.id.clone(), 0, 400)
+                .await
+                .unwrap();
+            let positions = events
+                .iter()
+                .filter(|event| event.kind == "manager.roundtable")
+                .count();
+            let finished = events.iter().any(|event| {
+                event.kind == "agent.message" && event.payload["text"] == "deliberation complete"
+            });
+            let sessions = engine
+                .list_sessions(Some(session.project_id.clone()))
+                .await
+                .unwrap();
+            if managers >= 2 && positions >= 4 && finished && sessions[0].status == "idle" {
+                break (agents, events, sessions);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "roundtable did not complete: managers={managers}, positions={positions}, finished={finished}, status={}",
+                sessions[0].status
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         let managers = agents
             .iter()
             .filter(|agent| agent.role == "manager")
             .collect::<Vec<_>>();
         assert_eq!(managers.len(), 2);
-        let events = engine
-            .list_events(session.id.clone(), 0, 400)
-            .await
-            .unwrap();
         let positions = events
             .iter()
             .filter(|event| event.kind == "manager.roundtable")
@@ -10863,10 +10888,6 @@ mod tests {
             !events.iter().any(|event| event.kind == "plan_task.started"),
             "deliberation should not execute plan tasks"
         );
-        let sessions = engine
-            .list_sessions(Some(session.project_id))
-            .await
-            .unwrap();
         assert_eq!(sessions[0].status, "idle");
     }
 
@@ -11859,7 +11880,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(question.question, "Proceed with the migration?");
-        let sessions = engine.list_sessions(Some(project.id)).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let sessions = loop {
+            let sessions = engine
+                .list_sessions(Some(project.id.clone()))
+                .await
+                .unwrap();
+            if sessions[0].status == "waiting_input" {
+                break sessions;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session did not enter waiting_input: {}",
+                sessions[0].status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
         assert_eq!(sessions[0].status, "waiting_input");
         assert!(engine.answer_question(&question.id, "yes").await.unwrap());
 
