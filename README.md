@@ -165,6 +165,8 @@ just cli cleanup-worktrees <project-id> --older-than-days 7 --dry-run --keep-fai
 just cli worktree-policy <project-id>
 just cli worktree-policy-set <project-id> --enabled --older-than-days 7 --drop-failed
 just cli resume-plan <session-id>
+just cli db-rebuild --dry-run
+just cli db-rebuild
 just cli project-budget <project-id>
 just cli project-budget-set <project-id> --token-budget 500000 --cost-budget-usd 5
 just cli doctor

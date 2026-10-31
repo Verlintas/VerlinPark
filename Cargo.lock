@@ -2127,6 +2127,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+ "vp-core",
  "vp-protocol",
  "vp-store",
 ]
@@ -2145,6 +2146,7 @@ dependencies = [
  "libc",
  "regex",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -2213,6 +2215,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

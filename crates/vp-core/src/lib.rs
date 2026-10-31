@@ -26,6 +26,9 @@ use crate::budget::BudgetRegistry;
 
 pub mod agent;
 pub mod budget;
+pub mod rebuild;
+
+pub use rebuild::rebuild_database;
 pub mod tools;
 pub mod worktree;
 
@@ -369,6 +372,11 @@ impl Engine {
             "project_id": session.project_id,
             "worktree": session.worktree,
             "branch": session.branch,
+            "token_budget": session.token_budget,
+            "cost_budget_usd": session.cost_budget_usd,
+            "time_budget_secs": session.time_budget_secs,
+            "base_commit": session.base_commit,
+            "created_at": session.created_at,
         });
         let _ = self
             .append_event(&session.id, "session.created", payload)
@@ -1243,6 +1251,11 @@ impl Engine {
         })
         .await??;
         self.get_project_budget(project_id).await
+    }
+
+    pub async fn record_project_manifest(&self) -> Result<()> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.record_project_manifest()).await?
     }
 
     pub async fn project_usage_report(&self, project_id: &str) -> Result<ProjectUsageResult> {

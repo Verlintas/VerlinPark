@@ -94,6 +94,9 @@ async fn main() -> Result<()> {
             "marked sessions interrupted by the previous daemon as failed"
         );
     }
+    if let Err(error) = engine.record_project_manifest().await {
+        tracing::warn!(%error, "failed to write project manifest");
+    }
     let agent = AgentService::from_env(engine.clone());
     let token = generate_token();
     let started_at = now_rfc3339();
@@ -338,7 +341,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
 async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
     let id = request.id.clone();
-    match request.method.as_str() {
+    let method = request.method.clone();
+    let response = match request.method.as_str() {
         "ping" => RpcResponse::success(
             id,
             PingResult {
@@ -1037,7 +1041,22 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             id,
             RpcError::new(codes::METHOD_NOT_FOUND, "method not found"),
         ),
+    };
+    if matches!(
+        method.as_str(),
+        "project.add"
+            | "project.shell_policy.set"
+            | "project.integration_policy.set"
+            | "project.budget.set"
+            | "project.worktree_policy.set"
+            | "mailbox.policy.set"
+            | "artifact.policy.set"
+            | "session.import"
+    ) && let Err(error) = state.engine.record_project_manifest().await
+    {
+        tracing::warn!(%error, "failed to update project manifest");
     }
+    response
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> std::result::Result<T, RpcError> {

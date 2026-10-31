@@ -28,6 +28,15 @@ enum Command {
     Info,
     /// Run local diagnostics.
     Doctor,
+    /// Rebuild the metadata database from the project manifest and event mirrors.
+    DbRebuild {
+        /// Validate and report without moving the database.
+        #[arg(long)]
+        dry_run: bool,
+        /// Proceed even if a daemon discovery file exists.
+        #[arg(long)]
+        force: bool,
+    },
     /// Send a tiny live request to the configured provider.
     ProviderTest,
     /// List projects.
@@ -278,8 +287,26 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::DbRebuild { dry_run, force } = &cli.command {
+        let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
+        if data_dir.join("run/daemon.json").exists() && !force {
+            bail!(
+                "daemon discovery file exists at {}; stop the daemon or pass --force",
+                data_dir.join("run/daemon.json").display()
+            );
+        }
+        let report = vp_core::rebuild_database(&data_dir, *dry_run).await?;
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_human(&value);
+        }
+        return Ok(());
+    }
     let discovery = read_discovery(cli.data_dir.as_deref())?;
     let value = match cli.command {
+        Command::DbRebuild { .. } => unreachable!("db rebuild is handled before discovery"),
         Command::Ping => {
             let result = rpc(&discovery, "ping", json!({})).await?;
             if cli.json {
@@ -1021,6 +1048,24 @@ fn print_human(value: &Value) {
             value["artifact_id"].as_str().unwrap_or("?"),
             value["path"].as_str().unwrap_or("?")
         );
+        return;
+    }
+    if value.get("dry_run").is_some() && value.get("projects").is_some() {
+        println!(
+            "db rebuild{}: projects={} sessions={} events={} backup={}",
+            if value["dry_run"].as_bool().unwrap_or(false) {
+                " (dry run)"
+            } else {
+                ""
+            },
+            value["projects"].as_u64().unwrap_or(0),
+            value["sessions"].as_u64().unwrap_or(0),
+            value["events"].as_u64().unwrap_or(0),
+            value["backup"].as_str().unwrap_or("none")
+        );
+        for warning in value["skipped"].as_array().into_iter().flatten() {
+            println!("  skipped: {}", warning.as_str().unwrap_or("?"));
+        }
         return;
     }
     if let Some(started) = value.get("started").and_then(Value::as_bool) {

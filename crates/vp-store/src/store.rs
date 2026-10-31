@@ -1,10 +1,11 @@
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
@@ -34,6 +35,46 @@ pub struct SessionRepair {
     pub artifacts: Option<Vec<Artifact>>,
     pub approvals: Option<Vec<Approval>>,
     pub artifact_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectManifestSnapshot {
+    pub version: u32,
+    pub recorded_at: String,
+    pub project: Project,
+    pub shell_policy: ShellPolicy,
+    pub integration_policy: IntegrationPolicy,
+    pub artifact_policy: ArtifactPolicy,
+    pub mailbox_policy: MailboxPolicy,
+    pub worktree_policy: WorktreeRetentionPolicy,
+    pub budget: ProjectBudget,
+}
+
+/// Read the latest project snapshot for each project from `projects.jsonl`.
+pub fn read_project_manifest(data_dir: &Path) -> Result<Vec<ProjectManifestSnapshot>> {
+    let path = data_dir.join("projects.jsonl");
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("opening project manifest {}", path.display()));
+        }
+    };
+    let mut latest: std::collections::HashMap<String, ProjectManifestSnapshot> =
+        std::collections::HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let snapshot: ProjectManifestSnapshot =
+            serde_json::from_str(&line).context("parsing project manifest snapshot")?;
+        latest.insert(snapshot.project.id.clone(), snapshot);
+    }
+    let mut snapshots = latest.into_values().collect::<Vec<_>>();
+    snapshots.sort_by(|left, right| left.project.created_at.cmp(&right.project.created_at));
+    Ok(snapshots)
 }
 
 /// SQLite-backed metadata store plus an append-only JSONL event mirror.
@@ -442,6 +483,83 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Append a full project/policy snapshot to `projects.jsonl`. The latest
+    /// line per project is used by `read_project_manifest` for rebuilds.
+    pub fn record_project_manifest(&self) -> Result<()> {
+        let projects = self.list_projects()?;
+        if projects.is_empty() {
+            return Ok(());
+        }
+        let path = self.data_dir.join("projects.jsonl");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening project manifest {}", path.display()))?;
+        for project in projects {
+            let snapshot = ProjectManifestSnapshot {
+                version: 1,
+                recorded_at: now_rfc3339(),
+                shell_policy: self.get_shell_policy(&project.id)?,
+                integration_policy: self.get_integration_policy(&project.id)?,
+                artifact_policy: self.get_artifact_policy(&project.id)?,
+                mailbox_policy: self.get_mailbox_policy(&project.id)?,
+                worktree_policy: self.get_worktree_policy(&project.id)?,
+                budget: self.get_project_budget(&project.id)?,
+                project,
+            };
+            serde_json::to_writer(&mut file, &snapshot)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        paths::ensure_private_file(&path)?;
+        Ok(())
+    }
+
+    pub fn insert_project_snapshot(&self, project: &Project) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO projects (id, name, root, default_branch, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                project.id,
+                project.name,
+                project.root,
+                project.default_branch,
+                project.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_session_snapshot(&self, session: &Session) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO sessions
+             (id, project_id, goal, status, worktree, branch, token_budget,
+              cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit,
+              team_plan, tokens_in, tokens_out, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14)",
+            params![
+                session.id,
+                session.project_id,
+                session.goal,
+                session.status,
+                session.worktree,
+                session.branch,
+                session.token_budget,
+                session.cost_budget_usd,
+                session.time_budget_secs,
+                session.cost_spent_usd,
+                session.base_commit,
+                session.tokens_in as i64,
+                session.tokens_out as i64,
+                session.created_at
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn get_shell_policy(&self, project_id: &str) -> Result<ShellPolicy> {
@@ -4122,6 +4240,50 @@ mod tests {
             )
             .unwrap();
         assert!(store.list_enabled_worktree_policies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn records_and_reads_the_latest_project_manifest_snapshot() {
+        let (data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        store
+            .set_shell_policy(
+                &project.id,
+                &ShellPolicy {
+                    network: "deny".into(),
+                    read_deny: vec!["~/secret".into()],
+                },
+            )
+            .unwrap();
+        store
+            .set_project_budget(
+                &project.id,
+                &ProjectBudget {
+                    token_budget: Some(1234),
+                    cost_budget_usd: Some(2.5),
+                },
+            )
+            .unwrap();
+        store.record_project_manifest().unwrap();
+        store
+            .set_shell_policy(
+                &project.id,
+                &ShellPolicy {
+                    network: "allow".into(),
+                    read_deny: Vec::new(),
+                },
+            )
+            .unwrap();
+        store.record_project_manifest().unwrap();
+
+        let snapshots = read_project_manifest(data.path()).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].project.id, project.id);
+        assert_eq!(snapshots[0].shell_policy.network, "allow");
+        assert_eq!(snapshots[0].budget.token_budget, Some(1234));
+        assert_eq!(snapshots[0].budget.cost_budget_usd, Some(2.5));
     }
 
     #[test]

@@ -81,6 +81,7 @@
 | [0069](adr/0069-worktree-retention-policy.md) | Opt-in worktree retention policy | Accepted | 运维/磁盘 |
 | [0070](adr/0070-resumable-team-plan.md) | Resumable TeamPlan execution | Accepted | 调度/恢复 |
 | [0071](adr/0071-provider-idle-timeout.md) | Provider stream idle timeout | Accepted | Provider/可靠性 |
+| [0072](adr/0072-database-rebuild.md) | Database rebuild from manifests and event mirrors | Accepted | 恢复/事件溯源 |
 
 ---
 
