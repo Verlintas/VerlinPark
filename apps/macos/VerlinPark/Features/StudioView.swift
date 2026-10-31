@@ -818,6 +818,8 @@ struct PreviewPanelView: View {
                     changes
                 case .plan:
                     plan
+                case .files:
+                    FilesPanel()
                 case .queue:
                     queue
                 case .mailbox:
@@ -841,10 +843,18 @@ struct PreviewPanelView: View {
             if model.consoleID != nil {
                 await model.closeConsole()
             }
+            if mode == .files {
+                await model.loadWorkspaceTree()
+            }
             if model.selectedSessionID != nil {
                 await model.loadDiff()
                 await model.loadMailbox()
                 await model.loadUsage()
+            }
+        }
+        .task(id: mode) {
+            if mode == .files {
+                await model.loadWorkspaceTree()
             }
         }
         .alert("Commit worktree", isPresented: $showingCommit) {
@@ -959,6 +969,9 @@ struct PreviewPanelView: View {
                 Button {
                     Task {
                         switch mode {
+                        case .files:
+                            await model.loadWorkspaceTree()
+                            await model.reloadWorkspaceFile()
                         case .queue:
                             await model.loadMergeQueue()
                         case .mailbox:
@@ -977,7 +990,8 @@ struct PreviewPanelView: View {
                 }
                 .buttonStyle(.plain)
                 .help(
-                    mode == .queue ? "Refresh queue" : mode == .mailbox ? "Refresh mailbox" :
+                    mode == .files ? "Refresh files" :
+                        mode == .queue ? "Refresh queue" : mode == .mailbox ? "Refresh mailbox" :
                         mode == .cost ? "Refresh usage" :
                         mode == .console ? "Refresh console" : "Refresh diff"
                 )
@@ -1696,6 +1710,7 @@ private struct UsageEntryRow: View {
 private enum PreviewMode: String, CaseIterable, Identifiable {
     case changes
     case plan
+    case files
     case queue
     case mailbox
     case cost
@@ -1710,12 +1725,170 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         switch self {
         case .changes: "Changes"
         case .plan: "Plan"
+        case .files: "Files"
         case .queue: "Queue"
         case .mailbox: "Mailbox"
         case .cost: "Cost"
         case .console: "Console"
         case .trace: "Trace"
         }
+    }
+}
+
+private struct FilesPanel: View {
+    @Environment(AppModel.self) private var model
+
+    private var filteredEntries: [WorkspaceEntry] {
+        let filter = model.workspaceFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.workspaceEntries.filter { entry in
+            guard !entry.isDirectory else { return false }
+            guard !filter.isEmpty else { return true }
+            return entry.path.localizedCaseInsensitiveContains(filter)
+                || entry.name.localizedCaseInsensitiveContains(filter)
+        }
+    }
+
+    var body: some View {
+        @Bindable var model = model
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 6) {
+                    TextField("Filter files", text: $model.workspaceFilter)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                    if model.workspaceTreeBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                .padding(8)
+                Divider().opacity(0.3)
+                if let error = model.workspaceTreeError {
+                    Text(error)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .padding(8)
+                }
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(filteredEntries) { entry in
+                            Button {
+                                Task { await model.openWorkspaceFile(entry) }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "doc.text")
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(.secondary)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(entry.name)
+                                            .font(.system(size: 10, weight: .medium))
+                                            .lineLimit(1)
+                                        Text(entry.path)
+                                            .font(.system(size: 7, design: .monospaced))
+                                            .foregroundStyle(.tertiary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Text(formatSize(entry.size))
+                                        .font(.system(size: 7, design: .monospaced))
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(
+                                    model.workspaceSelectedPath == entry.path
+                                        ? Color.accentColor.opacity(0.16) : Color.clear
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                if filteredEntries.isEmpty {
+                    Text(
+                        model.workspaceTreeBusy
+                            ? "Loading files…"
+                            : "No files match the filter."
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(10)
+                }
+            }
+            .frame(width: 280)
+            Divider().opacity(0.3)
+            VStack(alignment: .leading, spacing: 0) {
+                if let file = model.workspaceFile {
+                    HStack(spacing: 8) {
+                        Image(systemName: file.binary ? "doc.zipper" : "doc.text")
+                            .font(.system(size: 10))
+                        Text(file.path)
+                            .font(.system(size: 10, design: .monospaced))
+                            .lineLimit(1)
+                        if file.binary {
+                            Text("binary")
+                                .font(.system(size: 7, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(.orange.opacity(0.12), in: Capsule())
+                        }
+                        if file.truncated {
+                            Text("truncated")
+                                .font(.system(size: 7, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.yellow)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(.yellow.opacity(0.12), in: Capsule())
+                        }
+                        Spacer()
+                        Text(formatSize(file.size))
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(10)
+                    Divider().opacity(0.3)
+                    if let error = model.workspaceFileError {
+                        Text(error)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.orange)
+                            .padding(10)
+                    }
+                    TextEditor(text: .constant(file.content))
+                        .font(.system(size: 10, design: .monospaced))
+                        .scrollContentBackground(.hidden)
+                        .disabled(model.workspaceFileBusy)
+                        .padding(6)
+                } else {
+                    VStack(spacing: 8) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 24))
+                            .foregroundStyle(.secondary)
+                        Text(
+                            model.workspaceTreeBusy
+                                ? "Loading session files…"
+                                : "Select a file to inspect the session worktree."
+                        )
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        if model.workspaceFileBusy {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+        }
+    }
+
+    private func formatSize(_ bytes: UInt64) -> String {
+        if bytes < 1024 {
+            return "\(bytes) B"
+        }
+        if bytes < 1024 * 1024 {
+            return String(format: "%.1f KB", Double(bytes) / 1024)
+        }
+        return String(format: "%.1f MB", Double(bytes) / 1024 / 1024)
     }
 }
 

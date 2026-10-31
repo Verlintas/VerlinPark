@@ -95,6 +95,15 @@ final class AppModel {
     var memoryQuery = ""
     var memoryBusy = false
     var memoryStatus: String?
+    var workspaceEntries: [WorkspaceEntry] = []
+    var workspaceTreeBusy = false
+    var workspaceTreeError: String?
+    var workspaceFilter = ""
+    var workspaceSelectedPath: String?
+    var workspaceFile: WorkspaceFileResult?
+    var workspaceFileBusy = false
+    var workspaceFileError: String?
+    var workspaceSessionID: String?
     var consoleID: String?
     var consoleWorktree = ""
     var consoleOutput = ""
@@ -1004,6 +1013,62 @@ final class AppModel {
         memoryPolicyEnabled = policy.enabled
         memoryPolicyMaxItems = policy.maxItems.map(String.init) ?? ""
         memoryPolicyMaxAgeDays = policy.maxAgeDays.map(String.init) ?? ""
+    }
+
+    func loadWorkspaceTree() async {
+        guard let sessionID = selectedSessionID else {
+            workspaceEntries = []
+            workspaceSelectedPath = nil
+            workspaceFile = nil
+            workspaceSessionID = nil
+            return
+        }
+        let sessionChanged = workspaceSessionID != sessionID
+        workspaceSessionID = sessionID
+        if sessionChanged {
+            workspaceFilter = ""
+            workspaceSelectedPath = nil
+            workspaceFile = nil
+        }
+        workspaceTreeBusy = true
+        defer { workspaceTreeBusy = false }
+        do {
+            let result = try await core.workspaceTree(sessionID: sessionID)
+            guard sessionID == selectedSessionID else { return }
+            workspaceEntries = result.entries
+            workspaceTreeError = result.truncated ? "File list truncated to 5000 entries." : nil
+            if let selected = workspaceSelectedPath,
+               !result.entries.contains(where: { $0.path == selected && !$0.isDirectory })
+            {
+                workspaceSelectedPath = nil
+                workspaceFile = nil
+            }
+        } catch {
+            workspaceTreeError = error.localizedDescription
+        }
+    }
+
+    func openWorkspaceFile(_ entry: WorkspaceEntry) async {
+        guard !entry.isDirectory, let sessionID = selectedSessionID else { return }
+        workspaceSelectedPath = entry.path
+        workspaceFileBusy = true
+        workspaceFileError = nil
+        defer { workspaceFileBusy = false }
+        do {
+            let file = try await core.workspaceFile(sessionID: sessionID, path: entry.path)
+            guard sessionID == selectedSessionID else { return }
+            workspaceFile = file
+        } catch {
+            workspaceFile = nil
+            workspaceFileError = error.localizedDescription
+        }
+    }
+
+    func reloadWorkspaceFile() async {
+        guard let path = workspaceSelectedPath,
+              let entry = workspaceEntries.first(where: { $0.path == path })
+        else { return }
+        await openWorkspaceFile(entry)
     }
 
     func openConsole() async {

@@ -577,6 +577,22 @@ actor CoreClient {
             .decode(McpCallResult.self)
     }
 
+    func workspaceTree(sessionID: String) async throws -> WorkspaceTreeResult {
+        try await request(
+            method: "workspace.tree",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(WorkspaceTreeResult.self)
+    }
+
+    func workspaceFile(sessionID: String, path: String) async throws -> WorkspaceFileResult {
+        try await request(
+            method: "workspace.file",
+            params: ["session_id": .string(sessionID), "path": .string(path)]
+        )
+        .decode(WorkspaceFileResult.self)
+    }
+
     func openConsole(sessionID: String) async throws -> ConsoleOpenResult {
         try await request(
             method: "console.open",

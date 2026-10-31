@@ -184,6 +184,8 @@ just cli mcp-read-resource <server-id> file:///notes.md
 just cli mcp-prompts <server-id>
 just cli mcp-prompt <server-id> review --arg target=src/main.rs
 just cli console <session-id> "cargo test"
+just cli files <session-id>
+just cli file <session-id> src/main.rs
 just cli project-budget <project-id>
 just cli project-budget-set <project-id> --token-budget 500000 --cost-budget-usd 5
 just cli doctor

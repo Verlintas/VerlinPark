@@ -227,6 +227,41 @@ pub struct SessionPriorityResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceTreeParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceTreeResult {
+    pub root: String,
+    pub entries: Vec<WorkspaceEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceFileParams {
+    pub session_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceFileResult {
+    pub path: String,
+    pub size: u64,
+    pub truncated: bool,
+    pub binary: bool,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ConsoleOpenParams {
     pub session_id: String,
 }

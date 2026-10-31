@@ -181,6 +181,10 @@ enum Command {
     },
     /// Run one command in the session console under the shell sandbox.
     Console { session: String, command: String },
+    /// List files in a session worktree.
+    Files { session: String },
+    /// Show one session worktree file.
+    File { session: String, path: String },
     /// Search messages and event payloads across sessions.
     Search {
         query: String,
@@ -725,6 +729,17 @@ async fn main() -> Result<()> {
             )
             .await;
             json!({"console_streamed": true})
+        }
+        Command::Files { session } => {
+            rpc(&discovery, "workspace.tree", json!({"session_id": session})).await?
+        }
+        Command::File { session, path } => {
+            rpc(
+                &discovery,
+                "workspace.file",
+                json!({"session_id": session, "path": path}),
+            )
+            .await?
         }
         Command::Search {
             query,
@@ -1571,6 +1586,27 @@ fn print_human(value: &Value) {
             "question answered={}",
             value["answered"].as_bool().unwrap_or(false)
         );
+        return;
+    }
+    if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            println!(
+                "{:<4} {:>10}  {}",
+                entry["kind"].as_str().unwrap_or("?"),
+                entry["size"].as_u64().unwrap_or(0),
+                entry["path"].as_str().unwrap_or("?")
+            );
+        }
+        if value["truncated"].as_bool().unwrap_or(false) {
+            println!("(truncated)");
+        }
+        return;
+    }
+    if let Some(content) = value.get("content").and_then(Value::as_str)
+        && value.get("size").is_some()
+        && value.get("binary").is_some()
+    {
+        print!("{content}");
         return;
     }
     if let Some(memories) = value.get("memories").and_then(Value::as_array) {

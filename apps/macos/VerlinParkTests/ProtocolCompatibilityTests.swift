@@ -184,6 +184,38 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertTrue(result.questions.first?.isPending == true)
     }
 
+    func testWorkspaceTreeAndFileDecode() throws {
+        let treeJSON = """
+        {
+          "root": "/tmp/worktree",
+          "entries": [
+            {"path": "src", "name": "src", "kind": "dir", "size": 0},
+            {"path": "src/main.rs", "name": "main.rs", "kind": "file", "size": 42}
+          ],
+          "truncated": false
+        }
+        """
+        let tree = try JSONDecoder().decode(WorkspaceTreeResult.self, from: Data(treeJSON.utf8))
+        XCTAssertEqual(tree.entries.count, 2)
+        XCTAssertTrue(tree.entries[0].isDirectory)
+        XCTAssertEqual(tree.entries[1].path, "src/main.rs")
+        XCTAssertEqual(tree.entries[1].size, 42)
+
+        let fileJSON = """
+        {
+          "path": "src/main.rs",
+          "size": 42,
+          "truncated": false,
+          "binary": false,
+          "content": "fn main() {}\\n"
+        }
+        """
+        let file = try JSONDecoder().decode(WorkspaceFileResult.self, from: Data(fileJSON.utf8))
+        XCTAssertEqual(file.path, "src/main.rs")
+        XCTAssertFalse(file.binary)
+        XCTAssertFalse(file.truncated)
+    }
+
     func testConsoleResultsDecode() throws {
         let opened = try JSONDecoder().decode(
             ConsoleOpenResult.self,

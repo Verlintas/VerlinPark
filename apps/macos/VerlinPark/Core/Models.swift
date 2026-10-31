@@ -1112,6 +1112,35 @@ extension Int {
     }
 }
 
+struct WorkspaceEntry: Codable, Identifiable, Hashable, Sendable {
+    let path: String
+    let name: String
+    let kind: String
+    let size: UInt64
+
+    var id: String {
+        path
+    }
+
+    var isDirectory: Bool {
+        kind == "dir"
+    }
+}
+
+struct WorkspaceTreeResult: Codable, Sendable {
+    let root: String
+    let entries: [WorkspaceEntry]
+    let truncated: Bool
+}
+
+struct WorkspaceFileResult: Codable, Sendable {
+    let path: String
+    let size: UInt64
+    let truncated: Bool
+    let binary: Bool
+    let content: String
+}
+
 struct ConsoleOpenResult: Codable, Sendable {
     let consoleId: String
     let worktree: String

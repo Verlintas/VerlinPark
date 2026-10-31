@@ -22,8 +22,9 @@ use vp_protocol::types::{
     SearchResult, Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult,
     SessionLandResult, SessionLogStatus, SessionRehydrateResult, SessionReplayReport,
     SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket,
-    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
-    WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
+    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
+    WorkspaceTreeResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
+    WorktreeRetentionPolicy,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -35,6 +36,7 @@ pub mod budget;
 pub mod console;
 pub mod mcp;
 pub mod rebuild;
+pub mod workspace;
 
 pub use rebuild::rebuild_database;
 pub mod tools;
@@ -4043,6 +4045,36 @@ impl Engine {
 
     pub async fn console_close(&self, console_id: &str) -> Result<ConsoleCloseResult> {
         self.consoles.close(console_id).await
+    }
+
+    pub async fn workspace_tree(&self, session_id: &str) -> Result<WorkspaceTreeResult> {
+        let root = self.workspace_root(session_id).await?;
+        tokio::task::spawn_blocking(move || workspace::tree(Path::new(&root))).await?
+    }
+
+    pub async fn workspace_file(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<WorkspaceFileResult> {
+        let root = self.workspace_root(session_id).await?;
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || workspace::read(Path::new(&root), &path)).await?
+    }
+
+    async fn workspace_root(&self, session_id: &str) -> Result<String> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let session = self.ensure_session_worktree(&session.id).await?;
+        session
+            .worktree
+            .ok_or_else(|| anyhow::anyhow!("session has no worktree"))
     }
 
     pub async fn list_questions(&self, session_id: Option<String>) -> Result<QuestionListResult> {
