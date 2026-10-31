@@ -13,8 +13,8 @@ use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
     ArtifactMaterialization, ArtifactPolicy, DoctorCheck, Event, IntegrationPolicy,
     MailboxGcResult, MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult,
-    PullRequestResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
-    SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
+    ProjectUsageResult, PullRequestResult, SearchResult, Session, SessionBundle, SessionCommit,
+    SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
     SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
     UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
     WorktreeCleanupResult,
@@ -1243,6 +1243,30 @@ impl Engine {
         })
         .await??;
         self.get_project_budget(project_id).await
+    }
+
+    pub async fn project_usage_report(&self, project_id: &str) -> Result<ProjectUsageResult> {
+        let store = self.store.clone();
+        let id = project_id.to_string();
+        let sessions = tokio::task::spawn_blocking(move || {
+            store
+                .get_project(&id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {id}"))?;
+            store.project_usage_by_session(&id)
+        })
+        .await??;
+        let mut totals = UsageTotals::default();
+        for session in &sessions {
+            totals.calls = totals.calls.saturating_add(session.calls);
+            totals.input_tokens = totals.input_tokens.saturating_add(session.input_tokens);
+            totals.output_tokens = totals.output_tokens.saturating_add(session.output_tokens);
+            totals.cost_usd += session.cost_usd;
+        }
+        Ok(ProjectUsageResult {
+            project_id: project_id.to_string(),
+            sessions,
+            totals,
+        })
     }
 
     pub async fn project_usage(&self, project_id: &str) -> Result<(u64, f64)> {
@@ -3729,6 +3753,49 @@ mod tests {
                 .iter()
                 .any(|hit| hit.session_id == session.id)
         );
+    }
+
+    #[tokio::test]
+    async fn reports_project_usage_by_session() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("usage report".into()),
+            )
+            .await
+            .unwrap();
+        let first = engine
+            .create_session(project.id.clone(), "first".into(), None)
+            .await
+            .unwrap();
+        let second = engine
+            .create_session(project.id.clone(), "second".into(), None)
+            .await
+            .unwrap();
+        engine
+            .record_agent_usage(
+                &first.id, "agent-1", "Worker", "worker", None, None, "model", 10, 5, false, 0.5,
+            )
+            .await
+            .unwrap();
+        engine
+            .record_agent_usage(
+                &second.id, "agent-2", "Leader", "leader", None, None, "model", 3, 1, false, 0.1,
+            )
+            .await
+            .unwrap();
+
+        let report = engine.project_usage_report(&project.id).await.unwrap();
+        assert_eq!(report.sessions.len(), 2);
+        assert_eq!(report.totals.calls, 2);
+        assert_eq!(report.totals.input_tokens, 13);
+        assert_eq!(report.totals.output_tokens, 6);
+        assert!((report.totals.cost_usd - 0.6).abs() < 1e-9);
+        assert!(engine.project_usage_report("missing").await.is_err());
     }
 
     #[tokio::test]

@@ -466,6 +466,12 @@ actor CoreClient {
             .decode(UsageLedgerResult.self)
     }
 
+    func projectUsage(projectID: String) async throws -> ProjectUsageResult {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "project.usage", params: params)
+            .decode(ProjectUsageResult.self)
+    }
+
     func usageCsv(sessionID: String) async throws -> UsageCsvResult {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.usage_csv", params: params)

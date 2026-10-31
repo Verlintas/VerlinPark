@@ -170,6 +170,7 @@ just cask
 just cli search "rate limit" --project <project-id>
 just cli transcript <session-id>
 just cli usage <session-id> --csv
+just cli project-usage <project-id>
 just cli artifact-policy <project-id>
 just cli artifact-policy-set <project-id> --max-count 20 --auto-gc
 just cli gc <project-id>

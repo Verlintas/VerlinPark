@@ -61,6 +61,46 @@ struct ArtifactPolicy: Codable, Hashable, Sendable {
     }
 }
 
+struct ProjectUsageSession: Codable, Identifiable, Sendable {
+    let sessionId: String
+    let goal: String
+    let status: String
+    let calls: Int
+    let inputTokens: Int
+    let outputTokens: Int
+    let costUsd: Double
+
+    var id: String {
+        sessionId
+    }
+
+    var totalTokens: Int {
+        inputTokens + outputTokens
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case goal
+        case status
+        case calls
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case costUsd = "cost_usd"
+    }
+}
+
+struct ProjectUsageResult: Codable, Sendable {
+    let projectId: String
+    let sessions: [ProjectUsageSession]
+    let totals: UsageTotals
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case sessions
+        case totals
+    }
+}
+
 struct UsageCsvResult: Codable, Sendable {
     let sessionId: String
     let csv: String

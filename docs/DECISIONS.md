@@ -77,6 +77,7 @@
 | [0065](adr/0065-plan-batch-abort.md) | Plan batch abort settlement | Accepted | 调度/一致性 |
 | [0066](adr/0066-usage-csv.md) | Usage CSV export | Accepted | 成本/导出 |
 | [0067](adr/0067-homebrew-cask.md) | Generated Homebrew cask | Accepted | 分发 |
+| [0068](adr/0068-project-usage-report.md) | Project usage report | Accepted | 成本/可观测性 |
 
 ---
 

@@ -40,6 +40,8 @@ enum Command {
     },
     /// Show the project-wide shared budget and spend.
     ProjectBudget { project: String },
+    /// Show token/cost usage grouped by session for a project.
+    ProjectUsage { project: String },
     /// Set or clear the project-wide shared budget.
     ProjectBudgetSet {
         project: String,
@@ -293,6 +295,9 @@ async fn main() -> Result<()> {
                 json!({"project_id": project}),
             )
             .await?
+        }
+        Command::ProjectUsage { project } => {
+            rpc(&discovery, "project.usage", json!({"project_id": project})).await?
         }
         Command::ProjectBudgetSet {
             project,
@@ -792,6 +797,32 @@ fn print_human(value: &Value) {
         }
         if value["truncated"].as_bool().unwrap_or(false) {
             println!("… more matches exist; increase --limit or narrow the query.");
+        }
+        return;
+    }
+    if let Some(sessions) = value.get("sessions").and_then(Value::as_array)
+        && value.get("project_id").is_some()
+        && let Some(totals) = value.get("totals")
+    {
+        println!(
+            "project {}  sessions={}  calls={}  in={}  out={}  cost=${:.4}",
+            value["project_id"].as_str().unwrap_or("?"),
+            sessions.len(),
+            totals["calls"].as_u64().unwrap_or(0),
+            totals["input_tokens"].as_u64().unwrap_or(0),
+            totals["output_tokens"].as_u64().unwrap_or(0),
+            totals["cost_usd"].as_f64().unwrap_or(0.0)
+        );
+        for session in sessions {
+            println!(
+                "  {:<10} calls={:<4} in={:<8} out={:<8} ${:.4}  {}",
+                session["status"].as_str().unwrap_or("?"),
+                session["calls"].as_u64().unwrap_or(0),
+                session["input_tokens"].as_u64().unwrap_or(0),
+                session["output_tokens"].as_u64().unwrap_or(0),
+                session["cost_usd"].as_f64().unwrap_or(0.0),
+                session["goal"].as_str().unwrap_or("?")
+            );
         }
         return;
     }

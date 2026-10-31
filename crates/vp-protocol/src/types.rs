@@ -594,6 +594,29 @@ pub struct SetProjectBudgetParams {
     pub budget: ProjectBudget,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectUsageParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectUsageSession {
+    pub session_id: String,
+    pub goal: String,
+    pub status: String,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectUsageResult {
+    pub project_id: String,
+    pub sessions: Vec<ProjectUsageSession>,
+    pub totals: UsageTotals,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectBudgetResult {
     pub project_id: String,

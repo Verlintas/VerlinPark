@@ -67,6 +67,39 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertNil(hit.role)
     }
 
+    func testProjectUsageResultDecodes() throws {
+        let json = """
+        {
+          "project_id": "project-1",
+          "sessions": [
+            {
+              "session_id": "session-1",
+              "goal": "ship it",
+              "status": "idle",
+              "calls": 2,
+              "input_tokens": 10,
+              "output_tokens": 5,
+              "cost_usd": 0.25
+            }
+          ],
+          "totals": {
+            "calls": 2,
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cost_usd": 0.25,
+            "by_role": [],
+            "by_model": [],
+            "by_agent": [],
+            "by_task": []
+          }
+        }
+        """
+        let result = try JSONDecoder().decode(ProjectUsageResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.projectId, "project-1")
+        XCTAssertEqual(result.sessions.first?.totalTokens, 15)
+        XCTAssertEqual(result.totals.calls, 2)
+    }
+
     func testUsageCsvResultDecodes() throws {
         let json = """
         {

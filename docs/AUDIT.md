@@ -18,7 +18,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、worktree/scratch 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 119（core 94 / store 17 / providers 8），Swift 14。CI 以最新提交为准。
+当前测试：Rust 121（core 95 / store 18 / providers 8），Swift 15。CI 以最新提交为准。
 
 ### 0.1 2026-10-31 跟进
 
@@ -31,6 +31,8 @@
 - P2-10 已修复：Collab 新增 Manager roundtable 卡片，按轮次显示 title/profile/position。
 - 新增 `session.usage_csv` / `vp usage --csv` / Preview Export CSV。
 - 新增 Homebrew cask 生成脚本和 release asset（`just cask`），仍不是 tap。
+- 新增 `project.usage` / `vp project-usage` / Manage Dash 按 session 用量汇总。
+- 新增 Manage Dash 跨 project pending approvals 卡片，可直接 Approve/Deny。
 
 ---
 
@@ -58,9 +60,9 @@
 | 功能完整度（M3） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、显式/opt-in 自动冲突解决、本地 landing、`gh` PR、mailbox/artifacts/replay、search/transcript 已有；缺 default-on auto-resolution、global Task-DAG scheduler |
 | 正确性/一致性 | B | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影；从零数据库重建仍未完成 |
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
-| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable 卡片可用；更早的 round 仍受已加载 event window 限制 |
+| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage 可用；更早的 round 仍受已加载 event window 限制 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
-| 测试 | B− | 119 Rust + 14 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/search/transcript/preview/plan batch abort/usage CSV/HTTP probe 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 121 Rust + 15 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/search/transcript/preview/plan batch abort/usage CSV/project usage/HTTP probe 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | C | `just package` 生成 ad-hoc signed DMG + checksum，release workflow 同时生成并上传 Homebrew cask；仍无 Developer ID/公证、更新器和可持续升级的 Homebrew tap |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -252,7 +254,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 119 个 Rust 测试 + 14 个 Swift 测试，覆盖 Leader loop、provider probe/retry、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、usage CSV、OpenAI-compatible HTTP probe。仍缺：
+已有 121 个 Rust 测试 + 15 个 Swift 测试，覆盖 Leader loop、provider probe/retry、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、usage CSV、project usage、OpenAI-compatible HTTP probe。仍缺：
 
 - 并发预算超调上界与预算 abort 的 sibling 结算（当前只测取消 abort）
 - 非 GitHub PR adapter / 默认自动冲突解决策略 / 真正的 post-merge 集成分支
@@ -356,7 +358,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 119 passed after the 10-31 batch-abort/roundtable/CSV slice
+cargo test --workspace     # 121 passed after the 10-31 project-usage/approval-center slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

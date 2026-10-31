@@ -65,6 +65,10 @@ struct DashboardView: View {
                 }
                 .padding(18)
 
+                ApprovalCenterCard()
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 12)
+
                 if let project = model.selectedProject {
                     ShellPolicyCard(project: project)
                         .padding(.horizontal, 18)
@@ -73,6 +77,9 @@ struct DashboardView: View {
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
                     ProjectBudgetCard(project: project)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
+                    ProjectUsageCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
                     DoctorCard()
@@ -704,5 +711,222 @@ private struct WorktreeCleanupCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+    }
+}
+
+private struct ProjectUsageCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Usage by session")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.projectUsageBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task { await model.loadProjectUsage() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.projectUsageBusy)
+            }
+            if let usage = model.projectUsage {
+                HStack(spacing: 14) {
+                    usageMetric("Calls", "\(usage.totals.calls)")
+                    usageMetric(
+                        "Tokens",
+                        "\(usage.totals.inputTokens + usage.totals.outputTokens)"
+                    )
+                    usageMetric("Cost", String(format: "$%.4f", usage.totals.costUsd))
+                    Spacer()
+                    Text("\(usage.sessions.count) sessions")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                if usage.sessions.isEmpty {
+                    Text("No sessions yet.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(Array(usage.sessions.prefix(8))) { session in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text(session.status.uppercased())
+                                .font(.system(size: 8, weight: .medium, design: .monospaced))
+                                .foregroundStyle(color(for: session.status))
+                                .frame(width: 62, alignment: .leading)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(session.goal)
+                                    .font(.system(size: 9, weight: .medium))
+                                    .lineLimit(1)
+                                Text(
+                                    "calls \(session.calls) · tokens \(session.totalTokens) · $"
+                                        + String(format: "%.4f", session.costUsd)
+                                )
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                    }
+                    if usage.sessions.count > 8 {
+                        Text(
+                            "… and \(usage.sessions.count - 8) more sessions. Use `vp project-usage` for the full list."
+                        )
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    }
+                }
+            } else if let status = model.projectUsageStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private func usageMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+        }
+    }
+
+    private func color(for status: String) -> Color {
+        switch status {
+        case "idle", "completed": .green
+        case "running", "queued", "paused": .orange
+        case "failed", "cancelled": .red
+        default: .secondary
+        }
+    }
+}
+
+private struct ApprovalCenterCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Approvals")
+                    Text("Pending across projects")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.approvalCenterBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Text("\(model.pendingApprovals.count) pending")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Button("Refresh") {
+                    Task { await model.loadPendingApprovals() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.approvalCenterBusy)
+            }
+            if model.pendingApprovals.isEmpty {
+                Text(model.approvalCenterStatus ?? "No pending approvals.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.pendingApprovals) { approval in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 6) {
+                            Text(approval.tool.uppercased())
+                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(.orange.opacity(0.1), in: Capsule())
+                            Text(approval.agentName ?? approval.agentRole ?? "agent")
+                                .font(.system(size: 9, weight: .medium))
+                            if let title = approval.agentTitle {
+                                Text("· \(title)")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Spacer()
+                            Text(
+                                model.approvalSessionGoals[approval.sessionId]
+                                    ?? String(approval.sessionId.prefix(8))
+                            )
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                        }
+                        Text(inputSummary(approval))
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                            .textSelection(.enabled)
+                        HStack(spacing: 6) {
+                            Button("Approve") {
+                                Task {
+                                    await model.resolveGlobalApproval(approval.id, approved: true)
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .tint(.green)
+                            .disabled(model.approvalCenterBusy)
+                            Button("Deny") {
+                                Task {
+                                    await model.resolveGlobalApproval(approval.id, approved: false)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(model.approvalCenterBusy)
+                        }
+                    }
+                    .padding(9)
+                    .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task {
+            await model.loadPendingApprovals()
+        }
+    }
+
+    private func inputSummary(_ approval: Approval) -> String {
+        let object = approval.input.objectValue
+        if let command = object?["command"]?.stringValue {
+            return command
+        }
+        if let path = object?["path"]?.stringValue {
+            return path
+        }
+        if let url = object?["url"]?.stringValue {
+            return url
+        }
+        return approval.tool
     }
 }

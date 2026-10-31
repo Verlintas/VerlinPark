@@ -67,6 +67,13 @@ final class AppModel {
     var projectBudget = ProjectBudget.empty
     var projectSpentTokens = 0
     var projectSpentCostUsd = 0.0
+    var projectUsage: ProjectUsageResult?
+    var projectUsageBusy = false
+    var projectUsageStatus: String?
+    var pendingApprovals: [Approval] = []
+    var approvalSessionGoals: [String: String] = [:]
+    var approvalCenterBusy = false
+    var approvalCenterStatus: String?
     var projectTokenBudgetText = ""
     var projectCostBudgetText = ""
     var projectBudgetBusy = false
@@ -241,6 +248,8 @@ final class AppModel {
             projectTokenBudgetText = ""
             projectCostBudgetText = ""
             projectBudgetStatus = nil
+            projectUsage = nil
+            projectUsageStatus = nil
             teamPlan = nil
             planTaskStatuses = [:]
             lastCommit = nil
@@ -267,6 +276,7 @@ final class AppModel {
         Task { await loadArtifactPolicy() }
         Task { await loadMailboxPolicy() }
         Task { await loadProjectBudget() }
+        Task { await loadProjectUsage() }
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -614,6 +624,52 @@ final class AppModel {
         } catch {
             integrationPolicyStatus = error.localizedDescription
             handle(error)
+        }
+    }
+
+    func loadPendingApprovals() async {
+        approvalCenterBusy = true
+        defer { approvalCenterBusy = false }
+        do {
+            let approvals = try await core.listApprovals(sessionID: nil)
+            let allSessions = try await core.listSessions(projectID: nil)
+            pendingApprovals = approvals.filter { $0.status == "pending" }
+            approvalSessionGoals = Dictionary(
+                uniqueKeysWithValues: allSessions.map { ($0.id, $0.goal) }
+            )
+            approvalCenterStatus = pendingApprovals.isEmpty ? "No pending approvals." : nil
+        } catch {
+            approvalCenterStatus = error.localizedDescription
+        }
+    }
+
+    func resolveGlobalApproval(_ id: String, approved: Bool) async {
+        approvalCenterBusy = true
+        defer { approvalCenterBusy = false }
+        do {
+            try await core.resolveApproval(id: id, approved: approved)
+            pendingApprovals.removeAll { $0.id == id }
+            approvalCenterStatus = pendingApprovals.isEmpty ? "No pending approvals." : nil
+        } catch {
+            approvalCenterStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadProjectUsage() async {
+        guard let projectID = selectedProjectID else {
+            projectUsage = nil
+            return
+        }
+        projectUsageBusy = true
+        defer { projectUsageBusy = false }
+        do {
+            let usage = try await core.projectUsage(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            projectUsage = usage
+            projectUsageStatus = nil
+        } catch {
+            projectUsageStatus = error.localizedDescription
         }
     }
 

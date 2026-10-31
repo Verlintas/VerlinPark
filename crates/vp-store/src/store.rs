@@ -9,8 +9,8 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
-    MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, SearchHit, Session, SessionBundle,
-    ShellPolicy, StoredMessage, TodoItem, UsageEntry,
+    MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectUsageSession, SearchHit,
+    Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem, UsageEntry,
 };
 
 use crate::paths;
@@ -1156,6 +1156,29 @@ impl Store {
             |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?)),
         )
         .map_err(Into::into)
+    }
+
+    pub fn project_usage_by_session(&self, project_id: &str) -> Result<Vec<ProjectUsageSession>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.goal, s.status, s.tokens_in, s.tokens_out, s.cost_spent_usd,
+                    (SELECT COUNT(*) FROM usage_ledger u WHERE u.session_id = s.id)
+             FROM sessions s
+             WHERE s.project_id = ?1
+             ORDER BY s.created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok(ProjectUsageSession {
+                session_id: row.get(0)?,
+                goal: row.get(1)?,
+                status: row.get(2)?,
+                calls: row.get::<_, i64>(6)? as u64,
+                input_tokens: row.get::<_, i64>(3)? as u64,
+                output_tokens: row.get::<_, i64>(4)? as u64,
+                cost_usd: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn get_mailbox_policy(&self, project_id: &str) -> Result<MailboxPolicy> {
@@ -3991,6 +4014,42 @@ mod tests {
         let session = store.get_session(&session.id).unwrap().unwrap();
         assert_eq!(session.tokens_in, 30);
         assert_eq!(session.tokens_out, 12);
+    }
+
+    #[test]
+    fn groups_project_usage_by_session() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let alpha = store.create_session(&project.id, "alpha").unwrap();
+        let beta = store.create_session(&project.id, "beta").unwrap();
+        store
+            .add_usage_entry_with_events(
+                &alpha.id, "a1", "Alpha", "worker", None, None, "m", 10, 5, false, 0.5,
+            )
+            .unwrap();
+        store
+            .add_usage_entry_with_events(
+                &alpha.id, "a1", "Alpha", "worker", None, None, "m", 2, 1, true, 0.0,
+            )
+            .unwrap();
+        store
+            .add_usage_entry_with_events(
+                &beta.id, "b1", "Beta", "leader", None, None, "m", 7, 3, false, 0.25,
+            )
+            .unwrap();
+
+        let usage = store.project_usage_by_session(&project.id).unwrap();
+        assert_eq!(usage.len(), 2);
+        let alpha_usage = usage.iter().find(|row| row.session_id == alpha.id).unwrap();
+        assert_eq!(alpha_usage.calls, 2);
+        assert_eq!(alpha_usage.input_tokens, 12);
+        assert_eq!(alpha_usage.output_tokens, 6);
+        assert!((alpha_usage.cost_usd - 0.5).abs() < 1e-9);
+        let beta_usage = usage.iter().find(|row| row.session_id == beta.id).unwrap();
+        assert_eq!(beta_usage.calls, 1);
+        assert_eq!(beta_usage.input_tokens, 7);
     }
 
     #[test]
