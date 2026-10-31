@@ -57,7 +57,7 @@
 第一轮硬化（2026-10-30）已修复 plan scope/caps、token reservation 和 fetch_url 的 DNS 绕过。仍然存在的：
 
 1. **Shell 仍非完整沙箱**：写入已由 Seatbelt 限制在 worktree/Git 元数据/scratch；常见 credential/state 路径已 read-deny，但不是完整 read jail；项目 policy 可 deny network，但默认 allow，Docker 等 daemon 介导写入仍可能；`sandbox-exec` 已废弃。见 AUDIT P1-3。
-2. **Verifier 只读**：只是 prompt 约束；shell 写入虽被限制在它自己的 worktree，但仍可修改该 worktree 的源码。见 AUDIT P1-3。
+2. **Verifier 只读**：无 write/edit 工具，运行后会检查 tracked diff 并 reset/拒绝；但 shell 仍可创建 untracked/ignored 文件、读取任意路径，不是完整文件系统沙箱。见 AUDIT P1-3。
 3. **事件溯源**：关键状态已改为原子事件+投影；`session.replay` / `--repair` / `--rebuild` 可发现并重建覆盖的投影（含 agent roster）；`session.export` 可导出 bundle；数据库项目/会话创建元数据的从零导入仍未实现。见 AUDIT P1-5。
 4. **batch abort 状态一致性**：同批 task 在预算/取消中止时可能残留 `running` UI 状态；见 AUDIT P2-7。
 
