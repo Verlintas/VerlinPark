@@ -1009,6 +1009,9 @@ pub struct PlanTask {
     pub title: String,
     #[serde(default)]
     pub kind: String,
+    /// Higher values run first within a ready batch. Range -100..100.
+    #[serde(default)]
+    pub priority: i32,
     #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]

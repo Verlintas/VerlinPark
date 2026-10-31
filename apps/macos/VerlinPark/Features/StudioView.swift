@@ -255,6 +255,10 @@ private struct PlanTaskRow: View {
                     if let profile = task.profile {
                         Text("· \(profile)")
                     }
+                    if let priority = task.priority, priority != 0 {
+                        Text("· P\(priority)")
+                            .foregroundStyle(priority > 0 ? Color.orange : Color.secondary)
+                    }
                     if !task.deps.isEmpty {
                         Text("· deps \(task.deps.joined(separator: ","))")
                     }

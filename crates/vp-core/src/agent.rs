@@ -4868,6 +4868,7 @@ fn tool_schemas(
                                 "department": {"type": "string"},
                                 "title": {"type": "string"},
                                 "kind": {"type": "string"},
+                                "priority": {"type": "integer", "minimum": -100, "maximum": 100, "description": "Higher priority runs first within a ready batch"},
                                 "profile": {
                                     "type": "string",
                                     "enum": ["coding", "research", "verification", "generic"]
@@ -5509,6 +5510,9 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
         if task.kind.trim().is_empty() {
             return Err(anyhow!("task '{id}' needs a kind"));
         }
+        if !(-100..=100).contains(&task.priority) {
+            return Err(anyhow!("task '{id}' priority must be between -100 and 100"));
+        }
         if let Some(profile) = &task.profile
             && AgentProfile::parse(profile).is_none()
         {
@@ -5667,10 +5671,11 @@ fn plan_prompt(plan: &TeamPlan) -> String {
         .iter()
         .map(|task| {
             format!(
-                "- {} [{}] {} deps={} scope={}{}",
+                "- {} [{}] {} priority={} deps={} scope={}{}",
                 task.id,
                 task.department,
                 task.title,
+                task.priority,
                 task.deps.join(","),
                 task.write_scope.join(","),
                 plan_budget_text(task.token_budget, task.cost_budget_usd)
@@ -5952,7 +5957,13 @@ fn normalized_task_scope(task: &PlanTask) -> Vec<String> {
 /// are treated as unrestricted and run alone. A task that overlaps an earlier
 /// task in the batch stays pending for the next batch instead of being merged
 /// into a conflicting write set.
-fn select_plan_batch(ready: Vec<PlanTask>, limit: usize) -> Vec<PlanTask> {
+fn select_plan_batch(mut ready: Vec<PlanTask>, limit: usize) -> Vec<PlanTask> {
+    ready.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
     let mut batch: Vec<PlanTask> = Vec::new();
     for task in ready {
         if batch.len() >= limit {
@@ -9413,6 +9424,40 @@ mod tests {
     }
 
     #[test]
+    fn plan_batch_orders_ready_tasks_by_priority_then_id() {
+        fn task(id: &str, priority: i32, scope: &[&str]) -> PlanTask {
+            PlanTask {
+                id: id.to_string(),
+                department: "impl".to_string(),
+                title: id.to_string(),
+                kind: "coding".to_string(),
+                priority,
+                profile: None,
+                deps: Vec::new(),
+                write_scope: scope.iter().map(|scope| scope.to_string()).collect(),
+                acceptance: vec!["done".to_string()],
+                token_budget: None,
+                cost_budget_usd: None,
+            }
+        }
+        let batch = select_plan_batch(
+            vec![
+                task("T1", 0, &["src/a"]),
+                task("T2", 50, &["src/b"]),
+                task("T3", -10, &["src/c"]),
+            ],
+            10,
+        );
+        assert_eq!(
+            batch
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["T2", "T1", "T3"]
+        );
+    }
+
+    #[test]
     fn plan_batch_serializes_unscoped_and_overlapping_tasks() {
         fn task(id: &str, scope: &[&str]) -> PlanTask {
             PlanTask {
@@ -9420,6 +9465,7 @@ mod tests {
                 department: "impl".to_string(),
                 title: id.to_string(),
                 kind: "coding".to_string(),
+                priority: 0,
                 profile: None,
                 deps: Vec::new(),
                 write_scope: scope.iter().map(|scope| scope.to_string()).collect(),

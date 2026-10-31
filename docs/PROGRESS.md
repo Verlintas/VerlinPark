@@ -15,9 +15,9 @@
 | Session worktree | ✅ | 每个 session 独立 Git worktree + 分支；项目根只读 |
 | 四层组织 | ✅ | Leader → Manager → Worker → Labour；严格链路，Manager 必须有部门 title |
 | Agent profile | ✅ | coding / research / verification / generic；决定工具集与 prompt |
-| TeamPlan | ✅ | Leader 定义 departments / Manager titles / profiles / task DAG；runtime 校验结构、依赖和 scope 语法并持久化 |
+| TeamPlan | ✅ | Leader 定义 departments / Manager titles / profiles / task DAG / task priority（-100..100）；runtime 校验结构、依赖、优先级和 scope 语法并持久化 |
 | Manager 圆桌 | ✅ | `deliberate_team_plan`，1–3 轮，只读，后一轮看到前一轮所有 peer positions |
-| 自动派发 | ✅ | `run_team_plan` 按依赖批次执行 ready tasks；同批筛选不重叠 scope；Manager 懒创建；失败阻塞依赖 |
+| 自动派发 | ✅ | `run_team_plan` 按依赖批次执行 ready tasks；ready task 按 priority desc + id 排序；同批筛选不重叠 scope；Manager 懒创建；失败阻塞依赖 |
 | Task worktree | ✅ | Worker 独立 task worktree/branch；Labour 继承 Worker worktree |
 | 并行 Worker | ✅ | `delegate_many` / plan batch 并发；两边都校验 write scope 不重叠；空 scope 或重叠 scope 的 plan task 串行执行 |
 | Verifier gate | ✅ | 独立 Verifier；`submit_verdict`；approve 才合并。Verifier 无 write/edit 工具；shell 写入被限制在其 worktree；运行后检查 tracked diff，发现修改则 reset、标记 failed、拒绝 verdict（untracked/ignored 测试产物允许）；审批卡会提示 |
@@ -49,7 +49,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：109 个测试通过（core 88、store 16、providers 5）。
+- `cargo test --workspace`：110 个测试通过（core 89、store 16、providers 5）。
 - `xcodebuild test`：12 个 Swift 测试通过（含协议向后兼容解码）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -133,6 +133,7 @@
 - **M3 第三十九切片**：project-wide shared budget pool（跨 session token/USD reservation、abortive project scope、CLI/Manage Dash）。
 - **M3 第四十切片**：`server.doctor` / `vp doctor` 本地只读诊断（DB、权限、root、worktree、mirror、sandbox、provider）。
 - **M3 第四十一切片**：`agent.probe` / `vp provider-test` / Settings Test connection 真实 provider 连通性探针。
+- **M3 第四十二切片**：TeamPlan task priority（-100..100，ready batch priority desc + id，scope/capacity/budget 仍优先）。
 
 ## 如何运行
 
