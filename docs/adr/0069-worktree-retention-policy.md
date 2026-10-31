@@ -24,7 +24,8 @@ significant disk. The existing cleanup was safe but easy to forget.
    same cleanup implementation used by the manual command.
 5. **Safety unchanged.** Only terminal sessions, dirty worktrees are skipped
    without `force`, branches are kept unless `delete_branches`, and
-   failed/cancelled worktrees are kept unless `keep_failed` is false.
+   failed/cancelled worktrees are kept unless `keep_failed` is false; removing a
+   worktree also removes its `sandbox/<session>` scratch directory.
 6. **Manual override.** `project.cleanup_worktrees` gained `keep_failed`; the
    CLI has `--keep-failed`.
 7. **No global quota.** The sweep does not cap total bytes or count; it only
@@ -36,7 +37,9 @@ significant disk. The existing cleanup was safe but easy to forget.
 - The default remains safe: disabled, keeps failed evidence and branches.
 - The sweep interval is coarse and runs at daemon level, not exactly on session
   completion.
-- Shell scratch directories are not covered; only session worktrees.
+- Session sandbox scratch is removed together with the worktree, including
+  orphan scratch for sessions whose worktree is already missing; other runtime
+  caches are not covered.
 - A user who disables the policy keeps existing worktrees; nothing is deleted
   proactively.
 

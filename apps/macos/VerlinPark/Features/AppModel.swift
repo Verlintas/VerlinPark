@@ -12,6 +12,8 @@ struct ArtifactPreviewData {
 @MainActor
 @Observable
 final class AppModel {
+    private let noticesKey = "verlinpark.notices"
+
     enum ConnectionState: Equatable {
         case idle
         case connecting
@@ -189,6 +191,7 @@ final class AppModel {
             let discovery = try await daemon.ensureRunning()
             try await core.connect(to: discovery)
             connection = .connected
+            loadNotices()
             await configureStoredProvider()
             agentInfo = try? await core.agentInfo()
             if let info = agentInfo {
@@ -444,6 +447,7 @@ final class AppModel {
     func markNoticeRead(_ id: String) {
         guard let index = notices.firstIndex(where: { $0.id == id }) else { return }
         notices[index].isRead = true
+        saveNotices()
         updateDockBadge()
     }
 
@@ -451,11 +455,13 @@ final class AppModel {
         for index in notices.indices {
             notices[index].isRead = true
         }
+        saveNotices()
         updateDockBadge()
     }
 
     func clearNotices() {
         notices = []
+        saveNotices()
         updateDockBadge()
     }
 
@@ -1813,7 +1819,21 @@ final class AppModel {
         if notices.count > 100 {
             notices.removeLast(notices.count - 100)
         }
+        saveNotices()
         updateDockBadge()
+    }
+
+    private func loadNotices() {
+        guard let data = UserDefaults.standard.data(forKey: noticesKey),
+              let decoded = try? JSONDecoder().decode([AppNotice].self, from: data)
+        else { return }
+        notices = Array(decoded.prefix(100))
+        updateDockBadge()
+    }
+
+    private func saveNotices() {
+        guard let data = try? JSONEncoder().encode(notices) else { return }
+        UserDefaults.standard.set(data, forKey: noticesKey)
     }
 
     private func updateDockBadge() {

@@ -3468,6 +3468,7 @@ impl Engine {
             tokio::task::spawn_blocking(move || list_store.list_sessions(Some(&list_project_id)))
                 .await??;
         let now = time::OffsetDateTime::now_utc();
+        let sandbox_root = store.data_dir().join("sandbox");
         let mut entries = Vec::new();
         let mut removed = 0usize;
         let mut skipped = 0usize;
@@ -3519,6 +3520,9 @@ impl Engine {
             }
             let path = PathBuf::from(&worktree);
             if !path.exists() {
+                let sandbox = sandbox_root.join(&session.id);
+                let _ =
+                    tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&sandbox)).await?;
                 skipped += 1;
                 entries.push(WorktreeCleanupEntry {
                     session_id: session.id.clone(),
@@ -3568,6 +3572,14 @@ impl Engine {
             {
                 Ok(()) => {
                     let mut reason = "removed worktree".to_string();
+                    let sandbox = sandbox_root.join(&session.id);
+                    if let Err(error) =
+                        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&sandbox))
+                            .await?
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        reason = format!("{reason}; scratch cleanup failed: {error}");
+                    }
                     if delete_branches
                         && let Err(error) = tokio::task::spawn_blocking({
                             let root = project_root.clone();
@@ -5320,6 +5332,9 @@ mod tests {
             .unwrap();
         let worktree = PathBuf::from(session.worktree.clone().unwrap());
         let branch = session.branch.clone().unwrap();
+        let sandbox = data.path().join("sandbox").join(&session.id).join("tmp");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::write(sandbox.join("cache.bin"), "cache").unwrap();
         std::fs::write(worktree.join("dirty.txt"), "dirty\n").unwrap();
         engine
             .update_session_status(&session.id, "idle")
@@ -5358,6 +5373,7 @@ mod tests {
         assert_eq!(cleaned.scanned, 1, "active session must be skipped");
         assert_eq!(cleaned.removed, 1);
         assert!(!worktree.exists());
+        assert!(!data.path().join("sandbox").join(&session.id).exists());
         assert!(
             worktree::branch_exists(repo.path(), &branch).unwrap(),
             "cleanup must keep the branch unless explicitly asked"

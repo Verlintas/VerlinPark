@@ -835,7 +835,7 @@ extension Int {
     }
 }
 
-struct AppNotice: Identifiable, Hashable, Sendable {
+struct AppNotice: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let sessionId: String
     var projectId: String?

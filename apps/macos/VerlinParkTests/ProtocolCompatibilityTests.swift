@@ -67,6 +67,22 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertNil(hit.role)
     }
 
+    func testAppNoticeRoundTrip() throws {
+        let notice = AppNotice(
+            id: "approval-1",
+            sessionId: "session-1",
+            projectId: "project-1",
+            kind: "approval",
+            title: "Approval needed",
+            detail: "shell · Worker",
+            createdAt: "2026-10-31T00:00:00Z",
+            isRead: false
+        )
+        let data = try JSONEncoder().encode(notice)
+        let decoded = try JSONDecoder().decode(AppNotice.self, from: data)
+        XCTAssertEqual(decoded, notice)
+    }
+
     func testSessionPlanResumeResultDecodes() throws {
         let json = #"{"session_id":"session-1","started":true}"#
         let result = try JSONDecoder().decode(

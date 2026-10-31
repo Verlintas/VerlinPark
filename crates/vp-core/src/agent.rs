@@ -2123,9 +2123,18 @@ impl AgentService {
             return Err(error);
         }
 
+        self.spawn_run(config, session_id.to_string(), prompt.to_string(), control);
+        Ok(())
+    }
+
+    fn spawn_run(
+        &self,
+        config: AgentConfig,
+        session_id: String,
+        prompt: String,
+        control: Arc<RunControl>,
+    ) {
         let engine = self.engine.clone();
-        let session_id = session_id.to_string();
-        let prompt = prompt.to_string();
         let runs = self.runs.clone();
         let global_slots = self.global_slots.clone();
         tokio::spawn(async move {
@@ -2187,7 +2196,38 @@ impl AgentService {
                 runs.remove(&session_id);
             }
         });
-        Ok(())
+    }
+
+    /// Re-enqueue sessions that were admitted but had not started when the
+    /// daemon restarted. Their original prompt is read from `agent.queued`.
+    pub async fn resume_queued_sessions(&self) -> Result<usize> {
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned());
+        let Some(config) = config else {
+            return Ok(0);
+        };
+        let store = self.engine.store().clone();
+        let queued = tokio::task::spawn_blocking(move || store.queued_session_prompts()).await??;
+        let mut started = 0;
+        for (session_id, prompt) in queued {
+            let control = Arc::new(RunControl::new());
+            {
+                let mut runs = self
+                    .runs
+                    .lock()
+                    .map_err(|_| anyhow!("agent run mutex poisoned"))?;
+                if runs.contains_key(&session_id) {
+                    continue;
+                }
+                runs.insert(session_id.clone(), control.clone());
+            }
+            self.spawn_run(config.clone(), session_id, prompt, control);
+            started += 1;
+        }
+        Ok(started)
     }
 
     /// Resume a stored TeamPlan without another Leader model call. Completed
@@ -9289,6 +9329,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumes_persisted_queued_sessions_without_duplicating_the_prompt() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![vec![
+                StreamEvent::TextDelta("resumed queue".into()),
+                StreamEvent::Done,
+            ]])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "queued".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        engine
+            .append_message(
+                &session.id,
+                "user",
+                "continue the queue",
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .update_session_status(&session.id, "queued")
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "agent.queued",
+                serde_json::json!({"prompt": "continue the queue"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(service.resume_queued_sessions().await.unwrap(), 1);
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "idle");
+        let messages = engine.list_messages(&session.id).await.unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content == "continue the queue")
+                .count(),
+            1
+        );
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.message" && event.payload["text"] == "resumed queue"
+        }));
+    }
+
+    #[tokio::test]
     async fn resumes_only_unfinished_plan_tasks() {
         let dir = TempDir::new().unwrap();
         let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
@@ -10655,6 +10756,179 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "integrator.finished")
         );
+    }
+
+    #[tokio::test]
+    async fn runs_a_plan_through_the_anthropic_http_adapter() {
+        use vp_providers::AnthropicProvider;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn text_sse(text: &str) -> ResponseTemplate {
+            let chunk = serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text}
+            });
+            let done = serde_json::json!({
+                "type": "message_delta",
+                "usage": {"output_tokens": 2}
+            });
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!(
+                    "event: content_block_delta\ndata: {chunk}\n\nevent: message_delta\ndata: {done}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                ))
+        }
+
+        fn tool_sse(id: &str, name: &str, arguments: serde_json::Value) -> ResponseTemplate {
+            let start = serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+            });
+            let delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": arguments.to_string()}
+            });
+            let stop = serde_json::json!({"type": "content_block_stop", "index": 0});
+            let done = serde_json::json!({
+                "type": "message_delta",
+                "usage": {"output_tokens": 2}
+            });
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!(
+                    "event: content_block_start\ndata: {start}\n\nevent: content_block_delta\ndata: {delta}\n\nevent: content_block_stop\ndata: {stop}\n\nevent: message_delta\ndata: {done}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                ))
+        }
+
+        fn content_text(content: &serde_json::Value) -> String {
+            if let Some(text) = content.as_str() {
+                return text.to_string();
+            }
+            content
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|block| block["text"].as_str().or_else(|| block["content"].as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or_default();
+                let system = body["system"].as_str().unwrap_or_default();
+                let messages = body["messages"].as_array().cloned().unwrap_or_default();
+                let last = messages.last();
+                let last_content = last
+                    .map(|message| content_text(&message["content"]))
+                    .unwrap_or_default();
+                let tool_result = last
+                    .map(|message| message["content"].is_array())
+                    .unwrap_or(false);
+
+                if system.contains("You are Verifier") {
+                    return tool_sse(
+                        "verdict",
+                        "submit_verdict",
+                        serde_json::json!({
+                            "approved": true,
+                            "summary": "Anthropic worker output is correct"
+                        }),
+                    );
+                }
+                if system.contains("You are Worker") {
+                    if tool_result {
+                        return text_sse("worker done");
+                    }
+                    return tool_sse(
+                        "write",
+                        "write_file",
+                        serde_json::json!({"path": "worker.txt", "content": "anthropic e2e\n"}),
+                    );
+                }
+                if tool_result {
+                    if last_content.contains("Plan complete") {
+                        return text_sse("leader done");
+                    }
+                    return tool_sse("run_plan", "run_team_plan", serde_json::json!({}));
+                }
+                let plan = serde_json::json!({
+                    "goal": "anthropic e2e",
+                    "departments": [{
+                        "name": "impl",
+                        "manager_title": "Implementation",
+                        "profile": "coding",
+                        "objective": "build"
+                    }],
+                    "tasks": [{
+                        "id": "T1",
+                        "department": "impl",
+                        "title": "Write the file",
+                        "kind": "coding",
+                        "deps": [],
+                        "acceptance": ["done"],
+                        "write_scope": ["worker.txt"]
+                    }]
+                });
+                tool_sse("submit_plan", "submit_team_plan", plan)
+            })
+            .mount(&server)
+            .await;
+
+        let provider: Arc<dyn Provider> = Arc::new(AnthropicProvider::with_base_url(
+            "anthropic",
+            format!("{}/v1", server.uri()),
+            Some("test-key".to_string()),
+        ));
+        let dir = TempDir::new().unwrap();
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "anthropic e2e".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..200 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        service
+            .start(&session.id, "write worker.txt through Anthropic")
+            .await
+            .unwrap();
+        let sessions = wait_until_idle(&engine, &session).await;
+        approver.abort();
+        assert_eq!(sessions.status, "idle");
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("worker.txt")).unwrap(),
+            "anthropic e2e\n"
+        );
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].status, "merged");
     }
 
     #[tokio::test]

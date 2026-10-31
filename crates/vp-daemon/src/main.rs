@@ -98,6 +98,11 @@ async fn main() -> Result<()> {
         tracing::warn!(%error, "failed to write project manifest");
     }
     let agent = AgentService::from_env(engine.clone());
+    match agent.resume_queued_sessions().await {
+        Ok(0) => {}
+        Ok(started) => tracing::info!(started, "re-enqueued persisted queued sessions"),
+        Err(error) => tracing::warn!(%error, "failed to re-enqueue queued sessions"),
+    }
     let token = generate_token();
     let started_at = now_rfc3339();
     let state = AppState {
@@ -988,6 +993,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Ok(info) => {
                     let agent = state.agent.clone();
                     tokio::spawn(async move {
+                        let _ = agent.resume_queued_sessions().await;
                         agent.auto_resolve_all().await;
                     });
                     RpcResponse::success(id, info)

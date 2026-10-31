@@ -18,7 +18,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、shell scratch 回收、部分 merge 状态的人工检查。
 
-当前测试：Rust 132（core 104 / store 20 / providers 8），Swift 20。CI 以最新提交为准。
+当前测试：Rust 135（core 106 / store 21 / providers 8），Swift 21。CI 以最新提交为准。
 
 ### 0.1 2026-10-31 跟进
 
@@ -38,7 +38,9 @@
 - 新增 resumable TeamPlan：`session.plan_resume` / `vp resume-plan` / Preview Resume plan，跳过 completed task，复用 task worktree/commit；见 ADR-0070。
 - 新增 provider stream idle timeout（`VERLINPARK_PROVIDER_IDLE_SECS`，默认 300s）和 OpenAI-compatible HTTP adapter 全链路 E2E；见 ADR-0071。
 - 新增 `vp db-rebuild`：从 project manifest + session event mirrors 重建 SQLite 和关键投影；见 ADR-0072。
-- 新增 Rail 通知中心：approval、task failure、integration failure、session stop，带 unread/Dock badge 和跳转 session。
+- 新增 Rail 通知中心：approval、task failure、integration failure、session stop，带 unread/Dock badge 和跳转 session；通知历史持久化到 UserDefaults。
+- queued session 跨 daemon 重启保留并自动 re-enqueue；新增 store/agent 回归。
+- 新增 Anthropic HTTP adapter 全链路 E2E；worktree cleanup 同步清理 session scratch。
 
 ---
 
@@ -66,9 +68,9 @@
 | 功能完整度（M3） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、显式/opt-in 自动冲突解决、本地 landing、`gh` PR、mailbox/artifacts/replay、search/transcript 已有；缺 default-on auto-resolution、global Task-DAG scheduler |
 | 正确性/一致性 | B+ | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影；`vp db-rebuild` 可从 manifest + mirrors 从零重建，但 imported archive/blobs/worktree 需要原文件存在 |
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
-| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff、Rail 通知中心可用；通知仅 app 内存，更早的 round 仍受已加载 event window 限制 |
+| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff、Rail 通知中心（历史持久化）可用；仍无系统通知，更早的 round 受已加载 event window 限制 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
-| 测试 | B− | 132 Rust + 20 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/usage CSV/project usage/worktree retention/diff parser/HTTP probe/full HTTP adapter E2E/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
+| 测试 | B− | 135 Rust + 21 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/usage CSV/project usage/worktree retention/diff parser/OpenAI+Anthropic HTTP adapter E2E/queued recovery/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
 | 发布准备 | C | `just package` 生成 ad-hoc signed DMG + checksum，release workflow 同时生成并上传 Homebrew cask；仍无 Developer ID/公证、更新器和可持续升级的 Homebrew tap |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -260,17 +262,16 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 132 个 Rust 测试 + 20 个 Swift 测试，覆盖 Leader loop、provider probe/retry/idle timeout、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI-compatible HTTP probe 与全链路 E2E、db rebuild。仍缺：
+已有 135 个 Rust 测试 + 21 个 Swift 测试，覆盖 Leader loop、provider probe/retry/idle timeout、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、queued session 恢复、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI+Anthropic HTTP adapter E2E、db rebuild。仍缺：
 
 - 并发预算超调上界与预算 abort 的 sibling 结算（当前只测取消 abort）
 - 非 GitHub PR adapter / 默认自动冲突解决策略 / 真正的 post-merge 集成分支
 - WebSocket 断线重连
-- 真实 Anthropic 工具调用/委派 E2E（目前只有 SSE 解析/mock 测试）
-- 真实外部 Provider（需要 API key）的 E2E；本地 wiremock 全链路已覆盖 OpenAI-compatible
+- 真实外部 Provider（需要 API key）的 E2E；本地 wiremock 全链路已覆盖 OpenAI-compatible 与 Anthropic
 - FTS/索引搜索与跨 session 相关性排序
 - transcript 的 event timeline 与增量导出
 - roundtable 卡片的 UI snapshot / accessibility 回归
-- macOS UserNotifications / 通知持久化（目前只在 app 内存）
+- macOS UserNotifications / 前台通知 delegate（历史已持久化到 UserDefaults）
 
 ### P2-13：产品叙事大于实现
 
@@ -365,7 +366,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 132 passed after the 10-31 db-rebuild slice
+cargo test --workspace     # 135 passed after the 10-31 queued-recovery/Anthropic/scratch slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

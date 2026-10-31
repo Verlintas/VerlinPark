@@ -2841,14 +2841,13 @@ impl Store {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let sessions = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM sessions WHERE status IN ('running', 'paused', 'queued')",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT id FROM sessions WHERE status IN ('running', 'paused')")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
-            "UPDATE sessions SET status = 'failed' WHERE status IN ('running', 'paused', 'queued')",
+            "UPDATE sessions SET status = 'failed' WHERE status IN ('running', 'paused')",
             [],
         )?;
         let agents = {
@@ -3470,6 +3469,33 @@ impl Store {
             }
         }
         Ok(imported_event)
+    }
+
+    pub fn queued_session_prompts(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT e.session_id, e.payload
+             FROM events e JOIN sessions s ON s.id = e.session_id
+             WHERE s.status = 'queued' AND e.type = 'agent.queued'
+             ORDER BY e.session_id, e.seq DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut prompts = std::collections::HashMap::new();
+        for row in rows {
+            let (session_id, payload) = row?;
+            if prompts.contains_key(&session_id) {
+                continue;
+            }
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            if let Some(prompt) = payload.get("prompt").and_then(serde_json::Value::as_str)
+                && !prompt.trim().is_empty()
+            {
+                prompts.insert(session_id, prompt.to_string());
+            }
+        }
+        Ok(prompts.into_iter().collect())
     }
 
     pub fn interrupt_running_sessions(&self) -> Result<Vec<String>> {
@@ -4320,6 +4346,34 @@ mod tests {
         let beta_usage = usage.iter().find(|row| row.session_id == beta.id).unwrap();
         assert_eq!(beta_usage.calls, 1);
         assert_eq!(beta_usage.input_tokens, 7);
+    }
+
+    #[test]
+    fn keeps_queued_sessions_and_their_prompts_across_recovery() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "queued").unwrap();
+        store
+            .append_event(
+                &session.id,
+                "agent.queued",
+                serde_json::json!({"prompt": "continue the queue"}),
+            )
+            .unwrap();
+        store.update_session_status(&session.id, "queued").unwrap();
+        let (recovered, _) = store.recover_state().unwrap();
+        assert!(recovered.is_empty());
+        assert_eq!(
+            store.get_session(&session.id).unwrap().unwrap().status,
+            "queued"
+        );
+        let prompts = store.queued_session_prompts().unwrap();
+        assert_eq!(
+            prompts,
+            vec![(session.id, "continue the queue".to_string())]
+        );
     }
 
     #[test]
