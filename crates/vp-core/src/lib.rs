@@ -13,8 +13,8 @@ use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactGcResult, ArtifactPolicy, Event,
     IntegrationPolicy, MailboxGcResult, MailboxPolicy, MergeQueueEntry, Project, PullRequestResult,
     Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
-    SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
-    UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
+    SessionLogStatus, SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage,
+    TeamPlan, TodoItem, UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -2469,6 +2469,86 @@ impl Engine {
         Ok(report)
     }
 
+    pub async fn session_log_status(&self, session_id: &str) -> Result<SessionLogStatus> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (mirror, database) = tokio::task::spawn_blocking(move || {
+            let mirror = store.read_event_mirror(&id)?;
+            let database = store.list_all_events(&id)?;
+            Ok::<_, anyhow::Error>((mirror, database))
+        })
+        .await??;
+        let mirror_count = mirror.as_ref().map_or(0, Vec::len);
+        let matches = match &mirror {
+            None => database.is_empty(),
+            Some(mirror) => {
+                mirror.len() == database.len()
+                    && mirror.iter().zip(database.iter()).all(|(left, right)| {
+                        left.seq == right.seq
+                            && left.kind == right.kind
+                            && left.payload == right.payload
+                            && left.created_at == right.created_at
+                    })
+            }
+        };
+        let detail = if matches {
+            "event mirror matches the database".to_string()
+        } else if mirror.is_none() {
+            format!(
+                "event mirror is missing; database has {} event(s)",
+                database.len()
+            )
+        } else if mirror_count != database.len() {
+            format!(
+                "event mirror has {} event(s); database has {}",
+                mirror_count,
+                database.len()
+            )
+        } else {
+            "event mirror differs from the database".to_string()
+        };
+        Ok(SessionLogStatus {
+            session_id: session_id.to_string(),
+            mirror_events: mirror_count,
+            database_events: database.len(),
+            matches,
+            detail,
+        })
+    }
+
+    pub async fn restore_session_log(&self, session_id: &str) -> Result<SessionLogStatus> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let mirror = tokio::task::spawn_blocking(move || store.read_event_mirror(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("event mirror is missing for {session_id}"))?;
+        if mirror.is_empty() {
+            anyhow::bail!("event mirror is empty for {session_id}");
+        }
+        let mut expected_seq = 1u64;
+        for event in &mirror {
+            if event.session_id != session_id {
+                anyhow::bail!("event mirror contains an event for a different session");
+            }
+            if event.seq != expected_seq {
+                anyhow::bail!(
+                    "event mirror sequence is not contiguous at {} (expected {}, found {})",
+                    event.seq,
+                    expected_seq,
+                    event.seq
+                );
+            }
+            expected_seq = expected_seq.saturating_add(1);
+        }
+        let store = self.store.clone();
+        let events = mirror.clone();
+        let log_session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.replace_events(&log_session_id, &events))
+            .await??;
+        self.rebuild_session(session_id).await?;
+        self.session_log_status(session_id).await
+    }
+
     pub async fn replay_session(&self, session_id: &str) -> Result<SessionReplayReport> {
         let data = self.load_replay_data(session_id).await?;
         Self::replay_report(&data, false)
@@ -4093,6 +4173,82 @@ mod tests {
         assert_eq!(
             queue_status.get(&entry.id).map(String::as_str),
             Some("merged")
+        );
+    }
+
+    #[tokio::test]
+    async fn restores_the_event_table_from_the_jsonl_mirror() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("mirror".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "mirror".into(), None)
+            .await
+            .unwrap();
+        let (approval, _receiver) = engine
+            .request_approval(
+                &session.id,
+                "call-1",
+                "shell",
+                serde_json::json!({"command": "true"}),
+                None,
+            )
+            .await
+            .unwrap();
+        engine.resolve_approval(&approval.id, true).await.unwrap();
+        engine
+            .send_agent_message(
+                &session.id,
+                "sender",
+                "Sender",
+                "receiver",
+                "Receiver",
+                "note",
+                "mirror message",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        let status = engine.session_log_status(&session.id).await.unwrap();
+        assert!(status.matches, "{status:?}");
+        assert!(status.mirror_events > 0);
+        assert_eq!(status.mirror_events, status.database_events);
+
+        engine.store().replace_events(&session.id, &[]).unwrap();
+        let damaged = engine.session_log_status(&session.id).await.unwrap();
+        assert!(!damaged.matches);
+        assert!(damaged.mirror_events > 0);
+        assert_eq!(damaged.database_events, 0);
+
+        let restored = engine.restore_session_log(&session.id).await.unwrap();
+        assert!(restored.matches, "{restored:?}");
+        assert_eq!(restored.database_events, restored.mirror_events);
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.consistent, "{:?}", report.mismatches);
+        assert_eq!(
+            engine
+                .list_approvals(Some(session.id.clone()))
+                .await
+                .unwrap()[0]
+                .status,
+            "approved"
+        );
+        assert_eq!(
+            engine
+                .list_agent_messages(&session.id, None, false)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 

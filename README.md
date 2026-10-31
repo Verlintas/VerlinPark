@@ -153,6 +153,8 @@ just cli read-message <message-id>
 just cli artifacts <session-id>
 just cli artifact <artifact-id>
 just cli usage <session-id>
+just cli log-status <session-id>
+just cli restore-log <session-id>
 just cli artifact-policy <project-id>
 just cli artifact-policy-set <project-id> --max-count 20 --auto-gc
 just cli gc <project-id>

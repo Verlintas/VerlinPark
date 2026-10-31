@@ -34,10 +34,10 @@ use vp_protocol::types::{
     RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
     ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, ServerInfo,
     SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
-    SessionPauseParams, SessionPauseResult, SessionResumeParams, SessionResumeResult,
-    SessionTodosParams, SessionTodosResult, SetArtifactPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
+    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionResumeParams,
+    SessionResumeResult, SessionTodosParams, SessionTodosResult, SetArtifactPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetShellPolicyParams, ShellPolicyParams,
+    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -566,6 +566,20 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                         items,
                     },
                 ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.log_status" => match parse_params::<SessionLogParams>(request.params) {
+            Ok(params) => match state.engine.session_log_status(&params.session_id).await {
+                Ok(status) => RpcResponse::success(id, status),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.restore_log" => match parse_params::<SessionLogParams>(request.params) {
+            Ok(params) => match state.engine.restore_session_log(&params.session_id).await {
+                Ok(status) => RpcResponse::success(id, status),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

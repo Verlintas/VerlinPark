@@ -778,6 +778,20 @@ pub struct SessionRehydrateResult {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLogStatus {
+    pub session_id: String,
+    pub mirror_events: usize,
+    pub database_events: usize,
+    pub matches: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionLogParams {
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReplaySessionParams {
     pub session_id: String,

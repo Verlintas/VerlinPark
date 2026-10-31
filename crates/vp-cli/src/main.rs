@@ -181,6 +181,10 @@ enum Command {
         #[arg(long)]
         rebuild: bool,
     },
+    /// Compare the JSONL event mirror with the database.
+    LogStatus { session: String },
+    /// Restore the event table from the JSONL mirror and rebuild projections.
+    RestoreLog { session: String },
     /// Discard uncommitted changes in the session worktree.
     Discard { session: String },
     /// Commit the session worktree.
@@ -491,6 +495,22 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::LogStatus { session } => {
+            rpc(
+                &discovery,
+                "session.log_status",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::RestoreLog { session } => {
+            rpc(
+                &discovery,
+                "session.restore_log",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
         Command::Replay {
             session,
             repair,
@@ -773,6 +793,16 @@ fn print_human(value: &Value) {
         if let Some(detail) = entry["detail"].as_str() {
             println!("{detail}");
         }
+        return;
+    }
+    if value.get("mirror_events").is_some() && value.get("database_events").is_some() {
+        println!(
+            "{}  mirror={} database={}  {}",
+            value["session_id"].as_str().unwrap_or("?"),
+            value["mirror_events"].as_u64().unwrap_or(0),
+            value["database_events"].as_u64().unwrap_or(0),
+            value["detail"].as_str().unwrap_or("")
+        );
         return;
     }
     if let Some(consistent) = value.get("consistent").and_then(Value::as_bool) {

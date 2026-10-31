@@ -1587,6 +1587,60 @@ impl Store {
         Ok(())
     }
 
+    pub fn read_event_mirror(&self, session_id: &str) -> Result<Option<Vec<Event>>> {
+        let path = self
+            .data_dir
+            .join("sessions")
+            .join(session_id)
+            .join("events.jsonl");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading event mirror {}", path.display()))?;
+        let mut events = Vec::new();
+        for (index, line) in content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str::<Event>(line).with_context(|| {
+                format!("parsing event mirror {} line {}", path.display(), index + 1)
+            })?;
+            events.push(event);
+        }
+        Ok(Some(events))
+    }
+
+    pub fn replace_events(&self, session_id: &str, events: &[Event]) -> Result<()> {
+        if events.iter().any(|event| event.session_id != session_id) {
+            return Err(anyhow!(
+                "event mirror contains an event for a different session"
+            ));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM events WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for event in events {
+            tx.execute(
+                "INSERT INTO events (session_id, seq, type, payload, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    event.session_id,
+                    event.seq as i64,
+                    event.kind,
+                    serde_json::to_string(&event.payload)?,
+                    event.created_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn list_all_events(&self, session_id: &str) -> Result<Vec<Event>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
