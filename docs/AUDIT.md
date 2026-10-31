@@ -18,7 +18,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、shell scratch 回收、部分 merge 状态的人工检查。
 
-当前测试：Rust 142（core 111 / store 23 / providers 8），Swift 24。CI 以最新提交为准。
+当前测试：Rust 146（core 114 / store 24 / providers 8），Swift 25。CI 以最新提交为准。
 
 ### 0.1 2026-10-31 跟进
 
@@ -44,6 +44,7 @@
 - 新增 explicit project memory：`remember`/`recall` tools、`memory.list/create`、CLI/Manage Dash、replay/repair 与 bundle。
 - 新增 blocking user questions：`ask_user`、`waiting_input`、Chat 卡片、`question.*` RPC/CLI、replay/repair/bundle；Manage Dash inbox，timeout 由 `VERLINPARK_QUESTION_TIMEOUT_SECS` 配置。
 - 新增 opt-in shell home read jail（`ShellPolicy.restrict_home`），HOME 内容默认拒绝、toolchain allowlist、read-deny 最后生效。
+- 新增 MCP stdio client：server config、tools list/call、agent `mcp` tool、Settings/CLI、approval 与超时；见 ADR-0077。
 
 ---
 
@@ -73,7 +74,7 @@
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff、Rail 通知中心（历史持久化）可用；仍无系统通知，更早的 round 受已加载 event window 限制 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
-| 测试 | B− | 142 Rust + 24 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/home read jail/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/project memory/mid-run questions/usage CSV/project usage/worktree retention/diff parser/OpenAI+Anthropic HTTP adapter E2E/queued recovery/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
+| 测试 | B− | 146 Rust + 25 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/home read jail/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/project memory/mid-run questions/MCP stdio/usage CSV/project usage/worktree retention/diff parser/OpenAI+Anthropic HTTP adapter E2E/queued recovery/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
 | 发布准备 | C | `just package` 生成 ad-hoc signed DMG + checksum，release workflow 同时生成并上传 Homebrew cask；仍无 Developer ID/公证、更新器和可持续升级的 Homebrew tap |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -265,7 +266,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 142 个 Rust 测试 + 24 个 Swift 测试，覆盖 Leader loop、provider probe/retry/idle timeout、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、queued session 恢复、shell 沙箱/policy/home read jail、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、project memory、mid-run questions、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI+Anthropic HTTP adapter E2E、db rebuild。仍缺：
+已有 146 个 Rust 测试 + 25 个 Swift 测试，覆盖 Leader loop、provider probe/retry/idle timeout、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、queued session 恢复、shell 沙箱/policy/home read jail、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、project memory、mid-run questions、MCP stdio、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI+Anthropic HTTP adapter E2E、db rebuild。仍缺：
 
 - 并发预算超调上界与预算 abort 的 sibling 结算（当前只测取消 abort）
 - 非 GitHub PR adapter / 默认自动冲突解决策略 / 真正的 post-merge 集成分支
@@ -278,7 +279,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-13：产品叙事大于实现
 
-审计时 README 仍说 agent “collaborate through typed messages and shared artifacts”，架构图把 MCP、ACP、artifact store、merge queue 画成已有组件；本次已把 typed mailbox/artifact、MCP/ACP 标为 planned，并补上 merge queue/Integrator 的真实实现。后续仍需在每次能力变化时维护 **current / planned** 分离，否则第一次认真试用就会掉信任。
+审计时 README 仍说 agent “collaborate through typed messages and shared artifacts”，架构图把 MCP、ACP、artifact store、merge queue 画成已有组件；本次已把 typed mailbox/artifact、MCP/ACP 标为 planned，并补上 merge queue/Integrator 的真实实现；MCP stdio client 现已实现，ACP 仍 planned。后续仍需在每次能力变化时维护 **current / planned** 分离，否则第一次认真试用就会掉信任。
 
 ---
 
@@ -323,7 +324,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 1. binary artifact preview（content-addressed dedupe、zstd compression、artifact replay/repair、legacy backfill、mailbox auto GC 已实现）。
 2. project-wide budget quotas and alerts（project 共享 token/USD pool 已实现；per-project soft warning/alert 未做）。
 3. 持久化 global Task-DAG scheduler / 优先级与跨进程 capacity；capacity 层已做 session 间 fair round-robin，但仍是进程内队列。auto-expansion 未做。
-4. MCP/ACP、终端、hunk review、非 GitHub PR adapter。
+4. ACP、终端、hunk review、非 GitHub PR adapter。
 
 ---
 
@@ -369,7 +370,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 142 passed after the 10-31 home-read-jail slice
+cargo test --workspace     # 146 passed after the 10-31 MCP-stdio slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

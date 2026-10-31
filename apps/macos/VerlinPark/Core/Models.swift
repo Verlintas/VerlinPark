@@ -116,6 +116,76 @@ struct ProjectUsageResult: Codable, Sendable {
     }
 }
 
+struct McpServer: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+    let command: String
+    let args: [String]
+    let env: [String: String]
+    let enabled: Bool
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case command
+        case args
+        case env
+        case enabled
+        case createdAt = "created_at"
+    }
+}
+
+struct McpRemoveResult: Codable, Sendable {
+    let removed: Bool
+}
+
+struct McpServerListResult: Codable, Sendable {
+    let servers: [McpServer]
+}
+
+struct McpServerResult: Codable, Sendable {
+    let server: McpServer
+}
+
+struct McpTool: Codable, Identifiable, Hashable, Sendable {
+    let name: String
+    let description: String
+    let inputSchema: JSONValue?
+
+    var id: String {
+        name
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case description
+        case inputSchema = "input_schema"
+    }
+}
+
+struct McpToolListResult: Codable, Sendable {
+    let serverId: String
+    let tools: [McpTool]
+
+    enum CodingKeys: String, CodingKey {
+        case serverId = "server_id"
+        case tools
+    }
+}
+
+struct McpCallResult: Codable, Sendable {
+    let serverId: String
+    let tool: String
+    let result: JSONValue
+
+    enum CodingKeys: String, CodingKey {
+        case serverId = "server_id"
+        case tool
+        case result
+    }
+}
+
 struct MemoryItem: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let sessionId: String

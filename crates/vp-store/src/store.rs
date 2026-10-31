@@ -10,9 +10,9 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
-    MailboxPolicy, MemoryItem, MergeQueueEntry, Project, ProjectBudget, ProjectUsageSession,
-    Question, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem, UsageEntry,
-    WorktreeRetentionPolicy,
+    MailboxPolicy, McpServer, MemoryItem, MergeQueueEntry, Project, ProjectBudget,
+    ProjectUsageSession, Question, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage,
+    TodoItem, UsageEntry, WorktreeRetentionPolicy,
 };
 
 use crate::paths;
@@ -277,6 +277,16 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_questions_session
                 ON questions(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL UNIQUE,
+                command     TEXT NOT NULL,
+                args        TEXT NOT NULL,
+                env         TEXT NOT NULL,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                created_at  TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS project_worktree_policies (
                 project_id       TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -1700,6 +1710,96 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn list_mcp_servers(&self) -> Result<Vec<McpServer>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, command, args, env, enabled, created_at
+             FROM mcp_servers ORDER BY name ASC",
+        )?;
+        let rows = stmt.query_map([], map_mcp_server)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_mcp_server(&self, server_id: &str) -> Result<Option<McpServer>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, command, args, env, enabled, created_at
+             FROM mcp_servers WHERE id = ?1",
+            params![server_id],
+            map_mcp_server,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn add_mcp_server(
+        &self,
+        name: &str,
+        command: &str,
+        args: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+        enabled: bool,
+    ) -> Result<McpServer> {
+        let server = McpServer {
+            id: Uuid::now_v7().to_string(),
+            name: name.to_string(),
+            command: command.to_string(),
+            args: args.to_vec(),
+            env: env.clone(),
+            enabled,
+            created_at: now_rfc3339(),
+        };
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO mcp_servers (id, name, command, args, env, enabled, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                server.id,
+                server.name,
+                server.command,
+                serde_json::to_string(&server.args)?,
+                serde_json::to_string(&server.env)?,
+                if server.enabled { 1 } else { 0 },
+                server.created_at
+            ],
+        )?;
+        Ok(server)
+    }
+
+    pub fn update_mcp_server(
+        &self,
+        server_id: &str,
+        name: &str,
+        command: &str,
+        args: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+        enabled: bool,
+    ) -> Result<Option<McpServer>> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE mcp_servers SET name = ?1, command = ?2, args = ?3, env = ?4, enabled = ?5
+             WHERE id = ?6",
+            params![
+                name,
+                command,
+                serde_json::to_string(args)?,
+                serde_json::to_string(env)?,
+                if enabled { 1 } else { 0 },
+                server_id
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_mcp_server(server_id)
+    }
+
+    pub fn remove_mcp_server(&self, server_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        Ok(conn.execute("DELETE FROM mcp_servers WHERE id = ?1", params![server_id])? > 0)
     }
 
     pub fn get_worktree_policy(&self, project_id: &str) -> Result<WorktreeRetentionPolicy> {
@@ -4497,6 +4597,20 @@ fn detect_default_branch(root: &Path) -> String {
     }
 }
 
+fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServer> {
+    let args: String = row.get(3)?;
+    let env: String = row.get(4)?;
+    Ok(McpServer {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        command: row.get(2)?,
+        args: serde_json::from_str(&args).unwrap_or_default(),
+        env: serde_json::from_str(&env).unwrap_or_default(),
+        enabled: row.get::<_, i64>(5)? != 0,
+        created_at: row.get(6)?,
+    })
+}
+
 fn map_question(row: &rusqlite::Row<'_>) -> rusqlite::Result<Question> {
     let options: String = row.get(5)?;
     Ok(Question {
@@ -4922,6 +5036,43 @@ mod tests {
         assert_eq!(closed.0.status, "expired");
         assert_eq!(expired_event.kind, "question.requested");
         assert_eq!(closed.1.kind, "question.expired");
+    }
+
+    #[test]
+    fn manages_mcp_server_configs() {
+        let (_data, store, _repo) = test_store();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("TOKEN".to_string(), "hidden".to_string());
+        let server = store
+            .add_mcp_server(
+                "files",
+                "mcp-files",
+                &["--root".to_string(), "/tmp".to_string()],
+                &env,
+                true,
+            )
+            .unwrap();
+        assert_eq!(server.name, "files");
+        assert_eq!(store.list_mcp_servers().unwrap().len(), 1);
+        assert_eq!(
+            store.get_mcp_server(&server.id).unwrap().unwrap().args,
+            vec!["--root", "/tmp"]
+        );
+        let updated = store
+            .update_mcp_server(
+                &server.id,
+                "files-2",
+                "mcp-files",
+                &[],
+                &std::collections::BTreeMap::new(),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.name, "files-2");
+        assert!(!updated.enabled);
+        assert!(store.remove_mcp_server(&server.id).unwrap());
+        assert!(store.list_mcp_servers().unwrap().is_empty());
     }
 
     #[test]

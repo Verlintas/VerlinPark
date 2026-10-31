@@ -86,6 +86,7 @@
 | [0074](adr/0074-project-memory.md) | Explicit project memory | Accepted | 记忆/协作 |
 | [0075](adr/0075-blocking-user-questions.md) | Blocking user questions | Accepted | 交互/运行时 |
 | [0076](adr/0076-home-read-jail.md) | Opt-in home read jail | Accepted | 安全/沙箱 |
+| [0077](adr/0077-mcp-stdio-client.md) | MCP stdio client | Accepted | 工具/集成 |
 
 ---
 

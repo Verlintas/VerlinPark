@@ -13,6 +13,8 @@ struct SettingsView: View {
                 .tabItem { Label("Resident", systemImage: "sparkles") }
             ProvidersSettingsView()
                 .tabItem { Label("Providers", systemImage: "network") }
+            McpSettingsView()
+                .tabItem { Label("MCP", systemImage: "puzzlepiece.extension") }
             AboutSettingsView()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }

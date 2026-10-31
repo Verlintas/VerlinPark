@@ -67,6 +67,45 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertNil(hit.role)
     }
 
+    func testMcpServerAndToolsDecode() throws {
+        let serverJSON = """
+        {
+          "servers": [{
+            "id": "server-1",
+            "name": "files",
+            "command": "mcp-files",
+            "args": ["--root", "/tmp"],
+            "env": {"TOKEN": "hidden"},
+            "enabled": true,
+            "created_at": "2026-10-31T00:00:00Z"
+          }]
+        }
+        """
+        let servers = try JSONDecoder().decode(
+            McpServerListResult.self,
+            from: Data(serverJSON.utf8)
+        )
+        XCTAssertEqual(servers.servers.first?.name, "files")
+        XCTAssertEqual(servers.servers.first?.args, ["--root", "/tmp"])
+
+        let toolsJSON = """
+        {
+          "server_id": "server-1",
+          "tools": [{
+            "name": "echo",
+            "description": "Echo text",
+            "input_schema": {"type": "object"}
+          }]
+        }
+        """
+        let tools = try JSONDecoder().decode(
+            McpToolListResult.self,
+            from: Data(toolsJSON.utf8)
+        )
+        XCTAssertEqual(tools.tools.first?.name, "echo")
+        XCTAssertEqual(tools.tools.first?.description, "Echo text")
+    }
+
     func testShellPolicyWithoutRestrictHomeStillDecodes() throws {
         let json = #"{"network":"allow","read_deny":["~/secret"]}"#
         let policy = try JSONDecoder().decode(ShellPolicy.self, from: Data(json.utf8))

@@ -499,6 +499,66 @@ actor CoreClient {
             .decode(UsageLedgerResult.self)
     }
 
+    func listMcpServers() async throws -> [McpServer] {
+        try await request(method: "mcp.server.list", params: [:])
+            .decode(McpServerListResult.self)
+            .servers
+    }
+
+    func addMcpServer(name: String, command: String, args: [String]) async throws -> McpServer {
+        let params: [String: JSONValue] = [
+            "name": .string(name),
+            "command": .string(command),
+            "args": .array(args.map(JSONValue.string)),
+            "enabled": .bool(true),
+        ]
+        return try await request(method: "mcp.server.add", params: params)
+            .decode(McpServerResult.self)
+            .server
+    }
+
+    func updateMcpServer(_ server: McpServer, enabled: Bool) async throws -> McpServer {
+        let params: [String: JSONValue] = [
+            "id": .string(server.id),
+            "name": .string(server.name),
+            "command": .string(server.command),
+            "args": .array(server.args.map(JSONValue.string)),
+            "env": .object(server.env.mapValues(JSONValue.string)),
+            "enabled": .bool(enabled),
+        ]
+        return try await request(method: "mcp.server.update", params: params)
+            .decode(McpServerResult.self)
+            .server
+    }
+
+    func removeMcpServer(id: String) async throws -> Bool {
+        try await request(
+            method: "mcp.server.remove",
+            params: ["server_id": .string(id)]
+        )
+        .decode(McpRemoveResult.self)
+        .removed
+    }
+
+    func listMcpTools(serverID: String) async throws -> [McpTool] {
+        try await request(
+            method: "mcp.tools",
+            params: ["server_id": .string(serverID)]
+        )
+        .decode(McpToolListResult.self)
+        .tools
+    }
+
+    func callMcpTool(serverID: String, tool: String, arguments: JSONValue) async throws -> McpCallResult {
+        let params: [String: JSONValue] = [
+            "server_id": .string(serverID),
+            "tool": .string(tool),
+            "arguments": arguments,
+        ]
+        return try await request(method: "mcp.call", params: params)
+            .decode(McpCallResult.self)
+    }
+
     func listQuestions(sessionID: String) async throws -> [Question] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "question.list", params: params)

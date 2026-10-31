@@ -26,6 +26,26 @@ enum Command {
     Ping,
     /// Show daemon information.
     Info,
+    /// List configured MCP servers.
+    McpServers,
+    /// Add an MCP stdio server.
+    McpAdd {
+        name: String,
+        command: String,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+    },
+    /// Remove an MCP server by id.
+    McpRemove { server_id: String },
+    /// List tools exposed by an MCP server.
+    McpTools { server: String },
+    /// Call an MCP tool with a JSON arguments object.
+    McpCall {
+        server: String,
+        tool: String,
+        #[arg(long, default_value = "{}")]
+        arguments: String,
+    },
     /// Run local diagnostics.
     Doctor,
     /// Rebuild the metadata database from the project manifest and event mirrors.
@@ -351,6 +371,44 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::Info => rpc(&discovery, "server.info", json!({})).await?,
+        Command::McpServers => rpc(&discovery, "mcp.server.list", json!({})).await?,
+        Command::McpAdd {
+            name,
+            command,
+            args,
+        } => {
+            rpc(
+                &discovery,
+                "mcp.server.add",
+                json!({"name": name, "command": command, "args": args}),
+            )
+            .await?
+        }
+        Command::McpRemove { server_id } => {
+            rpc(
+                &discovery,
+                "mcp.server.remove",
+                json!({"server_id": server_id}),
+            )
+            .await?
+        }
+        Command::McpTools { server } => {
+            rpc(&discovery, "mcp.tools", json!({"server_id": server})).await?
+        }
+        Command::McpCall {
+            server,
+            tool,
+            arguments,
+        } => {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&arguments).context("parsing --arguments as JSON")?;
+            rpc(
+                &discovery,
+                "mcp.call",
+                json!({"server_id": server, "tool": tool, "arguments": arguments}),
+            )
+            .await?
+        }
         Command::Doctor => rpc(&discovery, "server.doctor", json!({})).await?,
         Command::ProviderTest => rpc(&discovery, "agent.probe", json!({})).await?,
         Command::Projects => rpc(&discovery, "project.list", json!({})).await?,
@@ -1128,6 +1186,50 @@ fn print_human(value: &Value) {
             value["artifact_id"].as_str().unwrap_or("?"),
             value["path"].as_str().unwrap_or("?")
         );
+        return;
+    }
+    if let Some(servers) = value.get("servers").and_then(Value::as_array) {
+        for server in servers {
+            println!(
+                "{}  {}  {}  enabled={}",
+                server["id"].as_str().unwrap_or("?"),
+                server["name"].as_str().unwrap_or("?"),
+                server["command"].as_str().unwrap_or("?"),
+                server["enabled"].as_bool().unwrap_or(false)
+            );
+        }
+        return;
+    }
+    if let Some(server) = value.get("server") {
+        println!(
+            "{}  {}  {}",
+            server["id"].as_str().unwrap_or("?"),
+            server["name"].as_str().unwrap_or("?"),
+            server["command"].as_str().unwrap_or("?")
+        );
+        return;
+    }
+    if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            println!(
+                "{:<30} {}",
+                tool["name"].as_str().unwrap_or("?"),
+                tool["description"].as_str().unwrap_or("")
+            );
+        }
+        return;
+    }
+    if let Some(result) = value.get("result")
+        && value.get("tool").is_some()
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string())
+        );
+        return;
+    }
+    if let Some(removed) = value.get("removed").and_then(Value::as_bool) {
+        println!("MCP server removed={removed}");
         return;
     }
     if let Some(questions) = value.get("questions").and_then(Value::as_array) {

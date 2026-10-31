@@ -62,7 +62,7 @@ The UI can inspect a session and show exactly why a change was proposed. `vp rep
 - A Rust core daemon that can run headless and be driven by a CLI.
 - Cloud APIs first; any OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp) works as a local provider.
 - Embedded MLX runtime planned for a later milestone.
-- MCP for tools, ACP for external agents, skills and hooks for project-specific behavior.
+- MCP stdio tools are implemented; ACP for external agents, skills, and hooks remain planned.
 - GPL-3.0, open protocols, no vendor lock-in.
 
 > **Aviiya is external.** The resident assistant surface is reserved for a future
@@ -80,7 +80,7 @@ flowchart LR
   CORE --> GIT["Git worktrees<br/>merge queue + Integrator"]
   CORE --> PTY["shell processes<br/>(no PTY yet)"]
   CORE --> LLM["Model providers<br/>cloud + local"]
-  CORE --> MCP["MCP servers<br/>(planned)"]
+  CORE --> MCP["MCP stdio client<br/>(implemented, stateless)"]
   CORE --> ACP["ACP agents<br/>(planned)"]
   CORE --> ART["Artifact store<br/>(planned)"]
 ```
@@ -171,6 +171,10 @@ just cli memory <project-id> --query "rate limit"
 just cli remember <session-id> decision "Use deterministic merges" "No LLM in the Integrator."
 just cli questions --session <session-id>
 just cli answer <question-id> "yes"
+just cli mcp-servers
+just cli mcp-add files npx --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp
+just cli mcp-tools <server-id>
+just cli mcp-call <server-id> echo --arguments '{"text":"hello"}' 
 just cli project-budget <project-id>
 just cli project-budget-set <project-id> --token-budget 500000 --cost-budget-usd 5
 just cli doctor

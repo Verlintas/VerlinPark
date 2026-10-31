@@ -22,27 +22,28 @@ use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
-    AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
-    AnswerQuestionResult, ApprovalListResult, ArtifactBackfillParams, ArtifactGcParams,
-    ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactMaterializeParams,
-    ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult, AuthParams, AuthResult,
-    CancelSessionParams, CancelSessionResult, CleanupWorktreesParams, CommitSessionParams,
-    ConfigureAgentParams, CreateSessionParams, DiscardSessionParams, DoctorCheck, DoctorReport,
-    EventListResult, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
-    ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams,
-    MailboxListResult, MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams,
-    MemoryCreateParams, MemoryCreateResult, MemoryListParams, MergeQueueListParams,
-    MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectBudgetParams,
-    ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
-    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
-    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, SearchParams,
-    ServerInfo, SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
-    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
-    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
-    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetProjectBudgetParams,
-    SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams, WorktreePolicyParams,
+    AddMcpServerParams, AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult,
+    AnswerQuestionParams, AnswerQuestionResult, ApprovalListResult, ArtifactBackfillParams,
+    ArtifactGcParams, ArtifactGetParams, ArtifactListParams, ArtifactListResult,
+    ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult,
+    AuthParams, AuthResult, CancelSessionParams, CancelSessionResult, CleanupWorktreesParams,
+    CommitSessionParams, ConfigureAgentParams, CreateSessionParams, DiscardSessionParams,
+    DoctorCheck, DoctorReport, EventListResult, IntegrationPolicyParams, IntegrationPolicyResult,
+    LandSessionParams, ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams,
+    MailboxListParams, MailboxListResult, MailboxPolicyParams, MailboxPolicyResult,
+    MarkMessageReadParams, McpCallParams, McpServerIdParams, MemoryCreateParams,
+    MemoryCreateResult, MemoryListParams, MergeQueueListParams, MergeQueueListResult,
+    OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams,
+    PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
+    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
+    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams,
+    SessionExportParams, SessionImportParams, SessionListResult, SessionLogParams,
+    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
+    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams,
+    ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
+    UpdateMcpServerParams, UsageLedgerParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -781,6 +782,74 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     id,
                     RpcError::new(codes::INVALID_PARAMS, "message not found".to_string()),
                 ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.server.list" => match state.engine.list_mcp_servers().await {
+            Ok(result) => RpcResponse::success(id, result),
+            Err(error) => internal_error(id, error),
+        },
+        "mcp.server.add" => match parse_params::<AddMcpServerParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .add_mcp_server(
+                    &params.name,
+                    &params.command,
+                    params.args,
+                    params.env,
+                    params.enabled,
+                )
+                .await
+            {
+                Ok(server) => RpcResponse::success(id, json!({"server": server})),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.server.update" => match parse_params::<UpdateMcpServerParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .update_mcp_server(
+                    &params.id,
+                    &params.name,
+                    &params.command,
+                    params.args,
+                    params.env,
+                    params.enabled,
+                )
+                .await
+            {
+                Ok(Some(server)) => RpcResponse::success(id, json!({"server": server})),
+                Ok(None) => RpcResponse::error(
+                    id,
+                    RpcError::new(codes::INVALID_PARAMS, "MCP server not found"),
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.server.remove" => match parse_params::<McpServerIdParams>(request.params) {
+            Ok(params) => match state.engine.remove_mcp_server(&params.server_id).await {
+                Ok(removed) => RpcResponse::success(id, json!({"removed": removed})),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.tools" => match parse_params::<McpServerIdParams>(request.params) {
+            Ok(params) => match state.engine.mcp_tools(&params.server_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.call" => match parse_params::<McpCallParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .mcp_call(&params.server_id, &params.tool, params.arguments)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

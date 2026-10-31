@@ -84,6 +84,11 @@ final class AppModel {
     var pendingQuestions: [Question] = []
     var questionCenterBusy = false
     var questionCenterStatus: String?
+    var mcpServers: [McpServer] = []
+    var mcpBusy = false
+    var mcpStatus: String?
+    var mcpTools: [String: [McpTool]] = [:]
+    var mcpToolStatus: [String: String] = [:]
     var memories: [MemoryItem] = []
     var memoryQuery = ""
     var memoryBusy = false
@@ -235,6 +240,7 @@ final class AppModel {
             await loadArtifactPolicy()
             await loadMailboxPolicy()
             await loadProjectBudget()
+            await loadMcpServers()
         } catch {
             handle(error)
         }
@@ -760,6 +766,67 @@ final class AppModel {
         } catch {
             approvalCenterStatus = error.localizedDescription
             handle(error)
+        }
+    }
+
+    func loadMcpServers() async {
+        mcpBusy = true
+        defer { mcpBusy = false }
+        do {
+            mcpServers = try await core.listMcpServers()
+            mcpStatus = nil
+        } catch {
+            mcpStatus = error.localizedDescription
+        }
+    }
+
+    func addMcpServer(name: String, command: String, args: [String]) async {
+        mcpBusy = true
+        defer { mcpBusy = false }
+        do {
+            _ = try await core.addMcpServer(name: name, command: command, args: args)
+            mcpStatus = "MCP server added."
+            await loadMcpServers()
+        } catch {
+            mcpStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func setMcpServerEnabled(_ server: McpServer, enabled: Bool) async {
+        mcpBusy = true
+        defer { mcpBusy = false }
+        do {
+            _ = try await core.updateMcpServer(server, enabled: enabled)
+            await loadMcpServers()
+        } catch {
+            mcpStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func removeMcpServer(id: String) async {
+        mcpBusy = true
+        defer { mcpBusy = false }
+        do {
+            _ = try await core.removeMcpServer(id: id)
+            mcpTools[id] = nil
+            mcpToolStatus[id] = nil
+            await loadMcpServers()
+        } catch {
+            mcpStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadMcpTools(serverID: String) async {
+        mcpToolStatus[serverID] = "loading…"
+        do {
+            let tools = try await core.listMcpTools(serverID: serverID)
+            mcpTools[serverID] = tools
+            mcpToolStatus[serverID] = "\(tools.count) tools"
+        } catch {
+            mcpToolStatus[serverID] = error.localizedDescription
         }
     }
 

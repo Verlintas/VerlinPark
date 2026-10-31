@@ -12,12 +12,13 @@ use uuid::Uuid;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
     ArtifactMaterialization, ArtifactPolicy, DoctorCheck, Event, IntegrationPolicy,
-    MailboxGcResult, MailboxPolicy, MemoryItem, MemoryListResult, MergeQueueEntry, Project,
-    ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
-    QuestionListResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
-    SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
-    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
-    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
+    MailboxGcResult, MailboxPolicy, McpCallResult, McpServer, McpServerListResult,
+    McpToolListResult, MemoryItem, MemoryListResult, MergeQueueEntry, Project, ProjectBudget,
+    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
+    SearchResult, Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult,
+    SessionLandResult, SessionLogStatus, SessionRehydrateResult, SessionReplayReport,
+    SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket,
+    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
     WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
 };
 use vp_store::Store;
@@ -27,6 +28,7 @@ use crate::budget::BudgetRegistry;
 
 pub mod agent;
 pub mod budget;
+pub mod mcp;
 pub mod rebuild;
 
 pub use rebuild::rebuild_database;
@@ -3644,6 +3646,92 @@ impl Engine {
         }
         let _ = self.events.send(event);
         Ok(Some(question))
+    }
+
+    pub async fn list_mcp_servers(&self) -> Result<McpServerListResult> {
+        let store = self.store.clone();
+        let servers = tokio::task::spawn_blocking(move || store.list_mcp_servers()).await??;
+        Ok(McpServerListResult { servers })
+    }
+
+    pub async fn add_mcp_server(
+        &self,
+        name: &str,
+        command: &str,
+        args: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        enabled: bool,
+    ) -> Result<McpServer> {
+        if name.trim().is_empty() || command.trim().is_empty() {
+            anyhow::bail!("MCP server name and command are required");
+        }
+        let store = self.store.clone();
+        let name = name.trim().to_string();
+        let command = command.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            store.add_mcp_server(&name, &command, &args, &env, enabled)
+        })
+        .await?
+    }
+
+    pub async fn update_mcp_server(
+        &self,
+        id: &str,
+        name: &str,
+        command: &str,
+        args: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        enabled: bool,
+    ) -> Result<Option<McpServer>> {
+        if name.trim().is_empty() || command.trim().is_empty() {
+            anyhow::bail!("MCP server name and command are required");
+        }
+        let store = self.store.clone();
+        let id = id.to_string();
+        let name = name.trim().to_string();
+        let command = command.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            store.update_mcp_server(&id, &name, &command, &args, &env, enabled)
+        })
+        .await?
+    }
+
+    pub async fn remove_mcp_server(&self, id: &str) -> Result<bool> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.remove_mcp_server(&id)).await?
+    }
+
+    pub async fn mcp_tools(&self, server_id: &str) -> Result<McpToolListResult> {
+        let store = self.store.clone();
+        let id = server_id.to_string();
+        let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
+        let tools = mcp::list_tools(&server).await?;
+        Ok(McpToolListResult {
+            server_id: server_id.to_string(),
+            tools,
+        })
+    }
+
+    pub async fn mcp_call(
+        &self,
+        server_id: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<McpCallResult> {
+        let store = self.store.clone();
+        let id = server_id.to_string();
+        let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
+        let result = mcp::call_tool(&server, tool, arguments).await?;
+        Ok(McpCallResult {
+            server_id: server_id.to_string(),
+            tool: tool.to_string(),
+            result,
+        })
     }
 
     pub async fn list_questions(&self, session_id: Option<String>) -> Result<QuestionListResult> {

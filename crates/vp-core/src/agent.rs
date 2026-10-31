@@ -4355,6 +4355,7 @@ async fn run_loop(
             );
             let is_memory_tool = matches!(call.name.as_str(), "remember" | "recall");
             let is_question_tool = call.name == "ask_user" && spec.role != AgentRole::Verifier;
+            let is_mcp_tool = call.name == "mcp";
             let registry_tool = config
                 .tools
                 .get(&call.name)
@@ -4371,6 +4372,10 @@ async fn run_loop(
                     || is_question_tool
                 {
                     false
+                } else if is_mcp_tool
+                    && input.get("action").and_then(serde_json::Value::as_str) == Some("call")
+                {
+                    true
                 } else {
                     registry_tool
                         .as_ref()
@@ -4518,6 +4523,23 @@ async fn run_loop(
                 match run_mailbox_tool(engine, session, spec, &call.name, input.clone()).await {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("mailbox error: {error}")),
+                }
+            } else if is_mcp_tool {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_mcp_tool(engine, input.clone()).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("MCP error: {error}")),
                 }
             } else if is_question_tool {
                 emit(
@@ -5013,6 +5035,86 @@ async fn run_loop(
     Err(anyhow!("maximum turns reached"))
 }
 
+async fn run_mcp_tool(engine: &Engine, input: serde_json::Value) -> Result<ToolOutput> {
+    let action = input
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("action is required"))?;
+    let servers = engine.list_mcp_servers().await?.servers;
+    let server = input
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .map(|selector| {
+            servers
+                .iter()
+                .find(|server| server.id == selector || server.name == selector)
+                .cloned()
+                .ok_or_else(|| anyhow!("MCP server not found: {selector}"))
+        })
+        .transpose()?;
+    match action {
+        "list" => {
+            if let Some(server) = server {
+                let tools = engine.mcp_tools(&server.id).await?.tools;
+                let mut text = format!(
+                    "MCP server {} ({}):
+",
+                    server.name, server.id
+                );
+                for tool in tools {
+                    text.push_str(&format!(
+                        "- {}: {}
+",
+                        tool.name,
+                        truncate_to(&tool.description, 300)
+                    ));
+                }
+                if text.ends_with(":\n") {
+                    text.push_str("(no tools)");
+                }
+                Ok(ToolOutput::ok(text))
+            } else {
+                let mut text = String::from(
+                    "MCP servers:
+",
+                );
+                for server in servers {
+                    text.push_str(&format!(
+                        "- {} ({}) [{}] {}
+",
+                        server.name,
+                        server.id,
+                        if server.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        server.command
+                    ));
+                }
+                Ok(ToolOutput::ok(text))
+            }
+        }
+        "call" => {
+            let server = server.ok_or_else(|| anyhow!("server is required for action=call"))?;
+            let tool = input
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("tool is required for action=call"))?;
+            let arguments = input
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let result = engine.mcp_call(&server.id, tool, arguments).await?;
+            Ok(ToolOutput::ok(truncate_to(
+                &serde_json::to_string_pretty(&result.result)?,
+                16_000,
+            )))
+        }
+        other => Ok(ToolOutput::error(format!("unknown MCP action: {other}"))),
+    }
+}
+
 async fn run_memory_tool(
     engine: &Engine,
     session: &Session,
@@ -5403,6 +5505,20 @@ fn tool_schemas(
             }),
         });
     }
+    tools.push(ToolSchema {
+        name: "mcp".to_string(),
+        description: "List configured MCP servers/tools or call one MCP tool. Calls require approval unless the agent is auto-approved.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "call"]},
+                "server": {"type": "string", "description": "MCP server id or name"},
+                "tool": {"type": "string"},
+                "arguments": {"type": "object"}
+            },
+            "required": ["action"]
+        }),
+    });
     if role == AgentRole::Leader {
         tools.push(ToolSchema {
             name: "todo_write".to_string(),
@@ -11277,6 +11393,116 @@ mod tests {
                     .is_some_and(|output| output.contains("User answered: yes"))
         }));
         assert!(events.iter().any(|event| event.kind == "question.answered"));
+    }
+
+    #[tokio::test]
+    async fn lists_and_calls_mcp_tools_from_an_agent() {
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("mcp_server.py");
+        std::fs::write(
+            &script,
+            r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "mock", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "echo", "description": "Echo text", "inputSchema": {"type": "object"}}]}
+    elif method == "tools/call":
+        result = {"content": [{"type": "text", "text": message.get("params", {}).get("arguments", {}).get("text", "")}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": message.get("id"), "result": result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "mcp_list".into(),
+                        name: "mcp".into(),
+                        arguments: serde_json::json!({
+                            "action": "list",
+                            "server": "mock"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "mcp_call".into(),
+                        name: "mcp".into(),
+                        arguments: serde_json::json!({
+                            "action": "call",
+                            "server": "mock",
+                            "tool": "echo",
+                            "arguments": {"text": "hello mcp"}
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![StreamEvent::TextDelta("mcp done".into()), StreamEvent::Done],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        engine
+            .store()
+            .add_mcp_server(
+                "mock",
+                "python3",
+                &[script.to_string_lossy().to_string()],
+                &std::collections::BTreeMap::new(),
+                true,
+            )
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "mcp tools".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..150 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        service.start(&session.id, "use mcp").await.unwrap();
+        let sessions = wait_until_idle(&engine, &session).await;
+        approver.abort();
+        assert_eq!(sessions.status, "idle");
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "mcp"
+                && event.payload["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("hello mcp"))
+        }));
     }
 
     #[tokio::test]

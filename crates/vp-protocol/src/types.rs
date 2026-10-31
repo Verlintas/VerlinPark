@@ -417,6 +417,85 @@ pub struct AnswerQuestionResult {
     pub answered: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpServer {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddMcpServerParams {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateMcpServerParams {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerIdParams {
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpServerListResult {
+    pub servers: Vec<McpServer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpTool {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpToolListResult {
+    pub server_id: String,
+    pub tools: Vec<McpTool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpCallParams {
+    pub server_id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpCallResult {
+    pub server_id: String,
+    pub tool: String,
+    pub result: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: String,
