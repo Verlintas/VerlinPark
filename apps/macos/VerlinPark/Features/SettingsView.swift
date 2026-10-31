@@ -592,15 +592,20 @@ struct NotificationsSettingsView: View {
     }
 
     private func refreshAuthorization() async {
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        authorization = switch settings.authorizationStatus {
-        case .authorized: "authorized"
-        case .denied: "denied"
-        case .notDetermined: "not determined"
-        case .provisional: "provisional"
-        case .ephemeral: "ephemeral"
-        @unknown default: "unknown"
+        let label = await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                let value = switch settings.authorizationStatus {
+                case .authorized: "authorized"
+                case .denied: "denied"
+                case .notDetermined: "not determined"
+                case .provisional: "provisional"
+                case .ephemeral: "ephemeral"
+                @unknown default: "unknown"
+                }
+                continuation.resume(returning: value)
+            }
         }
+        authorization = label
     }
 }
 
