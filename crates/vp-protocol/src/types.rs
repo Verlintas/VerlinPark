@@ -510,6 +510,107 @@ pub struct McpToolListResult {
     pub tools: Vec<McpTool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpResource {
+    pub uri: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpResourceTemplate {
+    pub uri_template: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceListResult {
+    pub server_id: String,
+    pub resources: Vec<McpResource>,
+    #[serde(default)]
+    pub templates: Vec<McpResourceTemplate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpReadResourceParams {
+    pub server_id: String,
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceContent {
+    pub uri: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpReadResourceResult {
+    pub server_id: String,
+    pub uri: String,
+    pub contents: Vec<McpResourceContent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpPromptArgument {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpPrompt {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptListResult {
+    pub server_id: String,
+    pub prompts: Vec<McpPrompt>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpGetPromptParams {
+    pub server_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptMessage {
+    pub role: String,
+    pub content: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpGetPromptResult {
+    pub server_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub messages: Vec<McpPromptMessage>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpCallParams {
     pub server_id: String,

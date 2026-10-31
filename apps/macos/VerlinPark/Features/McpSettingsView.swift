@@ -131,10 +131,19 @@ private struct McpServerRow: View {
                 )
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                Button("Tools") {
-                    Task { await model.loadMcpTools(serverID: server.id) }
+                Menu("Inspect") {
+                    Button("Tools") {
+                        Task { await model.loadMcpTools(serverID: server.id) }
+                    }
+                    Button("Resources") {
+                        Task { await model.loadMcpResources(serverID: server.id) }
+                    }
+                    Button("Prompts") {
+                        Task { await model.loadMcpPrompts(serverID: server.id) }
+                    }
                 }
-                .buttonStyle(.bordered)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
                 .controlSize(.small)
                 Button("Remove") {
                     Task { await model.removeMcpServer(id: server.id) }
@@ -158,6 +167,34 @@ private struct McpServerRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(tools) { tool in
                         Text("\(tool.name) · \(tool.description)")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                .padding(.leading, 8)
+            }
+            if let resources = model.mcpResources[server.id] {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(resources.resources) { resource in
+                        Text("\(resource.name) <\(resource.uri)>")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    ForEach(resources.templates) { template in
+                        Text("template \(template.name) <\(template.uriTemplate)>")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(2)
+                    }
+                }
+                .padding(.leading, 8)
+            }
+            if let prompts = model.mcpPrompts[server.id] {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(prompts.prompts) { prompt in
+                        Text("\(prompt.name) · \(prompt.description)")
                             .font(.system(size: 8, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .lineLimit(2)

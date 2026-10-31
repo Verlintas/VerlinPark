@@ -29,14 +29,21 @@ external tools, but there was no configuration or client path.
    plus their configured env; provider/daemon secrets are not inherited.
 6. **Agent access.** A generic `mcp` tool lists servers/tools or calls a tool.
    `call` requires approval unless the agent is auto-approved; `list` does not.
-7. **Pagination.** `tools/list` follows `nextCursor` up to 50 pages / 2,000 tools
-   and rejects repeated cursors.
+7. **Pagination.** `tools/list`, `resources/list`, `resources/templates/list`, and
+   `prompts/list` follow `nextCursor` up to 50 pages / 2,000 items and reject
+   repeated cursors.
 8. **No dynamic schemas yet.** MCP tools are discovered at runtime instead of
    being injected as individual tool schemas. The agent must call `mcp` with
    `action=list` first.
 9. **Trust boundary.** Configured MCP servers run as local processes outside the
    shell sandbox. Only trusted commands should be added; env values are stored in
    the local database, not Keychain.
+10. **Resources and prompts.** `resources/list`, `resources/templates/list`,
+    `resources/read`, `prompts/list`, and `prompts/get` are exposed through the
+    `mcp` agent tool, CLI, RPC, and Settings inspect menu. Resource text is
+    returned to agents; binary resources report only URI, MIME type, and base64
+    length. Prompt messages are returned as JSON content blocks. Reads never
+    require approval; only `tools/call` does.
 
 ## Consequences
 
@@ -49,7 +56,8 @@ external tools, but there was no configuration or client path.
   reference path yet.
 - Servers can read/do whatever their process permissions allow; MCP is not
   sandboxed.
-- Resources, prompts, sampling, and server notifications are not handled.
+- Sampling and server notifications are not handled. Binary resources are sized
+  but not decoded or materialized.
 
 ## Alternatives considered
 
@@ -57,4 +65,6 @@ external tools, but there was no configuration or client path.
   servers and loses server-side session state between calls.
 - **Dynamic per-tool schemas:** better model ergonomics but requires schema
   refresh and conflict handling in every run.
+- **Tools only:** simpler, but ignores resources/prompts that servers already
+  expose for context and reusable instructions.
 - **Only CLI access:** misses the point of agent tool use.

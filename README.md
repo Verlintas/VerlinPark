@@ -176,7 +176,11 @@ just cli answer <question-id> "yes"
 just cli mcp-servers
 just cli mcp-add files npx --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp
 just cli mcp-tools <server-id>
-just cli mcp-call <server-id> echo --arguments '{"text":"hello"}' 
+just cli mcp-call <server-id> echo --arguments '{"text":"hello"}'
+just cli mcp-resources <server-id>
+just cli mcp-read-resource <server-id> file:///notes.md
+just cli mcp-prompts <server-id>
+just cli mcp-prompt <server-id> review --arg target=src/main.rs
 just cli project-budget <project-id>
 just cli project-budget-set <project-id> --token-budget 500000 --cost-budget-usd 5
 just cli doctor

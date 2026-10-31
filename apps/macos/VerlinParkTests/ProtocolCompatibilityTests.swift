@@ -106,6 +106,54 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(tools.tools.first?.description, "Echo text")
     }
 
+    func testMcpResourcesAndPromptsDecode() throws {
+        let resourcesJSON = """
+        {
+          "server_id": "server-1",
+          "resources": [{
+            "uri": "file:///notes.md",
+            "name": "notes",
+            "description": "Project notes",
+            "mime_type": "text/markdown"
+          }],
+          "templates": [{
+            "uri_template": "file:///{path}",
+            "name": "file",
+            "description": "Read a file",
+            "mime_type": "text/plain"
+          }]
+        }
+        """
+        let resources = try JSONDecoder().decode(
+            McpResourceListResult.self,
+            from: Data(resourcesJSON.utf8)
+        )
+        XCTAssertEqual(resources.resources.first?.uri, "file:///notes.md")
+        XCTAssertEqual(resources.resources.first?.mimeType, "text/markdown")
+        XCTAssertEqual(resources.templates.first?.uriTemplate, "file:///{path}")
+
+        let promptsJSON = """
+        {
+          "server_id": "server-1",
+          "prompts": [{
+            "name": "review",
+            "description": "Review code",
+            "arguments": [{
+              "name": "target",
+              "description": "Path",
+              "required": true
+            }]
+          }]
+        }
+        """
+        let prompts = try JSONDecoder().decode(
+            McpPromptListResult.self,
+            from: Data(promptsJSON.utf8)
+        )
+        XCTAssertEqual(prompts.prompts.first?.name, "review")
+        XCTAssertTrue(prompts.prompts.first?.arguments.first?.required == true)
+    }
+
     func testShellPolicyWithoutRestrictHomeStillDecodes() throws {
         let json = #"{"network":"allow","read_deny":["~/secret"]}"#
         let policy = try JSONDecoder().decode(ShellPolicy.self, from: Data(json.utf8))

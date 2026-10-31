@@ -9,11 +9,14 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use vp_protocol::types::{McpServer, McpTool};
+use vp_protocol::types::{
+    McpPrompt, McpPromptListResult, McpPromptMessage, McpReadResourceResult, McpResource,
+    McpResourceContent, McpResourceListResult, McpResourceTemplate, McpServer, McpTool,
+};
 
 const MCP_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_TOOL_PAGES: usize = 50;
-const MAX_TOOLS: usize = 2_000;
+const MAX_PAGES: usize = 50;
+const MAX_ITEMS: usize = 2_000;
 
 /// A transport failure (closed pipe, process exit, timeout) as opposed to a
 /// JSON-RPC error returned by a healthy MCP server. Tool calls are never
@@ -281,6 +284,182 @@ impl McpManager {
         result
     }
 
+    pub async fn list_resources(&self, server: &McpServer) -> Result<McpResourceListResult> {
+        ensure_enabled(server)?;
+        let mut resources = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut complete = false;
+        for _ in 0..MAX_PAGES {
+            let params = cursor
+                .as_ref()
+                .map(|cursor| json!({ "cursor": cursor }))
+                .unwrap_or_else(|| json!({}));
+            let result = self.read_request(server, "resources/list", params).await?;
+            resources.extend(parse_resources(&result)?);
+            if resources.len() > MAX_ITEMS {
+                bail!(
+                    "MCP server {} exposes more than {MAX_ITEMS} resources",
+                    server.name
+                );
+            }
+            match result.get("nextCursor").and_then(Value::as_str) {
+                Some(next) if !next.is_empty() => {
+                    if !seen.insert(next.to_string()) {
+                        bail!("MCP resources/list cursor repeated: {next}");
+                    }
+                    cursor = Some(next.to_string());
+                }
+                _ => {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            bail!("MCP resources/list exceeded {MAX_PAGES} pages");
+        }
+        let templates = match self.list_resource_templates(server).await {
+            Ok(templates) => templates,
+            Err(error) => {
+                tracing::debug!(%error, "MCP resources/templates/list unavailable");
+                Vec::new()
+            }
+        };
+        Ok(McpResourceListResult {
+            server_id: server.id.clone(),
+            resources,
+            templates,
+        })
+    }
+
+    pub async fn read_resource(
+        &self,
+        server: &McpServer,
+        uri: &str,
+    ) -> Result<McpReadResourceResult> {
+        ensure_enabled(server)?;
+        if uri.trim().is_empty() {
+            bail!("MCP resource uri is required");
+        }
+        let result = self
+            .read_request(server, "resources/read", json!({ "uri": uri }))
+            .await?;
+        let contents = result
+            .get("contents")
+            .cloned()
+            .ok_or_else(|| anyhow!("MCP resources/read response has no contents"))?
+            .as_array()
+            .ok_or_else(|| anyhow!("MCP resources/read contents is not an array"))?
+            .iter()
+            .map(|item| McpResourceContent {
+                uri: item
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or(uri)
+                    .to_string(),
+                mime_type: item
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                text: item.get("text").and_then(Value::as_str).map(str::to_string),
+                blob: item.get("blob").and_then(Value::as_str).map(str::to_string),
+            })
+            .collect();
+        Ok(McpReadResourceResult {
+            server_id: server.id.clone(),
+            uri: uri.to_string(),
+            contents,
+        })
+    }
+
+    pub async fn list_prompts(&self, server: &McpServer) -> Result<McpPromptListResult> {
+        ensure_enabled(server)?;
+        let mut prompts = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut complete = false;
+        for _ in 0..MAX_PAGES {
+            let params = cursor
+                .as_ref()
+                .map(|cursor| json!({ "cursor": cursor }))
+                .unwrap_or_else(|| json!({}));
+            let result = self.read_request(server, "prompts/list", params).await?;
+            prompts.extend(parse_prompts(&result)?);
+            if prompts.len() > MAX_ITEMS {
+                bail!(
+                    "MCP server {} exposes more than {MAX_ITEMS} prompts",
+                    server.name
+                );
+            }
+            match result.get("nextCursor").and_then(Value::as_str) {
+                Some(next) if !next.is_empty() => {
+                    if !seen.insert(next.to_string()) {
+                        bail!("MCP prompts/list cursor repeated: {next}");
+                    }
+                    cursor = Some(next.to_string());
+                }
+                _ => {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            bail!("MCP prompts/list exceeded {MAX_PAGES} pages");
+        }
+        Ok(McpPromptListResult {
+            server_id: server.id.clone(),
+            prompts,
+        })
+    }
+
+    pub async fn get_prompt(
+        &self,
+        server: &McpServer,
+        name: &str,
+        arguments: std::collections::BTreeMap<String, String>,
+    ) -> Result<vp_protocol::types::McpGetPromptResult> {
+        ensure_enabled(server)?;
+        if name.trim().is_empty() {
+            bail!("MCP prompt name is required");
+        }
+        let result = self
+            .read_request(
+                server,
+                "prompts/get",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+        let messages = result
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| McpPromptMessage {
+                        role: message
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .unwrap_or("user")
+                            .to_string(),
+                        content: message.get("content").cloned().unwrap_or(Value::Null),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(vp_protocol::types::McpGetPromptResult {
+            server_id: server.id.clone(),
+            name: name.to_string(),
+            description: result
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            messages,
+        })
+    }
+
     pub async fn invalidate(&self, server_id: &str) {
         self.connections.lock().await.remove(server_id);
     }
@@ -352,12 +531,80 @@ impl McpManager {
         result
     }
 
+    async fn read_request(&self, server: &McpServer, method: &str, params: Value) -> Result<Value> {
+        match self.read_request_once(server, method, params.clone()).await {
+            Ok(result) => Ok(result),
+            Err(error) if is_transport(&error) => {
+                self.read_request_once(server, method, params).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn read_request_once(
+        &self,
+        server: &McpServer,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        let connection = self.connection(server).await?;
+        let result = self.request_on(&connection, method, params).await;
+        if let Err(error) = &result
+            && is_transport(error)
+        {
+            self.invalidate_connection(&server.id, &connection).await;
+        }
+        result
+    }
+
+    async fn list_resource_templates(
+        &self,
+        server: &McpServer,
+    ) -> Result<Vec<McpResourceTemplate>> {
+        let mut templates = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut complete = false;
+        for _ in 0..MAX_PAGES {
+            let params = cursor
+                .as_ref()
+                .map(|cursor| json!({ "cursor": cursor }))
+                .unwrap_or_else(|| json!({}));
+            let result = self
+                .read_request(server, "resources/templates/list", params)
+                .await?;
+            templates.extend(parse_resource_templates(&result)?);
+            if templates.len() > MAX_ITEMS {
+                bail!(
+                    "MCP server {} exposes more than {MAX_ITEMS} resource templates",
+                    server.name
+                );
+            }
+            match result.get("nextCursor").and_then(Value::as_str) {
+                Some(next) if !next.is_empty() => {
+                    if !seen.insert(next.to_string()) {
+                        bail!("MCP resources/templates/list cursor repeated: {next}");
+                    }
+                    cursor = Some(next.to_string());
+                }
+                _ => {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            bail!("MCP resources/templates/list exceeded {MAX_PAGES} pages");
+        }
+        Ok(templates)
+    }
+
     async fn list_tools_once(&self, server: &McpServer) -> Result<Vec<McpTool>> {
         let connection = self.connection(server).await?;
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
-        for _ in 0..MAX_TOOL_PAGES {
+        for _ in 0..MAX_PAGES {
             let params = cursor
                 .as_ref()
                 .map(|cursor| json!({ "cursor": cursor }))
@@ -373,9 +620,9 @@ impl McpManager {
                 }
             };
             tools.extend(parse_tools(&result)?);
-            if tools.len() > MAX_TOOLS {
+            if tools.len() > MAX_ITEMS {
                 bail!(
-                    "MCP server {} exposes more than {MAX_TOOLS} tools",
+                    "MCP server {} exposes more than {MAX_ITEMS} tools",
                     server.name
                 );
             }
@@ -389,7 +636,7 @@ impl McpManager {
                 _ => return Ok(tools),
             }
         }
-        bail!("MCP tools/list exceeded {MAX_TOOL_PAGES} pages")
+        bail!("MCP tools/list exceeded {MAX_PAGES} pages")
     }
 
     async fn invalidate_connection(&self, server_id: &str, connection: &Arc<McpConnection>) {
@@ -408,6 +655,122 @@ fn ensure_enabled(server: &McpServer) -> Result<()> {
         bail!("MCP server {} is disabled", server.name);
     }
     Ok(())
+}
+
+fn parse_resources(result: &Value) -> Result<Vec<McpResource>> {
+    result
+        .get("resources")
+        .cloned()
+        .ok_or_else(|| anyhow!("MCP resources/list response has no resources"))?
+        .as_array()
+        .ok_or_else(|| anyhow!("MCP resources/list resources is not an array"))?
+        .iter()
+        .map(|resource| {
+            Ok(McpResource {
+                uri: resource
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("MCP resource has no uri"))?
+                    .to_string(),
+                name: resource
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                description: resource
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                mime_type: resource
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+fn parse_resource_templates(result: &Value) -> Result<Vec<McpResourceTemplate>> {
+    result
+        .get("resourceTemplates")
+        .cloned()
+        .ok_or_else(|| anyhow!("MCP resources/templates/list response has no templates"))?
+        .as_array()
+        .ok_or_else(|| anyhow!("MCP resourceTemplates is not an array"))?
+        .iter()
+        .map(|template| {
+            Ok(McpResourceTemplate {
+                uri_template: template
+                    .get("uriTemplate")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("MCP resource template has no uriTemplate"))?
+                    .to_string(),
+                name: template
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                description: template
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                mime_type: template
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+fn parse_prompts(result: &Value) -> Result<Vec<McpPrompt>> {
+    result
+        .get("prompts")
+        .cloned()
+        .ok_or_else(|| anyhow!("MCP prompts/list response has no prompts"))?
+        .as_array()
+        .ok_or_else(|| anyhow!("MCP prompts/list prompts is not an array"))?
+        .iter()
+        .map(|prompt| {
+            Ok(McpPrompt {
+                name: prompt
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("MCP prompt has no name"))?
+                    .to_string(),
+                description: prompt
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                arguments: prompt
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .map(|arguments| {
+                        arguments
+                            .iter()
+                            .filter_map(|argument| {
+                                Some(vp_protocol::types::McpPromptArgument {
+                                    name: argument.get("name")?.as_str()?.to_string(),
+                                    description: argument
+                                        .get("description")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    required: argument
+                                        .get("required")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 fn parse_tools(result: &Value) -> Result<Vec<McpTool>> {
@@ -488,6 +851,17 @@ for line in sys.stdin:
             result = {"tools": [{"name": "echo", "description": "Echo text", "inputSchema": {"type": "object"}}]}
     elif method == "tools/call":
         result = {"content": [{"type": "text", "text": message.get("params", {}).get("arguments", {}).get("text", "")}]}
+    elif method == "resources/list":
+        result = {"resources": [{"uri": "file:///notes.md", "name": "notes", "description": "Project notes", "mimeType": "text/markdown"}]}
+    elif method == "resources/templates/list":
+        result = {"resourceTemplates": [{"uriTemplate": "file:///{path}", "name": "file", "description": "Read a file", "mimeType": "text/plain"}]}
+    elif method == "resources/read":
+        result = {"contents": [{"uri": message.get("params", {}).get("uri"), "mimeType": "text/markdown", "text": "hello resource"}]}
+    elif method == "prompts/list":
+        result = {"prompts": [{"name": "review", "description": "Review code", "arguments": [{"name": "target", "description": "Path", "required": True}]}]}
+    elif method == "prompts/get":
+        target = message.get("params", {}).get("arguments", {}).get("target", "")
+        result = {"description": "Review template", "messages": [{"role": "user", "content": {"type": "text", "text": "Review " + target}}]}
     else:
         result = {}
     print(json.dumps({"jsonrpc": "2.0", "id": message.get("id"), "result": result}), flush=True)
@@ -567,6 +941,44 @@ for line in sys.stdin:
         assert_eq!(manager.connection_count().await, 0);
         manager.list_tools(&server).await.unwrap();
         assert_eq!(startup_count(&log), 2);
+    }
+
+    #[tokio::test]
+    async fn lists_and_reads_resources_and_prompts() {
+        let dir = TempDir::new().unwrap();
+        let server = mock_server(&dir);
+        let manager = McpManager::new(Duration::from_secs(60));
+        let resources = manager.list_resources(&server).await.unwrap();
+        assert_eq!(resources.resources.len(), 1);
+        assert_eq!(resources.resources[0].uri, "file:///notes.md");
+        assert_eq!(
+            resources.resources[0].mime_type.as_deref(),
+            Some("text/markdown")
+        );
+        assert_eq!(resources.templates.len(), 1);
+        assert_eq!(resources.templates[0].uri_template, "file:///{path}");
+
+        let content = manager
+            .read_resource(&server, "file:///notes.md")
+            .await
+            .unwrap();
+        assert_eq!(content.contents.len(), 1);
+        assert_eq!(content.contents[0].text.as_deref(), Some("hello resource"));
+
+        let prompts = manager.list_prompts(&server).await.unwrap();
+        assert_eq!(prompts.prompts.len(), 1);
+        assert_eq!(prompts.prompts[0].name, "review");
+        assert!(prompts.prompts[0].arguments[0].required);
+
+        let mut arguments = std::collections::BTreeMap::new();
+        arguments.insert("target".to_string(), "src/main.rs".to_string());
+        let prompt = manager
+            .get_prompt(&server, "review", arguments)
+            .await
+            .unwrap();
+        assert_eq!(prompt.description, "Review template");
+        assert_eq!(prompt.messages.len(), 1);
+        assert_eq!(prompt.messages[0].content["text"], "Review src/main.rs");
     }
 
     #[tokio::test]

@@ -88,6 +88,8 @@ final class AppModel {
     var mcpBusy = false
     var mcpStatus: String?
     var mcpTools: [String: [McpTool]] = [:]
+    var mcpResources: [String: McpResourceListResult] = [:]
+    var mcpPrompts: [String: McpPromptListResult] = [:]
     var mcpToolStatus: [String: String] = [:]
     var memories: [MemoryItem] = []
     var memoryQuery = ""
@@ -811,6 +813,8 @@ final class AppModel {
         do {
             _ = try await core.removeMcpServer(id: id)
             mcpTools[id] = nil
+            mcpResources[id] = nil
+            mcpPrompts[id] = nil
             mcpToolStatus[id] = nil
             await loadMcpServers()
         } catch {
@@ -825,6 +829,29 @@ final class AppModel {
             let tools = try await core.listMcpTools(serverID: serverID)
             mcpTools[serverID] = tools
             mcpToolStatus[serverID] = "\(tools.count) tools"
+        } catch {
+            mcpToolStatus[serverID] = error.localizedDescription
+        }
+    }
+
+    func loadMcpResources(serverID: String) async {
+        mcpToolStatus[serverID] = "loading resources…"
+        do {
+            let result = try await core.listMcpResources(serverID: serverID)
+            mcpResources[serverID] = result
+            mcpToolStatus[serverID] =
+                "\(result.resources.count) resources · \(result.templates.count) templates"
+        } catch {
+            mcpToolStatus[serverID] = error.localizedDescription
+        }
+    }
+
+    func loadMcpPrompts(serverID: String) async {
+        mcpToolStatus[serverID] = "loading prompts…"
+        do {
+            let result = try await core.listMcpPrompts(serverID: serverID)
+            mcpPrompts[serverID] = result
+            mcpToolStatus[serverID] = "\(result.prompts.count) prompts"
         } catch {
             mcpToolStatus[serverID] = error.localizedDescription
         }

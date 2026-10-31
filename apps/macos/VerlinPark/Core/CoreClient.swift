@@ -549,6 +549,22 @@ actor CoreClient {
         .tools
     }
 
+    func listMcpResources(serverID: String) async throws -> McpResourceListResult {
+        try await request(
+            method: "mcp.resources",
+            params: ["server_id": .string(serverID)]
+        )
+        .decode(McpResourceListResult.self)
+    }
+
+    func listMcpPrompts(serverID: String) async throws -> McpPromptListResult {
+        try await request(
+            method: "mcp.prompts",
+            params: ["server_id": .string(serverID)]
+        )
+        .decode(McpPromptListResult.self)
+    }
+
     func callMcpTool(serverID: String, tool: String, arguments: JSONValue) async throws -> McpCallResult {
         let params: [String: JSONValue] = [
             "server_id": .string(serverID),

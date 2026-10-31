@@ -5111,6 +5111,129 @@ async fn run_mcp_tool(engine: &Engine, input: serde_json::Value) -> Result<ToolO
                 16_000,
             )))
         }
+        "resources" => {
+            let server =
+                server.ok_or_else(|| anyhow!("server is required for action=resources"))?;
+            let result = engine.mcp_resources(&server.id).await?;
+            let mut text = format!("MCP resources on {}:\n", server.name);
+            for resource in &result.resources {
+                text.push_str(&format!("- {} <{}>", resource.name, resource.uri));
+                if let Some(mime_type) = &resource.mime_type {
+                    text.push_str(&format!(" [{mime_type}]"));
+                }
+                if !resource.description.is_empty() {
+                    text.push_str(&format!(": {}", truncate_to(&resource.description, 200)));
+                }
+                text.push('\n');
+            }
+            for template in &result.templates {
+                text.push_str(&format!(
+                    "- template {} <{}>: {}\n",
+                    template.name,
+                    template.uri_template,
+                    truncate_to(&template.description, 200)
+                ));
+            }
+            if result.resources.is_empty() && result.templates.is_empty() {
+                text.push_str("(no resources)");
+            }
+            Ok(ToolOutput::ok(text))
+        }
+        "read_resource" => {
+            let server =
+                server.ok_or_else(|| anyhow!("server is required for action=read_resource"))?;
+            let uri = input
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("uri is required for action=read_resource"))?;
+            let result = engine.mcp_read_resource(&server.id, uri).await?;
+            let mut text = String::new();
+            for content in result.contents {
+                if let Some(body) = content.text {
+                    text.push_str(&body);
+                    text.push('\n');
+                } else if let Some(blob) = content.blob {
+                    text.push_str(&format!(
+                        "[binary resource {}: {} base64 chars{}]\n",
+                        content.uri,
+                        blob.len(),
+                        content
+                            .mime_type
+                            .map(|mime| format!(", {mime}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+            if text.is_empty() {
+                text.push_str("(empty resource)");
+            }
+            Ok(ToolOutput::ok(truncate_to(&text, 16_000)))
+        }
+        "prompts" => {
+            let server = server.ok_or_else(|| anyhow!("server is required for action=prompts"))?;
+            let result = engine.mcp_prompts(&server.id).await?;
+            let mut text = format!("MCP prompts on {}:\n", server.name);
+            for prompt in result.prompts {
+                text.push_str(&format!(
+                    "- {}: {}",
+                    prompt.name,
+                    truncate_to(&prompt.description, 200)
+                ));
+                if !prompt.arguments.is_empty() {
+                    let arguments = prompt
+                        .arguments
+                        .iter()
+                        .map(|argument| {
+                            if argument.required {
+                                format!("{}=?", argument.name)
+                            } else {
+                                format!("{}?", argument.name)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    text.push_str(&format!(" ({arguments})"));
+                }
+                text.push('\n');
+            }
+            if text.ends_with(":\n") {
+                text.push_str("(no prompts)");
+            }
+            Ok(ToolOutput::ok(text))
+        }
+        "get_prompt" => {
+            let server =
+                server.ok_or_else(|| anyhow!("server is required for action=get_prompt"))?;
+            let prompt = input
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("prompt is required for action=get_prompt"))?;
+            let arguments = input
+                .get("prompt_arguments")
+                .and_then(serde_json::Value::as_object)
+                .map(|arguments| {
+                    arguments
+                        .iter()
+                        .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let result = engine.mcp_prompt(&server.id, prompt, arguments).await?;
+            let mut text = String::new();
+            if !result.description.is_empty() {
+                text.push_str(&result.description);
+                text.push_str("\n\n");
+            }
+            for message in result.messages {
+                text.push_str(&format!("[{}] ", message.role));
+                text.push_str(&truncate_to(
+                    &serde_json::to_string(&message.content)?,
+                    4_000,
+                ));
+                text.push('\n');
+            }
+            Ok(ToolOutput::ok(truncate_to(&text, 16_000)))
+        }
         other => Ok(ToolOutput::error(format!("unknown MCP action: {other}"))),
     }
 }
@@ -5507,14 +5630,24 @@ fn tool_schemas(
     }
     tools.push(ToolSchema {
         name: "mcp".to_string(),
-        description: "List configured MCP servers/tools or call one MCP tool. Calls require approval unless the agent is auto-approved.".to_string(),
+        description: "Inspect configured MCP servers and use their tools, resources, or prompts. Tool calls require approval unless the agent is auto-approved.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["list", "call"]},
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "call", "resources", "read_resource", "prompts", "get_prompt"]
+                },
                 "server": {"type": "string", "description": "MCP server id or name"},
                 "tool": {"type": "string"},
-                "arguments": {"type": "object"}
+                "arguments": {"type": "object", "description": "Tool arguments for action=call"},
+                "uri": {"type": "string", "description": "Resource URI for action=read_resource"},
+                "prompt": {"type": "string", "description": "Prompt name for action=get_prompt"},
+                "prompt_arguments": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "String arguments for action=get_prompt"
+                }
             },
             "required": ["action"]
         }),
@@ -11417,6 +11550,12 @@ for line in sys.stdin:
         result = {"tools": [{"name": "echo", "description": "Echo text", "inputSchema": {"type": "object"}}]}
     elif method == "tools/call":
         result = {"content": [{"type": "text", "text": message.get("params", {}).get("arguments", {}).get("text", "")}]}
+    elif method == "resources/list":
+        result = {"resources": [{"uri": "file:///notes.md", "name": "notes", "description": "Project notes", "mimeType": "text/markdown"}]}
+    elif method == "resources/templates/list":
+        result = {"resourceTemplates": []}
+    elif method == "resources/read":
+        result = {"contents": [{"uri": "file:///notes.md", "mimeType": "text/markdown", "text": "hello resource"}]}
     else:
         result = {}
     print(json.dumps({"jsonrpc": "2.0", "id": message.get("id"), "result": result}), flush=True)
@@ -11446,6 +11585,18 @@ for line in sys.stdin:
                             "server": "mock",
                             "tool": "echo",
                             "arguments": {"text": "hello mcp"}
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "mcp_resources".into(),
+                        name: "mcp".into(),
+                        arguments: serde_json::json!({
+                            "action": "resources",
+                            "server": "mock"
                         })
                         .to_string(),
                     }),
@@ -11502,6 +11653,13 @@ for line in sys.stdin:
                 && event.payload["output"]
                     .as_str()
                     .is_some_and(|output| output.contains("hello mcp"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "mcp"
+                && event.payload["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("notes <file:///notes.md>"))
         }));
     }
 

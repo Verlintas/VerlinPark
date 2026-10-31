@@ -12,7 +12,8 @@ use uuid::Uuid;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
     ArtifactMaterialization, ArtifactPolicy, DoctorCheck, Event, IntegrationPolicy,
-    MailboxGcResult, MailboxPolicy, McpCallResult, McpServer, McpServerListResult,
+    MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult, McpPromptListResult,
+    McpReadResourceResult, McpResourceListResult, McpServer, McpServerListResult,
     McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPruneResult,
     MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult,
     PullRequestResult, Question, QuestionListResult, SearchResult, Session, SessionBundle,
@@ -3822,6 +3823,51 @@ impl Engine {
             tool: tool.to_string(),
             result,
         })
+    }
+
+    pub async fn mcp_resources(&self, server_id: &str) -> Result<McpResourceListResult> {
+        let store = self.store.clone();
+        let id = server_id.to_string();
+        let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
+        self.mcp.list_resources(&server).await
+    }
+
+    pub async fn mcp_read_resource(
+        &self,
+        server_id: &str,
+        uri: &str,
+    ) -> Result<McpReadResourceResult> {
+        let store = self.store.clone();
+        let id = server_id.to_string();
+        let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
+        self.mcp.read_resource(&server, uri).await
+    }
+
+    pub async fn mcp_prompts(&self, server_id: &str) -> Result<McpPromptListResult> {
+        let store = self.store.clone();
+        let id = server_id.to_string();
+        let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
+        self.mcp.list_prompts(&server).await
+    }
+
+    pub async fn mcp_prompt(
+        &self,
+        server_id: &str,
+        name: &str,
+        arguments: std::collections::BTreeMap<String, String>,
+    ) -> Result<McpGetPromptResult> {
+        let store = self.store.clone();
+        let id = server_id.to_string();
+        let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
+        self.mcp.get_prompt(&server, name, arguments).await
     }
 
     pub async fn list_questions(&self, session_id: Option<String>) -> Result<QuestionListResult> {

@@ -31,20 +31,20 @@ use vp_protocol::types::{
     DoctorCheck, DoctorReport, EventListResult, IntegrationPolicyParams, IntegrationPolicyResult,
     LandSessionParams, ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams,
     MailboxListParams, MailboxListResult, MailboxPolicyParams, MailboxPolicyResult,
-    MarkMessageReadParams, McpCallParams, McpServerIdParams, MemoryCreateParams,
-    MemoryCreateResult, MemoryDeleteParams, MemoryListParams, MemoryPruneParams,
-    MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams, PingResult,
-    ProjectBudgetParams, ProjectListResult, ProjectUsageParams, PromptParams, PromptResult,
-    QuestionListParams, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
-    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
-    RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams, SessionExportParams,
-    SessionImportParams, SessionListResult, SessionLogParams, SessionPauseParams,
-    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams,
-    SessionResumeResult, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
-    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
-    SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams,
-    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult, UpdateMcpServerParams,
-    UsageLedgerParams, WorktreePolicyParams,
+    MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpReadResourceParams,
+    McpServerIdParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
+    MemoryListParams, MemoryPruneParams, MergeQueueListParams, MergeQueueListResult,
+    OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams,
+    PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
+    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
+    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams,
+    SessionExportParams, SessionImportParams, SessionListResult, SessionLogParams,
+    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
+    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams,
+    ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
+    UpdateMcpServerParams, UsageLedgerParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -848,6 +848,42 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Ok(params) => match state
                 .engine
                 .mcp_call(&params.server_id, &params.tool, params.arguments)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.resources" => match parse_params::<McpServerIdParams>(request.params) {
+            Ok(params) => match state.engine.mcp_resources(&params.server_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.resource.read" => match parse_params::<McpReadResourceParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .mcp_read_resource(&params.server_id, &params.uri)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.prompts" => match parse_params::<McpServerIdParams>(request.params) {
+            Ok(params) => match state.engine.mcp_prompts(&params.server_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.prompt.get" => match parse_params::<McpGetPromptParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .mcp_prompt(&params.server_id, &params.name, params.arguments)
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),

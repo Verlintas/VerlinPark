@@ -49,6 +49,19 @@ enum Command {
         #[arg(long, default_value = "{}")]
         arguments: String,
     },
+    /// List resources exposed by an MCP server.
+    McpResources { server: String },
+    /// Read one MCP resource by URI.
+    McpReadResource { server: String, uri: String },
+    /// List prompts exposed by an MCP server.
+    McpPrompts { server: String },
+    /// Render one MCP prompt with KEY=VALUE arguments.
+    McpPrompt {
+        server: String,
+        name: String,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+    },
     /// Run local diagnostics.
     Doctor,
     /// Rebuild the metadata database from the project manifest and event mirrors.
@@ -425,6 +438,29 @@ async fn main() -> Result<()> {
                 &discovery,
                 "mcp.call",
                 json!({"server_id": server, "tool": tool, "arguments": arguments}),
+            )
+            .await?
+        }
+        Command::McpResources { server } => {
+            rpc(&discovery, "mcp.resources", json!({"server_id": server})).await?
+        }
+        Command::McpReadResource { server, uri } => {
+            rpc(
+                &discovery,
+                "mcp.resource.read",
+                json!({"server_id": server, "uri": uri}),
+            )
+            .await?
+        }
+        Command::McpPrompts { server } => {
+            rpc(&discovery, "mcp.prompts", json!({"server_id": server})).await?
+        }
+        Command::McpPrompt { server, name, args } => {
+            let arguments = parse_env_pairs(&args)?;
+            rpc(
+                &discovery,
+                "mcp.prompt.get",
+                json!({"server_id": server, "name": name, "arguments": arguments}),
             )
             .await?
         }
@@ -1261,6 +1297,86 @@ fn print_human(value: &Value) {
             server["name"].as_str().unwrap_or("?"),
             server["command"].as_str().unwrap_or("?")
         );
+        return;
+    }
+    if let Some(resources) = value.get("resources").and_then(Value::as_array) {
+        for resource in resources {
+            println!(
+                "{}  <{}>  {}",
+                resource["name"].as_str().unwrap_or("?"),
+                resource["uri"].as_str().unwrap_or("?"),
+                resource["mime_type"].as_str().unwrap_or("")
+            );
+            if let Some(description) = resource["description"].as_str()
+                && !description.is_empty()
+            {
+                println!("  {description}");
+            }
+        }
+        if let Some(templates) = value.get("templates").and_then(Value::as_array) {
+            for template in templates {
+                println!(
+                    "template {}  <{}>",
+                    template["name"].as_str().unwrap_or("?"),
+                    template["uri_template"].as_str().unwrap_or("?")
+                );
+            }
+        }
+        return;
+    }
+    if let Some(contents) = value.get("contents").and_then(Value::as_array) {
+        for content in contents {
+            if let Some(text) = content["text"].as_str() {
+                println!("{}", text);
+            } else if let Some(blob) = content["blob"].as_str() {
+                println!(
+                    "[binary {}: {} base64 chars]",
+                    content["uri"].as_str().unwrap_or("?"),
+                    blob.len()
+                );
+            }
+        }
+        return;
+    }
+    if let Some(prompts) = value.get("prompts").and_then(Value::as_array) {
+        for prompt in prompts {
+            println!(
+                "{}  {}",
+                prompt["name"].as_str().unwrap_or("?"),
+                prompt["description"].as_str().unwrap_or("")
+            );
+            if let Some(arguments) = prompt["arguments"].as_array() {
+                for argument in arguments {
+                    println!(
+                        "  {}{}",
+                        argument["name"].as_str().unwrap_or("?"),
+                        if argument["required"].as_bool().unwrap_or(false) {
+                            " (required)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+        return;
+    }
+    if let Some(messages) = value.get("messages").and_then(Value::as_array)
+        && value.get("server_id").is_some()
+    {
+        if let Some(description) = value["description"].as_str()
+            && !description.is_empty()
+        {
+            println!("{description}\n");
+        }
+        for message in messages {
+            println!(
+                "[{}] {}",
+                message["role"].as_str().unwrap_or("user"),
+                serde_json::to_string(&message["content"])
+                    .unwrap_or_else(|_| message["content"].to_string())
+            );
+        }
         return;
     }
     if let Some(tools) = value.get("tools").and_then(Value::as_array) {

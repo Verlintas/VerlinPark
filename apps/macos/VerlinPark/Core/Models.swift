@@ -174,6 +174,80 @@ struct McpToolListResult: Codable, Sendable {
     }
 }
 
+struct McpResource: Codable, Identifiable, Hashable, Sendable {
+    let uri: String
+    let name: String
+    let description: String
+    let mimeType: String?
+
+    var id: String {
+        uri
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case uri
+        case name
+        case description
+        case mimeType = "mime_type"
+    }
+}
+
+struct McpResourceTemplate: Codable, Identifiable, Hashable, Sendable {
+    let uriTemplate: String
+    let name: String
+    let description: String
+    let mimeType: String?
+
+    var id: String {
+        uriTemplate
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case uriTemplate = "uri_template"
+        case name
+        case description
+        case mimeType = "mime_type"
+    }
+}
+
+struct McpResourceListResult: Codable, Sendable {
+    let serverId: String
+    let resources: [McpResource]
+    let templates: [McpResourceTemplate]
+
+    enum CodingKeys: String, CodingKey {
+        case serverId = "server_id"
+        case resources
+        case templates
+    }
+}
+
+struct McpPromptArgument: Codable, Hashable, Sendable {
+    let name: String
+    let description: String
+    let required: Bool
+}
+
+struct McpPrompt: Codable, Identifiable, Hashable, Sendable {
+    let name: String
+    let description: String
+    let arguments: [McpPromptArgument]
+
+    var id: String {
+        name
+    }
+}
+
+struct McpPromptListResult: Codable, Sendable {
+    let serverId: String
+    let prompts: [McpPrompt]
+
+    enum CodingKeys: String, CodingKey {
+        case serverId = "server_id"
+        case prompts
+    }
+}
+
 struct McpCallResult: Codable, Sendable {
     let serverId: String
     let tool: String
