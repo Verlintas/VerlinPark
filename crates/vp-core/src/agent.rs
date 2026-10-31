@@ -5314,11 +5314,16 @@ async fn collect_dynamic_mcp_tools(engine: &Engine, role: AgentRole) -> Vec<McpT
             if !used.insert(exposed_name.clone()) {
                 continue;
             }
-            let parameters = if tool.input_schema.is_object() {
+            let mut parameters = if tool.input_schema.is_object() {
                 tool.input_schema.clone()
             } else {
-                serde_json::json!({"type": "object"})
+                serde_json::json!({})
             };
+            if parameters.get("type").is_none()
+                && let Some(object) = parameters.as_object_mut()
+            {
+                object.insert("type".to_string(), serde_json::json!("object"));
+            }
             bindings.push(McpToolBinding {
                 exposed_name: exposed_name.clone(),
                 server_id: server.id.clone(),
