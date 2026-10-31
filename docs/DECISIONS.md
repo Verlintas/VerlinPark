@@ -67,6 +67,7 @@
 | [0055](adr/0055-direct-dmg-packaging.md) | Ad-hoc direct DMG packaging | Accepted | 发布/分发 |
 | [0056](adr/0056-worktree-cleanup.md) | Explicit terminal worktree cleanup | Accepted | 运维/磁盘/安全 |
 | [0057](adr/0057-project-budget-pool.md) | Project-wide shared budget pool | Accepted | 预算/跨 session |
+| [0058](adr/0058-doctor-diagnostics.md) | Local doctor diagnostics | Accepted | 运维/诊断 |
 
 ---
 

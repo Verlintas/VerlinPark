@@ -8906,7 +8906,28 @@ mod tests {
             .start(&session.id, "overlapping plan")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let events = engine
+                .list_events(session.id.clone(), 0, 400)
+                .await
+                .unwrap();
+            let completed = events
+                .iter()
+                .filter(|event| {
+                    event.kind == "plan_task.finished"
+                        && event.payload["task_status"] == "completed"
+                })
+                .count();
+            if completed == 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "overlapping plan did not finish; events={events:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
 
         assert_eq!(
             provider
@@ -8914,20 +8935,6 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
             "overlapping write scopes must not run concurrently"
-        );
-        let events = engine
-            .list_events(session.id.clone(), 0, 400)
-            .await
-            .unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| {
-                    event.kind == "plan_task.finished"
-                        && event.payload["task_status"] == "completed"
-                })
-                .count(),
-            2
         );
     }
 

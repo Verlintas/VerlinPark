@@ -26,6 +26,8 @@ enum Command {
     Ping,
     /// Show daemon information.
     Info,
+    /// Run local diagnostics.
+    Doctor,
     /// List projects.
     Projects,
     /// Add a local repository as a project.
@@ -253,6 +255,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::Info => rpc(&discovery, "server.info", json!({})).await?,
+        Command::Doctor => rpc(&discovery, "server.doctor", json!({})).await?,
         Command::Projects => rpc(&discovery, "project.list", json!({})).await?,
         Command::ProjectAdd { path, name } => {
             let root = path
@@ -773,6 +776,25 @@ fn print_human(value: &Value) {
             value["messages"].as_array().map_or(0, Vec::len),
             value["merge_queue"].as_array().map_or(0, Vec::len)
         );
+        return;
+    }
+    if let Some(checks) = value.get("checks").and_then(Value::as_array) {
+        println!(
+            "{}",
+            if value["ok"].as_bool().unwrap_or(false) {
+                "doctor: ok"
+            } else {
+                "doctor: errors"
+            }
+        );
+        for check in checks {
+            println!(
+                "  {:<8} {:<18} {}",
+                check["status"].as_str().unwrap_or("?"),
+                check["name"].as_str().unwrap_or("?"),
+                check["detail"].as_str().unwrap_or("")
+            );
+        }
         return;
     }
     if value.get("budget").is_some() && value.get("spent_tokens").is_some() {

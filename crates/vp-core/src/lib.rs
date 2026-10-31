@@ -11,11 +11,11 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
-    ArtifactMaterialization, ArtifactPolicy, Event, IntegrationPolicy, MailboxGcResult,
-    MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult, PullRequestResult,
-    Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
-    SessionLogStatus, SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage,
-    TeamPlan, TodoItem, UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
+    ArtifactMaterialization, ArtifactPolicy, DoctorCheck, Event, IntegrationPolicy,
+    MailboxGcResult, MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult,
+    PullRequestResult, Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult,
+    SessionLandResult, SessionLogStatus, SessionRehydrateResult, SessionReplayReport, ShellPolicy,
+    StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
     WorktreeCleanupEntry, WorktreeCleanupResult,
 };
 use vp_store::Store;
@@ -2633,6 +2633,113 @@ impl Engine {
         Ok(report)
     }
 
+    pub async fn doctor_checks(&self) -> Result<Vec<DoctorCheck>> {
+        let store = self.store.clone();
+        let data_dir = store.data_dir().to_path_buf();
+        let (integrity, projects, sessions) = tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>((
+                store.integrity_check()?,
+                store.list_projects()?,
+                store.list_sessions(None)?,
+            ))
+        })
+        .await??;
+        let mut checks = Vec::new();
+        checks.push(DoctorCheck {
+            name: "database".into(),
+            status: if integrity == "ok" { "ok" } else { "error" }.into(),
+            detail: integrity,
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&data_dir)
+                .map(|metadata| metadata.permissions().mode() & 0o777)
+                .unwrap_or(0);
+            checks.push(DoctorCheck {
+                name: "data directory".into(),
+                status: if mode & 0o077 == 0 { "ok" } else { "warn" }.into(),
+                detail: format!("{} (mode {mode:o})", data_dir.display()),
+            });
+        }
+        let missing_projects = projects
+            .iter()
+            .filter(|project| !Path::new(&project.root).is_dir())
+            .count();
+        checks.push(DoctorCheck {
+            name: "project roots".into(),
+            status: if missing_projects == 0 { "ok" } else { "warn" }.into(),
+            detail: format!(
+                "{} project(s), {missing_projects} missing root(s)",
+                projects.len()
+            ),
+        });
+        let missing_worktrees = sessions
+            .iter()
+            .filter(|session| session.status != "imported")
+            .filter(|session| {
+                session
+                    .worktree
+                    .as_deref()
+                    .is_some_and(|path| !Path::new(path).exists())
+            })
+            .count();
+        let active = sessions
+            .iter()
+            .filter(|session| matches!(session.status.as_str(), "running" | "queued" | "paused"))
+            .count();
+        checks.push(DoctorCheck {
+            name: "sessions".into(),
+            status: if active > 0 { "warn" } else { "ok" }.into(),
+            detail: format!(
+                "{} session(s), {active} active/queued/paused, {missing_worktrees} missing worktree(s)",
+                sessions.len()
+            ),
+        });
+        let mut mirror_mismatches = Vec::new();
+        for session in &sessions {
+            match self.session_log_status(&session.id).await {
+                Ok(status) if !status.matches => mirror_mismatches.push(status.session_id),
+                Ok(_) => {}
+                Err(error) => mirror_mismatches.push(format!("{}: {error}", session.id)),
+            }
+        }
+        checks.push(DoctorCheck {
+            name: "event mirrors".into(),
+            status: if mirror_mismatches.is_empty() {
+                "ok"
+            } else {
+                "warn"
+            }
+            .into(),
+            detail: if mirror_mismatches.is_empty() {
+                "all mirrors match".to_string()
+            } else {
+                format!(
+                    "{} mirror mismatch(es): {}",
+                    mirror_mismatches.len(),
+                    mirror_mismatches
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+        });
+        let sandbox = Path::new("/usr/bin/sandbox-exec").is_file();
+        checks.push(DoctorCheck {
+            name: "shell sandbox".into(),
+            status: if sandbox { "ok" } else { "warn" }.into(),
+            detail: if sandbox {
+                "/usr/bin/sandbox-exec is available (deprecated by macOS)".to_string()
+            } else {
+                "sandbox-exec is missing; shell execution fails closed".to_string()
+            },
+        });
+        Ok(checks)
+    }
+
     pub async fn session_log_status(&self, session_id: &str) -> Result<SessionLogStatus> {
         let store = self.store.clone();
         let id = session_id.to_string();
@@ -4129,6 +4236,40 @@ mod tests {
         let report = engine.replay_session(&session.id).await.unwrap();
         assert!(report.consistent, "{:?}", report.mismatches);
         assert!(report.mailbox_matches);
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_missing_worktrees_and_clean_mirrors() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("doctor".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "doctor".into(), None)
+            .await
+            .unwrap();
+        let checks = engine.doctor_checks().await.unwrap();
+        assert!(checks.iter().all(|check| check.status != "error"));
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.name == "event mirrors" && check.status == "ok")
+        );
+        let worktree = session.worktree.clone().unwrap();
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let checks = engine.doctor_checks().await.unwrap();
+        let sessions = checks
+            .iter()
+            .find(|check| check.name == "sessions")
+            .unwrap();
+        assert!(sessions.detail.contains("1 missing worktree"));
     }
 
     #[tokio::test]

@@ -1787,6 +1787,12 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn integrity_check(&self) -> Result<String> {
+        let conn = self.lock()?;
+        conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
     pub fn project_count(&self) -> Result<usize> {
         let conn = self.lock()?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?;
@@ -3961,6 +3967,12 @@ mod tests {
             1
         );
         assert!(mailbox.iter().any(|column| column == "delete_unread"));
+    }
+
+    #[test]
+    fn integrity_check_reports_ok() {
+        let (_data, store, _repo) = test_store();
+        assert_eq!(store.integrity_check().unwrap(), "ok");
     }
 
     #[test]

@@ -550,6 +550,19 @@ pub struct ProjectBudgetResult {
     pub spent_cost_usd: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub checks: Vec<DoctorCheck>,
+    pub ok: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityInfo {
     #[serde(default)]

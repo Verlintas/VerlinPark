@@ -27,19 +27,19 @@ use vp_protocol::types::{
     ArtifactListResult, ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult,
     ArtifactResult, AuthParams, AuthResult, CancelSessionParams, CancelSessionResult,
     CleanupWorktreesParams, CommitSessionParams, ConfigureAgentParams, CreateSessionParams,
-    DiscardSessionParams, EventListResult, IntegrationPolicyParams, IntegrationPolicyResult,
-    LandSessionParams, ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams,
-    MailboxListParams, MailboxListResult, MailboxPolicyParams, MailboxPolicyResult,
-    MarkMessageReadParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
-    PingResult, ProjectBudgetParams, ProjectListResult, PromptParams, PromptResult,
-    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
-    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, ServerInfo,
-    SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
-    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionResumeParams,
-    SessionResumeResult, SessionTodosParams, SessionTodosResult, SetArtifactPolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetProjectBudgetParams,
-    SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams,
-    TeamPlanResult, UsageLedgerParams,
+    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, IntegrationPolicyParams,
+    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
+    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
+    MailboxPolicyResult, MarkMessageReadParams, MergeQueueListParams, MergeQueueListResult,
+    OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectListResult, PromptParams,
+    PromptResult, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
+    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
+    RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams, SessionImportParams,
+    SessionListResult, SessionLogParams, SessionPauseParams, SessionPauseResult,
+    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
+    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
+    SetProjectBudgetParams, SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -355,6 +355,27 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
+        },
+        "server.doctor" => match state.engine.doctor_checks().await {
+            Ok(mut checks) => {
+                let info = state.agent.info();
+                checks.push(DoctorCheck {
+                    name: "provider".into(),
+                    status: if info.configured { "ok" } else { "warn" }.into(),
+                    detail: if info.configured {
+                        format!(
+                            "{} / {}",
+                            info.provider.as_deref().unwrap_or("?"),
+                            info.model.as_deref().unwrap_or("?")
+                        )
+                    } else {
+                        "no provider configured".to_string()
+                    },
+                });
+                let ok = !checks.iter().any(|check| check.status == "error");
+                RpcResponse::success(id, DoctorReport { checks, ok })
+            }
+            Err(error) => internal_error(id, error),
         },
         "project.list" => match state.engine.list_projects().await {
             Ok(projects) => RpcResponse::success(id, ProjectListResult { projects }),

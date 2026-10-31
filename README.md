@@ -164,6 +164,7 @@ just cli backfill-artifacts <session-id>
 just cli cleanup-worktrees <project-id> --older-than-days 7 --dry-run
 just cli project-budget <project-id>
 just cli project-budget-set <project-id> --token-budget 500000 --cost-budget-usd 5
+just cli doctor
 just cli artifact-policy <project-id>
 just cli artifact-policy-set <project-id> --max-count 20 --auto-gc
 just cli gc <project-id>
