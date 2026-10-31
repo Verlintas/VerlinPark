@@ -70,6 +70,8 @@ pub struct AgentConfig {
     pub scope_locks: Arc<ScopeLocks>,
     /// Daemon-wide Worker/Labour admission.
     pub capacity: Arc<CapacityController>,
+    /// Maximum time to wait between provider stream events.
+    pub provider_idle_timeout_secs: u64,
 }
 
 /// Daemon-wide admission control for Worker/Labour runs. Per-session caps still
@@ -1038,6 +1040,11 @@ impl AgentService {
                     global_worker_cap(),
                     global_labour_cap(),
                 )),
+                provider_idle_timeout_secs: env::var("VERLINPARK_PROVIDER_IDLE_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(300)
+                    .clamp(10, 3600),
             },
         )
     }
@@ -1113,6 +1120,11 @@ impl AgentService {
             max_active_sessions: global_session_cap(),
             scope_locks: Arc::new(ScopeLocks::default()),
             capacity: self.capacity.clone(),
+            provider_idle_timeout_secs: env::var("VERLINPARK_PROVIDER_IDLE_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300)
+                .clamp(10, 3600),
         };
         *self
             .config
@@ -4091,7 +4103,16 @@ async fn run_loop(
                     }
                     continue;
                 }
-                item = stream.next() => item,
+                item = tokio::time::timeout(
+                    Duration::from_secs(config.provider_idle_timeout_secs),
+                    stream.next(),
+                ) => match item {
+                    Ok(item) => item,
+                    Err(_) => anyhow::bail!(
+                        "provider stream was idle for {}s",
+                        config.provider_idle_timeout_secs
+                    ),
+                },
             };
             let Some(item) = item else {
                 break;
@@ -7181,6 +7202,7 @@ mod tests {
                 global_worker_cap(),
                 global_labour_cap(),
             )),
+            provider_idle_timeout_secs: 300,
         };
         let service = AgentService::configured(engine.clone(), config);
         (engine, service, project)
@@ -7195,6 +7217,18 @@ mod tests {
             .expect("test service is configured")
             .clone();
         config.max_workers = max_workers;
+        *service.config.write().unwrap() = Some(config);
+    }
+
+    fn set_provider_idle_timeout(service: &AgentService, seconds: u64) {
+        let mut config = service
+            .config
+            .read()
+            .unwrap()
+            .as_ref()
+            .expect("test service is configured")
+            .clone();
+        config.provider_idle_timeout_secs = seconds;
         *service.config.write().unwrap() = Some(config);
     }
 
@@ -10462,6 +10496,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runs_a_plan_through_the_openai_http_adapter() {
+        use vp_providers::OpenAiCompatibleProvider;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn text_sse(text: &str) -> ResponseTemplate {
+            let chunk = serde_json::json!({
+                "choices": [{"delta": {"content": text}}]
+            });
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!(
+                    "data: {chunk}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+                ))
+        }
+
+        fn tool_sse(id: &str, name: &str, arguments: serde_json::Value) -> ResponseTemplate {
+            let chunk = serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": id,
+                    "function": {"name": name, "arguments": arguments.to_string()}
+                }]}}]
+            });
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!(
+                    "data: {chunk}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+                ))
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or_default();
+                let messages = body["messages"].as_array().cloned().unwrap_or_default();
+                let system = messages
+                    .iter()
+                    .find(|message| message["role"] == "system")
+                    .and_then(|message| message["content"].as_str())
+                    .unwrap_or_default();
+                let last = messages.last();
+                let last_role = last
+                    .and_then(|message| message["role"].as_str())
+                    .unwrap_or_default();
+                let last_content = last
+                    .and_then(|message| message["content"].as_str())
+                    .unwrap_or_default();
+
+                if system.contains("You are Verifier") {
+                    return tool_sse(
+                        "verdict",
+                        "submit_verdict",
+                        serde_json::json!({
+                            "approved": true,
+                            "summary": "HTTP worker output is correct"
+                        }),
+                    );
+                }
+                if system.contains("You are Worker") {
+                    if last_role == "tool" {
+                        return text_sse("worker done");
+                    }
+                    return tool_sse(
+                        "write",
+                        "write_file",
+                        serde_json::json!({"path": "worker.txt", "content": "http e2e\n"}),
+                    );
+                }
+                if last_role == "tool" {
+                    if last_content.contains("Plan complete") {
+                        return text_sse("leader done");
+                    }
+                    return tool_sse("run_plan", "run_team_plan", serde_json::json!({}));
+                }
+                let plan = serde_json::json!({
+                    "goal": "http e2e",
+                    "departments": [{
+                        "name": "impl",
+                        "manager_title": "Implementation",
+                        "profile": "coding",
+                        "objective": "build"
+                    }],
+                    "tasks": [{
+                        "id": "T1",
+                        "department": "impl",
+                        "title": "Write the file",
+                        "kind": "coding",
+                        "deps": [],
+                        "acceptance": ["done"],
+                        "write_scope": ["worker.txt"]
+                    }]
+                });
+                tool_sse("submit_plan", "submit_team_plan", plan)
+            })
+            .mount(&server)
+            .await;
+
+        let provider: Arc<dyn Provider> = Arc::new(OpenAiCompatibleProvider::local(
+            "openai",
+            format!("{}/v1", server.uri()),
+        ));
+        let dir = TempDir::new().unwrap();
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "http e2e".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..200 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        service
+            .start(&session.id, "write worker.txt through HTTP")
+            .await
+            .unwrap();
+        let sessions = wait_until_idle(&engine, &session).await;
+        approver.abort();
+        assert_eq!(sessions.status, "idle");
+
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("worker.txt")).unwrap(),
+            "http e2e\n"
+        );
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].status, "merged");
+        let events = engine
+            .list_events(session.id.clone(), 0, 400)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "plan_task.finished" && event.payload["task_status"] == "completed"
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "integrator.finished")
+        );
+    }
+
+    #[tokio::test]
     async fn probes_an_openai_compatible_endpoint_over_http() {
         use vp_providers::OpenAiCompatibleProvider;
         use wiremock::matchers::{method, path};
@@ -10807,6 +11003,31 @@ mod tests {
         assert!(events.iter().any(|event| event.kind == "agent.paused"));
         assert!(events.iter().any(|event| event.kind == "agent.resumed"));
         assert!(!service.pause(&session.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fails_a_run_when_the_provider_stream_is_idle() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(SlowProvider);
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        set_provider_idle_timeout(&service, 1);
+        let session = engine
+            .create_session(project.id, "stall".into(), None)
+            .await
+            .unwrap();
+        service.start(&session.id, "stall").await.unwrap();
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "failed");
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.failed"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("idle for 1s"))
+        }));
     }
 
     #[tokio::test]

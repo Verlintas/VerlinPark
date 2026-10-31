@@ -80,6 +80,7 @@
 | [0068](adr/0068-project-usage-report.md) | Project usage report | Accepted | 成本/可观测性 |
 | [0069](adr/0069-worktree-retention-policy.md) | Opt-in worktree retention policy | Accepted | 运维/磁盘 |
 | [0070](adr/0070-resumable-team-plan.md) | Resumable TeamPlan execution | Accepted | 调度/恢复 |
+| [0071](adr/0071-provider-idle-timeout.md) | Provider stream idle timeout | Accepted | Provider/可靠性 |
 
 ---
 
