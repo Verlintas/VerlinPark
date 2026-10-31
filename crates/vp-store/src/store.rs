@@ -9,8 +9,8 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
-    MailboxPolicy, MergeQueueEntry, Project, Session, SessionBundle, ShellPolicy, StoredMessage,
-    TodoItem, UsageEntry,
+    MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, Session, SessionBundle, ShellPolicy,
+    StoredMessage, TodoItem, UsageEntry,
 };
 
 use crate::paths;
@@ -205,6 +205,13 @@ impl Store {
                 max_age_secs INTEGER,
                 max_count    INTEGER,
                 updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_budgets (
+                project_id     TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                token_budget   INTEGER,
+                cost_budget_usd REAL,
+                updated_at     TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_mailbox_policies (
@@ -1099,6 +1106,56 @@ impl Store {
         let conn = self.lock()?;
         let changed = conn.execute("DELETE FROM artifacts WHERE id = ?1", params![artifact_id])?;
         Ok(changed > 0)
+    }
+
+    pub fn get_project_budget(&self, project_id: &str) -> Result<ProjectBudget> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT token_budget, cost_budget_usd
+                 FROM project_budgets WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(ProjectBudget {
+                        token_budget: row.get::<_, Option<i64>>(0)?.map(|value| value as u64),
+                        cost_budget_usd: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn set_project_budget(&self, project_id: &str, budget: &ProjectBudget) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_budgets
+                (project_id, token_budget, cost_budget_usd, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id) DO UPDATE SET
+                token_budget = excluded.token_budget,
+                cost_budget_usd = excluded.cost_budget_usd,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                budget.token_budget.map(|value| value as i64),
+                budget.cost_budget_usd,
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn project_usage(&self, project_id: &str) -> Result<(u64, f64)> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0),
+                    COALESCE(SUM(cost_spent_usd), 0)
+             FROM sessions WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?)),
+        )
+        .map_err(Into::into)
     }
 
     pub fn get_mailbox_policy(&self, project_id: &str) -> Result<MailboxPolicy> {

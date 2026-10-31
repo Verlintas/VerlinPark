@@ -920,8 +920,8 @@ impl BudgetStop {
         }
     }
 
-    fn is_session(&self) -> bool {
-        self.scope == "session"
+    fn is_abortive(&self) -> bool {
+        self.scope == "session" || self.scope == "project"
     }
 
     fn payload(&self) -> serde_json::Value {
@@ -3152,7 +3152,7 @@ async fn finish_worker(
                 }),
             )
             .await?;
-            if stop.is_session() {
+            if stop.is_abortive() {
                 Ok(WorkerFinish::BudgetExceeded(stop))
             } else {
                 Ok(WorkerFinish::Done {
@@ -3204,14 +3204,22 @@ fn shell_secret_roots(data_dir: &std::path::Path) -> Vec<PathBuf> {
 struct PlanBudgetScope {
     task_id: Option<String>,
     department: Option<String>,
+    project_id: Option<String>,
     task_tokens: Option<u64>,
     task_cost: Option<f64>,
     department_tokens: Option<u64>,
     department_cost: Option<f64>,
+    project_tokens: Option<u64>,
+    project_cost: Option<f64>,
 }
 
 impl PlanBudgetScope {
-    fn from_plan(plan: Option<&TeamPlan>, spec: &AgentSpec) -> Self {
+    fn from_plan(
+        plan: Option<&TeamPlan>,
+        spec: &AgentSpec,
+        project_budget: Option<&vp_protocol::types::ProjectBudget>,
+        project_id: &str,
+    ) -> Self {
         let task = spec.task_id.as_deref().and_then(|task_id| {
             plan.and_then(|plan| plan.tasks.iter().find(|task| task.id == task_id))
         });
@@ -3222,13 +3230,19 @@ impl PlanBudgetScope {
                     .find(|department| department.name == name)
             })
         });
+        let project_tokens = project_budget.and_then(|budget| budget.token_budget);
+        let project_cost = project_budget.and_then(|budget| budget.cost_budget_usd);
         Self {
             task_id: spec.task_id.clone(),
             department: spec.department.clone(),
+            project_id: (project_tokens.is_some() || project_cost.is_some())
+                .then(|| project_id.to_string()),
             task_tokens: task.and_then(|task| task.token_budget),
             task_cost: task.and_then(|task| task.cost_budget_usd),
             department_tokens: department.and_then(|department| department.token_budget),
             department_cost: department.and_then(|department| department.cost_budget_usd),
+            project_tokens,
+            project_cost,
         }
     }
 
@@ -3237,6 +3251,12 @@ impl PlanBudgetScope {
             || self.task_cost.is_some()
             || self.department_tokens.is_some()
             || self.department_cost.is_some()
+            || self.project_tokens.is_some()
+            || self.project_cost.is_some()
+    }
+
+    fn project_active(&self) -> bool {
+        self.project_tokens.is_some() || self.project_cost.is_some()
     }
 
     fn stop(
@@ -3264,8 +3284,10 @@ impl PlanBudgetScope {
 
     fn requests(
         &self,
+        session_id: &str,
         task: (u64, f64),
         department: (u64, f64),
+        project: (u64, f64),
         input_price: f64,
         output_price: f64,
     ) -> Vec<ScopeRequest> {
@@ -3274,6 +3296,7 @@ impl PlanBudgetScope {
             && let Some(id) = &self.task_id
         {
             requests.push(ScopeRequest {
+                pool_key: format!("session:{session_id}:task:{id}"),
                 scope: "task",
                 id: id.clone(),
                 limit_tokens: self.task_tokens,
@@ -3290,6 +3313,7 @@ impl PlanBudgetScope {
             && let Some(id) = &self.department
         {
             requests.push(ScopeRequest {
+                pool_key: format!("session:{session_id}:department:{id}"),
                 scope: "department",
                 id: id.clone(),
                 limit_tokens: self.department_tokens,
@@ -3302,10 +3326,56 @@ impl PlanBudgetScope {
                 output_price_per_m: output_price,
             });
         }
+        if (self.project_tokens.is_some() || self.project_cost.is_some())
+            && let Some(id) = &self.project_id
+        {
+            requests.push(ScopeRequest {
+                pool_key: format!("project:{id}"),
+                scope: "project",
+                id: id.clone(),
+                limit_tokens: self.project_tokens,
+                limit_cost: self.project_cost,
+                observed: Spend {
+                    tokens: project.0,
+                    cost_usd: project.1,
+                },
+                input_price_per_m: input_price,
+                output_price_per_m: output_price,
+            });
+        }
         requests
     }
 
-    fn after(&self, task: (u64, f64), department: (u64, f64)) -> Option<BudgetStop> {
+    fn after(
+        &self,
+        task: (u64, f64),
+        department: (u64, f64),
+        project: (u64, f64),
+    ) -> Option<BudgetStop> {
+        if let Some(limit) = self.project_tokens
+            && project.0 >= limit
+        {
+            return Some(self.stop(
+                "project",
+                self.project_id.as_deref().unwrap_or("?"),
+                "tokens",
+                Some(limit),
+                project,
+                self.project_cost,
+            ));
+        }
+        if let Some(limit) = self.project_cost
+            && project.1 >= limit
+        {
+            return Some(self.stop(
+                "project",
+                self.project_id.as_deref().unwrap_or("?"),
+                "cost",
+                self.project_tokens,
+                project,
+                Some(limit),
+            ));
+        }
         if let Some(limit) = self.task_tokens
             && task.0 >= limit
         {
@@ -3478,7 +3548,13 @@ async fn run_loop(
     let system = role_system_prompt(spec.role, project, session, spec, objective);
     let tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
     let mut team_plan = engine.get_team_plan(&session.id).await?;
-    let plan_budget = PlanBudgetScope::from_plan(team_plan.as_ref(), spec);
+    let project_budget = engine.get_project_budget(&project.id).await?;
+    let plan_budget = PlanBudgetScope::from_plan(
+        team_plan.as_ref(),
+        spec,
+        Some(&project_budget.budget),
+        &project.id,
+    );
 
     for turn in 0..config.max_turns {
         if !wait_for_resume(control).await {
@@ -3539,6 +3615,11 @@ async fn run_loop(
         let department_spent = scope_spent
             .map(|(_, _, tokens, cost)| (tokens, cost))
             .unwrap_or((0, 0.0));
+        let project_spent = if plan_budget.project_active() {
+            engine.project_usage(&project.id).await?
+        } else {
+            (0, 0.0)
+        };
         let desired_output = if budget.limit.is_some() {
             let remaining = budget.available_tokens().unwrap_or(0);
             if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
@@ -3551,10 +3632,15 @@ async fn run_loop(
             configured_output
         };
         let scope_lease = if plan_budget.active() {
-            let requests =
-                plan_budget.requests(task_spent, department_spent, input_price, output_price);
-            match engine.budget_registry().grant(
+            let requests = plan_budget.requests(
                 &session.id,
+                task_spent,
+                department_spent,
+                project_spent,
+                input_price,
+                output_price,
+            );
+            match engine.budget_registry().grant(
                 &requests,
                 input_estimate,
                 desired_output,
@@ -3689,9 +3775,15 @@ async fn run_loop(
                     spec.department.as_deref(),
                 )
                 .await?;
+            let project_usage = if plan_budget.project_active() {
+                engine.project_usage(&project.id).await?
+            } else {
+                (0, 0.0)
+            };
             if let Some(stop) = plan_budget.after(
                 (task_tokens, task_cost),
                 (department_tokens, department_cost),
+                project_usage,
             ) {
                 emit_scope_budget_stop(engine, &session.id, spec, &stop).await?;
                 return Ok(LoopOutcome::BudgetExceeded(stop));
@@ -4188,7 +4280,7 @@ async fn run_loop(
                                                     return Ok(LoopOutcome::Cancelled);
                                                 }
                                                 WorkerFinish::BudgetExceeded(stop) => {
-                                                    if stop.is_session() {
+                                                    if stop.is_abortive() {
                                                         return Ok(LoopOutcome::BudgetExceeded(
                                                             stop,
                                                         ));
@@ -5152,7 +5244,7 @@ async fn run_parallel_workers(
             }
             Ok(LoopOutcome::Verdict(_)) => {}
             Ok(LoopOutcome::BudgetExceeded(stop)) => {
-                if stop.is_session() {
+                if stop.is_abortive() {
                     budget_exceeded = true;
                 }
                 let (child_spec, _, _) = &prepared[index];
@@ -5257,7 +5349,7 @@ async fn run_parallel_workers(
             }
             Ok(LoopOutcome::Verdict(_)) | Ok(LoopOutcome::Cancelled) => {}
             Ok(LoopOutcome::BudgetExceeded(stop)) => {
-                if !stop.is_session() {
+                if !stop.is_abortive() {
                     reports.push(format!("{}: {}", child_spec.name, stop.summary()));
                 }
             }
@@ -6232,7 +6324,7 @@ async fn execute_team_plan(
                         }),
                     )
                     .await?;
-                    if stop.is_session() {
+                    if stop.is_abortive() {
                         return Ok(PlanRunResult::BudgetExceeded(stop));
                     }
                 }
@@ -9035,6 +9127,51 @@ mod tests {
                 && event.payload["task_id"] == "T1"
                 && event.payload["model"] == "worker-model"
         }));
+    }
+
+    #[test]
+    fn plan_budget_scope_includes_the_project_pool() {
+        let spec = AgentSpec {
+            id: "worker-1".into(),
+            role: AgentRole::Worker,
+            name: "Worker".into(),
+            depth: 2,
+            parent_name: None,
+            title: None,
+            task_id: None,
+            department: None,
+            profile: AgentProfile::Coding,
+            allow_delegation: false,
+            auto_approve: false,
+            worktree: PathBuf::from("/tmp"),
+            branch: "task".into(),
+            session_worktree: PathBuf::from("/tmp"),
+            session_branch: "session".into(),
+            write_scope: Vec::new(),
+            base_commit: "base".into(),
+        };
+        let plan = TeamPlan {
+            goal: "project budget".into(),
+            departments: Vec::new(),
+            tasks: Vec::new(),
+        };
+        let scope = PlanBudgetScope::from_plan(
+            Some(&plan),
+            &spec,
+            Some(&vp_protocol::types::ProjectBudget {
+                token_budget: Some(100),
+                cost_budget_usd: Some(1.0),
+            }),
+            "project-1",
+        );
+        assert!(scope.project_active());
+        let requests = scope.requests("session-1", (0, 0.0), (0, 0.0), (0, 0.0), 0.0, 0.0);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].pool_key, "project:project-1");
+        assert_eq!(requests[0].scope, "project");
+        let stop = scope.after((0, 0.0), (0, 0.0), (100, 0.0)).unwrap();
+        assert_eq!(stop.scope, "project");
+        assert_eq!(stop.reason, "tokens");
     }
 
     #[tokio::test]

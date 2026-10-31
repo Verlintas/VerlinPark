@@ -34,6 +34,16 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Show the project-wide shared budget and spend.
+    ProjectBudget { project: String },
+    /// Set or clear the project-wide shared budget.
+    ProjectBudgetSet {
+        project: String,
+        #[arg(long)]
+        token_budget: Option<u64>,
+        #[arg(long)]
+        cost_budget_usd: Option<f64>,
+    },
     /// Remove old terminal session worktrees while keeping branches by default.
     CleanupWorktrees {
         project: String,
@@ -252,6 +262,32 @@ async fn main() -> Result<()> {
                 &discovery,
                 "project.add",
                 json!({"root": root, "name": name}),
+            )
+            .await?
+        }
+        Command::ProjectBudget { project } => {
+            rpc(
+                &discovery,
+                "project.budget.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ProjectBudgetSet {
+            project,
+            token_budget,
+            cost_budget_usd,
+        } => {
+            rpc(
+                &discovery,
+                "project.budget.set",
+                json!({
+                    "project_id": project,
+                    "budget": {
+                        "token_budget": token_budget,
+                        "cost_budget_usd": cost_budget_usd,
+                    }
+                }),
             )
             .await?
         }
@@ -736,6 +772,17 @@ fn print_human(value: &Value) {
             value["agents"].as_array().map_or(0, Vec::len),
             value["messages"].as_array().map_or(0, Vec::len),
             value["merge_queue"].as_array().map_or(0, Vec::len)
+        );
+        return;
+    }
+    if value.get("budget").is_some() && value.get("spent_tokens").is_some() {
+        println!(
+            "project {}  token-budget={}  cost-budget={}  spent-tokens={}  spent-usd={:.4}",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["budget"]["token_budget"].as_u64().unwrap_or(0),
+            value["budget"]["cost_budget_usd"].as_f64().unwrap_or(0.0),
+            value["spent_tokens"].as_u64().unwrap_or(0),
+            value["spent_cost_usd"].as_f64().unwrap_or(0.0)
         );
         return;
     }

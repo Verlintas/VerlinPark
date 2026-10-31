@@ -11,6 +11,9 @@ pub struct Spend {
 /// A task or department budget that a provider call must fit inside.
 #[derive(Debug, Clone)]
 pub struct ScopeRequest {
+    /// Stable registry key, for example `session:<id>:task:<task>` or
+    /// `project:<id>`.
+    pub pool_key: String,
     pub scope: &'static str,
     pub id: String,
     pub limit_tokens: Option<u64>,
@@ -39,13 +42,6 @@ pub struct Rejection {
     pub reserved_cost: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PoolKey {
-    session_id: String,
-    scope: &'static str,
-    id: String,
-}
-
 #[derive(Debug, Default)]
 struct Pool {
     limit_tokens: Option<u64>,
@@ -65,14 +61,14 @@ struct Pool {
 /// concurrent callers see the same remaining capacity.
 #[derive(Debug, Default)]
 pub struct BudgetRegistry {
-    inner: Mutex<HashMap<PoolKey, Pool>>,
+    inner: Mutex<HashMap<String, Pool>>,
 }
 
 /// Releases the reservations for one provider call when dropped, including
 /// cancellation and provider errors.
 pub struct BudgetLease {
     registry: Arc<BudgetRegistry>,
-    keys: Vec<(PoolKey, u64, f64)>,
+    keys: Vec<(String, u64, f64)>,
     granted_output_tokens: u64,
 }
 
@@ -104,7 +100,6 @@ impl BudgetRegistry {
     /// must be held through the provider call and usage recording.
     pub fn grant(
         self: &Arc<Self>,
-        session_id: &str,
         requests: &[ScopeRequest],
         input_estimate: u64,
         desired_output: u64,
@@ -121,8 +116,8 @@ impl BudgetRegistry {
             Ok(pools) => pools,
             Err(_) => {
                 return Err(Rejection {
-                    scope: "session",
-                    id: session_id.to_string(),
+                    scope: "registry",
+                    id: "budget-registry".to_string(),
                     reason: BudgetReason::Tokens,
                     limit_tokens: None,
                     spent_tokens: 0,
@@ -135,11 +130,7 @@ impl BudgetRegistry {
         };
         let mut keys = Vec::with_capacity(requests.len());
         for request in requests {
-            let key = PoolKey {
-                session_id: session_id.to_string(),
-                scope: request.scope,
-                id: request.id.clone(),
-            };
+            let key = request.pool_key.clone();
             let pool = pools.entry(key.clone()).or_default();
             if request.limit_tokens.is_some() {
                 pool.limit_tokens = request.limit_tokens;
@@ -203,7 +194,7 @@ impl BudgetRegistry {
             if let Some((scope, id, reason)) = limiting
                 && let Some((key, request)) = keys
                     .iter()
-                    .find(|(key, request)| key.scope == scope && request.id == id)
+                    .find(|(_, request)| request.scope == scope && request.id == id)
                 && let Some(pool) = pools.get(key)
             {
                 return Err(rejection(pool, request, reason));
@@ -254,8 +245,16 @@ impl BudgetRegistry {
     /// Remove all reservations and limits for a finished session. Live leases
     /// may still release into an absent entry; that release is ignored.
     pub fn clear_session(&self, session_id: &str) {
+        let prefix = format!("session:{session_id}:");
         if let Ok(mut pools) = self.inner.lock() {
-            pools.retain(|key, _| key.session_id != session_id);
+            pools.retain(|key, _| !key.starts_with(&prefix));
+        }
+    }
+
+    pub fn clear_project(&self, project_id: &str) {
+        let key = format!("project:{project_id}");
+        if let Ok(mut pools) = self.inner.lock() {
+            pools.remove(&key);
         }
     }
 }
@@ -287,6 +286,7 @@ mod tests {
 
     fn request(scope: &'static str, id: &str, tokens: u64) -> ScopeRequest {
         ScopeRequest {
+            pool_key: format!("{scope}:{id}"),
             scope,
             id: id.to_string(),
             limit_tokens: Some(tokens),
@@ -302,24 +302,20 @@ mod tests {
         let registry = Arc::new(BudgetRegistry::new());
         let department = request("department", "impl", 100);
         let first = registry
-            .grant("session", std::slice::from_ref(&department), 10, 50, 10)
+            .grant(std::slice::from_ref(&department), 10, 50, 10)
             .unwrap();
         // 50 output leaves 40 after the first reservation (100 - 10 - 50).
         let second = registry
-            .grant("session", std::slice::from_ref(&department), 10, 50, 10)
+            .grant(std::slice::from_ref(&department), 10, 50, 10)
             .unwrap();
         assert_eq!(first.granted_output_tokens(), 50);
         assert_eq!(second.granted_output_tokens(), 30);
-        assert!(
-            registry
-                .grant("session", &[department], 10, 50, 10)
-                .is_err()
-        );
+        assert!(registry.grant(&[department], 10, 50, 10).is_err());
         drop(first);
         drop(second);
         assert!(
             registry
-                .grant("session", &[request("department", "impl", 100)], 10, 50, 10)
+                .grant(&[request("department", "impl", 100)], 10, 50, 10)
                 .is_ok()
         );
     }
@@ -330,12 +326,10 @@ mod tests {
         let task = request("task", "T1", 100);
         let department = request("department", "impl", 100);
         let first = registry
-            .grant("session", &[task.clone(), department.clone()], 10, 40, 10)
+            .grant(&[task.clone(), department.clone()], 10, 40, 10)
             .unwrap();
         assert_eq!(first.granted_output_tokens(), 40);
-        let second = registry
-            .grant("session", &[task, department], 10, 40, 10)
-            .unwrap();
+        let second = registry.grant(&[task, department], 10, 40, 10).unwrap();
         assert_eq!(second.granted_output_tokens(), 40);
     }
 
@@ -351,7 +345,7 @@ mod tests {
         request.input_price_per_m = 0.0;
         request.output_price_per_m = 10.0;
         // $0.001 buys 100 output tokens at $10 / 1M.
-        let lease = registry.grant("session", &[request], 0, 500, 1).unwrap();
+        let lease = registry.grant(&[request], 0, 500, 1).unwrap();
         assert_eq!(lease.granted_output_tokens(), 100);
     }
 
@@ -367,7 +361,7 @@ mod tests {
                 let results = results.clone();
                 std::thread::spawn(move || {
                     let request = request("department", "impl", 100);
-                    let lease = registry.grant("session", &[request], 10, 50, 10).ok();
+                    let lease = registry.grant(&[request], 10, 50, 10).ok();
                     let granted = lease.as_ref().map(BudgetLease::granted_output_tokens);
                     if let Ok(mut results) = results.lock() {
                         results.push(granted);
@@ -394,15 +388,13 @@ mod tests {
             tokens: 20,
             cost_usd: 0.0,
         };
-        let lease = registry
-            .grant("session", &[stale.clone()], 10, 50, 10)
-            .unwrap();
+        let lease = registry.grant(&[stale.clone()], 10, 50, 10).unwrap();
         assert_eq!(lease.granted_output_tokens(), 50);
         let mut newer = stale;
         newer.observed = Spend {
             tokens: 70,
             cost_usd: 0.0,
         };
-        assert!(registry.grant("session", &[newer], 10, 50, 10).is_err());
+        assert!(registry.grant(&[newer], 10, 50, 10).is_err());
     }
 }

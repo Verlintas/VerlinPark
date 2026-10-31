@@ -12,11 +12,11 @@ use uuid::Uuid;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
     ArtifactMaterialization, ArtifactPolicy, Event, IntegrationPolicy, MailboxGcResult,
-    MailboxPolicy, MergeQueueEntry, Project, PullRequestResult, Session, SessionBundle,
-    SessionCommit, SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus,
-    SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
-    UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
-    WorktreeCleanupResult,
+    MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult, PullRequestResult,
+    Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
+    SessionLogStatus, SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage,
+    TeamPlan, TodoItem, UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
+    WorktreeCleanupEntry, WorktreeCleanupResult,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -1160,6 +1160,60 @@ impl Engine {
             _ => return,
         };
         let _ = self.gc_artifacts(&project_id, &policy).await;
+    }
+
+    pub async fn get_project_budget(&self, project_id: &str) -> Result<ProjectBudgetResult> {
+        let store = self.store.clone();
+        let id = project_id.to_string();
+        let (budget, usage) = tokio::task::spawn_blocking(move || {
+            let budget = store.get_project_budget(&id)?;
+            let usage = store.project_usage(&id)?;
+            Ok::<_, anyhow::Error>((budget, usage))
+        })
+        .await??;
+        Ok(ProjectBudgetResult {
+            project_id: project_id.to_string(),
+            budget,
+            spent_tokens: usage.0,
+            spent_cost_usd: usage.1,
+        })
+    }
+
+    pub async fn set_project_budget(
+        &self,
+        project_id: &str,
+        budget: ProjectBudget,
+    ) -> Result<ProjectBudgetResult> {
+        if budget.token_budget.is_some_and(|value| value == 0) {
+            anyhow::bail!("project token budget must be greater than zero");
+        }
+        if budget
+            .cost_budget_usd
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            anyhow::bail!("project cost budget must be a positive finite number");
+        }
+        let store = self.store.clone();
+        let project_id_owned = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id_owned.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let for_store = budget.clone();
+        tokio::task::spawn_blocking(move || {
+            store.set_project_budget(&project_id_owned, &for_store)
+        })
+        .await??;
+        self.get_project_budget(project_id).await
+    }
+
+    pub async fn project_usage(&self, project_id: &str) -> Result<(u64, f64)> {
+        let store = self.store.clone();
+        let id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.project_usage(&id)).await?
     }
 
     pub async fn get_artifact_policy(&self, project_id: &str) -> Result<ArtifactPolicy> {
@@ -4075,6 +4129,68 @@ mod tests {
         let report = engine.replay_session(&session.id).await.unwrap();
         assert!(report.consistent, "{:?}", report.mismatches);
         assert!(report.mailbox_matches);
+    }
+
+    #[tokio::test]
+    async fn project_budget_round_trips_and_reports_spend() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("project-budget".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "budget".into(), None)
+            .await
+            .unwrap();
+        let budget = engine
+            .set_project_budget(
+                &project.id,
+                ProjectBudget {
+                    token_budget: Some(1000),
+                    cost_budget_usd: Some(0.5),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(budget.budget.token_budget, Some(1000));
+        assert_eq!(budget.spent_tokens, 0);
+        engine
+            .record_agent_usage(
+                &session.id,
+                "worker-1",
+                "Worker",
+                "worker",
+                Some("T1".into()),
+                Some("impl".into()),
+                "test",
+                100,
+                50,
+                false,
+                0.25,
+            )
+            .await
+            .unwrap();
+        let budget = engine.get_project_budget(&project.id).await.unwrap();
+        assert_eq!(budget.spent_tokens, 150);
+        assert!((budget.spent_cost_usd - 0.25).abs() < 1e-9);
+        assert!(
+            engine
+                .set_project_budget(
+                    &project.id,
+                    ProjectBudget {
+                        token_budget: Some(0),
+                        cost_budget_usd: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

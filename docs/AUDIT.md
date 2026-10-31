@@ -18,7 +18,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、worktree/scratch 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 104（core 84 / store 15 / providers 5），Swift 12。CI 以最新提交为准。
+当前测试：Rust 106（core 86 / store 15 / providers 5），Swift 12。CI 以最新提交为准。
 
 ---
 
@@ -48,7 +48,7 @@
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
-| 测试 | B− | 104 Rust + 12 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
+| 测试 | B− | 106 Rust + 12 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
 | 发布准备 | C− | `just package` 生成 ad-hoc signed DMG + checksum，tag 触发 Release workflow；仍无 Developer ID/公证、更新器和 Homebrew tap |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -240,7 +240,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 104 个 Rust 测试 + 12 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore。仍缺：
+已有 106 个 Rust 测试 + 12 个 Swift 测试，覆盖 Leader loop、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore。仍缺：
 
 - plan 自动派发的 scope overlap / cap 回归
 - 并发预算超调上界
@@ -296,7 +296,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 **M4 — 平台化**
 1. binary artifact preview（content-addressed dedupe、zstd compression、artifact replay/repair、legacy backfill、mailbox auto GC 已实现）。
-2. cross-session shared budget pools（session 内 task/department 已有原子 reservation；跨 session 共享池未实现）。
+2. project-wide budget quotas and alerts（project 共享 token/USD pool 已实现；per-project soft warning/alert 未做）。
 3. 持久化 global Task-DAG scheduler / 优先级与跨进程 capacity；capacity 层已做 session 间 fair round-robin，但仍是进程内队列。auto-expansion 未做。
 4. MCP/ACP、终端、hunk review、非 GitHub PR adapter。
 
@@ -344,7 +344,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 104 passed after the 10-31 worktree-cleanup slice
+cargo test --workspace     # 106 passed after the 10-31 project-budget slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

@@ -72,6 +72,9 @@ struct DashboardView: View {
                     IntegrationPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    ProjectBudgetCard(project: project)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                     ArtifactPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
@@ -465,6 +468,85 @@ private struct MailboxPolicyCard: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 9, design: .monospaced))
                 .frame(width: 90)
+        }
+    }
+}
+
+private struct ProjectBudgetCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Project shared budget")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.projectBudgetBusy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            Text(
+                "A project-wide token/USD pool shared by all sessions. Concurrent calls reserve against it atomically. Empty means unlimited."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Token budget")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("unlimited", text: $model.projectTokenBudgetText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 110)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("USD budget")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("unlimited", text: $model.projectCostBudgetText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 90)
+                }
+                Spacer()
+                Button("Reset") {
+                    Task { await model.resetProjectBudget() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.projectBudgetBusy)
+                Button("Save budget") {
+                    Task { await model.saveProjectBudget() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.projectBudgetBusy)
+            }
+            Text(
+                "Spent: \(model.projectSpentTokens) tokens · \(String(format: "$%.4f", model.projectSpentCostUsd))"
+            )
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let status = model.projectBudgetStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadProjectBudget()
         }
     }
 }

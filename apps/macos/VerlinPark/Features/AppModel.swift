@@ -52,6 +52,13 @@ final class AppModel {
     var artifactMaxCountText = ""
     var artifactPolicyBusy = false
     var artifactPolicyStatus: String?
+    var projectBudget = ProjectBudget.empty
+    var projectSpentTokens = 0
+    var projectSpentCostUsd = 0.0
+    var projectTokenBudgetText = ""
+    var projectCostBudgetText = ""
+    var projectBudgetBusy = false
+    var projectBudgetStatus: String?
     var mailboxPolicy = MailboxPolicy.disabled
     var mailboxMaxAgeText = ""
     var mailboxMaxCountText = ""
@@ -140,6 +147,7 @@ final class AppModel {
             await loadIntegrationPolicy()
             await loadArtifactPolicy()
             await loadMailboxPolicy()
+            await loadProjectBudget()
         } catch {
             handle(error)
         }
@@ -179,6 +187,12 @@ final class AppModel {
             mailboxDeleteUnread = false
             mailboxAutoGc = false
             mailboxPolicyStatus = nil
+            projectBudget = .empty
+            projectSpentTokens = 0
+            projectSpentCostUsd = 0
+            projectTokenBudgetText = ""
+            projectCostBudgetText = ""
+            projectBudgetStatus = nil
             teamPlan = nil
             planTaskStatuses = [:]
             lastCommit = nil
@@ -204,6 +218,7 @@ final class AppModel {
         Task { await loadIntegrationPolicy() }
         Task { await loadArtifactPolicy() }
         Task { await loadMailboxPolicy() }
+        Task { await loadProjectBudget() }
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -475,6 +490,77 @@ final class AppModel {
         }
     }
 
+    func loadProjectBudget() async {
+        guard let projectID = selectedProjectID else {
+            projectBudget = .empty
+            projectSpentTokens = 0
+            projectSpentCostUsd = 0
+            projectTokenBudgetText = ""
+            projectCostBudgetText = ""
+            projectBudgetStatus = nil
+            return
+        }
+        projectBudgetBusy = true
+        defer { projectBudgetBusy = false }
+        do {
+            let result = try await core.projectBudget(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            projectBudget = result.budget
+            projectSpentTokens = result.spentTokens
+            projectSpentCostUsd = result.spentCostUsd
+            projectTokenBudgetText = result.budget.tokenBudget.map { String($0) } ?? ""
+            projectCostBudgetText = result.budget.costBudgetUsd.map { String($0) } ?? ""
+            projectBudgetStatus = nil
+        } catch {
+            handle(error)
+        }
+    }
+
+    func saveProjectBudget() async {
+        guard let projectID = selectedProjectID else {
+            projectBudgetStatus = "Select a project first."
+            return
+        }
+        func optionalInt(_ text: String) -> Int? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty ? nil : Int(trimmed)
+        }
+        func optionalDouble(_ text: String) -> Double? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty ? nil : Double(trimmed)
+        }
+        let tokens = optionalInt(projectTokenBudgetText)
+        let cost = optionalDouble(projectCostBudgetText)
+        if (!projectTokenBudgetText.trimmingCharacters(in: .whitespaces).isEmpty && tokens == nil)
+            || (!projectCostBudgetText.trimmingCharacters(in: .whitespaces).isEmpty && cost == nil)
+        {
+            projectBudgetStatus = "Budgets must be empty or positive numbers."
+            return
+        }
+        projectBudgetBusy = true
+        defer { projectBudgetBusy = false }
+        do {
+            let result = try await core.setProjectBudget(
+                projectID: projectID,
+                budget: ProjectBudget(tokenBudget: tokens, costBudgetUsd: cost)
+            )
+            guard projectID == selectedProjectID else { return }
+            projectBudget = result.budget
+            projectSpentTokens = result.spentTokens
+            projectSpentCostUsd = result.spentCostUsd
+            projectBudgetStatus = "Project budget saved"
+        } catch {
+            projectBudgetStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func resetProjectBudget() async {
+        projectTokenBudgetText = ""
+        projectCostBudgetText = ""
+        await saveProjectBudget()
+    }
+
     func loadMailboxPolicy() async {
         guard let projectID = selectedProjectID else {
             mailboxPolicy = .disabled
@@ -483,6 +569,12 @@ final class AppModel {
             mailboxDeleteUnread = false
             mailboxAutoGc = false
             mailboxPolicyStatus = nil
+            projectBudget = .empty
+            projectSpentTokens = 0
+            projectSpentCostUsd = 0
+            projectTokenBudgetText = ""
+            projectCostBudgetText = ""
+            projectBudgetStatus = nil
             return
         }
         mailboxPolicyBusy = true
@@ -575,6 +667,12 @@ final class AppModel {
             mailboxDeleteUnread = false
             mailboxAutoGc = false
             mailboxPolicyStatus = nil
+            projectBudget = .empty
+            projectSpentTokens = 0
+            projectSpentCostUsd = 0
+            projectTokenBudgetText = ""
+            projectCostBudgetText = ""
+            projectBudgetStatus = nil
             return
         }
         artifactPolicyBusy = true

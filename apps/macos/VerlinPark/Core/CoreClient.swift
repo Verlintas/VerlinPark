@@ -295,6 +295,27 @@ actor CoreClient {
             .policy
     }
 
+    func projectBudget(projectID: String) async throws -> ProjectBudgetResult {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "project.budget.get", params: params)
+            .decode(ProjectBudgetResult.self)
+    }
+
+    func setProjectBudget(
+        projectID: String,
+        budget: ProjectBudget
+    ) async throws -> ProjectBudgetResult {
+        var value: [String: JSONValue] = [:]
+        value["token_budget"] = budget.tokenBudget.map { .number(Double($0)) } ?? .null
+        value["cost_budget_usd"] = budget.costBudgetUsd.map { .number($0) } ?? .null
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "budget": .object(value),
+        ]
+        return try await request(method: "project.budget.set", params: params)
+            .decode(ProjectBudgetResult.self)
+    }
+
     func mailboxPolicy(projectID: String) async throws -> MailboxPolicy {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "mailbox.policy.get", params: params)

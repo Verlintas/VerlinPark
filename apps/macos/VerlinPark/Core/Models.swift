@@ -61,6 +61,32 @@ struct ArtifactPolicy: Codable, Hashable, Sendable {
     }
 }
 
+struct ProjectBudget: Codable, Hashable, Sendable {
+    var tokenBudget: Int?
+    var costBudgetUsd: Double?
+
+    static let empty = ProjectBudget(tokenBudget: nil, costBudgetUsd: nil)
+
+    enum CodingKeys: String, CodingKey {
+        case tokenBudget = "token_budget"
+        case costBudgetUsd = "cost_budget_usd"
+    }
+}
+
+struct ProjectBudgetResult: Codable, Sendable {
+    let projectId: String
+    let budget: ProjectBudget
+    let spentTokens: Int
+    let spentCostUsd: Double
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case budget
+        case spentTokens = "spent_tokens"
+        case spentCostUsd = "spent_cost_usd"
+    }
+}
+
 struct MailboxPolicy: Codable, Hashable, Sendable {
     var maxAgeSecs: Int?
     var maxCount: Int?

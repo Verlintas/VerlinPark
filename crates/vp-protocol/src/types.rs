@@ -523,6 +523,33 @@ pub struct UsageLedgerResult {
     pub totals: UsageTotals,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectBudget {
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectBudgetParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetProjectBudgetParams {
+    pub project_id: String,
+    pub budget: ProjectBudget,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectBudgetResult {
+    pub project_id: String,
+    pub budget: ProjectBudget,
+    pub spent_tokens: u64,
+    pub spent_cost_usd: f64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityInfo {
     #[serde(default)]

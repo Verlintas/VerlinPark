@@ -31,14 +31,15 @@ use vp_protocol::types::{
     LandSessionParams, ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams,
     MailboxListParams, MailboxListResult, MailboxPolicyParams, MailboxPolicyResult,
     MarkMessageReadParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
-    PingResult, ProjectListResult, PromptParams, PromptResult, RehydrateSessionParams,
-    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
-    ResolveMergeResult, RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams,
-    SessionExportParams, SessionImportParams, SessionListResult, SessionLogParams,
-    SessionPauseParams, SessionPauseResult, SessionResumeParams, SessionResumeResult,
-    SessionTodosParams, SessionTodosResult, SetArtifactPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
+    PingResult, ProjectBudgetParams, ProjectListResult, PromptParams, PromptResult,
+    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
+    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, ServerInfo,
+    SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
+    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionResumeParams,
+    SessionResumeResult, SessionTodosParams, SessionTodosResult, SetArtifactPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetProjectBudgetParams,
+    SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams,
+    TeamPlanResult, UsageLedgerParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -567,6 +568,24 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                         items,
                     },
                 ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.budget.get" => match parse_params::<ProjectBudgetParams>(request.params) {
+            Ok(params) => match state.engine.get_project_budget(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.budget.set" => match parse_params::<SetProjectBudgetParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_project_budget(&params.project_id, params.budget)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
