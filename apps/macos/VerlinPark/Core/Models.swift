@@ -61,6 +61,24 @@ struct ArtifactPolicy: Codable, Hashable, Sendable {
     }
 }
 
+struct AgentProbeResult: Codable, Sendable {
+    let provider: String
+    let model: String
+    let latencyMs: Int
+    let inputTokens: Int
+    let outputTokens: Int
+    let text: String
+
+    enum CodingKeys: String, CodingKey {
+        case provider
+        case model
+        case latencyMs = "latency_ms"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case text
+    }
+}
+
 struct ProjectBudget: Codable, Hashable, Sendable {
     var tokenBudget: Int?
     var costBudgetUsd: Double?

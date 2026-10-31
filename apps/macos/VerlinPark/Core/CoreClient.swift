@@ -295,6 +295,11 @@ actor CoreClient {
             .policy
     }
 
+    func probeProvider() async throws -> AgentProbeResult {
+        try await request(method: "agent.probe", params: [:])
+            .decode(AgentProbeResult.self)
+    }
+
     func projectBudget(projectID: String) async throws -> ProjectBudgetResult {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "project.budget.get", params: params)

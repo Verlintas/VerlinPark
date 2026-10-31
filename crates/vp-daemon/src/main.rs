@@ -520,6 +520,10 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "agent.info" => RpcResponse::success(id, state.agent.info()),
+        "agent.probe" => match state.agent.probe().await {
+            Ok(result) => RpcResponse::success(id, result),
+            Err(error) => internal_error(id, error),
+        },
         "session.discard" => match parse_params::<DiscardSessionParams>(request.params) {
             Ok(params) => match state.engine.discard_session(&params.session_id).await {
                 Ok(()) => RpcResponse::success(id, json!({"discarded": true})),

@@ -387,7 +387,12 @@ struct ProvidersSettingsView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.providerBusy)
-                    if model.providerBusy {
+                    Button("Test connection") {
+                        Task { await model.probeProvider() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.providerProbeBusy || !(model.agentInfo?.configured ?? false))
+                    if model.providerBusy || model.providerProbeBusy {
                         ProgressView().controlSize(.small)
                     }
                     Spacer()
@@ -398,6 +403,11 @@ struct ProvidersSettingsView: View {
                     }
                 }
                 if let status = model.providerStatus {
+                    Text(status)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                if let status = model.providerProbeStatus {
                     Text(status)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)

@@ -563,6 +563,16 @@ pub struct DoctorReport {
     pub ok: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProbeResult {
+    pub provider: String,
+    pub model: String,
+    pub latency_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityInfo {
     #[serde(default)]

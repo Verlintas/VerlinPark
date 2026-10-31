@@ -28,6 +28,8 @@ enum Command {
     Info,
     /// Run local diagnostics.
     Doctor,
+    /// Send a tiny live request to the configured provider.
+    ProviderTest,
     /// List projects.
     Projects,
     /// Add a local repository as a project.
@@ -256,6 +258,7 @@ async fn main() -> Result<()> {
         }
         Command::Info => rpc(&discovery, "server.info", json!({})).await?,
         Command::Doctor => rpc(&discovery, "server.doctor", json!({})).await?,
+        Command::ProviderTest => rpc(&discovery, "agent.probe", json!({})).await?,
         Command::Projects => rpc(&discovery, "project.list", json!({})).await?,
         Command::ProjectAdd { path, name } => {
             let root = path
@@ -775,6 +778,18 @@ fn print_human(value: &Value) {
             value["agents"].as_array().map_or(0, Vec::len),
             value["messages"].as_array().map_or(0, Vec::len),
             value["merge_queue"].as_array().map_or(0, Vec::len)
+        );
+        return;
+    }
+    if value.get("latency_ms").is_some() && value.get("provider").is_some() {
+        println!(
+            "provider {} / {}  {} ms  in={} out={}  {}",
+            value["provider"].as_str().unwrap_or("?"),
+            value["model"].as_str().unwrap_or("?"),
+            value["latency_ms"].as_u64().unwrap_or(0),
+            value["input_tokens"].as_u64().unwrap_or(0),
+            value["output_tokens"].as_u64().unwrap_or(0),
+            value["text"].as_str().unwrap_or("")
         );
         return;
     }

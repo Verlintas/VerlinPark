@@ -12,8 +12,8 @@ use futures_util::StreamExt;
 use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
-    AgentInfo, CapacityInfo, ConfigureAgentParams, MergeQueueEntry, PlanDepartment, PlanTask,
-    Project, RoleModels, Session, StoredMessage, TeamPlan, TodoItem,
+    AgentInfo, AgentProbeResult, CapacityInfo, ConfigureAgentParams, MergeQueueEntry,
+    PlanDepartment, PlanTask, Project, RoleModels, Session, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, StreamEvent,
@@ -1145,6 +1145,60 @@ impl AgentService {
                 capacity: self.capacity.snapshot(),
             },
         }
+    }
+
+    pub async fn probe(&self) -> Result<AgentProbeResult> {
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned())
+            .ok_or_else(|| anyhow!("agent provider is not configured"))?;
+        let started = std::time::Instant::now();
+        let request = ChatRequest {
+            model: config.model.clone(),
+            messages: vec![ChatMessage::user("Reply with the single word: OK")],
+            system: Some("You are a connection probe. Reply concisely.".to_string()),
+            max_tokens: Some(16),
+            temperature: Some(0.0),
+            tools: Vec::new(),
+        };
+        let mut stream = timeout(
+            Duration::from_secs(30),
+            config.provider.stream_chat(request),
+        )
+        .await
+        .map_err(|_| anyhow!("provider probe timed out"))?
+        .context("starting provider probe")?;
+        let mut text = String::new();
+        let mut usage = (0u64, 0u64);
+        while let Some(item) = timeout(Duration::from_secs(30), stream.next())
+            .await
+            .map_err(|_| anyhow!("provider probe stream timed out"))?
+        {
+            match item? {
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    usage.0 = usage.0.saturating_add(input_tokens as u64);
+                    usage.1 = usage.1.saturating_add(output_tokens as u64);
+                }
+                StreamEvent::ToolCall(_) | StreamEvent::Done => {}
+            }
+        }
+        if text.trim().is_empty() {
+            anyhow::bail!("provider probe returned no text");
+        }
+        Ok(AgentProbeResult {
+            provider: config.provider_name,
+            model: config.model,
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            input_tokens: usage.0,
+            output_tokens: usage.1,
+            text: truncate(&text),
+        })
     }
 
     pub async fn retry_merge(&self, entry_id: &str) -> Result<MergeQueueEntry> {
@@ -9594,6 +9648,23 @@ mod tests {
         assert_eq!(model_for(&config, AgentRole::Worker), "worker-model");
         assert_eq!(model_for(&config, AgentRole::Manager), "test");
         assert_eq!(role_price(&config, AgentRole::Worker), (2.0, 4.0));
+    }
+
+    #[tokio::test]
+    async fn probes_the_configured_provider() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![vec![
+                StreamEvent::TextDelta("OK".into()),
+                StreamEvent::Done,
+            ]])),
+        });
+        let (_engine, service, _project) = test_service_with_provider(&dir, provider);
+        let result = service.probe().await.unwrap();
+        assert_eq!(result.provider, "queue");
+        assert_eq!(result.model, "test");
+        assert_eq!(result.text, "OK");
+        assert!(result.latency_ms < 5_000);
     }
 
     #[tokio::test]

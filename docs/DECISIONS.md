@@ -68,6 +68,7 @@
 | [0056](adr/0056-worktree-cleanup.md) | Explicit terminal worktree cleanup | Accepted | 运维/磁盘/安全 |
 | [0057](adr/0057-project-budget-pool.md) | Project-wide shared budget pool | Accepted | 预算/跨 session |
 | [0058](adr/0058-doctor-diagnostics.md) | Local doctor diagnostics | Accepted | 运维/诊断 |
+| [0059](adr/0059-provider-probe.md) | Live provider probe | Accepted | Provider/诊断 |
 
 ---
 

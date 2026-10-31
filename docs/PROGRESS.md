@@ -40,16 +40,16 @@
 | Rehydrate | ✅ | `vp rehydrate <session> [--worktree path]`：only imported；校验 project/base commit；创建/attach session worktree；按 branch 分组重建 imported agent task worktrees；状态回到 idle；返回 warnings/remapped count |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
 | Global scheduling | ✅ | daemon-wide session semaphore：`VERLINPARK_GLOBAL_SESSION_CAP` 默认 4（1–32）；超出时 session 状态 `queued`，`agent.queued`，可 cancel；跨 session Worker/Labour write-scope 锁按 project 串行等待，同 session 共享，空 scope 视为 wildcard；daemon-wide Worker/Labour capacity controller：`VERLINPARK_GLOBAL_WORKERS` 默认 12、`VERLINPARK_GLOBAL_LABOUR` 默认 24（1–100），run 级 permit、provider 重配置不重置、`agent.info`/Settings 可见；等待 permit 时写 `agent.capacity_wait` 并把 agent 标为 `queued`，获得后写 `agent.capacity_ready`；permit 在 session 间 round-robin，单 session 不能靠大批量占满队列；仍是进程内、无优先级、非持久 |
-| Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
+| Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证）；`agent.probe` / `vp provider-test` / Settings Test connection 发送一次无工具 16-token 请求，检查 endpoint/key/model/stream |
 | Models / budgets | ✅ | 分角色 model override + input/output USD/1M price；session token / USD / wall-clock budget；project-wide shared token/USD pool；TeamPlan department/task token/USD budgets；per-call `usage_ledger`（agent/role/task/department/model/tokens/estimated/cost）+ `session.usage` / `vp usage` / Preview → Cost 分组汇总；`agent.usage` / `agent.cost`；time 在 turn/tool 边界检查；Providers/New Session/CLI/UI |
-| CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/artifact/backfill-artifacts/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate/cleanup-worktrees/project-budget/project-budget-set/doctor |
+| CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/artifact/backfill-artifacts/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate/cleanup-worktrees/project-budget/project-budget-set/doctor/provider-test |
 | Distribution | ✅ | `just package` 生成 Release app + bundled `verlinpadd` + `vp` + docs 的 ad-hoc signed DMG 和 SHA-256；`v*` tag 触发 GitHub Release workflow；未 Developer ID 公证 |
 | Project budget | ✅ | `project.budget.get/set` / `vp project-budget*` / Manage Dash；跨 session 共享 token/USD pool，使用同一 `BudgetRegistry` `project:<id>` 原子 reservation；project 超限终止当前 run |
 | Worktree cleanup | ✅ | `project.cleanup_worktrees` / `vp cleanup-worktrees`：仅终端 session、默认 7 天、dry-run、dirty 保护、默认保留 branch、`--delete-branches` 显式删除 |
 
 ## 验证
 
-- `cargo test --workspace`：108 个测试通过（core 87、store 16、providers 5）。
+- `cargo test --workspace`：109 个测试通过（core 88、store 16、providers 5）。
 - `xcodebuild test`：12 个 Swift 测试通过（含协议向后兼容解码）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -132,6 +132,7 @@
 - **M3 第三十八切片**：terminal worktree cleanup（dry-run、dirty 保护、默认保留 branch）。
 - **M3 第三十九切片**：project-wide shared budget pool（跨 session token/USD reservation、abortive project scope、CLI/Manage Dash）。
 - **M3 第四十切片**：`server.doctor` / `vp doctor` 本地只读诊断（DB、权限、root、worktree、mirror、sandbox、provider）。
+- **M3 第四十一切片**：`agent.probe` / `vp provider-test` / Settings Test connection 真实 provider 连通性探针。
 
 ## 如何运行
 

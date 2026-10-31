@@ -87,6 +87,8 @@ final class AppModel {
     var providerAPIKey = Keychain.read(account: "provider.apiKey") ?? ""
     var providerStatus: String?
     var providerBusy = false
+    var providerProbeBusy = false
+    var providerProbeStatus: String?
 
     private static func loadRoleModels() -> RoleModels {
         guard let data = UserDefaults.standard.data(forKey: "provider.roleModels"),
@@ -922,6 +924,19 @@ final class AppModel {
             let materialized = try await core.materializeArtifact(artifactID: artifact.id)
             NSWorkspace.shared.open(URL(fileURLWithPath: materialized.path))
         } catch {
+            handle(error)
+        }
+    }
+
+    func probeProvider() async {
+        providerProbeBusy = true
+        defer { providerProbeBusy = false }
+        do {
+            let result = try await core.probeProvider()
+            providerProbeStatus =
+                "\(result.provider) / \(result.model) · \(result.latencyMs) ms · \(result.text)"
+        } catch {
+            providerProbeStatus = error.localizedDescription
             handle(error)
         }
     }
