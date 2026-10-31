@@ -58,6 +58,7 @@
 | [0046](adr/0046-mailbox-retention-gc.md) | Mailbox retention GC | Accepted | 邮箱/磁盘/保留策略 |
 | [0047](adr/0047-budget-reservations.md) | In-flight task/department budget reservations | Accepted | 预算/并发/正确性 |
 | [0048](adr/0048-artifact-replay.md) | Artifact replay and repair | Accepted | 事件溯源/产物 |
+| [0049](adr/0049-verifier-tracked-file-guard.md) | Verifier tracked-file guard | Accepted | 权限/验证/安全 |
 
 ---
 

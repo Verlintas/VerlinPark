@@ -334,6 +334,24 @@ pub fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
     Ok(status.success())
 }
 
+/// Tracked files changed in a worktree. Untracked build/test outputs are
+/// ignored so a read-only Verifier can still run tests.
+pub fn tracked_changes(root: &Path) -> Result<Vec<String>> {
+    let output = git_output(root, &["status", "--porcelain", "--untracked-files=no"])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Discard tracked modifications made by a Verifier. Untracked files are left
+/// alone because they may be legitimate test artifacts.
+pub fn reset_tracked_changes(root: &Path) -> Result<()> {
+    run_git(root, &["reset", "--hard", "HEAD"])
+}
+
 pub(crate) fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")

@@ -2621,6 +2621,45 @@ async fn verify_worker(
     .await;
     match result {
         Ok(LoopOutcome::Verdict(verdict)) => {
+            let verify_root = verifier_spec.worktree.clone();
+            let changed =
+                tokio::task::spawn_blocking(move || worktree::tracked_changes(&verify_root))
+                    .await??;
+            if !changed.is_empty() {
+                let reset_root = verifier_spec.worktree.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    worktree::reset_tracked_changes(&reset_root)
+                })
+                .await?
+                {
+                    tracing::warn!(%error, "failed to reset verifier worktree changes");
+                }
+                let summary = format!(
+                    "Verifier modified tracked files: {}",
+                    truncate_to(&changed.join(", "), 300)
+                );
+                engine.update_agent_status(&verifier.id, "failed").await?;
+                emit(
+                    engine,
+                    &session.id,
+                    &verifier_spec,
+                    "agent.finished",
+                    serde_json::json!({
+                        "status": "failed",
+                        "approved": false,
+                        "summary": summary,
+                        "modified_paths": changed,
+                        "verified_worker": worker_spec.name,
+                        "worktree": verifier_spec.worktree,
+                        "branch": verifier_spec.branch,
+                    }),
+                )
+                .await?;
+                return Ok(VerificationOutcome::Rejected(VerifierVerdict {
+                    approved: false,
+                    summary,
+                }));
+            }
             engine.update_agent_status(&verifier.id, "idle").await?;
             emit(
                 engine,
@@ -7838,6 +7877,151 @@ mod tests {
                 && event.payload["agent_role"] == "worker"
                 && event.payload["status"] == "changes_requested"
                 && event.payload["approved"] == false
+        }));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_verifier_that_modifies_tracked_files() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "title": "Quality",
+                            "objective": "review the change"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "write verifier-target.txt",
+                            "write_scope": ["verifier-target.txt"]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "verifier-target.txt",
+                            "content": "original\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker wrote".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_shell".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({
+                            "command": "printf 'tampered\n' > verifier-target.txt"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_verdict".into(),
+                        name: "submit_verdict".into(),
+                        arguments: serde_json::json!({
+                            "approved": true,
+                            "summary": "looks good"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "verifier-write".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..200 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        service.start(&session.id, "verifier-write").await.unwrap();
+        let _ = wait_until_idle(&engine, &session).await;
+        approver.abort();
+
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
+        assert_eq!(worker.status, "changes_requested");
+        let verifier = agents
+            .iter()
+            .find(|agent| agent.role == "verifier")
+            .unwrap();
+        assert_eq!(verifier.status, "failed");
+        let verifier_worktree = PathBuf::from(verifier.worktree.clone().unwrap());
+        assert!(
+            worktree::tracked_changes(&verifier_worktree)
+                .unwrap()
+                .is_empty(),
+            "verifier edits must be reset"
+        );
+        let session_worktree = session.worktree.clone().unwrap();
+        assert!(
+            !std::path::Path::new(&session_worktree)
+                .join("verifier-target.txt")
+                .exists()
+        );
+        let diff = engine.session_diff(&session.id).await.unwrap();
+        assert!(diff.patch.is_empty());
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.finished"
+                && event.payload["agent_role"] == "verifier"
+                && event.payload["approved"] == false
+                && event.payload["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("modified tracked files"))
         }));
     }
 
