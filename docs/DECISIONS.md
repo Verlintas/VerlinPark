@@ -89,6 +89,7 @@
 | [0077](adr/0077-mcp-stdio-client.md) | MCP stdio client | Accepted | 工具/集成 |
 | [0078](adr/0078-memory-retention-and-fts.md) | Memory retention and FTS | Accepted | 记忆/存储 |
 | [0079](adr/0079-priority-admission.md) | Priority-aware admission | Accepted | 调度 |
+| [0080](adr/0080-sandboxed-console.md) | Sandboxed line-oriented console | Accepted | 终端/执行 |
 
 ---
 

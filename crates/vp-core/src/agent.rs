@@ -3795,7 +3795,7 @@ async fn finish_worker(
     }
 }
 
-fn shell_secret_roots(data_dir: &std::path::Path) -> Vec<PathBuf> {
+pub(crate) fn shell_secret_roots(data_dir: &std::path::Path) -> Vec<PathBuf> {
     let mut roots = vec![
         data_dir.join("verlinpark.db"),
         data_dir.join("run"),

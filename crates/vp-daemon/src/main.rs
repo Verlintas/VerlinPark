@@ -27,25 +27,26 @@ use vp_protocol::types::{
     ArtifactGcParams, ArtifactGetParams, ArtifactListParams, ArtifactListResult,
     ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult,
     AuthParams, AuthResult, CancelSessionParams, CancelSessionResult, CleanupWorktreesParams,
-    CommitSessionParams, ConfigureAgentParams, CreateSessionParams, DiscardSessionParams,
-    DoctorCheck, DoctorReport, EventListResult, IntegrationPolicyParams, IntegrationPolicyResult,
-    LandSessionParams, ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams,
-    MailboxListParams, MailboxListResult, MailboxPolicyParams, MailboxPolicyResult,
-    MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpReadResourceParams,
-    McpServerIdParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
-    MemoryListParams, MemoryPolicyParams, MemoryPruneParams, MergeQueueListParams,
-    MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectBudgetParams,
-    ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
-    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
-    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, SearchParams,
-    ServerInfo, SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
-    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
-    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
-    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
-    SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams,
-    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult, UpdateMcpServerParams,
-    UsageLedgerParams, WorktreePolicyParams,
+    CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
+    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, CreateSessionParams,
+    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, IntegrationPolicyParams,
+    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
+    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
+    MailboxPolicyResult, MarkMessageReadParams, McpCallParams, McpGetPromptParams,
+    McpReadResourceParams, McpServerIdParams, MemoryCreateParams, MemoryCreateResult,
+    MemoryDeleteParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
+    MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams, PingResult,
+    ProjectBudgetParams, ProjectListResult, ProjectUsageParams, PromptParams, PromptResult,
+    QuestionListParams, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
+    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
+    RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams, SessionExportParams,
+    SessionImportParams, SessionListResult, SessionLogParams, SessionPauseParams,
+    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams,
+    SessionResumeResult, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
+    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
+    SetMemoryPolicyParams, SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams,
+    ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
+    UpdateMcpServerParams, UsageLedgerParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -518,6 +519,53 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     Err(error) => internal_error(id, error),
                 }
             }
+            Err(response) => response_with_id(id, response),
+        },
+        "console.open" => match parse_params::<ConsoleOpenParams>(request.params) {
+            Ok(params) => match state.engine.console_open(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "console.write" => match parse_params::<ConsoleWriteParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .console_write(&params.console_id, &params.data)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "console.read" => match parse_params::<ConsoleReadParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .console_read(&params.console_id, params.after_seq)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "console.signal" => match parse_params::<ConsoleSignalParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .console_signal(&params.console_id, &params.signal)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "console.close" => match parse_params::<ConsoleCloseParams>(request.params) {
+            Ok(params) => match state.engine.console_close(&params.console_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
             Err(response) => response_with_id(id, response),
         },
         "session.list" => {

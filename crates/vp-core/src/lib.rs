@@ -6,16 +6,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::tools::ToolContext;
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
-    ArtifactMaterialization, ArtifactPolicy, DoctorCheck, Event, IntegrationPolicy,
-    MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult, McpPromptListResult,
-    McpReadResourceResult, McpResourceListResult, McpServer, McpServerListResult,
-    McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPolicy,
-    MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, Project, ProjectBudget,
+    ArtifactMaterialization, ArtifactPolicy, ConsoleCloseResult, ConsoleOpenResult,
+    ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult, DoctorCheck, Event,
+    IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult,
+    McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer,
+    McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult,
+    MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, Project, ProjectBudget,
     ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
     SearchResult, Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult,
     SessionLandResult, SessionLogStatus, SessionRehydrateResult, SessionReplayReport,
@@ -30,6 +32,7 @@ use crate::budget::BudgetRegistry;
 
 pub mod agent;
 pub mod budget;
+pub mod console;
 pub mod mcp;
 pub mod rebuild;
 
@@ -69,6 +72,7 @@ pub struct Engine {
     git_lock: Arc<Mutex<()>>,
     budget_registry: Arc<BudgetRegistry>,
     mcp: Arc<mcp::McpManager>,
+    consoles: Arc<console::ConsoleManager>,
 }
 
 fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
@@ -187,6 +191,7 @@ impl Engine {
             git_lock: Arc::new(Mutex::new(())),
             budget_registry: Arc::new(BudgetRegistry::new()),
             mcp: Arc::new(mcp::McpManager::from_env()),
+            consoles: Arc::new(console::ConsoleManager::new()),
         }
     }
 
@@ -3970,6 +3975,74 @@ impl Engine {
             .await??
             .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
         self.mcp.get_prompt(&server, name, arguments).await
+    }
+
+    pub async fn console_open(&self, session_id: &str) -> Result<ConsoleOpenResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (session, project) = tokio::task::spawn_blocking(move || {
+            let session = store
+                .get_session(&id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+            let project = store
+                .get_project(&session.project_id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+            Ok::<_, anyhow::Error>((session, project))
+        })
+        .await??;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let session = self.ensure_session_worktree(&session.id).await?;
+        let worktree = session
+            .worktree
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?;
+        let policy = self.get_shell_policy(&project.id).await?;
+        let mut secret_roots = crate::agent::shell_secret_roots(self.store.data_dir());
+        secret_roots.extend(policy.read_deny.iter().map(PathBuf::from));
+        let context = ToolContext {
+            root: PathBuf::from(&worktree),
+            project_root: PathBuf::from(&project.root),
+            sandbox_root: self
+                .store
+                .data_dir()
+                .join("sandbox")
+                .join(&session.id)
+                .join("console"),
+            secret_roots,
+            network_allowed: policy.network != "deny",
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            restrict_home: policy.restrict_home,
+        };
+        self.consoles.open(&session.id, context).await
+    }
+
+    pub async fn console_write(&self, console_id: &str, data: &str) -> Result<ConsoleWriteResult> {
+        let written = self.consoles.write(console_id, data).await?;
+        Ok(ConsoleWriteResult { written })
+    }
+
+    pub async fn console_read(
+        &self,
+        console_id: &str,
+        after_seq: u64,
+    ) -> Result<ConsoleReadResult> {
+        self.consoles.read(console_id, after_seq).await
+    }
+
+    pub async fn console_signal(
+        &self,
+        console_id: &str,
+        signal: &str,
+    ) -> Result<ConsoleSignalResult> {
+        self.consoles.signal(console_id, signal).await
+    }
+
+    pub async fn console_close(&self, console_id: &str) -> Result<ConsoleCloseResult> {
+        self.consoles.close(console_id).await
     }
 
     pub async fn list_questions(&self, session_id: Option<String>) -> Result<QuestionListResult> {

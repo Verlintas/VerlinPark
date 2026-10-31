@@ -824,6 +824,8 @@ struct PreviewPanelView: View {
                     mailbox
                 case .cost:
                     cost
+                case .console:
+                    ConsolePanel()
                 case .trace:
                     trace
                 }
@@ -836,6 +838,9 @@ struct PreviewPanelView: View {
             }
         }
         .task(id: model.selectedSessionID) {
+            if model.consoleID != nil {
+                await model.closeConsole()
+            }
             if model.selectedSessionID != nil {
                 await model.loadDiff()
                 await model.loadMailbox()
@@ -960,6 +965,8 @@ struct PreviewPanelView: View {
                             await model.loadMailbox()
                         case .cost:
                             await model.loadUsage()
+                        case .console:
+                            await model.pollConsole()
                         default:
                             await model.loadDiff()
                         }
@@ -971,7 +978,8 @@ struct PreviewPanelView: View {
                 .buttonStyle(.plain)
                 .help(
                     mode == .queue ? "Refresh queue" : mode == .mailbox ? "Refresh mailbox" :
-                        mode == .cost ? "Refresh usage" : "Refresh diff"
+                        mode == .cost ? "Refresh usage" :
+                        mode == .console ? "Refresh console" : "Refresh diff"
                 )
                 .disabled(model.diffLoading)
             }
@@ -1691,6 +1699,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
     case queue
     case mailbox
     case cost
+    case console
     case trace
 
     var id: String {
@@ -1704,7 +1713,128 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .queue: "Queue"
         case .mailbox: "Mailbox"
         case .cost: "Cost"
+        case .console: "Console"
         case .trace: "Trace"
+        }
+    }
+}
+
+private struct ConsolePanel: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+                Text(model.consoleStatus)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                if !model.consoleWorktree.isEmpty {
+                    Text(model.consoleWorktree)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if model.consoleBusy {
+                    ProgressView().controlSize(.small)
+                }
+                if model.consoleID != nil {
+                    Button("Clear") {
+                        model.clearConsole()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Button("Interrupt") {
+                        Task { await model.interruptConsole() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.consoleStatus != "running")
+                    Button("Close") {
+                        Task { await model.closeConsole() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                } else {
+                    Button("Open console") {
+                        Task { await model.openConsole() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(model.selectedSessionID == nil || model.consoleBusy)
+                }
+            }
+            .padding(10)
+            Divider().opacity(0.3)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(
+                        model.consoleOutput.isEmpty
+                            ? "Line-oriented shell in the session worktree. Commands run under the Seatbelt write sandbox; full-screen TUI programs are not supported."
+                            : model.consoleOutput
+                    )
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(model.consoleOutput.isEmpty ? .secondary : .primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .id("console-bottom")
+                }
+                .onChange(of: model.consoleOutput) {
+                    proxy.scrollTo("console-bottom", anchor: .bottom)
+                }
+            }
+            Divider().opacity(0.3)
+            if let error = model.consoleError {
+                Text(error)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 4)
+            }
+            HStack(spacing: 8) {
+                Text("$")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.green)
+                TextField("command", text: $model.consoleInput)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11, design: .monospaced))
+                    .onSubmit {
+                        Task { await model.sendConsole() }
+                    }
+                    .disabled(model.consoleID == nil || model.consoleStatus != "running")
+                Button("Send") {
+                    Task { await model.sendConsole() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(
+                    model.consoleID == nil
+                        || model.consoleStatus != "running"
+                        || model.consoleInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
+            }
+            .padding(10)
+        }
+        .task(id: model.consoleID) {
+            guard model.consoleID != nil else { return }
+            while !Task.isCancelled, model.consoleStatus == "running" {
+                await model.pollConsole()
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+    }
+
+    private var statusColor: Color {
+        switch model.consoleStatus {
+        case "running": .green
+        case "failed": .red
+        case "exited": .secondary
+        default: .secondary
         }
     }
 }

@@ -95,6 +95,15 @@ final class AppModel {
     var memoryQuery = ""
     var memoryBusy = false
     var memoryStatus: String?
+    var consoleID: String?
+    var consoleWorktree = ""
+    var consoleOutput = ""
+    var consoleSeq: UInt64 = 0
+    var consoleStatus = "closed"
+    var consoleExitCode: Int?
+    var consoleInput = ""
+    var consoleBusy = false
+    var consoleError: String?
     var memoryPolicyEnabled = false
     var memoryPolicyMaxItems = "1000"
     var memoryPolicyMaxAgeDays = "180"
@@ -995,6 +1004,102 @@ final class AppModel {
         memoryPolicyEnabled = policy.enabled
         memoryPolicyMaxItems = policy.maxItems.map(String.init) ?? ""
         memoryPolicyMaxAgeDays = policy.maxAgeDays.map(String.init) ?? ""
+    }
+
+    func openConsole() async {
+        guard let sessionID = selectedSessionID else {
+            consoleError = "Select a session before opening a console."
+            return
+        }
+        guard consoleID == nil else { return }
+        consoleBusy = true
+        defer { consoleBusy = false }
+        do {
+            let opened = try await core.openConsole(sessionID: sessionID)
+            consoleID = opened.consoleId
+            consoleWorktree = opened.worktree
+            consoleOutput = "Console ready in \(opened.worktree)\n"
+            consoleSeq = 0
+            consoleStatus = "running"
+            consoleExitCode = nil
+            consoleInput = ""
+            consoleError = nil
+        } catch {
+            consoleError = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func sendConsole() async {
+        guard let consoleID else { return }
+        let command = consoleInput
+        guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        consoleInput = ""
+        consoleOutput += "$ \(command)\n"
+        do {
+            _ = try await core.writeConsole(
+                consoleID: consoleID,
+                data: command + "\n"
+            )
+        } catch {
+            consoleError = error.localizedDescription
+        }
+    }
+
+    func pollConsole() async {
+        guard let consoleID else { return }
+        do {
+            let result = try await core.readConsole(
+                consoleID: consoleID,
+                afterSeq: consoleSeq
+            )
+            if !result.chunks.isEmpty {
+                consoleOutput += result.chunks.map(\.text).joined()
+                if consoleOutput.count > 400_000 {
+                    consoleOutput = String(consoleOutput.suffix(300_000))
+                }
+            }
+            consoleSeq = result.nextSeq
+            if result.status != consoleStatus {
+                consoleStatus = result.status
+                if result.status != "running" {
+                    consoleExitCode = result.exitCode
+                }
+            }
+            if result.dropped > 0 {
+                consoleError = "console output buffer dropped \(result.dropped) chunks"
+            }
+        } catch {
+            consoleError = error.localizedDescription
+        }
+    }
+
+    func interruptConsole() async {
+        guard let consoleID else { return }
+        do {
+            _ = try await core.signalConsole(consoleID: consoleID, signal: "int")
+        } catch {
+            consoleError = error.localizedDescription
+        }
+    }
+
+    func closeConsole() async {
+        guard let consoleID else { return }
+        consoleBusy = true
+        defer { consoleBusy = false }
+        do {
+            let result = try await core.closeConsole(consoleID: consoleID)
+            consoleExitCode = result.exitCode ?? consoleExitCode
+            consoleStatus = "closed"
+        } catch {
+            consoleError = error.localizedDescription
+        }
+        self.consoleID = nil
+        consoleWorktree = ""
+    }
+
+    func clearConsole() {
+        consoleOutput = ""
     }
 
     func loadMemories() async {

@@ -227,6 +227,77 @@ pub struct SessionPriorityResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ConsoleOpenParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleOpenResult {
+    pub console_id: String,
+    pub worktree: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConsoleWriteParams {
+    pub console_id: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleWriteResult {
+    pub written: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConsoleReadParams {
+    pub console_id: String,
+    #[serde(default)]
+    pub after_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsoleChunk {
+    pub seq: u64,
+    pub stream: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleReadResult {
+    pub console_id: String,
+    pub chunks: Vec<ConsoleChunk>,
+    pub next_seq: u64,
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub dropped: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConsoleSignalParams {
+    pub console_id: String,
+    pub signal: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleSignalResult {
+    pub signaled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConsoleCloseParams {
+    pub console_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleCloseResult {
+    pub closed: bool,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ListSessionsParams {
     #[serde(default)]
     pub project_id: Option<String>,

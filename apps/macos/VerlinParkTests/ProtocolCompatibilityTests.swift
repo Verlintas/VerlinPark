@@ -184,6 +184,40 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertTrue(result.questions.first?.isPending == true)
     }
 
+    func testConsoleResultsDecode() throws {
+        let opened = try JSONDecoder().decode(
+            ConsoleOpenResult.self,
+            from: Data(#"{"console_id":"console-1","worktree":"/tmp/repo"}"#.utf8)
+        )
+        XCTAssertEqual(opened.consoleId, "console-1")
+        XCTAssertEqual(opened.worktree, "/tmp/repo")
+
+        let readJSON = """
+        {
+          "console_id": "console-1",
+          "chunks": [
+            {"seq": 1, "stream": "stdout", "text": "hello\\n"}
+          ],
+          "next_seq": 1,
+          "status": "exited",
+          "exit_code": 0,
+          "dropped": 0
+        }
+        """
+        let read = try JSONDecoder().decode(ConsoleReadResult.self, from: Data(readJSON.utf8))
+        XCTAssertEqual(read.chunks.first?.text, "hello\n")
+        XCTAssertEqual(read.nextSeq, 1)
+        XCTAssertEqual(read.status, "exited")
+        XCTAssertEqual(read.exitCode, 0)
+
+        let closed = try JSONDecoder().decode(
+            ConsoleCloseResult.self,
+            from: Data(#"{"closed":true,"exit_code":0}"#.utf8)
+        )
+        XCTAssertTrue(closed.closed)
+        XCTAssertEqual(closed.exitCode, 0)
+    }
+
     func testSessionPriorityDecodes() throws {
         let json = """
         {

@@ -1112,6 +1112,62 @@ extension Int {
     }
 }
 
+struct ConsoleOpenResult: Codable, Sendable {
+    let consoleId: String
+    let worktree: String
+
+    enum CodingKeys: String, CodingKey {
+        case consoleId = "console_id"
+        case worktree
+    }
+}
+
+struct ConsoleChunk: Codable, Identifiable, Hashable, Sendable {
+    let seq: UInt64
+    let stream: String
+    let text: String
+
+    var id: UInt64 {
+        seq
+    }
+}
+
+struct ConsoleReadResult: Codable, Sendable {
+    let consoleId: String
+    let chunks: [ConsoleChunk]
+    let nextSeq: UInt64
+    let status: String
+    let exitCode: Int?
+    let dropped: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case consoleId = "console_id"
+        case chunks
+        case nextSeq = "next_seq"
+        case status
+        case exitCode = "exit_code"
+        case dropped
+    }
+}
+
+struct ConsoleWriteResult: Codable, Sendable {
+    let written: Bool
+}
+
+struct ConsoleSignalResult: Codable, Sendable {
+    let signaled: Bool
+}
+
+struct ConsoleCloseResult: Codable, Sendable {
+    let closed: Bool
+    let exitCode: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case closed
+        case exitCode = "exit_code"
+    }
+}
+
 struct AppNotice: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let sessionId: String

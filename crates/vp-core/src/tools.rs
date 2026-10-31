@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -647,6 +647,194 @@ impl AgentTool for WriteFile {
     }
 }
 
+pub(crate) async fn sandboxed_command(context: &ToolContext) -> Result<Command> {
+    if !Path::new(SANDBOX_EXEC).is_file() {
+        bail!("shell sandbox is unavailable on this platform; refusing to run unsandboxed shell");
+    }
+    let root = context.root.canonicalize().context("resolving worktree")?;
+    tokio::fs::create_dir_all(&context.sandbox_root).await?;
+    let scratch = context
+        .sandbox_root
+        .canonicalize()
+        .context("resolving shell scratch directory")?;
+    let tmp = scratch.join("tmp");
+    tokio::fs::create_dir_all(&tmp).await?;
+    let project_root = context
+        .project_root
+        .canonicalize()
+        .unwrap_or_else(|_| root.clone());
+    let (git_dir, common_dir) = git_metadata_dirs(&root, &project_root);
+    let mut profile = String::from(SHELL_SANDBOX_PROFILE);
+    if !context.network_allowed {
+        profile.push_str("(deny network*)\n");
+    }
+    let secret_roots = context
+        .secret_roots
+        .iter()
+        .map(|secret| secret.canonicalize().unwrap_or_else(|_| secret.clone()))
+        .collect::<Vec<_>>();
+    let mut allowed_paths = Vec::new();
+    if context.restrict_home {
+        let home = context
+            .home
+            .canonicalize()
+            .unwrap_or_else(|_| context.home.clone());
+        profile.push_str("(deny file-read* (subpath (param \"HOME\")))\n");
+        profile.push_str("(allow file-read-metadata (subpath (param \"HOME\")))\n");
+        profile.push_str(
+                "(allow file-read* (subpath (param \"WORKTREE\")) (subpath (param \"SCRATCH\")) (subpath (param \"GIT_DIR\")) (subpath (param \"COMMON_DIR\")))\n",
+            );
+        let mut candidates = vec![
+            home.join(".cargo"),
+            home.join(".rustup"),
+            home.join(".nvm"),
+            home.join(".volta"),
+            home.join(".asdf"),
+            home.join(".pyenv"),
+            home.join(".bun"),
+            home.join(".local"),
+            home.join("Library/Developer"),
+        ];
+        for key in [
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "NVM_DIR",
+            "VOLTA_HOME",
+            "ASDF_DIR",
+            "ASDF_DATA_DIR",
+            "PYENV_ROOT",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "GEM_HOME",
+            "GEM_PATH",
+            "PNPM_HOME",
+            "BUN_INSTALL",
+            "HOMEBREW_PREFIX",
+            "HOMEBREW_CELLAR",
+            "HOMEBREW_REPOSITORY",
+            "JAVA_HOME",
+            "GOROOT",
+            "GOPATH",
+            "DEVELOPER_DIR",
+            "SDKROOT",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                for part in value.split(':') {
+                    if !part.is_empty() {
+                        candidates.push(PathBuf::from(part));
+                    }
+                }
+            }
+        }
+        for candidate in candidates {
+            let candidate = candidate.canonicalize().unwrap_or(candidate);
+            if candidate.is_dir() && !allowed_paths.contains(&candidate) {
+                allowed_paths.push(candidate);
+            }
+        }
+        for path in [
+            home.join(".gitconfig"),
+            home.join(".ssh/config"),
+            home.join(".ssh/known_hosts"),
+        ] {
+            if path.is_file() && !allowed_paths.contains(&path) {
+                allowed_paths.push(path);
+            }
+        }
+        for (index, path) in allowed_paths.iter().enumerate() {
+            let rule = if path.is_dir() { "subpath" } else { "literal" };
+            profile.push_str(&format!(
+                "(allow file-read* ({rule} (param \"ALLOW{index}\")))\n"
+            ));
+        }
+    }
+    for (index, _) in secret_roots.iter().enumerate() {
+        profile.push_str(&format!(
+            "(deny file-read* (subpath (param \"SECRET{index}\")))\n"
+        ));
+    }
+    let mut process = Command::new(SANDBOX_EXEC);
+    process.env_clear();
+    for key in SHELL_ENV_PASSTHROUGH {
+        if let Some(value) = std::env::var_os(key) {
+            process.env(key, value);
+        }
+    }
+    process
+        .arg("-D")
+        .arg(format!("WORKTREE={}", root.display()))
+        .arg("-D")
+        .arg(format!("SCRATCH={}", scratch.display()))
+        .arg("-D")
+        .arg(format!("GIT_DIR={}", git_dir.display()))
+        .arg("-D")
+        .arg(format!("COMMON_DIR={}", common_dir.display()))
+        .arg("-D")
+        .arg(format!(
+            "COMMON_HOOKS={}",
+            common_dir.join("hooks").display()
+        ))
+        .arg("-D")
+        .arg(format!(
+            "COMMON_CONFIG={}",
+            common_dir.join("config").display()
+        ))
+        .arg("-D")
+        .arg(format!(
+            "WORKTREE_CONFIG={}",
+            git_dir.join("config.worktree").display()
+        ));
+    for (index, secret) in secret_roots.iter().enumerate() {
+        process
+            .arg("-D")
+            .arg(format!("SECRET{index}={}", secret.display()));
+    }
+    if context.restrict_home {
+        let home = context
+            .home
+            .canonicalize()
+            .unwrap_or_else(|_| context.home.clone());
+        process.arg("-D").arg(format!("HOME={}", home.display()));
+        for (index, path) in allowed_paths.iter().enumerate() {
+            process
+                .arg("-D")
+                .arg(format!("ALLOW{index}={}", path.display()));
+        }
+    }
+    process
+        .arg("-p")
+        .arg(&profile)
+        .current_dir(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("TMPDIR", &tmp)
+        .env("TMP", &tmp)
+        .env("TEMP", &tmp)
+        .env("XDG_CACHE_HOME", scratch.join("cache"))
+        .env("CARGO_HOME", scratch.join("cargo"))
+        .env("GOCACHE", scratch.join("go-build"))
+        .env("GOMODCACHE", scratch.join("go-mod"))
+        .env("npm_config_cache", scratch.join("npm"))
+        .env("YARN_CACHE_FOLDER", scratch.join("yarn"))
+        .env("PIP_CACHE_DIR", scratch.join("pip"))
+        .env("CLANG_MODULE_CACHE_PATH", scratch.join("clang-modules"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "gc.auto")
+        .env("GIT_CONFIG_VALUE_0", "0")
+        .kill_on_drop(true);
+    if context.restrict_home {
+        process
+            .env("HOME", &context.home)
+            .env("XDG_CONFIG_HOME", scratch.join("config"))
+            .env("XDG_DATA_HOME", scratch.join("data"));
+    }
+    #[cfg(unix)]
+    process.process_group(0);
+
+    Ok(process)
+}
+
 #[async_trait]
 impl AgentTool for Shell {
     fn name(&self) -> &'static str {
@@ -695,190 +883,12 @@ impl AgentTool for Shell {
             .and_then(Value::as_u64)
             .unwrap_or(120)
             .min(900);
-        let root = context.root.canonicalize().context("resolving worktree")?;
-        tokio::fs::create_dir_all(&context.sandbox_root).await?;
-        let scratch = context
-            .sandbox_root
-            .canonicalize()
-            .context("resolving shell scratch directory")?;
-        let tmp = scratch.join("tmp");
-        tokio::fs::create_dir_all(&tmp).await?;
-        let project_root = context
-            .project_root
-            .canonicalize()
-            .unwrap_or_else(|_| root.clone());
-        let (git_dir, common_dir) = git_metadata_dirs(&root, &project_root);
-        let mut profile = String::from(SHELL_SANDBOX_PROFILE);
-        if !context.network_allowed {
-            profile.push_str("(deny network*)\n");
-        }
-        let secret_roots = context
-            .secret_roots
-            .iter()
-            .map(|secret| secret.canonicalize().unwrap_or_else(|_| secret.clone()))
-            .collect::<Vec<_>>();
-        let mut allowed_paths = Vec::new();
-        if context.restrict_home {
-            let home = context
-                .home
-                .canonicalize()
-                .unwrap_or_else(|_| context.home.clone());
-            profile.push_str("(deny file-read* (subpath (param \"HOME\")))\n");
-            profile.push_str("(allow file-read-metadata (subpath (param \"HOME\")))\n");
-            profile.push_str(
-                "(allow file-read* (subpath (param \"WORKTREE\")) (subpath (param \"SCRATCH\")) (subpath (param \"GIT_DIR\")) (subpath (param \"COMMON_DIR\")))\n",
-            );
-            let mut candidates = vec![
-                home.join(".cargo"),
-                home.join(".rustup"),
-                home.join(".nvm"),
-                home.join(".volta"),
-                home.join(".asdf"),
-                home.join(".pyenv"),
-                home.join(".bun"),
-                home.join(".local"),
-                home.join("Library/Developer"),
-            ];
-            for key in [
-                "RUSTUP_HOME",
-                "CARGO_HOME",
-                "NVM_DIR",
-                "VOLTA_HOME",
-                "ASDF_DIR",
-                "ASDF_DATA_DIR",
-                "PYENV_ROOT",
-                "VIRTUAL_ENV",
-                "CONDA_PREFIX",
-                "GEM_HOME",
-                "GEM_PATH",
-                "PNPM_HOME",
-                "BUN_INSTALL",
-                "HOMEBREW_PREFIX",
-                "HOMEBREW_CELLAR",
-                "HOMEBREW_REPOSITORY",
-                "JAVA_HOME",
-                "GOROOT",
-                "GOPATH",
-                "DEVELOPER_DIR",
-                "SDKROOT",
-            ] {
-                if let Ok(value) = std::env::var(key) {
-                    for part in value.split(':') {
-                        if !part.is_empty() {
-                            candidates.push(PathBuf::from(part));
-                        }
-                    }
-                }
-            }
-            for candidate in candidates {
-                let candidate = candidate.canonicalize().unwrap_or(candidate);
-                if candidate.is_dir() && !allowed_paths.contains(&candidate) {
-                    allowed_paths.push(candidate);
-                }
-            }
-            for path in [
-                home.join(".gitconfig"),
-                home.join(".ssh/config"),
-                home.join(".ssh/known_hosts"),
-            ] {
-                if path.is_file() && !allowed_paths.contains(&path) {
-                    allowed_paths.push(path);
-                }
-            }
-            for (index, path) in allowed_paths.iter().enumerate() {
-                let rule = if path.is_dir() { "subpath" } else { "literal" };
-                profile.push_str(&format!(
-                    "(allow file-read* ({rule} (param \"ALLOW{index}\")))\n"
-                ));
-            }
-        }
-        for (index, _) in secret_roots.iter().enumerate() {
-            profile.push_str(&format!(
-                "(deny file-read* (subpath (param \"SECRET{index}\")))\n"
-            ));
-        }
-        let mut process = Command::new(SANDBOX_EXEC);
-        process.env_clear();
-        for key in SHELL_ENV_PASSTHROUGH {
-            if let Some(value) = std::env::var_os(key) {
-                process.env(key, value);
-            }
-        }
+        let mut process = sandboxed_command(context).await?;
         process
-            .arg("-D")
-            .arg(format!("WORKTREE={}", root.display()))
-            .arg("-D")
-            .arg(format!("SCRATCH={}", scratch.display()))
-            .arg("-D")
-            .arg(format!("GIT_DIR={}", git_dir.display()))
-            .arg("-D")
-            .arg(format!("COMMON_DIR={}", common_dir.display()))
-            .arg("-D")
-            .arg(format!(
-                "COMMON_HOOKS={}",
-                common_dir.join("hooks").display()
-            ))
-            .arg("-D")
-            .arg(format!(
-                "COMMON_CONFIG={}",
-                common_dir.join("config").display()
-            ))
-            .arg("-D")
-            .arg(format!(
-                "WORKTREE_CONFIG={}",
-                git_dir.join("config.worktree").display()
-            ));
-        for (index, secret) in secret_roots.iter().enumerate() {
-            process
-                .arg("-D")
-                .arg(format!("SECRET{index}={}", secret.display()));
-        }
-        if context.restrict_home {
-            let home = context
-                .home
-                .canonicalize()
-                .unwrap_or_else(|_| context.home.clone());
-            process.arg("-D").arg(format!("HOME={}", home.display()));
-            for (index, path) in allowed_paths.iter().enumerate() {
-                process
-                    .arg("-D")
-                    .arg(format!("ALLOW{index}={}", path.display()));
-            }
-        }
-        process
-            .arg("-p")
-            .arg(&profile)
             .arg("/bin/sh")
             .arg("-c")
             .arg(command)
-            .current_dir(&root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("TMPDIR", &tmp)
-            .env("TMP", &tmp)
-            .env("TEMP", &tmp)
-            .env("XDG_CACHE_HOME", scratch.join("cache"))
-            .env("CARGO_HOME", scratch.join("cargo"))
-            .env("GOCACHE", scratch.join("go-build"))
-            .env("GOMODCACHE", scratch.join("go-mod"))
-            .env("npm_config_cache", scratch.join("npm"))
-            .env("YARN_CACHE_FOLDER", scratch.join("yarn"))
-            .env("PIP_CACHE_DIR", scratch.join("pip"))
-            .env("CLANG_MODULE_CACHE_PATH", scratch.join("clang-modules"))
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "gc.auto")
-            .env("GIT_CONFIG_VALUE_0", "0")
-            .kill_on_drop(true);
-        if context.restrict_home {
-            process
-                .env("HOME", &context.home)
-                .env("XDG_CONFIG_HOME", scratch.join("config"))
-                .env("XDG_DATA_HOME", scratch.join("data"));
-        }
-        #[cfg(unix)]
-        process.process_group(0);
+            .stdin(Stdio::null());
         let child = process.spawn().context("spawning sandboxed shell")?;
         let _group = ProcessGroupGuard::new(child.id());
         let output = timeout(Duration::from_secs(timeout_secs), child.wait_with_output())

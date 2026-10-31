@@ -577,6 +577,51 @@ actor CoreClient {
             .decode(McpCallResult.self)
     }
 
+    func openConsole(sessionID: String) async throws -> ConsoleOpenResult {
+        try await request(
+            method: "console.open",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(ConsoleOpenResult.self)
+    }
+
+    func writeConsole(consoleID: String, data: String) async throws -> Bool {
+        try await request(
+            method: "console.write",
+            params: ["console_id": .string(consoleID), "data": .string(data)]
+        )
+        .decode(ConsoleWriteResult.self)
+        .written
+    }
+
+    func readConsole(consoleID: String, afterSeq: UInt64) async throws -> ConsoleReadResult {
+        try await request(
+            method: "console.read",
+            params: [
+                "console_id": .string(consoleID),
+                "after_seq": .number(Double(afterSeq)),
+            ]
+        )
+        .decode(ConsoleReadResult.self)
+    }
+
+    func signalConsole(consoleID: String, signal: String) async throws -> Bool {
+        try await request(
+            method: "console.signal",
+            params: ["console_id": .string(consoleID), "signal": .string(signal)]
+        )
+        .decode(ConsoleSignalResult.self)
+        .signaled
+    }
+
+    func closeConsole(consoleID: String) async throws -> ConsoleCloseResult {
+        try await request(
+            method: "console.close",
+            params: ["console_id": .string(consoleID)]
+        )
+        .decode(ConsoleCloseResult.self)
+    }
+
     func listQuestions(sessionID: String) async throws -> [Question] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "question.list", params: params)
