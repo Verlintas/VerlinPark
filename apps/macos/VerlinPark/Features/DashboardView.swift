@@ -162,6 +162,65 @@ struct DashboardView: View {
     }
 }
 
+private struct MemoryRow: View {
+    @Environment(AppModel.self) private var model
+    let memory: MemoryItem
+    @State private var confirmDelete = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(memory.kind.uppercased())
+                    .font(.system(size: 8, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.cyan)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.cyan.opacity(0.1), in: Capsule())
+                Text(memory.title)
+                    .font(.system(size: 9, weight: .medium))
+                Spacer()
+                Text(memory.agentName)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Button {
+                    confirmDelete = true
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 8))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Delete memory")
+                .disabled(model.memoryBusy)
+            }
+            Text(memory.body)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+            if !memory.tags.isEmpty {
+                Text(memory.tags.map { "#\($0)" }.joined(separator: " "))
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+        .confirmationDialog(
+            "Delete this memory?",
+            isPresented: $confirmDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                Task { await model.deleteMemory(memory) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(memory.title)
+        }
+    }
+}
+
 private struct ShellPolicyCard: View {
     @Environment(AppModel.self) private var model
     let project: Project
@@ -996,6 +1055,7 @@ private struct ApprovalCenterCard: View {
 private struct MemoryCard: View {
     @Environment(AppModel.self) private var model
     let project: Project
+    @State private var confirmPrune = false
 
     var body: some View {
         @Bindable var model = model
@@ -1016,6 +1076,13 @@ private struct MemoryCard: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(model.memoryBusy)
+                Button("Prune") {
+                    confirmPrune = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.memoryBusy || model.memories.isEmpty)
+                .help("Delete memories older than 30 days")
             }
             Text("Durable decisions, facts, conventions, and sources shared across sessions.")
                 .font(.system(size: 10, design: .monospaced))
@@ -1073,34 +1140,7 @@ private struct MemoryCard: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(Array(model.memories.prefix(10))) { memory in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text(memory.kind.uppercased())
-                                .font(.system(size: 8, weight: .medium, design: .monospaced))
-                                .foregroundStyle(.cyan)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .background(.cyan.opacity(0.1), in: Capsule())
-                            Text(memory.title)
-                                .font(.system(size: 9, weight: .medium))
-                            Spacer()
-                            Text(memory.agentName)
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                        }
-                        Text(memory.body)
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(3)
-                        if !memory.tags.isEmpty {
-                            Text(memory.tags.map { "#\($0)" }.joined(separator: " "))
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+                    MemoryRow(memory: memory)
                 }
                 if model.memories.count > 10 {
                     Text("… and \(model.memories.count - 10) more memories.")
@@ -1119,6 +1159,18 @@ private struct MemoryCard: View {
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .confirmationDialog(
+            "Prune project memory?",
+            isPresented: $confirmPrune,
+            titleVisibility: .visible
+        ) {
+            Button("Delete memories older than 30 days", role: .destructive) {
+                Task { await model.pruneMemories(olderThanDays: 30) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Only memories created more than 30 days ago are removed. Recent memories are kept.")
         }
     }
 }

@@ -104,6 +104,11 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS store_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS projects (
                 id            TEXT PRIMARY KEY,
                 name          TEXT NOT NULL,
@@ -262,6 +267,35 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_memories_session
                 ON memories(session_id, created_at);
 
+            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                title,
+                body,
+                tags,
+                content='memories',
+                content_rowid='rowid',
+                tokenize='unicode61'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS memories_fts_insert
+            AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_fts(rowid, title, body, tags)
+                VALUES (new.rowid, new.title, new.body, new.tags);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memories_fts_delete
+            AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, title, body, tags)
+                VALUES ('delete', old.rowid, old.title, old.body, old.tags);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memories_fts_update
+            AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, title, body, tags)
+                VALUES ('delete', old.rowid, old.title, old.body, old.tags);
+                INSERT INTO memories_fts(rowid, title, body, tags)
+                VALUES (new.rowid, new.title, new.body, new.tags);
+            END;
+
             CREATE TABLE IF NOT EXISTS questions (
                 id          TEXT PRIMARY KEY,
                 session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -371,6 +405,24 @@ impl Store {
             );
             "#,
         )?;
+        let fts_migrated = conn
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'memory_fts'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if fts_migrated.is_none() {
+            conn.execute(
+                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO store_meta (key, value) VALUES ('memory_fts', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+        }
         ensure_column(&conn, "sessions", "worktree", "TEXT")?;
         ensure_column(&conn, "sessions", "branch", "TEXT")?;
         ensure_column(&conn, "sessions", "token_budget", "INTEGER")?;
@@ -1620,6 +1672,17 @@ impl Store {
         kind: Option<&str>,
         limit: u32,
     ) -> Result<Vec<MemoryItem>> {
+        if let Some(query) = query
+            && let Some(query) = fts_query(query)
+        {
+            match self.list_memories_fts(project_id, &query, kind, limit) {
+                Ok(memories) if !memories.is_empty() => return Ok(memories),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "memory FTS search failed; falling back to LIKE");
+                }
+            }
+        }
         let conn = self.lock()?;
         let pattern = query.map(|query| format!("%{query}%"));
         let mut stmt = conn.prepare(
@@ -1634,6 +1697,46 @@ impl Store {
         )?;
         let rows = stmt.query_map(
             params![project_id, pattern, kind, limit.clamp(1, 500) as i64],
+            |row| {
+                let tags: String = row.get(8)?;
+                Ok(MemoryItem {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    agent_id: row.get(3)?,
+                    agent_name: row.get(4)?,
+                    kind: row.get(5)?,
+                    title: row.get(6)?,
+                    body: row.get(7)?,
+                    tags: serde_json::from_str(&tags).unwrap_or_default(),
+                    created_at: row.get(9)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn list_memories_fts(
+        &self,
+        project_id: &str,
+        query: &str,
+        kind: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryItem>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.project_id, m.agent_id, m.agent_name, m.kind,
+                    m.title, m.body, m.tags, m.created_at
+             FROM memories_fts
+             JOIN memories m ON m.rowid = memories_fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND m.project_id = ?2
+               AND (?3 IS NULL OR m.kind = ?3)
+             ORDER BY bm25(memories_fts), m.created_at DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![query, project_id, kind, limit.clamp(1, 500) as i64],
             |row| {
                 let tags: String = row.get(8)?;
                 Ok(MemoryItem {
@@ -1710,6 +1813,97 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn delete_memories_with_events(&self, ids: &[String]) -> Result<Vec<(MemoryItem, Event)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut removed = Vec::new();
+        for id in ids {
+            let memory = tx
+                .query_row(
+                    "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                            tags, created_at
+                     FROM memories WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        let tags: String = row.get(8)?;
+                        Ok(MemoryItem {
+                            id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            project_id: row.get(2)?,
+                            agent_id: row.get(3)?,
+                            agent_name: row.get(4)?,
+                            kind: row.get(5)?,
+                            title: row.get(6)?,
+                            body: row.get(7)?,
+                            tags: serde_json::from_str(&tags).unwrap_or_default(),
+                            created_at: row.get(9)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(memory) = memory else {
+                continue;
+            };
+            tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+            let event = insert_event_tx(
+                &tx,
+                &memory.session_id,
+                "memory.deleted",
+                serde_json::to_value(&memory)?,
+            )?;
+            removed.push((memory, event));
+        }
+        tx.commit()?;
+        drop(conn);
+        for (_, event) in &removed {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok(removed)
+    }
+
+    pub fn memory_ids_for_prune(
+        &self,
+        project_id: &str,
+        older_than_days: Option<u32>,
+        keep_latest: Option<u32>,
+    ) -> Result<Vec<String>> {
+        if older_than_days.is_none() && keep_latest.is_none() {
+            return Ok(Vec::new());
+        }
+        let cutoff = older_than_days
+            .map(|days| time::OffsetDateTime::now_utc() - time::Duration::days(i64::from(days)));
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at FROM memories
+             WHERE project_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut ids = Vec::new();
+        for (index, row) in rows.enumerate() {
+            let (id, created_at) = row?;
+            let beyond_keep = keep_latest.is_some_and(|keep| index >= keep as usize);
+            let old = cutoff.is_some_and(|cutoff| {
+                time::OffsetDateTime::parse(
+                    &created_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .map(|created_at| created_at < cutoff)
+                .unwrap_or(false)
+            });
+            if beyond_keep || old {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     pub fn list_mcp_servers(&self) -> Result<Vec<McpServer>> {
@@ -4597,6 +4791,27 @@ fn detect_default_branch(root: &Path) -> String {
     }
 }
 
+fn fts_query(input: &str) -> Option<String> {
+    let terms = input
+        .split_whitespace()
+        .filter_map(|term| {
+            let term = term.trim_matches(|character: char| {
+                !character.is_alphanumeric() && character != '_' && character != '-'
+            });
+            if term.is_empty() {
+                None
+            } else {
+                Some(format!("\"{}\"", term.replace('"', "\"\"")))
+            }
+        })
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
 fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServer> {
     let args: String = row.get(3)?;
     let env: String = row.get(4)?;
@@ -5124,6 +5339,159 @@ mod tests {
 
         store.replace_session_memories(&session.id, &[]).unwrap();
         assert!(store.list_session_memories(&session.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn searches_memories_with_fts_and_falls_back_to_like() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "memory search").unwrap();
+        store
+            .create_memory_with_event(
+                &session.id,
+                &project.id,
+                "agent-1",
+                "Leader",
+                "decision",
+                "Caching layer",
+                "Use SQLite FTS5 for recall.",
+                &["architecture".to_string()],
+            )
+            .unwrap();
+        store
+            .create_memory_with_event(
+                &session.id,
+                &project.id,
+                "agent-1",
+                "Leader",
+                "fact",
+                "本地检索",
+                "项目记忆支持本地检索。",
+                &["memory".to_string()],
+            )
+            .unwrap();
+
+        let fts = store
+            .list_memories(&project.id, Some("FTS5"), None, 10)
+            .unwrap();
+        assert_eq!(fts.len(), 1);
+        assert_eq!(fts[0].title, "Caching layer");
+        let fallback = store
+            .list_memories(&project.id, Some("本地检索"), None, 10)
+            .unwrap();
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].title, "本地检索");
+        assert!(
+            store
+                .list_memories(&project.id, Some("missing-term"), None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deletes_and_prunes_memories_with_events() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store
+            .create_session(&project.id, "memory retention")
+            .unwrap();
+        let mut memories = Vec::new();
+        for index in 0..3 {
+            let (memory, _) = store
+                .create_memory_with_event(
+                    &session.id,
+                    &project.id,
+                    "agent-1",
+                    "Leader",
+                    "note",
+                    &format!("memory {index}"),
+                    &format!("retention body {index}"),
+                    &[],
+                )
+                .unwrap();
+            memories.push(memory);
+        }
+
+        let removed = store
+            .delete_memories_with_events(&[memories[0].id.clone()])
+            .unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0.id, memories[0].id);
+        assert_eq!(removed[0].1.kind, "memory.deleted");
+        assert_eq!(removed[0].1.payload["id"], memories[0].id);
+        assert!(
+            store
+                .list_memories(&project.id, Some("retention"), None, 10)
+                .unwrap()
+                .iter()
+                .all(|memory| memory.id != memories[0].id)
+        );
+
+        let ids = store
+            .memory_ids_for_prune(&project.id, None, Some(1))
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], memories[1].id);
+        let pruned = store.delete_memories_with_events(&ids).unwrap();
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(
+            store
+                .list_memories(&project.id, None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(pruned[0].1.kind, "memory.deleted");
+    }
+
+    #[test]
+    fn prunes_memories_older_than_a_cutoff() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "memory age").unwrap();
+        let (old, _) = store
+            .create_memory_with_event(
+                &session.id,
+                &project.id,
+                "agent-1",
+                "Leader",
+                "note",
+                "old memory",
+                "body",
+                &[],
+            )
+            .unwrap();
+        store
+            .create_memory_with_event(
+                &session.id,
+                &project.id,
+                "agent-1",
+                "Leader",
+                "note",
+                "new memory",
+                "body",
+                &[],
+            )
+            .unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "UPDATE memories SET created_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+                params![old.id],
+            )
+            .unwrap();
+        }
+        let ids = store
+            .memory_ids_for_prune(&project.id, Some(30), None)
+            .unwrap();
+        assert_eq!(ids, vec![old.id]);
     }
 
     #[test]

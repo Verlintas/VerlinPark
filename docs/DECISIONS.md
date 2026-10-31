@@ -87,6 +87,7 @@
 | [0075](adr/0075-blocking-user-questions.md) | Blocking user questions | Accepted | 交互/运行时 |
 | [0076](adr/0076-home-read-jail.md) | Opt-in home read jail | Accepted | 安全/沙箱 |
 | [0077](adr/0077-mcp-stdio-client.md) | MCP stdio client | Accepted | 工具/集成 |
+| [0078](adr/0078-memory-retention-and-fts.md) | Memory retention and FTS | Accepted | 记忆/存储 |
 
 ---
 

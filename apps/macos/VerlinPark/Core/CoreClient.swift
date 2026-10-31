@@ -618,6 +618,27 @@ actor CoreClient {
             .memory
     }
 
+    func deleteMemory(id: String) async throws -> MemoryDeleteResult {
+        try await request(method: "memory.delete", params: ["id": .string(id)])
+            .decode(MemoryDeleteResult.self)
+    }
+
+    func pruneMemories(
+        projectID: String,
+        olderThanDays: Int?,
+        keepLatest: Int?,
+        dryRun: Bool
+    ) async throws -> MemoryPruneResult {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "older_than_days": olderThanDays.map { .number(Double($0)) } ?? .null,
+            "keep_latest": keepLatest.map { .number(Double($0)) } ?? .null,
+            "dry_run": .bool(dryRun),
+        ]
+        return try await request(method: "memory.prune", params: params)
+            .decode(MemoryPruneResult.self)
+    }
+
     func projectUsage(projectID: String) async throws -> ProjectUsageResult {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "project.usage", params: params)

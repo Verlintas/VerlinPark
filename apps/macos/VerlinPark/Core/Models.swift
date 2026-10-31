@@ -186,6 +186,28 @@ struct McpCallResult: Codable, Sendable {
     }
 }
 
+struct MemoryDeleteResult: Codable, Sendable {
+    let memoryId: String
+    let removed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case memoryId = "memory_id"
+        case removed
+    }
+}
+
+struct MemoryPruneResult: Codable, Sendable {
+    let candidates: Int
+    let removed: Int
+    let dryRun: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case candidates
+        case removed
+        case dryRun = "dry_run"
+    }
+}
+
 struct MemoryItem: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let sessionId: String

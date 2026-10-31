@@ -34,6 +34,9 @@ enum Command {
         command: String,
         #[arg(long = "arg")]
         args: Vec<String>,
+        /// Environment override as KEY=VALUE (repeatable).
+        #[arg(long = "env")]
+        env: Vec<String>,
     },
     /// Remove an MCP server by id.
     McpRemove { server_id: String },
@@ -233,6 +236,20 @@ enum Command {
         #[arg(long = "tag")]
         tags: Vec<String>,
     },
+    /// Delete one project memory.
+    MemoryDelete { memory: String },
+    /// Prune old or excess project memories.
+    MemoryPrune {
+        project: String,
+        /// Delete memories older than this many days.
+        #[arg(long)]
+        days: Option<u32>,
+        /// Keep at most this many newest memories.
+        #[arg(long = "keep-latest")]
+        keep_latest: Option<u32>,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show the project artifact retention policy.
     ArtifactPolicy { project: String },
     /// Update artifact retention and optional automatic GC.
@@ -376,11 +393,13 @@ async fn main() -> Result<()> {
             name,
             command,
             args,
+            env,
         } => {
+            let env = parse_env_pairs(&env)?;
             rpc(
                 &discovery,
                 "mcp.server.add",
-                json!({"name": name, "command": command, "args": args}),
+                json!({"name": name, "command": command, "args": args, "env": env}),
             )
             .await?
         }
@@ -736,6 +755,27 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::MemoryDelete { memory } => {
+            rpc(&discovery, "memory.delete", json!({"id": memory})).await?
+        }
+        Command::MemoryPrune {
+            project,
+            days,
+            keep_latest,
+            dry_run,
+        } => {
+            rpc(
+                &discovery,
+                "memory.prune",
+                json!({
+                    "project_id": project,
+                    "older_than_days": days,
+                    "keep_latest": keep_latest,
+                    "dry_run": dry_run
+                }),
+            )
+            .await?
+        }
         Command::ArtifactPolicy { project } => {
             rpc(
                 &discovery,
@@ -984,6 +1024,20 @@ fn print_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn parse_env_pairs(values: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut env = std::collections::BTreeMap::new();
+    for value in values {
+        let (key, val) = value
+            .split_once('=')
+            .with_context(|| format!("--env must be KEY=VALUE: {value}"))?;
+        if key.trim().is_empty() {
+            bail!("--env key must not be empty");
+        }
+        env.insert(key.trim().to_string(), val.to_string());
+    }
+    Ok(env)
+}
+
 fn print_human(value: &Value) {
     if let Some(csv) = value.get("csv").and_then(Value::as_str) {
         print!("{csv}");
@@ -1228,6 +1282,14 @@ fn print_human(value: &Value) {
         );
         return;
     }
+    if let Some(memory_id) = value.get("memory_id").and_then(Value::as_str) {
+        println!(
+            "memory {} removed={}",
+            memory_id,
+            value["removed"].as_bool().unwrap_or(false)
+        );
+        return;
+    }
     if let Some(removed) = value.get("removed").and_then(Value::as_bool) {
         println!("MCP server removed={removed}");
         return;
@@ -1277,6 +1339,15 @@ fn print_human(value: &Value) {
             );
             println!("  {}", memory["body"].as_str().unwrap_or(""));
         }
+        return;
+    }
+    if let Some(candidates) = value.get("candidates").and_then(Value::as_u64) {
+        println!(
+            "memory prune: candidates={} removed={} dry_run={}",
+            candidates,
+            value["removed"].as_u64().unwrap_or(0),
+            value["dry_run"].as_bool().unwrap_or(false)
+        );
         return;
     }
     if let Some(memory) = value.get("memory") {

@@ -378,6 +378,35 @@ pub struct MemoryCreateResult {
     pub memory: MemoryItem,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryDeleteParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryDeleteResult {
+    pub memory_id: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryPruneParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+    #[serde(default)]
+    pub keep_latest: Option<u32>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryPruneResult {
+    pub candidates: usize,
+    pub removed: usize,
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Question {
     pub id: String,

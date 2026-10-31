@@ -158,6 +158,23 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(result.memories.first?.tags, ["architecture"])
     }
 
+    func testMemoryDeleteAndPruneDecode() throws {
+        let deleted = try JSONDecoder().decode(
+            MemoryDeleteResult.self,
+            from: Data(#"{"memory_id":"memory-1","removed":true}"#.utf8)
+        )
+        XCTAssertEqual(deleted.memoryId, "memory-1")
+        XCTAssertTrue(deleted.removed)
+
+        let pruned = try JSONDecoder().decode(
+            MemoryPruneResult.self,
+            from: Data(#"{"candidates":7,"removed":5,"dry_run":false}"#.utf8)
+        )
+        XCTAssertEqual(pruned.candidates, 7)
+        XCTAssertEqual(pruned.removed, 5)
+        XCTAssertFalse(pruned.dryRun)
+    }
+
     func testAppNoticeRoundTrip() throws {
         let notice = AppNotice(
             id: "approval-1",

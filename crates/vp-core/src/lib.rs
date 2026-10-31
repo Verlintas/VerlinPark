@@ -13,13 +13,14 @@ use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
     ArtifactMaterialization, ArtifactPolicy, DoctorCheck, Event, IntegrationPolicy,
     MailboxGcResult, MailboxPolicy, McpCallResult, McpServer, McpServerListResult,
-    McpToolListResult, MemoryItem, MemoryListResult, MergeQueueEntry, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
-    SearchResult, Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult,
-    SessionLandResult, SessionLogStatus, SessionRehydrateResult, SessionReplayReport,
-    SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket,
-    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
-    WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
+    McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPruneResult,
+    MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult,
+    PullRequestResult, Question, QuestionListResult, SearchResult, Session, SessionBundle,
+    SessionCommit, SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus,
+    SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
+    StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
+    UsageTotals, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
+    WorktreeRetentionPolicy,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -66,6 +67,7 @@ pub struct Engine {
     question_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     git_lock: Arc<Mutex<()>>,
     budget_registry: Arc<BudgetRegistry>,
+    mcp: Arc<mcp::McpManager>,
 }
 
 fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
@@ -166,6 +168,7 @@ impl Engine {
             question_waiters: Arc::new(Mutex::new(HashMap::new())),
             git_lock: Arc::new(Mutex::new(())),
             budget_registry: Arc::new(BudgetRegistry::new()),
+            mcp: Arc::new(mcp::McpManager::from_env()),
         }
     }
 
@@ -1555,6 +1558,59 @@ impl Engine {
         Ok(MemoryListResult { memories })
     }
 
+    pub async fn delete_memory(&self, id: &str) -> Result<MemoryDeleteResult> {
+        let store = self.store.clone();
+        let memory_id = id.to_string();
+        let lookup = memory_id.clone();
+        let removed =
+            tokio::task::spawn_blocking(move || store.delete_memories_with_events(&[lookup]))
+                .await??;
+        for (_, event) in &removed {
+            let _ = self.events.send(event.clone());
+        }
+        Ok(MemoryDeleteResult {
+            memory_id,
+            removed: !removed.is_empty(),
+        })
+    }
+
+    pub async fn prune_memories(
+        &self,
+        project_id: &str,
+        older_than_days: Option<u32>,
+        keep_latest: Option<u32>,
+        dry_run: bool,
+    ) -> Result<MemoryPruneResult> {
+        if older_than_days.is_none() && keep_latest.is_none() {
+            anyhow::bail!("memory prune requires older_than_days or keep_latest");
+        }
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let ids = tokio::task::spawn_blocking(move || {
+            store.memory_ids_for_prune(&project, older_than_days, keep_latest)
+        })
+        .await??;
+        let candidates = ids.len();
+        if dry_run || ids.is_empty() {
+            return Ok(MemoryPruneResult {
+                candidates,
+                removed: 0,
+                dry_run,
+            });
+        }
+        let store = self.store.clone();
+        let removed =
+            tokio::task::spawn_blocking(move || store.delete_memories_with_events(&ids)).await??;
+        for (_, event) in &removed {
+            let _ = self.events.send(event.clone());
+        }
+        Ok(MemoryPruneResult {
+            candidates,
+            removed: removed.len(),
+            dry_run: false,
+        })
+    }
+
     pub async fn list_artifacts(&self, session_id: &str) -> Result<Vec<Artifact>> {
         let store = self.store.clone();
         let session_id = session_id.to_string();
@@ -2313,15 +2369,24 @@ impl Engine {
             ));
         }
 
-        let replay_memories = data
-            .events
-            .iter()
-            .filter(|event| event.kind == "memory.created")
-            .filter_map(|event| {
-                let memory = serde_json::from_value::<MemoryItem>(event.payload.clone()).ok()?;
-                Some((memory.id.clone(), serde_json::to_value(memory).ok()?))
-            })
-            .collect::<HashMap<_, _>>();
+        let mut replay_memories = HashMap::new();
+        for event in &data.events {
+            match event.kind.as_str() {
+                "memory.created" => {
+                    if let Ok(memory) = serde_json::from_value::<MemoryItem>(event.payload.clone())
+                    {
+                        replay_memories.insert(memory.id.clone(), serde_json::to_value(memory)?);
+                    }
+                }
+                "memory.deleted" => {
+                    if let Ok(memory) = serde_json::from_value::<MemoryItem>(event.payload.clone())
+                    {
+                        replay_memories.remove(&memory.id);
+                    }
+                }
+                _ => {}
+            }
+        }
         let projected_memories = data
             .memories
             .iter()
@@ -2683,17 +2748,27 @@ impl Engine {
         let memories = {
             let mut items = Vec::new();
             let mut valid = true;
-            for event in data
-                .events
-                .iter()
-                .filter(|event| event.kind == "memory.created")
-            {
-                match serde_json::from_value::<MemoryItem>(event.payload.clone()) {
-                    Ok(memory) => items.push(memory),
-                    Err(_) => {
-                        valid = false;
-                        break;
+            for event in &data.events {
+                match event.kind.as_str() {
+                    "memory.created" => {
+                        match serde_json::from_value::<MemoryItem>(event.payload.clone()) {
+                            Ok(memory) => items.push(memory),
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        }
                     }
+                    "memory.deleted" => {
+                        match serde_json::from_value::<MemoryItem>(event.payload.clone()) {
+                            Ok(memory) => items.retain(|item| item.id != memory.id),
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             valid.then_some(items)
@@ -3690,16 +3765,31 @@ impl Engine {
         let id = id.to_string();
         let name = name.trim().to_string();
         let command = command.trim().to_string();
-        tokio::task::spawn_blocking(move || {
+        let updated = tokio::task::spawn_blocking(move || {
             store.update_mcp_server(&id, &name, &command, &args, &env, enabled)
         })
-        .await?
+        .await??;
+        if updated.is_some() {
+            self.mcp
+                .invalidate(
+                    &updated
+                        .as_ref()
+                        .map(|server| server.id.clone())
+                        .unwrap_or_default(),
+                )
+                .await;
+        }
+        Ok(updated)
     }
 
     pub async fn remove_mcp_server(&self, id: &str) -> Result<bool> {
         let store = self.store.clone();
         let id = id.to_string();
-        tokio::task::spawn_blocking(move || store.remove_mcp_server(&id)).await?
+        let lookup = id.clone();
+        let removed =
+            tokio::task::spawn_blocking(move || store.remove_mcp_server(&lookup)).await??;
+        self.mcp.invalidate(&id).await;
+        Ok(removed)
     }
 
     pub async fn mcp_tools(&self, server_id: &str) -> Result<McpToolListResult> {
@@ -3708,7 +3798,7 @@ impl Engine {
         let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
             .await??
             .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
-        let tools = mcp::list_tools(&server).await?;
+        let tools = self.mcp.list_tools(&server).await?;
         Ok(McpToolListResult {
             server_id: server_id.to_string(),
             tools,
@@ -3726,7 +3816,7 @@ impl Engine {
         let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
             .await??
             .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
-        let result = mcp::call_tool(&server, tool, arguments).await?;
+        let result = self.mcp.call_tool(&server, tool, arguments).await?;
         Ok(McpCallResult {
             server_id: server_id.to_string(),
             tool: tool.to_string(),
@@ -4361,6 +4451,123 @@ mod tests {
                 .len(),
             1
         );
+        let bundle = engine.export_session(&session.id).await.unwrap();
+        assert_eq!(bundle.memories.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deletes_and_prunes_memories_with_replay_support() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("memory retention".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "memory".into(), None)
+            .await
+            .unwrap();
+        let mut memories = Vec::new();
+        for index in 0..3 {
+            memories.push(
+                engine
+                    .create_memory_as(
+                        &session.id,
+                        "agent-1",
+                        "Leader",
+                        "note",
+                        &format!("memory {index}"),
+                        &format!("body {index}"),
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let deleted = engine.delete_memory(&memories[0].id).await.unwrap();
+        assert!(deleted.removed);
+        assert_eq!(deleted.memory_id, memories[0].id);
+        assert_eq!(
+            engine
+                .list_memories(&project.id, None, None, 10)
+                .await
+                .unwrap()
+                .memories
+                .len(),
+            2
+        );
+        let replay = engine.replay_session(&session.id).await.unwrap();
+        assert!(replay.memories_matches);
+
+        engine
+            .store()
+            .replace_session_memories(&session.id, &memories)
+            .unwrap();
+        assert!(
+            !engine
+                .replay_session(&session.id)
+                .await
+                .unwrap()
+                .memories_matches
+        );
+        assert!(engine.repair_session(&session.id).await.unwrap().consistent);
+        assert_eq!(
+            engine
+                .list_memories(&project.id, None, None, 10)
+                .await
+                .unwrap()
+                .memories
+                .len(),
+            2
+        );
+
+        let preview = engine
+            .prune_memories(&project.id, None, Some(1), true)
+            .await
+            .unwrap();
+        assert_eq!(preview.candidates, 1);
+        assert_eq!(preview.removed, 0);
+        assert!(preview.dry_run);
+        let pruned = engine
+            .prune_memories(&project.id, None, Some(1), false)
+            .await
+            .unwrap();
+        assert_eq!(pruned.candidates, 1);
+        assert_eq!(pruned.removed, 1);
+        assert!(!pruned.dry_run);
+        let remaining = engine
+            .list_memories(&project.id, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining.memories.len(), 1);
+        assert_eq!(remaining.memories[0].id, memories[2].id);
+        assert!(
+            engine
+                .prune_memories(&project.id, None, None, false)
+                .await
+                .is_err()
+        );
+
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "memory.deleted")
+                .count(),
+            2
+        );
+        let replay = engine.replay_session(&session.id).await.unwrap();
+        assert!(replay.memories_matches);
+        assert!(replay.consistent);
         let bundle = engine.export_session(&session.id).await.unwrap();
         assert_eq!(bundle.memories.len(), 1);
     }

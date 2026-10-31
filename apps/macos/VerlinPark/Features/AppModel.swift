@@ -907,6 +907,48 @@ final class AppModel {
         }
     }
 
+    func deleteMemory(_ memory: MemoryItem) async {
+        memoryBusy = true
+        defer { memoryBusy = false }
+        do {
+            let result = try await core.deleteMemory(id: memory.id)
+            memoryStatus = result.removed ? "Memory deleted." : "Memory no longer exists."
+            await loadMemories()
+        } catch {
+            memoryStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func pruneMemories(olderThanDays: Int? = nil, keepLatest: Int? = nil) async {
+        guard let projectID = selectedProjectID else { return }
+        memoryBusy = true
+        defer { memoryBusy = false }
+        do {
+            let preview = try await core.pruneMemories(
+                projectID: projectID,
+                olderThanDays: olderThanDays,
+                keepLatest: keepLatest,
+                dryRun: true
+            )
+            guard preview.candidates > 0 else {
+                memoryStatus = "No memories matched the prune policy."
+                return
+            }
+            let result = try await core.pruneMemories(
+                projectID: projectID,
+                olderThanDays: olderThanDays,
+                keepLatest: keepLatest,
+                dryRun: false
+            )
+            memoryStatus = "Pruned \(result.removed) memories."
+            await loadMemories()
+        } catch {
+            memoryStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
     func createMemory() async {
         guard let sessionID = selectedSessionID else {
             memoryStatus = "Select a session before adding a memory."
