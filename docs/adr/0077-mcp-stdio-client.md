@@ -32,9 +32,13 @@ external tools, but there was no configuration or client path.
 7. **Pagination.** `tools/list`, `resources/list`, `resources/templates/list`, and
    `prompts/list` follow `nextCursor` up to 50 pages / 2,000 items and reject
    repeated cursors.
-8. **No dynamic schemas yet.** MCP tools are discovered at runtime instead of
-   being injected as individual tool schemas. The agent must call `mcp` with
-   `action=list` first.
+8. **Dynamic tool exposure.** Leader, Worker, and Labour runs discover enabled
+   servers before the first turn and expose up to 32 MCP tools as
+   `mcp_<server>_<tool>` schemas (sanitized names, 400-character descriptions,
+   original `inputSchema`). Managers and Verifiers do not receive dynamic tools
+   to preserve their read-only policy; they can still use the generic `mcp` tool.
+   Dynamic calls require approval unless the run is explicitly auto-approved.
+   Collisions and oversized names are skipped/truncated.
 9. **Trust boundary.** Configured MCP servers run as local processes outside the
    shell sandbox. Only trusted commands should be added; env values are stored in
    the local database, not Keychain.
@@ -58,6 +62,8 @@ external tools, but there was no configuration or client path.
   sandboxed.
 - Sampling and server notifications are not handled. Binary resources are sized
   but not decoded or materialized.
+- Dynamic schemas consume context and are discovered on every agent run (the MCP
+  process is reused). There is no per-tool enable/disable or schema cache yet.
 
 ## Alternatives considered
 

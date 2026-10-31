@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -777,6 +777,16 @@ struct AgentSpec {
     write_scope: Vec<String>,
     base_commit: String,
 }
+
+#[derive(Clone)]
+struct McpToolBinding {
+    exposed_name: String,
+    server_id: String,
+    tool_name: String,
+    schema: ToolSchema,
+}
+
+const MAX_DYNAMIC_MCP_TOOLS: usize = 32;
 
 struct SessionBudget {
     limit: Option<u64>,
@@ -4199,7 +4209,13 @@ async fn run_loop(
         restrict_home: shell_policy.restrict_home,
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
-    let tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
+    let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;
+    let mut tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
+    tools.extend(
+        dynamic_mcp_tools
+            .iter()
+            .map(|binding| binding.schema.clone()),
+    );
     let mut team_plan = engine.get_team_plan(&session.id).await?;
     let project_budget = engine.get_project_budget(&project.id).await?;
     let plan_budget = PlanBudgetScope::from_plan(
@@ -4560,6 +4576,9 @@ async fn run_loop(
             let is_memory_tool = matches!(call.name.as_str(), "remember" | "recall");
             let is_question_tool = call.name == "ask_user" && spec.role != AgentRole::Verifier;
             let is_mcp_tool = call.name == "mcp";
+            let dynamic_mcp_tool = dynamic_mcp_tools
+                .iter()
+                .find(|binding| binding.exposed_name == call.name);
             let registry_tool = config
                 .tools
                 .get(&call.name)
@@ -4576,8 +4595,9 @@ async fn run_loop(
                     || is_question_tool
                 {
                     false
-                } else if is_mcp_tool
-                    && input.get("action").and_then(serde_json::Value::as_str) == Some("call")
+                } else if (is_mcp_tool
+                    && input.get("action").and_then(serde_json::Value::as_str) == Some("call"))
+                    || dynamic_mcp_tool.is_some()
                 {
                     true
                 } else {
@@ -4727,6 +4747,26 @@ async fn run_loop(
                 match run_mailbox_tool(engine, session, spec, &call.name, input.clone()).await {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("mailbox error: {error}")),
+                }
+            } else if let Some(binding) = dynamic_mcp_tool {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match engine
+                    .mcp_call(&binding.server_id, &binding.tool_name, input.clone())
+                    .await
+                {
+                    Ok(result) => ToolOutput::ok(format_mcp_tool_result(&result.result)),
+                    Err(error) => ToolOutput::error(format!("MCP error: {error}")),
                 }
             } else if is_mcp_tool {
                 emit(
@@ -5237,6 +5277,108 @@ async fn run_loop(
     }
 
     Err(anyhow!("maximum turns reached"))
+}
+
+async fn collect_dynamic_mcp_tools(engine: &Engine, role: AgentRole) -> Vec<McpToolBinding> {
+    if !matches!(
+        role,
+        AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+    ) {
+        return Vec::new();
+    }
+    let servers = match engine.list_mcp_servers().await {
+        Ok(result) => result.servers,
+        Err(error) => {
+            tracing::warn!(%error, "MCP dynamic tool discovery could not list servers");
+            return Vec::new();
+        }
+    };
+    let mut bindings = Vec::new();
+    let mut used = HashSet::new();
+    for server in servers.into_iter().filter(|server| server.enabled) {
+        if bindings.len() >= MAX_DYNAMIC_MCP_TOOLS {
+            break;
+        }
+        let tools = match engine.mcp_tools(&server.id).await {
+            Ok(result) => result.tools,
+            Err(error) => {
+                tracing::warn!(%error, server = %server.name, "MCP dynamic tool discovery failed");
+                continue;
+            }
+        };
+        for tool in tools {
+            if bindings.len() >= MAX_DYNAMIC_MCP_TOOLS {
+                break;
+            }
+            let exposed_name = dynamic_mcp_tool_name(&server.name, &tool.name);
+            if !used.insert(exposed_name.clone()) {
+                continue;
+            }
+            let parameters = if tool.input_schema.is_object() {
+                tool.input_schema.clone()
+            } else {
+                serde_json::json!({"type": "object"})
+            };
+            bindings.push(McpToolBinding {
+                exposed_name: exposed_name.clone(),
+                server_id: server.id.clone(),
+                tool_name: tool.name.clone(),
+                schema: ToolSchema {
+                    name: exposed_name,
+                    description: truncate_to(
+                        &format!("[MCP {}] {}", server.name, tool.description),
+                        400,
+                    ),
+                    parameters,
+                },
+            });
+        }
+    }
+    bindings
+}
+
+fn dynamic_mcp_tool_name(server: &str, tool: &str) -> String {
+    fn sanitize(value: &str) -> String {
+        let sanitized = value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        sanitized.trim_matches('_').to_string()
+    }
+    let mut name = format!("mcp_{}_{}", sanitize(server), sanitize(tool));
+    if name.len() > 64 {
+        name.truncate(64);
+    }
+    if name.is_empty() || name == "mcp__" {
+        "mcp_tool".to_string()
+    } else {
+        name
+    }
+}
+
+fn format_mcp_tool_result(result: &serde_json::Value) -> String {
+    let mut text = String::new();
+    if let Some(content) = result.get("content").and_then(serde_json::Value::as_array) {
+        for item in content {
+            if let Some(value) = item.get("text").and_then(serde_json::Value::as_str) {
+                text.push_str(value);
+                text.push('\n');
+            } else {
+                text.push_str(&serde_json::to_string(item).unwrap_or_else(|_| item.to_string()));
+                text.push('\n');
+            }
+        }
+    }
+    if text.trim().is_empty() {
+        text = serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string());
+    }
+    truncate_to(&text, 16_000)
 }
 
 async fn run_mcp_tool(engine: &Engine, input: serde_json::Value) -> Result<ToolOutput> {
@@ -11864,6 +12006,104 @@ for line in sys.stdin:
                 && event.payload["output"]
                     .as_str()
                     .is_some_and(|output| output.contains("notes <file:///notes.md>"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn exposes_mcp_tools_as_dynamic_agent_tools() {
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("dynamic_mcp_server.py");
+        std::fs::write(
+            &script,
+            r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "mock", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "echo", "description": "Echo text", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}}]}
+    elif method == "tools/call":
+        result = {"content": [{"type": "text", "text": message.get("params", {}).get("arguments", {}).get("text", "")}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": message.get("id"), "result": result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "dynamic_mcp".into(),
+                        name: "mcp_mock_echo".into(),
+                        arguments: serde_json::json!({"text": "dynamic mcp"}).to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("dynamic done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        engine
+            .store()
+            .add_mcp_server(
+                "mock",
+                "python3",
+                &[script.to_string_lossy().to_string()],
+                &std::collections::BTreeMap::new(),
+                true,
+            )
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "dynamic mcp".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..150 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        service.start(&session.id, "use dynamic mcp").await.unwrap();
+        let sessions = wait_until_idle(&engine, &session).await;
+        approver.abort();
+        assert_eq!(sessions.status, "idle");
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "mcp_mock_echo"
+                && event.payload["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("dynamic mcp"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "approval.requested" && event.payload["tool"] == "mcp_mock_echo"
         }));
     }
 
