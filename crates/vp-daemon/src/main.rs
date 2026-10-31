@@ -36,11 +36,12 @@ use vp_protocol::types::{
     ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
     RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams, SessionExportParams,
     SessionImportParams, SessionListResult, SessionLogParams, SessionPauseParams,
-    SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
-    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetProjectBudgetParams,
-    SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams, WorktreePolicyParams,
+    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams,
+    SessionResumeResult, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
+    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
+    SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams,
+    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
+    WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -571,6 +572,19 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     SessionPauseResult {
                         session_id: params.session_id,
                         paused,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.plan_resume" => match parse_params::<SessionPlanResumeParams>(request.params) {
+            Ok(params) => match state.agent.resume_plan(&params.session_id).await {
+                Ok(started) => RpcResponse::success(
+                    id,
+                    SessionPlanResumeResult {
+                        session_id: params.session_id,
+                        started,
                     },
                 ),
                 Err(error) => internal_error(id, error),

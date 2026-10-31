@@ -164,6 +164,7 @@ just cli backfill-artifacts <session-id>
 just cli cleanup-worktrees <project-id> --older-than-days 7 --dry-run --keep-failed
 just cli worktree-policy <project-id>
 just cli worktree-policy-set <project-id> --enabled --older-than-days 7 --drop-failed
+just cli resume-plan <session-id>
 just cli project-budget <project-id>
 just cli project-budget-set <project-id> --token-budget 500000 --cost-budget-usd 5
 just cli doctor

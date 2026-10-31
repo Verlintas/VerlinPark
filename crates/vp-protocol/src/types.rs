@@ -794,6 +794,17 @@ pub struct SessionResumeResult {
     pub resumed: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionPlanResumeParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionPlanResumeResult {
+    pub session_id: String,
+    pub started: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
     pub title: String,

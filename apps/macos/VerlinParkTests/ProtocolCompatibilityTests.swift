@@ -67,6 +67,16 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertNil(hit.role)
     }
 
+    func testSessionPlanResumeResultDecodes() throws {
+        let json = #"{"session_id":"session-1","started":true}"#
+        let result = try JSONDecoder().decode(
+            SessionPlanResumeResult.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(result.sessionId, "session-1")
+        XCTAssertTrue(result.started)
+    }
+
     func testProjectUsageResultDecodes() throws {
         let json = """
         {

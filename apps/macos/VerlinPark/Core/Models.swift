@@ -111,6 +111,16 @@ struct UsageCsvResult: Codable, Sendable {
     }
 }
 
+struct SessionPlanResumeResult: Codable, Sendable {
+    let sessionId: String
+    let started: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case started
+    }
+}
+
 struct SessionTranscriptResult: Codable, Sendable {
     let sessionId: String
     let markdown: String

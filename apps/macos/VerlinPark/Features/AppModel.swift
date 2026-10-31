@@ -109,6 +109,7 @@ final class AppModel {
     var providerBusy = false
     var providerProbeBusy = false
     var providerProbeStatus: String?
+    var planResumeBusy = false
     var cleanupOlderDaysText = "7"
     var cleanupDryRun = true
     var cleanupDeleteBranches = false
@@ -323,6 +324,18 @@ final class AppModel {
             await loadMailbox()
             await loadTeamPlan()
             await loadDiff()
+        }
+    }
+
+    func resumePlan() async {
+        guard let sessionID = selectedSessionID else { return }
+        planResumeBusy = true
+        defer { planResumeBusy = false }
+        do {
+            _ = try await core.resumePlan(sessionID: sessionID)
+            await loadTeamPlan()
+        } catch {
+            handle(error)
         }
     }
 

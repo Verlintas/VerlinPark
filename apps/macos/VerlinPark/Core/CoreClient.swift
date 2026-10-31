@@ -190,6 +190,13 @@ actor CoreClient {
             .decode(Session.self)
     }
 
+    func resumePlan(sessionID: String) async throws -> Bool {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.plan_resume", params: params)
+            .decode(SessionPlanResumeResult.self)
+            .started
+    }
+
     func transcript(sessionID: String) async throws -> SessionTranscriptResult {
         try await request(
             method: "session.transcript",

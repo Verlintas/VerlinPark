@@ -79,6 +79,7 @@
 | [0067](adr/0067-homebrew-cask.md) | Generated Homebrew cask | Accepted | 分发 |
 | [0068](adr/0068-project-usage-report.md) | Project usage report | Accepted | 成本/可观测性 |
 | [0069](adr/0069-worktree-retention-policy.md) | Opt-in worktree retention policy | Accepted | 运维/磁盘 |
+| [0070](adr/0070-resumable-team-plan.md) | Resumable TeamPlan execution | Accepted | 调度/恢复 |
 
 ---
 

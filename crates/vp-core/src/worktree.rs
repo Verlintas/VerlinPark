@@ -101,7 +101,12 @@ pub fn create_task(
         .join(project_id)
         .join(session_id)
         .join(task_id);
-    let base_commit = git_output(&root, &["rev-parse", base_branch])?;
+    let base_commit = if path.join(".git").is_file() {
+        git_output(&root, &["merge-base", base_branch, &branch])
+            .or_else(|_| git_output(&root, &["rev-parse", base_branch]))?
+    } else {
+        git_output(&root, &["rev-parse", base_branch])?
+    };
 
     if path.join(".git").is_file() {
         return Ok(WorktreeInfo {
@@ -111,23 +116,37 @@ pub fn create_task(
         });
     }
 
+    run_git(&root, &["worktree", "prune"])?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating worktree directory {}", parent.display()))?;
     }
 
-    run_git(
-        &root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            path.to_str()
-                .ok_or_else(|| anyhow!("worktree path is not valid UTF-8"))?,
-            base_branch,
-        ],
-    )?;
+    if branch_exists(&root, &branch)? {
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                path.to_str()
+                    .ok_or_else(|| anyhow!("worktree path is not valid UTF-8"))?,
+                &branch,
+            ],
+        )?;
+    } else {
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                path.to_str()
+                    .ok_or_else(|| anyhow!("worktree path is not valid UTF-8"))?,
+                base_branch,
+            ],
+        )?;
+    }
 
     Ok(WorktreeInfo {
         path,
@@ -477,6 +496,51 @@ mod tests {
         merge_branch(&session.path, &task.branch, "merge task").unwrap();
         assert_eq!(
             std::fs::read_to_string(session.path.join("worker.txt")).unwrap(),
+            "from worker\n"
+        );
+    }
+
+    #[test]
+    fn reattaches_an_existing_task_branch_and_keeps_the_branch_point() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let session = create(repo.path(), data.path(), "project-1", "session-1").unwrap();
+        let task = create_task(
+            repo.path(),
+            data.path(),
+            "project-1",
+            "session-1",
+            "task-1",
+            &session.branch,
+        )
+        .unwrap();
+        std::fs::write(
+            task.path.join("worker.txt"),
+            "from worker
+",
+        )
+        .unwrap();
+        commit_all(&task.path, "task work").unwrap();
+        let branch_point = git_output(repo.path(), &["rev-parse", &session.branch]).unwrap();
+        remove_worktree(repo.path(), &task.path).unwrap();
+        assert!(!task.path.exists());
+        assert!(branch_exists(repo.path(), &task.branch).unwrap());
+
+        let reattached = create_task(
+            repo.path(),
+            data.path(),
+            "project-1",
+            "session-1",
+            "task-1",
+            &session.branch,
+        )
+        .unwrap();
+        assert!(reattached.path.join(".git").is_file());
+        assert_eq!(reattached.branch, task.branch);
+        assert_eq!(reattached.base_commit, branch_point);
+        assert_eq!(
+            std::fs::read_to_string(reattached.path.join("worker.txt")).unwrap(),
             "from worker\n"
         );
     }

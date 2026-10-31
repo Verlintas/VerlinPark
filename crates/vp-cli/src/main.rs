@@ -151,6 +151,8 @@ enum Command {
     Pause { session: String },
     /// Resume a paused Leader.
     Resume { session: String },
+    /// Resume the stored TeamPlan, skipping completed tasks.
+    ResumePlan { session: String },
     /// Show the session plan/todo list.
     Todos { session: String },
     /// Show the per-call usage/cost ledger.
@@ -503,6 +505,14 @@ async fn main() -> Result<()> {
         }
         Command::Resume { session } => {
             rpc(&discovery, "session.resume", json!({"session_id": session})).await?
+        }
+        Command::ResumePlan { session } => {
+            rpc(
+                &discovery,
+                "session.plan_resume",
+                json!({"session_id": session}),
+            )
+            .await?
         }
         Command::Todos { session } => {
             rpc(&discovery, "session.todos", json!({"session_id": session})).await?
@@ -1010,6 +1020,14 @@ fn print_human(value: &Value) {
             "materialized {} at {}",
             value["artifact_id"].as_str().unwrap_or("?"),
             value["path"].as_str().unwrap_or("?")
+        );
+        return;
+    }
+    if let Some(started) = value.get("started").and_then(Value::as_bool) {
+        println!(
+            "session {}  plan-resume-started={}",
+            value["session_id"].as_str().unwrap_or("?"),
+            started
         );
         return;
     }

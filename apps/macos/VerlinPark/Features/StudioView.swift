@@ -1117,6 +1117,14 @@ struct PreviewPanelView: View {
         }
     }
 
+    private var canResumePlan: Bool {
+        guard let session = model.selectedSession,
+              let plan = model.teamPlan,
+              ["idle", "failed", "cancelled", "draft"].contains(session.status)
+        else { return false }
+        return plan.tasks.contains { model.planTaskStatuses[$0.id] != "completed" }
+    }
+
     private var selectedDiffFile: SessionDiffFile? {
         guard let path = selectedDiffPath else { return nil }
         return model.diffFiles.first { $0.path == path }
@@ -1135,6 +1143,25 @@ struct PreviewPanelView: View {
                         )
                         .font(.system(size: 8, design: .monospaced))
                         .foregroundStyle(.tertiary)
+                    }
+                    if canResumePlan {
+                        HStack(spacing: 8) {
+                            Text("Retry unfinished tasks without another Leader call.")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            if model.planResumeBusy {
+                                ProgressView().controlSize(.small)
+                            }
+                            Button("Resume plan") {
+                                Task { await model.resumePlan() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(model.planResumeBusy)
+                        }
+                        .padding(8)
+                        .background(.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
                     }
                     ForEach(plan.departments) { department in
                         HStack(spacing: 6) {

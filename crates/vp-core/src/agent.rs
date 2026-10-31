@@ -2178,6 +2178,138 @@ impl AgentService {
         Ok(())
     }
 
+    /// Resume a stored TeamPlan without another Leader model call. Completed
+    /// tasks are skipped; failed/blocked/cancelled/pending tasks are retried in
+    /// dependency batches.
+    pub async fn resume_plan(&self, session_id: &str) -> Result<bool> {
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned());
+        let Some(config) = config else {
+            anyhow::bail!("agent provider is not configured");
+        };
+        let (session, _) = load_session_project(self.engine.store().clone(), session_id).await?;
+        if session.status == "imported" {
+            anyhow::bail!(
+                "imported sessions are read-only archives; rehydrate before resuming a plan"
+            );
+        }
+        if matches!(
+            session.status.as_str(),
+            "queued" | "running" | "paused" | "landed"
+        ) {
+            anyhow::bail!("session must be idle, failed, cancelled, or draft to resume a plan");
+        }
+        let Some(plan) = self.engine.get_team_plan(session_id).await? else {
+            anyhow::bail!("session has no TeamPlan");
+        };
+        let completed = completed_plan_tasks(&self.engine, session_id).await?;
+        if plan.tasks.iter().all(|task| completed.contains(&task.id)) {
+            anyhow::bail!("plan is already complete");
+        }
+
+        let control = Arc::new(RunControl::new());
+        {
+            let mut runs = self
+                .runs
+                .lock()
+                .map_err(|_| anyhow!("agent run mutex poisoned"))?;
+            if runs.contains_key(session_id) {
+                return Err(anyhow!("session is already running"));
+            }
+            runs.insert(session_id.to_string(), control.clone());
+        }
+
+        let prepared: Result<()> = async {
+            self.engine
+                .update_session_status(session_id, "queued")
+                .await?;
+            self.engine
+                .append_event(
+                    session_id,
+                    "agent.plan_resume_queued",
+                    serde_json::json!({
+                        "goal": plan.goal,
+                        "remaining_tasks": plan.tasks.len().saturating_sub(completed.len()),
+                    }),
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = prepared {
+            if let Ok(mut runs) = self.runs.lock() {
+                runs.remove(session_id);
+            }
+            let _ = self
+                .engine
+                .update_session_status(session_id, "failed")
+                .await;
+            return Err(error);
+        }
+
+        let engine = self.engine.clone();
+        let session_id = session_id.to_string();
+        let runs = self.runs.clone();
+        let global_slots = self.global_slots.clone();
+        tokio::spawn(async move {
+            let permit = tokio::select! {
+                permit = global_slots.acquire_owned() => permit.ok(),
+                _ = wait_for_cancel(&control) => None,
+            };
+            let Some(_permit) = permit else {
+                let _ = engine
+                    .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
+                    .await;
+                let _ = control
+                    .finalize_session(&engine, &session_id, "cancelled")
+                    .await;
+                if let Ok(mut runs) = runs.lock() {
+                    runs.remove(&session_id);
+                }
+                return;
+            };
+            if control.is_cancelled() {
+                let _ = engine
+                    .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
+                    .await;
+                let _ = control
+                    .finalize_session(&engine, &session_id, "cancelled")
+                    .await;
+                if let Ok(mut runs) = runs.lock() {
+                    runs.remove(&session_id);
+                }
+                return;
+            }
+            let status = if control.is_paused() {
+                "paused"
+            } else {
+                "running"
+            };
+            let _ = engine.update_session_status(&session_id, status).await;
+            let result =
+                run_plan_resume(engine.clone(), config, &session_id, control.clone()).await;
+            if let Err(error) = &result {
+                let _ = engine
+                    .append_event(
+                        &session_id,
+                        "agent.failed",
+                        serde_json::json!({"error": error.to_string()}),
+                    )
+                    .await;
+                let _ = control
+                    .finalize_session(&engine, &session_id, "failed")
+                    .await;
+            }
+            if let Ok(mut runs) = runs.lock() {
+                runs.remove(&session_id);
+            }
+        });
+        Ok(true)
+    }
+
     pub fn cancel(&self, session_id: &str) -> bool {
         if let Ok(runs) = self.runs.lock()
             && let Some(control) = runs.get(session_id)
@@ -2243,6 +2375,161 @@ impl AgentService {
         drop(finalized);
         Ok(true)
     }
+}
+
+async fn run_plan_resume(
+    engine: Engine,
+    config: AgentConfig,
+    session_id: &str,
+    control: Arc<RunControl>,
+) -> Result<()> {
+    let store = engine.store().clone();
+    let (_, project) = load_session_project(store, session_id).await?;
+    let session = engine.ensure_session_worktree(session_id).await?;
+    let plan = engine
+        .get_team_plan(session_id)
+        .await?
+        .ok_or_else(|| anyhow!("session has no TeamPlan"))?;
+    let worktree = PathBuf::from(
+        session
+            .worktree
+            .clone()
+            .ok_or_else(|| anyhow!("session has no worktree"))?,
+    );
+    let session_branch = session.branch.clone().unwrap_or_default();
+    let leader = engine
+        .list_agents(session_id)
+        .await?
+        .into_iter()
+        .find(|agent| agent.role == "leader");
+    let leader_id = leader.as_ref().map(|agent| agent.id.clone());
+    let spec = AgentSpec {
+        id: leader_id.clone().unwrap_or_else(|| "leader".to_string()),
+        role: AgentRole::Leader,
+        name: leader
+            .map(|agent| agent.name)
+            .unwrap_or_else(|| "Leader".to_string()),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: worktree.clone(),
+        branch: session_branch.clone(),
+        session_worktree: worktree.clone(),
+        session_branch,
+        write_scope: Vec::new(),
+        base_commit: session.base_commit.clone().unwrap_or_default(),
+    };
+    let budget = SessionBudget::new(
+        session.token_budget,
+        session.tokens_in + session.tokens_out,
+        AgentCaps {
+            managers: config.max_managers,
+            workers: config.max_workers,
+            labour: config.max_labour,
+        },
+    )
+    .with_cost(session.cost_budget_usd, session.cost_spent_usd)
+    .with_time(session.time_budget_secs);
+    if budget.exhausted() {
+        emit(
+            &engine,
+            session_id,
+            &spec,
+            "agent.budget_exceeded",
+            serde_json::json!({
+                "reason": budget.exceeded_reason().unwrap_or("tokens"),
+                "limit": session.token_budget,
+                "spent": budget.spent(),
+                "cost_limit_usd": session.cost_budget_usd,
+                "cost_spent_usd": budget.cost_spent(),
+                "time_budget_secs": session.time_budget_secs,
+                "elapsed_secs": budget.elapsed_secs(),
+            }),
+        )
+        .await?;
+        control
+            .finalize_session(&engine, session_id, "failed")
+            .await?;
+        return Ok(());
+    }
+    if let Some(agent_id) = &leader_id {
+        engine.update_agent_status(agent_id, "running").await?;
+    }
+    emit(
+        &engine,
+        session_id,
+        &spec,
+        "agent.plan_resumed",
+        serde_json::json!({
+            "goal": plan.goal,
+            "model": model_for(&config, spec.role),
+            "provider": config.provider_name,
+            "worktree": session.worktree,
+            "branch": session.branch,
+        }),
+    )
+    .await?;
+
+    let result = execute_team_plan(
+        &engine, &config, &session, &project, &control, &budget, &spec, &plan,
+    )
+    .await;
+    match result? {
+        PlanRunResult::Done(summary) => {
+            if let Some(agent_id) = &leader_id {
+                engine.update_agent_status(agent_id, "idle").await?;
+            }
+            emit(
+                &engine,
+                session_id,
+                &spec,
+                "agent.message",
+                serde_json::json!({"text": summary}),
+            )
+            .await?;
+            control
+                .finalize_session(&engine, session_id, "idle")
+                .await?;
+        }
+        PlanRunResult::Cancelled => {
+            if let Some(agent_id) = &leader_id {
+                engine.update_agent_status(agent_id, "cancelled").await?;
+            }
+            emit(
+                &engine,
+                session_id,
+                &spec,
+                "agent.cancelled",
+                serde_json::json!({"resumed_plan": true}),
+            )
+            .await?;
+            control
+                .finalize_session(&engine, session_id, "cancelled")
+                .await?;
+        }
+        PlanRunResult::BudgetExceeded(stop) => {
+            if let Some(agent_id) = &leader_id {
+                engine.update_agent_status(agent_id, "failed").await?;
+            }
+            let mut payload = stop.payload();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "time_budget_secs".into(),
+                    serde_json::json!(session.time_budget_secs),
+                );
+            }
+            emit(&engine, session_id, &spec, "agent.budget_exceeded", payload).await?;
+            control
+                .finalize_session(&engine, session_id, "failed")
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_agent(
@@ -2498,7 +2785,19 @@ async fn commit_worker(spec: &AgentSpec, name: &str) -> Result<Option<String>> {
                 return Err(anyhow!("write scope violation: {}", outside.join(", ")));
             }
         }
-        worktree::commit_all(&task_worktree, &message)
+        let committed = worktree::commit_all(&task_worktree, &message)?;
+        if committed.is_some() {
+            return Ok(committed);
+        }
+        // A resumed task may already have a committed branch even though its
+        // worktree is clean. Re-enter verification/integration with that commit
+        // instead of treating the task as a no-op.
+        let head = worktree::head_commit(&task_worktree)?;
+        if head == base_commit {
+            Ok(None)
+        } else {
+            Ok(Some(head))
+        }
     })
     .await?
 }
@@ -6066,6 +6365,33 @@ fn select_plan_batch(mut ready: Vec<PlanTask>, limit: usize) -> Vec<PlanTask> {
     batch
 }
 
+async fn completed_plan_tasks(
+    engine: &Engine,
+    session_id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let store = engine.store().clone();
+    let id = session_id.to_string();
+    let events = tokio::task::spawn_blocking(move || store.list_all_events(&id)).await??;
+    let submission_seq = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "team_plan.submitted")
+        .map(|event| event.seq)
+        .unwrap_or(0);
+    let mut completed = std::collections::HashSet::new();
+    for event in events
+        .iter()
+        .filter(|event| event.seq > submission_seq && event.kind == "plan_task.finished")
+    {
+        if event.payload["task_status"] == "completed"
+            && let Some(task_id) = event.payload["task_id"].as_str()
+        {
+            completed.insert(task_id.to_string());
+        }
+    }
+    Ok(completed)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_team_plan(
     engine: &Engine,
@@ -6080,13 +6406,31 @@ async fn execute_team_plan(
     let mut manager_specs: std::collections::HashMap<String, AgentSpec> =
         std::collections::HashMap::new();
 
+    let completed = completed_plan_tasks(engine, &session.id).await?;
     let mut statuses = plan
         .tasks
         .iter()
-        .map(|task| (task.id.clone(), "pending".to_string()))
+        .map(|task| {
+            let status = if completed.contains(&task.id) {
+                "completed"
+            } else {
+                "pending"
+            };
+            (task.id.clone(), status.to_string())
+        })
         .collect::<std::collections::HashMap<_, _>>();
-    let mut remaining = plan.tasks.clone();
-    let mut reports = Vec::new();
+    let mut remaining = plan
+        .tasks
+        .iter()
+        .filter(|task| !completed.contains(&task.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut reports = plan
+        .tasks
+        .iter()
+        .filter(|task| completed.contains(&task.id))
+        .map(|task| format!("{} [completed]: already completed; skipped", task.id))
+        .collect::<Vec<_>>();
 
     while !remaining.is_empty() {
         if control.is_cancelled() {
@@ -8908,6 +9252,183 @@ mod tests {
                 && event.payload["name"] == "submit_team_plan"
                 && event.payload["is_error"] == true
         }));
+    }
+
+    #[tokio::test]
+    async fn resumes_only_unfinished_plan_tasks() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![vec![
+                StreamEvent::TextDelta("T2 done".into()),
+                StreamEvent::Done,
+            ]])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "resume plan".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        let plan = TeamPlan {
+            goal: "resume plan".into(),
+            departments: vec![PlanDepartment {
+                name: "impl".into(),
+                manager_title: "Implementation".into(),
+                profile: "coding".into(),
+                objective: "build".into(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: vec![
+                PlanTask {
+                    id: "T1".into(),
+                    department: "impl".into(),
+                    title: "One".into(),
+                    kind: "coding".into(),
+                    priority: 0,
+                    profile: None,
+                    deps: Vec::new(),
+                    write_scope: vec!["src/t1".into()],
+                    acceptance: vec!["done".into()],
+                    token_budget: None,
+                    cost_budget_usd: None,
+                },
+                PlanTask {
+                    id: "T2".into(),
+                    department: "impl".into(),
+                    title: "Two".into(),
+                    kind: "coding".into(),
+                    priority: 0,
+                    profile: None,
+                    deps: Vec::new(),
+                    write_scope: vec!["src/t2".into()],
+                    acceptance: vec!["done".into()],
+                    token_budget: None,
+                    cost_budget_usd: None,
+                },
+            ],
+        };
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "plan_task.finished",
+                serde_json::json!({"task_id": "T1", "task_status": "completed"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(service.resume_plan(&session.id).await.unwrap());
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "idle");
+
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
+            .await
+            .unwrap();
+        let started = events
+            .iter()
+            .filter(|event| event.kind == "plan_task.started")
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 1, "completed T1 must be skipped");
+        assert_eq!(started[0].payload["task_id"], "T2");
+        assert!(events.iter().any(|event| {
+            event.kind == "plan_task.finished"
+                && event.payload["task_id"] == "T2"
+                && event.payload["task_status"] == "completed"
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "agent.plan_resumed")
+        );
+    }
+
+    #[tokio::test]
+    async fn reuses_an_existing_task_commit_when_resuming() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::TextDelta("continued existing work".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "verdict".into(),
+                        name: "submit_verdict".into(),
+                        arguments: serde_json::json!({
+                            "approved": true,
+                            "summary": "existing commit is correct"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id.clone(), "resume commit".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        let plan = TeamPlan {
+            goal: "resume commit".into(),
+            departments: vec![PlanDepartment {
+                name: "impl".into(),
+                manager_title: "Implementation".into(),
+                profile: "coding".into(),
+                objective: "build".into(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: vec![PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "One".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: Vec::new(),
+                write_scope: vec!["worker.txt".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+        };
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        let session_branch = session.branch.clone().unwrap();
+        let task = engine
+            .create_task_worktree(
+                &project.root,
+                &project.id,
+                &session.id,
+                "T1",
+                &session_branch,
+            )
+            .await
+            .unwrap();
+        std::fs::write(task.path.join("worker.txt"), "already committed\n").unwrap();
+        worktree::commit_all(&task.path, "prior task commit").unwrap();
+
+        assert!(service.resume_plan(&session.id).await.unwrap());
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "idle");
+        let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(session_worktree.join("worker.txt")).unwrap(),
+            "already committed\n"
+        );
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].status, "merged");
     }
 
     #[tokio::test]
