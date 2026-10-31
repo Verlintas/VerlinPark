@@ -49,7 +49,7 @@
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace 可用；圆桌只出现在原始 Trace，缺少面向人的卡片 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
 | 测试 | B− | 103 Rust + 12 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay 已有回归，真实 Provider 路径仍缺 |
-| 发布准备 | D | unsigned debug build；无公证、无更新、无 release 流程 |
+| 发布准备 | C− | `just package` 生成 ad-hoc signed DMG + checksum，tag 触发 Release workflow；仍无 Developer ID/公证、更新器和 Homebrew tap |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
 
@@ -344,7 +344,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 103 passed after the 10-31 artifact-compression slice
+cargo test --workspace     # 103 passed after the 10-31 packaging slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

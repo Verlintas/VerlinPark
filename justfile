@@ -24,6 +24,9 @@ run: build
 bundle: build
     scripts/bundle-daemon.sh
 
+package:
+    scripts/package-release.sh
+
 daemon:
     cargo run -p vp-daemon
 

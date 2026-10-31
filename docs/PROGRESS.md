@@ -43,6 +43,7 @@
 | Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
 | Models / budgets | ✅ | 分角色 model override + input/output USD/1M price；session token / USD / wall-clock budget；TeamPlan department/task token/USD budgets；per-call `usage_ledger`（agent/role/task/department/model/tokens/estimated/cost）+ `session.usage` / `vp usage` / Preview → Cost 分组汇总；`agent.usage` / `agent.cost`；time 在 turn/tool 边界检查；Providers/New Session/CLI/UI |
 | CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/artifact/backfill-artifacts/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate |
+| Distribution | ✅ | `just package` 生成 Release app + bundled `verlinpadd` + `vp` + docs 的 ad-hoc signed DMG 和 SHA-256；`v*` tag 触发 GitHub Release workflow；未 Developer ID 公证 |
 
 ## 验证
 
@@ -125,6 +126,7 @@
 - **M3 第三十四切片**：legacy artifact event backfill（显式、幂等、backfill 后 replay/repair 可用）。
 - **M3 第三十五切片**：session-fair Worker/Labour capacity queue（round-robin、cancellation-safe、try_acquire 不插队）。
 - **M3 第三十六切片**：zstd artifact blob compression + materialize + bundle 原字节导出/导入。
+- **M3 第三十七切片**：direct DMG packaging（release build、bundled daemon、ad-hoc sign、checksum、tag release workflow）。
 
 ## 如何运行
 

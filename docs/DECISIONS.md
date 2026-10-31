@@ -64,6 +64,7 @@
 | [0052](adr/0052-artifact-backfill.md) | Legacy artifact event backfill | Accepted | 迁移/事件溯源 |
 | [0053](adr/0053-fair-capacity-queue.md) | Session-fair Worker/Labour capacity queue | Accepted | 调度/公平性 |
 | [0054](adr/0054-artifact-compression.md) | Compressed content-addressed artifact blobs | Accepted | 产物/磁盘/兼容性 |
+| [0055](adr/0055-direct-dmg-packaging.md) | Ad-hoc direct DMG packaging | Accepted | 发布/分发 |
 
 ---
 
