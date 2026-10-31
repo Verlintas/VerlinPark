@@ -184,6 +184,34 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertTrue(result.questions.first?.isPending == true)
     }
 
+    func testSessionPriorityDecodes() throws {
+        let json = """
+        {
+          "id": "session-1",
+          "project_id": "project-1",
+          "goal": "ship it",
+          "status": "running",
+          "priority": 25,
+          "worktree": null,
+          "branch": null,
+          "token_budget": 100000,
+          "cost_budget_usd": null,
+          "time_budget_secs": null,
+          "cost_spent_usd": 0,
+          "base_commit": null,
+          "tokens_in": 0,
+          "tokens_out": 0,
+          "created_at": "2026-11-01T00:00:00Z"
+        }
+        """
+        let session = try JSONDecoder().decode(Session.self, from: Data(json.utf8))
+        XCTAssertEqual(session.priority, 25)
+
+        let legacy = json.replacingOccurrences(of: #""priority": 25,"#, with: "")
+        let oldSession = try JSONDecoder().decode(Session.self, from: Data(legacy.utf8))
+        XCTAssertNil(oldSession.priority)
+    }
+
     func testMemoryListDecodes() throws {
         let json = """
         {

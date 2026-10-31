@@ -351,6 +351,11 @@ struct SessionChatView: View {
                             Image(systemName: "arrow.triangle.branch")
                             Text(branch)
                         }
+                        if let priority = session.priority, priority != 0 {
+                            Text("·")
+                            Image(systemName: "flag.fill")
+                            Text("priority \(priority)")
+                        }
                     }
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.tertiary)

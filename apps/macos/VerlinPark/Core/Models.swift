@@ -756,6 +756,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
     let projectId: String
     let goal: String
     let status: String
+    let priority: Int?
     let worktree: String?
     let branch: String?
     let tokenBudget: Int?
@@ -772,6 +773,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         case projectId = "project_id"
         case goal
         case status
+        case priority
         case worktree
         case branch
         case tokenBudget = "token_budget"

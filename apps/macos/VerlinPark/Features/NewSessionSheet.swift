@@ -5,6 +5,7 @@ struct NewSessionSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var goal = ""
     @State private var budget = 200_000
+    @State private var priority = 0
     @State private var costBudget = ""
     @State private var timeBudget = ""
 
@@ -27,6 +28,26 @@ struct NewSessionSheet: View {
             )
             .textFieldStyle(.roundedBorder)
             .lineLimit(3 ... 6)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Priority")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Picker("Priority", selection: $priority) {
+                    Text("Low").tag(-10)
+                    Text("Normal").tag(0)
+                    Text("High").tag(10)
+                    Text("Urgent").tag(50)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 360)
+                Text(
+                    "Higher priority sessions are admitted before lower priority runs when the global session cap is full."
+                )
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            }
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Token budget")
@@ -85,7 +106,8 @@ struct NewSessionSheet: View {
                             goal: goal,
                             tokenBudget: budget,
                             costBudgetUSD: Double(costBudget),
-                            timeBudgetSecs: Int(timeBudget)
+                            timeBudgetSecs: Int(timeBudget),
+                            priority: priority
                         )
                         dismiss()
                     }

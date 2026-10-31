@@ -43,7 +43,7 @@
 | Rehydrate | ✅ | `vp rehydrate <session> [--worktree path]`：only imported；校验 project/base commit；创建/attach session worktree；按 branch 分组重建 imported agent task worktrees；状态回到 idle；返回 warnings/remapped count |
 | DB rebuild | ✅ | `vp db-rebuild [--dry-run]`：读取 `projects.jsonl` 最新项目/policy/budget 快照 + 每个 session 的 `events.jsonl`，备份旧 DB，重建 projects/sessions/events/projections；worktree/branch/artifact blobs 原样保留；无 `session.created` 的 imported archive 跳过并报告 |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
-| Global scheduling | ✅ | daemon-wide session semaphore：`VERLINPARK_GLOBAL_SESSION_CAP` 默认 4（1–32）；超出时 session 状态 `queued`，`agent.queued`；daemon 重启时 queued session 保留，并从最近 `agent.queued` 的 prompt 自动 re-enqueue（running/paused 仍标 failed）；跨 session Worker/Labour write-scope 锁按 project 串行等待，同 session 共享，空 scope 视为 wildcard；daemon-wide Worker/Labour capacity controller：`VERLINPARK_GLOBAL_WORKERS` 默认 12、`VERLINPARK_GLOBAL_LABOUR` 默认 24（1–100），run 级 permit、provider 重配置不重置、`agent.info`/Settings 可见；等待 permit 时写 `agent.capacity_wait` 并把 agent 标为 `queued`，获得后写 `agent.capacity_ready`；permit 在 session 间 round-robin，单 session 不能靠大批量占满队列；仍是进程内、无跨 session Task-DAG 优先级/持久 lease |
+| Global scheduling | ✅ | daemon-wide session admission：`VERLINPARK_GLOBAL_SESSION_CAP` 默认 4（1–32）；session priority -100..100（`session-new --priority` / New Session 选择器），高优先级先准入，同优先级按 session/project round-robin；超出时 session 状态 `queued`，`agent.queued`；daemon 重启时 queued session 保留并 re-enqueue（running/paused 仍标 failed）；跨 session Worker/Labour write-scope 锁按 project 串行等待，同 session 共享，空 scope 视为 wildcard；Worker/Labour capacity controller：`VERLINPARK_GLOBAL_WORKERS` 默认 12、`VERLINPARK_GLOBAL_LABOUR` 默认 24（1–100），run 级 permit、provider 重配置不重置、`agent.info`/Settings 可见；等待 permit 时写 `agent.capacity_wait` 并标 `queued`，获得后写 `agent.capacity_ready`；capacity 也按 session priority + round-robin；仍是进程内、无 aging、无跨 session task-DAG 队列/持久 lease |
 | Provider | ✅ | OpenAI-compatible + Anthropic；`agent.probe` / `vp provider-test` / Settings Test connection 发送一次无工具 16-token 请求，检查 endpoint/key/model/stream；429/5xx/connection 在 stream 开始前最多重试 3 次（Retry-After + 指数退避，15s connect timeout）；stream 建立后每个事件最多等待 `VERLINPARK_PROVIDER_IDLE_SECS`（默认 300，10–3600），超时使 run 失败；OpenAI-compatible 与 Anthropic 都有本地 HTTP 全链路 E2E（plan → Worker write → approval → Verifier → Integrator） |
 | Models / budgets | ✅ | 分角色 model override + input/output USD/1M price；session token / USD / wall-clock budget；project-wide shared token/USD pool；TeamPlan department/task token/USD budgets；per-call `usage_ledger`（agent/role/task/department/model/tokens/estimated/cost）+ `session.usage` / `vp usage` / Preview → Cost 分组汇总；`session.usage_csv` / `vp usage --csv` / Preview Export CSV（RFC 4180 转义，逐 call 一行）；`project.usage` / `vp project-usage` / Manage Dash 按 session 汇总 tokens/cost/calls；`agent.usage` / `agent.cost`；time 在 turn/tool 边界检查；Providers/New Session/CLI/UI |
 | CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/artifact/backfill-artifacts/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/search/transcript/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate/cleanup-worktrees/worktree-policy/worktree-policy-set/project-budget/project-budget-set/project-usage/resume-plan/memory/remember/memory-delete/memory-prune/memory-policy/memory-policy-set/questions/answer/mcp-servers/mcp-add/mcp-remove/mcp-tools/mcp-call/mcp-resources/mcp-read-resource/mcp-prompts/mcp-prompt/doctor/provider-test/db-rebuild |
@@ -56,8 +56,8 @@
 
 ## 验证
 
-- `cargo test --workspace`：156 个测试通过（core 120、store 28、providers 8）。
-- `xcodebuild test`：28 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
+- `cargo test --workspace`：160 个测试通过（core 123、store 29、providers 8）。
+- `xcodebuild test`：29 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
 - 手工 E2E 已覆盖：Leader/Manager/Worker/Labour 委派、task worktree、并行 Worker、Verifier approve/reject、TeamPlan 自动派发、Manager 圆桌、审批、diff、commit/discard、预算/取消/暂停恢复、项目 shell policy get/set。
@@ -75,14 +75,14 @@
 
 - PR flow 依赖本机 `gh` 且只覆盖 GitHub；其他 host/PR provider 还没有 adapter。
 - merge queue 目前是 session 内、逐条 drain；显式 retry/auto-resolve 是人工触发；自动触发必须由项目 policy 显式开启，并有 attempt/token cap；没有 LLM Integrator。
-- Global session cap 是进程内 semaphore，不是持久队列/公平调度器；scope locks 只覆盖 Worker/Labour，daemon 重启会失败 in-flight runs；Leader/Manager/Verifier 写入不在全局 scope 锁内。
+- Global session admission 是进程内 priority queue，不是持久队列；高优先级持续负载可饿死低优先级（无 aging）；scope locks 只覆盖 Worker/Labour，daemon 重启会失败 in-flight runs；Leader/Manager/Verifier 写入不在全局 scope 锁内。
 - 如果 daemon 在 git merge 过程中崩溃，session worktree 可能仍需人工检查/abort；recovery 不会猜测部分 merge 的结果。
 - 自动派发中的 Manager 是确定性部门节点；LLM 圆桌只在 `deliberate_team_plan` 中运行。
-- 没有完整全局 Task-DAG 调度器/公平队列、task retry UI、单 task cancel/pause；daemon-wide session admission 与 Worker/Labour scope locks 已实现。
+- 没有完整全局 Task-DAG 调度器/task 级公平队列、task retry UI、单 task cancel/pause；已有 priority-aware session admission 与 Worker/Labour capacity。
 - 没有 auto-expansion；Manager/Worker 上限是固定 caps，不是按预算自动扩编。
 - 没有 per-role token budget（只有 per-role model/USD price）；task/department/project budget tree 已实现；USD 预算依赖用户手填价格，时间预算只在 turn/tool 边界检查，不能抢占 in-flight provider/tool。
 - Mailbox 是 pull-based：消息不会唤醒 idle Agent/创建新 run；mailbox auto GC 只在 send/read 边界触发且无回收站，unread 保护可能使 max_count 无法立即满足；artifact binary 上限 5MiB，已有 content-addressed dedupe、zstd 和内容级 replay/repair；GC oldest-first 无回收站；legacy artifact 事件只有部分元数据，repair 会跳过并警告，binary 依赖 content-addressed blob 存在。
-- Global capacity 是进程内 controller，非持久；等待 permit 时有 `agent.capacity_wait` 并标为 `queued`，但没有跨 daemon 重启的持久队列或全局优先级。
+- Global capacity 是进程内 controller，非持久；session priority 已进入 admission 与 capacity 排序，但没有跨 daemon 重启的持久 priority queue、aging 或 task 级 DAG 调度。
 - Task/department/project budget 已有进程内原子 reservation，但不跨 daemon 重启持久化；手动 delegate 任务没有 plan task id 时只受 session/project budget 约束。
 - 历史 session 只有在新事件带 `usage_id` 后才会被 replay 比较；repair 可用 legacy event 的 synthetic id 回填 ledger。
 - 没有 context compaction、checkpoint/resume；暂停状态只在内存中，daemon 重启会把 running/paused session 标为 failed。
@@ -191,6 +191,7 @@
 - **M3 第七十一切片**：memory retention + FTS5（delete/prune、事件回放、FTS/LIKE fallback、Manage Dash 删除/prune、`store_meta` 迁移标记）；见 ADR-0078。
 - **M3 第七十二切片**：MCP resources/prompts（list/read/get、模板、agent tool、CLI/RPC、Settings inspect、分页与只读重连）。
 - **M3 第七十三切片**：opt-in memory retention policy（per-project max items/max age、daemon sweep、CLI/Manage Dash、校验与测试）。
+- **M3 第七十四切片**：priority-aware session admission + Worker/Labour capacity（-100..100、priority queue、session/project tie-break、CLI/UI、测试）；见 ADR-0079。
 
 ## 如何运行
 

@@ -317,6 +317,40 @@ impl Engine {
         cost_budget_usd: Option<f64>,
         time_budget_secs: Option<u64>,
     ) -> Result<Session> {
+        self.create_session_full(
+            project_id,
+            goal,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            0,
+        )
+        .await
+    }
+
+    pub async fn create_session_with_priority(
+        &self,
+        project_id: String,
+        goal: String,
+        token_budget: Option<u64>,
+        priority: i32,
+    ) -> Result<Session> {
+        self.create_session_full(project_id, goal, token_budget, None, None, priority)
+            .await
+    }
+
+    async fn create_session_full(
+        &self,
+        project_id: String,
+        goal: String,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+        priority: i32,
+    ) -> Result<Session> {
+        if !(-100..=100).contains(&priority) {
+            anyhow::bail!("session priority must be between -100 and 100");
+        }
         if cost_budget_usd.is_some_and(|value| !value.is_finite() || value <= 0.0) {
             anyhow::bail!("cost budget must be a positive finite number");
         }
@@ -370,6 +404,7 @@ impl Engine {
                     cost_budget_usd,
                     time_budget_secs,
                     &base_commit,
+                    priority,
                 )
             }
         })
@@ -400,6 +435,7 @@ impl Engine {
             "project_id": session.project_id,
             "worktree": session.worktree,
             "branch": session.branch,
+            "priority": session.priority,
             "token_budget": session.token_budget,
             "cost_budget_usd": session.cost_budget_usd,
             "time_budget_secs": session.time_budget_secs,
@@ -4505,6 +4541,41 @@ mod tests {
         assert!(engine.repair_session(&session.id).await.unwrap().consistent);
         let bundle = engine.export_session(&session.id).await.unwrap();
         assert_eq!(bundle.questions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_priority_is_created_and_validated() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("priority".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session_with_priority(project.id.clone(), "urgent".into(), None, 50)
+            .await
+            .unwrap();
+        assert_eq!(session.priority, 50);
+        let events = engine.list_events(session.id.clone(), 0, 20).await.unwrap();
+        assert_eq!(events[0].kind, "session.created");
+        assert_eq!(events[0].payload["priority"], 50);
+        assert!(
+            engine
+                .create_session_with_priority(project.id.clone(), "bad".into(), None, 101)
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .create_session_with_priority(project.id, "bad".into(), None, -101)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

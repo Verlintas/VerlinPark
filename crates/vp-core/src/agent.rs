@@ -9,7 +9,7 @@ use async_recursion::async_recursion;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
     AgentInfo, AgentProbeResult, CapacityInfo, ConfigureAgentParams, MergeQueueEntry,
@@ -103,6 +103,7 @@ struct FairState {
 struct CapacityWaiter {
     id: u64,
     session_id: String,
+    priority: i32,
     sender: oneshot::Sender<()>,
 }
 
@@ -152,6 +153,7 @@ impl FairCapacity {
     async fn acquire(
         self: &Arc<Self>,
         session_id: &str,
+        priority: i32,
         control: &RunControl,
     ) -> Option<CapacityPermit> {
         let (waiter_id, receiver) = {
@@ -169,6 +171,7 @@ impl FairCapacity {
             state.waiters.push_back(CapacityWaiter {
                 id,
                 session_id: session_id.to_string(),
+                priority,
                 sender,
             });
             (id, receiver)
@@ -188,7 +191,7 @@ impl FairCapacity {
                         .waiters
                         .iter()
                         .position(|waiter| waiter.id == waiter_id)
-                        .and_then(|index| state.waiters.remove(index))
+                        .map(|index| state.waiters.remove(index))
                 };
                 if removed.is_none() {
                     // The permit was granted concurrently with cancellation.
@@ -208,13 +211,26 @@ impl FairCapacity {
 
     fn grant_waiters(&self, state: &mut FairState) {
         while state.active < self.limit && !state.waiters.is_empty() {
-            let index = state
+            let highest = state
                 .waiters
                 .iter()
-                .position(|waiter| {
-                    state.last_session.as_deref() != Some(waiter.session_id.as_str())
+                .map(|waiter| waiter.priority)
+                .max()
+                .expect("waiters are not empty");
+            let candidates = state
+                .waiters
+                .iter()
+                .enumerate()
+                .filter(|(_, waiter)| waiter.priority == highest)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let index = candidates
+                .iter()
+                .copied()
+                .find(|index| {
+                    state.last_session.as_deref() != Some(state.waiters[*index].session_id.as_str())
                 })
-                .unwrap_or(0);
+                .unwrap_or(candidates[0]);
             let waiter = state.waiters.remove(index).expect("waiter index exists");
             state.active += 1;
             let session_id = waiter.session_id.clone();
@@ -260,11 +276,12 @@ impl CapacityController {
         &self,
         role: AgentRole,
         session_id: &str,
+        priority: i32,
         control: &RunControl,
     ) -> Option<CapacityPermit> {
         match role {
-            AgentRole::Worker => self.workers.acquire(session_id, control).await,
-            AgentRole::Labour => self.labour.acquire(session_id, control).await,
+            AgentRole::Worker => self.workers.acquire(session_id, priority, control).await,
+            AgentRole::Labour => self.labour.acquire(session_id, priority, control).await,
             _ => None,
         }
     }
@@ -357,7 +374,7 @@ pub struct AgentService {
     config: Arc<RwLock<Option<AgentConfig>>>,
     runs: Arc<Mutex<HashMap<String, Arc<RunControl>>>>,
     auto_resolver_started: Arc<AtomicBool>,
-    global_slots: Arc<Semaphore>,
+    global_slots: Arc<AdmissionGate>,
     capacity: Arc<CapacityController>,
 }
 
@@ -417,6 +434,173 @@ impl RunControl {
     fn subscribe_paused(&self) -> watch::Receiver<bool> {
         self.paused.subscribe()
     }
+}
+
+/// Daemon-wide session admission with explicit priority. Higher priority runs
+/// are admitted first; ties prefer a different session/project from the last
+/// admitted one so one project cannot monopolize all slots.
+struct AdmissionGate {
+    limit: usize,
+    state: Mutex<AdmissionState>,
+}
+
+struct AdmissionState {
+    active: usize,
+    waiters: Vec<AdmissionWaiter>,
+    next_id: u64,
+    last_session: Option<String>,
+    last_project: Option<String>,
+}
+
+struct AdmissionWaiter {
+    id: u64,
+    session_id: String,
+    project_id: String,
+    priority: i32,
+    sender: oneshot::Sender<()>,
+}
+
+struct AdmissionPermit {
+    gate: Arc<AdmissionGate>,
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+impl AdmissionGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            state: Mutex::new(AdmissionState {
+                active: 0,
+                waiters: Vec::new(),
+                next_id: 0,
+                last_session: None,
+                last_project: None,
+            }),
+        }
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        session_id: &str,
+        project_id: &str,
+        priority: i32,
+        control: &RunControl,
+    ) -> Option<AdmissionPermit> {
+        let (waiter_id, receiver) = {
+            let mut state = self.state.lock().ok()?;
+            if state.active < self.limit && state.waiters.is_empty() {
+                state.active += 1;
+                state.last_session = Some(session_id.to_string());
+                state.last_project = Some(project_id.to_string());
+                return Some(AdmissionPermit { gate: self.clone() });
+            }
+            let id = state.next_id;
+            state.next_id = state.next_id.saturating_add(1);
+            let (sender, receiver) = oneshot::channel();
+            state.waiters.push(AdmissionWaiter {
+                id,
+                session_id: session_id.to_string(),
+                project_id: project_id.to_string(),
+                priority,
+                sender,
+            });
+            (id, receiver)
+        };
+        tokio::select! {
+            result = receiver => {
+                if result.is_ok() {
+                    Some(AdmissionPermit { gate: self.clone() })
+                } else {
+                    None
+                }
+            }
+            _ = wait_for_cancel(control) => {
+                let removed = {
+                    let mut state = self.state.lock().ok()?;
+                    state
+                        .waiters
+                        .iter()
+                        .position(|waiter| waiter.id == waiter_id)
+                        .map(|index| state.waiters.remove(index))
+                };
+                if removed.is_none() {
+                    self.release();
+                }
+                None
+            }
+        }
+    }
+
+    fn release(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active = state.active.saturating_sub(1);
+            self.grant_waiters(&mut state);
+        }
+    }
+
+    fn grant_waiters(&self, state: &mut AdmissionState) {
+        while state.active < self.limit {
+            let waiter = {
+                let last_session = state.last_session.as_deref();
+                let last_project = state.last_project.as_deref();
+                take_admission_waiter(&mut state.waiters, last_session, last_project)
+            };
+            let Some(waiter) = waiter else {
+                break;
+            };
+            state.active += 1;
+            let session_id = waiter.session_id.clone();
+            let project_id = waiter.project_id.clone();
+            if waiter.sender.send(()).is_ok() {
+                state.last_session = Some(session_id);
+                state.last_project = Some(project_id);
+            } else {
+                state.active = state.active.saturating_sub(1);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> (usize, usize, usize) {
+        self.state
+            .lock()
+            .map(|state| (self.limit, state.active, state.waiters.len()))
+            .unwrap_or((self.limit, 0, 0))
+    }
+}
+
+fn take_admission_waiter(
+    waiters: &mut Vec<AdmissionWaiter>,
+    last_session: Option<&str>,
+    last_project: Option<&str>,
+) -> Option<AdmissionWaiter> {
+    if waiters.is_empty() {
+        return None;
+    }
+    let highest = waiters.iter().map(|waiter| waiter.priority).max()?;
+    let candidates = waiters
+        .iter()
+        .enumerate()
+        .filter(|(_, waiter)| waiter.priority == highest)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let index = candidates
+        .iter()
+        .copied()
+        .find(|index| Some(waiters[*index].session_id.as_str()) != last_session)
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|index| Some(waiters[*index].project_id.as_str()) != last_project)
+        })
+        .unwrap_or(candidates[0]);
+    Some(waiters.remove(index))
 }
 
 async fn wait_for_resume(control: &RunControl) -> bool {
@@ -1062,7 +1246,7 @@ impl AgentService {
             config: Arc::new(RwLock::new(None)),
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
-            global_slots: Arc::new(Semaphore::new(global_session_cap())),
+            global_slots: Arc::new(AdmissionGate::new(global_session_cap())),
             capacity: Arc::new(CapacityController::new(
                 global_worker_cap(),
                 global_labour_cap(),
@@ -1078,7 +1262,7 @@ impl AgentService {
             config: Arc::new(RwLock::new(Some(config))),
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
-            global_slots: Arc::new(Semaphore::new(global_cap)),
+            global_slots: Arc::new(AdmissionGate::new(global_cap)),
             capacity,
         }
     }
@@ -1388,7 +1572,9 @@ impl AgentService {
             .update_session_status(&session.id, "queued")
             .await?;
         let permit = tokio::select! {
-            permit = self.global_slots.clone().acquire_owned() => permit.ok(),
+            permit = self
+                .global_slots
+                .acquire(&session.id, &session.project_id, session.priority, &control) => permit,
             _ = wait_for_cancel(&control) => None,
         };
         let Some(_permit) = permit else {
@@ -2135,7 +2321,14 @@ impl AgentService {
             return Err(error);
         }
 
-        self.spawn_run(config, session_id.to_string(), prompt.to_string(), control);
+        self.spawn_run(
+            config,
+            session.id.clone(),
+            session.project_id.clone(),
+            session.priority,
+            prompt.to_string(),
+            control,
+        );
         Ok(())
     }
 
@@ -2143,6 +2336,8 @@ impl AgentService {
         &self,
         config: AgentConfig,
         session_id: String,
+        project_id: String,
+        priority: i32,
         prompt: String,
         control: Arc<RunControl>,
     ) {
@@ -2151,7 +2346,7 @@ impl AgentService {
         let global_slots = self.global_slots.clone();
         tokio::spawn(async move {
             let permit = tokio::select! {
-                permit = global_slots.acquire_owned() => permit.ok(),
+                permit = global_slots.acquire(&session_id, &project_id, priority, &control) => permit,
                 _ = wait_for_cancel(&control) => None,
             };
             let Some(_permit) = permit else {
@@ -2224,7 +2419,7 @@ impl AgentService {
         let store = self.engine.store().clone();
         let queued = tokio::task::spawn_blocking(move || store.queued_session_prompts()).await??;
         let mut started = 0;
-        for (session_id, prompt) in queued {
+        for (session_id, project_id, prompt, priority) in queued {
             let control = Arc::new(RunControl::new());
             {
                 let mut runs = self
@@ -2236,7 +2431,14 @@ impl AgentService {
                 }
                 runs.insert(session_id.clone(), control.clone());
             }
-            self.spawn_run(config.clone(), session_id, prompt, control);
+            self.spawn_run(
+                config.clone(),
+                session_id,
+                project_id,
+                priority,
+                prompt,
+                control,
+            );
             started += 1;
         }
         Ok(started)
@@ -2316,11 +2518,13 @@ impl AgentService {
 
         let engine = self.engine.clone();
         let session_id = session_id.to_string();
+        let project_id = session.project_id.clone();
+        let priority = session.priority;
         let runs = self.runs.clone();
         let global_slots = self.global_slots.clone();
         tokio::spawn(async move {
             let permit = tokio::select! {
-                permit = global_slots.acquire_owned() => permit.ok(),
+                permit = global_slots.acquire(&session_id, &project_id, priority, &control) => permit,
                 _ = wait_for_cancel(&control) => None,
             };
             let Some(_permit) = permit else {
@@ -3932,7 +4136,7 @@ async fn run_loop(
                     engine.update_agent_status(&spec.id, "queued").await?;
                     let permit = match config
                         .capacity
-                        .acquire(spec.role, &session.id, control)
+                        .acquire(spec.role, &session.id, session.priority, control)
                         .await
                     {
                         Some(permit) => permit,
@@ -11780,7 +11984,7 @@ for line in sys.stdin:
         drop(probe);
         let control = RunControl::new();
         let first = capacity
-            .acquire(AgentRole::Worker, "session-a", &control)
+            .acquire(AgentRole::Worker, "session-a", 0, &control)
             .await
             .unwrap();
         assert_eq!(capacity.snapshot().worker_available, 0);
@@ -11793,7 +11997,7 @@ for line in sys.stdin:
         let second_control = Arc::new(RunControl::new());
         let mut waiter = tokio::spawn(async move {
             second_capacity
-                .acquire(AgentRole::Worker, "session-b", &second_control)
+                .acquire(AgentRole::Worker, "session-b", 0, &second_control)
                 .await
         });
         assert!(
@@ -11814,7 +12018,7 @@ for line in sys.stdin:
         let worker_control = third_control.clone();
         let cancelled = tokio::spawn(async move {
             third_capacity
-                .acquire(AgentRole::Worker, "session-c", &worker_control)
+                .acquire(AgentRole::Worker, "session-c", 0, &worker_control)
                 .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -11838,7 +12042,7 @@ for line in sys.stdin:
         let a_sender = sender.clone();
         let a = tokio::spawn(async move {
             let permit = a_capacity
-                .acquire(AgentRole::Worker, "session-a", &a_control)
+                .acquire(AgentRole::Worker, "session-a", 0, &a_control)
                 .await
                 .unwrap();
             a_sender.send("a2").unwrap();
@@ -11851,7 +12055,7 @@ for line in sys.stdin:
         let b_sender = sender.clone();
         let b = tokio::spawn(async move {
             let permit = b_capacity
-                .acquire(AgentRole::Worker, "session-b", &b_control)
+                .acquire(AgentRole::Worker, "session-b", 0, &b_control)
                 .await
                 .unwrap();
             b_sender.send("b1").unwrap();
@@ -11871,6 +12075,109 @@ for line in sys.stdin:
         assert_eq!((first_grant, second_grant), ("b1", "a2"));
         a.await.unwrap();
         b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capacity_prefers_higher_priority_tasks() {
+        let capacity = Arc::new(CapacityController::new(1, 1));
+        let first = capacity
+            .try_acquire(AgentRole::Worker, "session-holder")
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let low_capacity = capacity.clone();
+        let low_control = Arc::new(RunControl::new());
+        let low_sender = sender.clone();
+        let low = tokio::spawn(async move {
+            let permit = low_capacity
+                .acquire(AgentRole::Worker, "session-low", -10, &low_control)
+                .await
+                .unwrap();
+            low_sender.send("low").unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let high_capacity = capacity.clone();
+        let high_control = Arc::new(RunControl::new());
+        let high_sender = sender.clone();
+        let high = tokio::spawn(async move {
+            let permit = high_capacity
+                .acquire(AgentRole::Worker, "session-high", 50, &high_control)
+                .await
+                .unwrap();
+            high_sender.send("high").unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(first);
+
+        let first_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((first_grant, second_grant), ("high", "low"));
+        low.await.unwrap();
+        high.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admission_prefers_higher_priority_sessions() {
+        let gate = Arc::new(AdmissionGate::new(1));
+        let holder_control = Arc::new(RunControl::new());
+        let holder = gate
+            .acquire("session-holder", "project-holder", 0, &holder_control)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let low_gate = gate.clone();
+        let low_control = Arc::new(RunControl::new());
+        let low_sender = sender.clone();
+        let low = tokio::spawn(async move {
+            let permit = low_gate
+                .acquire("session-low", "project-low", -10, &low_control)
+                .await
+                .unwrap();
+            low_sender.send("low").unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let high_gate = gate.clone();
+        let high_control = Arc::new(RunControl::new());
+        let high_sender = sender.clone();
+        let high = tokio::spawn(async move {
+            let permit = high_gate
+                .acquire("session-high", "project-high", 50, &high_control)
+                .await
+                .unwrap();
+            high_sender.send("high").unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(gate.snapshot(), (1, 1, 2));
+        drop(holder);
+
+        let first_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((first_grant, second_grant), ("high", "low"));
+        low.await.unwrap();
+        high.await.unwrap();
     }
 
     #[tokio::test]

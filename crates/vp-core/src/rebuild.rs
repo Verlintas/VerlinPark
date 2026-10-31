@@ -111,6 +111,11 @@ fn session_from_created(event: &Event) -> Option<Session> {
         project_id: payload.get("project_id")?.as_str()?.to_string(),
         goal: payload.get("goal")?.as_str()?.to_string(),
         status: "draft".to_string(),
+        priority: payload
+            .get("priority")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0),
         worktree: payload
             .get("worktree")
             .and_then(serde_json::Value::as_str)

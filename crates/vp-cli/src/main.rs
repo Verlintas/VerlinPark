@@ -168,6 +168,9 @@ enum Command {
     SessionNew {
         project: String,
         goal: String,
+        /// Session priority from -100 to 100; higher runs are admitted first.
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
         #[arg(long)]
         token_budget: Option<u64>,
         #[arg(long)]
@@ -637,6 +640,7 @@ async fn main() -> Result<()> {
         Command::SessionNew {
             project,
             goal,
+            priority,
             token_budget,
             cost_budget_usd,
             time_budget_secs,
@@ -647,6 +651,7 @@ async fn main() -> Result<()> {
                 json!({
                     "project_id": project,
                     "goal": goal,
+                    "priority": priority,
                     "token_budget": token_budget,
                     "cost_budget_usd": cost_budget_usd,
                     "time_budget_secs": time_budget_secs,

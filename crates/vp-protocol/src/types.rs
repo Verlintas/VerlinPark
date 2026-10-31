@@ -103,6 +103,8 @@ pub struct Session {
     pub goal: String,
     pub status: String,
     #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
     pub worktree: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
@@ -203,11 +205,25 @@ pub struct CreateSessionParams {
     pub project_id: String,
     pub goal: String,
     #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
     pub token_budget: Option<u64>,
     #[serde(default)]
     pub cost_budget_usd: Option<f64>,
     #[serde(default)]
     pub time_budget_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSessionPriorityParams {
+    pub session_id: String,
+    pub priority: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionPriorityResult {
+    pub session_id: String,
+    pub priority: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

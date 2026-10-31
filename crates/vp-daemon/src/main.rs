@@ -476,34 +476,48 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             }
         }
         "session.create" => match parse_params::<CreateSessionParams>(request.params) {
-            Ok(params) => match state
-                .engine
-                .create_session_with_limits(
-                    params.project_id,
-                    params.goal.clone(),
-                    params.token_budget,
-                    params.cost_budget_usd,
-                    params.time_budget_secs,
-                )
-                .await
-            {
-                Ok(session) => {
-                    let info = state.agent.info();
-                    let model = info
-                        .role_models
-                        .leader
-                        .model
-                        .clone()
-                        .or(info.model)
-                        .unwrap_or_else(|| "unconfigured".to_string());
-                    let _ = state.engine.create_leader_agent(&session.id, &model).await;
-                    if let Err(error) = state.agent.start(&session.id, &params.goal).await {
-                        tracing::warn!(%error, session_id = %session.id, "agent did not start");
+            Ok(params) => {
+                let created = if let Some(priority) = params.priority {
+                    state
+                        .engine
+                        .create_session_with_priority(
+                            params.project_id,
+                            params.goal.clone(),
+                            params.token_budget,
+                            priority,
+                        )
+                        .await
+                } else {
+                    state
+                        .engine
+                        .create_session_with_limits(
+                            params.project_id,
+                            params.goal.clone(),
+                            params.token_budget,
+                            params.cost_budget_usd,
+                            params.time_budget_secs,
+                        )
+                        .await
+                };
+                match created {
+                    Ok(session) => {
+                        let info = state.agent.info();
+                        let model = info
+                            .role_models
+                            .leader
+                            .model
+                            .clone()
+                            .or(info.model)
+                            .unwrap_or_else(|| "unconfigured".to_string());
+                        let _ = state.engine.create_leader_agent(&session.id, &model).await;
+                        if let Err(error) = state.agent.start(&session.id, &params.goal).await {
+                            tracing::warn!(%error, session_id = %session.id, "agent did not start");
+                        }
+                        RpcResponse::success(id, session)
                     }
-                    RpcResponse::success(id, session)
+                    Err(error) => internal_error(id, error),
                 }
-                Err(error) => internal_error(id, error),
-            },
+            }
             Err(response) => response_with_id(id, response),
         },
         "session.list" => {

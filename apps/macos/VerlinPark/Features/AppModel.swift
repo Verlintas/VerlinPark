@@ -545,7 +545,8 @@ final class AppModel {
         goal: String,
         tokenBudget: Int? = nil,
         costBudgetUSD: Double? = nil,
-        timeBudgetSecs: Int? = nil
+        timeBudgetSecs: Int? = nil,
+        priority: Int = 0
     ) async {
         guard let projectID = selectedProjectID else {
             lastError = "Choose a project first."
@@ -564,7 +565,8 @@ final class AppModel {
                 goal: trimmed,
                 tokenBudget: budget,
                 costBudgetUSD: costBudgetUSD,
-                timeBudgetSecs: timeBudgetSecs
+                timeBudgetSecs: timeBudgetSecs,
+                priority: priority
             )
             sessions = try await core.listSessions(projectID: projectID)
             selectedSessionID = session.id
@@ -1954,6 +1956,7 @@ final class AppModel {
                 projectId: old.projectId,
                 goal: old.goal,
                 status: old.status,
+                priority: old.priority,
                 worktree: old.worktree,
                 branch: old.branch,
                 tokenBudget: old.tokenBudget,
@@ -1981,6 +1984,7 @@ final class AppModel {
                 projectId: old.projectId,
                 goal: old.goal,
                 status: old.status,
+                priority: old.priority,
                 worktree: old.worktree,
                 branch: old.branch,
                 tokenBudget: old.tokenBudget,
@@ -2004,6 +2008,7 @@ final class AppModel {
                 projectId: old.projectId,
                 goal: old.goal,
                 status: status,
+                priority: old.priority,
                 worktree: old.worktree,
                 branch: old.branch,
                 tokenBudget: old.tokenBudget,

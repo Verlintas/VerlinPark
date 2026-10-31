@@ -138,6 +138,7 @@ impl Store {
                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 goal       TEXT NOT NULL,
                 status        TEXT NOT NULL,
+                priority      INTEGER NOT NULL DEFAULT 0,
                 worktree      TEXT,
                 branch        TEXT,
                 token_budget  INTEGER,
@@ -431,6 +432,7 @@ impl Store {
                 [],
             )?;
         }
+        ensure_column(&conn, "sessions", "priority", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "sessions", "worktree", "TEXT")?;
         ensure_column(&conn, "sessions", "branch", "TEXT")?;
         ensure_column(&conn, "sessions", "token_budget", "INTEGER")?;
@@ -652,15 +654,16 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO sessions
-             (id, project_id, goal, status, worktree, branch, token_budget,
+             (id, project_id, goal, status, priority, worktree, branch, token_budget,
               cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit,
               team_plan, tokens_in, tokens_out, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, ?15)",
             params![
                 session.id,
                 session.project_id,
                 session.goal,
                 session.status,
+                session.priority,
                 session.worktree,
                 session.branch,
                 session.token_budget,
@@ -812,6 +815,25 @@ impl Store {
         cost_budget_usd: Option<f64>,
         time_budget_secs: Option<u64>,
     ) -> Result<Session> {
+        self.create_session_with_limits_and_priority(
+            project_id,
+            goal,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            0,
+        )
+    }
+
+    pub fn create_session_with_limits_and_priority(
+        &self,
+        project_id: &str,
+        goal: &str,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+        priority: i32,
+    ) -> Result<Session> {
         self.insert_session(
             Uuid::now_v7().to_string(),
             project_id,
@@ -822,6 +844,7 @@ impl Store {
             cost_budget_usd,
             time_budget_secs,
             None,
+            priority,
         )
     }
 
@@ -837,6 +860,7 @@ impl Store {
         cost_budget_usd: Option<f64>,
         time_budget_secs: Option<u64>,
         base_commit: &str,
+        priority: i32,
     ) -> Result<Session> {
         self.insert_session(
             id.to_string(),
@@ -848,6 +872,7 @@ impl Store {
             cost_budget_usd,
             time_budget_secs,
             Some(base_commit.to_string()),
+            priority,
         )
     }
 
@@ -863,6 +888,7 @@ impl Store {
         cost_budget_usd: Option<f64>,
         time_budget_secs: Option<u64>,
         base_commit: Option<String>,
+        priority: i32,
     ) -> Result<Session> {
         if self.get_project(project_id)?.is_none() {
             return Err(anyhow!("project not found: {project_id}"));
@@ -876,6 +902,7 @@ impl Store {
             project_id: project_id.to_string(),
             goal: goal.to_string(),
             status: "draft".to_string(),
+            priority,
             worktree,
             branch,
             token_budget,
@@ -890,15 +917,16 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO sessions
-             (id, project_id, goal, status, worktree, branch, token_budget,
+             (id, project_id, goal, status, priority, worktree, branch, token_budget,
               cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit,
               tokens_in, tokens_out, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, 0, 0, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, 0, 0, ?12)",
             params![
                 session.id,
                 session.project_id,
                 session.goal,
                 session.status,
+                session.priority,
                 session.worktree,
                 session.branch,
                 session.token_budget,
@@ -909,6 +937,15 @@ impl Store {
             ],
         )?;
         Ok(session)
+    }
+
+    pub fn set_session_priority(&self, session_id: &str, priority: i32) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sessions SET priority = ?1 WHERE id = ?2",
+            params![priority, session_id],
+        )?;
+        Ok(())
     }
 
     pub fn set_session_worktree(
@@ -2604,7 +2641,7 @@ impl Store {
         match project_id {
             Some(project_id) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at
+                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at, priority
                      FROM sessions WHERE project_id = ?1
                      ORDER BY created_at DESC",
                 )?;
@@ -2613,7 +2650,7 @@ impl Store {
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at
+                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at, priority
                      FROM sessions ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map([], map_session)?;
@@ -2626,7 +2663,7 @@ impl Store {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at
+            "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at, priority
              FROM sessions WHERE id = ?1",
             params![id],
             map_session,
@@ -4046,14 +4083,15 @@ impl Store {
             .transpose()?;
         tx.execute(
             "INSERT INTO sessions
-             (id, project_id, goal, status, worktree, branch, token_budget,
+             (id, project_id, goal, status, priority, worktree, branch, token_budget,
               cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit,
               team_plan, tokens_in, tokens_out, created_at)
-             VALUES (?1, ?2, ?3, 'imported', NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             VALUES (?1, ?2, ?3, 'imported', ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 bundle.session.id,
                 bundle.session.project_id,
                 bundle.session.goal,
+                bundle.session.priority,
                 bundle.session.branch,
                 bundle.session.token_budget,
                 bundle.session.cost_budget_usd,
@@ -4352,20 +4390,25 @@ impl Store {
         Ok(imported_event)
     }
 
-    pub fn queued_session_prompts(&self) -> Result<Vec<(String, String)>> {
+    pub fn queued_session_prompts(&self) -> Result<Vec<(String, String, String, i32)>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT e.session_id, e.payload
+            "SELECT e.session_id, s.project_id, s.priority, e.payload
              FROM events e JOIN sessions s ON s.id = e.session_id
              WHERE s.status = 'queued' AND e.type = 'agent.queued'
              ORDER BY e.session_id, e.seq DESC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })?;
         let mut prompts = std::collections::HashMap::new();
         for row in rows {
-            let (session_id, payload) = row?;
+            let (session_id, project_id, priority, payload) = row?;
             if prompts.contains_key(&session_id) {
                 continue;
             }
@@ -4373,10 +4416,17 @@ impl Store {
             if let Some(prompt) = payload.get("prompt").and_then(serde_json::Value::as_str)
                 && !prompt.trim().is_empty()
             {
-                prompts.insert(session_id, prompt.to_string());
+                prompts.insert(session_id, (project_id, prompt.to_string(), priority));
             }
         }
-        Ok(prompts.into_iter().collect())
+        let mut prompts = prompts
+            .into_iter()
+            .map(|(session_id, (project_id, prompt, priority))| {
+                (session_id, project_id, prompt, priority)
+            })
+            .collect::<Vec<_>>();
+        prompts.sort_by(|left, right| right.3.cmp(&left.3).then_with(|| left.0.cmp(&right.0)));
+        Ok(prompts)
     }
 
     pub fn interrupt_running_sessions(&self) -> Result<Vec<String>> {
@@ -4832,6 +4882,7 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         tokens_in: row.get::<_, i64>(11)? as u64,
         tokens_out: row.get::<_, i64>(12)? as u64,
         created_at: row.get(13)?,
+        priority: row.get(14)?,
     })
 }
 
@@ -5016,6 +5067,37 @@ mod tests {
             .join("events.jsonl");
         let mirror = std::fs::read_to_string(path).unwrap();
         assert_eq!(mirror.lines().count(), 2);
+    }
+
+    #[test]
+    fn round_trips_session_priority() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let low = store.create_session(&project.id, "low").unwrap();
+        assert_eq!(low.priority, 0);
+        let high = store
+            .create_session_with_limits_and_priority(
+                &project.id,
+                "high",
+                Some(1000),
+                None,
+                None,
+                42,
+            )
+            .unwrap();
+        assert_eq!(high.priority, 42);
+        assert_eq!(store.get_session(&high.id).unwrap().unwrap().priority, 42);
+        let sessions = store.list_sessions(Some(&project.id)).unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.id == high.id)
+                .unwrap()
+                .priority,
+            42
+        );
     }
 
     #[test]
@@ -5618,6 +5700,24 @@ mod tests {
             )
             .unwrap();
         store.update_session_status(&session.id, "queued").unwrap();
+        let urgent = store
+            .create_session_with_limits_and_priority(
+                &project.id,
+                "urgent queued",
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+        store
+            .append_event(
+                &urgent.id,
+                "agent.queued",
+                serde_json::json!({"prompt": "urgent work"}),
+            )
+            .unwrap();
+        store.update_session_status(&urgent.id, "queued").unwrap();
         let (recovered, _) = store.recover_state().unwrap();
         assert!(recovered.is_empty());
         assert_eq!(
@@ -5627,7 +5727,10 @@ mod tests {
         let prompts = store.queued_session_prompts().unwrap();
         assert_eq!(
             prompts,
-            vec![(session.id, "continue the queue".to_string())]
+            vec![
+                (urgent.id, project.id.clone(), "urgent work".to_string(), 10),
+                (session.id, project.id, "continue the queue".to_string(), 0)
+            ]
         );
     }
 

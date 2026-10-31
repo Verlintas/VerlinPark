@@ -172,11 +172,13 @@ actor CoreClient {
         goal: String,
         tokenBudget: Int?,
         costBudgetUSD: Double? = nil,
-        timeBudgetSecs: Int? = nil
+        timeBudgetSecs: Int? = nil,
+        priority: Int = 0
     ) async throws -> Session {
         var params: [String: JSONValue] = [
             "project_id": .string(projectID),
             "goal": .string(goal),
+            "priority": .number(Double(priority)),
         ]
         if let tokenBudget, tokenBudget > 0 {
             params["token_budget"] = .number(Double(tokenBudget))
