@@ -61,6 +61,7 @@
 | [0049](adr/0049-verifier-tracked-file-guard.md) | Verifier tracked-file guard | Accepted | 权限/验证/安全 |
 | [0050](adr/0050-approval-events.md) | Atomic approval events and replay | Accepted | 事件溯源/审批 |
 | [0051](adr/0051-event-mirror-restore.md) | Event mirror verification and restore | Accepted | 恢复/事件日志 |
+| [0052](adr/0052-artifact-backfill.md) | Legacy artifact event backfill | Accepted | 迁移/事件溯源 |
 
 ---
 

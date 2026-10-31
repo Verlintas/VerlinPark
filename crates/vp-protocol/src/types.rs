@@ -421,6 +421,18 @@ pub struct ArtifactListResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactBackfillParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactBackfillResult {
+    pub session_id: String,
+    pub scanned: usize,
+    pub backfilled: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ArtifactGetParams {
     pub artifact_id: String,
 }

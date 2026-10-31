@@ -113,6 +113,8 @@ enum Command {
     ReadMessage { message: String },
     /// List published artifacts.
     Artifacts { session: String },
+    /// Backfill full publish events for legacy artifacts in a session.
+    BackfillArtifacts { session: String },
     /// Show the project artifact retention policy.
     ArtifactPolicy { project: String },
     /// Update artifact retention and optional automatic GC.
@@ -380,6 +382,14 @@ async fn main() -> Result<()> {
         }
         Command::Artifact { artifact } => {
             rpc(&discovery, "artifact.get", json!({"artifact_id": artifact})).await?
+        }
+        Command::BackfillArtifacts { session } => {
+            rpc(
+                &discovery,
+                "artifact.backfill",
+                json!({"session_id": session}),
+            )
+            .await?
         }
         Command::ArtifactPolicy { project } => {
             rpc(
@@ -681,6 +691,15 @@ fn print_human(value: &Value) {
             value["agents"].as_array().map_or(0, Vec::len),
             value["messages"].as_array().map_or(0, Vec::len),
             value["merge_queue"].as_array().map_or(0, Vec::len)
+        );
+        return;
+    }
+    if value.get("session_id").is_some() && value.get("backfilled").is_some() {
+        println!(
+            "session {}  scanned={}  backfilled={}",
+            value["session_id"].as_str().unwrap_or("?"),
+            value["scanned"].as_u64().unwrap_or(0),
+            value["backfilled"].as_u64().unwrap_or(0)
         );
         return;
     }

@@ -3652,10 +3652,12 @@ mod tests {
         store.update_agent_status(&worker.id, "idle").unwrap();
         let agents = store.list_agents(&session.id).unwrap();
         assert_eq!(agents.len(), 2);
-        assert_eq!(agents[0].role, "leader");
-        assert_eq!(agents[1].name, "Worker 1");
-        assert_eq!(agents[1].status, "idle");
-        assert_eq!(agents[1].parent_id.as_deref(), Some(leader.as_str()));
+        let leader_agent = agents.iter().find(|agent| agent.role == "leader").unwrap();
+        let worker_agent = agents.iter().find(|agent| agent.role == "worker").unwrap();
+        assert_eq!(worker_agent.name, "Worker 1");
+        assert_eq!(worker_agent.status, "idle");
+        assert_eq!(worker_agent.parent_id.as_deref(), Some(leader.as_str()));
+        assert_eq!(leader_agent.id, leader);
     }
 
     #[test]

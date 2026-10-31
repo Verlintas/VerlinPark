@@ -10,11 +10,12 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    AgentMessage, AgentRecord, Approval, Artifact, ArtifactGcResult, ArtifactPolicy, Event,
-    IntegrationPolicy, MailboxGcResult, MailboxPolicy, MergeQueueEntry, Project, PullRequestResult,
-    Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult, SessionLandResult,
-    SessionLogStatus, SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage,
-    TeamPlan, TodoItem, UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
+    AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
+    ArtifactPolicy, Event, IntegrationPolicy, MailboxGcResult, MailboxPolicy, MergeQueueEntry,
+    Project, PullRequestResult, Session, SessionBundle, SessionCommit, SessionDiff,
+    SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
+    SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageEntry,
+    UsageLedgerResult, UsageTotals,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -54,6 +55,23 @@ pub struct Engine {
     approval_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     git_lock: Arc<Mutex<()>>,
     budget_registry: Arc<BudgetRegistry>,
+}
+
+fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
+    serde_json::json!({
+        "artifact_id": artifact.id,
+        "name": artifact.name,
+        "kind": artifact.kind,
+        "agent_id": artifact.agent_id,
+        "agent_name": artifact.agent_name,
+        "task_id": artifact.task_id,
+        "mime_type": artifact.mime_type,
+        "storage": artifact.storage,
+        "size_bytes": artifact.size_bytes,
+        "sha256": artifact.sha256,
+        "path": artifact.path,
+        "content": artifact.content,
+    })
 }
 
 fn add_usage_bucket(buckets: &mut HashMap<String, UsageBucket>, key: &str, entry: &UsageEntry) {
@@ -1257,6 +1275,52 @@ impl Engine {
         Ok(ArtifactGcResult {
             removed: remove.len(),
             bytes_freed,
+        })
+    }
+
+    pub async fn backfill_artifact_events(
+        &self,
+        session_id: &str,
+    ) -> Result<ArtifactBackfillResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (artifacts, events) = tokio::task::spawn_blocking(move || {
+            let artifacts = store.list_artifacts(&id)?;
+            let events = store.list_all_events(&id)?;
+            Ok::<_, anyhow::Error>((artifacts, events))
+        })
+        .await??;
+        let mut full = std::collections::HashSet::new();
+        for event in &events {
+            if event.kind == "artifact.published"
+                && event.payload.get("mime_type").is_some()
+                && event.payload.get("sha256").is_some()
+                && event.payload.get("content").is_some()
+                && let Some(artifact_id) = event
+                    .payload
+                    .get("artifact_id")
+                    .and_then(serde_json::Value::as_str)
+            {
+                full.insert(artifact_id.to_string());
+            }
+        }
+        let mut backfilled = 0;
+        for artifact in &artifacts {
+            if full.contains(&artifact.id) {
+                continue;
+            }
+            self.append_event(
+                session_id,
+                "artifact.published",
+                artifact_event_payload(artifact),
+            )
+            .await?;
+            backfilled += 1;
+        }
+        Ok(ArtifactBackfillResult {
+            session_id: session_id.to_string(),
+            scanned: artifacts.len(),
+            backfilled,
         })
     }
 
@@ -3368,6 +3432,82 @@ mod tests {
         );
         std::fs::remove_file(&blob).unwrap();
         assert!(!blob.exists());
+    }
+
+    #[tokio::test]
+    async fn backfills_legacy_artifact_events_for_repair() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("backfill".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "backfill".into(), None)
+            .await
+            .unwrap();
+        let artifact = engine
+            .publish_artifact(
+                &session.id,
+                "agent-a",
+                "Worker",
+                Some("T1".into()),
+                "legacy-note.md",
+                "note",
+                "text/markdown",
+                "legacy content",
+            )
+            .await
+            .unwrap();
+
+        let mut events = engine.store().list_all_events(&session.id).unwrap();
+        for event in &mut events {
+            if event.kind == "artifact.published" {
+                event.payload = serde_json::json!({
+                    "artifact_id": artifact.id,
+                    "name": artifact.name,
+                    "kind": artifact.kind,
+                    "agent_id": artifact.agent_id,
+                    "agent_name": artifact.agent_name,
+                });
+            }
+        }
+        engine.store().replace_events(&session.id, &events).unwrap();
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.artifacts_matches, "{:?}", report.mismatches);
+
+        let result = engine.backfill_artifact_events(&session.id).await.unwrap();
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.backfilled, 1);
+        assert_eq!(
+            engine
+                .backfill_artifact_events(&session.id)
+                .await
+                .unwrap()
+                .backfilled,
+            0
+        );
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.consistent, "{:?}", report.mismatches);
+
+        engine.store().delete_artifact(&artifact.id).unwrap();
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(!report.artifacts_matches);
+        let repaired = engine.repair_session(&session.id).await.unwrap();
+        assert!(repaired.artifacts_matches);
+        let restored = engine
+            .list_artifacts(&session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == artifact.id)
+            .unwrap();
+        assert_eq!(restored.content, "legacy content");
     }
 
     #[tokio::test]
