@@ -15,7 +15,8 @@ use vp_protocol::types::{
     MailboxPolicy, MergeQueueEntry, Project, PullRequestResult, Session, SessionBundle,
     SessionCommit, SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus,
     SessionRehydrateResult, SessionReplayReport, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
-    UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals,
+    UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
+    WorktreeCleanupResult,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -3007,6 +3008,159 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn cleanup_worktrees(
+        &self,
+        project_id: &str,
+        older_than_secs: u64,
+        dry_run: bool,
+        force: bool,
+        delete_branches: bool,
+    ) -> Result<WorktreeCleanupResult> {
+        let store = self.store.clone();
+        let project_store = store.clone();
+        let project_id_owned = project_id.to_string();
+        let project =
+            tokio::task::spawn_blocking(move || project_store.get_project(&project_id_owned))
+                .await??
+                .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let project_root = PathBuf::from(&project.root);
+        let list_store = store.clone();
+        let list_project_id = project_id.to_string();
+        let sessions =
+            tokio::task::spawn_blocking(move || list_store.list_sessions(Some(&list_project_id)))
+                .await??;
+        let now = time::OffsetDateTime::now_utc();
+        let mut entries = Vec::new();
+        let mut removed = 0usize;
+        let mut skipped = 0usize;
+        let mut scanned = 0usize;
+        for session in sessions {
+            let terminal = matches!(
+                session.status.as_str(),
+                "idle" | "failed" | "cancelled" | "landed"
+            );
+            if !terminal {
+                continue;
+            }
+            let Some(worktree) = session.worktree.clone() else {
+                continue;
+            };
+            let Some(branch) = session.branch.clone() else {
+                continue;
+            };
+            scanned += 1;
+            let age = time::OffsetDateTime::parse(
+                &session.created_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map(|created| (now - created).whole_seconds().max(0) as u64)
+            .unwrap_or(0);
+            if age < older_than_secs {
+                skipped += 1;
+                entries.push(WorktreeCleanupEntry {
+                    session_id: session.id.clone(),
+                    status: session.status.clone(),
+                    worktree,
+                    branch,
+                    removed: false,
+                    reason: "younger than retention threshold".to_string(),
+                });
+                continue;
+            }
+            let path = PathBuf::from(&worktree);
+            if !path.exists() {
+                skipped += 1;
+                entries.push(WorktreeCleanupEntry {
+                    session_id: session.id.clone(),
+                    status: session.status.clone(),
+                    worktree,
+                    branch,
+                    removed: false,
+                    reason: "worktree path is already missing".to_string(),
+                });
+                continue;
+            }
+            let dirty = tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || worktree::has_uncommitted_changes(&path)
+            })
+            .await??;
+            if dirty && !force {
+                skipped += 1;
+                entries.push(WorktreeCleanupEntry {
+                    session_id: session.id.clone(),
+                    status: session.status.clone(),
+                    worktree,
+                    branch,
+                    removed: false,
+                    reason: "uncommitted changes (use force to remove)".to_string(),
+                });
+                continue;
+            }
+            if dry_run {
+                skipped += 1;
+                entries.push(WorktreeCleanupEntry {
+                    session_id: session.id.clone(),
+                    status: session.status.clone(),
+                    worktree,
+                    branch,
+                    removed: false,
+                    reason: "would remove".to_string(),
+                });
+                continue;
+            }
+            match tokio::task::spawn_blocking({
+                let root = project_root.clone();
+                let path = path.clone();
+                move || worktree::remove_worktree(&root, &path)
+            })
+            .await?
+            {
+                Ok(()) => {
+                    let mut reason = "removed worktree".to_string();
+                    if delete_branches
+                        && let Err(error) = tokio::task::spawn_blocking({
+                            let root = project_root.clone();
+                            let branch = branch.clone();
+                            move || worktree::delete_branch(&root, &branch)
+                        })
+                        .await?
+                    {
+                        reason = format!("removed worktree; branch delete failed: {error}");
+                    }
+                    removed += 1;
+                    entries.push(WorktreeCleanupEntry {
+                        session_id: session.id.clone(),
+                        status: session.status.clone(),
+                        worktree,
+                        branch,
+                        removed: true,
+                        reason,
+                    });
+                }
+                Err(error) => {
+                    skipped += 1;
+                    entries.push(WorktreeCleanupEntry {
+                        session_id: session.id.clone(),
+                        status: session.status.clone(),
+                        worktree,
+                        branch,
+                        removed: false,
+                        reason: format!("remove failed: {error}"),
+                    });
+                }
+            }
+        }
+        Ok(WorktreeCleanupResult {
+            project_id: project.id,
+            scanned,
+            removed,
+            skipped,
+            entries,
+        })
+    }
+
     pub async fn append_event(
         &self,
         session_id: &str,
@@ -4374,6 +4528,71 @@ mod tests {
             queue_status.get(&entry.id).map(String::as_str),
             Some("merged")
         );
+    }
+
+    #[tokio::test]
+    async fn cleans_up_terminal_worktrees_without_losing_branches_by_default() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("cleanup".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "cleanup".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let branch = session.branch.clone().unwrap();
+        std::fs::write(worktree.join("dirty.txt"), "dirty\n").unwrap();
+        engine
+            .update_session_status(&session.id, "idle")
+            .await
+            .unwrap();
+
+        let active = engine
+            .create_session(project.id.clone(), "active".into(), None)
+            .await
+            .unwrap();
+        engine
+            .update_session_status(&active.id, "running")
+            .await
+            .unwrap();
+
+        let protected = engine
+            .cleanup_worktrees(&project.id, 0, false, false, false)
+            .await
+            .unwrap();
+        assert_eq!(protected.removed, 0);
+        assert_eq!(protected.skipped, 1);
+        assert!(worktree.exists());
+
+        let dry = engine
+            .cleanup_worktrees(&project.id, 0, true, true, false)
+            .await
+            .unwrap();
+        assert_eq!(dry.removed, 0);
+        assert_eq!(dry.entries[0].reason, "would remove");
+        assert!(worktree.exists());
+
+        let cleaned = engine
+            .cleanup_worktrees(&project.id, 0, false, true, false)
+            .await
+            .unwrap();
+        assert_eq!(cleaned.scanned, 1, "active session must be skipped");
+        assert_eq!(cleaned.removed, 1);
+        assert!(!worktree.exists());
+        assert!(
+            worktree::branch_exists(repo.path(), &branch).unwrap(),
+            "cleanup must keep the branch unless explicitly asked"
+        );
+        let active_worktree = active.worktree.clone().unwrap();
+        assert!(std::path::Path::new(&active_worktree).exists());
     }
 
     #[tokio::test]

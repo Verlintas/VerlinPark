@@ -313,6 +313,31 @@ pub fn check_merged_diff(worktree: &Path, base_commit: &str) -> Result<()> {
     }
 }
 
+/// Remove only the worktree, keeping its branch. Used by explicit cleanup so
+/// unlanded commits remain recoverable.
+pub fn remove_worktree(project_root: &Path, worktree: &Path) -> Result<()> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving project root {}", project_root.display()))?;
+    run_git(
+        &root,
+        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+    )
+}
+
+pub fn delete_branch(project_root: &Path, branch: &str) -> Result<()> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving project root {}", project_root.display()))?;
+    run_git(&root, &["branch", "-D", branch])
+}
+
+pub fn has_uncommitted_changes(worktree: &Path) -> Result<bool> {
+    Ok(!git_output(worktree, &["status", "--porcelain"])?
+        .trim()
+        .is_empty())
+}
+
 pub fn remove(project_root: &Path, worktree: &Path, branch: &str) {
     if let Ok(root) = project_root.canonicalize() {
         let _ = run_git(

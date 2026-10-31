@@ -813,6 +813,38 @@ pub struct SessionLogStatus {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CleanupWorktreesParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub older_than_secs: u64,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub delete_branches: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeCleanupEntry {
+    pub session_id: String,
+    pub status: String,
+    pub worktree: String,
+    pub branch: String,
+    pub removed: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeCleanupResult {
+    pub project_id: String,
+    pub scanned: usize,
+    pub removed: usize,
+    pub skipped: usize,
+    pub entries: Vec<WorktreeCleanupEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SessionLogParams {
     pub session_id: String,
 }

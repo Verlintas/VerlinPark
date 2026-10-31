@@ -26,17 +26,17 @@ use vp_protocol::types::{
     ArtifactBackfillParams, ArtifactGcParams, ArtifactGetParams, ArtifactListParams,
     ArtifactListResult, ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult,
     ArtifactResult, AuthParams, AuthResult, CancelSessionParams, CancelSessionResult,
-    CommitSessionParams, ConfigureAgentParams, CreateSessionParams, DiscardSessionParams,
-    EventListResult, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
-    ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams,
-    MailboxListResult, MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams,
-    MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams, PingResult,
-    ProjectListResult, PromptParams, PromptResult, RehydrateSessionParams, ReplaySessionParams,
-    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
-    RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams, SessionExportParams,
-    SessionImportParams, SessionListResult, SessionLogParams, SessionPauseParams,
-    SessionPauseResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
-    SessionTodosResult, SetArtifactPolicyParams, SetIntegrationPolicyParams,
+    CleanupWorktreesParams, CommitSessionParams, ConfigureAgentParams, CreateSessionParams,
+    DiscardSessionParams, EventListResult, IntegrationPolicyParams, IntegrationPolicyResult,
+    LandSessionParams, ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams,
+    MailboxListParams, MailboxListResult, MailboxPolicyParams, MailboxPolicyResult,
+    MarkMessageReadParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
+    PingResult, ProjectListResult, PromptParams, PromptResult, RehydrateSessionParams,
+    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
+    ResolveMergeResult, RetryMergeParams, RetryMergeResult, ServerInfo, SessionDiffParams,
+    SessionExportParams, SessionImportParams, SessionListResult, SessionLogParams,
+    SessionPauseParams, SessionPauseResult, SessionResumeParams, SessionResumeResult,
+    SessionTodosParams, SessionTodosResult, SetArtifactPolicyParams, SetIntegrationPolicyParams,
     SetMailboxPolicyParams, SetShellPolicyParams, ShellPolicyParams, ShellPolicyResult,
     SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
 };
@@ -571,6 +571,25 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "project.cleanup_worktrees" => {
+            match parse_params::<CleanupWorktreesParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .cleanup_worktrees(
+                        &params.project_id,
+                        params.older_than_secs,
+                        params.dry_run,
+                        params.force,
+                        params.delete_branches,
+                    )
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.log_status" => match parse_params::<SessionLogParams>(request.params) {
             Ok(params) => match state.engine.session_log_status(&params.session_id).await {
                 Ok(status) => RpcResponse::success(id, status),

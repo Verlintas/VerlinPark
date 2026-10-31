@@ -34,6 +34,21 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Remove old terminal session worktrees while keeping branches by default.
+    CleanupWorktrees {
+        project: String,
+        #[arg(long, default_value_t = 7)]
+        older_than_days: u64,
+        /// Report what would be removed without touching the filesystem.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove worktrees with uncommitted changes.
+        #[arg(long)]
+        force: bool,
+        /// Also delete the session branches.
+        #[arg(long)]
+        delete_branches: bool,
+    },
     /// Show the project's shell permission policy.
     ShellPolicy { project: String },
     /// Update the project's shell network/read-deny policy.
@@ -237,6 +252,26 @@ async fn main() -> Result<()> {
                 &discovery,
                 "project.add",
                 json!({"root": root, "name": name}),
+            )
+            .await?
+        }
+        Command::CleanupWorktrees {
+            project,
+            older_than_days,
+            dry_run,
+            force,
+            delete_branches,
+        } => {
+            rpc(
+                &discovery,
+                "project.cleanup_worktrees",
+                json!({
+                    "project_id": project,
+                    "older_than_secs": older_than_days.saturating_mul(86_400),
+                    "dry_run": dry_run,
+                    "force": force,
+                    "delete_branches": delete_branches,
+                }),
             )
             .await?
         }
@@ -702,6 +737,29 @@ fn print_human(value: &Value) {
             value["messages"].as_array().map_or(0, Vec::len),
             value["merge_queue"].as_array().map_or(0, Vec::len)
         );
+        return;
+    }
+    if value.get("scanned").is_some() && value.get("entries").is_some() {
+        println!(
+            "project {}  scanned={}  removed={}  skipped={}",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["scanned"].as_u64().unwrap_or(0),
+            value["removed"].as_u64().unwrap_or(0),
+            value["skipped"].as_u64().unwrap_or(0)
+        );
+        for entry in value["entries"].as_array().into_iter().flatten() {
+            println!(
+                "{}  {}  {}  {}",
+                if entry["removed"].as_bool().unwrap_or(false) {
+                    "removed"
+                } else {
+                    "skipped"
+                },
+                entry["session_id"].as_str().unwrap_or("?"),
+                entry["branch"].as_str().unwrap_or("?"),
+                entry["reason"].as_str().unwrap_or("")
+            );
+        }
         return;
     }
     if value.get("artifact_id").is_some() && value.get("path").is_some() {
