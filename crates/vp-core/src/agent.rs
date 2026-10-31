@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +9,7 @@ use async_recursion::async_recursion;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
     AgentInfo, CapacityInfo, ConfigureAgentParams, MergeQueueEntry, PlanDepartment, PlanTask,
@@ -74,11 +74,153 @@ pub struct AgentConfig {
 
 /// Daemon-wide admission control for Worker/Labour runs. Per-session caps still
 /// apply; this prevents many sessions from each running their own full cap.
+///
+/// Permits are granted round-robin across sessions so one session cannot
+/// monopolize the queue with a large batch.
 pub struct CapacityController {
-    workers: Arc<Semaphore>,
-    labour: Arc<Semaphore>,
+    workers: Arc<FairCapacity>,
+    labour: Arc<FairCapacity>,
     worker_limit: usize,
     labour_limit: usize,
+}
+
+struct FairCapacity {
+    limit: usize,
+    state: Mutex<FairState>,
+}
+
+struct FairState {
+    active: usize,
+    waiters: VecDeque<CapacityWaiter>,
+    next_id: u64,
+    last_session: Option<String>,
+}
+
+struct CapacityWaiter {
+    id: u64,
+    session_id: String,
+    sender: oneshot::Sender<()>,
+}
+
+pub struct CapacityPermit {
+    queue: Arc<FairCapacity>,
+}
+
+impl Drop for CapacityPermit {
+    fn drop(&mut self) {
+        self.queue.release();
+    }
+}
+
+impl FairCapacity {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            state: Mutex::new(FairState {
+                active: 0,
+                waiters: VecDeque::new(),
+                next_id: 0,
+                last_session: None,
+            }),
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| self.limit.saturating_sub(state.active))
+            .unwrap_or(0)
+    }
+
+    fn try_acquire(self: &Arc<Self>, session_id: &str) -> Option<CapacityPermit> {
+        let mut state = self.state.lock().ok()?;
+        if state.active >= self.limit || !state.waiters.is_empty() {
+            return None;
+        }
+        state.active += 1;
+        state.last_session = Some(session_id.to_string());
+        drop(state);
+        Some(CapacityPermit {
+            queue: self.clone(),
+        })
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        session_id: &str,
+        control: &RunControl,
+    ) -> Option<CapacityPermit> {
+        let (waiter_id, receiver) = {
+            let mut state = self.state.lock().ok()?;
+            if state.active < self.limit && state.waiters.is_empty() {
+                state.active += 1;
+                state.last_session = Some(session_id.to_string());
+                return Some(CapacityPermit {
+                    queue: self.clone(),
+                });
+            }
+            let id = state.next_id;
+            state.next_id = state.next_id.saturating_add(1);
+            let (sender, receiver) = oneshot::channel();
+            state.waiters.push_back(CapacityWaiter {
+                id,
+                session_id: session_id.to_string(),
+                sender,
+            });
+            (id, receiver)
+        };
+        tokio::select! {
+            result = receiver => {
+                if result.is_ok() {
+                    Some(CapacityPermit { queue: self.clone() })
+                } else {
+                    None
+                }
+            }
+            _ = wait_for_cancel(control) => {
+                let removed = {
+                    let mut state = self.state.lock().ok()?;
+                    state
+                        .waiters
+                        .iter()
+                        .position(|waiter| waiter.id == waiter_id)
+                        .and_then(|index| state.waiters.remove(index))
+                };
+                if removed.is_none() {
+                    // The permit was granted concurrently with cancellation.
+                    self.release();
+                }
+                None
+            }
+        }
+    }
+
+    fn release(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active = state.active.saturating_sub(1);
+            self.grant_waiters(&mut state);
+        }
+    }
+
+    fn grant_waiters(&self, state: &mut FairState) {
+        while state.active < self.limit && !state.waiters.is_empty() {
+            let index = state
+                .waiters
+                .iter()
+                .position(|waiter| {
+                    state.last_session.as_deref() != Some(waiter.session_id.as_str())
+                })
+                .unwrap_or(0);
+            let waiter = state.waiters.remove(index).expect("waiter index exists");
+            state.active += 1;
+            let session_id = waiter.session_id.clone();
+            if waiter.sender.send(()).is_ok() {
+                state.last_session = Some(session_id);
+            } else {
+                state.active = state.active.saturating_sub(1);
+            }
+        }
+    }
 }
 
 impl CapacityController {
@@ -86,8 +228,8 @@ impl CapacityController {
         let worker_limit = workers.max(1);
         let labour_limit = labour.max(1);
         Self {
-            workers: Arc::new(Semaphore::new(worker_limit)),
-            labour: Arc::new(Semaphore::new(labour_limit)),
+            workers: Arc::new(FairCapacity::new(worker_limit)),
+            labour: Arc::new(FairCapacity::new(labour_limit)),
             worker_limit,
             labour_limit,
         }
@@ -96,29 +238,30 @@ impl CapacityController {
     fn snapshot(&self) -> CapacityInfo {
         CapacityInfo {
             worker_limit: self.worker_limit,
-            worker_available: self.workers.available_permits(),
+            worker_available: self.workers.available(),
             labour_limit: self.labour_limit,
-            labour_available: self.labour.available_permits(),
+            labour_available: self.labour.available(),
         }
     }
 
-    fn try_acquire(&self, role: AgentRole) -> Option<OwnedSemaphorePermit> {
+    fn try_acquire(&self, role: AgentRole, session_id: &str) -> Option<CapacityPermit> {
         match role {
-            AgentRole::Worker => self.workers.clone().try_acquire_owned().ok(),
-            AgentRole::Labour => self.labour.clone().try_acquire_owned().ok(),
+            AgentRole::Worker => self.workers.try_acquire(session_id),
+            AgentRole::Labour => self.labour.try_acquire(session_id),
             _ => None,
         }
     }
 
-    async fn acquire(&self, role: AgentRole, control: &RunControl) -> Option<OwnedSemaphorePermit> {
-        let semaphore = match role {
-            AgentRole::Worker => self.workers.clone(),
-            AgentRole::Labour => self.labour.clone(),
-            _ => return None,
-        };
-        tokio::select! {
-            permit = semaphore.acquire_owned() => permit.ok(),
-            _ = wait_for_cancel(control) => None,
+    async fn acquire(
+        &self,
+        role: AgentRole,
+        session_id: &str,
+        control: &RunControl,
+    ) -> Option<CapacityPermit> {
+        match role {
+            AgentRole::Worker => self.workers.acquire(session_id, control).await,
+            AgentRole::Labour => self.labour.acquire(session_id, control).await,
+            _ => None,
         }
     }
 }
@@ -3247,7 +3390,7 @@ async fn run_loop(
 ) -> Result<LoopOutcome> {
     let _capacity_permit =
         if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
-            match config.capacity.try_acquire(spec.role) {
+            match config.capacity.try_acquire(spec.role, &session.id) {
                 Some(permit) => Some(permit),
                 None => {
                     let snapshot = config.capacity.snapshot();
@@ -3272,7 +3415,11 @@ async fn run_loop(
                     )
                     .await?;
                     engine.update_agent_status(&spec.id, "queued").await?;
-                    let permit = match config.capacity.acquire(spec.role, control).await {
+                    let permit = match config
+                        .capacity
+                        .acquire(spec.role, &session.id, control)
+                        .await
+                    {
                         Some(permit) => permit,
                         None => return Ok(LoopOutcome::Cancelled),
                     };
@@ -9299,17 +9446,26 @@ mod tests {
                 labour_available: 1,
             }
         );
-        let probe = capacity.try_acquire(AgentRole::Worker).unwrap();
+        let probe = capacity
+            .try_acquire(AgentRole::Worker, "session-a")
+            .unwrap();
         drop(probe);
         let control = RunControl::new();
-        let first = capacity.acquire(AgentRole::Worker, &control).await.unwrap();
+        let first = capacity
+            .acquire(AgentRole::Worker, "session-a", &control)
+            .await
+            .unwrap();
         assert_eq!(capacity.snapshot().worker_available, 0);
-        assert!(capacity.try_acquire(AgentRole::Worker).is_none());
+        assert!(
+            capacity
+                .try_acquire(AgentRole::Worker, "session-b")
+                .is_none()
+        );
         let second_capacity = capacity.clone();
         let second_control = Arc::new(RunControl::new());
         let mut waiter = tokio::spawn(async move {
             second_capacity
-                .acquire(AgentRole::Worker, &second_control)
+                .acquire(AgentRole::Worker, "session-b", &second_control)
                 .await
         });
         assert!(
@@ -9330,7 +9486,7 @@ mod tests {
         let worker_control = third_control.clone();
         let cancelled = tokio::spawn(async move {
             third_capacity
-                .acquire(AgentRole::Worker, &worker_control)
+                .acquire(AgentRole::Worker, "session-c", &worker_control)
                 .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -9340,6 +9496,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn capacity_round_robins_across_sessions() {
+        let capacity = Arc::new(CapacityController::new(1, 1));
+        let first = capacity
+            .try_acquire(AgentRole::Worker, "session-a")
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let a_capacity = capacity.clone();
+        let a_control = Arc::new(RunControl::new());
+        let a_sender = sender.clone();
+        let a = tokio::spawn(async move {
+            let permit = a_capacity
+                .acquire(AgentRole::Worker, "session-a", &a_control)
+                .await
+                .unwrap();
+            a_sender.send("a2").unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let b_capacity = capacity.clone();
+        let b_control = Arc::new(RunControl::new());
+        let b_sender = sender.clone();
+        let b = tokio::spawn(async move {
+            let permit = b_capacity
+                .acquire(AgentRole::Worker, "session-b", &b_control)
+                .await
+                .unwrap();
+            b_sender.send("b1").unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(first);
+        let first_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((first_grant, second_grant), ("b1", "a2"));
+        a.await.unwrap();
+        b.await.unwrap();
     }
 
     #[tokio::test]

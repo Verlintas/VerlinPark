@@ -39,14 +39,14 @@
 | Import archive | ✅ | `vp import <bundle>` 保留 session/project/事件/approvals/投影；导入 session 为只读 archive，不创建 worktree |
 | Rehydrate | ✅ | `vp rehydrate <session> [--worktree path]`：only imported；校验 project/base commit；创建/attach session worktree；按 branch 分组重建 imported agent task worktrees；状态回到 idle；返回 warnings/remapped count |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
-| Global scheduling | ✅ | daemon-wide session semaphore：`VERLINPARK_GLOBAL_SESSION_CAP` 默认 4（1–32）；超出时 session 状态 `queued`，`agent.queued`，可 cancel；跨 session Worker/Labour write-scope 锁按 project 串行等待，同 session 共享，空 scope 视为 wildcard；daemon-wide Worker/Labour capacity controller：`VERLINPARK_GLOBAL_WORKERS` 默认 12、`VERLINPARK_GLOBAL_LABOUR` 默认 24（1–100），run 级 permit、provider 重配置不重置、`agent.info`/Settings 可见；等待 permit 时写 `agent.capacity_wait` 并把 agent 标为 `queued`，获得后写 `agent.capacity_ready`；非持久、无公平队列 |
+| Global scheduling | ✅ | daemon-wide session semaphore：`VERLINPARK_GLOBAL_SESSION_CAP` 默认 4（1–32）；超出时 session 状态 `queued`，`agent.queued`，可 cancel；跨 session Worker/Labour write-scope 锁按 project 串行等待，同 session 共享，空 scope 视为 wildcard；daemon-wide Worker/Labour capacity controller：`VERLINPARK_GLOBAL_WORKERS` 默认 12、`VERLINPARK_GLOBAL_LABOUR` 默认 24（1–100），run 级 permit、provider 重配置不重置、`agent.info`/Settings 可见；等待 permit 时写 `agent.capacity_wait` 并把 agent 标为 `queued`，获得后写 `agent.capacity_ready`；permit 在 session 间 round-robin，单 session 不能靠大批量占满队列；仍是进程内、无优先级、非持久 |
 | Provider | ✅ | OpenAI-compatible + Anthropic（Anthropic 工具调用仅 mock 验证） |
 | Models / budgets | ✅ | 分角色 model override + input/output USD/1M price；session token / USD / wall-clock budget；TeamPlan department/task token/USD budgets；per-call `usage_ledger`（agent/role/task/department/model/tokens/estimated/cost）+ `session.usage` / `vp usage` / Preview → Cost 分组汇总；`agent.usage` / `agent.cost`；time 在 turn/tool 边界检查；Providers/New Session/CLI/UI |
 | CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate |
 
 ## 验证
 
-- `cargo test --workspace`：102 个测试通过（core 82、store 15、providers 5）。
+- `cargo test --workspace`：103 个测试通过（core 83、store 15、providers 5）。
 - `xcodebuild test`：12 个 Swift 测试通过（含协议向后兼容解码）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -123,6 +123,7 @@
 - **M3 第三十二切片**：approval event+projection 原子化 + approval replay/repair。
 - **M3 第三十三切片**：event mirror status/restore（contiguity 校验、events 表替换、projection rebuild）。
 - **M3 第三十四切片**：legacy artifact event backfill（显式、幂等、backfill 后 replay/repair 可用）。
+- **M3 第三十五切片**：session-fair Worker/Labour capacity queue（round-robin、cancellation-safe、try_acquire 不插队）。
 
 ## 如何运行
 
