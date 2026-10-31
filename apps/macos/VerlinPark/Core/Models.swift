@@ -835,6 +835,22 @@ extension Int {
     }
 }
 
+struct AppNotice: Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    var projectId: String?
+    let kind: String
+    let title: String
+    let detail: String
+    let createdAt: String
+    var isRead: Bool
+}
+
+struct SessionDirectoryEntry: Hashable, Sendable {
+    let projectId: String
+    let goal: String
+}
+
 struct RoundtablePosition: Identifiable, Hashable, Sendable {
     let id: String
     let title: String

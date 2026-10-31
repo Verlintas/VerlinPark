@@ -7,6 +7,7 @@ struct RailView: View {
     @Environment(\.openSettings) private var openSettings
 
     @Binding var showDashboard: Bool
+    @State private var showingNotifications = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -119,6 +120,15 @@ struct RailView: View {
                 }
 
                 railAction(
+                    icon: model.unreadNoticeCount > 0 ? "bell.badge" : "bell",
+                    title: "Notifications",
+                    subtitle: model.unreadNoticeCount > 0
+                        ? "\(model.unreadNoticeCount) unread · approvals & failures"
+                        : "approvals & failures"
+                ) {
+                    showingNotifications = true
+                }
+                railAction(
                     icon: "gearshape",
                     title: "Settings",
                     subtitle: "brand · models · presets"
@@ -144,6 +154,10 @@ struct RailView: View {
             .padding(.bottom, 10)
         }
         .background(.ultraThinMaterial.opacity(0.55))
+        .sheet(isPresented: $showingNotifications) {
+            NotificationCenterView()
+                .environment(model)
+        }
     }
 
     private func projectRow(_ project: Project) -> some View {

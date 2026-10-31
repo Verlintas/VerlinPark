@@ -33,7 +33,7 @@
 | Shell 写入沙箱 | ✅ | macOS Seatbelt（`sandbox-exec`）：只允许写 worktree、对应 Git 元数据、per-agent scratch 和 `/dev/null`；拒绝 common hooks/config 与 worktree `config.worktree`；`.git` 指向校验；scratch 承载 TMPDIR/构建缓存；env allowlist 不继承 provider/daemon secrets；常见 credential/state 路径 read-deny；timeout/cancel 杀整个 process group；项目级 `ShellPolicy` 可拒绝网络并追加 read-deny；sandbox 不可用时 fail closed |
 | 预算 / 取消 / 暂停 | ✅ | session token reservation + provider usage 结算；TeamPlan 可声明 department/task token/USD budget 树；daemon-wide `BudgetRegistry` 在 turn 前原子 grant task+department 最紧 output budget（token + USD reservation，RAII 释放），并按 ledger 复查；task/department 超限只 block 该任务，session 超限仍失败；session 和 project pool 用量到 80% 时各发一次 `agent.budget_warning`；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复；`session.pause` / `session.resume` / `vp pause` / `vp resume` 在 turn/tool 边界协作式暂停并继续同一 run |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；Chat Approve/Deny；Manage Dash “Approvals” 跨 project 汇总 pending、显示 session goal、可直接 Approve/Deny |
-| 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR/mailbox/artifact 事件；Collab roster；Preview Plan/Changes/Queue/Mailbox/Cost/Trace；`server.doctor` / `vp doctor` 检查 DB、权限、project root、worktree、event mirror、sandbox、provider，Manage Dash 有 Doctor 与 worktree cleanup 卡片 |
+| 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR/mailbox/artifact 事件；Collab roster；Preview Plan/Changes/Queue/Mailbox/Cost/Trace；`server.doctor` / `vp doctor` 检查 DB、权限、project root、worktree、event mirror、sandbox、provider，Manage Dash 有 Doctor 与 worktree cleanup 卡片；Rail Notifications 聚合 approval/task/integration/session failure，支持 unread badge、Mark all read、open session |
 | Mailbox / artifacts | ✅ | session-scoped typed messages（unread/read、sender/receiver、kind、body、JSON payload）+ text artifacts（≤100KB）+ content-addressed zstd binary blobs（≤5MiB，SHA-256/path，跨 artifact 去重，refcount 删除，按需 materialize）+ legacy artifact event backfill；agent tools `send_message`/`read_mailbox`/`publish_artifact`/`list_artifacts`/`read_artifact`；RPC/CLI/Preview Mailbox；artifact 预览支持图片、64KB 文本、1KB hex/ASCII dump；bundle export/import（binary base64）；项目 artifact policy（max bytes/age/count、auto GC）+ manual GC（`bytes_freed` 为实际释放的物理字节）；项目 mailbox policy（max age/count、delete_unread、auto_gc）+ manual/auto oldest-first GC，默认保护 unread |
 | Event consistency | ✅ | session status / usage / agent status / team plan / todos / messages / merge queue / agent roster / approvals / usage ledger / mailbox / artifacts / recovery 使用 event+projection 原子事务；`session.replay` 比较 approvals、usage ledger、mailbox 与 artifacts，`--repair` / `--rebuild` 从 `approval.*`、`agent.usage`、`mailbox.*` 和完整 `artifact.published/pruned` 事件重建投影；`session.log_status` 比较 JSONL mirror 与 events 表，`session.restore_log` 从连续 mirror 恢复 events 并 rebuild；artifact/mailbox GC 发出 `artifact.pruned` / `mailbox.pruned`；`session.export` / `session.import` bundle 包含 usage ledger |
 | Import archive | ✅ | `vp import <bundle>` 保留 session/project/事件/approvals/投影；导入 session 为只读 archive，不创建 worktree |
@@ -97,6 +97,7 @@
 - Plan resume 是显式操作，不会在 daemon 重启后自动继续；只重跑非 completed task，completed task 不重新验证；plan 版本只按最近一次 `team_plan.submitted` 区分；batch abort 只结算，不自动重跑 sibling task。
 - Provider idle timeout 只覆盖 stream 事件间隔，不限制总时长；超时不会重放已产生的 partial text/tool calls；外部真实 Provider 的 E2E 仍需 API key。
 - `db-rebuild` 依赖 `projects.jsonl`（daemon 至少启动/变更过一次）；旧 session 的 budget/base commit 可能回落默认值；imported archive 需要重新 `vp import`；worktree/artifact blobs 不重建；没有自动清理旧备份。
+- 通知中心只在 app 运行期间保存内存列表，重启后清空；没有 macOS 系统通知/后台推送；同一个 session 的失败/取消可能各产生一条通知。
 - Shell 只做写入隔离与常见 credential read-deny；项目 policy 只能收窄不能放宽、只对后续 run 生效，且不随 session bundle 导出；不是完整 read jail，network allow 下仍可外发，`sandbox-exec` 是废弃 API；task worktree/branch 有显式 `cleanup-worktrees`，但没有自动/定时清理；shell scratch 仍无统一回收。
 - `IntegrationPolicy` 与 auto-resolve attempt 计数是项目/队列元数据，不随 session bundle 导出；自动触发必须有 provider 配置，且仍受 session token budget 与 per-resolution cap 限制。
 - Aviiya 仍是 NovaBAIC 外部桥接占位，不在本仓库实现人格/记忆。
@@ -168,6 +169,7 @@
 - **M3 第五十七切片**：provider stream idle timeout（默认 300s，10–3600 可配，超时失败 run）。
 - **M3 第五十八切片**：OpenAI-compatible HTTP adapter 全链路 E2E（wiremock SSE → plan → write → approval → Verifier → Integrator）。
 - **M3 第五十九切片**：`vp db-rebuild`：project manifest + session event mirrors 的从零数据库重建（dry-run、旧 DB backup、projection rebuild）。
+- **M3 第六十切片**：Rail 通知中心（approval / task failure / integration failure / session stop，unread badge、Dock badge、open session）。
 
 ## 如何运行
 

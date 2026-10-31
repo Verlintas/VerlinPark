@@ -40,6 +40,8 @@ final class AppModel {
     var searchHits: [SearchHit] = []
     var searchTruncated = false
     var searchBusy = false
+    var notices: [AppNotice] = []
+    var sessionDirectory: [String: SessionDirectoryEntry] = [:]
     var todos: [TodoItem] = []
     var agents: [AgentRecord] = []
     var mergeQueue: [MergeQueueEntry] = []
@@ -142,6 +144,10 @@ final class AppModel {
     private var eventTask: Task<Void, Never>?
     private var started = false
 
+    var unreadNoticeCount: Int {
+        notices.count(where: { !$0.isRead })
+    }
+
     var selectedProject: Project? {
         projects.first { $0.id == selectedProjectID }
     }
@@ -208,6 +214,7 @@ final class AppModel {
                 selectedProjectID = projects.first?.id
             }
             await loadSessions()
+            await refreshSessionDirectory()
             await loadShellPolicy()
             await loadIntegrationPolicy()
             await loadArtifactPolicy()
@@ -396,25 +403,72 @@ final class AppModel {
     }
 
     func openSearchHit(_ hit: SearchHit) async {
-        if selectedProjectID != hit.projectId {
-            selectProject(hit.projectId)
+        await openSession(sessionID: hit.sessionId, projectID: hit.projectId)
+    }
+
+    func openSession(sessionID: String, projectID: String) async {
+        if selectedProjectID != projectID {
+            selectProject(projectID)
         }
         do {
-            let loaded = try await core.listSessions(projectID: hit.projectId)
-            if selectedProjectID == hit.projectId {
+            let loaded = try await core.listSessions(projectID: projectID)
+            if selectedProjectID == projectID {
                 sessions = loaded
             }
         } catch {
             handle(error)
             return
         }
-        guard sessions.contains(where: { $0.id == hit.sessionId }) else {
+        for session in sessions {
+            sessionDirectory[session.id] = SessionDirectoryEntry(
+                projectId: session.projectId,
+                goal: session.goal
+            )
+        }
+        guard sessions.contains(where: { $0.id == sessionID }) else {
             lastError = "That session is no longer available."
             return
         }
-        if selectedSessionID != hit.sessionId {
+        if selectedSessionID != sessionID {
             selectedSessionID = nil
-            selectSession(hit.sessionId)
+            selectSession(sessionID)
+        }
+    }
+
+    func openNotice(_ notice: AppNotice) async {
+        markNoticeRead(notice.id)
+        guard let projectID = notice.projectId else { return }
+        await openSession(sessionID: notice.sessionId, projectID: projectID)
+    }
+
+    func markNoticeRead(_ id: String) {
+        guard let index = notices.firstIndex(where: { $0.id == id }) else { return }
+        notices[index].isRead = true
+        updateDockBadge()
+    }
+
+    func markAllNoticesRead() {
+        for index in notices.indices {
+            notices[index].isRead = true
+        }
+        updateDockBadge()
+    }
+
+    func clearNotices() {
+        notices = []
+        updateDockBadge()
+    }
+
+    func refreshSessionDirectory() async {
+        guard connection == .connected,
+              let allSessions = try? await core.listSessions(projectID: nil) else { return }
+        sessionDirectory = Dictionary(
+            uniqueKeysWithValues: allSessions.map {
+                ($0.id, SessionDirectoryEntry(projectId: $0.projectId, goal: $0.goal))
+            }
+        )
+        for index in notices.indices where notices[index].projectId == nil {
+            notices[index].projectId = sessionDirectory[notices[index].sessionId]?.projectId
         }
     }
 
@@ -1627,6 +1681,7 @@ final class AppModel {
         {
             Task {
                 await self.loadSessions()
+                await self.refreshSessionDirectory()
                 await self.loadDiff()
             }
         }
@@ -1670,6 +1725,99 @@ final class AppModel {
         {
             Task { await self.loadDiff() }
         }
+
+        recordNotice(for: event)
+    }
+
+    private func recordNotice(for event: Event) {
+        let directory = sessionDirectory[event.sessionId]
+        let fallbackProject = event.sessionId == selectedSessionID ? selectedProjectID : nil
+        let goal = directory?.goal ?? String(event.sessionId.prefix(8))
+        switch event.type {
+        case "approval.requested":
+            guard let approval = try? event.payload.decode(Approval.self) else { return }
+            addNotice(
+                id: "approval-\(approval.id)",
+                event: event,
+                projectId: directory?.projectId ?? fallbackProject,
+                kind: "approval",
+                title: "Approval needed · \(goal)",
+                detail: "\(approval.tool) · \(approval.agentName ?? approval.agentRole ?? "agent")",
+                createdAt: event.createdAt
+            )
+        case "plan_task.finished":
+            let status = event.payload.objectValue?["task_status"]?.stringValue ?? ""
+            guard status == "failed" || status == "blocked" else { return }
+            let task = event.payload.objectValue?["task_id"]?.stringValue ?? "task"
+            addNotice(
+                id: "task-\(event.sessionId)-\(task)-\(status)-\(event.seq)",
+                event: event,
+                projectId: directory?.projectId ?? fallbackProject,
+                kind: "task",
+                title: "Plan task \(status) · \(task)",
+                detail: goal,
+                createdAt: event.createdAt
+            )
+        case "integrator.finished":
+            let status = event.payload.objectValue?["status"]?.stringValue ?? ""
+            guard status == "failed" || status == "conflict" else { return }
+            addNotice(
+                id: "integrator-\(event.sessionId)-\(status)-\(event.seq)",
+                event: event,
+                projectId: directory?.projectId ?? fallbackProject,
+                kind: "integration",
+                title: "Integration \(status)",
+                detail: goal,
+                createdAt: event.createdAt
+            )
+        case "session.updated":
+            let status = event.payload.objectValue?["status"]?.stringValue ?? ""
+            guard status == "failed" || status == "cancelled" else { return }
+            addNotice(
+                id: "session-\(event.sessionId)-\(status)",
+                event: event,
+                projectId: directory?.projectId ?? fallbackProject,
+                kind: "session",
+                title: "Session \(status)",
+                detail: goal,
+                createdAt: event.createdAt
+            )
+        default:
+            break
+        }
+    }
+
+    private func addNotice(
+        id: String,
+        event: Event,
+        projectId: String?,
+        kind: String,
+        title: String,
+        detail: String,
+        createdAt: String
+    ) {
+        guard !notices.contains(where: { $0.id == id }) else { return }
+        notices.insert(
+            AppNotice(
+                id: id,
+                sessionId: event.sessionId,
+                projectId: projectId,
+                kind: kind,
+                title: title,
+                detail: detail,
+                createdAt: createdAt,
+                isRead: false
+            ),
+            at: 0
+        )
+        if notices.count > 100 {
+            notices.removeLast(notices.count - 100)
+        }
+        updateDockBadge()
+    }
+
+    private func updateDockBadge() {
+        NSApp.dockTile.badgeLabel = unreadNoticeCount > 0 ? "\(unreadNoticeCount)" : nil
     }
 
     private func handle(_ error: Error) {

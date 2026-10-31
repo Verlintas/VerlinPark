@@ -38,6 +38,7 @@
 - 新增 resumable TeamPlan：`session.plan_resume` / `vp resume-plan` / Preview Resume plan，跳过 completed task，复用 task worktree/commit；见 ADR-0070。
 - 新增 provider stream idle timeout（`VERLINPARK_PROVIDER_IDLE_SECS`，默认 300s）和 OpenAI-compatible HTTP adapter 全链路 E2E；见 ADR-0071。
 - 新增 `vp db-rebuild`：从 project manifest + session event mirrors 重建 SQLite 和关键投影；见 ADR-0072。
+- 新增 Rail 通知中心：approval、task failure、integration failure、session stop，带 unread/Dock badge 和跳转 session。
 
 ---
 
@@ -65,7 +66,7 @@
 | 功能完整度（M3） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、显式/opt-in 自动冲突解决、本地 landing、`gh` PR、mailbox/artifacts/replay、search/transcript 已有；缺 default-on auto-resolution、global Task-DAG scheduler |
 | 正确性/一致性 | B+ | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影；`vp db-rebuild` 可从 manifest + mirrors 从零重建，但 imported archive/blobs/worktree 需要原文件存在 |
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
-| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff 可用；更早的 round 仍受已加载 event window 限制 |
+| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff、Rail 通知中心可用；通知仅 app 内存，更早的 round 仍受已加载 event window 限制 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
 | 测试 | B− | 132 Rust + 20 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/usage CSV/project usage/worktree retention/diff parser/HTTP probe/full HTTP adapter E2E/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
 | 发布准备 | C | `just package` 生成 ad-hoc signed DMG + checksum，release workflow 同时生成并上传 Homebrew cask；仍无 Developer ID/公证、更新器和可持续升级的 Homebrew tap |
@@ -269,6 +270,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 - FTS/索引搜索与跨 session 相关性排序
 - transcript 的 event timeline 与增量导出
 - roundtable 卡片的 UI snapshot / accessibility 回归
+- macOS UserNotifications / 通知持久化（目前只在 app 内存）
 
 ### P2-13：产品叙事大于实现
 
