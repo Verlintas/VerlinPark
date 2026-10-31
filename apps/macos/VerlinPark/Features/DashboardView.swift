@@ -89,6 +89,9 @@ struct DashboardView: View {
                     MemoryCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    MemoryPolicyCard(project: project)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                     DoctorCard()
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
@@ -217,6 +220,69 @@ private struct MemoryRow: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(memory.title)
+        }
+    }
+}
+
+private struct MemoryPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Memory retention")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.memoryPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Save") {
+                    Task { await model.saveMemoryPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.memoryPolicyBusy)
+            }
+            Toggle("Automatic prune", isOn: $model.memoryPolicyEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+            HStack(spacing: 8) {
+                TextField("max items", text: $model.memoryPolicyMaxItems)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 110)
+                TextField("max age days", text: $model.memoryPolicyMaxAgeDays)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 110)
+                Text("leave blank to disable a limit")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            Text(
+                "Off by default. The daemon sweeps enabled policies periodically (default hourly) and emits event-backed deletions. At least one limit is required to enable."
+            )
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let status = model.memoryPolicyStatus {
+                Text(status)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task {
+            await model.loadMemoryPolicy()
         }
     }
 }

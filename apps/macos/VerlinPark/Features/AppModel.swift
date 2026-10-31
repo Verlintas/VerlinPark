@@ -95,6 +95,11 @@ final class AppModel {
     var memoryQuery = ""
     var memoryBusy = false
     var memoryStatus: String?
+    var memoryPolicyEnabled = false
+    var memoryPolicyMaxItems = "1000"
+    var memoryPolicyMaxAgeDays = "180"
+    var memoryPolicyBusy = false
+    var memoryPolicyStatus: String?
     var memoryNewKind = "note"
     var memoryNewTitle = ""
     var memoryNewBody = ""
@@ -243,6 +248,7 @@ final class AppModel {
             await loadMailboxPolicy()
             await loadProjectBudget()
             await loadMcpServers()
+            await loadMemoryPolicy()
         } catch {
             handle(error)
         }
@@ -909,6 +915,70 @@ final class AppModel {
         } catch {
             handle(error)
         }
+    }
+
+    func loadMemoryPolicy() async {
+        guard let projectID = selectedProjectID else {
+            memoryPolicyEnabled = false
+            memoryPolicyMaxItems = "1000"
+            memoryPolicyMaxAgeDays = "180"
+            memoryPolicyStatus = nil
+            return
+        }
+        memoryPolicyBusy = true
+        defer { memoryPolicyBusy = false }
+        do {
+            let policy = try await core.memoryPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            applyMemoryPolicy(policy)
+            memoryPolicyStatus = nil
+        } catch {
+            memoryPolicyStatus = error.localizedDescription
+        }
+    }
+
+    func saveMemoryPolicy() async {
+        guard let projectID = selectedProjectID else {
+            memoryPolicyStatus = "Select a project first."
+            return
+        }
+        let itemsText = memoryPolicyMaxItems.trimmingCharacters(in: .whitespacesAndNewlines)
+        let daysText = memoryPolicyMaxAgeDays.trimmingCharacters(in: .whitespacesAndNewlines)
+        let maxItems = itemsText.isEmpty ? nil : Int(itemsText)
+        let maxAgeDays = daysText.isEmpty ? nil : Int(daysText)
+        if !itemsText.isEmpty, maxItems == nil {
+            memoryPolicyStatus = "Max items must be a whole number."
+            return
+        }
+        if !daysText.isEmpty, maxAgeDays == nil {
+            memoryPolicyStatus = "Max age days must be a whole number."
+            return
+        }
+        if memoryPolicyEnabled, maxItems == nil, maxAgeDays == nil {
+            memoryPolicyStatus = "Enable requires a max item count or max age."
+            return
+        }
+        memoryPolicyBusy = true
+        defer { memoryPolicyBusy = false }
+        do {
+            let policy = try await core.setMemoryPolicy(
+                projectID: projectID,
+                enabled: memoryPolicyEnabled,
+                maxItems: maxItems,
+                maxAgeDays: maxAgeDays
+            )
+            applyMemoryPolicy(policy)
+            memoryPolicyStatus = "Memory retention policy saved."
+        } catch {
+            memoryPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    private func applyMemoryPolicy(_ policy: MemoryPolicy) {
+        memoryPolicyEnabled = policy.enabled
+        memoryPolicyMaxItems = policy.maxItems.map(String.init) ?? ""
+        memoryPolicyMaxAgeDays = policy.maxAgeDays.map(String.init) ?? ""
     }
 
     func loadMemories() async {

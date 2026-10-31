@@ -29,13 +29,18 @@ could not be corrected or pruned, and substring scans do not scale.
    `memory.deleted` in event order. Repair rebuilds the projection the same way,
    so a deleted memory cannot come back after `session.replay --repair` or
    `db-rebuild`.
-6. **No automatic schedule yet.** There is no background retention sweep and no
-   per-project retention policy; pruning is explicit. Embeddings and semantic
-   recall are not implemented.
+6. **Opt-in scheduled retention.** `project_memory_policies` stores `enabled`,
+   `max_items`, and `max_age_days`. The daemon sweeps enabled projects every
+   `VERLINPARK_MEMORY_SWEEP_SECS` (default 3600; `0` disables) through the same
+   event-backed prune path. Policies are off by default, require at least one
+   limit to enable, and bound limits at 100,000 items / 36,500 days. CLI exposes
+   `vp memory-policy` / `vp memory-policy-set`; Manage Dash edits the same policy.
+7. **No semantic recall.** Embeddings and vector search are not implemented.
 
 ## Consequences
 
-- Memory can be corrected and kept bounded without losing event history.
+- Memory can be corrected and kept bounded without losing event history, either
+  manually or through an opt-in hourly sweep.
 - FTS indexes add write overhead and a rebuild on first open of an old database.
 - CJK search relies on the LIKE fallback; unicode61 does not segment every CJK
   phrase.
@@ -48,5 +53,7 @@ could not be corrected or pruned, and substring scans do not scale.
 - **Hard delete without events:** simpler, but replay/repair would resurrect the
   row and the audit trail would lie.
 - **Automatic pruning on create:** risks deleting knowledge without user intent.
+- **Default-on background retention:** could delete memory on first launch after
+  an upgrade; the policy is opt-in and explicit.
 - **Embedding search:** better semantics, but needs an embedding provider, cost
   controls, and a vector index that do not exist yet.

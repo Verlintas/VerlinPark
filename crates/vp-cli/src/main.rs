@@ -263,6 +263,24 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show the project memory retention policy.
+    MemoryPolicy { project: String },
+    /// Update the opt-in project memory retention policy.
+    MemoryPolicySet {
+        project: String,
+        /// Disable automatic memory pruning.
+        #[arg(long)]
+        disable: bool,
+        /// Keep at most this many newest memories.
+        #[arg(long = "max-items")]
+        max_items: Option<u32>,
+        /// Delete memories older than this many days.
+        #[arg(long = "max-age-days")]
+        max_age_days: Option<u32>,
+        /// Disable the policy and clear both limits.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Show the project artifact retention policy.
     ArtifactPolicy { project: String },
     /// Update artifact retention and optional automatic GC.
@@ -808,6 +826,42 @@ async fn main() -> Result<()> {
                     "older_than_days": days,
                     "keep_latest": keep_latest,
                     "dry_run": dry_run
+                }),
+            )
+            .await?
+        }
+        Command::MemoryPolicy { project } => {
+            rpc(
+                &discovery,
+                "memory.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::MemoryPolicySet {
+            project,
+            disable,
+            max_items,
+            max_age_days,
+            clear,
+        } => {
+            let (max_items, max_age_days) = if clear {
+                (None, None)
+            } else if max_items.is_none() && max_age_days.is_none() {
+                (Some(1000), Some(180))
+            } else {
+                (max_items, max_age_days)
+            };
+            rpc(
+                &discovery,
+                "memory.policy.set",
+                json!({
+                    "project_id": project,
+                    "policy": {
+                        "enabled": !clear && !disable,
+                        "max_items": max_items,
+                        "max_age_days": max_age_days
+                    }
                 }),
             )
             .await?
@@ -1455,6 +1509,23 @@ fn print_human(value: &Value) {
             );
             println!("  {}", memory["body"].as_str().unwrap_or(""));
         }
+        return;
+    }
+    if let Some(policy) = value.get("policy")
+        && value.get("project_id").is_some()
+    {
+        println!(
+            "memory policy enabled={} max_items={} max_age_days={}",
+            policy["enabled"].as_bool().unwrap_or(false),
+            policy["max_items"]
+                .as_u64()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            policy["max_age_days"]
+                .as_u64()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
         return;
     }
     if let Some(candidates) = value.get("candidates").and_then(Value::as_u64) {

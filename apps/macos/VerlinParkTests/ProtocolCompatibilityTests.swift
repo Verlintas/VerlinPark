@@ -223,6 +223,32 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertFalse(pruned.dryRun)
     }
 
+    func testMemoryPolicyDecode() throws {
+        let json = """
+        {
+          "project_id": "project-1",
+          "policy": {
+            "enabled": true,
+            "max_items": 500,
+            "max_age_days": 30
+          }
+        }
+        """
+        let result = try JSONDecoder().decode(MemoryPolicyResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.projectId, "project-1")
+        XCTAssertTrue(result.policy.enabled)
+        XCTAssertEqual(result.policy.maxItems, 500)
+        XCTAssertEqual(result.policy.maxAgeDays, 30)
+
+        let unbounded = try JSONDecoder().decode(
+            MemoryPolicy.self,
+            from: Data(#"{"enabled":false,"max_items":null,"max_age_days":null}"#.utf8)
+        )
+        XCTAssertFalse(unbounded.enabled)
+        XCTAssertNil(unbounded.maxItems)
+        XCTAssertNil(unbounded.maxAgeDays)
+    }
+
     func testAppNoticeRoundTrip() throws {
         let notice = AppNotice(
             id: "approval-1",

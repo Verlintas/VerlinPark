@@ -33,18 +33,19 @@ use vp_protocol::types::{
     MailboxListParams, MailboxListResult, MailboxPolicyParams, MailboxPolicyResult,
     MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpReadResourceParams,
     McpServerIdParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
-    MemoryListParams, MemoryPruneParams, MergeQueueListParams, MergeQueueListResult,
-    OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams,
-    PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
-    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
-    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams,
-    SessionExportParams, SessionImportParams, SessionListResult, SessionLogParams,
-    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
-    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
-    SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams,
-    ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
-    UpdateMcpServerParams, UsageLedgerParams, WorktreePolicyParams,
+    MemoryListParams, MemoryPolicyParams, MemoryPruneParams, MergeQueueListParams,
+    MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectBudgetParams,
+    ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
+    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
+    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, SearchParams,
+    ServerInfo, SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
+    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
+    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
+    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
+    SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams,
+    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult, UpdateMcpServerParams,
+    UsageLedgerParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -119,6 +120,7 @@ async fn main() -> Result<()> {
     };
     state.agent.start_auto_resolver();
     spawn_worktree_sweeper(state.engine.clone());
+    spawn_memory_sweeper(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
     let addr = listener.local_addr()?;
@@ -965,6 +967,24 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "memory.policy.get" => match parse_params::<MemoryPolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_memory_policy(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.policy.set" => match parse_params::<SetMemoryPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_memory_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "artifact.list" => match parse_params::<ArtifactListParams>(request.params) {
             Ok(params) => match state.engine.list_artifacts(&params.session_id).await {
                 Ok(artifacts) => RpcResponse::success(id, ArtifactListResult { artifacts }),
@@ -1279,6 +1299,32 @@ fn spawn_worktree_sweeper(engine: Engine) {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(error = %error, "automatic worktree retention failed");
+                }
+            }
+        }
+    });
+}
+
+fn spawn_memory_sweeper(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_MEMORY_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3600);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine.sweep_memory_retention().await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, "automatic memory retention pruned memories");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "automatic memory retention failed");
                 }
             }
         }

@@ -260,6 +260,28 @@ struct McpCallResult: Codable, Sendable {
     }
 }
 
+struct MemoryPolicy: Codable, Equatable, Sendable {
+    let enabled: Bool
+    let maxItems: Int?
+    let maxAgeDays: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case maxItems = "max_items"
+        case maxAgeDays = "max_age_days"
+    }
+}
+
+struct MemoryPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: MemoryPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
 struct MemoryDeleteResult: Codable, Sendable {
     let memoryId: String
     let removed: Bool

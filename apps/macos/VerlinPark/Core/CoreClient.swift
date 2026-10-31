@@ -634,6 +634,35 @@ actor CoreClient {
             .memory
     }
 
+    func memoryPolicy(projectID: String) async throws -> MemoryPolicy {
+        try await request(
+            method: "memory.policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(MemoryPolicyResult.self)
+        .policy
+    }
+
+    func setMemoryPolicy(
+        projectID: String,
+        enabled: Bool,
+        maxItems: Int?,
+        maxAgeDays: Int?
+    ) async throws -> MemoryPolicy {
+        let policy: [String: JSONValue] = [
+            "enabled": .bool(enabled),
+            "max_items": maxItems.map { .number(Double($0)) } ?? .null,
+            "max_age_days": maxAgeDays.map { .number(Double($0)) } ?? .null,
+        ]
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object(policy),
+        ]
+        return try await request(method: "memory.policy.set", params: params)
+            .decode(MemoryPolicyResult.self)
+            .policy
+    }
+
     func deleteMemory(id: String) async throws -> MemoryDeleteResult {
         try await request(method: "memory.delete", params: ["id": .string(id)])
             .decode(MemoryDeleteResult.self)

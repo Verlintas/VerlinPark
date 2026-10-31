@@ -10,7 +10,7 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
-    MailboxPolicy, McpServer, MemoryItem, MergeQueueEntry, Project, ProjectBudget,
+    MailboxPolicy, McpServer, MemoryItem, MemoryPolicy, MergeQueueEntry, Project, ProjectBudget,
     ProjectUsageSession, Question, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage,
     TodoItem, UsageEntry, WorktreeRetentionPolicy,
 };
@@ -320,6 +320,14 @@ impl Store {
                 env         TEXT NOT NULL,
                 enabled     INTEGER NOT NULL DEFAULT 1,
                 created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_memory_policies (
+                project_id   TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled      INTEGER NOT NULL,
+                max_items    INTEGER,
+                max_age_days INTEGER,
+                updated_at   TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_worktree_policies (
@@ -1904,6 +1912,74 @@ impl Store {
             }
         }
         Ok(ids)
+    }
+
+    pub fn get_memory_policy(&self, project_id: &str) -> Result<MemoryPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT enabled, max_items, max_age_days
+                 FROM project_memory_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(MemoryPolicy {
+                        enabled: row.get::<_, i64>(0)? != 0,
+                        max_items: row
+                            .get::<_, Option<i64>>(1)?
+                            .and_then(|value| u32::try_from(value).ok()),
+                        max_age_days: row
+                            .get::<_, Option<i64>>(2)?
+                            .and_then(|value| u32::try_from(value).ok()),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn set_memory_policy(&self, project_id: &str, policy: &MemoryPolicy) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_memory_policies
+             (project_id, enabled, max_items, max_age_days, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                max_items = excluded.max_items,
+                max_age_days = excluded.max_age_days,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                if policy.enabled { 1 } else { 0 },
+                policy.max_items.map(i64::from),
+                policy.max_age_days.map(i64::from),
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_enabled_memory_policies(&self) -> Result<Vec<(String, MemoryPolicy)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT project_id, enabled, max_items, max_age_days
+             FROM project_memory_policies WHERE enabled = 1",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                MemoryPolicy {
+                    enabled: row.get::<_, i64>(1)? != 0,
+                    max_items: row
+                        .get::<_, Option<i64>>(2)?
+                        .and_then(|value| u32::try_from(value).ok()),
+                    max_age_days: row
+                        .get::<_, Option<i64>>(3)?
+                        .and_then(|value| u32::try_from(value).ok()),
+                },
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn list_mcp_servers(&self) -> Result<Vec<McpServer>> {
@@ -5492,6 +5568,39 @@ mod tests {
             .memory_ids_for_prune(&project.id, Some(30), None)
             .unwrap();
         assert_eq!(ids, vec![old.id]);
+    }
+
+    #[test]
+    fn round_trips_memory_retention_policy() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        assert_eq!(
+            store.get_memory_policy(&project.id).unwrap(),
+            MemoryPolicy::default()
+        );
+        let policy = MemoryPolicy {
+            enabled: true,
+            max_items: Some(200),
+            max_age_days: Some(30),
+        };
+        store.set_memory_policy(&project.id, &policy).unwrap();
+        assert_eq!(store.get_memory_policy(&project.id).unwrap(), policy);
+        let enabled = store.list_enabled_memory_policies().unwrap();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].0, project.id);
+        assert_eq!(enabled[0].1, policy);
+        store
+            .set_memory_policy(
+                &project.id,
+                &MemoryPolicy {
+                    enabled: false,
+                    ..policy
+                },
+            )
+            .unwrap();
+        assert!(store.list_enabled_memory_policies().unwrap().is_empty());
     }
 
     #[test]

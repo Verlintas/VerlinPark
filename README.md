@@ -170,6 +170,8 @@ just cli db-rebuild
 just cli memory <project-id> --query "rate limit"
 just cli memory-delete <memory-id>
 just cli memory-prune <project-id> --days 30 --dry-run
+just cli memory-policy <project-id>
+just cli memory-policy-set <project-id> --max-items 1000 --max-age-days 180
 just cli remember <session-id> decision "Use deterministic merges" "No LLM in the Integrator."
 just cli questions --session <session-id>
 just cli answer <question-id> "yes"

@@ -408,6 +408,43 @@ pub struct MemoryPruneResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max_items: Option<u32>,
+    #[serde(default)]
+    pub max_age_days: Option<u32>,
+}
+
+impl Default for MemoryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_items: Some(1000),
+            max_age_days: Some(180),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetMemoryPolicyParams {
+    pub project_id: String,
+    pub policy: MemoryPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryPolicyResult {
+    pub project_id: String,
+    pub policy: MemoryPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Question {
     pub id: String,
     pub session_id: String,

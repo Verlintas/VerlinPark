@@ -14,14 +14,14 @@ use vp_protocol::types::{
     ArtifactMaterialization, ArtifactPolicy, DoctorCheck, Event, IntegrationPolicy,
     MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult, McpPromptListResult,
     McpReadResourceResult, McpResourceListResult, McpServer, McpServerListResult,
-    McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPruneResult,
-    MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult,
-    PullRequestResult, Question, QuestionListResult, SearchResult, Session, SessionBundle,
-    SessionCommit, SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus,
-    SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
-    StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
-    UsageTotals, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
-    WorktreeRetentionPolicy,
+    McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPolicy,
+    MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, Project, ProjectBudget,
+    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
+    SearchResult, Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult,
+    SessionLandResult, SessionLogStatus, SessionRehydrateResult, SessionReplayReport,
+    SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket,
+    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
+    WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -116,6 +116,23 @@ fn sorted_usage_buckets(buckets: HashMap<String, UsageBucket>) -> Vec<UsageBucke
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(data))
+}
+
+fn validate_memory_policy(policy: &MemoryPolicy) -> Result<()> {
+    if let Some(max_items) = policy.max_items
+        && !(1..=100_000).contains(&max_items)
+    {
+        anyhow::bail!("memory max_items must be between 1 and 100000");
+    }
+    if let Some(max_age_days) = policy.max_age_days
+        && !(1..=36_500).contains(&max_age_days)
+    {
+        anyhow::bail!("memory max_age_days must be between 1 and 36500");
+    }
+    if policy.enabled && policy.max_items.is_none() && policy.max_age_days.is_none() {
+        anyhow::bail!("enabled memory policy requires max_items or max_age_days");
+    }
+    Ok(())
 }
 
 fn normalize_shell_policy(mut policy: ShellPolicy) -> Result<ShellPolicy> {
@@ -1610,6 +1627,55 @@ impl Engine {
             removed: removed.len(),
             dry_run: false,
         })
+    }
+
+    pub async fn get_memory_policy(&self, project_id: &str) -> Result<MemoryPolicyResult> {
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let policy =
+            tokio::task::spawn_blocking(move || store.get_memory_policy(&project)).await??;
+        Ok(MemoryPolicyResult {
+            project_id: project_id.to_string(),
+            policy,
+        })
+    }
+
+    pub async fn set_memory_policy(
+        &self,
+        project_id: &str,
+        policy: MemoryPolicy,
+    ) -> Result<MemoryPolicyResult> {
+        validate_memory_policy(&policy)?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let stored = policy.clone();
+        tokio::task::spawn_blocking(move || store.set_memory_policy(&project, &stored)).await??;
+        Ok(MemoryPolicyResult {
+            project_id: project_id.to_string(),
+            policy,
+        })
+    }
+
+    pub async fn sweep_memory_retention(&self) -> Result<usize> {
+        let store = self.store.clone();
+        let policies =
+            tokio::task::spawn_blocking(move || store.list_enabled_memory_policies()).await??;
+        let mut removed = 0;
+        for (project_id, policy) in policies {
+            if policy.max_items.is_none() && policy.max_age_days.is_none() {
+                continue;
+            }
+            match self
+                .prune_memories(&project_id, policy.max_age_days, policy.max_items, false)
+                .await
+            {
+                Ok(result) => removed += result.removed,
+                Err(error) => {
+                    tracing::warn!(%error, %project_id, "memory retention sweep failed");
+                }
+            }
+        }
+        Ok(removed)
     }
 
     pub async fn list_artifacts(&self, session_id: &str) -> Result<Vec<Artifact>> {
@@ -4616,6 +4682,102 @@ mod tests {
         assert!(replay.consistent);
         let bundle = engine.export_session(&session.id).await.unwrap();
         assert_eq!(bundle.memories.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sweeps_enabled_memory_policies() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("memory policy".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "memory policy".into(), None)
+            .await
+            .unwrap();
+        for index in 0..3 {
+            engine
+                .create_memory_as(
+                    &session.id,
+                    "agent-1",
+                    "Leader",
+                    "note",
+                    &format!("memory {index}"),
+                    "body",
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            engine
+                .set_memory_policy(
+                    &project.id,
+                    MemoryPolicy {
+                        enabled: true,
+                        max_items: None,
+                        max_age_days: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .set_memory_policy(
+                    &project.id,
+                    MemoryPolicy {
+                        enabled: true,
+                        max_items: Some(0),
+                        max_age_days: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        let policy = MemoryPolicy {
+            enabled: true,
+            max_items: Some(1),
+            max_age_days: None,
+        };
+        engine
+            .set_memory_policy(&project.id, policy.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get_memory_policy(&project.id).await.unwrap().policy,
+            policy
+        );
+        assert_eq!(engine.sweep_memory_retention().await.unwrap(), 2);
+        assert_eq!(
+            engine
+                .list_memories(&project.id, None, None, 10)
+                .await
+                .unwrap()
+                .memories
+                .len(),
+            1
+        );
+        engine
+            .set_memory_policy(
+                &project.id,
+                MemoryPolicy {
+                    enabled: false,
+                    ..policy
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.sweep_memory_retention().await.unwrap(), 0);
+        let replay = engine.replay_session(&session.id).await.unwrap();
+        assert!(replay.memories_matches);
+        assert!(replay.consistent);
     }
 
     #[tokio::test]
