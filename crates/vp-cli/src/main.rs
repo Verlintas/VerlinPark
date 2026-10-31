@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -185,6 +185,13 @@ enum Command {
     Files { session: String },
     /// Show one session worktree file.
     File { session: String, path: String },
+    /// Write a session worktree file (content from --content or stdin).
+    WriteFile {
+        session: String,
+        path: String,
+        #[arg(long)]
+        content: Option<String>,
+    },
     /// Search messages and event payloads across sessions.
     Search {
         query: String,
@@ -738,6 +745,27 @@ async fn main() -> Result<()> {
                 &discovery,
                 "workspace.file",
                 json!({"session_id": session, "path": path}),
+            )
+            .await?
+        }
+        Command::WriteFile {
+            session,
+            path,
+            content,
+        } => {
+            let content = if let Some(content) = content {
+                content
+            } else {
+                let mut content = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut content)
+                    .context("reading file content from stdin")?;
+                content
+            };
+            rpc(
+                &discovery,
+                "workspace.write",
+                json!({"session_id": session, "path": path, "content": content}),
             )
             .await?
         }
@@ -1585,6 +1613,19 @@ fn print_human(value: &Value) {
         println!(
             "question answered={}",
             value["answered"].as_bool().unwrap_or(false)
+        );
+        return;
+    }
+    if let Some(sha256) = value.get("sha256").and_then(Value::as_str)
+        && value.get("size").is_some()
+        && value.get("path").is_some()
+        && value.get("content").is_none()
+    {
+        println!(
+            "wrote {} ({} bytes, sha256 {})",
+            value["path"].as_str().unwrap_or("?"),
+            value["size"].as_u64().unwrap_or(0),
+            &sha256[..sha256.len().min(12)]
         );
         return;
     }

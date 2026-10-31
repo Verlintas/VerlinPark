@@ -23,8 +23,8 @@ use vp_protocol::types::{
     SessionLandResult, SessionLogStatus, SessionRehydrateResult, SessionReplayReport,
     SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket,
     UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
-    WorkspaceTreeResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
-    WorktreeRetentionPolicy,
+    WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
+    WorktreePolicyResult, WorktreeRetentionPolicy,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -4060,6 +4060,42 @@ impl Engine {
         let root = self.workspace_root(session_id).await?;
         let path = path.to_string();
         tokio::task::spawn_blocking(move || workspace::read(Path::new(&root), &path)).await?
+    }
+
+    pub async fn workspace_write(
+        &self,
+        session_id: &str,
+        path: &str,
+        content: String,
+        expected_sha256: Option<String>,
+    ) -> Result<WorkspaceWriteResult> {
+        let root = self.workspace_root(session_id).await?;
+        let path_for_write = path.to_string();
+        let expected = expected_sha256.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            workspace::write(
+                Path::new(&root),
+                &path_for_write,
+                &content,
+                expected.as_deref(),
+            )
+        })
+        .await??;
+        if let Err(error) = self
+            .append_event(
+                session_id,
+                "workspace.file_saved",
+                serde_json::json!({
+                    "path": result.path,
+                    "size": result.size,
+                    "sha256": result.sha256,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%error, "failed to append workspace save event");
+        }
+        Ok(result)
     }
 
     async fn workspace_root(&self, session_id: &str) -> Result<String> {

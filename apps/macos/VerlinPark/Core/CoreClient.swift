@@ -593,6 +593,22 @@ actor CoreClient {
         .decode(WorkspaceFileResult.self)
     }
 
+    func workspaceWrite(
+        sessionID: String,
+        path: String,
+        content: String,
+        expectedSha256: String?
+    ) async throws -> WorkspaceWriteResult {
+        let params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "path": .string(path),
+            "content": .string(content),
+            "expected_sha256": expectedSha256.map(JSONValue.string) ?? .null,
+        ]
+        return try await request(method: "workspace.write", params: params)
+            .decode(WorkspaceWriteResult.self)
+    }
+
     func openConsole(sessionID: String) async throws -> ConsoleOpenResult {
         try await request(
             method: "console.open",

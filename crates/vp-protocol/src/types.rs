@@ -259,6 +259,24 @@ pub struct WorkspaceFileResult {
     pub truncated: bool,
     pub binary: bool,
     pub content: String,
+    pub sha256: String,
+    pub editable: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceWriteParams {
+    pub session_id: String,
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceWriteResult {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

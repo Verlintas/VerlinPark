@@ -1,10 +1,14 @@
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
-use vp_protocol::types::{WorkspaceEntry, WorkspaceFileResult, WorkspaceTreeResult};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+use vp_protocol::types::{
+    WorkspaceEntry, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
+};
 
 const MAX_ENTRIES: usize = 5_000;
 const MAX_DEPTH: usize = 20;
@@ -80,7 +84,7 @@ pub fn read(root: &Path, relative: &str) -> Result<WorkspaceFileResult> {
     }
     let mut file = File::open(&path).context("opening workspace file")?;
     let mut bytes = Vec::new();
-    file.by_ref()
+    (&mut file)
         .take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .context("reading workspace file")?;
@@ -103,7 +107,121 @@ pub fn read(root: &Path, relative: &str) -> Result<WorkspaceFileResult> {
         truncated,
         binary,
         content,
+        sha256: sha256_hex(&bytes),
+        editable: !truncated && !binary,
     })
+}
+
+pub fn write(
+    root: &Path,
+    relative: &str,
+    content: &str,
+    expected_sha256: Option<&str>,
+) -> Result<WorkspaceWriteResult> {
+    if content.len() as u64 > MAX_FILE_BYTES {
+        bail!("file content exceeds {MAX_FILE_BYTES} bytes");
+    }
+    let root = root.canonicalize().context("resolving workspace root")?;
+    let path = resolve_for_write(&root, relative)?;
+    if let Some(expected) = expected_sha256 {
+        let current = std::fs::read(&path).context("reading file for conflict check")?;
+        if current.len() as u64 > MAX_FILE_BYTES {
+            bail!("file is too large to edit safely");
+        }
+        let actual = sha256_hex(&current);
+        if actual != expected {
+            bail!("file changed on disk; reload before saving");
+        }
+    }
+    let bytes = content.as_bytes();
+    let temp = path
+        .parent()
+        .context("file has no parent")?
+        .join(format!(".verlinpark-{}.tmp", Uuid::now_v7()));
+    let result = (|| -> Result<()> {
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)
+                .context("creating temporary file")?;
+            file.write_all(bytes).context("writing temporary file")?;
+            file.sync_all().context("syncing temporary file")?;
+        }
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            let _ = std::fs::set_permissions(&temp, metadata.permissions());
+        }
+        std::fs::rename(&temp, &path).context("replacing workspace file")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result?;
+    Ok(WorkspaceWriteResult {
+        path: relative.to_string(),
+        size: bytes.len() as u64,
+        sha256: sha256_hex(bytes),
+    })
+}
+
+fn resolve_for_write(root: &Path, relative: &str) -> Result<PathBuf> {
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("workspace path must be relative and must not contain ..");
+    }
+    if relative_path
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        bail!("workspace path must not target .git");
+    }
+    let candidate = root.join(relative_path);
+    if candidate.exists() {
+        let resolved = candidate
+            .canonicalize()
+            .with_context(|| format!("resolving workspace path {relative}"))?;
+        if !resolved.starts_with(root) {
+            bail!("workspace path escapes the session worktree");
+        }
+        if resolved.is_dir() {
+            bail!("path is a directory: {relative}");
+        }
+        let canonical_relative = resolved.strip_prefix(root).unwrap_or(&resolved);
+        if canonical_relative
+            .components()
+            .any(|component| component.as_os_str() == ".git")
+        {
+            bail!("workspace path must not target .git");
+        }
+        return Ok(resolved);
+    }
+    let parent = candidate
+        .parent()
+        .context("workspace path has no parent")?
+        .canonicalize()
+        .with_context(|| format!("resolving parent for {relative}"))?;
+    if !parent.starts_with(root) {
+        bail!("workspace path escapes the session worktree");
+    }
+    let parent_relative = parent.strip_prefix(root).unwrap_or(&parent);
+    if parent_relative
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        bail!("workspace path must not target .git");
+    }
+    let name = candidate
+        .file_name()
+        .context("workspace path has no file name")?;
+    Ok(parent.join(name))
 }
 
 fn resolve(root: &Path, relative: &str) -> Result<PathBuf> {
@@ -133,6 +251,10 @@ fn resolve(root: &Path, relative: &str) -> Result<PathBuf> {
         bail!("workspace path must not target .git");
     }
     Ok(resolved)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn hex_preview(bytes: &[u8]) -> String {
@@ -191,11 +313,14 @@ mod tests {
         assert_eq!(file.content, "hello workspace");
         assert!(!file.binary);
         assert!(!file.truncated);
+        assert!(file.editable);
+        assert_eq!(file.sha256.len(), 64);
 
         let binary = [0_u8, 159, 146, 150, 10];
         std::fs::write(dir.path().join("blob.bin"), binary).unwrap();
         let file = read(dir.path(), "blob.bin").unwrap();
         assert!(file.binary);
+        assert!(!file.editable);
         assert!(file.content.starts_with("00000000"));
         assert!(file.content.contains("00 9f 92 96 0a"));
     }
@@ -216,6 +341,42 @@ mod tests {
             .unwrap();
             assert!(read(dir.path(), "escape.txt").is_err());
         }
+    }
+
+    #[test]
+    fn writes_files_with_conflict_detection() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "old").unwrap();
+        let file = read(dir.path(), "notes.txt").unwrap();
+        let written = write(dir.path(), "notes.txt", "new content", Some(&file.sha256)).unwrap();
+        assert_eq!(written.size, 11);
+        assert_eq!(
+            read(dir.path(), "notes.txt").unwrap().content,
+            "new content"
+        );
+        assert!(write(dir.path(), "notes.txt", "stale", Some(&file.sha256)).is_err());
+
+        let created = write(dir.path(), "new.txt", "created", None).unwrap();
+        assert_eq!(created.path, "new.txt");
+        assert_eq!(read(dir.path(), "new.txt").unwrap().content, "created");
+    }
+
+    #[test]
+    fn rejects_writes_outside_the_worktree() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        assert!(write(dir.path(), "../escape.txt", "nope", None).is_err());
+        assert!(write(dir.path(), outside.path().to_str().unwrap(), "nope", None).is_err());
+        assert!(write(dir.path(), ".git/config", "nope", None).is_err());
+        assert!(
+            write(
+                dir.path(),
+                "too-large.txt",
+                &"a".repeat(MAX_FILE_BYTES as usize + 1),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]

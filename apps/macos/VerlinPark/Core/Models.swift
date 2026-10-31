@@ -1139,6 +1139,14 @@ struct WorkspaceFileResult: Codable, Sendable {
     let truncated: Bool
     let binary: Bool
     let content: String
+    let sha256: String
+    let editable: Bool
+}
+
+struct WorkspaceWriteResult: Codable, Sendable {
+    let path: String
+    let size: UInt64
+    let sha256: String
 }
 
 struct ConsoleOpenResult: Codable, Sendable {

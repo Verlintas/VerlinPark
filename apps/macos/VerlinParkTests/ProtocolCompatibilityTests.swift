@@ -207,13 +207,24 @@ final class ProtocolCompatibilityTests: XCTestCase {
           "size": 42,
           "truncated": false,
           "binary": false,
-          "content": "fn main() {}\\n"
+          "content": "fn main() {}\\n",
+          "sha256": "abc123",
+          "editable": true
         }
         """
         let file = try JSONDecoder().decode(WorkspaceFileResult.self, from: Data(fileJSON.utf8))
         XCTAssertEqual(file.path, "src/main.rs")
         XCTAssertFalse(file.binary)
         XCTAssertFalse(file.truncated)
+        XCTAssertEqual(file.sha256, "abc123")
+        XCTAssertTrue(file.editable)
+
+        let written = try JSONDecoder().decode(
+            WorkspaceWriteResult.self,
+            from: Data(#"{"path":"src/main.rs","size":14,"sha256":"def456"}"#.utf8)
+        )
+        XCTAssertEqual(written.size, 14)
+        XCTAssertEqual(written.sha256, "def456")
     }
 
     func testConsoleResultsDecode() throws {

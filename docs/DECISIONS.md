@@ -91,6 +91,7 @@
 | [0079](adr/0079-priority-admission.md) | Priority-aware admission | Accepted | 调度 |
 | [0080](adr/0080-sandboxed-console.md) | Sandboxed line-oriented console | Accepted | 终端/执行 |
 | [0081](adr/0081-workspace-file-browser.md) | Read-only workspace file browser | Accepted | UI/文件 |
+| [0082](adr/0082-workspace-text-editing.md) | Workspace text editing | Accepted | UI/文件 |
 
 ---
 

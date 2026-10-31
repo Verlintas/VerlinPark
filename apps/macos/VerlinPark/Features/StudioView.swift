@@ -1737,6 +1737,10 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
 
 private struct FilesPanel: View {
     @Environment(AppModel.self) private var model
+    @State private var draft = ""
+    @State private var dirty = false
+    @State private var pendingEntry: WorkspaceEntry?
+    @State private var confirmDiscard = false
 
     private var filteredEntries: [WorkspaceEntry] {
         let filter = model.workspaceFilter.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1772,7 +1776,7 @@ private struct FilesPanel: View {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(filteredEntries) { entry in
                             Button {
-                                Task { await model.openWorkspaceFile(entry) }
+                                select(entry)
                             } label: {
                                 HStack(spacing: 6) {
                                     Image(systemName: "doc.text")
@@ -1841,10 +1845,36 @@ private struct FilesPanel: View {
                                 .padding(.vertical, 1)
                                 .background(.yellow.opacity(0.12), in: Capsule())
                         }
+                        if dirty {
+                            Text("modified")
+                                .font(.system(size: 7, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.cyan)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(.cyan.opacity(0.12), in: Capsule())
+                        }
                         Spacer()
                         Text(formatSize(file.size))
                             .font(.system(size: 8, design: .monospaced))
                             .foregroundStyle(.tertiary)
+                        if file.editable {
+                            Button("Reload") {
+                                reload()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(model.workspaceSaveBusy)
+                            Button("Save") {
+                                Task {
+                                    if await model.saveWorkspaceFile(content: draft) {
+                                        dirty = false
+                                    }
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(!dirty || model.workspaceSaveBusy)
+                        }
                     }
                     .padding(10)
                     Divider().opacity(0.3)
@@ -1854,10 +1884,20 @@ private struct FilesPanel: View {
                             .foregroundStyle(.orange)
                             .padding(10)
                     }
-                    TextEditor(text: .constant(file.content))
+                    if let status = model.workspaceSaveStatus {
+                        Text(status)
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(status.hasPrefix("Saved") ? .green : .orange)
+                            .padding(.horizontal, 10)
+                            .padding(.top, 4)
+                    }
+                    TextEditor(text: $draft)
                         .font(.system(size: 10, design: .monospaced))
                         .scrollContentBackground(.hidden)
-                        .disabled(model.workspaceFileBusy)
+                        .disabled(!file.editable || model.workspaceFileBusy || model.workspaceSaveBusy)
+                        .onChange(of: draft) { _, value in
+                            dirty = file.editable && value != file.content
+                        }
                         .padding(6)
                 } else {
                     VStack(spacing: 8) {
@@ -1878,6 +1918,65 @@ private struct FilesPanel: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
+        }
+        .onAppear {
+            syncDraft()
+        }
+        .onChange(of: fileKey) {
+            syncDraft()
+        }
+        .confirmationDialog(
+            "Discard unsaved changes?",
+            isPresented: $confirmDiscard,
+            titleVisibility: .visible
+        ) {
+            Button("Discard", role: .destructive) {
+                if let entry = pendingEntry {
+                    pendingEntry = nil
+                    Task { await model.openWorkspaceFile(entry) }
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingEntry = nil
+            }
+        } message: {
+            Text("The current draft has not been saved.")
+        }
+    }
+
+    private var fileKey: String {
+        guard let file = model.workspaceFile else { return "" }
+        return "\(file.path):\(file.sha256)"
+    }
+
+    private func syncDraft() {
+        guard let file = model.workspaceFile else {
+            draft = ""
+            dirty = false
+            return
+        }
+        draft = file.content
+        dirty = false
+    }
+
+    private func select(_ entry: WorkspaceEntry) {
+        if dirty {
+            pendingEntry = entry
+            confirmDiscard = true
+        } else {
+            Task { await model.openWorkspaceFile(entry) }
+        }
+    }
+
+    private func reload() {
+        guard let path = model.workspaceSelectedPath,
+              let entry = model.workspaceEntries.first(where: { $0.path == path })
+        else { return }
+        if dirty {
+            pendingEntry = entry
+            confirmDiscard = true
+        } else {
+            Task { await model.reloadWorkspaceFile() }
         }
     }
 

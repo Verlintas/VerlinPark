@@ -103,6 +103,8 @@ final class AppModel {
     var workspaceFile: WorkspaceFileResult?
     var workspaceFileBusy = false
     var workspaceFileError: String?
+    var workspaceSaveBusy = false
+    var workspaceSaveStatus: String?
     var workspaceSessionID: String?
     var consoleID: String?
     var consoleWorktree = ""
@@ -1053,6 +1055,7 @@ final class AppModel {
         workspaceSelectedPath = entry.path
         workspaceFileBusy = true
         workspaceFileError = nil
+        workspaceSaveStatus = nil
         defer { workspaceFileBusy = false }
         do {
             let file = try await core.workspaceFile(sessionID: sessionID, path: entry.path)
@@ -1061,6 +1064,44 @@ final class AppModel {
         } catch {
             workspaceFile = nil
             workspaceFileError = error.localizedDescription
+        }
+    }
+
+    func saveWorkspaceFile(content: String) async -> Bool {
+        guard let sessionID = selectedSessionID,
+              let file = workspaceFile,
+              file.editable
+        else {
+            workspaceSaveStatus = "This file is read-only."
+            return false
+        }
+        workspaceSaveBusy = true
+        workspaceSaveStatus = nil
+        defer { workspaceSaveBusy = false }
+        do {
+            let result = try await core.workspaceWrite(
+                sessionID: sessionID,
+                path: file.path,
+                content: content,
+                expectedSha256: file.sha256
+            )
+            guard sessionID == selectedSessionID else { return false }
+            workspaceFile = WorkspaceFileResult(
+                path: result.path,
+                size: result.size,
+                truncated: false,
+                binary: false,
+                content: content,
+                sha256: result.sha256,
+                editable: true
+            )
+            workspaceFileError = nil
+            workspaceSaveStatus = "Saved \(result.path) (\(result.size) bytes)."
+            await loadDiff()
+            return true
+        } catch {
+            workspaceSaveStatus = error.localizedDescription
+            return false
         }
     }
 
