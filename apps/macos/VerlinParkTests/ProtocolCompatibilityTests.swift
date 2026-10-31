@@ -67,6 +67,18 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertNil(hit.role)
     }
 
+    func testUsageCsvResultDecodes() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "csv": "created_at,agent_name\\n2026-10-31T00:00:00Z,Leader\\n"
+        }
+        """
+        let result = try JSONDecoder().decode(UsageCsvResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.sessionId, "session-1")
+        XCTAssertTrue(result.csv.hasPrefix("created_at,agent_name"))
+    }
+
     func testPlanTaskWithoutBudgetsStillDecodes() throws {
         let json = """
         {

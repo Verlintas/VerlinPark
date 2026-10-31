@@ -129,6 +129,31 @@ final class AppModel {
         projects.first { $0.id == selectedProjectID }
     }
 
+    var roundtableRounds: [RoundtableRound] {
+        var grouped: [Int: [RoundtablePosition]] = [:]
+        for event in events where event.type == "manager.roundtable" {
+            let payload = event.payload.objectValue
+            guard let position = payload?["position"]?.stringValue else { continue }
+            let round = payload?["round"]?.intValue ?? 0
+            let title = payload?["title"]?.stringValue
+                ?? payload?["agent_title"]?.stringValue
+                ?? payload?["agent_name"]?.stringValue
+                ?? "Manager"
+            grouped[round, default: []].append(
+                RoundtablePosition(
+                    id: event.id,
+                    title: title,
+                    profile: payload?["profile"]?.stringValue,
+                    position: position,
+                    agentName: payload?["agent_name"]?.stringValue
+                )
+            )
+        }
+        return grouped
+            .sorted { $0.key < $1.key }
+            .map { RoundtableRound(round: $0.key, positions: $0.value) }
+    }
+
     var selectedSession: Session? {
         sessions.first { $0.id == selectedSessionID }
     }
@@ -276,6 +301,20 @@ final class AppModel {
             await loadMailbox()
             await loadTeamPlan()
             await loadDiff()
+        }
+    }
+
+    func exportUsageCsv() async {
+        guard let session = selectedSession else { return }
+        do {
+            let result = try await core.usageCsv(sessionID: session.id)
+            let panel = NSSavePanel()
+            panel.canCreateDirectories = true
+            panel.nameFieldStringValue = "usage-\(session.id.prefix(8)).csv"
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try result.csv.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            handle(error)
         }
     }
 

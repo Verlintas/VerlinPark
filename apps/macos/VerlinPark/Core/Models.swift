@@ -61,6 +61,16 @@ struct ArtifactPolicy: Codable, Hashable, Sendable {
     }
 }
 
+struct UsageCsvResult: Codable, Sendable {
+    let sessionId: String
+    let csv: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case csv
+    }
+}
+
 struct SessionTranscriptResult: Codable, Sendable {
     let sessionId: String
     let markdown: String
@@ -741,6 +751,23 @@ struct CancelResult: Codable, Sendable {
 extension Int {
     var clampedTokenBudget: Int {
         Swift.max(1000, Swift.min(self, 2_000_000))
+    }
+}
+
+struct RoundtablePosition: Identifiable, Hashable, Sendable {
+    let id: String
+    let title: String
+    let profile: String?
+    let position: String
+    let agentName: String?
+}
+
+struct RoundtableRound: Identifiable, Hashable, Sendable {
+    let round: Int
+    let positions: [RoundtablePosition]
+
+    var id: Int {
+        round
     }
 }
 

@@ -563,6 +563,12 @@ pub struct UsageLedgerParams {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct UsageCsvResult {
+    pub session_id: String,
+    pub csv: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct UsageLedgerResult {
     pub session_id: String,
     pub entries: Vec<UsageEntry>,

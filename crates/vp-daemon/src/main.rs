@@ -678,6 +678,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "session.usage_csv" => match parse_params::<UsageLedgerParams>(request.params) {
+            Ok(params) => match state.engine.usage_csv(&params.session_id).await {
+                Ok(csv) => RpcResponse::success(id, csv),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "session.diff" => match parse_params::<SessionDiffParams>(request.params) {
             Ok(params) => match state.engine.session_diff(&params.session_id).await {
                 Ok(diff) => RpcResponse::success(id, diff),

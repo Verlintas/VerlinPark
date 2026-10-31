@@ -27,6 +27,9 @@ bundle: build
 package:
     scripts/package-release.sh
 
+cask:
+    scripts/generate-homebrew-cask.sh
+
 daemon:
     cargo run -p vp-daemon
 

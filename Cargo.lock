@@ -2155,6 +2155,7 @@ dependencies = [
  "vp-protocol",
  "vp-providers",
  "vp-store",
+ "wiremock",
  "zstd",
 ]
 

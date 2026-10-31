@@ -121,6 +121,11 @@ struct CollabGraphView: View {
                     TeamPlanCard(plan: plan)
                 }
 
+                if !model.roundtableRounds.isEmpty {
+                    OrgConnector()
+                    RoundtableCard(rounds: model.roundtableRounds)
+                }
+
                 if !model.todos.isEmpty {
                     OrgConnector()
                     LeaderPlanCard(todos: model.todos)
@@ -345,6 +350,80 @@ struct TeamPlanCard: View {
             RoundedRectangle(cornerRadius: 10)
                 .strokeBorder(.cyan.opacity(0.15), lineWidth: 1)
         }
+    }
+}
+
+private struct RoundtableCard: View {
+    let rounds: [RoundtableRound]
+    @State private var expanded: Set<Int> = [1]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("MANAGER ROUNDTABLE", systemImage: "bubble.left.and.bubble.right")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(rounds.count) round\(rounds.count == 1 ? "" : "s")")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            ForEach(rounds) { round in
+                DisclosureGroup(isExpanded: binding(for: round.round)) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(round.positions) { position in
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(position.title)
+                                        .font(.system(size: 9, weight: .medium))
+                                    if let profile = position.profile {
+                                        Text(profile)
+                                            .font(.system(size: 8, design: .monospaced))
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    Spacer(minLength: 0)
+                                    if let agent = position.agentName, agent != position.title {
+                                        Text(agent)
+                                            .font(.system(size: 8, design: .monospaced))
+                                            .foregroundStyle(.tertiary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                Text(position.position)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                    .padding(.top, 4)
+                } label: {
+                    Text("Round \(round.round)")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .background(.purple.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(.purple.opacity(0.14), lineWidth: 1)
+        }
+    }
+
+    private func binding(for round: Int) -> Binding<Bool> {
+        Binding(
+            get: { expanded.contains(round) },
+            set: { isExpanded in
+                if isExpanded {
+                    expanded.insert(round)
+                } else {
+                    expanded.remove(round)
+                }
+            }
+        )
     }
 }
 
@@ -1103,6 +1182,17 @@ struct PreviewPanelView: View {
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("SESSION USAGE")
+                                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                            Spacer()
+                            Button("Export CSV…") {
+                                Task { await model.exportUsageCsv() }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
                         HStack(spacing: 10) {
                             UsageMetric(
                                 title: "Calls",

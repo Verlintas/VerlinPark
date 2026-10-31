@@ -18,7 +18,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、非 GitHub PR、worktree/scratch 清理、部分 merge 状态的人工检查、P2 batch abort 状态一致性。
 
-当前测试：Rust 116（core 91 / store 17 / providers 8），Swift 13。CI 以最新提交为准。
+当前测试：Rust 119（core 94 / store 17 / providers 8），Swift 14。CI 以最新提交为准。
 
 ### 0.1 2026-10-31 跟进
 
@@ -27,6 +27,10 @@
 - 新增 `session.transcript` / `vp transcript` / Export Transcript：Markdown 记录 plan、conversation 和 tool calls，超长内容截断。
 - Preview 支持文本（64KB）与二进制 hex/ASCII（1KB）artifact 预览；Manage Dash 增加 Doctor 和 worktree cleanup 卡片；project pool 80% 也发 `agent.budget_warning`。
 - 修复 merge 回滚测试中 queue 投影先于 agent 状态可见导致的竞态。
+- 修复 P2-7：plan batch 中止时同批未处理 task 现在会结算为 `cancelled`/`blocked` 并发出 `plan_task.finished`，不再留下 running 投影；新增取消 batch 回归。
+- P2-10 已修复：Collab 新增 Manager roundtable 卡片，按轮次显示 title/profile/position。
+- 新增 `session.usage_csv` / `vp usage --csv` / Preview Export CSV。
+- 新增 Homebrew cask 生成脚本和 release asset（`just cask`），仍不是 tap。
 
 ---
 
@@ -54,10 +58,10 @@
 | 功能完整度（M3） | B | 主链路真实可跑；merge queue、Integrator、rebase+retry、显式/opt-in 自动冲突解决、本地 landing、`gh` PR、mailbox/artifacts/replay、search/transcript 已有；缺 default-on auto-resolution、global Task-DAG scheduler |
 | 正确性/一致性 | B | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影；从零数据库重建仍未完成 |
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
-| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup 可用；圆桌仍主要出现在原始 Trace，缺少面向人的卡片 |
+| 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Doctor、cleanup、roundtable 卡片可用；更早的 round 仍受已加载 event window 限制 |
 | 可维护性 | C− | `agent.rs` 9,576 行、`vp-core/lib.rs` 4,852 行、`store.rs` 4,025 行、`StudioView.swift` 1,669 行；模块边界和文档状态仍需持续治理 |
-| 测试 | B− | 116 Rust + 13 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/search/transcript/preview 已有回归，真实 Provider 路径仍缺 |
-| 发布准备 | C− | `just package` 生成 ad-hoc signed DMG + checksum，tag 触发 Release workflow；仍无 Developer ID/公证、更新器和 Homebrew tap |
+| 测试 | B− | 119 Rust + 14 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/search/transcript/preview/plan batch abort/usage CSV/HTTP probe 已有回归，真实 Provider 路径仍缺 |
+| 发布准备 | C | `just package` 生成 ad-hoc signed DMG + checksum，release workflow 同时生成并上传 Homebrew cask；仍无 Developer ID/公证、更新器和可持续升级的 Homebrew tap |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
 
@@ -202,13 +206,13 @@
 
 ## 3. 次级问题与债务
 
-### P2-7：batch abort 后同批 task 状态可能悬挂
+### P2-7（已修复 2026-10-31）：batch abort 后同批 task 状态可能悬挂
 
-`execute_team_plan` 在某个 task 的 `finish_worker` 返回 `BudgetExceeded` 或 `Cancelled` 时，只标记当前 task 和“不在本 batch 的 remaining”，同一 batch 中尚未处理的兄弟 task 可能仍留在 `running` 状态。UI 的 Plan board 会显示一直运行。建议在 abort 时统一结算整个 batch，并 emit 对应的 `plan_task.finished`。
+`execute_team_plan` 在某个 task 的 `finish_worker` 返回 `BudgetExceeded` 或 `Cancelled` 时，只标记当前 task 和“不在本 batch 的 remaining”，同一 batch 中尚未处理的兄弟 task 可能仍留在 `running` 状态。UI 的 Plan board 会显示一直运行。现在 abort 后会先结算整个 batch（cancelled/blocked + `plan_task.finished`），再返回；见 ADR-0065。
 
-### P2-8：worktree / branch 生命周期没有清理
+### P2-8（部分修复 2026-10-31）：worktree / branch 生命周期没有自动清理
 
-`worktree::remove` 只在 session 创建失败时调用；task worktree 和 `verlinpark/<session>--<task>` 分支在成功/失败/取消后都保留。长时间使用会积累磁盘和 refs。需要 session 归档/清理策略，以及“保留失败现场供审阅”的显式选项。
+`worktree::remove` 原先只在 session 创建失败时调用；task worktree 和 `verlinpark/<session>--<task>` 分支在成功/失败/取消后都保留。现在有显式 `project.cleanup_worktrees` / `vp cleanup-worktrees`（terminal session、dry-run、dirty 保护、默认保留 branch）；仍没有自动/定时保留策略或统一 shell scratch 回收。“保留失败现场供审阅”仍是默认行为。
 
 ### P2-9：Dashboard / Settings / Studio 有过期文案（审计时）
 
@@ -220,9 +224,9 @@
 
 这些不是功能 bug，但会让用户/贡献者误判当前能力，属于“玻璃盒”产品的可信度问题。本次已做最小文案修正（Dashboard、Org sheet、Computer lease、tier ranges、预算提示）；更完整的 UI 状态化应随后处理。
 
-### P2-10：Manager 圆桌在 UI 中不可见
+### P2-10（已修复 2026-10-31）：Manager 圆桌在 UI 中不可见
 
-`manager.roundtable` 事件只出现在 Preview → Trace 的原始 JSON 行里；Collab 没有圆桌卡片，Chat 也不显示。用户看不到“Manager 们讨论了什么、分歧在哪、最后怎么收敛”。建议在 Collab 增加 Roundtable 卡片：轮次、Manager title、position 摘要、peer 关系；点击展开完整内容。
+`manager.roundtable` 事件原先只出现在 Preview → Trace 的原始 JSON 行里。Collab 现在有 Roundtable 卡片：按轮次分组、显示 Manager title/profile/position 摘要，可展开/折叠；完整原始 payload 仍在 Trace。
 
 ### P2-11：代码与文档体量
 
@@ -248,18 +252,16 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 116 个 Rust 测试 + 13 个 Swift 测试，覆盖 Leader loop、provider probe/retry、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript。仍缺：
+已有 119 个 Rust 测试 + 14 个 Swift 测试，覆盖 Leader loop、provider probe/retry、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、shell 沙箱/policy、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、global session admission、cross-session scope locks、global Worker/Labour capacity、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、usage CSV、OpenAI-compatible HTTP probe。仍缺：
 
-- plan 自动派发的 scope overlap / cap 回归
-- 并发预算超调上界
-- `fetch_url` 的 DNS/私网/IPv6 SSRF
+- 并发预算超调上界与预算 abort 的 sibling 结算（当前只测取消 abort）
 - 非 GitHub PR adapter / 默认自动冲突解决策略 / 真正的 post-merge 集成分支
 - WebSocket 断线重连
 - 真实 Anthropic 工具调用（目前只有 mock/SSE 解析测试）
-- UI 的 event → plan status / roundtable 渲染
 - 真实 Provider 的工具调用/委派 E2E（当前只用 wiremock/SSE mock）
 - FTS/索引搜索与跨 session 相关性排序
 - transcript 的 event timeline 与增量导出
+- roundtable 卡片的 UI snapshot / accessibility 回归
 
 ### P2-13：产品叙事大于实现
 
@@ -354,7 +356,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 116 passed after the 10-31 search/transcript/retry slice
+cargo test --workspace     # 119 passed after the 10-31 batch-abort/roundtable/CSV slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

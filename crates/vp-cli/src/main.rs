@@ -133,7 +133,12 @@ enum Command {
     /// Show the session plan/todo list.
     Todos { session: String },
     /// Show the per-call usage/cost ledger.
-    Usage { session: String },
+    Usage {
+        session: String,
+        /// Emit CSV instead of the grouped human-readable ledger.
+        #[arg(long)]
+        csv: bool,
+    },
     /// Show the validated team plan.
     TeamPlan { session: String },
     /// Print a Markdown transcript of the session's plan and messages.
@@ -459,8 +464,13 @@ async fn main() -> Result<()> {
             )
             .await?
         }
-        Command::Usage { session } => {
-            rpc(&discovery, "session.usage", json!({"session_id": session})).await?
+        Command::Usage { session, csv } => {
+            let method = if csv {
+                "session.usage_csv"
+            } else {
+                "session.usage"
+            };
+            rpc(&discovery, method, json!({"session_id": session})).await?
         }
         Command::Agents { session } => {
             rpc(&discovery, "agent.list", json!({"session_id": session})).await?
@@ -746,6 +756,10 @@ fn print_json(value: &Value) -> Result<()> {
 }
 
 fn print_human(value: &Value) {
+    if let Some(csv) = value.get("csv").and_then(Value::as_str) {
+        print!("{csv}");
+        return;
+    }
     if let Some(markdown) = value.get("markdown").and_then(Value::as_str) {
         print!("{markdown}");
         return;

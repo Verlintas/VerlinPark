@@ -74,6 +74,9 @@
 | [0062](adr/0062-session-search.md) | Session search | Accepted | 检索/UX |
 | [0063](adr/0063-markdown-transcript.md) | Markdown transcript export | Accepted | 导出/UX |
 | [0064](adr/0064-artifact-preview.md) | Artifact text and binary previews | Accepted | 产物/UX |
+| [0065](adr/0065-plan-batch-abort.md) | Plan batch abort settlement | Accepted | 调度/一致性 |
+| [0066](adr/0066-usage-csv.md) | Usage CSV export | Accepted | 成本/导出 |
+| [0067](adr/0067-homebrew-cask.md) | Generated Homebrew cask | Accepted | 分发 |
 
 ---
 

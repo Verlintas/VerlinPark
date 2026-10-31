@@ -16,7 +16,7 @@ use vp_protocol::types::{
     PullRequestResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
     SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
     SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
-    UsageBucket, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
+    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
     WorktreeCleanupResult,
 };
 use vp_store::Store;
@@ -929,6 +929,40 @@ impl Engine {
             session_id: session_id.to_string(),
             entries,
             totals,
+        })
+    }
+
+    pub async fn usage_csv(&self, session_id: &str) -> Result<UsageCsvResult> {
+        let ledger = self.usage_ledger(session_id).await?;
+        let mut csv = String::from(
+            "created_at,agent_name,role,task_id,department,model,input_tokens,output_tokens,total_tokens,estimated,cost_usd\n",
+        );
+        for entry in ledger.entries {
+            let fields = [
+                entry.created_at,
+                entry.agent_name,
+                entry.role,
+                entry.task_id.unwrap_or_default(),
+                entry.department.unwrap_or_default(),
+                entry.model,
+                entry.input_tokens.to_string(),
+                entry.output_tokens.to_string(),
+                (entry.input_tokens + entry.output_tokens).to_string(),
+                entry.estimated.to_string(),
+                format!("{:.6}", entry.cost_usd),
+            ];
+            csv.push_str(
+                &fields
+                    .iter()
+                    .map(|field| csv_field(field))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            csv.push('\n');
+        }
+        Ok(UsageCsvResult {
+            session_id: session_id.to_string(),
+            csv,
         })
     }
 
@@ -3596,6 +3630,14 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
         .to_string())
 }
 
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn clip_transcript(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         text.to_string()
@@ -3686,6 +3728,51 @@ mod tests {
                 .hits
                 .iter()
                 .any(|hit| hit.session_id == session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn exports_usage_as_escaped_csv() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("usage".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "measure usage".into(), None)
+            .await
+            .unwrap();
+        engine
+            .record_agent_usage(
+                &session.id,
+                "agent-1",
+                "Worker, One",
+                "worker",
+                Some("T1".into()),
+                Some("impl".into()),
+                "test-model",
+                10,
+                5,
+                true,
+                0.25,
+            )
+            .await
+            .unwrap();
+
+        let result = engine.usage_csv(&session.id).await.unwrap();
+        assert_eq!(result.session_id, session.id);
+        assert!(result.csv.starts_with("created_at,agent_name,role,"));
+        assert!(result.csv.contains("\"Worker, One\""));
+        assert!(
+            result
+                .csv
+                .contains(",worker,T1,impl,test-model,10,5,15,true,0.250000")
         );
     }
 

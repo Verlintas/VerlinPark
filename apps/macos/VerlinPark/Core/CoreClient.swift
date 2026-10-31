@@ -466,6 +466,12 @@ actor CoreClient {
             .decode(UsageLedgerResult.self)
     }
 
+    func usageCsv(sessionID: String) async throws -> UsageCsvResult {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.usage_csv", params: params)
+            .decode(UsageCsvResult.self)
+    }
+
     func sessionDiff(sessionID: String) async throws -> SessionDiff {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.diff", params: params)

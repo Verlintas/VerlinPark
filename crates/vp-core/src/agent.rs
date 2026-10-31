@@ -5877,6 +5877,45 @@ enum PlanRunResult {
     BudgetExceeded(BudgetStop),
 }
 
+enum PlanAbort {
+    Cancelled,
+    Budget(BudgetStop),
+}
+
+impl PlanAbort {
+    fn task_status(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Budget(_) => "blocked",
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::Cancelled => "session cancelled".to_string(),
+            Self::Budget(stop) => stop.summary(),
+        }
+    }
+}
+
+async fn emit_plan_task_finished(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+    task_id: &str,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    let mut payload = serde_json::json!({
+        "task_id": task_id,
+        "task_status": status,
+    });
+    if let Some(reason) = reason {
+        payload["reason"] = serde_json::json!(reason);
+    }
+    emit(engine, session_id, spec, "plan_task.finished", payload).await
+}
+
 fn task_profile(task: &PlanTask, department_profile: AgentProfile) -> AgentProfile {
     if let Some(profile) = &task.profile
         && let Some(profile) = AgentProfile::parse(profile)
@@ -6280,8 +6319,35 @@ async fn execute_team_plan(
             });
         let results = futures_util::future::join_all(futures).await;
 
+        let mut abort: Option<PlanAbort> = None;
         for (index, result) in results.into_iter().enumerate() {
             let (task, worker_spec, manager_spec, objective, acceptance, _) = &prepared[index];
+            if let Some(abort) = &abort {
+                let status = abort.task_status();
+                let reason = abort.reason();
+                engine
+                    .update_agent_status(
+                        &worker_spec.id,
+                        if status == "cancelled" {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        },
+                    )
+                    .await?;
+                statuses.insert(task.id.clone(), status.to_string());
+                emit_plan_task_finished(
+                    engine,
+                    &session.id,
+                    worker_spec,
+                    &task.id,
+                    status,
+                    Some(&reason),
+                )
+                .await?;
+                reports.push(format!("{} [{}]: {}", task.id, status, reason));
+                continue;
+            }
             match result {
                 Ok(LoopOutcome::Final(summary)) => {
                     let summary = if summary.trim().is_empty() {
@@ -6339,24 +6405,7 @@ async fn execute_team_plan(
                                 }),
                             )
                             .await?;
-                            for task in remaining
-                                .iter()
-                                .filter(|task| !batch_ids.contains(&task.id))
-                            {
-                                statuses.insert(task.id.clone(), "cancelled".to_string());
-                                emit(
-                                    engine,
-                                    &session.id,
-                                    leader_spec,
-                                    "plan_task.finished",
-                                    serde_json::json!({
-                                        "task_id": task.id,
-                                        "task_status": "cancelled",
-                                    }),
-                                )
-                                .await?;
-                            }
-                            return Ok(PlanRunResult::Cancelled);
+                            abort = Some(PlanAbort::Cancelled);
                         }
                         WorkerFinish::BudgetExceeded(stop) => {
                             statuses.insert(task.id.clone(), "blocked".to_string());
@@ -6368,29 +6417,11 @@ async fn execute_team_plan(
                                 serde_json::json!({
                                     "task_id": task.id,
                                     "task_status": "blocked",
-                                    "reason": "token budget exhausted",
+                                    "reason": stop.summary(),
                                 }),
                             )
                             .await?;
-                            for task in remaining
-                                .iter()
-                                .filter(|task| !batch_ids.contains(&task.id))
-                            {
-                                statuses.insert(task.id.clone(), "blocked".to_string());
-                                emit(
-                                    engine,
-                                    &session.id,
-                                    leader_spec,
-                                    "plan_task.finished",
-                                    serde_json::json!({
-                                        "task_id": task.id,
-                                        "task_status": "blocked",
-                                        "reason": "token budget exhausted",
-                                    }),
-                                )
-                                .await?;
-                            }
-                            return Ok(PlanRunResult::BudgetExceeded(stop));
+                            abort = Some(PlanAbort::Budget(stop));
                         }
                     }
                 }
@@ -6410,7 +6441,7 @@ async fn execute_team_plan(
                         }),
                     )
                     .await?;
-                    return Ok(PlanRunResult::Cancelled);
+                    abort = Some(PlanAbort::Cancelled);
                 }
                 Ok(LoopOutcome::BudgetExceeded(stop)) => {
                     engine
@@ -6430,7 +6461,7 @@ async fn execute_team_plan(
                     )
                     .await?;
                     if stop.is_abortive() {
-                        return Ok(PlanRunResult::BudgetExceeded(stop));
+                        abort = Some(PlanAbort::Budget(stop));
                     }
                 }
                 Ok(LoopOutcome::Verdict(_)) => {}
@@ -6454,6 +6485,30 @@ async fn execute_team_plan(
                     reports.push(format!("{} [failed]: {error}", task.id));
                 }
             }
+        }
+
+        if let Some(abort) = abort {
+            let status = abort.task_status();
+            let reason = abort.reason();
+            for task in remaining
+                .iter()
+                .filter(|task| !batch_ids.contains(&task.id))
+            {
+                statuses.insert(task.id.clone(), status.to_string());
+                emit_plan_task_finished(
+                    engine,
+                    &session.id,
+                    leader_spec,
+                    &task.id,
+                    status,
+                    Some(&reason),
+                )
+                .await?;
+            }
+            return Ok(match abort {
+                PlanAbort::Cancelled => PlanRunResult::Cancelled,
+                PlanAbort::Budget(stop) => PlanRunResult::BudgetExceeded(stop),
+            });
         }
 
         remaining.retain(|task| !batch_ids.contains(&task.id));
@@ -7140,6 +7195,67 @@ mod tests {
                         .unwrap()
                         .remove("token_budget");
                 }
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "submit_plan".into(),
+                        name: "submit_team_plan".into(),
+                        arguments: plan.to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            };
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+
+    struct CancellingPlanProvider;
+
+    #[async_trait]
+    impl Provider for CancellingPlanProvider {
+        fn id(&self) -> &str {
+            "cancelling-plan"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+            let last_role = request.messages.last().map(|message| message.role.as_str());
+            let user_text = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            if user_text.contains("Execute plan task") {
+                return Ok(Box::pin(futures_util::stream::once(async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok(StreamEvent::TextDelta("late".into()))
+                })));
+            }
+            let events = if last_role == Some("tool") {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "run_plan".into(),
+                        name: "run_team_plan".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else {
+                let plan = serde_json::json!({
+                    "goal": "cancel a batch",
+                    "departments": [{
+                        "name": "impl",
+                        "manager_title": "Implementation",
+                        "profile": "coding",
+                        "objective": "build"
+                    }],
+                    "tasks": [
+                        {"id": "T1", "department": "impl", "title": "One", "kind": "coding", "deps": [], "acceptance": ["done"], "write_scope": ["src/t1"]},
+                        {"id": "T2", "department": "impl", "title": "Two", "kind": "coding", "deps": [], "acceptance": ["done"], "write_scope": ["src/t2"]}
+                    ]
+                });
                 vec![
                     StreamEvent::ToolCall(ToolCall {
                         id: "submit_plan".into(),
@@ -8795,6 +8911,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settles_sibling_tasks_when_a_batch_is_cancelled() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(CancellingPlanProvider);
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "cancel a plan batch".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service
+            .start(&session.id, "cancel a plan batch")
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let events = engine
+                .list_events(session.id.clone(), 0, 200)
+                .await
+                .unwrap();
+            if events
+                .iter()
+                .filter(|event| event.kind == "plan_task.started")
+                .count()
+                == 2
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plan tasks did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(service.cancel(&session.id));
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "cancelled");
+
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
+            .await
+            .unwrap();
+        let finished = events
+            .iter()
+            .filter(|event| event.kind == "plan_task.finished")
+            .collect::<Vec<_>>();
+        assert_eq!(finished.len(), 2, "unreported sibling tasks: {finished:?}");
+        assert!(
+            finished
+                .iter()
+                .all(|event| event.payload["task_status"] == "cancelled"),
+            "all sibling tasks must settle as cancelled: {finished:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn task_budget_blocks_only_the_task_not_the_plan() {
         let dir = TempDir::new().unwrap();
         let provider: Arc<dyn Provider> = Arc::new(BudgetPlanProvider {
@@ -9763,6 +9938,37 @@ mod tests {
         assert_eq!(result.model, "test");
         assert_eq!(result.text, "OK");
         assert!(result.latency_ms < 5_000);
+    }
+
+    #[tokio::test]
+    async fn probes_an_openai_compatible_endpoint_over_http() {
+        use vp_providers::OpenAiCompatibleProvider;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let provider: Arc<dyn Provider> = Arc::new(OpenAiCompatibleProvider::local(
+            "openai",
+            format!("{}/v1", server.uri()),
+        ));
+        let dir = TempDir::new().unwrap();
+        let (_engine, service, _project) = test_service_with_provider(&dir, provider);
+        let result = service.probe().await.unwrap();
+        assert_eq!(result.text, "OK");
+        assert_eq!(result.provider, "queue");
+        assert_eq!(result.model, "test");
     }
 
     #[tokio::test]
