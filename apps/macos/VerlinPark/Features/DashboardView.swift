@@ -82,6 +82,9 @@ struct DashboardView: View {
                     ProjectUsageCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    MemoryCard(project: project)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                     DoctorCard()
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
@@ -976,5 +979,135 @@ private struct ApprovalCenterCard: View {
             return url
         }
         return approval.tool
+    }
+}
+
+private struct MemoryCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Project memory")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.memoryBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task { await model.loadMemories() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.memoryBusy)
+            }
+            Text("Durable decisions, facts, conventions, and sources shared across sessions.")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                TextField("Search memories", text: $model.memoryQuery)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .onSubmit {
+                        Task { await model.loadMemories() }
+                    }
+                Button("Search") {
+                    Task { await model.loadMemories() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            if let session = model.selectedSession {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        TextField("kind (decision, fact, source)", text: $model.memoryNewKind)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 150)
+                        TextField("title", text: $model.memoryNewTitle)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                    }
+                    TextField("body", text: $model.memoryNewBody, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .lineLimit(2 ... 4)
+                    HStack {
+                        Text(session.goal)
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                        Spacer()
+                        Button("Add memory") {
+                            Task { await model.createMemory() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(model.memoryBusy)
+                    }
+                }
+            } else {
+                Text("Select a session to add a memory.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            if model.memories.isEmpty {
+                Text(model.memoryStatus ?? "No project memories yet.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(model.memories.prefix(10))) { memory in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(memory.kind.uppercased())
+                                .font(.system(size: 8, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.cyan)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(.cyan.opacity(0.1), in: Capsule())
+                            Text(memory.title)
+                                .font(.system(size: 9, weight: .medium))
+                            Spacer()
+                            Text(memory.agentName)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Text(memory.body)
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                        if !memory.tags.isEmpty {
+                            Text(memory.tags.map { "#\($0)" }.joined(separator: " "))
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+                }
+                if model.memories.count > 10 {
+                    Text("… and \(model.memories.count - 10) more memories.")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            if let status = model.memoryStatus, !model.memories.isEmpty {
+                Text(status)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
     }
 }

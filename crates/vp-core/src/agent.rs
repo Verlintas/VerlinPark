@@ -4337,6 +4337,8 @@ async fn run_loop(
                     | "list_artifacts"
                     | "read_artifact"
             );
+            let is_memory_tool = matches!(call.name.as_str(), "remember" | "recall");
+            let is_question_tool = call.name == "ask_user" && spec.role != AgentRole::Verifier;
             let registry_tool = config
                 .tools
                 .get(&call.name)
@@ -4349,6 +4351,8 @@ async fn run_loop(
                     || is_run_plan
                     || is_todo
                     || is_mailbox_tool
+                    || is_memory_tool
+                    || is_question_tool
                 {
                     false
                 } else {
@@ -4498,6 +4502,89 @@ async fn run_loop(
                 match run_mailbox_tool(engine, session, spec, &call.name, input.clone()).await {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("mailbox error: {error}")),
+                }
+            } else if is_question_tool {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                let question = input
+                    .get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow!("question is required"))?;
+                let options = input
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let (item, receiver) = engine
+                    .request_question(&session.id, &spec.id, &spec.name, question, options)
+                    .await?;
+                engine
+                    .update_session_status(&session.id, "waiting_input")
+                    .await?;
+                engine
+                    .update_agent_status(&spec.id, "waiting_input")
+                    .await?;
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "agent.waiting_input",
+                    serde_json::json!({
+                        "question_id": item.id,
+                        "question": item.question,
+                        "options": item.options,
+                    }),
+                )
+                .await?;
+                match wait_for_question(receiver, control).await {
+                    QuestionOutcome::Answered(answer) => {
+                        engine.update_session_status(&session.id, "running").await?;
+                        engine.update_agent_status(&spec.id, "running").await?;
+                        ToolOutput::ok(format!("User answered: {answer}"))
+                    }
+                    QuestionOutcome::Cancelled => {
+                        let _ = engine.close_question(&item.id, "cancelled").await;
+                        engine.update_agent_status(&spec.id, "cancelled").await?;
+                        return Ok(LoopOutcome::Cancelled);
+                    }
+                    QuestionOutcome::TimedOut => {
+                        let _ = engine.close_question(&item.id, "expired").await;
+                        engine.update_session_status(&session.id, "running").await?;
+                        engine.update_agent_status(&spec.id, "running").await?;
+                        ToolOutput::error("User did not answer before the question timed out.")
+                    }
+                }
+            } else if is_memory_tool {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_memory_tool(engine, session, project, spec, &call.name, input.clone())
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("memory error: {error}")),
                 }
             } else if is_verdict {
                 emit(
@@ -4910,6 +4997,87 @@ async fn run_loop(
     Err(anyhow!("maximum turns reached"))
 }
 
+async fn run_memory_tool(
+    engine: &Engine,
+    session: &Session,
+    project: &Project,
+    spec: &AgentSpec,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<ToolOutput> {
+    match name {
+        "remember" => {
+            if spec.role == AgentRole::Verifier {
+                return Ok(ToolOutput::error("Verifier cannot write project memory"));
+            }
+            let kind = input
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("kind is required"))?;
+            let title = input
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("title is required"))?;
+            let body = input
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("body is required"))?;
+            let tags = input
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let memory = engine
+                .create_memory_as(&session.id, &spec.id, &spec.name, kind, title, body, tags)
+                .await?;
+            Ok(ToolOutput::ok(format!(
+                "remembered [{}] {} ({})",
+                memory.kind, memory.title, memory.id
+            )))
+        }
+        "recall" => {
+            let query = input
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let kind = input
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let limit = input
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(10)
+                .clamp(1, 20) as u32;
+            let memories = engine
+                .list_memories(&project.id, query, kind, limit)
+                .await?
+                .memories;
+            if memories.is_empty() {
+                return Ok(ToolOutput::ok("No matching project memories."));
+            }
+            let mut text = String::new();
+            for memory in memories {
+                text.push_str(&format!(
+                    "[{}] {} · {} · {}
+{}
+",
+                    memory.kind,
+                    memory.title,
+                    memory.agent_name,
+                    truncate_to(&memory.body, 1200),
+                    memory.id
+                ));
+            }
+            Ok(ToolOutput::ok(text))
+        }
+        other => Ok(ToolOutput::error(format!("unknown memory tool: {other}"))),
+    }
+}
+
 async fn run_mailbox_tool(
     engine: &Engine,
     session: &Session,
@@ -5169,6 +5337,56 @@ fn tool_schemas(
             "required": ["artifact_id"]
         }),
     });
+    tools.push(ToolSchema {
+        name: "recall".to_string(),
+        description: "Search project memories recorded by any session or agent.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "kind": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+            }
+        }),
+    });
+    if role != AgentRole::Verifier {
+        tools.push(ToolSchema {
+            name: "remember".to_string(),
+            description: "Record a durable project memory (decision, fact, convention, or source) for later agents.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "maxItems": 10,
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["kind", "title", "body"]
+            }),
+        });
+    }
+    if role != AgentRole::Verifier {
+        tools.push(ToolSchema {
+            name: "ask_user".to_string(),
+            description: "Ask the user a blocking question and wait for an answer. Use only when the task cannot proceed safely without a decision.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "maxLength": 2000},
+                    "options": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {"type": "string", "maxLength": 200}
+                    }
+                },
+                "required": ["question"]
+            }),
+        });
+    }
     if role == AgentRole::Leader {
         tools.push(ToolSchema {
             name: "todo_write".to_string(),
@@ -7120,6 +7338,30 @@ enum ApprovalOutcome {
     Cancelled,
 }
 
+enum QuestionOutcome {
+    Answered(String),
+    Cancelled,
+    TimedOut,
+}
+
+async fn wait_for_question(
+    receiver: oneshot::Receiver<String>,
+    control: &RunControl,
+) -> QuestionOutcome {
+    if control.is_cancelled() {
+        return QuestionOutcome::Cancelled;
+    }
+    let mut cancel_rx = control.subscribe();
+    tokio::select! {
+        _ = cancel_rx.changed() => QuestionOutcome::Cancelled,
+        result = timeout(Duration::from_secs(1800), receiver) => match result {
+            Ok(Ok(answer)) => QuestionOutcome::Answered(answer),
+            Ok(Err(_)) => QuestionOutcome::TimedOut,
+            Err(_) => QuestionOutcome::TimedOut,
+        },
+    }
+}
+
 async fn wait_for_approval(
     receiver: oneshot::Receiver<bool>,
     control: &RunControl,
@@ -7932,24 +8174,33 @@ mod tests {
             .start(&session.id, "delegate the work")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        let agents = engine.list_agents(&session.id).await.unwrap();
-        let roles = agents
-            .iter()
-            .map(|agent| agent.role.as_str())
-            .collect::<Vec<_>>();
-        assert!(roles.contains(&"leader"));
-        assert!(roles.contains(&"manager"));
-        assert!(roles.contains(&"worker"));
-        assert!(roles.contains(&"labour"));
-        assert!(
-            agents
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let agents = engine.list_agents(&session.id).await.unwrap();
+            let roles = agents
                 .iter()
-                .filter(|agent| agent.role != "leader")
-                .all(|agent| agent.status == "idle")
-        );
+                .map(|agent| agent.role.as_str())
+                .collect::<Vec<_>>();
+            let settled = roles.contains(&"leader")
+                && roles.contains(&"manager")
+                && roles.contains(&"worker")
+                && roles.contains(&"labour")
+                && agents
+                    .iter()
+                    .filter(|agent| agent.role != "leader")
+                    .all(|agent| agent.status == "idle");
+            if settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agents did not settle: {agents:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
 
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "idle");
         let events = engine
             .list_events(session.id.clone(), 0, 200)
             .await
@@ -7966,11 +8217,6 @@ mod tests {
                 |event| event.kind == "agent.message" && event.payload["text"] == "leader done"
             )
         );
-        let sessions = engine
-            .list_sessions(Some(session.project_id))
-            .await
-            .unwrap();
-        assert_eq!(sessions[0].status, "idle");
     }
 
     #[tokio::test]
@@ -9114,7 +9360,7 @@ mod tests {
             }
         });
         service.start(&session.id, "scope").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        let _ = wait_until_idle(&engine, &session).await;
         approver.abort();
 
         let worktree = session.worktree.clone().unwrap();
@@ -9123,9 +9369,19 @@ mod tests {
                 .join("docs/out.txt")
                 .exists()
         );
-        let agents = engine.list_agents(&session.id).await.unwrap();
-        let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
-        assert_eq!(worker.status, "failed");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let agents = engine.list_agents(&session.id).await.unwrap();
+            let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
+            if worker.status == "failed" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker status did not settle: {worker:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         let events = engine
             .list_events(session.id.clone(), 0, 200)
             .await
@@ -10929,6 +11185,148 @@ mod tests {
         let queue = engine.list_merge_queue(&session.id).await.unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].status, "merged");
+    }
+
+    #[tokio::test]
+    async fn asks_the_user_and_continues_after_an_answer() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "ask_1".into(),
+                        name: "ask_user".into(),
+                        arguments: serde_json::json!({
+                            "question": "Proceed with the migration?",
+                            "options": ["yes", "no"]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("continued after answer".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id.clone(), "ask".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service
+            .start(&session.id, "ask before migrating")
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let question = loop {
+            let questions = engine
+                .list_questions(Some(session.id.clone()))
+                .await
+                .unwrap()
+                .questions;
+            if let Some(question) = questions.into_iter().find(|item| item.status == "pending") {
+                break question;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "question was not requested"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(question.question, "Proceed with the migration?");
+        let sessions = engine.list_sessions(Some(project.id)).await.unwrap();
+        assert_eq!(sessions[0].status, "waiting_input");
+        assert!(engine.answer_question(&question.id, "yes").await.unwrap());
+
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "idle");
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "ask_user"
+                && event.payload["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("User answered: yes"))
+        }));
+        assert!(events.iter().any(|event| event.kind == "question.answered"));
+    }
+
+    #[tokio::test]
+    async fn remembers_and_recalls_project_memory_from_tools() {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "remember_1".into(),
+                        name: "remember".into(),
+                        arguments: serde_json::json!({
+                            "kind": "decision",
+                            "title": "Keep merges deterministic",
+                            "body": "Do not use an LLM in the Integrator.",
+                            "tags": ["architecture"]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "recall_1".into(),
+                        name: "recall".into(),
+                        arguments: serde_json::json!({"query": "deterministic"}).to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("memory done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id.clone(), "memory tools".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service
+            .start(&session.id, "remember a decision")
+            .await
+            .unwrap();
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "idle");
+        let memories = engine
+            .list_memories(&project.id, None, None, 10)
+            .await
+            .unwrap()
+            .memories;
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].title, "Keep merges deterministic");
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "recall"
+                && event.payload["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("Keep merges deterministic"))
+        }));
     }
 
     #[tokio::test]

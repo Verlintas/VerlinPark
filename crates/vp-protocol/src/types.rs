@@ -327,6 +327,91 @@ pub struct AgentMessage {
     pub read_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryItem {
+    pub id: String,
+    pub session_id: String,
+    pub project_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryListParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryListResult {
+    pub memories: Vec<MemoryItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryCreateParams {
+    pub session_id: String,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryCreateResult {
+    pub memory: MemoryItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Question {
+    pub id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    pub status: String,
+    #[serde(default)]
+    pub answer: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub answered_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuestionListParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuestionListResult {
+    pub questions: Vec<Question>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnswerQuestionParams {
+    pub question_id: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnswerQuestionResult {
+    pub answered: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: String,
@@ -1065,6 +1150,10 @@ pub struct SessionBundle {
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
     pub usage: Vec<UsageEntry>,
+    #[serde(default)]
+    pub memories: Vec<MemoryItem>,
+    #[serde(default)]
+    pub questions: Vec<Question>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1086,6 +1175,10 @@ pub struct SessionReplayReport {
     pub approvals_matches: bool,
     #[serde(default)]
     pub ledger_matches: bool,
+    #[serde(default)]
+    pub memories_matches: bool,
+    #[serde(default)]
+    pub questions_matches: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,

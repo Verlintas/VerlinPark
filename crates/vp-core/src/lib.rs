@@ -12,9 +12,10 @@ use uuid::Uuid;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
     ArtifactMaterialization, ArtifactPolicy, DoctorCheck, Event, IntegrationPolicy,
-    MailboxGcResult, MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult,
-    ProjectUsageResult, PullRequestResult, SearchResult, Session, SessionBundle, SessionCommit,
-    SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
+    MailboxGcResult, MailboxPolicy, MemoryItem, MemoryListResult, MergeQueueEntry, Project,
+    ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
+    QuestionListResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
+    SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
     SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
     UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorktreeCleanupEntry,
     WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
@@ -43,6 +44,8 @@ struct ReplayData {
     agent_messages: Vec<AgentMessage>,
     artifacts: Vec<Artifact>,
     usage: Vec<UsageEntry>,
+    memories: Vec<MemoryItem>,
+    questions: Vec<Question>,
     events: Vec<Event>,
 }
 
@@ -58,6 +61,7 @@ pub struct Engine {
     store: Store,
     events: broadcast::Sender<Event>,
     approval_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    question_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     git_lock: Arc<Mutex<()>>,
     budget_registry: Arc<BudgetRegistry>,
 }
@@ -157,6 +161,7 @@ impl Engine {
             store,
             events,
             approval_waiters: Arc::new(Mutex::new(HashMap::new())),
+            question_waiters: Arc::new(Mutex::new(HashMap::new())),
             git_lock: Arc::new(Mutex::new(())),
             budget_registry: Arc::new(BudgetRegistry::new()),
         }
@@ -1465,6 +1470,89 @@ impl Engine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_memory_as(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+        tags: Vec<String>,
+    ) -> Result<MemoryItem> {
+        let kind = kind.trim();
+        let title = title.trim();
+        if kind.is_empty() || kind.chars().count() > 40 {
+            anyhow::bail!("memory kind must be 1-40 characters");
+        }
+        if title.is_empty() || title.chars().count() > 200 {
+            anyhow::bail!("memory title must be 1-200 characters");
+        }
+        if body.trim().is_empty() || body.chars().count() > 20_000 {
+            anyhow::bail!("memory body must be 1-20000 characters");
+        }
+        if tags.len() > 10 || tags.iter().any(|tag| tag.chars().count() > 40) {
+            anyhow::bail!("at most 10 tags of 40 characters are allowed");
+        }
+        let store = self.store.clone();
+        let session_id_owned = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&session_id_owned))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let store = self.store.clone();
+        let session_id = session.id;
+        let project_id = session.project_id;
+        let agent_id = agent_id.to_string();
+        let agent_name = agent_name.to_string();
+        let kind = kind.to_string();
+        let title = title.to_string();
+        let body = body.to_string();
+        let (memory, event) = tokio::task::spawn_blocking(move || {
+            store.create_memory_with_event(
+                &session_id,
+                &project_id,
+                &agent_id,
+                &agent_name,
+                &kind,
+                &title,
+                &body,
+                &tags,
+            )
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(memory)
+    }
+
+    pub async fn create_memory(
+        &self,
+        session_id: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+        tags: Vec<String>,
+    ) -> Result<MemoryItem> {
+        self.create_memory_as(session_id, "user", "User", kind, title, body, tags)
+            .await
+    }
+
+    pub async fn list_memories(
+        &self,
+        project_id: &str,
+        query: Option<String>,
+        kind: Option<String>,
+        limit: u32,
+    ) -> Result<MemoryListResult> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        let memories = tokio::task::spawn_blocking(move || {
+            store.list_memories(&project_id, query.as_deref(), kind.as_deref(), limit)
+        })
+        .await??;
+        Ok(MemoryListResult { memories })
+    }
+
     pub async fn list_artifacts(&self, session_id: &str) -> Result<Vec<Artifact>> {
         let store = self.store.clone();
         let session_id = session_id.to_string();
@@ -1733,6 +1821,8 @@ impl Engine {
             let agent_messages = store.list_agent_messages(&id, None, false)?;
             let artifacts = store.list_artifacts(&id)?;
             let usage = store.list_usage_entries(&id)?;
+            let memories = store.list_session_memories(&id)?;
+            let questions = store.list_session_questions(&id)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -1745,6 +1835,8 @@ impl Engine {
                 agent_messages,
                 artifacts,
                 usage,
+                memories,
+                questions,
                 events,
             })
         })
@@ -2186,6 +2278,62 @@ impl Engine {
             ));
         }
 
+        let replay_questions = data
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "question.requested"
+                        | "question.answered"
+                        | "question.cancelled"
+                        | "question.expired"
+                )
+            })
+            .filter_map(|event| {
+                let question = serde_json::from_value::<Question>(event.payload.clone()).ok()?;
+                Some((question.id.clone(), serde_json::to_value(question).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_questions = data
+            .questions
+            .iter()
+            .filter_map(|question| {
+                Some((question.id.clone(), serde_json::to_value(question).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let questions_matches = replay_questions == projected_questions;
+        if !questions_matches {
+            mismatches.push(format!(
+                "questions: projection={}, replay={}",
+                projected_questions.len(),
+                replay_questions.len()
+            ));
+        }
+
+        let replay_memories = data
+            .events
+            .iter()
+            .filter(|event| event.kind == "memory.created")
+            .filter_map(|event| {
+                let memory = serde_json::from_value::<MemoryItem>(event.payload.clone()).ok()?;
+                Some((memory.id.clone(), serde_json::to_value(memory).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_memories = data
+            .memories
+            .iter()
+            .filter_map(|memory| Some((memory.id.clone(), serde_json::to_value(memory).ok()?)))
+            .collect::<HashMap<_, _>>();
+        let memories_matches = replay_memories == projected_memories;
+        if !memories_matches {
+            mismatches.push(format!(
+                "memories: projection={}, replay={}",
+                projected_memories.len(),
+                replay_memories.len()
+            ));
+        }
+
         let expected_approvals = Self::expected_approvals(data);
         let expected_approval_values = expected_approvals
             .iter()
@@ -2320,6 +2468,8 @@ impl Engine {
             && mailbox_matches
             && artifacts_matches
             && approvals_matches
+            && memories_matches
+            && questions_matches
             && plan_matches
             && todos_matches
             && messages_matches
@@ -2339,6 +2489,8 @@ impl Engine {
             artifacts_matches,
             approvals_matches,
             ledger_matches,
+            memories_matches,
+            questions_matches,
             consistent,
             repaired,
             rebuilt: false,
@@ -2495,6 +2647,56 @@ impl Engine {
             }
         };
 
+        let questions = {
+            let mut latest = HashMap::new();
+            let mut valid = true;
+            for event in data.events.iter().filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "question.requested"
+                        | "question.answered"
+                        | "question.cancelled"
+                        | "question.expired"
+                )
+            }) {
+                match serde_json::from_value::<Question>(event.payload.clone()) {
+                    Ok(question) => {
+                        latest.insert(question.id.clone(), question);
+                    }
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                let mut items = latest.into_values().collect::<Vec<_>>();
+                items.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+                Some(items)
+            } else {
+                None
+            }
+        };
+
+        let memories = {
+            let mut items = Vec::new();
+            let mut valid = true;
+            for event in data
+                .events
+                .iter()
+                .filter(|event| event.kind == "memory.created")
+            {
+                match serde_json::from_value::<MemoryItem>(event.payload.clone()) {
+                    Ok(memory) => items.push(memory),
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            valid.then_some(items)
+        };
+
         let expected_artifacts = Self::expected_artifacts(data);
         let all_full = expected_artifacts.iter().all(|expected| expected.full);
         let mut artifact_warnings = Vec::new();
@@ -2547,6 +2749,8 @@ impl Engine {
             queue,
             artifacts,
             approvals: Some(Self::expected_approvals(data)),
+            memories,
+            questions,
             artifact_warnings,
         })
     }
@@ -2807,6 +3011,8 @@ impl Engine {
             agent_messages,
             artifacts,
             usage,
+            memories: data.memories,
+            questions: data.questions,
         })
     }
 
@@ -3355,6 +3561,99 @@ impl Engine {
         Ok((approval, receiver))
     }
 
+    pub async fn request_question(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        question: &str,
+        options: Vec<String>,
+    ) -> Result<(Question, oneshot::Receiver<String>)> {
+        let question = question.trim();
+        if question.is_empty() || question.chars().count() > 2_000 {
+            anyhow::bail!("question must be 1-2000 characters");
+        }
+        if options.len() > 8 || options.iter().any(|option| option.chars().count() > 200) {
+            anyhow::bail!("at most 8 options of 200 characters are allowed");
+        }
+        let store = self.store.clone();
+        let session_id_owned = session_id.to_string();
+        let agent_id = agent_id.to_string();
+        let agent_name = agent_name.to_string();
+        let question = question.to_string();
+        let (item, event) = tokio::task::spawn_blocking(move || {
+            store.create_question_with_event(
+                &session_id_owned,
+                &agent_id,
+                &agent_name,
+                &question,
+                &options,
+            )
+        })
+        .await??;
+        let (sender, receiver) = oneshot::channel();
+        self.question_waiters
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question mutex poisoned"))?
+            .insert(item.id.clone(), sender);
+        let _ = self.events.send(event);
+        Ok((item, receiver))
+    }
+
+    pub async fn answer_question(&self, question_id: &str, answer: &str) -> Result<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || answer.chars().count() > 4_000 {
+            anyhow::bail!("answer must be 1-4000 characters");
+        }
+        let store = self.store.clone();
+        let question_id_owned = question_id.to_string();
+        let answer_owned = answer.to_string();
+        let answered = tokio::task::spawn_blocking(move || {
+            store.answer_question_with_event(&question_id_owned, &answer_owned)
+        })
+        .await??;
+        let Some((question, event)) = answered else {
+            return Ok(false);
+        };
+        if let Ok(mut waiters) = self.question_waiters.lock()
+            && let Some(sender) = waiters.remove(&question.id)
+        {
+            let _ = sender.send(question.answer.unwrap_or_default());
+        }
+        let _ = self.events.send(event);
+        Ok(true)
+    }
+
+    pub async fn close_question(
+        &self,
+        question_id: &str,
+        status: &str,
+    ) -> Result<Option<Question>> {
+        let store = self.store.clone();
+        let question_id_owned = question_id.to_string();
+        let status_owned = status.to_string();
+        let closed = tokio::task::spawn_blocking(move || {
+            store.close_question_with_event(&question_id_owned, &status_owned)
+        })
+        .await??;
+        let Some((question, event)) = closed else {
+            return Ok(None);
+        };
+        if let Ok(mut waiters) = self.question_waiters.lock() {
+            waiters.remove(&question.id);
+        }
+        let _ = self.events.send(event);
+        Ok(Some(question))
+    }
+
+    pub async fn list_questions(&self, session_id: Option<String>) -> Result<QuestionListResult> {
+        let store = self.store.clone();
+        let questions =
+            tokio::task::spawn_blocking(move || store.list_questions(session_id.as_deref()))
+                .await??;
+        Ok(QuestionListResult { questions })
+    }
+
     pub async fn resolve_approval(&self, approval_id: &str, approved: bool) -> Result<()> {
         let store = self.store.clone();
         let id = approval_id.to_string();
@@ -3860,6 +4159,122 @@ mod tests {
                 .iter()
                 .any(|hit| hit.session_id == session.id)
         );
+    }
+
+    #[tokio::test]
+    async fn questions_round_trip_and_repair_with_events() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("questions".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "ask".into(), None)
+            .await
+            .unwrap();
+        let (question, receiver) = engine
+            .request_question(
+                &session.id,
+                "agent-1",
+                "Leader",
+                "Proceed?",
+                vec!["yes".into(), "no".into()],
+            )
+            .await
+            .unwrap();
+        assert!(engine.answer_question(&question.id, "yes").await.unwrap());
+        assert_eq!(receiver.await.unwrap(), "yes");
+        let listed = engine
+            .list_questions(Some(session.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(listed.questions.len(), 1);
+        assert_eq!(listed.questions[0].status, "answered");
+        assert_eq!(listed.questions[0].answer.as_deref(), Some("yes"));
+
+        let replay = engine.replay_session(&session.id).await.unwrap();
+        assert!(replay.questions_matches);
+        assert!(replay.consistent);
+        engine
+            .store()
+            .replace_session_questions(&session.id, &[])
+            .unwrap();
+        assert!(
+            !engine
+                .replay_session(&session.id)
+                .await
+                .unwrap()
+                .questions_matches
+        );
+        assert!(engine.repair_session(&session.id).await.unwrap().consistent);
+        let bundle = engine.export_session(&session.id).await.unwrap();
+        assert_eq!(bundle.questions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn records_memories_and_repairs_their_projection() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("memory".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "memory".into(), None)
+            .await
+            .unwrap();
+        let memory = engine
+            .create_memory_as(
+                &session.id,
+                "agent-1",
+                "Leader",
+                "decision",
+                "Keep merges deterministic",
+                "The Integrator must not depend on an LLM.",
+                vec!["architecture".into()],
+            )
+            .await
+            .unwrap();
+        let listed = engine
+            .list_memories(&project.id, Some("deterministic".into()), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(listed.memories.len(), 1);
+        assert_eq!(listed.memories[0].id, memory.id);
+
+        let replay = engine.replay_session(&session.id).await.unwrap();
+        assert!(replay.memories_matches);
+        assert!(replay.consistent);
+        engine
+            .store()
+            .replace_session_memories(&session.id, &[])
+            .unwrap();
+        let drifted = engine.replay_session(&session.id).await.unwrap();
+        assert!(!drifted.memories_matches);
+        let repaired = engine.repair_session(&session.id).await.unwrap();
+        assert!(repaired.consistent);
+        assert_eq!(
+            engine
+                .list_memories(&project.id, None, None, 10)
+                .await
+                .unwrap()
+                .memories
+                .len(),
+            1
+        );
+        let bundle = engine.export_session(&session.id).await.unwrap();
+        assert_eq!(bundle.memories.len(), 1);
     }
 
     #[tokio::test]

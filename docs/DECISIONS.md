@@ -83,6 +83,8 @@
 | [0071](adr/0071-provider-idle-timeout.md) | Provider stream idle timeout | Accepted | Provider/可靠性 |
 | [0072](adr/0072-database-rebuild.md) | Database rebuild from manifests and event mirrors | Accepted | 恢复/事件溯源 |
 | [0073](adr/0073-queued-session-recovery.md) | Queued session recovery across restarts | Accepted | 调度/恢复 |
+| [0074](adr/0074-project-memory.md) | Explicit project memory | Accepted | 记忆/协作 |
+| [0075](adr/0075-blocking-user-questions.md) | Blocking user questions | Accepted | 交互/运行时 |
 
 ---
 

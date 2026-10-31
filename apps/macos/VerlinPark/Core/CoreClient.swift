@@ -498,6 +498,59 @@ actor CoreClient {
             .decode(UsageLedgerResult.self)
     }
 
+    func listQuestions(sessionID: String) async throws -> [Question] {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "question.list", params: params)
+            .decode(QuestionListResult.self)
+            .questions
+    }
+
+    func answerQuestion(id: String, answer: String) async throws -> Bool {
+        let params: [String: JSONValue] = [
+            "question_id": .string(id),
+            "answer": .string(answer),
+        ]
+        return try await request(method: "question.answer", params: params)
+            .decode(AnswerQuestionResult.self)
+            .answered
+    }
+
+    func listMemories(
+        projectID: String,
+        query: String?,
+        kind: String?,
+        limit: Int = 50
+    ) async throws -> [MemoryItem] {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "query": query.map(JSONValue.string) ?? .null,
+            "kind": kind.map(JSONValue.string) ?? .null,
+            "limit": .number(Double(limit)),
+        ]
+        return try await request(method: "memory.list", params: params)
+            .decode(MemoryListResult.self)
+            .memories
+    }
+
+    func createMemory(
+        sessionID: String,
+        kind: String,
+        title: String,
+        body: String,
+        tags: [String]
+    ) async throws -> MemoryItem {
+        let params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "kind": .string(kind),
+            "title": .string(title),
+            "body": .string(body),
+            "tags": .array(tags.map(JSONValue.string)),
+        ]
+        return try await request(method: "memory.create", params: params)
+            .decode(MemoryCreateResult.self)
+            .memory
+    }
+
     func projectUsage(projectID: String) async throws -> ProjectUsageResult {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "project.usage", params: params)

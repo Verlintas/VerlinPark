@@ -121,6 +121,7 @@ private struct NotificationRow: View {
 
     private var icon: String {
         switch notice.kind {
+        case "question": "questionmark.bubble"
         case "approval": "checkmark.shield"
         case "task": "list.bullet.rectangle"
         case "integration": "arrow.triangle.merge"
@@ -130,6 +131,7 @@ private struct NotificationRow: View {
 
     private var color: Color {
         switch notice.kind {
+        case "question": .cyan
         case "approval": .orange
         case "task": .red
         case "integration": .purple

@@ -22,26 +22,27 @@ use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
-    AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, ApprovalListResult,
-    ArtifactBackfillParams, ArtifactGcParams, ArtifactGetParams, ArtifactListParams,
-    ArtifactListResult, ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult,
-    ArtifactResult, AuthParams, AuthResult, CancelSessionParams, CancelSessionResult,
-    CleanupWorktreesParams, CommitSessionParams, ConfigureAgentParams, CreateSessionParams,
-    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, IntegrationPolicyParams,
-    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
-    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
-    MailboxPolicyResult, MarkMessageReadParams, MergeQueueListParams, MergeQueueListResult,
-    OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams,
-    PromptParams, PromptResult, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
-    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
-    RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams, SessionExportParams,
-    SessionImportParams, SessionListResult, SessionLogParams, SessionPauseParams,
-    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams,
-    SessionResumeResult, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
-    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
-    SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams,
-    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams,
-    WorktreePolicyParams,
+    AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
+    AnswerQuestionResult, ApprovalListResult, ArtifactBackfillParams, ArtifactGcParams,
+    ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactMaterializeParams,
+    ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult, AuthParams, AuthResult,
+    CancelSessionParams, CancelSessionResult, CleanupWorktreesParams, CommitSessionParams,
+    ConfigureAgentParams, CreateSessionParams, DiscardSessionParams, DoctorCheck, DoctorReport,
+    EventListResult, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
+    ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams,
+    MailboxListResult, MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams,
+    MemoryCreateParams, MemoryCreateResult, MemoryListParams, MergeQueueListParams,
+    MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectBudgetParams,
+    ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
+    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
+    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, SearchParams,
+    ServerInfo, SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
+    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
+    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
+    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetProjectBudgetParams,
+    SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TeamPlanParams, TeamPlanResult, UsageLedgerParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -780,6 +781,57 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     id,
                     RpcError::new(codes::INVALID_PARAMS, "message not found".to_string()),
                 ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "question.list" => match parse_params::<QuestionListParams>(request.params) {
+            Ok(params) => match state.engine.list_questions(params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "question.answer" => match parse_params::<AnswerQuestionParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .answer_question(&params.question_id, &params.answer)
+                .await
+            {
+                Ok(answered) => RpcResponse::success(id, AnswerQuestionResult { answered }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.list" => match parse_params::<MemoryListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .list_memories(
+                    &params.project_id,
+                    params.query,
+                    params.kind,
+                    params.limit.unwrap_or(100),
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.create" => match parse_params::<MemoryCreateParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .create_memory(
+                    &params.session_id,
+                    &params.kind,
+                    &params.title,
+                    &params.body,
+                    params.tags,
+                )
+                .await
+            {
+                Ok(memory) => RpcResponse::success(id, MemoryCreateResult { memory }),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

@@ -67,6 +67,50 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertNil(hit.role)
     }
 
+    func testQuestionListDecodes() throws {
+        let json = """
+        {
+          "questions": [{
+            "id": "question-1",
+            "session_id": "session-1",
+            "agent_id": "leader",
+            "agent_name": "Leader",
+            "question": "Proceed?",
+            "options": ["yes", "no"],
+            "status": "pending",
+            "answer": null,
+            "created_at": "2026-10-31T00:00:00Z",
+            "answered_at": null
+          }]
+        }
+        """
+        let result = try JSONDecoder().decode(QuestionListResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.questions.first?.question, "Proceed?")
+        XCTAssertTrue(result.questions.first?.isPending == true)
+    }
+
+    func testMemoryListDecodes() throws {
+        let json = """
+        {
+          "memories": [{
+            "id": "memory-1",
+            "session_id": "session-1",
+            "project_id": "project-1",
+            "agent_id": "leader",
+            "agent_name": "Leader",
+            "kind": "decision",
+            "title": "Keep merges deterministic",
+            "body": "No LLM in the Integrator.",
+            "tags": ["architecture"],
+            "created_at": "2026-10-31T00:00:00Z"
+          }]
+        }
+        """
+        let result = try JSONDecoder().decode(MemoryListResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.memories.first?.title, "Keep merges deterministic")
+        XCTAssertEqual(result.memories.first?.tags, ["architecture"])
+    }
+
     func testAppNoticeRoundTrip() throws {
         let notice = AppNotice(
             id: "approval-1",

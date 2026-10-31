@@ -10,8 +10,8 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
-    MailboxPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectUsageSession, SearchHit,
-    Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem, UsageEntry,
+    MailboxPolicy, MemoryItem, MergeQueueEntry, Project, ProjectBudget, ProjectUsageSession,
+    Question, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage, TodoItem, UsageEntry,
     WorktreeRetentionPolicy,
 };
 
@@ -34,6 +34,8 @@ pub struct SessionRepair {
     pub queue: Option<Vec<MergeQueueEntry>>,
     pub artifacts: Option<Vec<Artifact>>,
     pub approvals: Option<Vec<Approval>>,
+    pub memories: Option<Vec<MemoryItem>>,
+    pub questions: Option<Vec<Question>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -239,6 +241,41 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_usage_ledger_session
                 ON usage_ledger(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS memories (
+                id          TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                agent_id    TEXT NOT NULL,
+                agent_name  TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                title       TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                tags        TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memories_project
+                ON memories(project_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_memories_session
+                ON memories(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS questions (
+                id          TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                agent_id    TEXT NOT NULL,
+                agent_name  TEXT NOT NULL,
+                question    TEXT NOT NULL,
+                options     TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                answer      TEXT,
+                created_at  TEXT NOT NULL,
+                answered_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_questions_session
+                ON questions(session_id, created_at);
 
             CREATE TABLE IF NOT EXISTS project_worktree_policies (
                 project_id       TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -1306,6 +1343,340 @@ impl Store {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn create_question_with_event(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        question: &str,
+        options: &[String],
+    ) -> Result<(Question, Event)> {
+        let item = Question {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.to_string(),
+            agent_name: agent_name.to_string(),
+            question: question.to_string(),
+            options: options.to_vec(),
+            status: "pending".to_string(),
+            answer: None,
+            created_at: now_rfc3339(),
+            answered_at: None,
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO questions
+             (id, session_id, agent_id, agent_name, question, options, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+            params![
+                item.id,
+                item.session_id,
+                item.agent_id,
+                item.agent_name,
+                item.question,
+                serde_json::to_string(&item.options)?,
+                item.created_at
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "question.requested",
+            serde_json::to_value(&item)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((item, event))
+    }
+
+    pub fn answer_question_with_event(
+        &self,
+        question_id: &str,
+        answer: &str,
+    ) -> Result<Option<(Question, Event)>> {
+        let answered_at = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE questions SET status = 'answered', answer = ?1, answered_at = ?2
+             WHERE id = ?3 AND status = 'pending'",
+            params![answer, answered_at, question_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let mut question = tx.query_row(
+            "SELECT id, session_id, agent_id, agent_name, question, options, status,
+                    answer, created_at, answered_at FROM questions WHERE id = ?1",
+            params![question_id],
+            map_question,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &question.session_id,
+            "question.answered",
+            serde_json::to_value(&question)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        question.status = "answered".to_string();
+        Ok(Some((question, event)))
+    }
+
+    pub fn close_question_with_event(
+        &self,
+        question_id: &str,
+        status: &str,
+    ) -> Result<Option<(Question, Event)>> {
+        if !matches!(status, "cancelled" | "expired") {
+            return Err(anyhow!("question status must be cancelled or expired"));
+        }
+        let answered_at = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE questions SET status = ?1, answered_at = ?2
+             WHERE id = ?3 AND status = 'pending'",
+            params![status, answered_at, question_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let question = tx.query_row(
+            "SELECT id, session_id, agent_id, agent_name, question, options, status,
+                    answer, created_at, answered_at FROM questions WHERE id = ?1",
+            params![question_id],
+            map_question,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &question.session_id,
+            if status == "cancelled" {
+                "question.cancelled"
+            } else {
+                "question.expired"
+            },
+            serde_json::to_value(&question)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((question, event)))
+    }
+
+    pub fn list_questions(&self, session_id: Option<&str>) -> Result<Vec<Question>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, agent_id, agent_name, question, options, status,
+                    answer, created_at, answered_at
+             FROM questions
+             WHERE (?1 IS NULL OR session_id = ?1)
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], map_question)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_session_questions(&self, session_id: &str) -> Result<Vec<Question>> {
+        self.list_questions(Some(session_id))
+    }
+
+    pub fn replace_session_questions(
+        &self,
+        session_id: &str,
+        questions: &[Question],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM questions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for question in questions {
+            tx.execute(
+                "INSERT INTO questions
+                 (id, session_id, agent_id, agent_name, question, options, status, answer,
+                  created_at, answered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    question.id,
+                    question.session_id,
+                    question.agent_id,
+                    question.agent_name,
+                    question.question,
+                    serde_json::to_string(&question.options)?,
+                    question.status,
+                    question.answer,
+                    question.created_at,
+                    question.answered_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_memory_with_event(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+        tags: &[String],
+    ) -> Result<(MemoryItem, Event)> {
+        let memory = MemoryItem {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            project_id: project_id.to_string(),
+            agent_id: agent_id.to_string(),
+            agent_name: agent_name.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            tags: tags.to_vec(),
+            created_at: now_rfc3339(),
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO memories
+             (id, session_id, project_id, agent_id, agent_name, kind, title, body, tags, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                memory.id,
+                memory.session_id,
+                memory.project_id,
+                memory.agent_id,
+                memory.agent_name,
+                memory.kind,
+                memory.title,
+                memory.body,
+                serde_json::to_string(&memory.tags)?,
+                memory.created_at
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "memory.created",
+            serde_json::to_value(&memory)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((memory, event))
+    }
+
+    pub fn list_memories(
+        &self,
+        project_id: &str,
+        query: Option<&str>,
+        kind: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryItem>> {
+        let conn = self.lock()?;
+        let pattern = query.map(|query| format!("%{query}%"));
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                    tags, created_at
+             FROM memories
+             WHERE project_id = ?1
+               AND (?2 IS NULL OR title LIKE ?2 OR body LIKE ?2 OR tags LIKE ?2)
+               AND (?3 IS NULL OR kind = ?3)
+             ORDER BY created_at DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![project_id, pattern, kind, limit.clamp(1, 500) as i64],
+            |row| {
+                let tags: String = row.get(8)?;
+                Ok(MemoryItem {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    agent_id: row.get(3)?,
+                    agent_name: row.get(4)?,
+                    kind: row.get(5)?,
+                    title: row.get(6)?,
+                    body: row.get(7)?,
+                    tags: serde_json::from_str(&tags).unwrap_or_default(),
+                    created_at: row.get(9)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_session_memories(&self, session_id: &str) -> Result<Vec<MemoryItem>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                    tags, created_at
+             FROM memories WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            let tags: String = row.get(8)?;
+            Ok(MemoryItem {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                project_id: row.get(2)?,
+                agent_id: row.get(3)?,
+                agent_name: row.get(4)?,
+                kind: row.get(5)?,
+                title: row.get(6)?,
+                body: row.get(7)?,
+                tags: serde_json::from_str(&tags).unwrap_or_default(),
+                created_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn replace_session_memories(
+        &self,
+        session_id: &str,
+        memories: &[MemoryItem],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM memories WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for memory in memories {
+            tx.execute(
+                "INSERT INTO memories
+                 (id, session_id, project_id, agent_id, agent_name, kind, title, body, tags, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    memory.id,
+                    memory.session_id,
+                    memory.project_id,
+                    memory.agent_id,
+                    memory.agent_name,
+                    memory.kind,
+                    memory.title,
+                    memory.body,
+                    serde_json::to_string(&memory.tags)?,
+                    memory.created_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_worktree_policy(&self, project_id: &str) -> Result<WorktreeRetentionPolicy> {
@@ -2701,7 +3072,7 @@ impl Store {
     pub fn interrupt_running_agents(&self) -> Result<usize> {
         let conn = self.lock()?;
         let changed = conn.execute(
-            "UPDATE agents SET status = 'failed' WHERE status = 'running'",
+            "UPDATE agents SET status = 'failed' WHERE status IN ('running', 'waiting_input')",
             [],
         )?;
         Ok(changed)
@@ -2847,12 +3218,14 @@ impl Store {
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
-            "UPDATE sessions SET status = 'failed' WHERE status IN ('running', 'paused')",
+            "UPDATE sessions SET status = 'failed' WHERE status IN ('running', 'paused', 'waiting_input')",
             [],
         )?;
         let agents = {
-            let mut stmt =
-                tx.prepare("SELECT id, session_id FROM agents WHERE status = 'running'")?;
+            let mut stmt = tx.prepare(
+                "SELECT id, session_id FROM agents
+                     WHERE status IN ('running', 'waiting_input')",
+            )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -2872,6 +3245,19 @@ impl Store {
         };
         tx.execute(
             "UPDATE approvals SET status = 'denied', resolved_at = ?1
+             WHERE status = 'pending'",
+            params![now],
+        )?;
+        let expired_questions = {
+            let mut stmt =
+                tx.prepare("SELECT id, session_id FROM questions WHERE status = 'pending'")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "UPDATE questions SET status = 'expired', answered_at = ?1
              WHERE status = 'pending'",
             params![now],
         )?;
@@ -2905,6 +3291,18 @@ impl Store {
                 "agent.failed",
                 serde_json::json!({
                     "error": "The daemon restarted while this run was active."
+                }),
+            )?);
+        }
+        for (question_id, session_id) in &expired_questions {
+            events.push(insert_event_tx(
+                &tx,
+                session_id,
+                "question.expired",
+                serde_json::json!({
+                    "question_id": question_id,
+                    "status": "expired",
+                    "error": "The daemon restarted before the question was answered."
                 }),
             )?);
         }
@@ -3089,6 +3487,57 @@ impl Store {
                         entry.detail,
                         entry.created_at,
                         entry.updated_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(memories) = &repair.memories {
+            tx.execute(
+                "DELETE FROM memories WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for memory in memories {
+                tx.execute(
+                    "INSERT INTO memories
+                     (id, session_id, project_id, agent_id, agent_name, kind, title, body, tags, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        memory.id,
+                        memory.session_id,
+                        memory.project_id,
+                        memory.agent_id,
+                        memory.agent_name,
+                        memory.kind,
+                        memory.title,
+                        memory.body,
+                        serde_json::to_string(&memory.tags)?,
+                        memory.created_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(questions) = &repair.questions {
+            tx.execute(
+                "DELETE FROM questions WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for question in questions {
+                tx.execute(
+                    "INSERT INTO questions
+                     (id, session_id, agent_id, agent_name, question, options, status, answer,
+                      created_at, answered_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        question.id,
+                        question.session_id,
+                        question.agent_id,
+                        question.agent_name,
+                        question.question,
+                        serde_json::to_string(&question.options)?,
+                        question.status,
+                        question.answer,
+                        question.created_at,
+                        question.answered_at
                     ],
                 )?;
             }
@@ -3288,6 +3737,45 @@ impl Store {
                     approval.status,
                     approval.created_at,
                     approval.resolved_at
+                ],
+            )?;
+        }
+        for memory in &bundle.memories {
+            tx.execute(
+                "INSERT INTO memories
+                 (id, session_id, project_id, agent_id, agent_name, kind, title, body, tags, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    memory.id,
+                    memory.session_id,
+                    memory.project_id,
+                    memory.agent_id,
+                    memory.agent_name,
+                    memory.kind,
+                    memory.title,
+                    memory.body,
+                    serde_json::to_string(&memory.tags)?,
+                    memory.created_at
+                ],
+            )?;
+        }
+        for question in &bundle.questions {
+            tx.execute(
+                "INSERT INTO questions
+                 (id, session_id, agent_id, agent_name, question, options, status, answer,
+                  created_at, answered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    question.id,
+                    question.session_id,
+                    question.agent_id,
+                    question.agent_name,
+                    question.question,
+                    serde_json::to_string(&question.options)?,
+                    question.status,
+                    question.answer,
+                    question.created_at,
+                    question.answered_at
                 ],
             )?;
         }
@@ -3986,6 +4474,22 @@ fn detect_default_branch(root: &Path) -> String {
     }
 }
 
+fn map_question(row: &rusqlite::Row<'_>) -> rusqlite::Result<Question> {
+    let options: String = row.get(5)?;
+    Ok(Question {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        agent_name: row.get(3)?,
+        question: row.get(4)?,
+        options: serde_json::from_str(&options).unwrap_or_default(),
+        status: row.get(6)?,
+        answer: row.get(7)?,
+        created_at: row.get(8)?,
+        answered_at: row.get(9)?,
+    })
+}
+
 fn escape_like(query: &str) -> String {
     query
         .replace('\\', "\\\\")
@@ -4346,6 +4850,103 @@ mod tests {
         let beta_usage = usage.iter().find(|row| row.session_id == beta.id).unwrap();
         assert_eq!(beta_usage.calls, 1);
         assert_eq!(beta_usage.input_tokens, 7);
+    }
+
+    #[test]
+    fn creates_answers_and_expires_questions() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "questions").unwrap();
+        let (question, event) = store
+            .create_question_with_event(
+                &session.id,
+                "agent-1",
+                "Leader",
+                "Which database should I use?",
+                &["SQLite".to_string(), "Postgres".to_string()],
+            )
+            .unwrap();
+        assert_eq!(event.kind, "question.requested");
+        assert_eq!(question.status, "pending");
+        assert_eq!(store.list_questions(Some(&session.id)).unwrap().len(), 1);
+
+        let (answered, answer_event) = store
+            .answer_question_with_event(&question.id, "SQLite")
+            .unwrap()
+            .unwrap();
+        assert_eq!(answered.status, "answered");
+        assert_eq!(answered.answer.as_deref(), Some("SQLite"));
+        assert_eq!(answer_event.kind, "question.answered");
+        assert!(
+            store
+                .answer_question_with_event(&question.id, "again")
+                .unwrap()
+                .is_none()
+        );
+
+        let (expired, expired_event) = store
+            .create_question_with_event(&session.id, "agent-1", "Leader", "Continue?", &[])
+            .unwrap();
+        let closed = store
+            .close_question_with_event(&expired.id, "expired")
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.0.status, "expired");
+        assert_eq!(expired_event.kind, "question.requested");
+        assert_eq!(closed.1.kind, "question.expired");
+    }
+
+    #[test]
+    fn creates_and_filters_project_memories() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "memory").unwrap();
+        let (first, event) = store
+            .create_memory_with_event(
+                &session.id,
+                &project.id,
+                "agent-1",
+                "Leader",
+                "decision",
+                "Use deterministic merge",
+                "Keep the Integrator deterministic.",
+                &["architecture".to_string()],
+            )
+            .unwrap();
+        assert_eq!(event.kind, "memory.created");
+        assert_eq!(event.payload["title"], "Use deterministic merge");
+        store
+            .create_memory_with_event(
+                &session.id,
+                &project.id,
+                "agent-1",
+                "Leader",
+                "source",
+                "Hermes paper",
+                "A source about agent memory.",
+                &["research".to_string()],
+            )
+            .unwrap();
+
+        let all = store.list_memories(&project.id, None, None, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        let decisions = store
+            .list_memories(&project.id, Some("deterministic"), None, 10)
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].id, first.id);
+        let sources = store
+            .list_memories(&project.id, None, Some("source"), 10)
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(store.list_session_memories(&session.id).unwrap().len(), 2);
+
+        store.replace_session_memories(&session.id, &[]).unwrap();
+        assert!(store.list_session_memories(&session.id).unwrap().is_empty());
     }
 
     #[test]

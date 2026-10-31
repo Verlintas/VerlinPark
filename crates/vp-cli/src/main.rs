@@ -191,6 +191,25 @@ enum Command {
     Artifacts { session: String },
     /// Backfill full publish events for legacy artifacts in a session.
     BackfillArtifacts { session: String },
+    /// List project memories across sessions.
+    Memory {
+        project: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Add a project memory tied to a session.
+    Remember {
+        session: String,
+        kind: String,
+        title: String,
+        body: String,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
     /// Show the project artifact retention policy.
     ArtifactPolicy { project: String },
     /// Update artifact retention and optional automatic GC.
@@ -278,6 +297,13 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// List blocking user questions.
+    Questions {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Answer a blocking user question.
+    Answer { question: String, answer: String },
     /// Approve a pending tool call.
     Approve { approval: String },
     /// Deny a pending tool call.
@@ -609,6 +635,44 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::Memory {
+            project,
+            query,
+            kind,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "memory.list",
+                json!({
+                    "project_id": project,
+                    "query": query,
+                    "kind": kind,
+                    "limit": limit
+                }),
+            )
+            .await?
+        }
+        Command::Remember {
+            session,
+            kind,
+            title,
+            body,
+            tags,
+        } => {
+            rpc(
+                &discovery,
+                "memory.create",
+                json!({
+                    "session_id": session,
+                    "kind": kind,
+                    "title": title,
+                    "body": body,
+                    "tags": tags
+                }),
+            )
+            .await?
+        }
         Command::ArtifactPolicy { project } => {
             rpc(
                 &discovery,
@@ -772,6 +836,17 @@ async fn main() -> Result<()> {
         }
         Command::Approvals { session } => {
             rpc(&discovery, "approval.list", json!({"session_id": session})).await?
+        }
+        Command::Questions { session } => {
+            rpc(&discovery, "question.list", json!({"session_id": session})).await?
+        }
+        Command::Answer { question, answer } => {
+            rpc(
+                &discovery,
+                "question.answer",
+                json!({"question_id": question, "answer": answer}),
+            )
+            .await?
         }
         Command::Approve { approval } => {
             rpc(
@@ -1047,6 +1122,62 @@ fn print_human(value: &Value) {
             "materialized {} at {}",
             value["artifact_id"].as_str().unwrap_or("?"),
             value["path"].as_str().unwrap_or("?")
+        );
+        return;
+    }
+    if let Some(questions) = value.get("questions").and_then(Value::as_array) {
+        for question in questions {
+            println!(
+                "[{}] {} · {} · {}",
+                question["status"].as_str().unwrap_or("?"),
+                question["question"].as_str().unwrap_or("?"),
+                question["agent_name"].as_str().unwrap_or("?"),
+                question["id"].as_str().unwrap_or("?")
+            );
+            if let Some(options) = question["options"].as_array()
+                && !options.is_empty()
+            {
+                println!(
+                    "  options: {}",
+                    options
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                );
+            }
+            if let Some(answer) = question["answer"].as_str() {
+                println!("  answer: {answer}");
+            }
+        }
+        return;
+    }
+    if value.get("answered").is_some() && value.get("started").is_none() {
+        println!(
+            "question answered={}",
+            value["answered"].as_bool().unwrap_or(false)
+        );
+        return;
+    }
+    if let Some(memories) = value.get("memories").and_then(Value::as_array) {
+        for memory in memories {
+            println!(
+                "[{}] {} · {} · {}",
+                memory["kind"].as_str().unwrap_or("note"),
+                memory["title"].as_str().unwrap_or("?"),
+                memory["agent_name"].as_str().unwrap_or("?"),
+                memory["id"].as_str().unwrap_or("?")
+            );
+            println!("  {}", memory["body"].as_str().unwrap_or(""));
+        }
+        return;
+    }
+    if let Some(memory) = value.get("memory") {
+        println!(
+            "remembered [{}] {} · {}",
+            memory["kind"].as_str().unwrap_or("note"),
+            memory["title"].as_str().unwrap_or("?"),
+            memory["id"].as_str().unwrap_or("?")
         );
         return;
     }

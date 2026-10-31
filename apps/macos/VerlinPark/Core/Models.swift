@@ -101,6 +101,78 @@ struct ProjectUsageResult: Codable, Sendable {
     }
 }
 
+struct MemoryItem: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    let projectId: String
+    let agentId: String
+    let agentName: String
+    let kind: String
+    let title: String
+    let body: String
+    let tags: [String]
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case projectId = "project_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case kind
+        case title
+        case body
+        case tags
+        case createdAt = "created_at"
+    }
+}
+
+struct Question: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    let agentId: String
+    let agentName: String
+    let question: String
+    let options: [String]
+    let status: String
+    let answer: String?
+    let createdAt: String
+    let answeredAt: String?
+
+    var isPending: Bool {
+        status == "pending"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case question
+        case options
+        case status
+        case answer
+        case createdAt = "created_at"
+        case answeredAt = "answered_at"
+    }
+}
+
+struct QuestionListResult: Codable, Sendable {
+    let questions: [Question]
+}
+
+struct AnswerQuestionResult: Codable, Sendable {
+    let answered: Bool
+}
+
+struct MemoryListResult: Codable, Sendable {
+    let memories: [MemoryItem]
+}
+
+struct MemoryCreateResult: Codable, Sendable {
+    let memory: MemoryItem
+}
+
 struct UsageCsvResult: Codable, Sendable {
     let sessionId: String
     let csv: String

@@ -272,6 +272,9 @@ struct SessionChatView: View {
                         agent: meta?.agent ?? agentLabel(event)
                     )
                 )
+            case "question.requested":
+                guard let question = try? event.payload.decode(Question.self) else { continue }
+                result.append(.question(id: question.id))
             case "approval.requested":
                 guard let approval = try? event.payload.decode(Approval.self) else { continue }
                 result.append(.approval(approval))
@@ -554,6 +557,8 @@ struct SessionChatView: View {
                 isError: isError,
                 agent: agent
             )
+        case let .question(id):
+            QuestionCard(questionID: id)
         case let .approval(approval):
             ApprovalCard(approval: approval, resolved: false)
         case let .approvalResolved(approval):
@@ -630,6 +635,7 @@ private enum ChatEntry: Identifiable {
     )
     case approval(Approval)
     case approvalResolved(Approval)
+    case question(id: String)
     case notice(id: String, text: String)
     case error(id: String, text: String)
 
@@ -640,7 +646,97 @@ private enum ChatEntry: Identifiable {
             id
         case let .approval(approval), let .approvalResolved(approval):
             "approval-\(approval.id)"
+        case let .question(id):
+            "question-\(id)"
         }
+    }
+}
+
+private struct QuestionCard: View {
+    @Environment(AppModel.self) private var model
+    let questionID: String
+    @State private var draft = ""
+
+    private var question: Question? {
+        model.questions.first { $0.id == questionID }
+    }
+
+    var body: some View {
+        if let question {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 7) {
+                    Image(systemName: "questionmark.bubble")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.cyan)
+                    Text("USER QUESTION")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.cyan)
+                    Text(question.agentName)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                    Text(question.status.uppercased())
+                        .font(.system(size: 8, weight: .medium, design: .monospaced))
+                        .foregroundStyle(statusColor)
+                }
+                Text(question.question)
+                    .font(.system(size: 11))
+                    .fixedSize(horizontal: false, vertical: true)
+                if question.isPending {
+                    if !question.options.isEmpty {
+                        HStack(spacing: 6) {
+                            ForEach(question.options, id: \.self) { option in
+                                Button(option) {
+                                    Task { await model.answerQuestion(question.id, answer: option) }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                    HStack(spacing: 6) {
+                        TextField("Type an answer", text: $draft)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .onSubmit {
+                                submit(question)
+                            }
+                        Button("Send") {
+                            submit(question)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                } else if let answer = question.answer {
+                    Label(answer, systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.green)
+                        .textSelection(.enabled)
+                }
+            }
+            .padding(10)
+            .background(.cyan.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(.cyan.opacity(0.14), lineWidth: 1)
+            }
+        }
+    }
+
+    private var statusColor: Color {
+        switch question?.status {
+        case "pending": .orange
+        case "answered": .green
+        default: .secondary
+        }
+    }
+
+    private func submit(_ question: Question) {
+        let answer = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !answer.isEmpty else { return }
+        draft = ""
+        Task { await model.answerQuestion(question.id, answer: answer) }
     }
 }
 

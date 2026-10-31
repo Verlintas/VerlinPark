@@ -79,6 +79,14 @@ final class AppModel {
     var approvalSessionGoals: [String: String] = [:]
     var approvalCenterBusy = false
     var approvalCenterStatus: String?
+    var questions: [Question] = []
+    var memories: [MemoryItem] = []
+    var memoryQuery = ""
+    var memoryBusy = false
+    var memoryStatus: String?
+    var memoryNewKind = "note"
+    var memoryNewTitle = ""
+    var memoryNewBody = ""
     var projectTokenBudgetText = ""
     var projectCostBudgetText = ""
     var projectBudgetBusy = false
@@ -298,6 +306,7 @@ final class AppModel {
         Task { await loadMailboxPolicy() }
         Task { await loadProjectBudget() }
         Task { await loadProjectUsage() }
+        Task { await loadMemories() }
         Task { await loadWorktreePolicy() }
         teamPlan = nil
         planTaskStatuses = [:]
@@ -333,6 +342,7 @@ final class AppModel {
             await loadMergeQueue()
             await loadMailbox()
             await loadTeamPlan()
+            await loadQuestions()
             await loadDiff()
         }
     }
@@ -737,6 +747,87 @@ final class AppModel {
             approvalCenterStatus = pendingApprovals.isEmpty ? "No pending approvals." : nil
         } catch {
             approvalCenterStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadQuestions() async {
+        guard let sessionID = selectedSessionID else {
+            questions = []
+            return
+        }
+        do {
+            let loaded = try await core.listQuestions(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                questions = loaded
+            }
+        } catch {
+            // The event stream will retry on question.requested.
+        }
+    }
+
+    func answerQuestion(_ questionID: String, answer: String) async {
+        let answer = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !answer.isEmpty else { return }
+        do {
+            _ = try await core.answerQuestion(id: questionID, answer: answer)
+            await loadQuestions()
+        } catch {
+            handle(error)
+        }
+    }
+
+    func loadMemories() async {
+        guard let projectID = selectedProjectID else {
+            memories = []
+            return
+        }
+        memoryBusy = true
+        defer { memoryBusy = false }
+        do {
+            let query = memoryQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            let items = try await core.listMemories(
+                projectID: projectID,
+                query: query.isEmpty ? nil : query,
+                kind: nil,
+                limit: 50
+            )
+            guard projectID == selectedProjectID else { return }
+            memories = items
+            memoryStatus = nil
+        } catch {
+            memoryStatus = error.localizedDescription
+        }
+    }
+
+    func createMemory() async {
+        guard let sessionID = selectedSessionID else {
+            memoryStatus = "Select a session before adding a memory."
+            return
+        }
+        let kind = memoryNewKind.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = memoryNewTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = memoryNewBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !kind.isEmpty, !title.isEmpty, !body.isEmpty else {
+            memoryStatus = "Kind, title, and body are required."
+            return
+        }
+        memoryBusy = true
+        defer { memoryBusy = false }
+        do {
+            _ = try await core.createMemory(
+                sessionID: sessionID,
+                kind: kind,
+                title: title,
+                body: body,
+                tags: []
+            )
+            memoryNewTitle = ""
+            memoryNewBody = ""
+            memoryStatus = "Memory added."
+            await loadMemories()
+        } catch {
+            memoryStatus = error.localizedDescription
             handle(error)
         }
     }
@@ -1726,6 +1817,21 @@ final class AppModel {
             Task { await self.loadMailbox() }
         }
 
+        if event.type == "memory.created" {
+            Task { await self.loadMemories() }
+        }
+
+        if ["question.requested", "question.answered", "question.cancelled", "question.expired"]
+            .contains(event.type),
+           let question = try? event.payload.decode(Question.self)
+        {
+            if let index = questions.firstIndex(where: { $0.id == question.id }) {
+                questions[index] = question
+            } else {
+                questions.append(question)
+            }
+        }
+
         if event.sessionId == selectedSessionID,
            ["tool.finished", "agent.turn_finished", "session.worktree"].contains(event.type)
         {
@@ -1740,6 +1846,17 @@ final class AppModel {
         let fallbackProject = event.sessionId == selectedSessionID ? selectedProjectID : nil
         let goal = directory?.goal ?? String(event.sessionId.prefix(8))
         switch event.type {
+        case "question.requested":
+            guard let question = try? event.payload.decode(Question.self) else { return }
+            addNotice(
+                id: "question-\(question.id)",
+                event: event,
+                projectId: directory?.projectId ?? fallbackProject,
+                kind: "question",
+                title: "Input needed · \(goal)",
+                detail: question.question,
+                createdAt: event.createdAt
+            )
         case "approval.requested":
             guard let approval = try? event.payload.decode(Approval.self) else { return }
             addNotice(
