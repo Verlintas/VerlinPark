@@ -261,6 +261,15 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(closed.exitCode, 0)
     }
 
+    func testApprovalNotificationIDExtraction() {
+        XCTAssertEqual(
+            SystemNotifier.approvalID(from: "approval-abc-123"),
+            "abc-123"
+        )
+        XCTAssertNil(SystemNotifier.approvalID(from: "task-session-task-failed-1"))
+        XCTAssertNil(SystemNotifier.approvalID(from: "approval-"))
+    }
+
     func testSessionPriorityDecodes() throws {
         let json = """
         {

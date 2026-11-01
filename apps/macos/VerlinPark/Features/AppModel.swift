@@ -237,6 +237,12 @@ final class AppModel {
             connection = .connected
             loadNotices()
             SystemNotifier.shared.requestAuthorization()
+            SystemNotifier.shared.onResolveApproval = { [weak self] approvalID, approved in
+                guard let self else { return }
+                Task { @MainActor in
+                    await self.resolveGlobalApproval(approvalID, approved: approved)
+                }
+            }
             SystemNotifier.shared.onOpenSession = { [weak self] sessionID in
                 guard let self else { return }
                 Task { @MainActor in

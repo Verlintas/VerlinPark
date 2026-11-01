@@ -23,8 +23,11 @@ with many queued runs could delay unrelated work.
    break across sessions.
 4. **Cancellation.** A queued run that is cancelled is removed from the waiter
    queue; if a permit was granted concurrently, the permit is released.
-5. **No aging yet.** Lower-priority waiters can starve under sustained high-
-   priority load. There is no aging or deadline promotion.
+5. **Aging.** Effective priority increases by one point per
+   `VERLINPARK_PRIORITY_AGING_SECS` (default 60; `0` disables) up to +100.
+   Aging applies to both admission and Worker/Labour capacity, so a low-priority
+   run eventually overtakes a sustained high-priority queue. Equal effective
+   priorities still use the session/project round-robin tie-break.
 6. **Not a Task-DAG scheduler.** This orders session runs and capacity slots, not
    individual DAG tasks across sessions. Task batches still dispatch per session;
    there is still no persistent global task queue or persistent global write
@@ -34,7 +37,8 @@ with many queued runs could delay unrelated work.
 
 - Urgent sessions can start and acquire workers before background sessions.
 - Equal-priority work still alternates across sessions and projects.
-- A burst of high-priority sessions can delay low-priority work indefinitely.
+- A burst of high-priority sessions delays low-priority work only until aging
+  closes the gap; the delay is bounded by priority difference × aging interval.
 - The gate remains in-process; queued runs survive daemon restart only through
   the existing session recovery path, not through a persisted priority queue.
 

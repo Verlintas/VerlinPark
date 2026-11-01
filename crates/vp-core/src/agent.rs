@@ -3,7 +3,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_recursion::async_recursion;
 
@@ -50,6 +50,28 @@ fn global_labour_cap() -> usize {
         .clamp(1, 100)
 }
 
+fn priority_aging() -> Duration {
+    let seconds = env::var("VERLINPARK_PRIORITY_AGING_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60)
+        .min(86_400);
+    if seconds == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(seconds)
+    }
+}
+
+fn effective_priority(priority: i32, enqueued_at: Instant, aging: Duration) -> i64 {
+    if aging.is_zero() {
+        return i64::from(priority);
+    }
+    let elapsed = enqueued_at.elapsed().as_millis() as i64;
+    let interval = aging.as_millis().max(1) as i64;
+    i64::from(priority) + (elapsed / interval).min(100)
+}
+
 #[derive(Clone)]
 pub struct AgentConfig {
     pub provider: Arc<dyn Provider>,
@@ -90,6 +112,7 @@ pub struct CapacityController {
 
 struct FairCapacity {
     limit: usize,
+    aging: Duration,
     state: Mutex<FairState>,
 }
 
@@ -104,6 +127,7 @@ struct CapacityWaiter {
     id: u64,
     session_id: String,
     priority: i32,
+    enqueued_at: Instant,
     sender: oneshot::Sender<()>,
 }
 
@@ -118,9 +142,10 @@ impl Drop for CapacityPermit {
 }
 
 impl FairCapacity {
-    fn new(limit: usize) -> Self {
+    fn new_with_aging(limit: usize, aging: Duration) -> Self {
         Self {
             limit: limit.max(1),
+            aging,
             state: Mutex::new(FairState {
                 active: 0,
                 waiters: VecDeque::new(),
@@ -172,6 +197,7 @@ impl FairCapacity {
                 id,
                 session_id: session_id.to_string(),
                 priority,
+                enqueued_at: Instant::now(),
                 sender,
             });
             (id, receiver)
@@ -211,17 +237,20 @@ impl FairCapacity {
 
     fn grant_waiters(&self, state: &mut FairState) {
         while state.active < self.limit && !state.waiters.is_empty() {
+            let aging = self.aging;
             let highest = state
                 .waiters
                 .iter()
-                .map(|waiter| waiter.priority)
+                .map(|waiter| effective_priority(waiter.priority, waiter.enqueued_at, aging))
                 .max()
                 .expect("waiters are not empty");
             let candidates = state
                 .waiters
                 .iter()
                 .enumerate()
-                .filter(|(_, waiter)| waiter.priority == highest)
+                .filter(|(_, waiter)| {
+                    effective_priority(waiter.priority, waiter.enqueued_at, aging) == highest
+                })
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
             let index = candidates
@@ -245,11 +274,15 @@ impl FairCapacity {
 
 impl CapacityController {
     fn new(workers: usize, labour: usize) -> Self {
+        Self::new_with_aging(workers, labour, priority_aging())
+    }
+
+    fn new_with_aging(workers: usize, labour: usize, aging: Duration) -> Self {
         let worker_limit = workers.max(1);
         let labour_limit = labour.max(1);
         Self {
-            workers: Arc::new(FairCapacity::new(worker_limit)),
-            labour: Arc::new(FairCapacity::new(labour_limit)),
+            workers: Arc::new(FairCapacity::new_with_aging(worker_limit, aging)),
+            labour: Arc::new(FairCapacity::new_with_aging(labour_limit, aging)),
             worker_limit,
             labour_limit,
         }
@@ -441,6 +474,7 @@ impl RunControl {
 /// admitted one so one project cannot monopolize all slots.
 struct AdmissionGate {
     limit: usize,
+    aging: Duration,
     state: Mutex<AdmissionState>,
 }
 
@@ -457,6 +491,7 @@ struct AdmissionWaiter {
     session_id: String,
     project_id: String,
     priority: i32,
+    enqueued_at: Instant,
     sender: oneshot::Sender<()>,
 }
 
@@ -472,8 +507,13 @@ impl Drop for AdmissionPermit {
 
 impl AdmissionGate {
     fn new(limit: usize) -> Self {
+        Self::new_with_aging(limit, priority_aging())
+    }
+
+    fn new_with_aging(limit: usize, aging: Duration) -> Self {
         Self {
             limit: limit.max(1),
+            aging,
             state: Mutex::new(AdmissionState {
                 active: 0,
                 waiters: Vec::new(),
@@ -507,6 +547,7 @@ impl AdmissionGate {
                 session_id: session_id.to_string(),
                 project_id: project_id.to_string(),
                 priority,
+                enqueued_at: Instant::now(),
                 sender,
             });
             (id, receiver)
@@ -548,7 +589,7 @@ impl AdmissionGate {
             let waiter = {
                 let last_session = state.last_session.as_deref();
                 let last_project = state.last_project.as_deref();
-                take_admission_waiter(&mut state.waiters, last_session, last_project)
+                take_admission_waiter(&mut state.waiters, last_session, last_project, self.aging)
             };
             let Some(waiter) = waiter else {
                 break;
@@ -578,15 +619,21 @@ fn take_admission_waiter(
     waiters: &mut Vec<AdmissionWaiter>,
     last_session: Option<&str>,
     last_project: Option<&str>,
+    aging: Duration,
 ) -> Option<AdmissionWaiter> {
     if waiters.is_empty() {
         return None;
     }
-    let highest = waiters.iter().map(|waiter| waiter.priority).max()?;
+    let highest = waiters
+        .iter()
+        .map(|waiter| effective_priority(waiter.priority, waiter.enqueued_at, aging))
+        .max()?;
     let candidates = waiters
         .iter()
         .enumerate()
-        .filter(|(_, waiter)| waiter.priority == highest)
+        .filter(|(_, waiter)| {
+            effective_priority(waiter.priority, waiter.enqueued_at, aging) == highest
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let index = candidates
@@ -12457,6 +12504,112 @@ for line in sys.stdin:
             .unwrap()
             .unwrap();
         assert_eq!((first_grant, second_grant), ("high", "low"));
+        low.await.unwrap();
+        high.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capacity_aging_boosts_low_priority_waiters() {
+        let capacity = Arc::new(CapacityController::new_with_aging(
+            1,
+            1,
+            Duration::from_millis(10),
+        ));
+        let holder = capacity
+            .try_acquire(AgentRole::Worker, "session-holder")
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let low_capacity = capacity.clone();
+        let low_control = Arc::new(RunControl::new());
+        let low_sender = sender.clone();
+        let low = tokio::spawn(async move {
+            let permit = low_capacity
+                .acquire(AgentRole::Worker, "session-low", 0, &low_control)
+                .await
+                .unwrap();
+            low_sender.send("low").unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let high_capacity = capacity.clone();
+        let high_control = Arc::new(RunControl::new());
+        let high_sender = sender.clone();
+        let high = tokio::spawn(async move {
+            let permit = high_capacity
+                .acquire(AgentRole::Worker, "session-high", 5, &high_control)
+                .await
+                .unwrap();
+            high_sender.send("high").unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(holder);
+
+        let first_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((first_grant, second_grant), ("low", "high"));
+        low.await.unwrap();
+        high.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admission_aging_boosts_low_priority_sessions() {
+        let gate = Arc::new(AdmissionGate::new_with_aging(1, Duration::from_millis(10)));
+        let holder_control = Arc::new(RunControl::new());
+        let holder = gate
+            .acquire("session-holder", "project-holder", 0, &holder_control)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let low_gate = gate.clone();
+        let low_control = Arc::new(RunControl::new());
+        let low_sender = sender.clone();
+        let low = tokio::spawn(async move {
+            let permit = low_gate
+                .acquire("session-low", "project-low", 0, &low_control)
+                .await
+                .unwrap();
+            low_sender.send("low").unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let high_gate = gate.clone();
+        let high_control = Arc::new(RunControl::new());
+        let high_sender = sender.clone();
+        let high = tokio::spawn(async move {
+            let permit = high_gate
+                .acquire("session-high", "project-high", 5, &high_control)
+                .await
+                .unwrap();
+            high_sender.send("high").unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(permit);
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(holder);
+
+        let first_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_grant = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((first_grant, second_grant), ("low", "high"));
         low.await.unwrap();
         high.await.unwrap();
     }

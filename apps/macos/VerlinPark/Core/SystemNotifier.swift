@@ -13,11 +13,36 @@ final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = SystemNotifier()
 
     var onOpenSession: ((String) -> Void)?
+    var onResolveApproval: ((String, Bool) -> Void)?
     private var requestedAuthorization = false
+
+    nonisolated static func approvalID(from noticeID: String) -> String? {
+        guard noticeID.hasPrefix("approval-") else { return nil }
+        let id = String(noticeID.dropFirst("approval-".count))
+        return id.isEmpty ? nil : id
+    }
 
     func requestAuthorization() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
+        let approve = UNNotificationAction(
+            identifier: "verlinpark.approve",
+            title: "Approve",
+            options: []
+        )
+        let deny = UNNotificationAction(
+            identifier: "verlinpark.deny",
+            title: "Deny",
+            options: [.destructive]
+        )
+        center.setNotificationCategories([
+            UNNotificationCategory(
+                identifier: "verlinpark.approval",
+                actions: [approve, deny],
+                intentIdentifiers: [],
+                options: []
+            ),
+        ])
         guard !requestedAuthorization else { return }
         requestedAuthorization = true
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
@@ -37,6 +62,10 @@ final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         content.body = notice.detail
         content.sound = .default
         content.userInfo = ["session_id": notice.sessionId]
+        if let approvalID = Self.approvalID(from: notice.id) {
+            content.categoryIdentifier = "verlinpark.approval"
+            content.userInfo["approval_id"] = approvalID
+        }
         let request = UNNotificationRequest(
             identifier: "verlinpark-\(notice.id)",
             content: content,
@@ -59,7 +88,15 @@ final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let sessionID = response.notification.request.content.userInfo["session_id"] as? String
+        let approvalID = response.notification.request.content.userInfo["approval_id"] as? String
+        let action = response.actionIdentifier
         Task { @MainActor in
+            if action == "verlinpark.approve" || action == "verlinpark.deny",
+               let approvalID
+            {
+                self.onResolveApproval?(approvalID, action == "verlinpark.approve")
+                return
+            }
             NSApp.activate(ignoringOtherApps: true)
             if let sessionID {
                 self.onOpenSession?(sessionID)
