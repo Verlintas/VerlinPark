@@ -88,6 +88,8 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
         .arg(root)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
         .output()
         .context("running git")?;
     if !output.status.success() {
