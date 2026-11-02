@@ -185,6 +185,14 @@ enum Command {
     Files { session: String },
     /// Show one session worktree file.
     File { session: String, path: String },
+    /// Show recent commits on the session branch.
+    History {
+        session: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Show one commit's stat and patch.
+    Show { session: String, commit: String },
     /// Write a session worktree file (content from --content or stdin).
     WriteFile {
         session: String,
@@ -766,6 +774,22 @@ async fn main() -> Result<()> {
                 &discovery,
                 "workspace.write",
                 json!({"session_id": session, "path": path, "content": content}),
+            )
+            .await?
+        }
+        Command::History { session, limit } => {
+            rpc(
+                &discovery,
+                "git.log",
+                json!({"session_id": session, "limit": limit}),
+            )
+            .await?
+        }
+        Command::Show { session, commit } => {
+            rpc(
+                &discovery,
+                "git.show",
+                json!({"session_id": session, "commit": commit}),
             )
             .await?
         }
@@ -1627,6 +1651,29 @@ fn print_human(value: &Value) {
             value["size"].as_u64().unwrap_or(0),
             &sha256[..sha256.len().min(12)]
         );
+        return;
+    }
+    if let Some(commits) = value.get("commits").and_then(Value::as_array) {
+        for commit in commits {
+            println!(
+                "{}  {}  {}  {}",
+                commit["short_hash"].as_str().unwrap_or("?"),
+                commit["author_date"].as_str().unwrap_or("?"),
+                commit["author"].as_str().unwrap_or("?"),
+                commit["subject"].as_str().unwrap_or("?")
+            );
+            if let Some(refs) = commit["refs"].as_str()
+                && !refs.is_empty()
+            {
+                println!("         {}", refs);
+            }
+        }
+        return;
+    }
+    if let Some(output) = value.get("output").and_then(Value::as_str)
+        && value.get("commit").is_some()
+    {
+        println!("{output}");
         return;
     }
     if let Some(entries) = value.get("entries").and_then(Value::as_array) {

@@ -184,6 +184,39 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertTrue(result.questions.first?.isPending == true)
     }
 
+    func testGitLogAndShowDecode() throws {
+        let logJSON = """
+        {
+          "session_id": "session-1",
+          "branch": "verlinpark/session",
+          "base_commit": "abc123",
+          "commits": [{
+            "hash": "deadbeef",
+            "short_hash": "deadbee",
+            "author": "Test User",
+            "email": "test@example.com",
+            "author_date": "2026-11-02T00:00:00Z",
+            "subject": "Ship history",
+            "refs": "HEAD -> verlinpark/session"
+          }]
+        }
+        """
+        let log = try JSONDecoder().decode(GitLogResult.self, from: Data(logJSON.utf8))
+        XCTAssertEqual(log.branch, "verlinpark/session")
+        XCTAssertEqual(log.commits.first?.shortHash, "deadbee")
+        XCTAssertEqual(log.commits.first?.subject, "Ship history")
+
+        let show = try JSONDecoder().decode(
+            GitShowResult.self,
+            from: Data(
+                #"{"session_id":"session-1","commit":"deadbeef","output":"diff --git a/x b/x","truncated":false}"#
+                    .utf8
+            )
+        )
+        XCTAssertEqual(show.commit, "deadbeef")
+        XCTAssertTrue(show.output.contains("diff --git"))
+    }
+
     func testWorkspaceTreeAndFileDecode() throws {
         let treeJSON = """
         {

@@ -4801,3 +4801,11 @@ async fn cancels_a_slow_provider_stream() {
     assert_eq!(sessions[0].status, "cancelled");
     assert!(!service.cancel(&session.id));
 }
+
+#[test]
+fn task_priority_contributes_to_capacity_priority() {
+    assert_eq!(task_capacity_priority(0, 20), 20);
+    assert_eq!(task_capacity_priority(10, -20), -10);
+    assert_eq!(task_capacity_priority(100, 100), 100);
+    assert_eq!(task_capacity_priority(-100, -100), -100);
+}

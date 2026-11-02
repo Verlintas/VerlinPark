@@ -63,6 +63,12 @@ fn priority_aging() -> Duration {
     }
 }
 
+fn task_capacity_priority(session_priority: i32, task_priority: i32) -> i32 {
+    session_priority
+        .saturating_add(task_priority)
+        .clamp(-100, 100)
+}
+
 fn effective_priority(priority: i32, enqueued_at: Instant, aging: Duration) -> i64 {
     if aging.is_zero() {
         return i64::from(priority);
@@ -4164,6 +4170,23 @@ async fn run_loop(
     conversation: &mut Vec<ChatMessage>,
     top_level: bool,
 ) -> Result<LoopOutcome> {
+    let task_priority = if let Some(task_id) = &spec.task_id {
+        engine
+            .get_team_plan(&session.id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|plan| {
+                plan.tasks
+                    .iter()
+                    .find(|task| &task.id == task_id)
+                    .map(|task| task.priority)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let capacity_priority = task_capacity_priority(session.priority, task_priority);
     let _capacity_permit =
         if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
             match config.capacity.try_acquire(spec.role, &session.id) {
@@ -4193,7 +4216,7 @@ async fn run_loop(
                     engine.update_agent_status(&spec.id, "queued").await?;
                     let permit = match config
                         .capacity
-                        .acquire(spec.role, &session.id, session.priority, control)
+                        .acquire(spec.role, &session.id, capacity_priority, control)
                         .await
                     {
                         Some(permit) => permit,

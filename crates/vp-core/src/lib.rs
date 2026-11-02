@@ -13,16 +13,16 @@ use uuid::Uuid;
 use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
     ArtifactMaterialization, ArtifactPolicy, ConsoleCloseResult, ConsoleOpenResult,
-    ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult, DoctorCheck, Event,
-    IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult,
-    McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer,
-    McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult,
-    MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
-    SearchResult, Session, SessionBundle, SessionCommit, SessionDiff, SessionImportResult,
-    SessionLandResult, SessionLogStatus, SessionRehydrateResult, SessionReplayReport,
-    SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem, UsageBucket,
-    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
+    ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult, DoctorCheck, Event, GitLogResult,
+    GitShowResult, IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult,
+    McpGetPromptResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult,
+    McpServer, McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem,
+    MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry,
+    Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
+    QuestionListResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
+    SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
+    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
+    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
     WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
     WorktreePolicyResult, WorktreeRetentionPolicy,
 };
@@ -34,6 +34,7 @@ use crate::budget::BudgetRegistry;
 pub mod agent;
 pub mod budget;
 pub mod console;
+pub mod history;
 pub mod mcp;
 pub mod rebuild;
 pub mod workspace;
@@ -4099,6 +4100,10 @@ impl Engine {
     }
 
     async fn workspace_root(&self, session_id: &str) -> Result<String> {
+        Ok(self.workspace_session(session_id).await?.1)
+    }
+
+    async fn workspace_session(&self, session_id: &str) -> Result<(Session, String)> {
         let store = self.store.clone();
         let id = session_id.to_string();
         let session = tokio::task::spawn_blocking(move || store.get_session(&id))
@@ -4108,9 +4113,32 @@ impl Engine {
             anyhow::bail!("imported sessions are read-only archives");
         }
         let session = self.ensure_session_worktree(&session.id).await?;
-        session
+        let worktree = session
             .worktree
-            .ok_or_else(|| anyhow::anyhow!("session has no worktree"))
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?;
+        Ok((session, worktree))
+    }
+
+    pub async fn git_log(&self, session_id: &str, limit: u32) -> Result<GitLogResult> {
+        let (session, root) = self.workspace_session(session_id).await?;
+        let commits =
+            tokio::task::spawn_blocking(move || history::log(Path::new(&root), limit)).await??;
+        Ok(GitLogResult {
+            session_id: session_id.to_string(),
+            branch: session.branch,
+            base_commit: session.base_commit,
+            commits,
+        })
+    }
+
+    pub async fn git_show(&self, session_id: &str, commit: &str) -> Result<GitShowResult> {
+        let (_, root) = self.workspace_session(session_id).await?;
+        let commit = commit.to_string();
+        let mut result =
+            tokio::task::spawn_blocking(move || history::show(Path::new(&root), &commit)).await??;
+        result.session_id = session_id.to_string();
+        Ok(result)
     }
 
     pub async fn list_questions(&self, session_id: Option<String>) -> Result<QuestionListResult> {

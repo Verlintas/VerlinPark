@@ -187,6 +187,8 @@ just cli console <session-id> "cargo test"
 just cli files <session-id>
 just cli file <session-id> src/main.rs
 echo "new content" | just cli write-file <session-id> src/main.rs
+just cli history <session-id>
+just cli show <session-id> <commit>
 just cli project-budget <project-id>
 just cli project-budget-set <project-id> --token-budget 500000 --cost-budget-usd 5
 just cli doctor

@@ -1116,6 +1116,58 @@ extension Int {
     }
 }
 
+struct GitCommit: Codable, Identifiable, Hashable, Sendable {
+    let hash: String
+    let shortHash: String
+    let author: String
+    let email: String
+    let authorDate: String
+    let subject: String
+    let refs: String
+
+    var id: String {
+        hash
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case hash
+        case shortHash = "short_hash"
+        case author
+        case email
+        case authorDate = "author_date"
+        case subject
+        case refs
+    }
+}
+
+struct GitLogResult: Codable, Sendable {
+    let sessionId: String
+    let branch: String?
+    let baseCommit: String?
+    let commits: [GitCommit]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case branch
+        case baseCommit = "base_commit"
+        case commits
+    }
+}
+
+struct GitShowResult: Codable, Sendable {
+    let sessionId: String
+    let commit: String
+    let output: String
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case commit
+        case output
+        case truncated
+    }
+}
+
 struct WorkspaceEntry: Codable, Identifiable, Hashable, Sendable {
     let path: String
     let name: String

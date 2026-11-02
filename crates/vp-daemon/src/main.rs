@@ -29,25 +29,25 @@ use vp_protocol::types::{
     AuthParams, AuthResult, CancelSessionParams, CancelSessionResult, CleanupWorktreesParams,
     CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
     ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, CreateSessionParams,
-    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, IntegrationPolicyParams,
-    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
-    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
-    MailboxPolicyResult, MarkMessageReadParams, McpCallParams, McpGetPromptParams,
-    McpReadResourceParams, McpServerIdParams, MemoryCreateParams, MemoryCreateResult,
-    MemoryDeleteParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
-    MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams, PingResult,
-    ProjectBudgetParams, ProjectListResult, ProjectUsageParams, PromptParams, PromptResult,
-    QuestionListParams, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
-    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
-    RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams, SessionExportParams,
-    SessionImportParams, SessionListResult, SessionLogParams, SessionPauseParams,
-    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams,
-    SessionResumeResult, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
-    SetArtifactPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
-    SetMemoryPolicyParams, SetProjectBudgetParams, SetShellPolicyParams, SetWorktreePolicyParams,
-    ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult,
-    UpdateMcpServerParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceTreeParams,
-    WorkspaceWriteParams, WorktreePolicyParams,
+    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, GitLogParams, GitShowParams,
+    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
+    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
+    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
+    McpGetPromptParams, McpReadResourceParams, McpServerIdParams, MemoryCreateParams,
+    MemoryCreateResult, MemoryDeleteParams, MemoryListParams, MemoryPolicyParams,
+    MemoryPruneParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
+    PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams, PromptParams,
+    PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
+    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
+    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams,
+    SessionExportParams, SessionImportParams, SessionListResult, SessionLogParams,
+    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
+    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams, SetShellPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams,
+    TeamPlanResult, UpdateMcpServerParams, UsageLedgerParams, WorkspaceFileParams,
+    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -564,6 +564,28 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "console.close" => match parse_params::<ConsoleCloseParams>(request.params) {
             Ok(params) => match state.engine.console_close(&params.console_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "git.log" => match parse_params::<GitLogParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .git_log(&params.session_id, params.limit.unwrap_or(50))
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "git.show" => match parse_params::<GitShowParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .git_show(&params.session_id, &params.commit)
+                .await
+            {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },

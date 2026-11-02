@@ -95,6 +95,16 @@ final class AppModel {
     var memoryQuery = ""
     var memoryBusy = false
     var memoryStatus: String?
+    var gitCommits: [GitCommit] = []
+    var gitBranch: String?
+    var gitBaseCommit: String?
+    var gitLogBusy = false
+    var gitLogError: String?
+    var gitSelectedCommit: String?
+    var gitShow: GitShowResult?
+    var gitShowBusy = false
+    var gitShowError: String?
+    var gitHistorySessionID: String?
     var workspaceEntries: [WorkspaceEntry] = []
     var workspaceTreeBusy = false
     var workspaceTreeError: String?
@@ -1025,6 +1035,61 @@ final class AppModel {
         memoryPolicyEnabled = policy.enabled
         memoryPolicyMaxItems = policy.maxItems.map(String.init) ?? ""
         memoryPolicyMaxAgeDays = policy.maxAgeDays.map(String.init) ?? ""
+    }
+
+    func loadGitHistory() async {
+        guard let sessionID = selectedSessionID else {
+            gitCommits = []
+            gitSelectedCommit = nil
+            gitShow = nil
+            gitHistorySessionID = nil
+            return
+        }
+        let sessionChanged = gitHistorySessionID != sessionID
+        gitHistorySessionID = sessionID
+        if sessionChanged {
+            gitSelectedCommit = nil
+            gitShow = nil
+        }
+        gitLogBusy = true
+        defer { gitLogBusy = false }
+        do {
+            let result = try await core.gitLog(sessionID: sessionID)
+            guard sessionID == selectedSessionID else { return }
+            gitCommits = result.commits
+            gitBranch = result.branch
+            gitBaseCommit = result.baseCommit
+            gitLogError = nil
+            if let selected = gitSelectedCommit,
+               !result.commits.contains(where: { $0.hash == selected })
+            {
+                gitSelectedCommit = nil
+                gitShow = nil
+            }
+            if let selected = gitSelectedCommit {
+                await loadGitCommit(selected)
+            } else if let first = result.commits.first {
+                await loadGitCommit(first.hash)
+            }
+        } catch {
+            gitLogError = error.localizedDescription
+        }
+    }
+
+    func loadGitCommit(_ hash: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        gitSelectedCommit = hash
+        gitShowBusy = true
+        gitShowError = nil
+        defer { gitShowBusy = false }
+        do {
+            let show = try await core.gitShow(sessionID: sessionID, commit: hash)
+            guard sessionID == selectedSessionID else { return }
+            gitShow = show
+        } catch {
+            gitShow = nil
+            gitShowError = error.localizedDescription
+        }
     }
 
     func loadWorkspaceTree() async {

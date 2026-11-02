@@ -227,6 +227,49 @@ pub struct SessionPriorityResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct GitLogParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GitCommit {
+    pub hash: String,
+    pub short_hash: String,
+    pub author: String,
+    pub email: String,
+    pub author_date: String,
+    pub subject: String,
+    #[serde(default)]
+    pub refs: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitLogResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub base_commit: Option<String>,
+    pub commits: Vec<GitCommit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitShowParams {
+    pub session_id: String,
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitShowResult {
+    pub session_id: String,
+    pub commit: String,
+    pub output: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct WorkspaceTreeParams {
     pub session_id: String,
 }

@@ -577,6 +577,25 @@ actor CoreClient {
             .decode(McpCallResult.self)
     }
 
+    func gitLog(sessionID: String, limit: Int = 50) async throws -> GitLogResult {
+        try await request(
+            method: "git.log",
+            params: [
+                "session_id": .string(sessionID),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(GitLogResult.self)
+    }
+
+    func gitShow(sessionID: String, commit: String) async throws -> GitShowResult {
+        try await request(
+            method: "git.show",
+            params: ["session_id": .string(sessionID), "commit": .string(commit)]
+        )
+        .decode(GitShowResult.self)
+    }
+
     func workspaceTree(sessionID: String) async throws -> WorkspaceTreeResult {
         try await request(
             method: "workspace.tree",
