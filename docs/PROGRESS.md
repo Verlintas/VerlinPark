@@ -46,6 +46,7 @@
 | DB rebuild | ✅ | `vp db-rebuild [--dry-run]`：读取 `projects.jsonl` 最新项目/policy/budget 快照 + 每个 session 的 `events.jsonl`，备份旧 DB，重建 projects/sessions/events/projections；worktree/branch/artifact blobs 原样保留；无 `session.created` 的 imported archive 跳过并报告 |
 | 容量 | ✅ | 默认 4 Managers / 6 Workers / 12 Labour；runtime caps 5/10/40；plan ≤100 tasks；`delegate_many` ≤10；Worker/Labour 用 active slot，plan batch 按可用容量选择 |
 | Global scheduling | ✅ | daemon-wide session admission：`VERLINPARK_GLOBAL_SESSION_CAP` 默认 4（1–32）；session priority -100..100（`session-new --priority` / New Session 选择器），高优先级先准入，aging 每 `VERLINPARK_PRIORITY_AGING_SECS`（默认 60，0 关闭）提升 1 点至 +100，同优先级按 session/project round-robin；超出时 session 状态 `queued`，`agent.queued`；daemon 重启时 queued session 保留并 re-enqueue（running/paused 仍标 failed）；跨 session Worker/Labour write-scope 锁按 project 串行等待，同 session 共享，空 scope 视为 wildcard；Worker/Labour capacity controller：`VERLINPARK_GLOBAL_WORKERS` 默认 12、`VERLINPARK_GLOBAL_LABOUR` 默认 24（1–100），run 级 permit、provider 重配置不重置、`agent.info`/Settings 可见；等待 permit 时写 `agent.capacity_wait` 并标 `queued`，获得后写 `agent.capacity_ready`；capacity 也按 session priority + aging + round-robin；仍是进程内、无跨 session task-DAG 队列/持久 lease |
+| Team capacity | ✅ | Settings → Providers → Team capacity：Managers 1–5 / Workers 1–10 / Labour 1–40 Stepper，Apply 写入 UserDefaults 并通过 `agent.configure` 应用；默认 4/6/12，运行时 hard cap 5/10/40 |
 | Provider | ✅ | OpenAI-compatible + Anthropic；`agent.probe` / `vp provider-test` / Settings Test connection 发送一次无工具 16-token 请求，检查 endpoint/key/model/stream；429/5xx/connection 在 stream 开始前最多重试 3 次（Retry-After + 指数退避，15s connect timeout）；stream 建立后每个事件最多等待 `VERLINPARK_PROVIDER_IDLE_SECS`（默认 300，10–3600），超时使 run 失败；OpenAI-compatible 与 Anthropic 都有本地 HTTP 全链路 E2E（plan → Worker write → approval → Verifier → Integrator） |
 | Models / budgets | ✅ | 分角色 model override + input/output USD/1M price；session token / USD / wall-clock budget；project-wide shared token/USD pool；TeamPlan department/task token/USD budgets；per-call `usage_ledger`（agent/role/task/department/model/tokens/estimated/cost）+ `session.usage` / `vp usage` / Preview → Cost 分组汇总；`session.usage_csv` / `vp usage --csv` / Preview Export CSV（RFC 4180 转义，逐 call 一行）；`project.usage` / `vp project-usage` / Manage Dash 按 session 汇总 tokens/cost/calls；`agent.usage` / `agent.cost`；time 在 turn/tool 边界检查；Providers/New Session/CLI/UI |
 | CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/artifact/backfill-artifacts/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/search/transcript/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate/cleanup-worktrees/worktree-policy/worktree-policy-set/project-budget/project-budget-set/project-usage/resume-plan/memory/remember/memory-delete/memory-prune/memory-policy/memory-policy-set/questions/answer/mcp-servers/mcp-add/mcp-remove/mcp-tools/mcp-call/mcp-resources/mcp-read-resource/mcp-prompts/mcp-prompt/console/files/file/write-file/doctor/provider-test/db-rebuild |
@@ -59,7 +60,7 @@
 ## 验证
 
 - `cargo test --workspace`：171 个测试通过（core 134、store 29、providers 8）。
-- `xcodebuild test`：32 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
+- `xcodebuild test`：33 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
 - 手工 E2E 已覆盖：Leader/Manager/Worker/Labour 委派、task worktree、并行 Worker、Verifier approve/reject、TeamPlan 自动派发、Manager 圆桌、审批、diff、commit/discard、预算/取消/暂停恢复、项目 shell policy get/set。
@@ -201,6 +202,8 @@
 - **M3 第七十九切片**：workspace text editing（expected_sha256 冲突检测、atomic write、`workspace.file_saved` 事件、dirty/save/reload UI、CLI）；见 ADR-0082。
 - **M3 第八十切片**：priority aging（`VERLINPARK_PRIORITY_AGING_SECS`、+100 cap、admission/capacity 测试）。
 - **M3 第八十一切片**：approval 通知 Approve/Deny actions（category、action routing、测试）。
+- **M3 第八十二切片**：Team capacity Settings 编辑器（Managers/Workers/Labour Stepper + apply）。
+- **M3 第八十三切片**：测试模块拆分（`agent/tests.rs`、`lib.rs` 测试移到 `tests.rs`、`store/tests.rs`），无行为变更。
 
 ## 如何运行
 

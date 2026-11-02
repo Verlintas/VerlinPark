@@ -1110,6 +1110,10 @@ extension Int {
     var clampedTokenBudget: Int {
         Swift.max(1000, Swift.min(self, 2_000_000))
     }
+
+    func clamped(to range: ClosedRange<Int>) -> Int {
+        Swift.max(range.lowerBound, Swift.min(self, range.upperBound))
+    }
 }
 
 struct WorkspaceEntry: Codable, Identifiable, Hashable, Sendable {

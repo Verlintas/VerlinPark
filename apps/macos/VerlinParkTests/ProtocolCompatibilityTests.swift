@@ -261,6 +261,12 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(closed.exitCode, 0)
     }
 
+    func testIntegerClamping() {
+        XCTAssertEqual(99.clamped(to: 1 ... 5), 5)
+        XCTAssertEqual((-3).clamped(to: 1 ... 5), 1)
+        XCTAssertEqual(3.clamped(to: 1 ... 5), 3)
+    }
+
     func testApprovalNotificationIDExtraction() {
         XCTAssertEqual(
             SystemNotifier.approvalID(from: "approval-abc-123"),

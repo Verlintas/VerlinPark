@@ -432,6 +432,23 @@ struct ProvidersSettingsView: View {
                 RoleModelRow(title: "Labour", config: $model.roleModels.labour)
             }
 
+            Section("Team capacity") {
+                Stepper("Managers: \(model.orgManagers)", value: $model.orgManagers, in: 1 ... 5)
+                Stepper("Workers: \(model.orgWorkers)", value: $model.orgWorkers, in: 1 ... 10)
+                Stepper("Labour: \(model.orgLabour)", value: $model.orgLabour, in: 1 ... 40)
+                Text(
+                    "Per-session hard caps. Defaults are 4 Managers / 6 Workers / 12 Labour; runtime limits are 5 / 10 / 40. Applying also re-saves the current provider configuration."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Button("Apply capacity") {
+                    Task { await model.saveOrgCaps() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.providerBusy)
+            }
+
             Section("Global capacity") {
                 if let capacity = model.agentInfo?.capacity {
                     LabeledContent(

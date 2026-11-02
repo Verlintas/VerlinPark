@@ -152,6 +152,9 @@ final class AppModel {
             ?? "https://api.openai.com/v1"
     var providerModel = UserDefaults.standard.string(forKey: "provider.model") ?? ""
     var roleModels = AppModel.loadRoleModels()
+    var orgManagers = 4
+    var orgWorkers = 6
+    var orgLabour = 12
     var providerAPIKey = Keychain.read(account: "provider.apiKey") ?? ""
     var providerStatus: String?
     var providerBusy = false
@@ -236,6 +239,7 @@ final class AppModel {
             try await core.connect(to: discovery)
             connection = .connected
             loadNotices()
+            loadOrgCaps()
             SystemNotifier.shared.requestAuthorization()
             SystemNotifier.shared.onResolveApproval = { [weak self] approvalID, approved in
                 guard let self else { return }
@@ -1608,12 +1612,32 @@ final class AppModel {
     }
 
     private var orgCaps: (managers: Int, workers: Int, labour: Int) {
+        (orgManagers, orgWorkers, orgLabour)
+    }
+
+    func loadOrgCaps() {
         let defaults = UserDefaults.standard
-        return (
-            defaults.object(forKey: "verlinpark.org.managers") as? Int ?? 4,
-            defaults.object(forKey: "verlinpark.org.workers") as? Int ?? 6,
-            defaults.object(forKey: "verlinpark.org.labour") as? Int ?? 12
-        )
+        orgManagers = (defaults.object(forKey: "verlinpark.org.managers") as? Int ?? 4)
+            .clamped(to: 1 ... 5)
+        orgWorkers = (defaults.object(forKey: "verlinpark.org.workers") as? Int ?? 6)
+            .clamped(to: 1 ... 10)
+        orgLabour = (defaults.object(forKey: "verlinpark.org.labour") as? Int ?? 12)
+            .clamped(to: 1 ... 40)
+    }
+
+    func saveOrgCaps() async {
+        orgManagers = orgManagers.clamped(to: 1 ... 5)
+        orgWorkers = orgWorkers.clamped(to: 1 ... 10)
+        orgLabour = orgLabour.clamped(to: 1 ... 40)
+        let defaults = UserDefaults.standard
+        defaults.set(orgManagers, forKey: "verlinpark.org.managers")
+        defaults.set(orgWorkers, forKey: "verlinpark.org.workers")
+        defaults.set(orgLabour, forKey: "verlinpark.org.labour")
+        guard agentInfo?.configured == true else {
+            providerStatus = "Team capacity saved. Configure a provider to apply it."
+            return
+        }
+        await saveProviderSettings()
     }
 
     func saveProviderSettings() async {
@@ -1643,6 +1667,10 @@ final class AppModel {
             )
             agentInfo = info
             roleModels = info.roleModels
+            let defaults = UserDefaults.standard
+            defaults.set(orgManagers, forKey: "verlinpark.org.managers")
+            defaults.set(orgWorkers, forKey: "verlinpark.org.workers")
+            defaults.set(orgLabour, forKey: "verlinpark.org.labour")
             UserDefaults.standard.set(providerKind, forKey: "provider.kind")
             UserDefaults.standard.set(baseURL, forKey: "provider.baseURL")
             UserDefaults.standard.set(model, forKey: "provider.model")
