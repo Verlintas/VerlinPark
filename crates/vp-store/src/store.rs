@@ -23,6 +23,7 @@ use crate::paths;
 #[derive(Debug, Clone)]
 pub struct SessionRepair {
     pub status: String,
+    pub priority: Option<i32>,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub replace_plan: bool,
@@ -946,6 +947,34 @@ impl Store {
             params![priority, session_id],
         )?;
         Ok(())
+    }
+
+    pub fn set_session_priority_with_event(
+        &self,
+        session_id: &str,
+        priority: i32,
+    ) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET priority = ?1 WHERE id = ?2",
+            params![priority, session_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "session.priority",
+            serde_json::json!({"priority": priority}),
+        )?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
     }
 
     pub fn set_session_worktree(
@@ -3785,10 +3814,12 @@ impl Store {
         let tx = conn.transaction()?;
         let changed = tx.execute(
             "UPDATE sessions
-             SET status = ?1, tokens_in = ?2, tokens_out = ?3
-             WHERE id = ?4",
+             SET status = ?1, priority = COALESCE(?2, priority),
+                 tokens_in = ?3, tokens_out = ?4
+             WHERE id = ?5",
             params![
                 repair.status,
+                repair.priority,
                 repair.tokens_in as i64,
                 repair.tokens_out as i64,
                 session_id

@@ -335,6 +335,12 @@ final class ProtocolCompatibilityTests: XCTestCase {
         let legacy = json.replacingOccurrences(of: #""priority": 25,"#, with: "")
         let oldSession = try JSONDecoder().decode(Session.self, from: Data(legacy.utf8))
         XCTAssertNil(oldSession.priority)
+
+        let updated = try JSONDecoder().decode(
+            SessionPriorityResult.self,
+            from: Data(#"{"session_id":"session-1","priority":40}"#.utf8)
+        )
+        XCTAssertEqual(updated.priority, 40)
     }
 
     func testMemoryListDecodes() throws {

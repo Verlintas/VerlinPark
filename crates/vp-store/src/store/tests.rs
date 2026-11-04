@@ -1034,3 +1034,23 @@ fn lists_sessions_by_project() {
     assert_eq!(sessions.len(), 2);
     assert_eq!(store.list_sessions(None).unwrap().len(), 2);
 }
+
+#[test]
+fn updates_session_priority_with_an_event() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "priority").unwrap();
+    let event = store
+        .set_session_priority_with_event(&session.id, 42)
+        .unwrap();
+    assert_eq!(event.kind, "session.priority");
+    assert_eq!(event.payload["priority"], 42);
+    assert_eq!(
+        store.get_session(&session.id).unwrap().unwrap().priority,
+        42
+    );
+    let events = store.list_events(&session.id, 1, 10).unwrap();
+    assert!(events.iter().any(|event| event.kind == "session.priority"));
+}

@@ -351,11 +351,29 @@ struct SessionChatView: View {
                             Image(systemName: "arrow.triangle.branch")
                             Text(branch)
                         }
-                        if let priority = session.priority, priority != 0 {
-                            Text("·")
-                            Image(systemName: "flag.fill")
-                            Text("priority \(priority)")
+                        Text("·")
+                        Menu {
+                            Button("Low (-10)") {
+                                Task { await model.setSessionPriority(-10) }
+                            }
+                            Button("Normal (0)") {
+                                Task { await model.setSessionPriority(0) }
+                            }
+                            Button("High (10)") {
+                                Task { await model.setSessionPriority(10) }
+                            }
+                            Button("Urgent (50)") {
+                                Task { await model.setSessionPriority(50) }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "flag")
+                                Text("priority \(session.priority ?? 0)")
+                            }
                         }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("Set session priority")
                     }
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.tertiary)

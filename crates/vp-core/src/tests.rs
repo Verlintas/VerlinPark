@@ -2650,3 +2650,52 @@ async fn creates_session_and_broadcasts_event() {
     let events = engine.list_events(session.id, 0, 10).await.unwrap();
     assert_eq!(events.len(), 1);
 }
+
+#[tokio::test]
+async fn updates_session_priority_and_rebuilds_the_projection() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("priority update".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "priority update".into(), None)
+        .await
+        .unwrap();
+    let result = engine.set_session_priority(&session.id, 50).await.unwrap();
+    assert_eq!(result.priority, 50);
+    assert_eq!(
+        engine
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == session.id)
+            .unwrap()
+            .priority,
+        50
+    );
+    assert!(engine.set_session_priority(&session.id, 101).await.is_err());
+
+    engine.store().set_session_priority(&session.id, 0).unwrap();
+    engine.rebuild_session(&session.id).await.unwrap();
+    let events = engine.list_events(session.id.clone(), 0, 50).await.unwrap();
+    assert!(events.iter().any(|event| event.kind == "session.priority"));
+    assert_eq!(
+        engine
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == session.id)
+            .unwrap()
+            .priority,
+        50
+    );
+}

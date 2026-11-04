@@ -200,6 +200,8 @@ enum Command {
         #[arg(long)]
         content: Option<String>,
     },
+    /// Set a session priority from -100 to 100.
+    SessionPriority { session: String, priority: i32 },
     /// Search messages and event payloads across sessions.
     Search {
         query: String,
@@ -790,6 +792,14 @@ async fn main() -> Result<()> {
                 &discovery,
                 "git.show",
                 json!({"session_id": session, "commit": commit}),
+            )
+            .await?
+        }
+        Command::SessionPriority { session, priority } => {
+            rpc(
+                &discovery,
+                "session.priority.set",
+                json!({"session_id": session, "priority": priority}),
             )
             .await?
         }
@@ -1650,6 +1660,17 @@ fn print_human(value: &Value) {
             value["path"].as_str().unwrap_or("?"),
             value["size"].as_u64().unwrap_or(0),
             &sha256[..sha256.len().min(12)]
+        );
+        return;
+    }
+    if let Some(priority) = value.get("priority").and_then(Value::as_i64)
+        && value.get("session_id").is_some()
+        && value.get("commits").is_none()
+    {
+        println!(
+            "session {} priority={}",
+            value["session_id"].as_str().unwrap_or("?"),
+            priority
         );
         return;
     }

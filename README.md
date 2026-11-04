@@ -144,6 +144,7 @@ just cli shell-policy-set <project-id> --network deny --restrict-home --read-den
 just cli integration-policy <project-id>
 just cli integration-policy-set <project-id> --auto-resolve --max-auto-attempts 1 --max-resolve-tokens 50000
 just cli session-new <project-id> "Add team invitations" --priority 10 --cost-budget-usd 5 --time-budget-secs 1800
+just cli session-priority <session-id> 50
 just cli events <session-id>
 just cli prompt <session-id> "Now add tests"
 just cli diff <session-id>

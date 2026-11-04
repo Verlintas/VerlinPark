@@ -20,11 +20,11 @@ use vp_protocol::types::{
     MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry,
     Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
     QuestionListResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
-    SessionImportResult, SessionLandResult, SessionLogStatus, SessionRehydrateResult,
-    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TeamPlan, TodoItem,
-    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
-    WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
-    WorktreePolicyResult, WorktreeRetentionPolicy,
+    SessionImportResult, SessionLandResult, SessionLogStatus, SessionPriorityResult,
+    SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
+    StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
+    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
+    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -3020,8 +3020,17 @@ impl Engine {
             );
             None
         };
+        let priority = data
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "session.priority")
+            .and_then(|event| event.payload.get("priority"))
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
         Ok(SessionRepair {
             status,
+            priority,
             tokens_in,
             tokens_out,
             replace_plan,
@@ -3549,6 +3558,27 @@ impl Engine {
         .await?;
         let data = self.load_replay_data(session_id).await?;
         Self::replay_report(&data, true)
+    }
+
+    pub async fn set_session_priority(
+        &self,
+        session_id: &str,
+        priority: i32,
+    ) -> Result<SessionPriorityResult> {
+        if !(-100..=100).contains(&priority) {
+            anyhow::bail!("session priority must be between -100 and 100");
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let event = tokio::task::spawn_blocking(move || {
+            store.set_session_priority_with_event(&id, priority)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(SessionPriorityResult {
+            session_id: session_id.to_string(),
+            priority,
+        })
     }
 
     pub async fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {

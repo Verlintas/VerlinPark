@@ -386,6 +386,16 @@ struct UsageCsvResult: Codable, Sendable {
     }
 }
 
+struct SessionPriorityResult: Codable, Sendable {
+    let sessionId: String
+    let priority: Int
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case priority
+    }
+}
+
 struct SessionPlanResumeResult: Codable, Sendable {
     let sessionId: String
     let started: Bool

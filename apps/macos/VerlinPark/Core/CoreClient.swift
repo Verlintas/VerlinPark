@@ -817,6 +817,17 @@ actor CoreClient {
             .approvals
     }
 
+    func setSessionPriority(sessionID: String, priority: Int) async throws -> SessionPriorityResult {
+        try await request(
+            method: "session.priority.set",
+            params: [
+                "session_id": .string(sessionID),
+                "priority": .number(Double(priority)),
+            ]
+        )
+        .decode(SessionPriorityResult.self)
+    }
+
     func cancelSession(sessionID: String) async throws -> Bool {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.cancel", params: params)

@@ -651,6 +651,39 @@ final class AppModel {
         }
     }
 
+    func setSessionPriority(_ priority: Int) async {
+        guard let sessionID = selectedSessionID else { return }
+        do {
+            let result = try await core.setSessionPriority(
+                sessionID: sessionID,
+                priority: priority
+            )
+            if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
+                let old = sessions[index]
+                sessions[index] = Session(
+                    id: old.id,
+                    projectId: old.projectId,
+                    goal: old.goal,
+                    status: old.status,
+                    priority: result.priority,
+                    worktree: old.worktree,
+                    branch: old.branch,
+                    tokenBudget: old.tokenBudget,
+                    costBudgetUsd: old.costBudgetUsd,
+                    timeBudgetSecs: old.timeBudgetSecs,
+                    costSpentUsd: old.costSpentUsd,
+                    baseCommit: old.baseCommit,
+                    tokensIn: old.tokensIn,
+                    tokensOut: old.tokensOut,
+                    createdAt: old.createdAt
+                )
+            }
+            lastError = nil
+        } catch {
+            handle(error)
+        }
+    }
+
     func cancelSession() async {
         guard let sessionID = selectedSessionID else { return }
         do {

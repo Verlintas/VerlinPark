@@ -44,10 +44,11 @@ use vp_protocol::types::{
     SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
     SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams, SetShellPolicyParams,
-    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams, TeamPlanParams,
-    TeamPlanResult, UpdateMcpServerParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
+    SetSessionPriorityParams, SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams,
+    ShellPolicyResult, SubscribeParams, TeamPlanParams, TeamPlanResult, UpdateMcpServerParams,
+    UsageLedgerParams, WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams,
+    WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -618,6 +619,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     params.content,
                     params.expected_sha256,
                 )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.priority.set" => match parse_params::<SetSessionPriorityParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_session_priority(&params.session_id, params.priority)
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
