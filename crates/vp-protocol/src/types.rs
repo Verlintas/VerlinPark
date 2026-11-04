@@ -1244,6 +1244,8 @@ pub struct ConfigureAgentParams {
     pub max_workers: Option<u32>,
     #[serde(default)]
     pub max_labour: Option<u32>,
+    #[serde(default)]
+    pub auto_expand_workers: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

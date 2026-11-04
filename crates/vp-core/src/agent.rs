@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,17 @@ fn global_labour_cap() -> usize {
         .clamp(1, 100)
 }
 
+fn auto_expand_workers() -> bool {
+    env::var("VERLINPARK_AUTO_EXPAND_WORKERS")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+}
+
 fn priority_aging() -> Duration {
     let seconds = env::var("VERLINPARK_PRIORITY_AGING_SECS")
         .ok()
@@ -90,6 +101,7 @@ pub struct AgentConfig {
     pub max_managers: usize,
     pub max_workers: usize,
     pub max_labour: usize,
+    pub auto_expand_workers: bool,
     pub integration_command: Option<String>,
     pub tools: ToolRegistry,
     /// Maximum number of session runs active across the whole daemon.
@@ -841,12 +853,15 @@ struct McpToolBinding {
 
 const MAX_DYNAMIC_MCP_TOOLS: usize = 32;
 
+const HARD_WORKER_CAP: usize = 10;
+
 struct SessionBudget {
     limit: Option<u64>,
     cost_limit: Option<f64>,
     time_limit: Option<Duration>,
     started: std::time::Instant,
     caps: AgentCaps,
+    worker_cap: AtomicUsize,
     state: Mutex<BudgetState>,
 }
 
@@ -884,6 +899,17 @@ impl Drop for AgentSlot<'_> {
     }
 }
 
+struct WorkerCapGuard<'a> {
+    budget: &'a SessionBudget,
+    original: usize,
+}
+
+impl Drop for WorkerCapGuard<'_> {
+    fn drop(&mut self) {
+        self.budget.set_worker_cap(self.original);
+    }
+}
+
 struct TokenReservation<'a> {
     budget: &'a SessionBudget,
     amount: u64,
@@ -897,6 +923,7 @@ impl SessionBudget {
             time_limit: None,
             started: std::time::Instant::now(),
             caps,
+            worker_cap: AtomicUsize::new(caps.workers),
             state: Mutex::new(BudgetState {
                 spent,
                 reserved_tokens: 0,
@@ -1001,6 +1028,28 @@ impl SessionBudget {
         self.started.elapsed().as_secs()
     }
 
+    fn worker_cap(&self) -> usize {
+        self.worker_cap.load(Ordering::SeqCst)
+    }
+
+    fn set_worker_cap(&self, cap: usize) {
+        self.worker_cap
+            .store(cap.clamp(1, HARD_WORKER_CAP), Ordering::SeqCst);
+    }
+
+    fn expand_workers(&self, target: usize) {
+        let target = target.clamp(1, HARD_WORKER_CAP);
+        self.worker_cap.fetch_max(target, Ordering::SeqCst);
+    }
+
+    fn can_expand_workers(&self) -> bool {
+        let Some(limit) = self.limit else {
+            return true;
+        };
+        self.available_tokens()
+            .is_some_and(|available| available >= limit.saturating_mul(20) / 100)
+    }
+
     fn available_tokens(&self) -> Option<u64> {
         let limit = self.limit?;
         let state = self.state.lock().ok()?;
@@ -1030,7 +1079,7 @@ impl SessionBudget {
         let mut state = self.state.lock().ok()?;
         let (counter, cap) = match role {
             AgentRole::Manager => (&mut state.managers, self.caps.managers),
-            AgentRole::Worker => (&mut state.workers, self.caps.workers),
+            AgentRole::Worker => (&mut state.workers, self.worker_cap.load(Ordering::SeqCst)),
             AgentRole::Verifier => (&mut state.verifiers, 100),
             AgentRole::Labour => (&mut state.labour, self.caps.labour),
             AgentRole::Leader => return None,
@@ -1067,7 +1116,7 @@ impl SessionBudget {
         };
         let (active, cap) = match role {
             AgentRole::Manager => (state.managers, self.caps.managers),
-            AgentRole::Worker => (state.workers, self.caps.workers),
+            AgentRole::Worker => (state.workers, self.worker_cap.load(Ordering::SeqCst)),
             AgentRole::Verifier => (state.verifiers, 100),
             AgentRole::Labour => (state.labour, self.caps.labour),
             AgentRole::Leader => return 0,
@@ -1279,6 +1328,7 @@ impl AgentService {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(40),
+                auto_expand_workers: auto_expand_workers(),
                 integration_command: env::var("VERLINPARK_INTEGRATION_COMMAND")
                     .ok()
                     .filter(|command| !command.trim().is_empty()),
@@ -1367,6 +1417,7 @@ impl AgentService {
             max_managers: params.max_managers.unwrap_or(5).clamp(1, 5) as usize,
             max_workers: params.max_workers.unwrap_or(10).clamp(1, 10) as usize,
             max_labour: params.max_labour.unwrap_or(40).clamp(1, 40) as usize,
+            auto_expand_workers: params.auto_expand_workers.unwrap_or(false),
             integration_command: env::var("VERLINPARK_INTEGRATION_COMMAND")
                 .ok()
                 .filter(|command| !command.trim().is_empty()),
@@ -7368,6 +7419,11 @@ async fn execute_team_plan(
     leader_spec: &AgentSpec,
     plan: &TeamPlan,
 ) -> Result<PlanRunResult> {
+    let original_worker_cap = budget.worker_cap();
+    let _worker_cap_guard = config.auto_expand_workers.then(|| WorkerCapGuard {
+        budget,
+        original: original_worker_cap,
+    });
     let mut manager_specs: std::collections::HashMap<String, AgentSpec> =
         std::collections::HashMap::new();
 
@@ -7462,10 +7518,24 @@ async fn execute_team_plan(
             }
             break;
         }
-        let capacity = config
-            .max_workers
-            .max(1)
-            .min(budget.available(AgentRole::Worker));
+        if config.auto_expand_workers && ready.len() > budget.worker_cap() {
+            let target = ready.len().min(HARD_WORKER_CAP);
+            if budget.can_expand_workers() {
+                budget.expand_workers(target);
+                emit(
+                    engine,
+                    &session.id,
+                    leader_spec,
+                    "plan.auto_expand",
+                    serde_json::json!({
+                        "ready_tasks": ready.len(),
+                        "worker_cap": budget.worker_cap(),
+                    }),
+                )
+                .await?;
+            }
+        }
+        let capacity = budget.available(AgentRole::Worker);
         if capacity == 0 {
             for task in &remaining {
                 statuses.insert(task.id.clone(), "blocked".to_string());

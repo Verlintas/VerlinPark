@@ -845,7 +845,8 @@ actor CoreClient {
         apiKey: String,
         maxManagers: Int,
         maxWorkers: Int,
-        maxLabour: Int
+        maxLabour: Int,
+        autoExpandWorkers: Bool = false
     ) async throws -> AgentInfo {
         var params: [String: JSONValue] = [
             "provider": .string(kind),
@@ -854,6 +855,7 @@ actor CoreClient {
             "max_managers": .number(Double(maxManagers)),
             "max_workers": .number(Double(maxWorkers)),
             "max_labour": .number(Double(maxLabour)),
+            "auto_expand_workers": .bool(autoExpandWorkers),
         ]
         if let roleModels {
             params["role_models"] = Self.roleModelsValue(roleModels)

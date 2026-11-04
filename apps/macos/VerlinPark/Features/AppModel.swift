@@ -165,6 +165,7 @@ final class AppModel {
     var orgManagers = 4
     var orgWorkers = 6
     var orgLabour = 12
+    var autoExpandWorkers = false
     var providerAPIKey = Keychain.read(account: "provider.apiKey") ?? ""
     var providerStatus: String?
     var providerBusy = false
@@ -1688,6 +1689,7 @@ final class AppModel {
             .clamped(to: 1 ... 10)
         orgLabour = (defaults.object(forKey: "verlinpark.org.labour") as? Int ?? 12)
             .clamped(to: 1 ... 40)
+        autoExpandWorkers = defaults.bool(forKey: "verlinpark.org.autoExpandWorkers")
     }
 
     func saveOrgCaps() async {
@@ -1698,6 +1700,7 @@ final class AppModel {
         defaults.set(orgManagers, forKey: "verlinpark.org.managers")
         defaults.set(orgWorkers, forKey: "verlinpark.org.workers")
         defaults.set(orgLabour, forKey: "verlinpark.org.labour")
+        defaults.set(autoExpandWorkers, forKey: "verlinpark.org.autoExpandWorkers")
         guard agentInfo?.configured == true else {
             providerStatus = "Team capacity saved. Configure a provider to apply it."
             return
@@ -1728,7 +1731,8 @@ final class AppModel {
                 apiKey: providerAPIKey,
                 maxManagers: caps.managers,
                 maxWorkers: caps.workers,
-                maxLabour: caps.labour
+                maxLabour: caps.labour,
+                autoExpandWorkers: autoExpandWorkers
             )
             agentInfo = info
             roleModels = info.roleModels
@@ -1736,6 +1740,7 @@ final class AppModel {
             defaults.set(orgManagers, forKey: "verlinpark.org.managers")
             defaults.set(orgWorkers, forKey: "verlinpark.org.workers")
             defaults.set(orgLabour, forKey: "verlinpark.org.labour")
+            defaults.set(autoExpandWorkers, forKey: "verlinpark.org.autoExpandWorkers")
             UserDefaults.standard.set(providerKind, forKey: "provider.kind")
             UserDefaults.standard.set(baseURL, forKey: "provider.baseURL")
             UserDefaults.standard.set(model, forKey: "provider.model")
@@ -1767,7 +1772,8 @@ final class AppModel {
                 apiKey: providerAPIKey,
                 maxManagers: caps.managers,
                 maxWorkers: caps.workers,
-                maxLabour: caps.labour
+                maxLabour: caps.labour,
+                autoExpandWorkers: autoExpandWorkers
             )
         } catch {
             providerStatus = error.localizedDescription

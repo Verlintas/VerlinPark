@@ -83,6 +83,7 @@ fn test_service_with_provider_cap(
         max_managers: 5,
         max_workers: 10,
         max_labour: 20,
+        auto_expand_workers: false,
         integration_command: None,
         tools: ToolRegistry::default_tools(),
         max_active_sessions,
@@ -168,6 +169,7 @@ fn configures_provider_without_persisting_secrets() {
             max_managers: None,
             max_workers: None,
             max_labour: None,
+            auto_expand_workers: None,
         })
         .unwrap();
     assert!(info.configured);
@@ -186,6 +188,7 @@ fn configures_provider_without_persisting_secrets() {
             max_managers: None,
             max_workers: None,
             max_labour: None,
+            auto_expand_workers: None,
         })
         .unwrap_err();
     assert!(error.to_string().contains("model is required"));
@@ -4808,4 +4811,24 @@ fn task_priority_contributes_to_capacity_priority() {
     assert_eq!(task_capacity_priority(10, -20), -10);
     assert_eq!(task_capacity_priority(100, 100), 100);
     assert_eq!(task_capacity_priority(-100, -100), -100);
+}
+
+#[test]
+fn worker_auto_expansion_respects_budget_and_hard_cap() {
+    let caps = AgentCaps {
+        managers: 5,
+        workers: 2,
+        labour: 10,
+    };
+    let budget = SessionBudget::new(Some(1_000), 100, caps);
+    assert_eq!(budget.worker_cap(), 2);
+    assert!(budget.can_expand_workers());
+    budget.expand_workers(8);
+    assert_eq!(budget.worker_cap(), 8);
+    assert_eq!(budget.available(AgentRole::Worker), 8);
+    budget.expand_workers(99);
+    assert_eq!(budget.worker_cap(), 10);
+
+    let tight = SessionBudget::new(Some(1_000), 900, caps);
+    assert!(!tight.can_expand_workers());
 }

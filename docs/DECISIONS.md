@@ -93,6 +93,7 @@
 | [0081](adr/0081-workspace-file-browser.md) | Read-only workspace file browser | Accepted | UI/文件 |
 | [0082](adr/0082-workspace-text-editing.md) | Workspace text editing | Accepted | UI/文件 |
 | [0083](adr/0083-git-history-viewer.md) | Read-only Git history viewer | Accepted | Git/UI |
+| [0084](adr/0084-worker-auto-expansion.md) | Budget-gated Worker auto-expansion | Accepted | 调度/预算 |
 
 ---
 

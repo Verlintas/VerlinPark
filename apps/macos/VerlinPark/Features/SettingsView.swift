@@ -441,6 +441,14 @@ struct ProvidersSettingsView: View {
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                Toggle("Auto-expand plan Workers", isOn: $model.autoExpandWorkers)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Text(
+                    "When a plan has more ready tasks than the base Worker cap, expand Workers up to the hard cap of 10 while at least 20% of the session token budget remains. Off by default."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 Button("Apply capacity") {
                     Task { await model.saveOrgCaps() }
                 }
