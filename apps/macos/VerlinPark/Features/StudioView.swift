@@ -892,7 +892,7 @@ struct PreviewPanelView: View {
             )
         }
         .confirmationDialog(
-            "Open a pull request?",
+            "Open a PR / MR?",
             isPresented: $showingPR
         ) {
             Button("Push branch & open PR") {
@@ -960,7 +960,7 @@ struct PreviewPanelView: View {
                     .controlSize(.small)
                     .disabled(model.commitBusy)
                 } else if mode == .changes, canLand(session) {
-                    Button("Open PR") {
+                    Button("Open PR / MR") {
                         showingPR = true
                     }
                     .buttonStyle(.bordered)

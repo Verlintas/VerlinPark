@@ -183,6 +183,77 @@ fn normalize_shell_policy(mut policy: ShellPolicy) -> Result<ShellPolicy> {
     Ok(policy)
 }
 
+#[derive(Clone, Copy)]
+enum PrCli {
+    GitHub,
+    GitLab,
+}
+
+impl PrCli {
+    fn binary_name(self) -> &'static str {
+        match self {
+            Self::GitHub => "gh",
+            Self::GitLab => "glab",
+        }
+    }
+
+    fn change_name(self) -> &'static str {
+        match self {
+            Self::GitHub => "PR",
+            Self::GitLab => "MR",
+        }
+    }
+
+    fn auth_args(self) -> &'static [&'static str] {
+        &["auth", "status"]
+    }
+
+    fn create_args(self, base_branch: &str, branch: &str, title: &str, body: &str) -> Vec<String> {
+        match self {
+            Self::GitHub => vec![
+                "pr".into(),
+                "create".into(),
+                "--base".into(),
+                base_branch.into(),
+                "--head".into(),
+                branch.into(),
+                "--title".into(),
+                title.into(),
+                "--body".into(),
+                body.into(),
+            ],
+            Self::GitLab => vec![
+                "mr".into(),
+                "create".into(),
+                "--source-branch".into(),
+                branch.into(),
+                "--target-branch".into(),
+                base_branch.into(),
+                "--title".into(),
+                title.into(),
+                "--description".into(),
+                body.into(),
+                "--yes".into(),
+            ],
+        }
+    }
+
+    fn create_label(self) -> &'static str {
+        match self {
+            Self::GitHub => "gh pr create",
+            Self::GitLab => "glab mr create",
+        }
+    }
+}
+
+fn detect_pr_cli(origin: &str) -> PrCli {
+    if origin.to_ascii_lowercase().contains("gitlab") {
+        PrCli::GitLab
+    } else {
+        PrCli::GitHub
+    }
+}
+
 impl Engine {
     pub fn new(store: Store) -> Self {
         let (events, _) = broadcast::channel(2048);
@@ -744,14 +815,45 @@ impl Engine {
 
     pub async fn open_pull_request(&self, session_id: &str) -> Result<PullRequestResult> {
         self.reject_imported_session(session_id).await?;
-        let gh = std::env::var("VERLINPARK_GH_BIN").unwrap_or_else(|_| "gh".to_string());
-        self.open_pull_request_with_gh(session_id, &gh).await
+        let kind = match std::env::var("VERLINPARK_PR_PROVIDER")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("gitlab") => PrCli::GitLab,
+            Some("github") => PrCli::GitHub,
+            Some(other) => anyhow::bail!("unsupported PR provider: {other}"),
+            None => detect_pr_cli(&self.pull_request_origin(session_id).await?),
+        };
+        let bin = match kind {
+            PrCli::GitHub => std::env::var("VERLINPARK_GH_BIN").unwrap_or_else(|_| "gh".into()),
+            PrCli::GitLab => std::env::var("VERLINPARK_GLAB_BIN").unwrap_or_else(|_| "glab".into()),
+        };
+        self.open_pull_request_with_cli(session_id, &bin, kind)
+            .await
     }
 
-    async fn open_pull_request_with_gh(
+    async fn pull_request_origin(&self, session_id: &str) -> Result<String> {
+        let session = self.ensure_session_worktree(session_id).await?;
+        let store = self.store.clone();
+        let project_id = session.project_id;
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let root = PathBuf::from(&project.root);
+        tokio::task::spawn_blocking(move || {
+            git_output(&root, &["remote", "get-url", "origin"])
+                .map(|origin| origin.trim().to_string())
+                .context("a git origin remote is required to open a PR")
+        })
+        .await?
+    }
+
+    async fn open_pull_request_with_cli(
         &self,
         session_id: &str,
-        gh_bin: &str,
+        cli_bin: &str,
+        kind: PrCli,
     ) -> Result<PullRequestResult> {
         let session = self.ensure_session_worktree(session_id).await?;
         if session.status == "running" {
@@ -784,7 +886,7 @@ impl Engine {
         let base_branch = project.default_branch.clone();
         let branch_for_push = branch.clone();
         let base_for_check = base_branch.clone();
-        let gh_bin = gh_bin.to_string();
+        let cli_bin = cli_bin.to_string();
         let title = session
             .goal
             .lines()
@@ -797,9 +899,9 @@ impl Engine {
             "Opened from VerlinPark session {}.\n\nGoal: {}",
             session.id, session.goal
         );
-        let title_for_gh = title.clone();
-        let body_for_gh = body.clone();
-        let gh_bin_for_pr = gh_bin.clone();
+        let title_for_cli = title.clone();
+        let body_for_cli = body.clone();
+        let cli_bin_for_create = cli_bin.clone();
         let git_lock = self.git_lock.clone();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -819,14 +921,15 @@ impl Engine {
             if ahead.trim() == "0" {
                 anyhow::bail!("session branch has no commits ahead of {base_for_check}");
             }
-            let auth = std::process::Command::new(&gh_bin)
-                .args(["auth", "status"])
+            let auth = std::process::Command::new(&cli_bin)
+                .args(kind.auth_args())
                 .current_dir(&project_root)
                 .output()
-                .context("running gh auth status")?;
+                .with_context(|| format!("running {} auth status", kind.binary_name()))?;
             if !auth.status.success() {
                 anyhow::bail!(
-                    "gh is not authenticated: {}",
+                    "{} is not authenticated: {}",
+                    kind.binary_name(),
                     String::from_utf8_lossy(&auth.stderr).trim()
                 );
             }
@@ -857,29 +960,19 @@ impl Engine {
         )
         .await?;
 
-        let project_root_for_gh = PathBuf::from(&project.root);
+        let project_root_for_cli = PathBuf::from(&project.root);
         let branch_for_pr = branch.clone();
         let base_for_pr = base_branch.clone();
         let url = tokio::task::spawn_blocking(move || -> Result<String> {
-            let output = std::process::Command::new(&gh_bin_for_pr)
-                .args([
-                    "pr",
-                    "create",
-                    "--base",
-                    &base_for_pr,
-                    "--head",
-                    &branch_for_pr,
-                    "--title",
-                    &title_for_gh,
-                    "--body",
-                    &body_for_gh,
-                ])
-                .current_dir(&project_root_for_gh)
+            let output = std::process::Command::new(&cli_bin_for_create)
+                .args(kind.create_args(&base_for_pr, &branch_for_pr, &title_for_cli, &body_for_cli))
+                .current_dir(&project_root_for_cli)
                 .output()
-                .context("running gh pr create")?;
+                .with_context(|| format!("running {}", kind.create_label()))?;
             if !output.status.success() {
                 anyhow::bail!(
-                    "branch pushed, but gh pr create failed: {}",
+                    "branch pushed, but {} failed: {}",
+                    kind.create_label(),
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
@@ -889,7 +982,10 @@ impl Engine {
                 .map(str::trim)
                 .find(|line| line.starts_with("http"))
                 .ok_or_else(|| {
-                    anyhow::anyhow!("gh pr create succeeded but did not return a URL: {stdout}")
+                    anyhow::anyhow!(
+                        "{} succeeded but did not return a URL: {stdout}",
+                        kind.create_label()
+                    )
                 })?
                 .to_string();
             Ok(url)
@@ -912,7 +1008,7 @@ impl Engine {
             base_branch,
             pushed: true,
             url: Some(url.clone()),
-            detail: format!("branch pushed and PR opened at {url}"),
+            detail: format!("branch pushed and {} opened at {url}", kind.change_name()),
         })
     }
 

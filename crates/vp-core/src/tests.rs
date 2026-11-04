@@ -1708,7 +1708,7 @@ async fn pushes_a_branch_and_opens_a_pull_request() {
     std::fs::set_permissions(&gh, permissions).unwrap();
 
     let result = engine
-        .open_pull_request_with_gh(&session.id, gh.to_str().unwrap())
+        .open_pull_request_with_cli(&session.id, gh.to_str().unwrap(), PrCli::GitHub)
         .await
         .unwrap();
     assert!(result.pushed);
@@ -1724,6 +1724,66 @@ async fn pushes_a_branch_and_opens_a_pull_request() {
     let events = engine.list_events(session.id, 0, 100).await.unwrap();
     assert!(events.iter().any(|event| event.kind == "session.pushed"));
     assert!(events.iter().any(|event| event.kind == "session.pr_opened"));
+}
+
+#[tokio::test]
+async fn opens_a_gitlab_merge_request_with_glab() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let status = Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(remote.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["remote", "add", "origin", remote.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("gitlab".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "MR me".into(), None)
+        .await
+        .unwrap();
+    let worktree = session.worktree.clone().unwrap();
+    std::fs::write(Path::new(&worktree).join("README.md"), "mr\n").unwrap();
+    engine
+        .commit_session(&session.id, "session change")
+        .await
+        .unwrap();
+
+    let glab = data.path().join("fake-glab");
+    std::fs::write(
+        &glab,
+        "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then exit 0; fi\nif [ \"$1\" = \"mr\" ]; then echo https://gitlab.example/mr/1; exit 0; fi\nexit 0\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&glab).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&glab, permissions).unwrap();
+
+    let result = engine
+        .open_pull_request_with_cli(&session.id, glab.to_str().unwrap(), PrCli::GitLab)
+        .await
+        .unwrap();
+    assert!(result.pushed);
+    assert_eq!(result.url.as_deref(), Some("https://gitlab.example/mr/1"));
+    assert!(result.detail.contains("MR opened"));
 }
 
 #[tokio::test]

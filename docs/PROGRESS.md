@@ -27,7 +27,7 @@
 | Conflict resolution | ✅ | `merge_queue.resolve` / `vp resolve` / Queue UI Auto-resolve：resolver agent 在 Worker worktree 解决 rebase 冲突；runtime 检查 markers、完成 rebase、独立 Verifier 复核、再走确定性 Integrator；失败回到 conflict |
 | Auto-resolve policy | ✅ | 项目级 `IntegrationPolicy`：默认关闭；`max_auto_attempts` 0–5；`max_resolve_tokens` 1000–10M；daemon watcher 在 session idle / 启动时扫描 conflict，持久 attempt 计数 + per-resolution token cap；RPC/CLI/Manage Dash |
 | Landing | ✅ | `session.land` / `vp land` / Preview → Land：clean + default branch 检查后 `--no-ff` 合入项目默认分支；不 push、不建 PR |
-| PR flow | ✅ | `session.pr` / `vp pr` / Preview → Open PR：preflight origin + `gh auth status`，push session branch，`gh pr create`；gh 失败会明确报告 branch 已 push |
+| PR flow | ✅ | `session.pr` / `vp pr` / Preview → Open PR / MR：preflight origin，GitHub 用 `gh auth status` + `gh pr create`，GitLab 用 `glab auth status` + `glab mr create`（origin 含 gitlab 自动检测，`VERLINPARK_PR_PROVIDER` 可覆盖）；push session branch，CLI 失败会明确报告 branch 已 push |
 | Queue recovery | ✅ | daemon 重启把 queued/merging/checking entry 标为 interrupted 并补事件；interrupted 可 rebase+retry |
 | Diff / commit | ✅ | base..worktree diff、显式 commit、discard、session committed 事件；Preview Changes 解析 unified diff，按文件选择并显示 +/- 行数 |
 | Shell 写入沙箱 | ✅ | macOS Seatbelt（`sandbox-exec`）：只允许写 worktree、对应 Git 元数据、per-agent scratch 和 `/dev/null`；拒绝 common hooks/config 与 worktree `config.worktree`；`.git` 指向校验；scratch 承载 TMPDIR/构建缓存；env allowlist 不继承 provider/daemon secrets；常见 credential/state 路径 read-deny；timeout/cancel 杀整个 process group；项目级 `ShellPolicy` 可拒绝网络、追加 read-deny，并可 opt-in `restrict_home`：HOME 内容默认拒绝，只允许 worktree/scratch/Git 元数据、常见 toolchain/cache 与 `.gitconfig`/SSH config/known_hosts；HOME metadata 允许以支持路径遍历；sandbox 不可用时 fail closed |
@@ -60,7 +60,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：175 个测试通过（core 138、store 29、providers 8）。
+- `cargo test --workspace`：176 个测试通过（core 139、store 29、providers 8）。
 - `xcodebuild test`：34 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
@@ -208,6 +208,7 @@
 - **M3 第八十四切片**：read-only Git history viewer（`git.log`/`git.show`、History tab、CLI、hash 校验与 patch cap）；见 ADR-0083。
 - **M3 第八十五切片**：plan task priority 计入全局 Worker/Labour capacity 排序（session priority + task priority clamp ±100）。
 - **M3 第八十六切片**：budget-gated plan Worker auto-expansion（20% token gate、hard cap 10、cap guard、Settings/agent.configure/env、`plan.auto_expand`）；见 ADR-0084。
+- **M3 第八十七切片**：GitLab merge-request adapter（origin 检测、`glab` preflight/push/MR、provider override、GitHub/GitLab 共用执行路径）；见 ADR-0085。
 
 ## 如何运行
 

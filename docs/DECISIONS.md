@@ -94,6 +94,7 @@
 | [0082](adr/0082-workspace-text-editing.md) | Workspace text editing | Accepted | UI/文件 |
 | [0083](adr/0083-git-history-viewer.md) | Read-only Git history viewer | Accepted | Git/UI |
 | [0084](adr/0084-worker-auto-expansion.md) | Budget-gated Worker auto-expansion | Accepted | 调度/预算 |
+| [0085](adr/0085-gitlab-merge-request.md) | GitLab merge-request adapter | Accepted | Git/发布 |
 
 ---
 
