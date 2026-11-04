@@ -96,6 +96,7 @@
 | [0084](adr/0084-worker-auto-expansion.md) | Budget-gated Worker auto-expansion | Accepted | 调度/预算 |
 | [0085](adr/0085-gitlab-merge-request.md) | GitLab merge-request adapter | Accepted | Git/发布 |
 | [0086](adr/0086-mutable-session-priority.md) | Mutable session priority | Accepted | 调度 |
+| [0087](adr/0087-pty-terminal.md) | PTY terminal with SwiftTerm | Accepted | 终端/UI |
 
 ---
 

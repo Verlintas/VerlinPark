@@ -628,6 +628,62 @@ actor CoreClient {
             .decode(WorkspaceWriteResult.self)
     }
 
+    func openTerminal(sessionID: String, cols: Int, rows: Int) async throws -> TerminalOpenResult {
+        try await request(
+            method: "terminal.open",
+            params: [
+                "session_id": .string(sessionID),
+                "cols": .number(Double(cols)),
+                "rows": .number(Double(rows)),
+            ]
+        )
+        .decode(TerminalOpenResult.self)
+    }
+
+    func writeTerminal(terminalID: String, data: Data) async throws -> Bool {
+        try await request(
+            method: "terminal.write",
+            params: [
+                "terminal_id": .string(terminalID),
+                "data": .string(data.base64EncodedString()),
+            ]
+        )
+        .decode(TerminalWriteResult.self)
+        .written
+    }
+
+    func readTerminal(terminalID: String, afterSeq: UInt64) async throws -> TerminalReadResult {
+        try await request(
+            method: "terminal.read",
+            params: [
+                "terminal_id": .string(terminalID),
+                "after_seq": .number(Double(afterSeq)),
+            ]
+        )
+        .decode(TerminalReadResult.self)
+    }
+
+    func resizeTerminal(terminalID: String, cols: Int, rows: Int) async throws -> Bool {
+        try await request(
+            method: "terminal.resize",
+            params: [
+                "terminal_id": .string(terminalID),
+                "cols": .number(Double(cols)),
+                "rows": .number(Double(rows)),
+            ]
+        )
+        .decode(TerminalResizeResult.self)
+        .resized
+    }
+
+    func closeTerminal(terminalID: String) async throws -> TerminalCloseResult {
+        try await request(
+            method: "terminal.close",
+            params: ["terminal_id": .string(terminalID)]
+        )
+        .decode(TerminalCloseResult.self)
+    }
+
     func openConsole(sessionID: String) async throws -> ConsoleOpenResult {
         try await request(
             method: "console.open",

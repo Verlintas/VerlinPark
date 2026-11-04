@@ -10,6 +10,7 @@ name = "vp"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }

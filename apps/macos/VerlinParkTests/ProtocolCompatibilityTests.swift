@@ -260,6 +260,36 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(written.sha256, "def456")
     }
 
+    func testTerminalResultsDecode() throws {
+        let opened = try JSONDecoder().decode(
+            TerminalOpenResult.self,
+            from: Data(#"{"terminal_id":"terminal-1","worktree":"/tmp/repo"}"#.utf8)
+        )
+        XCTAssertEqual(opened.terminalId, "terminal-1")
+
+        let readJSON = """
+        {
+          "terminal_id": "terminal-1",
+          "chunks": [{"seq": 1, "data": "aGVsbG8="}],
+          "next_seq": 1,
+          "status": "running",
+          "exit_code": null,
+          "dropped": 0
+        }
+        """
+        let read = try JSONDecoder().decode(TerminalReadResult.self, from: Data(readJSON.utf8))
+        XCTAssertEqual(read.chunks.first?.data, "aGVsbG8=")
+        XCTAssertEqual(read.status, "running")
+        XCTAssertNil(read.exitCode)
+
+        let closed = try JSONDecoder().decode(
+            TerminalCloseResult.self,
+            from: Data(#"{"closed":true,"exit_code":0}"#.utf8)
+        )
+        XCTAssertTrue(closed.closed)
+        XCTAssertEqual(closed.exitCode, 0)
+    }
+
     func testConsoleResultsDecode() throws {
         let opened = try JSONDecoder().decode(
             ConsoleOpenResult.self,

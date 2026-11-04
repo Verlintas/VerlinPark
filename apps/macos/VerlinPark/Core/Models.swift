@@ -1178,6 +1178,61 @@ struct GitShowResult: Codable, Sendable {
     }
 }
 
+struct TerminalOpenResult: Codable, Sendable {
+    let terminalId: String
+    let worktree: String
+
+    enum CodingKeys: String, CodingKey {
+        case terminalId = "terminal_id"
+        case worktree
+    }
+}
+
+struct TerminalChunk: Codable, Identifiable, Hashable, Sendable {
+    let seq: UInt64
+    let data: String
+
+    var id: UInt64 {
+        seq
+    }
+}
+
+struct TerminalReadResult: Codable, Sendable {
+    let terminalId: String
+    let chunks: [TerminalChunk]
+    let nextSeq: UInt64
+    let status: String
+    let exitCode: Int?
+    let dropped: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case terminalId = "terminal_id"
+        case chunks
+        case nextSeq = "next_seq"
+        case status
+        case exitCode = "exit_code"
+        case dropped
+    }
+}
+
+struct TerminalWriteResult: Codable, Sendable {
+    let written: Bool
+}
+
+struct TerminalResizeResult: Codable, Sendable {
+    let resized: Bool
+}
+
+struct TerminalCloseResult: Codable, Sendable {
+    let closed: Bool
+    let exitCode: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case closed
+        case exitCode = "exit_code"
+    }
+}
+
 struct WorkspaceEntry: Codable, Identifiable, Hashable, Sendable {
     let path: String
     let name: String

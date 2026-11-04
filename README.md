@@ -185,6 +185,7 @@ just cli mcp-read-resource <server-id> file:///notes.md
 just cli mcp-prompts <server-id>
 just cli mcp-prompt <server-id> review --arg target=src/main.rs
 just cli console <session-id> "cargo test"
+just cli terminal <session-id> "cargo test"
 just cli files <session-id>
 just cli file <session-id> src/main.rs
 echo "new content" | just cli write-file <session-id> src/main.rs

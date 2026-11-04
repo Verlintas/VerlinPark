@@ -17,6 +17,11 @@ settings:
     ENABLE_HARDENED_RUNTIME: NO
     DEVELOPMENT_TEAM: ""
     CLANG_ENABLE_MODULES: YES
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    exactVersion: 1.10.1
+
 targets:
   VerlinPark:
     type: application
@@ -32,7 +37,8 @@ targets:
         MARKETING_VERSION: 0.1.0
         CURRENT_PROJECT_VERSION: 1
         ENABLE_PREVIEWS: YES
-    dependencies: []
+    dependencies:
+      - package: SwiftTerm
   VerlinParkTests:
     type: bundle.unit-test
     platform: macOS

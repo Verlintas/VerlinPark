@@ -116,6 +116,17 @@ final class AppModel {
     var workspaceSaveBusy = false
     var workspaceSaveStatus: String?
     var workspaceSessionID: String?
+    var terminalID: String?
+    var terminalWorktree = ""
+    var terminalData = Data()
+    var terminalSeq: UInt64 = 0
+    var terminalStatus = "closed"
+    var terminalExitCode: Int?
+    var terminalCols = 80
+    var terminalRows = 24
+    var terminalBusy = false
+    var terminalError: String?
+    var terminalSessionID: String?
     var consoleID: String?
     var consoleWorktree = ""
     var consoleOutput = ""
@@ -1219,6 +1230,104 @@ final class AppModel {
               let entry = workspaceEntries.first(where: { $0.path == path })
         else { return }
         await openWorkspaceFile(entry)
+    }
+
+    func openTerminal() async {
+        guard let sessionID = selectedSessionID else {
+            terminalError = "Select a session before opening a terminal."
+            return
+        }
+        guard terminalID == nil else { return }
+        terminalBusy = true
+        defer { terminalBusy = false }
+        do {
+            let opened = try await core.openTerminal(
+                sessionID: sessionID,
+                cols: terminalCols,
+                rows: terminalRows
+            )
+            terminalID = opened.terminalId
+            terminalWorktree = opened.worktree
+            terminalData = Data()
+            terminalSeq = 0
+            terminalStatus = "running"
+            terminalExitCode = nil
+            terminalError = nil
+            terminalSessionID = sessionID
+        } catch {
+            terminalError = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func sendTerminalInput(_ data: Data) async {
+        guard let terminalID else { return }
+        do {
+            _ = try await core.writeTerminal(terminalID: terminalID, data: data)
+        } catch {
+            terminalError = error.localizedDescription
+        }
+    }
+
+    func pollTerminal() async {
+        guard let terminalID else { return }
+        do {
+            let result = try await core.readTerminal(
+                terminalID: terminalID,
+                afterSeq: terminalSeq
+            )
+            for chunk in result.chunks {
+                if let data = Data(base64Encoded: chunk.data) {
+                    terminalData.append(data)
+                }
+            }
+            terminalSeq = result.nextSeq
+            if result.status != terminalStatus {
+                terminalStatus = result.status
+                if result.status != "running" {
+                    terminalExitCode = result.exitCode
+                }
+            }
+            if result.dropped > 0 {
+                terminalError = "terminal output buffer dropped \(result.dropped) chunks"
+            }
+        } catch {
+            terminalError = error.localizedDescription
+        }
+    }
+
+    func resizeTerminal(cols: Int, rows: Int) async {
+        guard let terminalID else { return }
+        let cols = cols.clamped(to: 1 ... 500)
+        let rows = rows.clamped(to: 1 ... 500)
+        guard cols != terminalCols || rows != terminalRows else { return }
+        terminalCols = cols
+        terminalRows = rows
+        do {
+            _ = try await core.resizeTerminal(
+                terminalID: terminalID,
+                cols: cols,
+                rows: rows
+            )
+        } catch {
+            terminalError = error.localizedDescription
+        }
+    }
+
+    func closeTerminal() async {
+        guard let terminalID else { return }
+        terminalBusy = true
+        defer { terminalBusy = false }
+        do {
+            let result = try await core.closeTerminal(terminalID: terminalID)
+            terminalExitCode = result.exitCode ?? terminalExitCode
+        } catch {
+            terminalError = error.localizedDescription
+        }
+        self.terminalID = nil
+        terminalWorktree = ""
+        terminalStatus = "closed"
+        terminalSessionID = nil
     }
 
     func openConsole() async {

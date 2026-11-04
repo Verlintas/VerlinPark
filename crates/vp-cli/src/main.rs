@@ -2,6 +2,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use vp_protocol::discovery::Discovery;
@@ -185,6 +187,8 @@ enum Command {
     Files { session: String },
     /// Show one session worktree file.
     File { session: String, path: String },
+    /// Run one command in a sandboxed PTY terminal.
+    Terminal { session: String, command: String },
     /// Show recent commits on the session branch.
     History {
         session: String,
@@ -803,6 +807,75 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::Terminal { session, command } => {
+            let opened = rpc(
+                &discovery,
+                "terminal.open",
+                json!({"session_id": session, "cols": 100, "rows": 30}),
+            )
+            .await?;
+            let terminal_id = opened["terminal_id"]
+                .as_str()
+                .context("terminal.open returned no terminal_id")?
+                .to_string();
+            println!(
+                "terminal ready in {}",
+                opened["worktree"].as_str().unwrap_or("?")
+            );
+            let data = BASE64.encode(format!("{command}\nexit\n"));
+            rpc(
+                &discovery,
+                "terminal.write",
+                json!({"terminal_id": terminal_id, "data": data}),
+            )
+            .await?;
+            let mut after_seq = 0_u64;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                let result = rpc(
+                    &discovery,
+                    "terminal.read",
+                    json!({"terminal_id": terminal_id, "after_seq": after_seq}),
+                )
+                .await?;
+                if let Some(chunks) = result["chunks"].as_array() {
+                    for chunk in chunks {
+                        if let Some(data) = chunk["data"].as_str()
+                            && let Ok(bytes) = BASE64.decode(data)
+                        {
+                            print!("{}", String::from_utf8_lossy(&bytes));
+                        }
+                    }
+                    let _ = std::io::stdout().flush();
+                }
+                after_seq = result["next_seq"].as_u64().unwrap_or(after_seq);
+                let status = result["status"].as_str().unwrap_or("running");
+                if status != "running" {
+                    if let Some(exit_code) = result["exit_code"].as_i64() {
+                        println!("[terminal {status}, exit {exit_code}]");
+                    }
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = rpc(
+                        &discovery,
+                        "terminal.close",
+                        json!({"terminal_id": terminal_id}),
+                    )
+                    .await;
+                    eprintln!("terminal command timed out after 300s");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let _ = rpc(
+                &discovery,
+                "terminal.close",
+                json!({"terminal_id": terminal_id}),
+            )
+            .await;
+            json!({"terminal_streamed": true})
+        }
         Command::Search {
             query,
             project,
@@ -1278,7 +1351,9 @@ fn parse_env_pairs(values: &[String]) -> Result<std::collections::BTreeMap<Strin
 }
 
 fn print_human(value: &Value) {
-    if value.get("console_streamed").and_then(Value::as_bool) == Some(true) {
+    if value.get("console_streamed").and_then(Value::as_bool) == Some(true)
+        || value.get("terminal_streamed").and_then(Value::as_bool) == Some(true)
+    {
         return;
     }
     if let Some(csv) = value.get("csv").and_then(Value::as_str) {

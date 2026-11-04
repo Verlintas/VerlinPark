@@ -22,8 +22,9 @@ use vp_protocol::types::{
     QuestionListResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
     SessionImportResult, SessionLandResult, SessionLogStatus, SessionPriorityResult,
     SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
-    StoredMessage, TeamPlan, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
-    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
+    StoredMessage, TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult,
+    TerminalResizeResult, TerminalWriteResult, TodoItem, UsageBucket, UsageCsvResult, UsageEntry,
+    UsageLedgerResult, UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
     WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
 };
 use vp_store::Store;
@@ -37,6 +38,7 @@ pub mod console;
 pub mod history;
 pub mod mcp;
 pub mod rebuild;
+pub mod terminal;
 pub mod workspace;
 
 pub use rebuild::rebuild_database;
@@ -76,6 +78,7 @@ pub struct Engine {
     budget_registry: Arc<BudgetRegistry>,
     mcp: Arc<mcp::McpManager>,
     consoles: Arc<console::ConsoleManager>,
+    terminals: Arc<terminal::TerminalManager>,
 }
 
 fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
@@ -266,6 +269,7 @@ impl Engine {
             budget_registry: Arc::new(BudgetRegistry::new()),
             mcp: Arc::new(mcp::McpManager::from_env()),
             consoles: Arc::new(console::ConsoleManager::new()),
+            terminals: Arc::new(terminal::TerminalManager::new()),
         }
     }
 
@@ -4265,6 +4269,69 @@ impl Engine {
             tokio::task::spawn_blocking(move || history::show(Path::new(&root), &commit)).await??;
         result.session_id = session_id.to_string();
         Ok(result)
+    }
+
+    pub async fn terminal_open(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<TerminalOpenResult> {
+        let (session, worktree) = self.workspace_session(session_id).await?;
+        let store = self.store.clone();
+        let project_id = session.project_id.clone();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let policy = self.get_shell_policy(&project.id).await?;
+        let mut secret_roots = crate::agent::shell_secret_roots(self.store.data_dir());
+        secret_roots.extend(policy.read_deny.iter().map(PathBuf::from));
+        let context = ToolContext {
+            root: PathBuf::from(&worktree),
+            project_root: PathBuf::from(&project.root),
+            sandbox_root: self
+                .store
+                .data_dir()
+                .join("sandbox")
+                .join(&session.id)
+                .join("terminal"),
+            secret_roots,
+            network_allowed: policy.network != "deny",
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            restrict_home: policy.restrict_home,
+        };
+        self.terminals.open(&session.id, context, cols, rows).await
+    }
+
+    pub async fn terminal_write(
+        &self,
+        terminal_id: &str,
+        data: &str,
+    ) -> Result<TerminalWriteResult> {
+        self.terminals.write(terminal_id, data).await
+    }
+
+    pub async fn terminal_read(
+        &self,
+        terminal_id: &str,
+        after_seq: u64,
+    ) -> Result<TerminalReadResult> {
+        self.terminals.read(terminal_id, after_seq).await
+    }
+
+    pub async fn terminal_resize(
+        &self,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<TerminalResizeResult> {
+        self.terminals.resize(terminal_id, cols, rows).await
+    }
+
+    pub async fn terminal_close(&self, terminal_id: &str) -> Result<TerminalCloseResult> {
+        self.terminals.close(terminal_id).await
     }
 
     pub async fn list_questions(&self, session_id: Option<String>) -> Result<QuestionListResult> {

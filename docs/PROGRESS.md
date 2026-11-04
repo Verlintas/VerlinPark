@@ -37,6 +37,7 @@
 | 可观测性 | ✅ | agent/tool/approval/plan_task/manager.roundtable/merge_queue/integrator/landing/PR/mailbox/artifact 事件；Collab roster；Preview Plan/Changes/Queue/Mailbox/Cost/Trace；`server.doctor` / `vp doctor` 检查 DB、权限、project root、worktree、event mirror、sandbox、provider，Manage Dash 有 Doctor 与 worktree cleanup 卡片；Rail Notifications 聚合 approval/task/integration/session failure，支持 unread badge、Dock badge、Mark all read、open session，并通过 UserDefaults 持久化最多 100 条 |
 | Git history | ✅ | Preview → History + `vp history` / `vp show`：read-only `git -C <worktree> log/show`（200 commits、4–40 hex hash 校验、200 KB patch cap、stat+patch、refs/author/date）；不提供 checkout/reset/rebase |
 | Workspace files | ✅ | Preview → Files + `vp files` / `vp file` / `vp write-file`：session worktree tree（.gitignore、跳过 .git、5000 entries/depth 20、truncated）+ 单文件读取（相对路径 canonicalize jail、拒绝 `..`/absolute/.git/symlink escape、512 KiB 文本 cap、binary 1 KiB hex preview、sha256/editable）+ 文本编辑（expected_sha256 冲突检测、atomic temp+rename、`workspace.file_saved` 事件、dirty/reload 确认）；binary/truncated/超大只读 |
+| Terminal | ✅ | Preview → Terminal + `vp terminal`：daemon-owned PTY（`portable-pty`）、sandbox-exec + `/bin/sh -l`、base64 raw bytes、resize、512 KiB ring + dropped、process-group kill；SwiftTerm 1.10.1 渲染；与 Console 分开；输出不持久化 |
 | Console | ✅ | per-session line-oriented `/bin/sh -s`，run 在同一 session worktree 的 Seatbelt write sandbox 内；`console.open/write/read/signal/close` / Preview → Console / `vp console` 一次性执行；stdin/stdout/stderr streaming chunks，256 KiB ring buffer + dropped 计数、64 KiB write cap、200 chunks/read；int/term/kill + process-group cleanup；不是 PTY，不支持 TUI/raw mode；输出不持久化 |
 | MCP | ✅ | global stdio MCP server configs（name/command/args/env/enabled）；`mcp.server.*` / `mcp.tools` / `mcp.call` / `mcp.resources` / `mcp.resource.read` / `mcp.prompts` / `mcp.prompt.get` / `vp mcp-*` / Settings → MCP inspect；每 server 一个 persistent process，initialize 后复用、串行调用、idle 300s 回收（`VERLINPARK_MCP_IDLE_SECS`）、config 变更失效、进程组清理；tools/resources/templates/prompts cursor 分页（50 页/2000 items）、读操作可重连一次、call 不重试；60s timeout、2MiB line cap、env allowlist；agent generic `mcp` tool（tool call 需 approval；resources/prompts 只读）；Leader/Worker/Labour 启动时把最多 32 个 MCP tools 作为 `mcp_<server>_<tool>` 动态 schema 注入（Manager/Verifier 不注入，call 需 approval）；binary resource 只报告长度；无 sampling/notifications |
 | Project memory | ✅ | `MemoryItem`（kind/title/body/tags/session/agent）+ `remember` / `recall` agent tools；recall 跨 project 内所有 session；`memory.list` / `memory.create` / `memory.delete` / `memory.prune` / `memory.policy.get` / `memory.policy.set` / `vp memory` / `vp remember` / `vp memory-delete` / `vp memory-prune` / `vp memory-policy` / `vp memory-policy-set` / Manage Dash Project memory（删除 + 30 天 prune + opt-in retention policy）；`memory.created` / `memory.deleted` 事件参与 replay/repair，bundle 包含 memories；FTS5 外部内容索引 + LIKE fallback；daemon 每小时 sweep enabled policy（`VERLINPARK_MEMORY_SWEEP_SECS`）；无 embedding |
@@ -50,7 +51,7 @@
 | Team capacity | ✅ | Settings → Providers → Team capacity：Managers 1–5 / Workers 1–10 / Labour 1–40 Stepper，Apply 写入 UserDefaults 并通过 `agent.configure` 应用；默认 4/6/12，运行时 hard cap 5/10/40；可选 auto-expand plan Workers（预算 ≥20% 时按 ready tasks 扩到最多 10，plan 结束后恢复 base cap，`VERLINPARK_AUTO_EXPAND_WORKERS`） |
 | Provider | ✅ | OpenAI-compatible + Anthropic；`agent.probe` / `vp provider-test` / Settings Test connection 发送一次无工具 16-token 请求，检查 endpoint/key/model/stream；429/5xx/connection 在 stream 开始前最多重试 3 次（Retry-After + 指数退避，15s connect timeout）；stream 建立后每个事件最多等待 `VERLINPARK_PROVIDER_IDLE_SECS`（默认 300，10–3600），超时使 run 失败；OpenAI-compatible 与 Anthropic 都有本地 HTTP 全链路 E2E（plan → Worker write → approval → Verifier → Integrator） |
 | Models / budgets | ✅ | 分角色 model override + input/output USD/1M price；session token / USD / wall-clock budget；project-wide shared token/USD pool；TeamPlan department/task token/USD budgets；per-call `usage_ledger`（agent/role/task/department/model/tokens/estimated/cost）+ `session.usage` / `vp usage` / Preview → Cost 分组汇总；`session.usage_csv` / `vp usage --csv` / Preview Export CSV（RFC 4180 转义，逐 call 一行）；`project.usage` / `vp project-usage` / Manage Dash 按 session 汇总 tokens/cost/calls；`agent.usage` / `agent.cost`；time 在 turn/tool 边界检查；Providers/New Session/CLI/UI |
-| CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/artifact/backfill-artifacts/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/search/transcript/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate/cleanup-worktrees/worktree-policy/worktree-policy-set/project-budget/project-budget-set/project-usage/resume-plan/memory/remember/memory-delete/memory-prune/memory-policy/memory-policy-set/questions/answer/mcp-servers/mcp-add/mcp-remove/mcp-tools/mcp-call/mcp-resources/mcp-read-resource/mcp-prompts/mcp-prompt/console/files/file/write-file/history/show/doctor/provider-test/db-rebuild |
+| CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/artifact/backfill-artifacts/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/search/transcript/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate/cleanup-worktrees/worktree-policy/worktree-policy-set/project-budget/project-budget-set/project-usage/resume-plan/memory/remember/memory-delete/memory-prune/memory-policy/memory-policy-set/questions/answer/mcp-servers/mcp-add/mcp-remove/mcp-tools/mcp-call/mcp-resources/mcp-read-resource/mcp-prompts/mcp-prompt/console/terminal/files/file/write-file/history/show/doctor/provider-test/db-rebuild |
 | Search | ✅ | `session.search` / `vp search` / Stage `Cmd-F`；跨 session 搜索 message content 与 raw event payload，可按 project 过滤，newest-first，`truncated` 标记；LIKE 转义 `%`/`_`/`\`，snippet 截断；无 FTS/index |
 | Transcript | ✅ | `session.transcript` / `vp transcript` / Session menu Export Transcript…；Markdown 包含 session 元数据、按 department 的 TeamPlan、按时间排序的 conversation 与 tool calls；单 message 8KB、tool args 1KB 截断；不是可导入 bundle |
 | Distribution | ✅ | `just package` 生成 Release app + bundled `verlinpadd` + `vp` + docs 的 ad-hoc signed DMG 和 SHA-256；`just cask` / release workflow 生成并上传 Homebrew cask（DMG URL + SHA-256，arm64/macOS 15+）；`v*` tag 触发 GitHub Release workflow；未 Developer ID 公证，暂无 tap |
@@ -60,8 +61,8 @@
 
 ## 验证
 
-- `cargo test --workspace`：178 个测试通过（core 140、store 30、providers 8）。
-- `xcodebuild test`：34 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
+- `cargo test --workspace`：179 个测试通过（core 141、store 30、providers 8）。
+- `xcodebuild test`：35 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub Actions success。
 - 手工 E2E 已覆盖：Leader/Manager/Worker/Labour 委派、task worktree、并行 Worker、Verifier approve/reject、TeamPlan 自动派发、Manager 圆桌、审批、diff、commit/discard、预算/取消/暂停恢复、项目 shell policy get/set。
@@ -90,7 +91,7 @@
 - Task/department/project budget 已有进程内原子 reservation，但不跨 daemon 重启持久化；手动 delegate 任务没有 plan task id 时只受 session/project budget 约束。
 - 历史 session 只有在新事件带 `usage_id` 后才会被 replay 比较；repair 可用 legacy event 的 synthetic id 回填 ledger。
 - 没有 context compaction、checkpoint/resume；暂停状态只在内存中，daemon 重启会把 running/paused session 标为 failed。
-- 没有 PTY/全屏 TUI 终端、逐 hunk review、真实 Collab 节点、ACP、web search；Console 是 line-oriented，不支持 vim/top/interactive raw mode；Files 文本编辑限制 512 KiB、binary/truncated 只读，保存用 expected_sha256 检测并发修改但不做三方合并。
+- Terminal 是 daemon-owned PTY，但终端输出/scrollback 不持久化、跨 daemon 重启不恢复；SwiftTerm 固定 1.10.1（新版本引入 Metal toolchain/plugin 要求）；逐 hunk review、真实 Collab 节点、ACP、web search 仍缺；Console 仍是 line-oriented；Files 文本编辑限制 512 KiB、binary/truncated 只读，保存用 expected_sha256 检测并发修改但不做三方合并。
 - Search 是 `LIKE` 扫描，无 FTS/index/ranking；非 ASCII 大小写匹配不完整，event 结果是 raw JSON snippet。
 - Transcript 不包含完整 event timeline、artifacts 或 approvals，且不可导入；超长内容会截断。
 - Provider retry 只覆盖 stream 建立前的错误；stream 中途断开不会自动续传。
@@ -210,6 +211,7 @@
 - **M3 第八十六切片**：budget-gated plan Worker auto-expansion（20% token gate、hard cap 10、cap guard、Settings/agent.configure/env、`plan.auto_expand`）；见 ADR-0084。
 - **M3 第八十七切片**：GitLab merge-request adapter（origin 检测、`glab` preflight/push/MR、provider override、GitHub/GitLab 共用执行路径）；见 ADR-0085。
 - **M3 第八十八切片**：mutable session priority（`session.priority.set`、事件/repair/rebuild、CLI、header menu）；见 ADR-0086。
+- **M3 第八十九切片**：PTY terminal（portable-pty、SwiftTerm、Terminal tab、`vp terminal`、resize/process-group）；见 ADR-0087。
 
 ## 如何运行
 

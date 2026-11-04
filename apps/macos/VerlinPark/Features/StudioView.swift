@@ -830,6 +830,8 @@ struct PreviewPanelView: View {
                     cost
                 case .console:
                     ConsolePanel()
+                case .terminal:
+                    TerminalPanel()
                 case .trace:
                     trace
                 }
@@ -844,6 +846,9 @@ struct PreviewPanelView: View {
         .task(id: model.selectedSessionID) {
             if model.consoleID != nil {
                 await model.closeConsole()
+            }
+            if model.terminalID != nil {
+                await model.closeTerminal()
             }
             if mode == .files {
                 await model.loadWorkspaceTree()
@@ -990,6 +995,8 @@ struct PreviewPanelView: View {
                             await model.loadUsage()
                         case .console:
                             await model.pollConsole()
+                        case .terminal:
+                            await model.pollTerminal()
                         default:
                             await model.loadDiff()
                         }
@@ -1004,7 +1011,8 @@ struct PreviewPanelView: View {
                         mode == .history ? "Refresh history" :
                         mode == .queue ? "Refresh queue" : mode == .mailbox ? "Refresh mailbox" :
                         mode == .cost ? "Refresh usage" :
-                        mode == .console ? "Refresh console" : "Refresh diff"
+                        mode == .console ? "Refresh console" :
+                        mode == .terminal ? "Refresh terminal" : "Refresh diff"
                 )
                 .disabled(model.diffLoading)
             }
@@ -1727,6 +1735,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
     case mailbox
     case cost
     case console
+    case terminal
     case trace
 
     var id: String {
@@ -1743,6 +1752,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .mailbox: "Mailbox"
         case .cost: "Cost"
         case .console: "Console"
+        case .terminal: "Terminal"
         case .trace: "Trace"
         }
     }

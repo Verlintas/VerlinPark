@@ -323,6 +323,82 @@ pub struct WorkspaceWriteResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct TerminalOpenParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TerminalOpenResult {
+    pub terminal_id: String,
+    pub worktree: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerminalWriteParams {
+    pub terminal_id: String,
+    /// Base64-encoded bytes, because PTY input may contain arbitrary control bytes.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TerminalWriteResult {
+    pub written: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerminalReadParams {
+    pub terminal_id: String,
+    #[serde(default)]
+    pub after_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalChunk {
+    pub seq: u64,
+    /// Base64-encoded PTY output bytes.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TerminalReadResult {
+    pub terminal_id: String,
+    pub chunks: Vec<TerminalChunk>,
+    pub next_seq: u64,
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    pub dropped: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerminalResizeParams {
+    pub terminal_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TerminalResizeResult {
+    pub resized: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerminalCloseParams {
+    pub terminal_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TerminalCloseResult {
+    pub closed: bool,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ConsoleOpenParams {
     pub session_id: String,
 }
