@@ -130,6 +130,9 @@ enum Command {
         /// Deny reads under HOME except worktree/scratch/Git metadata/toolchains.
         #[arg(long)]
         restrict_home: bool,
+        /// Deny sibling user homes and /Volumes outside the worktree/toolchains.
+        #[arg(long)]
+        read_jail: bool,
     },
     /// Show the project's automatic worktree retention policy.
     WorktreePolicy { project: String },
@@ -602,6 +605,7 @@ async fn main() -> Result<()> {
             network,
             read_deny,
             restrict_home,
+            read_jail,
         } => {
             rpc(
                 &discovery,
@@ -612,6 +616,7 @@ async fn main() -> Result<()> {
                         "network": network,
                         "read_deny": read_deny,
                         "restrict_home": restrict_home,
+                        "read_jail": read_jail,
                     }
                 }),
             )
@@ -1893,6 +1898,7 @@ fn print_human(value: &Value) {
     }
     if let Some(policy) = value.get("policy")
         && value.get("project_id").is_some()
+        && policy.get("enabled").is_some()
     {
         println!(
             "memory policy enabled={} max_items={} max_age_days={}",
@@ -2008,10 +2014,11 @@ fn print_human(value: &Value) {
             return;
         }
         println!(
-            "project {}  network={}  restrict-home={}",
+            "project {}  network={}  restrict-home={}  read-jail={}",
             value["project_id"].as_str().unwrap_or("?"),
             policy["network"].as_str().unwrap_or("?"),
-            policy["restrict_home"].as_bool().unwrap_or(false)
+            policy["restrict_home"].as_bool().unwrap_or(false),
+            policy["read_jail"].as_bool().unwrap_or(false)
         );
         let paths = policy["read_deny"].as_array();
         if paths.is_none_or(|paths| paths.is_empty()) {

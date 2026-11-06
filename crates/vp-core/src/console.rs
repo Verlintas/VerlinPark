@@ -352,6 +352,7 @@ mod tests {
             network_allowed: false,
             home: root.join("home"),
             restrict_home: false,
+            read_jail: false,
         }
     }
 

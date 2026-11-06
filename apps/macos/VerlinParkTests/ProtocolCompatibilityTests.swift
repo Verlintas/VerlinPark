@@ -260,6 +260,25 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(written.sha256, "def456")
     }
 
+    func testShellPolicyReadsOptionalReadJail() throws {
+        let legacy = try JSONDecoder().decode(
+            ShellPolicy.self,
+            from: Data(#"{"network":"allow","read_deny":[],"restrict_home":true}"#.utf8)
+        )
+        XCTAssertTrue(legacy.restrictHome)
+        XCTAssertFalse(legacy.readJail)
+
+        let full = try JSONDecoder().decode(
+            ShellPolicy.self,
+            from: Data(
+                #"{"network":"deny","read_deny":["~/secrets"],"restrict_home":false,"read_jail":true}"#
+                    .utf8
+            )
+        )
+        XCTAssertTrue(full.readJail)
+        XCTAssertEqual(full.readDeny, ["~/secrets"])
+    }
+
     func testTaskActionResultDecodes() throws {
         let json = """
         {

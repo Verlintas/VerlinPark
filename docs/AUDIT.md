@@ -12,13 +12,13 @@
 - **P0-1 已修复**：TeamPlan 自动派发按 `write_scope` 选择可并行批次；空 scope / 重叠 scope 的任务串行执行。Worker 使用可释放的 active slot，Manager 继续按 run 计数；`available(Worker)` 限制 batch 大小。
 - **P0-2 已修复**：provider 请求前做 token reservation，按保守输入估算 + 动态 output budget 预留；provider 返回 usage 后结算，缺少 usage 的本地端点会以 `estimated: true` 的估算用量持久化。并发批次不再共用同一个 pre-flight 窗口。
 - **P1-4 已修复**：`fetch_url` 在连接前解析并固定已校验的 IP，阻止解析到 loopback/private/link-local/文档/benchmark 等地址；补充了 IPv4-mapped IPv6 与特殊段检查。
-- **P1-3 部分修复**：shell 现在通过 macOS Seatbelt 拒绝 worktree/Git 元数据/scratch 之外的写入，并保护 common hooks/config；sandbox 不可用时 fail closed。常见 credential/state 路径已 read-deny，timeout/cancel 会清理整个 process group，项目级 policy 可 deny network、追加 read-deny，并可 opt-in `restrict_home` 拒绝 HOME 内容（worktree/scratch/Git/toolchain 例外；HOME metadata 仍开放）；HOME 外任意读取、network allow 下的外发、进程执行策略和 Docker 等 daemon 介导写入仍未隔离，Verifier 的 shell 仍可创建 untracked/ignored 文件并读取 HOME 外路径；tracked 源码修改已有 post-run guard。
+- **P1-3 部分修复**：shell 现在通过 macOS Seatbelt 拒绝 worktree/Git 元数据/scratch 之外的写入，并保护 common hooks/config；sandbox 不可用时 fail closed。常见 credential/state 路径已 read-deny，timeout/cancel 会清理整个 process group，项目级 policy 可 deny network、追加 read-deny，并可 opt-in `restrict_home` 拒绝 HOME 内容，或 `read_jail` 进一步拒绝 HOME parent（通常 `/Users`）和 `/Volumes`（worktree/scratch/Git/toolchain/系统路径例外）；System 路径、`/private/tmp`、`/private/var`、network allow 下的外发、进程执行策略和 Docker 等 daemon 介导写入仍未隔离，Verifier 的 shell 仍可创建 untracked/ignored 文件并读取未 deny 的路径；tracked 源码修改已有 post-run guard。
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，冲突可显式调用 resolver agent 解决并重新验证；项目级 opt-in policy 可在 session idle 时自动触发，带 attempt/token cap；本地 landing 和 `gh` PR flow 可用。仍缺默认开启的静默自动冲突解决、LLM Integrator、其他 forge PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、其他 forge PR、shell scratch 回收、部分 merge 状态的人工检查。
 
-当前测试：Rust 189（core 147 / store 34 / providers 8），Swift 37。CI 以最新提交为准。
+当前测试：Rust 190（core 148 / store 34 / providers 8），Swift 38。CI 以最新提交为准。
 
 ### 0.1 2026-10-31 跟进
 
@@ -57,6 +57,7 @@
 - MCP 工具现在会以 `mcp_<server>_<tool>` 动态 schema 注入 Leader/Worker/Labour；Manager/Verifier 保持只读，不注入动态工具。
 - 新增 daemon-owned line-oriented Console：session worktree Seatbelt sandbox、streaming chunks、signals、Preview tab 与 `vp console`；不是 PTY。
 - 新增 workspace file browser：tree/file 路径 jail、Preview Files tab、`vp files` / `vp file`、binary/large preview；后续切片加入 expected_sha256 冲突检测的文本编辑、atomic write 与 `workspace.file_saved` 事件。
+- 新增 opt-in user/volume read jail：`ShellPolicy.read_jail`、HOME parent + `/Volumes` deny、toolchain/worktree allowlist、Manage Dash/CLI，Agent/Console/PTY 统一；见 ADR-0089。
 - 新增持久 task-DAG 队列与全局 write leases：`plan_tasks`/`write_leases`、plan lifecycle rebuild、priority+aging ready order、`task.queue`/`vp tasks`/Manage Dash、recovery 将 in-flight task 标为 interrupted 并清 lease；task 行已进入 replay/repair/bundle/db-rebuild；非 active session 可通过 `task.skip` / `task.retry` 和 Manage Dash 按钮跳过/重试 task，事件为 `plan_task.skipped` / `plan_task.retried`；opt-in `VERLINPARK_TASK_SCHEDULER` 可按 effective priority/round-robin resume 待办 session plan；见 ADR-0088。
 
 ---
@@ -87,7 +88,7 @@
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Console、Terminal、Files、History、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff、Rail 通知中心（历史持久化）可用；系统通知已支持（后台本地通知），更早的 round 受已加载 event window 限制 |
 | 可维护性 | C− | `agent.rs` 8,058 行（测试移到 `agent/tests.rs`）、`vp-core/lib.rs` 4,548 行（测试移到 `tests.rs`）、`store.rs` 5,002 行（测试移到 `store/tests.rs`）、`StudioView.swift` 约 2.4k 行；核心逻辑模块边界仍需治理 |
-| 测试 | B− | 189 Rust + 37 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/home read jail/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/project memory delete-prune-FTS-retention-policy/mid-run questions/MCP stdio persistent-pagination-resources-prompts-dynamic-tools/sandboxed console/PTY terminal/task-DAG queue/global write leases/opt-in global resume scheduler/task queue replay-bundle-rebuild/task skip-retry/usage CSV/project usage/worktree retention/diff parser/OpenAI+Anthropic HTTP adapter E2E/queued recovery/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
+| 测试 | B− | 190 Rust + 38 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/home read jail/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/project memory delete-prune-FTS-retention-policy/mid-run questions/MCP stdio persistent-pagination-resources-prompts-dynamic-tools/sandboxed console/PTY terminal/task-DAG queue/global write leases/opt-in global resume scheduler/task queue replay-bundle-rebuild/task skip-retry/user-volume read jail/usage CSV/project usage/worktree retention/diff parser/OpenAI+Anthropic HTTP adapter E2E/queued recovery/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
 | 发布准备 | C | `just package` 生成 ad-hoc signed DMG + checksum，release workflow 同时生成并上传 Homebrew cask；仍无 Developer ID/公证、更新器和可持续升级的 Homebrew tap |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -279,7 +280,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 189 个 Rust 测试 + 37 个 Swift 测试，覆盖 Leader loop、provider probe/retry/idle timeout、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、queued session 恢复、shell 沙箱/policy/home read jail、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、priority-aware aging global session admission、persistent task-DAG queue/global write leases/opt-in global resume scheduler、cross-session scope locks、priority-aware aging task+session global Worker/Labour capacity/budget-gated plan auto-expansion、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、project memory（delete/prune/FTS/replay/retention policy）、mid-run questions、MCP stdio（persistent/pagination/resources/prompts/dynamic tools）、sandboxed console、PTY terminal、workspace files/edit、Git history、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI+Anthropic HTTP adapter E2E、db rebuild。仍缺：
+已有 190 个 Rust 测试 + 38 个 Swift 测试，覆盖 Leader loop、provider probe/retry/idle timeout、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、queued session 恢复、shell 沙箱/policy/home read jail、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、priority-aware aging global session admission、persistent task-DAG queue/global write leases/opt-in global resume scheduler、cross-session scope locks、priority-aware aging task+session global Worker/Labour capacity/budget-gated plan auto-expansion、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、project memory（delete/prune/FTS/replay/retention policy）、mid-run questions、MCP stdio（persistent/pagination/resources/prompts/dynamic tools）、sandboxed console、PTY terminal、workspace files/edit、Git history、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI+Anthropic HTTP adapter E2E、db rebuild。仍缺：
 
 - 并发预算超调上界与预算 abort 的 sibling 结算（当前只测取消 abort）
 - 其他 forge PR adapter / 默认自动冲突解决策略 / 真正的 post-merge 集成分支
@@ -385,7 +386,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 189 passed after the 11-06 task-DAG/lease slice
+cargo test --workspace     # 190 passed after the 11-06 user/volume read jail slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
 just test                  # Rust + xcodebuild test (12 Swift tests)
 ```

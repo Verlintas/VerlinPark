@@ -4387,6 +4387,7 @@ impl Engine {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             restrict_home: policy.restrict_home,
+            read_jail: policy.read_jail,
         };
         self.consoles.open(&session.id, context).await
     }
@@ -4539,6 +4540,7 @@ impl Engine {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             restrict_home: policy.restrict_home,
+            read_jail: policy.read_jail,
         };
         self.terminals.open(&session.id, context, cols, rows).await
     }

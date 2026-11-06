@@ -54,6 +54,7 @@ final class AppModel {
     var shellPolicy = ShellPolicy.allow
     var shellPolicyNetwork = "allow"
     var shellPolicyRestrictHome = false
+    var shellPolicyReadJail = false
     var shellPolicyReadDenyText = ""
     var shellPolicyBusy = false
     var shellPolicyStatus: String?
@@ -341,6 +342,7 @@ final class AppModel {
             shellPolicy = .allow
             shellPolicyNetwork = "allow"
             shellPolicyRestrictHome = false
+            shellPolicyReadJail = false
             shellPolicyReadDenyText = ""
             shellPolicyStatus = nil
             integrationPolicy = .disabled
@@ -743,6 +745,7 @@ final class AppModel {
             shellPolicy = policy
             shellPolicyNetwork = policy.network
             shellPolicyRestrictHome = policy.restrictHome
+            shellPolicyReadJail = policy.readJail
             shellPolicyReadDenyText = policy.readDeny.joined(separator: "\n")
             shellPolicyStatus = nil
         } catch {
@@ -767,16 +770,18 @@ final class AppModel {
                 policy: ShellPolicy(
                     network: shellPolicyNetwork,
                     readDeny: readDeny,
-                    restrictHome: shellPolicyRestrictHome
+                    restrictHome: shellPolicyRestrictHome,
+                    readJail: shellPolicyReadJail
                 )
             )
             guard projectID == selectedProjectID else { return }
             shellPolicy = policy
             shellPolicyNetwork = policy.network
             shellPolicyRestrictHome = policy.restrictHome
+            shellPolicyReadJail = policy.readJail
             shellPolicyReadDenyText = policy.readDeny.joined(separator: "\n")
             shellPolicyStatus =
-                "Saved · network \(policy.network) · \(policy.readDeny.count) read-deny paths"
+                "Saved · network \(policy.network) · \(policy.readDeny.count) read-deny paths · read jail \(policy.readJail ? "on" : "off")"
         } catch {
             shellPolicyStatus = error.localizedDescription
             handle(error)
@@ -786,6 +791,7 @@ final class AppModel {
     func resetShellPolicy() async {
         shellPolicyNetwork = "allow"
         shellPolicyRestrictHome = false
+        shellPolicyReadJail = false
         shellPolicyReadDenyText = ""
         await saveShellPolicy()
     }

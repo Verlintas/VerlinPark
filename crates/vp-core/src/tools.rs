@@ -32,6 +32,9 @@ pub struct ToolContext {
     pub home: PathBuf,
     /// Deny reads under home except worktree/scratch/Git metadata/toolchains.
     pub restrict_home: bool,
+    /// Deny reads under the home parent (normally `/Users`) and `/Volumes`
+    /// outside the worktree/scratch/Git metadata/toolchain allowlist.
+    pub read_jail: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -674,13 +677,25 @@ pub(crate) async fn sandboxed_command(context: &ToolContext) -> Result<Command> 
         .map(|secret| secret.canonicalize().unwrap_or_else(|_| secret.clone()))
         .collect::<Vec<_>>();
     let mut allowed_paths = Vec::new();
-    if context.restrict_home {
+    if context.restrict_home || context.read_jail {
         let home = context
             .home
             .canonicalize()
             .unwrap_or_else(|_| context.home.clone());
-        profile.push_str("(deny file-read* (subpath (param \"HOME\")))\n");
-        profile.push_str("(allow file-read-metadata (subpath (param \"HOME\")))\n");
+        if context.restrict_home {
+            profile.push_str("(deny file-read* (subpath (param \"HOME\")))\n");
+        }
+        if context.read_jail {
+            if let Some(parent) = home.parent()
+                && parent != Path::new("/")
+            {
+                profile.push_str("(deny file-read* (subpath (param \"READ_ROOT\")))\n");
+            }
+            profile.push_str("(deny file-read* (subpath \"/Volumes\"))\n");
+        }
+        if context.restrict_home {
+            profile.push_str("(allow file-read-metadata (subpath (param \"HOME\")))\n");
+        }
         profile.push_str(
                 "(allow file-read* (subpath (param \"WORKTREE\")) (subpath (param \"SCRATCH\")) (subpath (param \"GIT_DIR\")) (subpath (param \"COMMON_DIR\")))\n",
             );
@@ -789,12 +804,20 @@ pub(crate) async fn sandboxed_command(context: &ToolContext) -> Result<Command> 
             .arg("-D")
             .arg(format!("SECRET{index}={}", secret.display()));
     }
-    if context.restrict_home {
+    if context.restrict_home || context.read_jail {
         let home = context
             .home
             .canonicalize()
             .unwrap_or_else(|_| context.home.clone());
         process.arg("-D").arg(format!("HOME={}", home.display()));
+        if context.read_jail
+            && let Some(parent) = home.parent()
+            && parent != Path::new("/")
+        {
+            process
+                .arg("-D")
+                .arg(format!("READ_ROOT={}", parent.display()));
+        }
         for (index, path) in allowed_paths.iter().enumerate() {
             process
                 .arg("-D")
@@ -823,7 +846,7 @@ pub(crate) async fn sandboxed_command(context: &ToolContext) -> Result<Command> 
         .env("GIT_CONFIG_KEY_0", "gc.auto")
         .env("GIT_CONFIG_VALUE_0", "0")
         .kill_on_drop(true);
-    if context.restrict_home {
+    if context.restrict_home || context.read_jail {
         process
             .env("HOME", &context.home)
             .env("XDG_CONFIG_HOME", scratch.join("config"))
@@ -1092,6 +1115,7 @@ mod tests {
                 sandbox_root,
                 home,
                 restrict_home: false,
+                read_jail: false,
                 secret_roots: Vec::new(),
                 network_allowed: true,
             },
@@ -1256,6 +1280,7 @@ mod tests {
             sandbox_root: dir.path().join("sandbox"),
             home: dir.path().join("home"),
             restrict_home: false,
+            read_jail: false,
             secret_roots: Vec::new(),
             network_allowed: true,
         };
@@ -1306,6 +1331,7 @@ mod tests {
             network_allowed: true,
             home: home.clone(),
             restrict_home: true,
+            read_jail: false,
         };
         let visible = Shell
             .execute(&context, json!({"command": "cat visible.txt"}))
@@ -1324,6 +1350,47 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    async fn shell_read_jail_denies_home_siblings_but_allows_worktree() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("worktree");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("visible.txt"), "worktree\n").unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("secret.txt"), "secret\n").unwrap();
+        let context = ToolContext {
+            root: root.clone(),
+            project_root: root.clone(),
+            sandbox_root: dir.path().join("sandbox"),
+            secret_roots: Vec::new(),
+            network_allowed: true,
+            home,
+            restrict_home: false,
+            read_jail: true,
+        };
+        let visible = Shell
+            .execute(&context, json!({"command": "cat visible.txt"}))
+            .await
+            .unwrap();
+        assert!(!visible.is_error, "{}", visible.content);
+        assert!(visible.content.contains("worktree"));
+
+        let secret = Shell
+            .execute(&context, json!({"command": "cat ../home/secret.txt"}))
+            .await
+            .unwrap();
+        assert!(secret.is_error, "{}", secret.content);
+        assert!(secret.content.contains("Operation not permitted"));
+
+        let system = Shell
+            .execute(&context, json!({"command": "cat /etc/hosts >/dev/null"}))
+            .await
+            .unwrap();
+        assert!(!system.is_error, "{}", system.content);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     async fn shell_network_policy_can_deny_access() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("worktree");
@@ -1334,6 +1401,7 @@ mod tests {
             sandbox_root: dir.path().join("sandbox"),
             home: dir.path().join("home"),
             restrict_home: false,
+            read_jail: false,
             secret_roots: Vec::new(),
             network_allowed: false,
         };
@@ -1359,6 +1427,7 @@ mod tests {
             sandbox_root: dir.path().join("sandbox"),
             home: dir.path().join("home"),
             restrict_home: false,
+            read_jail: false,
             secret_roots: Vec::new(),
             network_allowed: true,
         };
@@ -1408,6 +1477,7 @@ mod tests {
             sandbox_root: dir.path().join("sandbox"),
             home: dir.path().join("home"),
             restrict_home: false,
+            read_jail: false,
             secret_roots: Vec::new(),
             network_allowed: true,
         };
@@ -1466,6 +1536,7 @@ mod tests {
             sandbox_root: dir.path().join("sandbox"),
             home: dir.path().join("home"),
             restrict_home: false,
+            read_jail: false,
             secret_roots: Vec::new(),
             network_allowed: true,
         };

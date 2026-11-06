@@ -113,6 +113,7 @@ actor CoreClient {
                 "network": .string(policy.network),
                 "read_deny": .array(policy.readDeny.map(JSONValue.string)),
                 "restrict_home": .bool(policy.restrictHome),
+                "read_jail": .bool(policy.readJail),
             ]),
         ]
         return try await request(method: "project.shell_policy.set", params: params)

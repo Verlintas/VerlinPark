@@ -692,11 +692,13 @@ async fn shell_policy_round_trips_and_validates() {
                 network: "deny".into(),
                 read_deny: vec![deny_path.to_string_lossy().to_string()],
                 restrict_home: true,
+                read_jail: true,
             },
         )
         .await
         .unwrap();
     assert_eq!(saved.network, "deny");
+    assert!(saved.read_jail);
     assert_eq!(engine.get_shell_policy(&project.id).await.unwrap(), saved);
     assert!(
         engine
@@ -706,6 +708,7 @@ async fn shell_policy_round_trips_and_validates() {
                     network: "sometimes".into(),
                     read_deny: Vec::new(),
                     restrict_home: false,
+                    read_jail: false,
                 },
             )
             .await
@@ -719,6 +722,7 @@ async fn shell_policy_round_trips_and_validates() {
                     network: "allow".into(),
                     read_deny: vec!["relative/path".into()],
                     restrict_home: false,
+                    read_jail: false,
                 },
             )
             .await

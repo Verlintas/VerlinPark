@@ -1,6 +1,6 @@
 # VerlinPark 进度
 
-> 最后更新：2026-10-31
+> 最后更新：2026-11-06
 > 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
@@ -30,7 +30,7 @@
 | PR flow | ✅ | `session.pr` / `vp pr` / Preview → Open PR / MR：preflight origin，GitHub 用 `gh auth status` + `gh pr create`，GitLab 用 `glab auth status` + `glab mr create`（origin 含 gitlab 自动检测，`VERLINPARK_PR_PROVIDER` 可覆盖）；push session branch，CLI 失败会明确报告 branch 已 push |
 | Queue recovery | ✅ | daemon 重启把 queued/merging/checking entry 标为 interrupted 并补事件；interrupted 可 rebase+retry |
 | Diff / commit | ✅ | base..worktree diff、显式 commit、discard、session committed 事件；Preview Changes 解析 unified diff，按文件选择并显示 +/- 行数 |
-| Shell 写入沙箱 | ✅ | macOS Seatbelt（`sandbox-exec`）：只允许写 worktree、对应 Git 元数据、per-agent scratch 和 `/dev/null`；拒绝 common hooks/config 与 worktree `config.worktree`；`.git` 指向校验；scratch 承载 TMPDIR/构建缓存；env allowlist 不继承 provider/daemon secrets；常见 credential/state 路径 read-deny；timeout/cancel 杀整个 process group；项目级 `ShellPolicy` 可拒绝网络、追加 read-deny，并可 opt-in `restrict_home`：HOME 内容默认拒绝，只允许 worktree/scratch/Git 元数据、常见 toolchain/cache 与 `.gitconfig`/SSH config/known_hosts；HOME metadata 允许以支持路径遍历；sandbox 不可用时 fail closed |
+| Shell 写入沙箱 | ✅ | macOS Seatbelt（`sandbox-exec`）：只允许写 worktree、对应 Git 元数据、per-agent scratch 和 `/dev/null`；拒绝 common hooks/config 与 worktree `config.worktree`；`.git` 指向校验；scratch 承载 TMPDIR/构建缓存；env allowlist 不继承 provider/daemon secrets；常见 credential/state 路径 read-deny；timeout/cancel 杀整个 process group；项目级 `ShellPolicy` 可拒绝网络、追加 read-deny，并可 opt-in `restrict_home`（HOME 内容默认拒绝，只允许 worktree/scratch/Git 元数据、常见 toolchain/cache 与 `.gitconfig`/SSH config/known_hosts）或 `read_jail`（进一步拒绝 HOME parent 通常是 `/Users` 和 `/Volumes`，保留 worktree/scratch/Git/toolchain/系统路径）；HOME metadata 允许以支持路径遍历；sandbox 不可用时 fail closed；System 路径、`/private/tmp`、`/private/var` 等仍可读，network allow 仍可外发 |
 | 预算 / 取消 / 暂停 | ✅ | session token reservation + provider usage 结算；TeamPlan 可声明 department/task token/USD budget 树；daemon-wide `BudgetRegistry` 在 turn 前原子 grant task+department 最紧 output budget（token + USD reservation，RAII 释放），并按 ledger 复查；task/department 超限只 block 该任务，session 超限仍失败；session 和 project pool 用量到 80% 时各发一次 `agent.budget_warning`；无 usage 端点使用 `estimated: true` 估算；Stop、CLI cancel、崩溃恢复；`session.pause` / `session.resume` / `vp pause` / `vp resume` 在 turn/tool 边界协作式暂停并继续同一 run |
 | 审批 | ✅ | 写/Shell 审批；事件带发起 Agent；Chat Approve/Deny；Manage Dash “Approvals” 跨 project 汇总 pending、显示 session goal、可直接 Approve/Deny |
 | 中途提问 | ✅ | `ask_user` tool（Leader/Manager/Worker/Labour，非 Verifier）+ `question.requested/answered/cancelled/expired` 事件；session `waiting_input`；Chat 选项/自由文本、`question.list`/`question.answer`、`vp questions`/`vp answer`；Manage Dash “Questions” 跨 session inbox；`VERLINPARK_QUESTION_TIMEOUT_SECS` 默认 1800（60–86400）；replay/repair/bundle |
@@ -61,8 +61,8 @@
 
 ## 验证
 
-- `cargo test --workspace`：189 个测试通过（core 147、store 34、providers 8）。
-- `xcodebuild test`：37 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
+- `cargo test --workspace`：190 个测试通过（core 148、store 34、providers 8）。
+- `xcodebuild test`：38 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub hosted macOS runner 持续排队/容量受限；本地 lint、Rust/Swift 测试与打包通过。
 - 手工 E2E 已覆盖：Leader/Manager/Worker/Labour 委派、task worktree、并行 Worker、Verifier approve/reject、TeamPlan 自动派发、Manager 圆桌、审批、diff、commit/discard、预算/取消/暂停恢复、项目 shell policy get/set。
@@ -108,7 +108,7 @@
 - 通知历史通过 UserDefaults 持久化，内容包含 session goal/tool/agent；macOS 系统通知在 app 非 active 时发送，前台由 Rail 承担，点击通知打开对应 session；系统通知权限被拒时仅保留 in-app 通知；同一个 session 的失败/取消可能各产生一条通知。
 - Project memory 支持手动删除、`older_than_days` / `keep_latest` prune，以及 opt-in per-project retention policy；daemon 每小时（可配置/可关闭）sweep enabled policy；recall 先走 FTS5，无结果/失败时回退 LIKE；CJK 分词不完整，主要靠 fallback；无 embedding/语义检索；删除保留事件历史。
 - `ask_user` 等待时占用 session admission slot；超时可配（`VERLINPARK_QUESTION_TIMEOUT_SECS`，默认 1800s）；一个 question 只接受一个答案，不能做多问题访谈；inbox 只在 Manage Dash 拉取，不是持久任务队列。
-- `restrict_home` 只限制 HOME 内容；HOME metadata、其他用户目录、`/Volumes`、HOME 外任意路径、network allow 和 daemon 介导写入仍未隔离；allowlist 是启发式，可能需调整或关闭；`sandbox-exec` 已废弃。
+- `restrict_home` 只限制 HOME 内容；`read_jail` 进一步限制 HOME parent 与 `/Volumes`，但 System 路径、`/private/tmp`、`/private/var`、HOME 外其他路径、network allow 下的外发和 daemon 介导写入仍未隔离；allowlist 是启发式，可能需调整；`sandbox-exec` 已废弃。
 - MCP 首次连接仍有进程启动延迟；无 sampling/notifications；binary resource 只显示 base64 长度，未解码/物化；env 存在本地 DB 而非 Keychain；MCP server 本身不在 shell sandbox 内，只应添加可信命令；tool call 丢失响应时按失败处理，不自动重试。
 - queued session 恢复需要 provider 已配置；未配置时保持 `queued`，配置后由 `agent.configure` 触发 re-enqueue；queued session 的取消仍依赖 active run。
 - Shell 只做写入隔离与常见 credential read-deny；项目 policy 只能收窄不能放宽、只对后续 run 生效，且不随 session bundle 导出；不是完整 read jail，network allow 下仍可外发，`sandbox-exec` 是废弃 API；task worktree/branch 有显式 `cleanup-worktrees`，但没有自动/定时清理；shell scratch 仍无统一回收。
@@ -213,6 +213,7 @@
 - **M3 第八十八切片**：mutable session priority（`session.priority.set`、事件/repair/rebuild、CLI、header menu）；见 ADR-0086。
 - **M3 第八十九切片**：PTY terminal（portable-pty、SwiftTerm、Terminal tab、`vp terminal`、resize/process-group）；见 ADR-0087。
 - **M3 第九十切片**：持久 task-DAG 队列 + SQLite global write leases + opt-in global resume scheduler（`task.queue`/`vp tasks`/Manage Dash、aging/round-robin、恢复清理）；task 行 replay/repair/bundle/db-rebuild 已补齐；task skip/retry + Manage Dash actions 已完成；见 ADR-0088。
+- **M3 第九十一切片**：opt-in user/volume read jail（`ShellPolicy.read_jail`、HOME parent + `/Volumes` deny、toolchain/worktree allowlist、Manage Dash/CLI/RPC、Agent/Console/PTY 统一）；见 ADR-0089。
 
 ## 如何运行
 

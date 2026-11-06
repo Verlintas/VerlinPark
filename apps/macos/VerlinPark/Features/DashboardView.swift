@@ -325,15 +325,23 @@ private struct ShellPolicyCard: View {
                 .frame(width: 210)
             }
 
-            Toggle("Restrict home reads", isOn: $model.shellPolicyRestrictHome)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .help(
-                    "Deny reads under HOME except the worktree, scratch, Git metadata, and known toolchain/cache paths."
-                )
+            HStack(spacing: 16) {
+                Toggle("Restrict home reads", isOn: $model.shellPolicyRestrictHome)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help(
+                        "Deny reads under HOME except the worktree, scratch, Git metadata, and known toolchain/cache paths."
+                    )
+                Toggle("Read jail (all users + volumes)", isOn: $model.shellPolicyReadJail)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help(
+                        "Deny reads under the home parent (normally /Users) and /Volumes except the worktree, scratch, Git metadata, toolchains, and read-deny exceptions. System paths remain readable."
+                    )
+            }
 
             Text(
-                "Writes remain confined to the worktree, Git metadata, and runtime scratch. Network deny blocks outbound sockets. Restrict home reads denies HOME except the worktree, scratch, Git metadata, and known toolchains. Read-deny paths are additive and must be absolute or start with ~/."
+                "Writes remain confined to the worktree, Git metadata, and runtime scratch. Network deny blocks outbound sockets. Restrict home reads denies HOME; Read jail also denies sibling user homes and /Volumes. Both allow the worktree, scratch, Git metadata, and known toolchains. Read-deny paths are additive and must be absolute or start with ~/. This is not a full filesystem read sandbox."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)

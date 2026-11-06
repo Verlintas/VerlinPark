@@ -20,6 +20,11 @@ pub struct ShellPolicy {
     /// Git metadata, and explicitly allowed toolchain/cache paths.
     #[serde(default)]
     pub restrict_home: bool,
+    /// Deny reads under the user's home-parent (normally `/Users`) and
+    /// `/Volumes` outside the worktree, scratch, Git metadata, and toolchain
+    /// allowlist. System paths remain readable.
+    #[serde(default)]
+    pub read_jail: bool,
 }
 
 impl Default for ShellPolicy {
@@ -28,6 +33,7 @@ impl Default for ShellPolicy {
             network: default_shell_network(),
             read_deny: Vec::new(),
             restrict_home: false,
+            read_jail: false,
         }
     }
 }

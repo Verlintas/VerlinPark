@@ -4,19 +4,27 @@ struct ShellPolicy: Codable, Hashable, Sendable {
     var network: String
     var readDeny: [String]
     var restrictHome: Bool
+    var readJail: Bool
 
-    static let allow = ShellPolicy(network: "allow", readDeny: [], restrictHome: false)
+    static let allow = ShellPolicy(
+        network: "allow",
+        readDeny: [],
+        restrictHome: false,
+        readJail: false
+    )
 
     enum CodingKeys: String, CodingKey {
         case network
         case readDeny = "read_deny"
         case restrictHome = "restrict_home"
+        case readJail = "read_jail"
     }
 
-    init(network: String, readDeny: [String], restrictHome: Bool) {
+    init(network: String, readDeny: [String], restrictHome: Bool, readJail: Bool) {
         self.network = network
         self.readDeny = readDeny
         self.restrictHome = restrictHome
+        self.readJail = readJail
     }
 
     init(from decoder: Decoder) throws {
@@ -24,6 +32,7 @@ struct ShellPolicy: Codable, Hashable, Sendable {
         network = try container.decode(String.self, forKey: .network)
         readDeny = try container.decodeIfPresent([String].self, forKey: .readDeny) ?? []
         restrictHome = try container.decodeIfPresent(Bool.self, forKey: .restrictHome) ?? false
+        readJail = try container.decodeIfPresent(Bool.self, forKey: .readJail) ?? false
     }
 }
 

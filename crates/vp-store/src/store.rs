@@ -126,6 +126,7 @@ impl Store {
                 network         TEXT NOT NULL,
                 read_deny       TEXT NOT NULL,
                 restrict_home   INTEGER NOT NULL DEFAULT 0,
+                read_jail       INTEGER NOT NULL DEFAULT 0,
                 updated_at      TEXT NOT NULL
             );
 
@@ -515,6 +516,12 @@ impl Store {
         )?;
         ensure_column(
             &conn,
+            "project_shell_policies",
+            "read_jail",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
             "project_mailbox_policies",
             "delete_unread",
             "INTEGER NOT NULL DEFAULT 0",
@@ -723,7 +730,7 @@ impl Store {
         let conn = self.lock()?;
         let stored = conn
             .query_row(
-                "SELECT network, read_deny, restrict_home
+                "SELECT network, read_deny, restrict_home, read_jail
                  FROM project_shell_policies WHERE project_id = ?1",
                 params![project_id],
                 |row| {
@@ -731,16 +738,18 @@ impl Store {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)? != 0,
                     ))
                 },
             )
             .optional()?;
         match stored {
-            Some((network, read_deny, restrict_home)) => Ok(ShellPolicy {
+            Some((network, read_deny, restrict_home, read_jail)) => Ok(ShellPolicy {
                 network,
                 read_deny: serde_json::from_str(&read_deny)
                     .context("parsing stored shell read-deny policy")?,
                 restrict_home,
+                read_jail,
             }),
             None => Ok(ShellPolicy::default()),
         }
@@ -752,18 +761,20 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO project_shell_policies
-             (project_id, network, read_deny, restrict_home, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             (project_id, network, read_deny, restrict_home, read_jail, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(project_id) DO UPDATE SET
                 network = excluded.network,
                 read_deny = excluded.read_deny,
                 restrict_home = excluded.restrict_home,
+                read_jail = excluded.read_jail,
                 updated_at = excluded.updated_at",
             params![
                 project_id,
                 policy.network,
                 read_deny,
                 if policy.restrict_home { 1 } else { 0 },
+                if policy.read_jail { 1 } else { 0 },
                 now_rfc3339()
             ],
         )?;

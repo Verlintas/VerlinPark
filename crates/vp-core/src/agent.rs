@@ -4464,6 +4464,7 @@ async fn run_loop(
             .map(PathBuf::from)
             .unwrap_or_default(),
         restrict_home: shell_policy.restrict_home,
+        read_jail: shell_policy.read_jail,
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
     let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;

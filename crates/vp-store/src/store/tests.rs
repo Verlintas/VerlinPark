@@ -287,6 +287,7 @@ fn records_and_reads_the_latest_project_manifest_snapshot() {
                 network: "deny".into(),
                 read_deny: vec!["~/secret".into()],
                 restrict_home: true,
+                read_jail: false,
             },
         )
         .unwrap();
@@ -307,6 +308,7 @@ fn records_and_reads_the_latest_project_manifest_snapshot() {
                 network: "allow".into(),
                 read_deny: Vec::new(),
                 restrict_home: false,
+                read_jail: false,
             },
         )
         .unwrap();
