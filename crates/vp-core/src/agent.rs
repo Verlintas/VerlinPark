@@ -2711,13 +2711,19 @@ impl AgentService {
             anyhow::bail!("session has no TeamPlan");
         };
         let (_, scheduled) = self.engine.scheduler().sync_plan(&session, &plan).await?;
-        let completed = scheduled
+        let mut terminal = scheduled
             .iter()
-            .filter(|task| task.status == "completed")
+            .filter(|task| matches!(task.status.as_str(), "completed" | "skipped"))
             .map(|task| task.task_id.clone())
             .collect::<std::collections::HashSet<_>>();
-        if plan.tasks.iter().all(|task| completed.contains(&task.id)) {
-            anyhow::bail!("plan is already complete");
+        // Tasks absent from a just-synced queue are treated as pending.
+        for task in &plan.tasks {
+            if !scheduled.iter().any(|row| row.task_id == task.id) {
+                terminal.remove(&task.id);
+            }
+        }
+        if plan.tasks.iter().all(|task| terminal.contains(&task.id)) {
+            anyhow::bail!("plan is already complete or skipped");
         }
 
         let control = Arc::new(RunControl::new());
@@ -2742,7 +2748,7 @@ impl AgentService {
                     "agent.plan_resume_queued",
                     serde_json::json!({
                         "goal": plan.goal,
-                        "remaining_tasks": plan.tasks.len().saturating_sub(completed.len()),
+                        "remaining_tasks": plan.tasks.len().saturating_sub(terminal.len()),
                     }),
                 )
                 .await?;
@@ -7556,17 +7562,32 @@ async fn execute_team_plan(
         .filter(|(_, status)| status.as_str() == "completed")
         .map(|(task_id, _)| task_id.clone())
         .collect::<std::collections::HashSet<_>>();
+    let skipped = statuses
+        .iter()
+        .filter(|(_, status)| status.as_str() == "skipped")
+        .map(|(task_id, _)| task_id.clone())
+        .collect::<std::collections::HashSet<_>>();
     let mut remaining = plan
         .tasks
         .iter()
-        .filter(|task| !completed.contains(&task.id))
+        .filter(|task| !completed.contains(&task.id) && !skipped.contains(&task.id))
         .cloned()
         .collect::<Vec<_>>();
     let mut reports = plan
         .tasks
         .iter()
-        .filter(|task| completed.contains(&task.id))
-        .map(|task| format!("{} [completed]: already completed; skipped", task.id))
+        .filter_map(|task| {
+            if completed.contains(&task.id) {
+                Some(format!(
+                    "{} [completed]: already completed; skipped",
+                    task.id
+                ))
+            } else if skipped.contains(&task.id) {
+                Some(format!("{} [skipped]: previously skipped", task.id))
+            } else {
+                None
+            }
+        })
         .collect::<Vec<_>>();
 
     while !remaining.is_empty() {
@@ -8128,7 +8149,12 @@ async fn execute_team_plan(
         .count();
     let failed = statuses
         .values()
-        .filter(|status| matches!(status.as_str(), "failed" | "blocked" | "cancelled"))
+        .filter(|status| {
+            matches!(
+                status.as_str(),
+                "failed" | "blocked" | "cancelled" | "skipped"
+            )
+        })
         .count();
     reports.push(format!(
         "Plan complete: {completed} completed, {failed} not completed."

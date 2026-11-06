@@ -174,6 +174,10 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Retry a failed, blocked, interrupted, cancelled, or skipped plan task.
+    TaskRetry { session: String, task: String },
+    /// Skip a queued plan task for the current plan revision.
+    TaskSkip { session: String, task: String },
     /// Create a session for a project.
     SessionNew {
         project: String,
@@ -677,6 +681,22 @@ async fn main() -> Result<()> {
                 &discovery,
                 "task.queue",
                 json!({"project_id": project, "session_id": session}),
+            )
+            .await?
+        }
+        Command::TaskRetry { session, task } => {
+            rpc(
+                &discovery,
+                "task.retry",
+                json!({"session_id": session, "task_id": task}),
+            )
+            .await?
+        }
+        Command::TaskSkip { session, task } => {
+            rpc(
+                &discovery,
+                "task.skip",
+                json!({"session_id": session, "task_id": task}),
             )
             .await?
         }
@@ -1434,6 +1454,18 @@ fn print_human(value: &Value) {
                 session["goal"].as_str().unwrap_or("?")
             );
         }
+        return;
+    }
+    if let Some(task) = value.get("task")
+        && task.get("session_id").is_some()
+        && task.get("task_id").is_some()
+    {
+        println!(
+            "{} {} -> {}",
+            task["session_id"].as_str().unwrap_or("?"),
+            task["task_id"].as_str().unwrap_or("?"),
+            task["status"].as_str().unwrap_or("?")
+        );
         return;
     }
     if let Some(tasks) = value.get("tasks").and_then(Value::as_array)

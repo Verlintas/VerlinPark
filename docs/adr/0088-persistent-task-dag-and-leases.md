@@ -52,6 +52,12 @@ one ready batch inside one session.
 7. **Observability.** `task.queue` returns rows plus active leases; `vp tasks`
    and the Manage Dash scheduler card expose them. `Sync_plan_tasks` remains the
    repair point for the operational projection.
+8. **Manual skip/retry.** A non-active session can retry a
+   failed/blocked/interrupted/cancelled/skipped task back to `pending`
+   (`plan_task.retried`) or skip a queued task (`plan_task.skipped`). A skipped
+   task is terminal for scheduling and is not picked up by the global scheduler;
+   its dependants remain blocked. Both transitions are atomic with events and
+   replay/repair/bundle aware.
 
 ## Consequences
 
@@ -66,6 +72,8 @@ one ready batch inside one session.
   plans; it does not run a single task from an inactive session without a plan
   run, and it executes ready tasks in batches rather than a fully autonomous
   per-task dispatcher.
+- Tasks can be skipped or retried without restarting a session; running tasks
+  still require session pause/cancel.
 - Task rows are part of `session.replay` drift checks and
   `--repair`/`--rebuild`, session bundle export/import, and `db-rebuild`.
   They are regenerated from the plan and plan events. Write leases are ephemeral

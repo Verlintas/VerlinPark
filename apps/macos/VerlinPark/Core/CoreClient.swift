@@ -639,6 +639,24 @@ actor CoreClient {
         .decode(TaskQueueResult.self)
     }
 
+    func retryTask(sessionID: String, taskID: String) async throws -> SchedulerTask {
+        try await request(
+            method: "task.retry",
+            params: ["session_id": .string(sessionID), "task_id": .string(taskID)]
+        )
+        .decode(TaskActionResult.self)
+        .task
+    }
+
+    func skipTask(sessionID: String, taskID: String) async throws -> SchedulerTask {
+        try await request(
+            method: "task.skip",
+            params: ["session_id": .string(sessionID), "task_id": .string(taskID)]
+        )
+        .decode(TaskActionResult.self)
+        .task
+    }
+
     func openTerminal(sessionID: String, cols: Int, rows: Int) async throws -> TerminalOpenResult {
         try await request(
             method: "terminal.open",

@@ -1218,6 +1218,10 @@ struct SchedulerTask: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+struct TaskActionResult: Codable, Sendable {
+    let task: SchedulerTask
+}
+
 struct WriteLease: Codable, Identifiable, Hashable, Sendable {
     let projectID: String
     let sessionID: String

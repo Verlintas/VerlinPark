@@ -160,6 +160,8 @@ final class AppModel {
     var taskQueue: TaskQueueResult?
     var taskQueueBusy = false
     var taskQueueStatus: String?
+    var taskActionBusyID: String?
+    var taskActionStatus: String?
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -1997,6 +1999,30 @@ final class AppModel {
             taskQueueStatus = nil
         } catch {
             taskQueueStatus = error.localizedDescription
+        }
+    }
+
+    func retryScheduledTask(_ task: SchedulerTask) async {
+        taskActionBusyID = task.id
+        defer { taskActionBusyID = nil }
+        do {
+            let updated = try await core.retryTask(sessionID: task.sessionID, taskID: task.taskID)
+            taskActionStatus = "\(updated.taskID) -> \(updated.status)"
+            await loadTaskQueue()
+        } catch {
+            taskActionStatus = error.localizedDescription
+        }
+    }
+
+    func skipScheduledTask(_ task: SchedulerTask) async {
+        taskActionBusyID = task.id
+        defer { taskActionBusyID = nil }
+        do {
+            let updated = try await core.skipTask(sessionID: task.sessionID, taskID: task.taskID)
+            taskActionStatus = "\(updated.taskID) -> \(updated.status)"
+            await loadTaskQueue()
+        } catch {
+            taskActionStatus = error.localizedDescription
         }
     }
 

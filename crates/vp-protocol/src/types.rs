@@ -1833,6 +1833,17 @@ pub struct TaskQueueResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct TaskActionParams {
+    pub session_id: String,
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskActionResult {
+    pub task: ScheduledTask,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct TeamPlanParams {
     pub session_id: String,
 }

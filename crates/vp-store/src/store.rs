@@ -3674,7 +3674,8 @@ impl Store {
                 "SELECT type, payload, created_at FROM events
                  WHERE session_id = ?1 AND seq > ?2
                    AND type IN ('plan_task.started', 'plan_task.finished',
-                                'plan_task.interrupted')
+                                'plan_task.interrupted', 'plan_task.retried',
+                                'plan_task.skipped')
                  ORDER BY seq ASC",
             )?;
             let rows = stmt.query_map(params![session_id, plan_seq as i64], |row| {
@@ -3722,6 +3723,16 @@ impl Store {
                     }
                     "plan_task.interrupted" => {
                         state.status = "interrupted".to_string();
+                        state.finished_at = Some(created_at);
+                        state.last_error = payload["reason"].as_str().map(str::to_string);
+                    }
+                    "plan_task.retried" => {
+                        state.status = "pending".to_string();
+                        state.finished_at = None;
+                        state.last_error = None;
+                    }
+                    "plan_task.skipped" => {
+                        state.status = "skipped".to_string();
                         state.finished_at = Some(created_at);
                         state.last_error = payload["reason"].as_str().map(str::to_string);
                     }
@@ -3894,6 +3905,152 @@ impl Store {
             .optional()?;
         tx.commit()?;
         Ok(task)
+    }
+
+    /// Retry a terminal/blocked task after the session is no longer active.
+    /// The task returns to `pending`; the next plan resume or global scheduler
+    /// tick can claim it. The projection update and event are atomic.
+    pub fn retry_plan_task_with_event(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(ScheduledTask, Event)> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let (plan_seq, status, session_status) = tx
+            .query_row(
+                "SELECT t.plan_seq, t.status, s.status
+                 FROM plan_tasks t JOIN sessions s ON s.id = t.session_id
+                 WHERE t.session_id = ?1 AND t.task_id = ?2
+                 ORDER BY t.plan_seq DESC LIMIT 1",
+                params![session_id, task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("task not found: {task_id}"))?;
+        if !matches!(
+            session_status.as_str(),
+            "idle" | "failed" | "cancelled" | "draft"
+        ) {
+            return Err(anyhow!(
+                "session {session_id} is {session_status}; stop it before retrying a task"
+            ));
+        }
+        if !matches!(
+            status.as_str(),
+            "failed" | "blocked" | "interrupted" | "cancelled" | "skipped"
+        ) {
+            return Err(anyhow!("task {task_id} is {status}, not retryable"));
+        }
+        tx.execute(
+            "UPDATE plan_tasks
+             SET status = 'pending', finished_at = NULL, last_error = NULL, updated_at = ?1
+             WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4",
+            params![now, session_id, plan_seq, task_id],
+        )?;
+        let task = tx.query_row(
+            "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
+                    status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
+                    last_error
+             FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
+            params![session_id, plan_seq, task_id],
+            map_scheduled_task,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "plan_task.retried",
+            serde_json::json!({
+                "task_id": task_id,
+                "task_status": "pending",
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((task, event))
+    }
+
+    /// Skip a queued/blocked task for the current plan revision. A skipped task
+    /// is terminal for scheduling and is not picked up by the global scheduler;
+    /// downstream dependencies remain blocked rather than silently running.
+    pub fn skip_plan_task_with_event(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(ScheduledTask, Event)> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let (plan_seq, status, session_status) = tx
+            .query_row(
+                "SELECT t.plan_seq, t.status, s.status
+                 FROM plan_tasks t JOIN sessions s ON s.id = t.session_id
+                 WHERE t.session_id = ?1 AND t.task_id = ?2
+                 ORDER BY t.plan_seq DESC LIMIT 1",
+                params![session_id, task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("task not found: {task_id}"))?;
+        if !matches!(
+            session_status.as_str(),
+            "idle" | "failed" | "cancelled" | "draft"
+        ) {
+            return Err(anyhow!(
+                "session {session_id} is {session_status}; stop it before skipping a task"
+            ));
+        }
+        if !matches!(
+            status.as_str(),
+            "pending" | "failed" | "blocked" | "interrupted" | "cancelled"
+        ) {
+            return Err(anyhow!("task {task_id} is {status}, not skippable"));
+        }
+        tx.execute(
+            "UPDATE plan_tasks
+             SET status = 'skipped', last_error = 'skipped by user',
+                 finished_at = ?1, updated_at = ?1
+             WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4",
+            params![now, session_id, plan_seq, task_id],
+        )?;
+        let task = tx.query_row(
+            "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
+                    status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
+                    last_error
+             FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
+            params![session_id, plan_seq, task_id],
+            map_scheduled_task,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "plan_task.skipped",
+            serde_json::json!({
+                "task_id": task_id,
+                "task_status": "skipped",
+                "reason": "skipped by user",
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((task, event))
     }
 
     /// Mark in-flight task rows as interrupted after a daemon restart. Returns

@@ -637,6 +637,30 @@ impl Engine {
         self.scheduler.leases(project_id, session_id).await
     }
 
+    pub async fn retry_plan_task(&self, session_id: &str, task_id: &str) -> Result<ScheduledTask> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let (task, event) = tokio::task::spawn_blocking(move || {
+            store.retry_plan_task_with_event(&session_id, &task_id)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(task)
+    }
+
+    pub async fn skip_plan_task(&self, session_id: &str, task_id: &str) -> Result<ScheduledTask> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let (task, event) = tokio::task::spawn_blocking(move || {
+            store.skip_plan_task_with_event(&session_id, &task_id)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(task)
+    }
+
     pub async fn interrupt_running_plan_tasks(&self, session_id: &str) -> Result<usize> {
         let store = self.store.clone();
         let id = session_id.to_string();
@@ -2223,7 +2247,11 @@ impl Engine {
         for event in data.events.iter().filter(|event| event.seq > plan_seq) {
             if !matches!(
                 event.kind.as_str(),
-                "plan_task.started" | "plan_task.finished" | "plan_task.interrupted"
+                "plan_task.started"
+                    | "plan_task.finished"
+                    | "plan_task.interrupted"
+                    | "plan_task.retried"
+                    | "plan_task.skipped"
             ) {
                 continue;
             }
@@ -2261,6 +2289,16 @@ impl Engine {
                 }
                 "plan_task.interrupted" => {
                     task.status = "interrupted".to_string();
+                    task.finished_at = Some(event.created_at.clone());
+                    task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                }
+                "plan_task.retried" => {
+                    task.status = "pending".to_string();
+                    task.finished_at = None;
+                    task.last_error = None;
+                }
+                "plan_task.skipped" => {
+                    task.status = "skipped".to_string();
                     task.finished_at = Some(event.created_at.clone());
                     task.last_error = event.payload["reason"].as_str().map(str::to_string);
                 }

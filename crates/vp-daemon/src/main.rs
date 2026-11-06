@@ -46,10 +46,10 @@ use vp_protocol::types::{
     SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
     SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
     SetSessionPriorityParams, SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams,
-    ShellPolicyResult, SubscribeParams, TaskQueueParams, TeamPlanParams, TeamPlanResult,
-    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, UpdateMcpServerParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    ShellPolicyResult, SubscribeParams, TaskActionParams, TaskActionResult, TaskQueueParams,
+    TeamPlanParams, TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
+    TerminalResizeParams, TerminalWriteParams, UpdateMcpServerParams, UsageLedgerParams,
+    WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -532,6 +532,28 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "task.retry" => match parse_params::<TaskActionParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .retry_plan_task(&params.session_id, &params.task_id)
+                .await
+            {
+                Ok(task) => RpcResponse::success(id, TaskActionResult { task }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "task.skip" => match parse_params::<TaskActionParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .skip_plan_task(&params.session_id, &params.task_id)
+                .await
+            {
+                Ok(task) => RpcResponse::success(id, TaskActionResult { task }),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

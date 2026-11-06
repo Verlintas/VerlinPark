@@ -1395,8 +1395,14 @@ private struct TaskSchedulerCard: View {
                     schedulerCount("running", queue.tasks.count(where: { $0.status == "running" }))
                     schedulerCount("completed", queue.tasks.count(where: { $0.status == "completed" }))
                     schedulerCount("blocked", queue.tasks.count(where: { $0.status == "blocked" }))
+                    schedulerCount("skipped", queue.tasks.count(where: { $0.status == "skipped" }))
                     schedulerCount("leases", queue.leases.count)
                     Spacer()
+                }
+                if let status = model.taskActionStatus {
+                    Text(status)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
                 }
                 if queue.tasks.isEmpty {
                     Text("No plan tasks are queued for the selected project.")
@@ -1424,6 +1430,34 @@ private struct TaskSchedulerCard: View {
                             Text(task.status)
                                 .font(.system(size: 8, design: .monospaced))
                                 .foregroundStyle(statusColor(task.status))
+                            if model.taskActionBusyID == task.id {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                    .frame(width: 16)
+                            } else {
+                                if canRetry(task.status) {
+                                    Button {
+                                        Task { await model.retryScheduledTask(task) }
+                                    } label: {
+                                        Image(systemName: "arrow.clockwise")
+                                            .font(.system(size: 8))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(.cyan)
+                                    .help("Retry this task")
+                                }
+                                if canSkip(task.status) {
+                                    Button {
+                                        Task { await model.skipScheduledTask(task) }
+                                    } label: {
+                                        Image(systemName: "forward.end")
+                                            .font(.system(size: 8))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(.orange)
+                                    .help("Skip this queued task")
+                                }
+                            }
                         }
                         .padding(.vertical, 2)
                     }
@@ -1481,13 +1515,21 @@ private struct TaskSchedulerCard: View {
         }
     }
 
+    private func canRetry(_ status: String) -> Bool {
+        ["failed", "blocked", "interrupted", "cancelled", "skipped"].contains(status)
+    }
+
+    private func canSkip(_ status: String) -> Bool {
+        ["pending", "failed", "blocked", "interrupted", "cancelled"].contains(status)
+    }
+
     private func statusColor(_ status: String) -> Color {
         switch status {
         case "running": .green
         case "completed": .cyan
         case "failed", "blocked": .orange
         case "interrupted": .yellow
-        case "cancelled": .secondary
+        case "cancelled", "skipped": .secondary
         default: .secondary
         }
     }

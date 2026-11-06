@@ -173,6 +173,77 @@ async fn session_priority_is_created_and_validated() {
 }
 
 #[tokio::test]
+async fn skips_and_retries_plan_tasks_with_replay() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("task actions".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "task actions".into(), None)
+        .await
+        .unwrap();
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "task actions",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "build"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "department": "impl",
+            "title": "Build",
+            "kind": "coding",
+            "deps": [],
+            "acceptance": ["done"]
+        }]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+
+    let skipped = engine.skip_plan_task(&session.id, "T1").await.unwrap();
+    assert_eq!(skipped.status, "skipped");
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.task_queue_matches, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+    assert!(engine.skip_plan_task(&session.id, "T1").await.is_err());
+    let retried = engine.retry_plan_task(&session.id, "T1").await.unwrap();
+    assert_eq!(retried.status, "pending");
+    let error = engine.retry_plan_task(&session.id, "T1").await.unwrap_err();
+    assert!(error.to_string().contains("not retryable"));
+
+    let queue = engine
+        .task_queue(Some(project.id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(queue.tasks[0].status, "pending");
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "plan_task.skipped"));
+    assert!(events.iter().any(|event| event.kind == "plan_task.retried"));
+
+    engine
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    assert!(engine.skip_plan_task(&session.id, "T1").await.is_err());
+}
+
+#[tokio::test]
 async fn records_memories_and_repairs_their_projection() {
     let data = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();

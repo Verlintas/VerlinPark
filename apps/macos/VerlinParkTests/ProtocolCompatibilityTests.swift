@@ -260,6 +260,34 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(written.sha256, "def456")
     }
 
+    func testTaskActionResultDecodes() throws {
+        let json = """
+        {
+          "task": {
+            "session_id": "session-1",
+            "project_id": "project-1",
+            "plan_seq": 4,
+            "task_id": "T1",
+            "department": "Implementation",
+            "title": "Build",
+            "priority": 10,
+            "status": "skipped",
+            "deps": [],
+            "write_scope": ["src"],
+            "attempts": 1,
+            "enqueued_at": "2026-11-06T12:00:00Z",
+            "started_at": "2026-11-06T12:01:00Z",
+            "finished_at": "2026-11-06T12:02:00Z",
+            "last_error": "skipped by user"
+          }
+        }
+        """
+        let result = try JSONDecoder().decode(TaskActionResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.task.taskID, "T1")
+        XCTAssertEqual(result.task.status, "skipped")
+        XCTAssertEqual(result.task.lastError, "skipped by user")
+    }
+
     func testTaskQueueResultsDecode() throws {
         let json = """
         {
