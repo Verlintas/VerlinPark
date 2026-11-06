@@ -38,9 +38,11 @@ one ready batch inside one session.
    or wildcard scope conflicts with every other session. `ScopeLocks` keeps only
    the in-process notification handle; the production configuration reuses one
    lock registry across provider reconfiguration.
-5. **Recovery.** Daemon startup marks running/claimed task rows `interrupted`,
-   appends `plan_task.interrupted` events, and deletes all write leases, because
-   no agent from the previous process is still running.
+5. **Recovery and terminal cleanup.** Daemon startup marks running/claimed task
+   rows `interrupted`, appends `plan_task.interrupted` events, and deletes all
+   write leases, because no agent from the previous process is still running.
+   A session that reaches a terminal state during normal operation also clears
+   its own leftover running task rows and appends `plan_task.interrupted`.
 6. **Opt-in global resume scheduler.** With `VERLINPARK_TASK_SCHEDULER=1`, a
    background loop selects one idle/failed/cancelled session with retryable
    tasks using effective priority, aging, and a session round-robin tie-break,

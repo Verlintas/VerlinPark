@@ -636,6 +636,29 @@ impl Engine {
         self.scheduler.leases(project_id, session_id).await
     }
 
+    pub async fn interrupt_running_plan_tasks(&self, session_id: &str) -> Result<usize> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let tasks = tokio::task::spawn_blocking(move || {
+            store.interrupt_session_plan_tasks(&id, "the session ended before the task finished")
+        })
+        .await??;
+        let count = tasks.len();
+        for task in tasks {
+            self.append_event(
+                session_id,
+                "plan_task.interrupted",
+                serde_json::json!({
+                    "task_id": task.task_id,
+                    "task_status": "interrupted",
+                    "reason": "the session ended before the task finished",
+                }),
+            )
+            .await?;
+        }
+        Ok(count)
+    }
+
     pub async fn get_team_plan(&self, session_id: &str) -> Result<Option<TeamPlan>> {
         let store = self.store.clone();
         let id = session_id.to_string();

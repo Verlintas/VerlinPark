@@ -491,6 +491,9 @@ impl RunControl {
         let mut finalized = self.finalized.lock().await;
         *finalized = Some(status.to_string());
         engine.budget_registry().clear_session(session_id);
+        if let Err(error) = engine.interrupt_running_plan_tasks(session_id).await {
+            tracing::warn!(%error, session_id, "failed to clear running plan tasks");
+        }
         engine.update_session_status(session_id, status).await
     }
 

@@ -1270,3 +1270,64 @@ fn recovery_interrupts_tasks_and_clears_leases() {
         event.kind == "plan_task.interrupted" && event.payload["task_id"] == "T1"
     }));
 }
+
+#[test]
+fn interrupts_only_the_finished_sessions_tasks() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let first_plan = store
+        .append_event(
+            &first.id,
+            "team_plan.submitted",
+            serde_json::json!({"goal": "first"}),
+        )
+        .unwrap();
+    let second_plan = store
+        .append_event(
+            &second.id,
+            "team_plan.submitted",
+            serde_json::json!({"goal": "second"}),
+        )
+        .unwrap();
+    store
+        .sync_plan_tasks(&first.id, &project.id, first_plan.seq, &scheduled_plan())
+        .unwrap();
+    store
+        .sync_plan_tasks(&second.id, &project.id, second_plan.seq, &scheduled_plan())
+        .unwrap();
+    store
+        .claim_plan_tasks(&first.id, first_plan.seq, &["T1".into()])
+        .unwrap();
+    store
+        .claim_plan_tasks(&second.id, second_plan.seq, &["T1".into()])
+        .unwrap();
+
+    let interrupted = store
+        .interrupt_session_plan_tasks(&first.id, "session ended")
+        .unwrap();
+    assert_eq!(interrupted.len(), 1);
+    assert_eq!(
+        store
+            .list_plan_tasks(Some(&project.id), Some(&first.id))
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == "T1")
+            .unwrap()
+            .status,
+        "interrupted"
+    );
+    assert_eq!(
+        store
+            .list_plan_tasks(Some(&project.id), Some(&second.id))
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == "T1")
+            .unwrap()
+            .status,
+        "running"
+    );
+}
