@@ -61,6 +61,17 @@ fn auto_expand_workers() -> bool {
         })
 }
 
+fn task_scheduler_enabled() -> bool {
+    env::var("VERLINPARK_TASK_SCHEDULER")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+}
+
 fn priority_aging() -> Duration {
     let seconds = env::var("VERLINPARK_PRIORITY_AGING_SECS")
         .ok()
@@ -341,10 +352,15 @@ impl CapacityController {
 /// A daemon-wide registry of active task write scopes. Tasks in different
 /// sessions that overlap wait for each other; tasks in the same session are
 /// allowed to share (their own scheduler already serializes them).
+///
+/// Production instances use the daemon store as the authoritative registry, so
+/// leases survive a client reconnect and are visible through `task.queue`.
+/// `Default` keeps an in-memory registry for unit tests and embedders.
 #[derive(Default)]
 pub struct ScopeLocks {
     entries: Mutex<Vec<ScopeLockEntry>>,
     changed: tokio::sync::Notify,
+    store: Option<Store>,
 }
 
 struct ScopeLockEntry {
@@ -361,6 +377,14 @@ pub struct ScopeLockGuard {
 }
 
 impl ScopeLocks {
+    pub fn with_store(store: Store) -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            changed: tokio::sync::Notify::new(),
+            store: Some(store),
+        }
+    }
+
     async fn acquire(
         self: &Arc<Self>,
         project_id: &str,
@@ -376,7 +400,9 @@ impl ScopeLocks {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            {
+            let acquired = if let Some(store) = &self.store {
+                store.try_acquire_write_lease(project_id, session_id, agent_id, scopes)?
+            } else {
                 let mut entries = self
                     .entries
                     .lock()
@@ -393,12 +419,17 @@ impl ScopeLocks {
                         agent_id: agent_id.to_string(),
                         scopes: scopes.to_vec(),
                     });
-                    return Ok(Some(ScopeLockGuard {
-                        locks: self.clone(),
-                        project_id: project_id.to_string(),
-                        agent_id: agent_id.to_string(),
-                    }));
+                    true
+                } else {
+                    false
                 }
+            };
+            if acquired {
+                return Ok(Some(ScopeLockGuard {
+                    locks: self.clone(),
+                    project_id: project_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                }));
             }
             tokio::select! {
                 _ = &mut changed => {}
@@ -410,7 +441,11 @@ impl ScopeLocks {
 
 impl Drop for ScopeLockGuard {
     fn drop(&mut self) {
-        if let Ok(mut entries) = self.locks.entries.lock() {
+        if let Some(store) = &self.locks.store {
+            if let Err(error) = store.release_write_lease(&self.agent_id) {
+                tracing::warn!(%error, agent_id = %self.agent_id, "failed to release write lease");
+            }
+        } else if let Ok(mut entries) = self.locks.entries.lock() {
             entries.retain(|entry| {
                 !(entry.project_id == self.project_id && entry.agent_id == self.agent_id)
             });
@@ -425,6 +460,7 @@ pub struct AgentService {
     config: Arc<RwLock<Option<AgentConfig>>>,
     runs: Arc<Mutex<HashMap<String, Arc<RunControl>>>>,
     auto_resolver_started: Arc<AtomicBool>,
+    task_scheduler_started: Arc<AtomicBool>,
     global_slots: Arc<AdmissionGate>,
     capacity: Arc<CapacityController>,
 }
@@ -1300,6 +1336,7 @@ impl AgentService {
             base_url.clone(),
             api_key,
         ));
+        let scope_store = engine.store().clone();
         Self::configured(
             engine,
             AgentConfig {
@@ -1334,7 +1371,7 @@ impl AgentService {
                     .filter(|command| !command.trim().is_empty()),
                 tools: ToolRegistry::default_tools(),
                 max_active_sessions: global_session_cap(),
-                scope_locks: Arc::new(ScopeLocks::default()),
+                scope_locks: Arc::new(ScopeLocks::with_store(scope_store)),
                 capacity: Arc::new(CapacityController::new(
                     global_worker_cap(),
                     global_labour_cap(),
@@ -1359,6 +1396,7 @@ impl AgentService {
             config: Arc::new(RwLock::new(None)),
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
+            task_scheduler_started: Arc::new(AtomicBool::new(false)),
             global_slots: Arc::new(AdmissionGate::new(global_session_cap())),
             capacity: Arc::new(CapacityController::new(
                 global_worker_cap(),
@@ -1375,6 +1413,7 @@ impl AgentService {
             config: Arc::new(RwLock::new(Some(config))),
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
+            task_scheduler_started: Arc::new(AtomicBool::new(false)),
             global_slots: Arc::new(AdmissionGate::new(global_cap)),
             capacity,
         }
@@ -1406,6 +1445,12 @@ impl AgentService {
             )),
             other => return Err(anyhow!("unsupported provider: {other}")),
         };
+        let scope_locks = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().map(|config| config.scope_locks.clone()))
+            .unwrap_or_else(|| Arc::new(ScopeLocks::with_store(self.engine.store().clone())));
         let config = AgentConfig {
             provider,
             provider_name: params.provider,
@@ -1423,7 +1468,7 @@ impl AgentService {
                 .filter(|command| !command.trim().is_empty()),
             tools: ToolRegistry::default_tools(),
             max_active_sessions: global_session_cap(),
-            scope_locks: Arc::new(ScopeLocks::default()),
+            scope_locks,
             capacity: self.capacity.clone(),
             provider_idle_timeout_secs: env::var("VERLINPARK_PROVIDER_IDLE_SECS")
                 .ok()
@@ -2226,6 +2271,81 @@ impl AgentService {
         });
     }
 
+    /// Opt-in global task-DAG resume scheduler. Every tick it picks one
+    /// idle/failed/cancelled session with retryable tasks, ordered by effective
+    /// priority and session round-robin, then resumes its stored plan. This is
+    /// intentionally not default-on: resuming a plan spends the session budget.
+    pub fn start_task_scheduler(&self) {
+        if !task_scheduler_enabled() {
+            return;
+        }
+        if self.task_scheduler_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let interval_secs = env::var("VERLINPARK_TASK_SCHEDULER_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(5)
+            .clamp(1, 3600);
+        let cooldown_secs = env::var("VERLINPARK_TASK_SCHEDULER_COOLDOWN_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60)
+            .clamp(1, 86_400);
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            ticker.tick().await;
+            let mut last_session: Option<String> = None;
+            let mut cooldowns: HashMap<String, Instant> = HashMap::new();
+            loop {
+                ticker.tick().await;
+                let now = Instant::now();
+                cooldowns.retain(|_, until| *until > now);
+                let excluded = cooldowns.keys().cloned().collect::<Vec<_>>();
+                let candidate = match service
+                    .engine
+                    .scheduler()
+                    .next_pending_session(last_session.as_deref(), &excluded)
+                    .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        tracing::warn!(%error, "global task scheduler could not read the queue");
+                        continue;
+                    }
+                };
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                cooldowns.insert(
+                    candidate.session_id.clone(),
+                    now + Duration::from_secs(cooldown_secs),
+                );
+                tracing::info!(
+                    session_id = %candidate.session_id,
+                    project_id = %candidate.project_id,
+                    pending = candidate.pending,
+                    priority = candidate.effective_priority,
+                    "global task scheduler resuming a plan"
+                );
+                match service.resume_plan(&candidate.session_id).await {
+                    Ok(true) => {
+                        last_session = Some(candidate.session_id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %candidate.session_id,
+                            %error,
+                            "global task scheduler could not resume a plan"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn auto_resolve_project(&self, project_id: &str) {
         let sessions = match self
             .engine
@@ -2585,7 +2705,12 @@ impl AgentService {
         let Some(plan) = self.engine.get_team_plan(session_id).await? else {
             anyhow::bail!("session has no TeamPlan");
         };
-        let completed = completed_plan_tasks(&self.engine, session_id).await?;
+        let (_, scheduled) = self.engine.scheduler().sync_plan(&session, &plan).await?;
+        let completed = scheduled
+            .iter()
+            .filter(|task| task.status == "completed")
+            .map(|task| task.task_id.clone())
+            .collect::<std::collections::HashSet<_>>();
         if plan.tasks.iter().all(|task| completed.contains(&task.id)) {
             anyhow::bail!("plan is already complete");
         }
@@ -7231,6 +7356,21 @@ async fn emit_plan_task_finished(
     emit(engine, session_id, spec, "plan_task.finished", payload).await
 }
 
+async fn record_scheduled_task_finish(
+    engine: &Engine,
+    session_id: &str,
+    plan_seq: u64,
+    task_id: &str,
+    status: &str,
+    detail: Option<&str>,
+) -> Result<()> {
+    engine
+        .scheduler()
+        .finish(session_id, plan_seq, task_id, status, detail)
+        .await?;
+    Ok(())
+}
+
 fn task_profile(task: &PlanTask, department_profile: AgentProfile) -> AgentProfile {
     if let Some(profile) = &task.profile
         && let Some(profile) = AgentProfile::parse(profile)
@@ -7347,17 +7487,13 @@ fn normalized_task_scope(task: &PlanTask) -> Vec<String> {
         .collect()
 }
 
-/// Select a ready batch that can safely run concurrently. Tasks with no scope
-/// are treated as unrestricted and run alone. A task that overlaps an earlier
-/// task in the batch stays pending for the next batch instead of being merged
-/// into a conflicting write set.
-fn select_plan_batch(mut ready: Vec<PlanTask>, limit: usize) -> Vec<PlanTask> {
-    ready.sort_by(|left, right| {
-        right
-            .priority
-            .cmp(&left.priority)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+/// Select a ready batch that can safely run concurrently. The input order is
+/// the scheduler's effective-priority order (session + task + aging); this
+/// function only removes scope conflicts. Tasks with no scope are treated as
+/// unrestricted and run alone. A task that overlaps an earlier task in the
+/// batch stays pending for the next batch instead of being merged into a
+/// conflicting write set.
+fn select_plan_batch(ready: Vec<PlanTask>, limit: usize) -> Vec<PlanTask> {
     let mut batch: Vec<PlanTask> = Vec::new();
     for task in ready {
         if batch.len() >= limit {
@@ -7381,33 +7517,6 @@ fn select_plan_batch(mut ready: Vec<PlanTask>, limit: usize) -> Vec<PlanTask> {
     batch
 }
 
-async fn completed_plan_tasks(
-    engine: &Engine,
-    session_id: &str,
-) -> Result<std::collections::HashSet<String>> {
-    let store = engine.store().clone();
-    let id = session_id.to_string();
-    let events = tokio::task::spawn_blocking(move || store.list_all_events(&id)).await??;
-    let submission_seq = events
-        .iter()
-        .rev()
-        .find(|event| event.kind == "team_plan.submitted")
-        .map(|event| event.seq)
-        .unwrap_or(0);
-    let mut completed = std::collections::HashSet::new();
-    for event in events
-        .iter()
-        .filter(|event| event.seq > submission_seq && event.kind == "plan_task.finished")
-    {
-        if event.payload["task_status"] == "completed"
-            && let Some(task_id) = event.payload["task_id"].as_str()
-        {
-            completed.insert(task_id.to_string());
-        }
-    }
-    Ok(completed)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn execute_team_plan(
     engine: &Engine,
@@ -7427,19 +7536,21 @@ async fn execute_team_plan(
     let mut manager_specs: std::collections::HashMap<String, AgentSpec> =
         std::collections::HashMap::new();
 
-    let completed = completed_plan_tasks(engine, &session.id).await?;
-    let mut statuses = plan
-        .tasks
+    let (plan_seq, scheduled) = engine.scheduler().sync_plan(session, plan).await?;
+    let mut statuses = scheduled
         .iter()
-        .map(|task| {
-            let status = if completed.contains(&task.id) {
-                "completed"
-            } else {
-                "pending"
-            };
-            (task.id.clone(), status.to_string())
-        })
+        .map(|task| (task.task_id.clone(), task.status.clone()))
         .collect::<std::collections::HashMap<_, _>>();
+    for task in &plan.tasks {
+        statuses
+            .entry(task.id.clone())
+            .or_insert_with(|| "pending".to_string());
+    }
+    let completed = statuses
+        .iter()
+        .filter(|(_, status)| status.as_str() == "completed")
+        .map(|(task_id, _)| task_id.clone())
+        .collect::<std::collections::HashSet<_>>();
     let mut remaining = plan
         .tasks
         .iter()
@@ -7468,6 +7579,15 @@ async fn execute_team_plan(
                     }),
                 )
                 .await?;
+                record_scheduled_task_finish(
+                    engine,
+                    &session.id,
+                    plan_seq,
+                    &task.id,
+                    "cancelled",
+                    None,
+                )
+                .await?;
             }
             return Ok(PlanRunResult::Cancelled);
         }
@@ -7486,20 +7606,22 @@ async fn execute_team_plan(
                     }),
                 )
                 .await?;
+                record_scheduled_task_finish(
+                    engine,
+                    &session.id,
+                    plan_seq,
+                    &task.id,
+                    "blocked",
+                    Some("token budget exhausted"),
+                )
+                .await?;
             }
             return Ok(PlanRunResult::BudgetExceeded(BudgetStop::session(budget)));
         }
-        let ready = remaining
-            .iter()
-            .filter(|task| {
-                task.deps.iter().all(|dep| {
-                    statuses
-                        .get(dep)
-                        .is_some_and(|status| status == "completed")
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let ready = engine
+            .scheduler()
+            .ready_tasks(session, plan_seq, plan, plan.tasks.len())
+            .await?;
         if ready.is_empty() {
             for task in &remaining {
                 statuses.insert(task.id.clone(), "blocked".to_string());
@@ -7513,6 +7635,15 @@ async fn execute_team_plan(
                         "task_status": "blocked",
                         "reason": "dependency not completed",
                     }),
+                )
+                .await?;
+                record_scheduled_task_finish(
+                    engine,
+                    &session.id,
+                    plan_seq,
+                    &task.id,
+                    "blocked",
+                    Some("dependency not completed"),
                 )
                 .await?;
             }
@@ -7551,14 +7682,35 @@ async fn execute_team_plan(
                     }),
                 )
                 .await?;
+                record_scheduled_task_finish(
+                    engine,
+                    &session.id,
+                    plan_seq,
+                    &task.id,
+                    "blocked",
+                    Some("Worker cap is fully occupied"),
+                )
+                .await?;
             }
             break;
         }
         let batch = select_plan_batch(ready, capacity);
-        let batch_ids = batch
+        let task_ids = batch.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
+        let claimed = engine
+            .scheduler()
+            .claim(&session.id, plan_seq, &task_ids)
+            .await?;
+        if claimed.is_empty() {
+            break;
+        }
+        let batch_ids = claimed
             .iter()
-            .map(|task| task.id.clone())
+            .map(|task| task.task_id.clone())
             .collect::<std::collections::HashSet<_>>();
+        let batch = batch
+            .into_iter()
+            .filter(|task| batch_ids.contains(&task.id))
+            .collect::<Vec<_>>();
 
         let mut prepared = Vec::new();
         let mut worker_slots = Vec::new();
@@ -7724,6 +7876,15 @@ async fn execute_team_plan(
                     Some(&reason),
                 )
                 .await?;
+                record_scheduled_task_finish(
+                    engine,
+                    &session.id,
+                    plan_seq,
+                    &task.id,
+                    status,
+                    Some(&reason),
+                )
+                .await?;
                 reports.push(format!("{} [{}]: {}", task.id, status, reason));
                 continue;
             }
@@ -7764,6 +7925,15 @@ async fn execute_team_plan(
                                 }),
                             )
                             .await?;
+                            record_scheduled_task_finish(
+                                engine,
+                                &session.id,
+                                plan_seq,
+                                &task.id,
+                                status,
+                                (status != "completed").then_some(report.as_str()),
+                            )
+                            .await?;
                             reports.push(format!(
                                 "{} [{}]: {}",
                                 task.id,
@@ -7784,6 +7954,15 @@ async fn execute_team_plan(
                                 }),
                             )
                             .await?;
+                            record_scheduled_task_finish(
+                                engine,
+                                &session.id,
+                                plan_seq,
+                                &task.id,
+                                "cancelled",
+                                None,
+                            )
+                            .await?;
                             abort = Some(PlanAbort::Cancelled);
                         }
                         WorkerFinish::BudgetExceeded(stop) => {
@@ -7798,6 +7977,15 @@ async fn execute_team_plan(
                                     "task_status": "blocked",
                                     "reason": stop.summary(),
                                 }),
+                            )
+                            .await?;
+                            record_scheduled_task_finish(
+                                engine,
+                                &session.id,
+                                plan_seq,
+                                &task.id,
+                                "blocked",
+                                Some(&stop.summary()),
                             )
                             .await?;
                             abort = Some(PlanAbort::Budget(stop));
@@ -7820,6 +8008,15 @@ async fn execute_team_plan(
                         }),
                     )
                     .await?;
+                    record_scheduled_task_finish(
+                        engine,
+                        &session.id,
+                        plan_seq,
+                        &task.id,
+                        "cancelled",
+                        None,
+                    )
+                    .await?;
                     abort = Some(PlanAbort::Cancelled);
                 }
                 Ok(LoopOutcome::BudgetExceeded(stop)) => {
@@ -7837,6 +8034,15 @@ async fn execute_team_plan(
                             "task_status": "blocked",
                             "reason": stop.summary(),
                         }),
+                    )
+                    .await?;
+                    record_scheduled_task_finish(
+                        engine,
+                        &session.id,
+                        plan_seq,
+                        &task.id,
+                        "blocked",
+                        Some(&stop.summary()),
                     )
                     .await?;
                     if stop.is_abortive() {
@@ -7861,6 +8067,15 @@ async fn execute_team_plan(
                         }),
                     )
                     .await?;
+                    record_scheduled_task_finish(
+                        engine,
+                        &session.id,
+                        plan_seq,
+                        &task.id,
+                        "failed",
+                        Some(&error.to_string()),
+                    )
+                    .await?;
                     reports.push(format!("{} [failed]: {error}", task.id));
                 }
             }
@@ -7878,6 +8093,15 @@ async fn execute_team_plan(
                     engine,
                     &session.id,
                     leader_spec,
+                    &task.id,
+                    status,
+                    Some(&reason),
+                )
+                .await?;
+                record_scheduled_task_finish(
+                    engine,
+                    &session.id,
+                    plan_seq,
                     &task.id,
                     status,
                     Some(&reason),

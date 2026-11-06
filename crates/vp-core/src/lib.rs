@@ -22,10 +22,11 @@ use vp_protocol::types::{
     QuestionListResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
     SessionImportResult, SessionLandResult, SessionLogStatus, SessionPriorityResult,
     SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
-    StoredMessage, TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult,
-    TerminalResizeResult, TerminalWriteResult, TodoItem, UsageBucket, UsageCsvResult, UsageEntry,
-    UsageLedgerResult, UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
-    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
+    StoredMessage, TaskQueueResult, TeamPlan, TerminalCloseResult, TerminalOpenResult,
+    TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem, UsageBucket,
+    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
+    WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
+    WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -38,6 +39,7 @@ pub mod console;
 pub mod history;
 pub mod mcp;
 pub mod rebuild;
+pub mod scheduler;
 pub mod terminal;
 pub mod workspace;
 
@@ -79,6 +81,7 @@ pub struct Engine {
     mcp: Arc<mcp::McpManager>,
     consoles: Arc<console::ConsoleManager>,
     terminals: Arc<terminal::TerminalManager>,
+    scheduler: Arc<scheduler::TaskScheduler>,
 }
 
 fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
@@ -261,6 +264,7 @@ impl Engine {
     pub fn new(store: Store) -> Self {
         let (events, _) = broadcast::channel(2048);
         Self {
+            scheduler: Arc::new(scheduler::TaskScheduler::new(store.clone())),
             store,
             events,
             approval_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -279,6 +283,10 @@ impl Engine {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub fn scheduler(&self) -> &Arc<scheduler::TaskScheduler> {
+        &self.scheduler
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -603,7 +611,29 @@ impl Engine {
         let event = tokio::task::spawn_blocking(move || store.set_team_plan_with_event(&id, &json))
             .await??;
         let _ = self.events.send(event);
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        self.scheduler.sync_plan(&session, plan).await?;
         Ok(())
+    }
+
+    pub async fn task_queue(
+        &self,
+        project_id: Option<String>,
+        session_id: Option<String>,
+    ) -> Result<TaskQueueResult> {
+        self.scheduler.queue(project_id, session_id).await
+    }
+
+    pub async fn write_leases(
+        &self,
+        project_id: Option<String>,
+        session_id: Option<String>,
+    ) -> Result<Vec<WriteLease>> {
+        self.scheduler.leases(project_id, session_id).await
     }
 
     pub async fn get_team_plan(&self, session_id: &str) -> Result<Option<TeamPlan>> {

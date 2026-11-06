@@ -260,6 +260,44 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(written.sha256, "def456")
     }
 
+    func testTaskQueueResultsDecode() throws {
+        let json = """
+        {
+          "tasks": [{
+            "session_id": "session-1",
+            "project_id": "project-1",
+            "plan_seq": 4,
+            "task_id": "T1",
+            "department": "Implementation",
+            "title": "Build the scheduler",
+            "priority": 10,
+            "status": "running",
+            "deps": ["T0"],
+            "write_scope": ["src/scheduler"],
+            "attempts": 1,
+            "enqueued_at": "2026-11-06T12:00:00Z",
+            "started_at": "2026-11-06T12:01:00Z",
+            "finished_at": null,
+            "last_error": null
+          }],
+          "leases": [{
+            "project_id": "project-1",
+            "session_id": "session-1",
+            "agent_id": "agent-1",
+            "scopes": ["src/scheduler"],
+            "acquired_at": "2026-11-06T12:01:00Z"
+          }]
+        }
+        """
+        let result = try JSONDecoder().decode(TaskQueueResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.tasks.count, 1)
+        XCTAssertEqual(result.tasks[0].taskID, "T1")
+        XCTAssertEqual(result.tasks[0].planSeq, 4)
+        XCTAssertEqual(result.tasks[0].attempts, 1)
+        XCTAssertEqual(result.tasks[0].writeScope, ["src/scheduler"])
+        XCTAssertEqual(result.leases[0].agentID, "agent-1")
+    }
+
     func testTerminalResultsDecode() throws {
         let opened = try JSONDecoder().decode(
             TerminalOpenResult.self,

@@ -1774,6 +1774,59 @@ pub struct TeamPlan {
     pub tasks: Vec<PlanTask>,
 }
 
+/// A persistent task-DAG node owned by the daemon scheduler. The plan remains
+/// the source of truth for task definitions; this row carries live scheduling
+/// state across plan runs and daemon restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledTask {
+    pub session_id: String,
+    pub project_id: String,
+    pub plan_seq: u64,
+    pub task_id: String,
+    pub department: String,
+    pub title: String,
+    pub priority: i32,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub attempts: u32,
+    pub enqueued_at: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteLease {
+    pub project_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub acquired_at: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TaskQueueParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskQueueResult {
+    pub tasks: Vec<ScheduledTask>,
+    pub leases: Vec<WriteLease>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TeamPlanParams {
     pub session_id: String,

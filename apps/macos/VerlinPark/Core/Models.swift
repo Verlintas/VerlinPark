@@ -1178,6 +1178,71 @@ struct GitShowResult: Codable, Sendable {
     }
 }
 
+struct SchedulerTask: Codable, Identifiable, Hashable, Sendable {
+    let sessionID: String
+    let projectID: String
+    let planSeq: UInt64
+    let taskID: String
+    let department: String
+    let title: String
+    let priority: Int
+    let status: String
+    let deps: [String]
+    let writeScope: [String]
+    let attempts: UInt32
+    let enqueuedAt: String
+    let startedAt: String?
+    let finishedAt: String?
+    let lastError: String?
+
+    var id: String {
+        "\(sessionID)/\(planSeq)/\(taskID)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case projectID = "project_id"
+        case planSeq = "plan_seq"
+        case taskID = "task_id"
+        case department
+        case title
+        case priority
+        case status
+        case deps
+        case writeScope = "write_scope"
+        case attempts
+        case enqueuedAt = "enqueued_at"
+        case startedAt = "started_at"
+        case finishedAt = "finished_at"
+        case lastError = "last_error"
+    }
+}
+
+struct WriteLease: Codable, Identifiable, Hashable, Sendable {
+    let projectID: String
+    let sessionID: String
+    let agentID: String
+    let scopes: [String]
+    let acquiredAt: String
+
+    var id: String {
+        agentID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case sessionID = "session_id"
+        case agentID = "agent_id"
+        case scopes
+        case acquiredAt = "acquired_at"
+    }
+}
+
+struct TaskQueueResult: Codable, Sendable {
+    let tasks: [SchedulerTask]
+    let leases: [WriteLease]
+}
+
 struct TerminalOpenResult: Codable, Sendable {
     let terminalId: String
     let worktree: String

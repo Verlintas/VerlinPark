@@ -43,6 +43,11 @@ struct DashboardView: View {
                         detail: "Defaults 4 / 6 / 12 · caps 5 / 10 / 40"
                     )
                     metric(
+                        "Scheduler",
+                        value: "\(model.taskQueue?.tasks.count ?? 0) tasks",
+                        detail: "\(runningTasks) running · \(model.taskQueue?.leases.count ?? 0) write leases"
+                    )
+                    metric(
                         "Computer",
                         value: "not wired",
                         detail: "GUI/browser lease is design-only · shell/worktrees run in parallel"
@@ -92,6 +97,9 @@ struct DashboardView: View {
                     MemoryPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    TaskSchedulerCard()
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                     DoctorCard()
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
@@ -124,10 +132,10 @@ struct DashboardView: View {
                         Image(systemName: "hammer")
                             .foregroundStyle(.green)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Next · Merge queue + Integrator")
+                            Text("Next · ACP and read isolation")
                                 .font(.system(size: 12, weight: .medium))
                             Text(
-                                "Approved branches merge serially today; queue, retry, and post-merge checks are next."
+                                "The persistent global task-DAG queue and write leases are live. Next: an ACP external-agent bridge, full filesystem read confinement, and updater/tap upgrades."
                             )
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.secondary)
@@ -143,6 +151,10 @@ struct DashboardView: View {
         }
         .frame(width: 760, height: 600)
         .background(.ultraThinMaterial)
+    }
+
+    private var runningTasks: Int {
+        model.taskQueue?.tasks.count(where: { $0.status == "running" }) ?? 0
     }
 
     private func metric(_ title: String, value: String, detail: String) -> some View {
@@ -1345,5 +1357,138 @@ private struct PendingQuestionRow: View {
         guard !answer.isEmpty else { return }
         draft = ""
         Task { await model.answerGlobalQuestion(question.id, answer: answer) }
+    }
+}
+
+private struct TaskSchedulerCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Task scheduler")
+                    Text("Persistent global task-DAG queue")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.taskQueueBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task { await model.loadTaskQueue() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.taskQueueBusy)
+            }
+
+            Text(
+                "Ready tasks are ordered by task priority plus session priority, with aging so low-priority work cannot starve. Write leases are stored by the daemon and enforce overlapping path scopes across sessions; the same session may share its worktree."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            if let queue = model.taskQueue {
+                HStack(spacing: 14) {
+                    schedulerCount("queued", queue.tasks.count(where: { $0.status == "pending" }))
+                    schedulerCount("running", queue.tasks.count(where: { $0.status == "running" }))
+                    schedulerCount("completed", queue.tasks.count(where: { $0.status == "completed" }))
+                    schedulerCount("blocked", queue.tasks.count(where: { $0.status == "blocked" }))
+                    schedulerCount("leases", queue.leases.count)
+                    Spacer()
+                }
+                if queue.tasks.isEmpty {
+                    Text("No plan tasks are queued for the selected project.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ForEach(queue.tasks.prefix(8)) { task in
+                        HStack(spacing: 7) {
+                            Circle()
+                                .fill(statusColor(task.status))
+                                .frame(width: 6, height: 6)
+                            Text(task.taskID)
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .frame(width: 70, alignment: .leading)
+                            Text(task.title)
+                                .font(.system(size: 9))
+                                .lineLimit(1)
+                            Spacer()
+                            Text(task.department)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Text("p\(task.priority)")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                            Text(task.status)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(statusColor(task.status))
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    if queue.tasks.count > 8 {
+                        Text("+\(queue.tasks.count - 8) more tasks")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                if !queue.leases.isEmpty {
+                    Divider().opacity(0.25)
+                    Text("Write leases")
+                        .font(.system(size: 8, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    ForEach(queue.leases.prefix(5)) { lease in
+                        HStack(spacing: 7) {
+                            Image(systemName: "lock")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.cyan)
+                            Text(lease.agentID)
+                                .font(.system(size: 8, design: .monospaced))
+                                .lineLimit(1)
+                            Text(lease.scopes.isEmpty ? "unrestricted" : lease.scopes.joined(separator: ", "))
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                    }
+                }
+            } else {
+                Text(model.taskQueueStatus ?? "Loading scheduler state…")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task {
+            await model.loadTaskQueue()
+        }
+    }
+
+    private func schedulerCount(_ title: String, _ value: Int) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("\(value)")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func statusColor(_ status: String) -> Color {
+        switch status {
+        case "running": .green
+        case "completed": .cyan
+        case "failed", "blocked": .orange
+        case "interrupted": .yellow
+        case "cancelled": .secondary
+        default: .secondary
+        }
     }
 }

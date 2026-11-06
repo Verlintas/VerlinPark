@@ -628,6 +628,17 @@ actor CoreClient {
             .decode(WorkspaceWriteResult.self)
     }
 
+    func taskQueue(projectID: String?, sessionID: String?) async throws -> TaskQueueResult {
+        try await request(
+            method: "task.queue",
+            params: [
+                "project_id": projectID.map(JSONValue.string) ?? .null,
+                "session_id": sessionID.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(TaskQueueResult.self)
+    }
+
     func openTerminal(sessionID: String, cols: Int, rows: Int) async throws -> TerminalOpenResult {
         try await request(
             method: "terminal.open",

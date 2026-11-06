@@ -87,7 +87,7 @@ fn test_service_with_provider_cap(
         integration_command: None,
         tools: ToolRegistry::default_tools(),
         max_active_sessions,
-        scope_locks: Arc::new(ScopeLocks::default()),
+        scope_locks: Arc::new(ScopeLocks::with_store(engine.store().clone())),
         capacity: Arc::new(CapacityController::new(
             global_worker_cap(),
             global_labour_cap(),
@@ -2347,6 +2347,25 @@ async fn resumes_only_unfinished_plan_tasks() {
             .iter()
             .any(|event| event.kind == "agent.plan_resumed")
     );
+    let queue = engine
+        .task_queue(Some(sessions.project_id.clone()), Some(sessions.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(queue.tasks.len(), 2);
+    assert!(
+        queue.tasks.iter().all(|task| task.status == "completed"),
+        "the persistent task queue must reflect the resumed plan: {:?}",
+        queue.tasks
+    );
+    assert!(
+        queue
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "T2")
+            .unwrap()
+            .attempts
+            >= 1
+    );
 }
 
 #[tokio::test]
@@ -3185,7 +3204,7 @@ fn team_plan_validates_task_and_department_budgets() {
 }
 
 #[test]
-fn plan_batch_orders_ready_tasks_by_priority_then_id() {
+fn plan_batch_preserves_scheduler_ready_order() {
     fn task(id: &str, priority: i32, scope: &[&str]) -> PlanTask {
         PlanTask {
             id: id.to_string(),
@@ -3203,8 +3222,8 @@ fn plan_batch_orders_ready_tasks_by_priority_then_id() {
     }
     let batch = select_plan_batch(
         vec![
-            task("T1", 0, &["src/a"]),
             task("T2", 50, &["src/b"]),
+            task("T1", 0, &["src/a"]),
             task("T3", -10, &["src/c"]),
         ],
         10,
@@ -4601,6 +4620,73 @@ async fn scope_locks_serialize_overlapping_sessions() {
         .unwrap()
         .unwrap();
     assert!(acquired.is_some());
+}
+
+#[tokio::test]
+async fn persistent_scope_locks_publish_store_leases() {
+    let dir = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("leases"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let locks = Arc::new(ScopeLocks::with_store(store.clone()));
+    let control = RunControl::new();
+    let guard = locks
+        .acquire(
+            &project.id,
+            &first.id,
+            "agent-a",
+            &["src/api/**".into()],
+            &control,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let leases = store.list_write_leases(Some(&project.id), None).unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].agent_id, "agent-a");
+    assert_eq!(leases[0].scopes, vec!["src/api".to_string()]);
+
+    let waiting_locks = locks.clone();
+    let waiting_control = RunControl::new();
+    let second_id = second.id.clone();
+    let project_id = project.id.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiting_locks
+            .acquire(
+                &project_id,
+                &second_id,
+                "agent-b",
+                &["src/api/handler".into()],
+                &waiting_control,
+            )
+            .await
+            .unwrap()
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(120), &mut waiter)
+            .await
+            .is_err()
+    );
+    assert!(store.list_write_leases(None, None).unwrap().len() == 1);
+    drop(guard);
+    let second_guard = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .list_write_leases(Some(&project.id), Some(&second.id))
+            .unwrap()[0]
+            .agent_id,
+        "agent-b"
+    );
+    drop(second_guard);
+    assert!(store.list_write_leases(None, None).unwrap().is_empty());
 }
 
 struct BlockingProvider {

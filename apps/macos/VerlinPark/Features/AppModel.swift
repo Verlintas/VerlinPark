@@ -157,6 +157,9 @@ final class AppModel {
     var mailboxPolicyStatus: String?
     var teamPlan: TeamPlan?
     var planTaskStatuses: [String: String] = [:]
+    var taskQueue: TaskQueueResult?
+    var taskQueueBusy = false
+    var taskQueueStatus: String?
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -1983,6 +1986,17 @@ final class AppModel {
             }
         } catch {
             // The event stream will retry on team_plan.submitted.
+        }
+    }
+
+    func loadTaskQueue() async {
+        taskQueueBusy = true
+        defer { taskQueueBusy = false }
+        do {
+            taskQueue = try await core.taskQueue(projectID: selectedProjectID, sessionID: nil)
+            taskQueueStatus = nil
+        } catch {
+            taskQueueStatus = error.localizedDescription
         }
     }
 

@@ -167,6 +167,13 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// List the persistent global task-DAG queue and write leases.
+    Tasks {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Create a session for a project.
     SessionNew {
         project: String,
@@ -664,6 +671,14 @@ async fn main() -> Result<()> {
         }
         Command::Sessions { project } => {
             rpc(&discovery, "session.list", json!({"project_id": project})).await?
+        }
+        Command::Tasks { project, session } => {
+            rpc(
+                &discovery,
+                "task.queue",
+                json!({"project_id": project, "session_id": session}),
+            )
+            .await?
         }
         Command::SessionNew {
             project,
@@ -1417,6 +1432,44 @@ fn print_human(value: &Value) {
                 session["output_tokens"].as_u64().unwrap_or(0),
                 session["cost_usd"].as_f64().unwrap_or(0.0),
                 session["goal"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if let Some(tasks) = value.get("tasks").and_then(Value::as_array)
+        && value.get("leases").is_some()
+    {
+        if tasks.is_empty() && value["leases"].as_array().is_none_or(Vec::is_empty) {
+            println!("No scheduled tasks or write leases.");
+            return;
+        }
+        for task in tasks {
+            println!(
+                "{:<10} {:<8} p{:<4} {:<12} {:<24} {}",
+                task["status"].as_str().unwrap_or("?"),
+                task["task_id"].as_str().unwrap_or("?"),
+                task["priority"].as_i64().unwrap_or(0),
+                task["department"].as_str().unwrap_or("?"),
+                task["session_id"].as_str().unwrap_or("?"),
+                task["title"].as_str().unwrap_or("")
+            );
+            if let Some(error) = task["last_error"].as_str() {
+                println!("  last error: {error}");
+            }
+        }
+        for lease in value["leases"].as_array().into_iter().flatten() {
+            println!(
+                "lease {:<14} {:<20} scopes={}",
+                lease["agent_id"].as_str().unwrap_or("?"),
+                lease["session_id"].as_str().unwrap_or("?"),
+                lease["scopes"]
+                    .as_array()
+                    .map(|scopes| scopes
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default()
             );
         }
         return;

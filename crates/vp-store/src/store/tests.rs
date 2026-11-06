@@ -1054,3 +1054,219 @@ fn updates_session_priority_with_an_event() {
     let events = store.list_events(&session.id, 1, 10).unwrap();
     assert!(events.iter().any(|event| event.kind == "session.priority"));
 }
+
+fn scheduled_plan() -> TeamPlan {
+    use vp_protocol::types::{PlanDepartment, PlanTask};
+    TeamPlan {
+        goal: "schedule".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "build".into(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![
+            PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "One".into(),
+                kind: "coding".into(),
+                priority: 10,
+                profile: None,
+                deps: vec![],
+                write_scope: vec!["src/one".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+            PlanTask {
+                id: "T2".into(),
+                department: "impl".into(),
+                title: "Two".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: vec!["T1".into()],
+                write_scope: vec!["src/two".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+        ],
+    }
+}
+
+#[test]
+fn persists_task_queue_claims_and_completions() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "schedule").unwrap();
+    let submitted = store
+        .append_event(
+            &session.id,
+            "team_plan.submitted",
+            serde_json::json!({"goal": "schedule"}),
+        )
+        .unwrap();
+    let tasks = store
+        .sync_plan_tasks(&session.id, &project.id, submitted.seq, &scheduled_plan())
+        .unwrap();
+    assert_eq!(tasks.len(), 2);
+    assert!(tasks.iter().all(|task| task.status == "pending"));
+    assert_eq!(tasks[0].task_id, "T1");
+
+    let claimed = store
+        .claim_plan_tasks(&session.id, submitted.seq, &["T1".into()])
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].status, "running");
+    assert_eq!(claimed[0].attempts, 1);
+    assert!(claimed[0].started_at.is_some());
+
+    let finished = store
+        .finish_plan_task(&session.id, submitted.seq, "T1", "completed", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(finished.status, "completed");
+    assert!(finished.finished_at.is_some());
+    let queue = store.list_plan_tasks(Some(&project.id), None).unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|task| task.task_id == "T1")
+            .unwrap()
+            .status,
+        "completed"
+    );
+
+    // A rebuild from events preserves completed dependencies and queued tasks.
+    store
+        .append_event(
+            &session.id,
+            "plan_task.finished",
+            serde_json::json!({"task_id": "T1", "task_status": "completed"}),
+        )
+        .unwrap();
+    store
+        .append_event(
+            &session.id,
+            "plan_task.started",
+            serde_json::json!({"task_id": "T2", "task_status": "running"}),
+        )
+        .unwrap();
+    let rebuilt = store
+        .sync_plan_tasks(&session.id, &project.id, submitted.seq, &scheduled_plan())
+        .unwrap();
+    assert_eq!(
+        rebuilt
+            .iter()
+            .find(|task| task.task_id == "T1")
+            .unwrap()
+            .status,
+        "completed"
+    );
+    assert_eq!(
+        rebuilt
+            .iter()
+            .find(|task| task.task_id == "T2")
+            .unwrap()
+            .status,
+        "interrupted"
+    );
+}
+
+#[test]
+fn persistent_write_leases_block_overlapping_projects_and_survive_reopen() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    assert!(
+        store
+            .try_acquire_write_lease(&project.id, &first.id, "agent-a", &["src/api".into()])
+            .unwrap()
+    );
+    // Same-session workers may share a worktree.
+    assert!(
+        store
+            .try_acquire_write_lease(
+                &project.id,
+                &first.id,
+                "agent-a2",
+                &["src/api/handler".into()]
+            )
+            .unwrap()
+    );
+    assert!(
+        !store
+            .try_acquire_write_lease(&project.id, &second.id, "agent-b", &["src/api".into()])
+            .unwrap()
+    );
+    assert!(
+        store
+            .try_acquire_write_lease(&project.id, &second.id, "agent-b", &["docs".into()])
+            .unwrap()
+    );
+
+    drop(store);
+    let reopened = Store::open(data.path()).unwrap();
+    let leases = reopened.list_write_leases(None, None).unwrap();
+    assert_eq!(leases.len(), 3);
+    assert!(leases.iter().any(|lease| lease.agent_id == "agent-a"));
+    assert!(leases.iter().any(|lease| lease.agent_id == "agent-b"));
+    reopened.release_write_lease("agent-a").unwrap();
+    reopened.release_write_lease("agent-a2").unwrap();
+    assert!(
+        reopened
+            .try_acquire_write_lease(&project.id, &second.id, "agent-c", &["src/api".into()])
+            .unwrap()
+    );
+}
+
+#[test]
+fn recovery_interrupts_tasks_and_clears_leases() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "recover tasks").unwrap();
+    let submitted = store
+        .append_event(
+            &session.id,
+            "team_plan.submitted",
+            serde_json::json!({"goal": "recover"}),
+        )
+        .unwrap();
+    store
+        .sync_plan_tasks(&session.id, &project.id, submitted.seq, &scheduled_plan())
+        .unwrap();
+    store
+        .claim_plan_tasks(&session.id, submitted.seq, &["T1".into()])
+        .unwrap();
+    store
+        .try_acquire_write_lease(&project.id, &session.id, "agent-a", &["src/one".into()])
+        .unwrap();
+    store.update_session_status(&session.id, "running").unwrap();
+
+    let (recovered, events) = store.recover_state().unwrap();
+    assert_eq!(recovered, vec![session.id.clone()]);
+    assert!(store.list_write_leases(None, None).unwrap().is_empty());
+    let tasks = store.list_plan_tasks(Some(&project.id), None).unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .find(|task| task.task_id == "T1")
+            .unwrap()
+            .status,
+        "interrupted"
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "plan_task.interrupted" && event.payload["task_id"] == "T1"
+    }));
+}
