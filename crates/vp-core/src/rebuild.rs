@@ -267,6 +267,41 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let plan: vp_protocol::types::TeamPlan = serde_json::from_value(serde_json::json!({
+                "goal": "rebuild me",
+                "departments": [{
+                    "name": "impl",
+                    "manager_title": "Implementation",
+                    "profile": "coding",
+                    "objective": "build"
+                }],
+                "tasks": [{
+                    "id": "T1",
+                    "department": "impl",
+                    "title": "Rebuild task",
+                    "kind": "coding",
+                    "deps": [],
+                    "acceptance": ["done"]
+                }]
+            }))
+            .unwrap();
+            engine.set_team_plan(&session.id, &plan).await.unwrap();
+            engine
+                .append_event(
+                    &session.id,
+                    "plan_task.started",
+                    serde_json::json!({"task_id": "T1", "task_status": "running"}),
+                )
+                .await
+                .unwrap();
+            engine
+                .append_event(
+                    &session.id,
+                    "plan_task.finished",
+                    serde_json::json!({"task_id": "T1", "task_status": "completed"}),
+                )
+                .await
+                .unwrap();
             engine.record_project_manifest().await.unwrap();
             (project.id, session.id)
         };
@@ -298,6 +333,11 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "session.created")
         );
+        let tasks = store.list_plan_tasks(None, Some(&session_id)).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, "T1");
+        assert_eq!(tasks[0].status, "completed");
+        assert_eq!(tasks[0].attempts, 1);
     }
 
     #[tokio::test]

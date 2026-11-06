@@ -1666,6 +1666,9 @@ pub struct SessionBundle {
     pub memories: Vec<MemoryItem>,
     #[serde(default)]
     pub questions: Vec<Question>,
+    /// Persistent task-DAG rows. Older bundles decode as an empty queue.
+    #[serde(default)]
+    pub tasks: Vec<ScheduledTask>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1691,6 +1694,8 @@ pub struct SessionReplayReport {
     pub memories_matches: bool,
     #[serde(default)]
     pub questions_matches: bool,
+    #[serde(default)]
+    pub task_queue_matches: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,

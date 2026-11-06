@@ -19,8 +19,8 @@ use vp_protocol::types::{
     McpServer, McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem,
     MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry,
     Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
-    QuestionListResult, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
-    SessionImportResult, SessionLandResult, SessionLogStatus, SessionPriorityResult,
+    QuestionListResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCommit,
+    SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus, SessionPriorityResult,
     SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
     StoredMessage, TaskQueueResult, TeamPlan, TerminalCloseResult, TerminalOpenResult,
     TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem, UsageBucket,
@@ -60,6 +60,7 @@ struct ReplayData {
     usage: Vec<UsageEntry>,
     memories: Vec<MemoryItem>,
     questions: Vec<Question>,
+    tasks: Vec<ScheduledTask>,
     events: Vec<Event>,
 }
 
@@ -2145,6 +2146,7 @@ impl Engine {
             let usage = store.list_usage_entries(&id)?;
             let memories = store.list_session_memories(&id)?;
             let questions = store.list_session_questions(&id)?;
+            let tasks = store.list_plan_tasks(None, Some(&id))?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -2159,10 +2161,130 @@ impl Engine {
                 usage,
                 memories,
                 questions,
+                tasks,
                 events,
             })
         })
         .await?
+    }
+
+    /// Reconstruct task-DAG rows from the active plan event and the plan
+    /// lifecycle events after it. Timestamps are derived from event times;
+    /// `same_expected_task` deliberately compares only durable scheduling state
+    /// so a live claim/finish timestamp cannot create false drift.
+    fn expected_tasks(data: &ReplayData) -> Option<Vec<ScheduledTask>> {
+        let plan_event = data
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "team_plan.submitted");
+        let (plan_seq, plan, enqueued_at) = match plan_event {
+            Some(event) => {
+                let plan = serde_json::from_value::<TeamPlan>(event.payload.clone()).ok()?;
+                (event.seq, plan, event.created_at.clone())
+            }
+            None => {
+                let Some(plan) = data
+                    .plan
+                    .as_deref()
+                    .and_then(|plan| serde_json::from_str::<TeamPlan>(plan).ok())
+                else {
+                    return data.tasks.is_empty().then(Vec::new);
+                };
+                (0, plan, data.session.created_at.clone())
+            }
+        };
+        let mut tasks = plan
+            .tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    ScheduledTask {
+                        session_id: data.session.id.clone(),
+                        project_id: data.session.project_id.clone(),
+                        plan_seq,
+                        task_id: task.id.clone(),
+                        department: task.department.clone(),
+                        title: task.title.clone(),
+                        priority: task.priority,
+                        status: "pending".to_string(),
+                        deps: task.deps.clone(),
+                        write_scope: task.write_scope.clone(),
+                        attempts: 0,
+                        enqueued_at: enqueued_at.clone(),
+                        started_at: None,
+                        finished_at: None,
+                        last_error: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for event in data.events.iter().filter(|event| event.seq > plan_seq) {
+            if !matches!(
+                event.kind.as_str(),
+                "plan_task.started" | "plan_task.finished" | "plan_task.interrupted"
+            ) {
+                continue;
+            }
+            let Some(task_id) = event.payload["task_id"].as_str() else {
+                continue;
+            };
+            let Some(task) = tasks.get_mut(task_id) else {
+                continue;
+            };
+            match event.kind.as_str() {
+                "plan_task.started" => {
+                    if task.status != "completed" {
+                        task.status = "interrupted".to_string();
+                        task.finished_at = None;
+                        task.last_error = None;
+                    }
+                    task.attempts = task.attempts.saturating_add(1);
+                    task.started_at = Some(event.created_at.clone());
+                }
+                "plan_task.finished" => {
+                    let status = event.payload["task_status"]
+                        .as_str()
+                        .unwrap_or("failed")
+                        .to_string();
+                    task.last_error = if status == "completed" {
+                        None
+                    } else {
+                        event.payload["reason"]
+                            .as_str()
+                            .or_else(|| event.payload["summary"].as_str())
+                            .map(str::to_string)
+                    };
+                    task.status = status;
+                    task.finished_at = Some(event.created_at.clone());
+                }
+                "plan_task.interrupted" => {
+                    task.status = "interrupted".to_string();
+                    task.finished_at = Some(event.created_at.clone());
+                    task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                }
+                _ => {}
+            }
+        }
+        let mut tasks = tasks.into_values().collect::<Vec<_>>();
+        tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        Some(tasks)
+    }
+
+    fn same_expected_task(left: &ScheduledTask, right: &ScheduledTask) -> bool {
+        left.session_id == right.session_id
+            && left.project_id == right.project_id
+            && left.plan_seq == right.plan_seq
+            && left.task_id == right.task_id
+            && left.department == right.department
+            && left.title == right.title
+            && left.priority == right.priority
+            && left.status == right.status
+            && left.deps == right.deps
+            && left.write_scope == right.write_scope
+            && left.attempts == right.attempts
+            && left.enqueued_at == right.enqueued_at
     }
 
     fn expected_approvals(data: &ReplayData) -> Vec<Approval> {
@@ -2633,6 +2755,27 @@ impl Engine {
             ));
         }
 
+        let expected_tasks = Self::expected_tasks(data);
+        let task_queue_matches = match &expected_tasks {
+            Some(expected) => {
+                expected.len() == data.tasks.len()
+                    && expected.iter().all(|expected| {
+                        data.tasks
+                            .iter()
+                            .find(|task| task.task_id == expected.task_id)
+                            .is_some_and(|projected| Self::same_expected_task(expected, projected))
+                    })
+            }
+            None => false,
+        };
+        if !task_queue_matches {
+            mismatches.push(format!(
+                "task queue: projection={}, replay={}",
+                data.tasks.len(),
+                expected_tasks.as_ref().map(Vec::len).unwrap_or(0)
+            ));
+        }
+
         let mut replay_memories = HashMap::new();
         for event in &data.events {
             match event.kind.as_str() {
@@ -2801,6 +2944,7 @@ impl Engine {
             && approvals_matches
             && memories_matches
             && questions_matches
+            && task_queue_matches
             && plan_matches
             && todos_matches
             && messages_matches
@@ -2822,6 +2966,7 @@ impl Engine {
             ledger_matches,
             memories_matches,
             questions_matches,
+            task_queue_matches,
             consistent,
             repaired,
             rebuilt: false,
@@ -3101,6 +3246,7 @@ impl Engine {
             approvals: Some(Self::expected_approvals(data)),
             memories,
             questions,
+            tasks: Self::expected_tasks(data),
             artifact_warnings,
         })
     }
@@ -3363,6 +3509,7 @@ impl Engine {
             usage,
             memories: data.memories,
             questions: data.questions,
+            tasks: data.tasks,
         })
     }
 

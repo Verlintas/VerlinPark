@@ -2318,6 +2318,26 @@ async fn replay_checks_critical_projections() {
     assert!(report.todos_matches);
     assert!(report.messages_matches);
     assert!(report.queue_matches);
+    assert!(report.task_queue_matches);
+
+    // A plan lifecycle event without its projection update must show up as
+    // task-queue drift, and repair must rebuild the row from the event.
+    engine
+        .append_event(
+            &session.id,
+            "plan_task.started",
+            serde_json::json!({"task_id": "T1", "task_status": "running"}),
+        )
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "plan_task.finished",
+            serde_json::json!({"task_id": "T1", "task_status": "completed"}),
+        )
+        .await
+        .unwrap();
 
     // Bypass the event path deliberately: replay must expose the drift.
     engine
@@ -2342,12 +2362,21 @@ async fn replay_checks_critical_projections() {
     assert!(!report.status_matches);
     assert!(!report.ledger_matches);
     assert!(!report.approvals_matches);
+    assert!(!report.task_queue_matches);
 
     let repaired = engine.repair_session(&session.id).await.unwrap();
     assert!(repaired.repaired);
     assert!(repaired.consistent, "{:?}", repaired.mismatches);
     assert!(repaired.ledger_matches);
     assert!(repaired.approvals_matches);
+    assert!(repaired.task_queue_matches);
+    let repaired_tasks = engine
+        .task_queue(Some(session.project_id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(repaired_tasks.tasks.len(), 1);
+    assert_eq!(repaired_tasks.tasks[0].status, "completed");
+    assert_eq!(repaired_tasks.tasks[0].attempts, 1);
     assert_eq!(
         engine
             .list_approvals(Some(session.id.clone()))
@@ -2482,6 +2511,9 @@ async fn replay_checks_critical_projections() {
         usage.agent_name == agent.name && usage.department.as_deref() == Some("impl")
     }));
     assert!(bundle.team_plan.is_some());
+    assert_eq!(bundle.tasks.len(), 1);
+    assert_eq!(bundle.tasks[0].task_id, "T1");
+    assert_eq!(bundle.tasks[0].status, "completed");
     assert!(!bundle.events.is_empty());
     let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
     assert!(rebuilt.repaired);
@@ -2532,6 +2564,12 @@ async fn replay_checks_critical_projections() {
     assert_eq!(imported_agents.len(), 1);
     let imported_messages = imported_engine.list_messages(&session.id).await.unwrap();
     assert_eq!(imported_messages.len(), 1);
+    let imported_tasks = imported_engine
+        .task_queue(Some(imported.project_id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(imported_tasks.tasks.len(), 1);
+    assert_eq!(imported_tasks.tasks[0].status, "completed");
     let imported_usage = imported_engine.usage_ledger(&session.id).await.unwrap();
     assert_eq!(imported_usage.entries.len(), 2);
     assert!(

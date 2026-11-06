@@ -37,6 +37,7 @@ pub struct SessionRepair {
     pub approvals: Option<Vec<Approval>>,
     pub memories: Option<Vec<MemoryItem>>,
     pub questions: Option<Vec<Question>>,
+    pub tasks: Option<Vec<ScheduledTask>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -3638,9 +3639,16 @@ impl Store {
         let now = now_rfc3339();
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
+        struct TaskEventState {
+            status: String,
+            attempts: u32,
+            started_at: Option<String>,
+            finished_at: Option<String>,
+            last_error: Option<String>,
+        }
         let previous = {
             let mut stmt = tx.prepare(
-                "SELECT task_id, plan_seq, enqueued_at, attempts FROM plan_tasks
+                "SELECT task_id, plan_seq, enqueued_at FROM plan_tasks
                  WHERE session_id = ?1 ORDER BY plan_seq ASC",
             )?;
             let rows = stmt.query_map(params![session_id], |row| {
@@ -3648,60 +3656,107 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?.max(0) as u32,
                 ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let mut statuses = std::collections::HashMap::new();
+        let plan_enqueued_at = tx
+            .query_row(
+                "SELECT created_at FROM events WHERE session_id = ?1 AND seq = ?2",
+                params![session_id, plan_seq as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| now.clone());
+        let mut states = std::collections::HashMap::<String, TaskEventState>::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT type, payload FROM events
+                "SELECT type, payload, created_at FROM events
                  WHERE session_id = ?1 AND seq > ?2
-                   AND type IN ('plan_task.started', 'plan_task.finished')
+                   AND type IN ('plan_task.started', 'plan_task.finished',
+                                'plan_task.interrupted')
                  ORDER BY seq ASC",
             )?;
             let rows = stmt.query_map(params![session_id, plan_seq as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?;
             for row in rows {
-                let (kind, payload) = row?;
+                let (kind, payload, created_at) = row?;
                 let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
                 let Some(task_id) = payload["task_id"].as_str() else {
                     continue;
                 };
-                if kind == "plan_task.finished" {
-                    let status = payload["task_status"].as_str().unwrap_or("failed");
-                    statuses.insert(task_id.to_string(), status.to_string());
-                } else if !statuses.contains_key(task_id) {
-                    statuses.insert(task_id.to_string(), "interrupted".to_string());
+                let state = states.entry(task_id.to_string()).or_insert(TaskEventState {
+                    status: "pending".to_string(),
+                    attempts: 0,
+                    started_at: None,
+                    finished_at: None,
+                    last_error: None,
+                });
+                match kind.as_str() {
+                    "plan_task.started" => {
+                        if state.status != "completed" {
+                            state.status = "interrupted".to_string();
+                            state.finished_at = None;
+                            state.last_error = None;
+                        }
+                        state.attempts = state.attempts.saturating_add(1);
+                        state.started_at = Some(created_at);
+                    }
+                    "plan_task.finished" => {
+                        let status = payload["task_status"].as_str().unwrap_or("failed");
+                        state.status = status.to_string();
+                        state.finished_at = Some(created_at);
+                        state.last_error = if status == "completed" {
+                            None
+                        } else {
+                            payload["reason"]
+                                .as_str()
+                                .or_else(|| payload["summary"].as_str())
+                                .map(str::to_string)
+                        };
+                    }
+                    "plan_task.interrupted" => {
+                        state.status = "interrupted".to_string();
+                        state.finished_at = Some(created_at);
+                        state.last_error = payload["reason"].as_str().map(str::to_string);
+                    }
+                    _ => {}
                 }
             }
         }
         let previous_map = previous
             .into_iter()
-            .filter(|(_, previous_seq, _, _)| *previous_seq == plan_seq as i64)
-            .map(|(task_id, _, enqueued_at, attempts)| (task_id, (enqueued_at, attempts)))
+            .filter(|(_, previous_seq, _)| *previous_seq == plan_seq as i64)
+            .map(|(task_id, _, enqueued_at)| (task_id, enqueued_at))
             .collect::<std::collections::HashMap<_, _>>();
         tx.execute(
             "DELETE FROM plan_tasks WHERE session_id = ?1",
             params![session_id],
         )?;
         for task in &plan.tasks {
-            let status = statuses
+            let state = states.get(&task.id);
+            let status = state
+                .map(|state| state.status.as_str())
+                .unwrap_or("pending");
+            let attempts = state.map(|state| state.attempts).unwrap_or(0);
+            let started_at = state.and_then(|state| state.started_at.as_deref());
+            let finished_at = state.and_then(|state| state.finished_at.as_deref());
+            let last_error = state.and_then(|state| state.last_error.as_deref());
+            let enqueued_at = previous_map
                 .get(&task.id)
                 .cloned()
-                .unwrap_or_else(|| "pending".to_string());
-            let (enqueued_at, attempts) = previous_map
-                .get(&task.id)
-                .cloned()
-                .unwrap_or_else(|| (now.clone(), 0));
+                .unwrap_or_else(|| plan_enqueued_at.clone());
             tx.execute(
                 "INSERT INTO plan_tasks
                  (session_id, plan_seq, task_id, project_id, department, title, priority,
                   status, deps, write_scope, attempts, last_error, enqueued_at, started_at,
                   finished_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, NULL, NULL, ?13)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     session_id,
                     plan_seq as i64,
@@ -3714,7 +3769,10 @@ impl Store {
                     serde_json::to_string(&task.deps)?,
                     serde_json::to_string(&task.write_scope)?,
                     i64::from(attempts),
+                    last_error,
                     enqueued_at,
+                    started_at,
+                    finished_at,
                     now
                 ],
             )?;
@@ -4452,6 +4510,39 @@ impl Store {
                 )?;
             }
         }
+        if let Some(tasks) = &repair.tasks {
+            tx.execute(
+                "DELETE FROM plan_tasks WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for task in tasks {
+                tx.execute(
+                    "INSERT INTO plan_tasks
+                     (session_id, plan_seq, task_id, project_id, department, title, priority,
+                      status, deps, write_scope, attempts, last_error, enqueued_at, started_at,
+                      finished_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    params![
+                        task.session_id,
+                        task.plan_seq as i64,
+                        task.task_id,
+                        task.project_id,
+                        task.department,
+                        task.title,
+                        task.priority,
+                        task.status,
+                        serde_json::to_string(&task.deps)?,
+                        serde_json::to_string(&task.write_scope)?,
+                        i64::from(task.attempts),
+                        task.last_error,
+                        task.enqueued_at,
+                        task.started_at,
+                        task.finished_at,
+                        now
+                    ],
+                )?;
+            }
+        }
         if let Some(artifacts) = &repair.artifacts {
             tx.execute(
                 "DELETE FROM artifacts WHERE session_id = ?1",
@@ -4602,6 +4693,45 @@ impl Store {
                     agent.status,
                     agent.model,
                     agent.created_at
+                ],
+            )?;
+        }
+        for task in &bundle.tasks {
+            if task.session_id != bundle.session.id {
+                return Err(anyhow!(
+                    "bundle task {} belongs to a different session",
+                    task.task_id
+                ));
+            }
+            if task.project_id != bundle.project.id {
+                return Err(anyhow!(
+                    "bundle task {} belongs to a different project",
+                    task.task_id
+                ));
+            }
+            tx.execute(
+                "INSERT INTO plan_tasks
+                 (session_id, plan_seq, task_id, project_id, department, title, priority,
+                  status, deps, write_scope, attempts, last_error, enqueued_at, started_at,
+                  finished_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    task.session_id,
+                    task.plan_seq as i64,
+                    task.task_id,
+                    task.project_id,
+                    task.department,
+                    task.title,
+                    task.priority,
+                    task.status,
+                    serde_json::to_string(&task.deps)?,
+                    serde_json::to_string(&task.write_scope)?,
+                    i64::from(task.attempts),
+                    task.last_error,
+                    task.enqueued_at,
+                    task.started_at,
+                    task.finished_at,
+                    bundle.exported_at
                 ],
             )?;
         }

@@ -66,10 +66,10 @@ one ready batch inside one session.
   plans; it does not run a single task from an inactive session without a plan
   run, and it executes ready tasks in batches rather than a fully autonomous
   per-task dispatcher.
-- Task rows are an operational projection, not yet part of `session.replay`
-  repair, bundle export, or `db-rebuild`. They are regenerated from the plan
-  and plan events on sync. Write leases are ephemeral coordination state, not
-  event-sourced audit history; recovery clears them.
+- Task rows are part of `session.replay` drift checks and
+  `--repair`/`--rebuild`, session bundle export/import, and `db-rebuild`.
+  They are regenerated from the plan and plan events. Write leases are ephemeral
+  coordination state, not event-sourced audit history; recovery clears them.
 - The scheduler and lease registry remain single-daemon (the daemon already
   holds an instance lock). There is no cross-process priority queue.
 
