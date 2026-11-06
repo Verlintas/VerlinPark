@@ -23,6 +23,7 @@ pub struct PendingSession {
     pub project_id: String,
     pub priority: i32,
     pub pending: usize,
+    pub task_priority: i32,
     pub enqueued_at: String,
     pub effective_priority: i64,
 }
@@ -168,19 +169,26 @@ impl TaskScheduler {
             let mut candidates = store
                 .pending_task_sessions()?
                 .into_iter()
-                .filter(|(session_id, _, _, _, _)| !excluded.contains(session_id))
-                .map(|(session_id, project_id, priority, pending, enqueued_at)| {
-                    let effective_priority =
-                        session_effective_priority(priority, &enqueued_at, now, aging);
-                    PendingSession {
-                        session_id,
-                        project_id,
-                        priority,
-                        pending,
-                        enqueued_at,
-                        effective_priority,
-                    }
-                })
+                .filter(|(session_id, _, _, _, _, _)| !excluded.contains(session_id))
+                .map(
+                    |(session_id, project_id, priority, pending, enqueued_at, task_priority)| {
+                        let effective_priority = session_effective_priority(
+                            priority.saturating_add(task_priority).clamp(-100, 100),
+                            &enqueued_at,
+                            now,
+                            aging,
+                        );
+                        PendingSession {
+                            session_id,
+                            project_id,
+                            priority,
+                            pending,
+                            task_priority,
+                            enqueued_at,
+                            effective_priority,
+                        }
+                    },
+                )
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
                 return Ok(None);
@@ -409,6 +417,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(picked.session_id, first.id);
+    }
+
+    #[tokio::test]
+    async fn pending_session_selection_uses_high_task_priority() {
+        let (_dir, store, project, first) = store();
+        let second = store.create_session(&project.id, "high task").unwrap();
+        store
+            .append_event(&second.id, "team_plan.submitted", serde_json::json!({}))
+            .unwrap();
+        store.update_session_status(&first.id, "idle").unwrap();
+        store.update_session_status(&second.id, "idle").unwrap();
+        let scheduler = TaskScheduler::new_with_aging(store, Duration::ZERO);
+        scheduler
+            .sync_plan(&first, &plan(vec![task("low", -20, vec![])]))
+            .await
+            .unwrap();
+        scheduler
+            .sync_plan(&second, &plan(vec![task("high", 50, vec![])]))
+            .await
+            .unwrap();
+        let picked = scheduler
+            .next_pending_session(None, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.session_id, second.id);
+        assert_eq!(picked.task_priority, 50);
     }
 
     #[tokio::test]

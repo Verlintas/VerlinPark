@@ -2326,7 +2326,9 @@ impl AgentService {
                     session_id = %candidate.session_id,
                     project_id = %candidate.project_id,
                     pending = candidate.pending,
-                    priority = candidate.effective_priority,
+                    session_priority = candidate.priority,
+                    task_priority = candidate.task_priority,
+                    effective_priority = candidate.effective_priority,
                     "global task scheduler resuming a plan"
                 );
                 match service.resume_plan(&candidate.session_id).await {

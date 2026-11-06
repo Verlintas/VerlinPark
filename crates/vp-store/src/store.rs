@@ -40,7 +40,7 @@ pub struct SessionRepair {
     pub artifact_warnings: Vec<String>,
 }
 
-pub type PendingTaskSessionRow = (String, String, i32, usize, String);
+pub type PendingTaskSessionRow = (String, String, i32, usize, String, i32);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectManifestSnapshot {
@@ -3747,7 +3747,8 @@ impl Store {
     pub fn pending_task_sessions(&self) -> Result<Vec<PendingTaskSessionRow>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT t.session_id, t.project_id, s.priority, COUNT(*), MIN(t.enqueued_at)
+            "SELECT t.session_id, t.project_id, s.priority, COUNT(*), MIN(t.enqueued_at),
+                    MAX(t.priority)
              FROM plan_tasks t
              JOIN sessions s ON s.id = t.session_id
              WHERE t.status IN ('pending', 'interrupted', 'failed', 'blocked', 'cancelled')
@@ -3762,6 +3763,7 @@ impl Store {
                 row.get::<_, i32>(2)?,
                 row.get::<_, i64>(3)?.max(0) as usize,
                 row.get::<_, String>(4)?,
+                row.get::<_, i32>(5)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
