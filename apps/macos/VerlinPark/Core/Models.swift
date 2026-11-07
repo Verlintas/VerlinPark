@@ -601,6 +601,9 @@ struct AgentProbeResult: Codable, Sendable {
     let provider: String
     let model: String
     let latencyMs: Int
+    let firstTokenMs: Int?
+    let chunks: Int?
+    let done: Bool?
     let inputTokens: Int
     let outputTokens: Int
     let text: String
@@ -609,6 +612,9 @@ struct AgentProbeResult: Codable, Sendable {
         case provider
         case model
         case latencyMs = "latency_ms"
+        case firstTokenMs = "first_token_ms"
+        case chunks
+        case done
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
         case text

@@ -13,13 +13,14 @@
 - **P0-2 已修复**：provider 请求前做 token reservation，按保守输入估算 + 动态 output budget 预留；provider 返回 usage 后结算，缺少 usage 的本地端点会以 `estimated: true` 的估算用量持久化。并发批次不再共用同一个 pre-flight 窗口。
 - **P1-4 已修复**：`fetch_url` 在连接前解析并固定已校验的 IP，阻止解析到 loopback/private/link-local/文档/benchmark 等地址；补充了 IPv4-mapped IPv6 与特殊段检查。
 - **P1-3 部分修复**：shell 现在通过 macOS Seatbelt 拒绝 worktree/Git 元数据/scratch 之外的写入，并保护 common hooks/config；sandbox 不可用时 fail closed。常见 credential/state 路径已 read-deny，timeout/cancel 会清理整个 process group，项目级 policy 可 deny network、追加 read-deny，并可 opt-in `restrict_home` 拒绝 HOME 内容，或 `read_jail` 进一步拒绝 HOME parent（通常 `/Users`）和 `/Volumes`（worktree/scratch/Git/toolchain/系统路径例外）；System 路径、`/private/tmp`、`/private/var`、network allow 下的外发、进程执行策略和 Docker 等 daemon 介导写入仍未隔离，Verifier 的 shell 现在运行在 isolated detached clone 中，不能修改 Worker worktree/branch；tracked 源码修改仍有 post-run guard。
+- **P1-8 部分修复**：provider stream 在**尚无任何输出**时最多 3 次 attempts（含首次）；partial failure/cancel 会保留 `partial: true` message，并按 provider usage 或估算结算 token reservation；partial turn 不会 replay。`agent.probe` 现在报告 chunks/first-token/done；env-gated live OpenAI/Anthropic/local E2E 已加入。仍不能从 mid-stream 断点续传。
 - **P1-7 已实现（第一版）**：ACP external-agent bridge。外部 stdio agent 注册表、Leader/Manager `delegate_acp`、Worker slot + global capacity/write lease、task worktree、Seatbelt 写沙箱 + scratch HOME、MCP 传递、permission→approval、timeout/cancel、Verifier/Integrator 全链路、`acp.agent.probe`、CLI/Settings 已具备；仍缺 HTTP/SSE transport、session resume、`fs/*`/`terminal/*` capability、auth flow、usage ledger 映射，且外部二进制仍是受信任程序。
 - **P1-6 已修复（第一版）**：Verifier-approved commit 进入持久 merge queue，确定性 Integrator 执行 merge、diff check 和可选项目检查，失败回滚，冲突记录；conflict/failed 可 rebase+retry，冲突可显式调用 resolver agent 解决并重新验证；项目级 opt-in policy 可在 session idle 时自动触发，带 attempt/token cap；本地 landing 和 `gh` PR flow 可用。仍缺默认开启的静默自动冲突解决、LLM Integrator、其他 forge PR adapter。
 - **队列恢复**：daemon 重启把 queued/merging/checking entry 标为 `interrupted` 并补事件；interrupted 可人工 rebase+retry。
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
-- **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、其他 forge PR、shell scratch 回收、部分 merge 状态的人工检查、外部 ACP agent 的网络/凭证边界。
+- **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、其他 forge PR、shell scratch 回收、部分 merge 状态的人工检查、外部 ACP agent 的网络/凭证边界、mid-stream 断点续传。
 
-当前测试：Rust 202（core 158 / store 36 / providers 8），Swift 40。CI 以最新提交为准。
+当前测试：Rust 206（core 162 / store 36 / providers 8；另有 3 个 ignored live tests），Swift 40。CI 以最新提交为准。
 
 ### 0.1 2026-10-31 跟进
 
@@ -92,8 +93,8 @@
 | 正确性/一致性 | B+ | P0 的 plan scope/caps 与预算 reservation 已修复；关键状态事件+投影已原子化，export/import/rehydrate/rebuild 已覆盖关键投影（含 memory/question）；`vp db-rebuild` 可从 manifest + mirrors 从零重建，但 imported archive/blobs/worktree 需要原文件存在 |
 | 隔离与安全 | B− | 路径 jail、loopback token、fetch_url DNS 固定、shell 写入 Seatbelt、credential read-deny、process group 清理、项目级 network/read-deny policy 已具备；任意读取/network allow 下的外发/daemon 介导写入仍未隔离 |
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Console、Terminal、Files、History、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff、Rail 通知中心（历史持久化）可用；系统通知已支持（后台本地通知），更早的 round 受已加载 event window 限制 |
-| 可维护性 | C− | `agent.rs` 8,058 行（测试移到 `agent/tests.rs`）、`vp-core/lib.rs` 4,548 行（测试移到 `tests.rs`）、`store.rs` 5,002 行（测试移到 `store/tests.rs`）、`StudioView.swift` 约 2.4k 行；核心逻辑模块边界仍需治理 |
-| 测试 | B− | 202 Rust + 40 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/home read jail/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/project memory delete-prune-FTS-retention-policy/mid-run questions/MCP stdio persistent-pagination-resources-prompts-dynamic-tools/sandboxed console/PTY terminal/task-DAG queue/global write leases/project-level auto-resume policy/task queue replay-bundle-rebuild/task skip-retry-running-cancel-pause-resume/user-volume read jail/isolated-verifier-checkout/ACP-external-agent/usage CSV/project usage/worktree retention/diff parser/OpenAI+Anthropic HTTP adapter E2E/queued recovery/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
+| 可维护性 | C− | `agent.rs` 约 9.4k 行（测试移到 `agent/tests.rs`）、`vp-core/lib.rs` 约 5.4k 行（测试移到 `tests.rs`）、`store.rs` 约 6.3k 行（测试移到 `store/tests.rs`）、`StudioView.swift` 约 2.4k 行；核心逻辑模块边界仍需治理 |
+| 测试 | B− | 206 Rust + 40 Swift 全绿（+3 ignored live）；并发/scope/SSRF/shell sandbox/policy/home read jail/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/project memory delete-prune-FTS-retention-policy/mid-run questions/MCP stdio persistent-pagination-resources-prompts-dynamic-tools/sandboxed console/PTY terminal/task-DAG queue/global write leases/project-level auto-resume policy/task queue replay-bundle-rebuild/task skip-retry-running-cancel-pause-resume/user-volume read jail/isolated-verifier-checkout/ACP-external-agent/provider-stream-retry-partial-settlement/long-stream/live-harness/usage CSV/project usage/worktree retention/diff parser/OpenAI+Anthropic HTTP adapter E2E/queued recovery/db rebuild 已有回归；真实外部 Provider 由 env-gated live harness 覆盖但 CI 不运行 |
 | 发布准备 | C+ | `just package` 默认 ad-hoc DMG + checksum；Developer ID/公证已明确暂缓，不要求 Apple 开发者账号；可选 tap 发布；仍无 Sparkle 更新器，首次打开可能需 Gatekeeper 确认 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
@@ -263,6 +264,30 @@
 - UI 增加 ACP session 事件时间线（当前复用通用 tool/message 事件）。
 
 ---
+
+### P1-8（部分修复 2026-11-07）：provider stream 断线会丢失结算，且真实 Provider E2E 不可复现
+
+**证据**
+
+- 修复前 `run_loop` 在 stream item 返回 `Err` 时直接 `?`，尚未写 usage ledger、未 settle token reservation；partial text 已通过 `agent.message_delta` 发出，但 `agent.failed` 会清掉实时 transcript。
+- 修复后 `consume_stream` 在没有任何 text/tool/usage 前对 transient stream error、idle timeout 最多 3 次 attempts；已有输出后不 replay。
+- partial failure/cancel 使用 provider usage 或 partial text/tool 的估算记录 usage，settle reservation，并发出 `agent.message {partial:true}`；turn 仍然 failed/cancelled。
+- `agent.probe` 增加 `chunks`、`first_token_ms`、`done`；`vp-providers/tests/live.rs` 提供默认 ignored 的真实 OpenAI/Anthropic/local E2E。
+- 新增测试覆盖 stream retry、partial failure、cancelled partial、500-chunk long stream、probe 指标；原有 wiremock rate-limit/SSE 测试保留。
+
+**影响**
+
+- 有输出后的断线仍不能从断点续传；只能保留 partial output、结算费用并失败该 turn。这样避免重复文本/工具调用/计费，但长回答断线仍需用户重试。
+- 如果 provider 实际收费但没有返回 usage 且没有输出，本地无法检测该费用。
+- live tests 依赖用户自己的 key/网络，不在 CI 中运行。
+
+**后续**
+
+- 评估 provider 原生 resume（若 API 提供 event id / response id）而不是 replay prompt。
+- 为 live harness 增加长流、限流与断线的用户侧脚本，而不仅是基础 streaming。
+- 把 `agent.probe` 的 first-token/chunk 指标显示在 Settings 的 provider 状态里（本轮已接入基础展示）。
+
+---
 ## 3. 次级问题与债务
 
 ### P2-7（已修复 2026-10-31）：batch abort 后同批 task 状态可能悬挂
@@ -311,12 +336,12 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 202 个 Rust 测试 + 40 个 Swift 测试，覆盖 Leader loop、provider probe/retry/idle timeout、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、queued session 恢复、shell 沙箱/policy/home read jail、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、priority-aware aging global session admission、persistent task-DAG queue/global write leases/project-level auto-resume policy、cross-session scope locks、priority-aware aging task+session global Worker/Labour capacity/budget-gated plan auto-expansion、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、project memory（delete/prune/FTS/replay/retention policy）、mid-run questions、MCP stdio（persistent/pagination/resources/prompts/dynamic tools）、ACP stdio（initialize/session/new/prompt/permission/update/timeout/probe/Worker integration）、sandboxed console、PTY terminal、workspace files/edit、Git history、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI+Anthropic HTTP adapter E2E、db rebuild。仍缺：
+已有 206 个 Rust 测试 + 40 个 Swift 测试，覆盖 Leader loop、provider probe/retry/idle timeout/stream retry before output/partial usage settlement、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、queued session 恢复、shell 沙箱/policy/home read jail、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、priority-aware aging global session admission、persistent task-DAG queue/global write leases/project-level auto-resume policy、cross-session scope locks、priority-aware aging task+session global Worker/Labour capacity/budget-gated plan auto-expansion、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、project memory（delete/prune/FTS/replay/retention policy）、mid-run questions、MCP stdio（persistent/pagination/resources/prompts/dynamic tools）、ACP stdio（initialize/session/new/prompt/permission/update/timeout/probe/Worker integration）、sandboxed console、PTY terminal、workspace files/edit、Git history、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI+Anthropic HTTP adapter E2E、db rebuild。仍缺：
 
 - 并发预算超调上界与预算 abort 的 sibling 结算（当前只测取消 abort）
 - 其他 forge PR adapter / 默认自动冲突解决策略 / 真正的 post-merge 集成分支
 - WebSocket 断线重连
-- 真实外部 Provider（需要 API key）的 E2E；本地 wiremock 全链路已覆盖 OpenAI-compatible 与 Anthropic
+- 真实外部 Provider E2E 已有 env-gated live harness（OpenAI/Anthropic/local，默认 ignored）；CI 不运行，仍需要用户凭证人工验证。本地 wiremock 全链路已覆盖 OpenAI-compatible 与 Anthropic
 - FTS/索引搜索与跨 session 相关性排序
 - transcript 的 event timeline 与增量导出
 - roundtable 卡片的 UI snapshot / accessibility 回归
@@ -417,9 +442,9 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 ## 6. 复现与验证
 
 ```bash
-cargo test --workspace     # 202 passed after the 11-07 ACP external-agent slice
+cargo test --workspace     # 206 passed after the 11-07 provider stream resilience slice
 just lint                  # fmt + clippy -D warnings + swiftformat lint
-just test                  # Rust + xcodebuild test (12 Swift tests)
+just test                  # Rust + xcodebuild test (40 Swift tests)
 ```
 
 审计基线 CI：GitHub Actions run `40902407039`（commit `cbef2e6`）成功。

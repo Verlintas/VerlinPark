@@ -151,6 +151,49 @@ impl Provider for SlowProvider {
     }
 }
 
+struct ScriptedStreamProvider {
+    responses: Mutex<VecDeque<Vec<Result<StreamEvent, ProviderError>>>>,
+}
+
+#[async_trait]
+impl Provider for ScriptedStreamProvider {
+    fn id(&self) -> &str {
+        "scripted-stream"
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+        let events = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::Done),
+                ]
+            });
+        Ok(Box::pin(futures_util::stream::iter(events)))
+    }
+}
+
+struct PartialSlowProvider;
+
+#[async_trait]
+impl Provider for PartialSlowProvider {
+    fn id(&self) -> &str {
+        "partial-slow"
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+        Ok(Box::pin(
+            futures_util::stream::iter(vec![Ok(StreamEvent::TextDelta("partial".into()))]).chain(
+                futures_util::stream::pending::<Result<StreamEvent, ProviderError>>(),
+            ),
+        ))
+    }
+}
+
 #[test]
 fn configures_provider_without_persisting_secrets() {
     let dir = TempDir::new().unwrap();
@@ -3489,6 +3532,9 @@ async fn probes_the_configured_provider() {
     assert_eq!(result.model, "test");
     assert_eq!(result.text, "OK");
     assert!(result.latency_ms < 5_000);
+    assert_eq!(result.chunks, 1);
+    assert!(result.first_token_ms <= result.latency_ms);
+    assert!(result.done);
 }
 
 #[tokio::test]
@@ -5319,4 +5365,158 @@ async fn delegates_to_an_external_acp_agent_and_integrates_it() {
             && event.payload["agent_role"] == "worker"
             && event.payload["merged"] == true
     }));
+}
+
+#[tokio::test]
+async fn retries_a_stream_failure_before_output() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![Err(ProviderError::Stream("connection reset".into()))],
+            vec![
+                Ok(StreamEvent::TextDelta("recovered".into())),
+                Ok(StreamEvent::Done),
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "retry stream".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "retry stream").await.unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.stream_retry"
+            && event.payload["attempt"] == 1
+            && event.payload["phase"] == "stream"
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.kind == "agent.message" && event.payload["text"] == "recovered" })
+    );
+}
+
+#[tokio::test]
+async fn preserves_partial_output_and_usage_when_the_stream_breaks() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            Ok(StreamEvent::TextDelta("half a thought".into())),
+            Err(ProviderError::Stream("connection reset".into())),
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "partial".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "partial").await.unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "failed");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message"
+            && event.payload["text"] == "half a thought"
+            && event.payload["partial"] == true
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.stream_retry"),
+        "partial output must not be replayed"
+    );
+    let ledger = engine.usage_ledger(&session.id).await.unwrap();
+    assert_eq!(ledger.entries.len(), 1);
+    assert!(ledger.entries[0].estimated);
+    assert!(ledger.entries[0].input_tokens > 0);
+    assert!(ledger.entries[0].output_tokens > 0);
+    assert_eq!(ledger.totals.input_tokens, ledger.entries[0].input_tokens);
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.failed"
+            && event.payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("connection reset"))
+    }));
+}
+
+#[tokio::test]
+async fn records_partial_usage_when_a_stream_is_cancelled() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(PartialSlowProvider);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "cancel partial".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "cancel partial").await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = engine.list_events(session.id.clone(), 0, 50).await.unwrap();
+        if events
+            .iter()
+            .any(|event| event.kind == "agent.message_delta" && event.payload["text"] == "partial")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "partial output was not streamed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(service.cancel(&session.id));
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "cancelled");
+    let ledger = engine.usage_ledger(&session.id).await.unwrap();
+    assert_eq!(ledger.entries.len(), 1);
+    assert!(ledger.entries[0].estimated);
+    assert!(ledger.entries[0].output_tokens > 0);
+}
+
+#[tokio::test]
+async fn handles_a_long_provider_stream_without_losing_chunks() {
+    let dir = TempDir::new().unwrap();
+    let expected = (0..500)
+        .map(|index| format!("{index},"))
+        .collect::<String>();
+    let mut events = (0..500)
+        .map(|index| Ok(StreamEvent::TextDelta(format!("{index},"))))
+        .collect::<Vec<_>>();
+    events.push(Ok(StreamEvent::Done));
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![events])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "long stream".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "long stream").await.unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 2_000)
+        .await
+        .unwrap();
+    let message = events
+        .iter()
+        .find(|event| event.kind == "agent.message")
+        .expect("final assistant message");
+    assert_eq!(message.payload["text"].as_str().unwrap(), expected);
+    let messages = engine.list_messages(&session.id).await.unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == "assistant" && message.content == expected)
+    );
 }

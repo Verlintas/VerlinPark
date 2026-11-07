@@ -17,8 +17,8 @@ use vp_protocol::types::{
     PlanDepartment, PlanTask, Project, RoleModels, Session, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
-    AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, StreamEvent,
-    ToolCall, ToolSchema,
+    AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
+    StreamEvent, ToolCall, ToolSchema,
 };
 use vp_store::Store;
 
@@ -1585,12 +1585,24 @@ impl AgentService {
         .context("starting provider probe")?;
         let mut text = String::new();
         let mut usage = (0u64, 0u64);
+        let mut chunks = 0u32;
+        let mut first_token_ms = 0u64;
+        let mut done = false;
         while let Some(item) = timeout(Duration::from_secs(30), stream.next())
             .await
             .map_err(|_| anyhow!("provider probe stream timed out"))?
         {
             match item? {
-                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::TextDelta(delta) => {
+                    if !delta.is_empty() {
+                        if chunks == 0 {
+                            first_token_ms =
+                                started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        }
+                        chunks = chunks.saturating_add(1);
+                        text.push_str(&delta);
+                    }
+                }
                 StreamEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -1598,7 +1610,8 @@ impl AgentService {
                     usage.0 = usage.0.saturating_add(input_tokens as u64);
                     usage.1 = usage.1.saturating_add(output_tokens as u64);
                 }
-                StreamEvent::ToolCall(_) | StreamEvent::Done => {}
+                StreamEvent::Done => done = true,
+                StreamEvent::ToolCall(_) => {}
             }
         }
         if text.trim().is_empty() {
@@ -1608,6 +1621,9 @@ impl AgentService {
             provider: config.provider_name,
             model: config.model,
             latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            first_token_ms,
+            chunks,
+            done,
             input_tokens: usage.0,
             output_tokens: usage.1,
             text: truncate(&text),
@@ -2668,7 +2684,7 @@ impl AgentService {
                     .append_event(
                         &session_id,
                         "agent.failed",
-                        serde_json::json!({"error": error.to_string()}),
+                        serde_json::json!({"error": format!("{error:#}")}),
                     )
                     .await;
                 let _ = control
@@ -2851,7 +2867,7 @@ impl AgentService {
                     .append_event(
                         &session_id,
                         "agent.failed",
-                        serde_json::json!({"error": error.to_string()}),
+                        serde_json::json!({"error": format!("{error:#}")}),
                     )
                     .await;
                 let _ = control
@@ -5056,6 +5072,208 @@ async fn emit_scope_budget_stop(
     .await
 }
 
+const STREAM_ATTEMPTS: u32 = 3;
+const STREAM_RETRY_BASE: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct StreamTurn {
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    usage: (u64, u64),
+    cancelled: bool,
+    error: Option<anyhow::Error>,
+}
+
+fn stream_error_retryable(error: &ProviderError) -> bool {
+    match error {
+        ProviderError::Http(error) => {
+            error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body()
+                || error.is_decode()
+        }
+        ProviderError::Stream(_) => true,
+        ProviderError::Api { status, .. } => {
+            matches!(status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504)
+        }
+        ProviderError::MissingApiKey | ProviderError::Parse(_) | ProviderError::Unsupported(_) => {
+            false
+        }
+    }
+}
+
+async fn emit_stream_retry(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+    attempt: u32,
+    phase: &str,
+    error: &str,
+) -> Result<()> {
+    emit(
+        engine,
+        session_id,
+        spec,
+        "agent.stream_retry",
+        serde_json::json!({
+            "attempt": attempt,
+            "max_attempts": STREAM_ATTEMPTS,
+            "phase": phase,
+            "error": truncate(error),
+        }),
+    )
+    .await
+}
+
+async fn stream_retry_delay(control: &RunControl, attempt: u32) -> bool {
+    if control.is_cancelled() {
+        return false;
+    }
+    let delay = STREAM_RETRY_BASE.saturating_mul(attempt.max(1));
+    let mut cancel_rx = control.subscribe();
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => !control.is_cancelled(),
+        _ = cancel_rx.changed() => false,
+    }
+}
+
+/// Consume one provider stream turn. Transient failures before any output are
+/// retried; after partial output the turn returns its error together with the
+/// text/usage received so far so the caller can persist a partial message and
+/// settle the budget honestly.
+#[allow(clippy::too_many_arguments)]
+async fn consume_stream(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+    control: &RunControl,
+    provider: &dyn Provider,
+    request: &ChatRequest,
+    idle_timeout: Duration,
+) -> Result<StreamTurn> {
+    let mut turn = StreamTurn::default();
+    let mut attempt = 0;
+    'streams: loop {
+        attempt += 1;
+        let mut stream = match provider.stream_chat(request.clone()).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                // The provider's own send path already retries transient
+                // startup failures; do not multiply those attempts here.
+                turn.error = Some(anyhow!(error).context("starting provider stream"));
+                break;
+            }
+        };
+        let mut produced = false;
+        let mut cancel_rx = control.subscribe();
+        loop {
+            if control.is_cancelled() {
+                turn.cancelled = true;
+                break 'streams;
+            }
+            let item = tokio::select! {
+                changed = cancel_rx.changed() => {
+                    if changed.is_err() || *cancel_rx.borrow() {
+                        turn.cancelled = true;
+                        break 'streams;
+                    }
+                    continue;
+                }
+                item = tokio::time::timeout(idle_timeout, stream.next()) => match item {
+                    Ok(item) => item,
+                    Err(_) => {
+                        let error = format!(
+                            "provider stream was idle for {}s",
+                            idle_timeout.as_secs()
+                        );
+                        if !produced
+                            && turn.usage == (0, 0)
+                            && attempt < STREAM_ATTEMPTS
+                            && !control.is_cancelled()
+                        {
+                            emit_stream_retry(
+                                engine,
+                                session_id,
+                                spec,
+                                attempt,
+                                "idle",
+                                &error,
+                            )
+                            .await?;
+                            if !stream_retry_delay(control, attempt).await {
+                                turn.cancelled = true;
+                                break 'streams;
+                            }
+                            continue 'streams;
+                        }
+                        turn.error = Some(anyhow!(error));
+                        break 'streams;
+                    }
+                },
+            };
+            let Some(item) = item else {
+                break;
+            };
+            match item {
+                Ok(StreamEvent::TextDelta(delta)) => {
+                    produced = true;
+                    turn.text.push_str(&delta);
+                    emit(
+                        engine,
+                        session_id,
+                        spec,
+                        "agent.message_delta",
+                        serde_json::json!({"text": delta}),
+                    )
+                    .await?;
+                }
+                Ok(StreamEvent::ToolCall(call)) => {
+                    produced = true;
+                    turn.tool_calls.push(call);
+                }
+                Ok(StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                }) => {
+                    turn.usage = (
+                        turn.usage.0 + input_tokens as u64,
+                        turn.usage.1 + output_tokens as u64,
+                    );
+                }
+                Ok(StreamEvent::Done) => {}
+                Err(error) => {
+                    if !produced
+                        && turn.usage == (0, 0)
+                        && stream_error_retryable(&error)
+                        && attempt < STREAM_ATTEMPTS
+                        && !control.is_cancelled()
+                    {
+                        emit_stream_retry(
+                            engine,
+                            session_id,
+                            spec,
+                            attempt,
+                            "stream",
+                            &error.to_string(),
+                        )
+                        .await?;
+                        if !stream_retry_delay(control, attempt).await {
+                            turn.cancelled = true;
+                            break 'streams;
+                        }
+                        continue 'streams;
+                    }
+                    turn.error = Some(anyhow!(error).context("provider stream"));
+                    break 'streams;
+                }
+            }
+        }
+        break;
+    }
+    Ok(turn)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[async_recursion]
 async fn run_loop(
@@ -5326,106 +5544,82 @@ async fn run_loop(
             request.max_tokens = Some(output_budget.min(u32::MAX as u64) as u32);
         }
         let _scope_lease = scope_lease;
-        let mut stream = config
-            .provider
-            .stream_chat(request.clone())
-            .await
-            .context("starting provider stream")?;
-
-        let mut text = String::new();
-        let mut tool_calls = Vec::new();
-        let mut usage = (0u32, 0u32);
-        let mut cancelled = false;
-        let mut cancel_rx = control.subscribe();
-        loop {
-            if control.is_cancelled() {
-                cancelled = true;
-                break;
-            }
-            let item = tokio::select! {
-                changed = cancel_rx.changed() => {
-                    if changed.is_err() || *cancel_rx.borrow() {
-                        cancelled = true;
-                        break;
-                    }
-                    continue;
-                }
-                item = tokio::time::timeout(
-                    Duration::from_secs(config.provider_idle_timeout_secs),
-                    stream.next(),
-                ) => match item {
-                    Ok(item) => item,
-                    Err(_) => anyhow::bail!(
-                        "provider stream was idle for {}s",
-                        config.provider_idle_timeout_secs
-                    ),
-                },
-            };
-            let Some(item) = item else {
-                break;
-            };
-            match item? {
-                StreamEvent::TextDelta(delta) => {
-                    text.push_str(&delta);
-                    emit(
-                        engine,
-                        &session.id,
-                        spec,
-                        "agent.message_delta",
-                        serde_json::json!({"text": delta}),
-                    )
-                    .await?;
-                }
-                StreamEvent::ToolCall(call) => tool_calls.push(call),
-                StreamEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                } => {
-                    usage = (usage.0 + input_tokens, usage.1 + output_tokens);
-                }
-                StreamEvent::Done => {}
-            }
-        }
-        if cancelled {
-            return Ok(LoopOutcome::Cancelled);
-        }
-        let (input_tokens, output_tokens, estimated) = if usage != (0, 0) {
-            (usage.0 as u64, usage.1 as u64, false)
-        } else {
+        let stream_turn = consume_stream(
+            engine,
+            &session.id,
+            spec,
+            control,
+            config.provider.as_ref(),
+            &request,
+            Duration::from_secs(config.provider_idle_timeout_secs),
+        )
+        .await?;
+        let has_output = !stream_turn.text.is_empty() || !stream_turn.tool_calls.is_empty();
+        let (input_tokens, output_tokens, estimated, record_usage) = if stream_turn.usage != (0, 0)
+        {
+            (stream_turn.usage.0, stream_turn.usage.1, false, true)
+        } else if has_output {
             // Some local endpoints omit usage. Persist a conservative estimate
             // so the budget still survives across turns and daemon restarts;
             // the event is marked `estimated` so it is not mistaken for
             // provider-reported usage.
             let input = estimate_request_tokens(&request);
-            let output = estimate_text_tokens(&text).saturating_add(
-                serde_json::to_string(&tool_calls)
+            let output = estimate_text_tokens(&stream_turn.text).saturating_add(
+                serde_json::to_string(&stream_turn.tool_calls)
                     .map(|calls| estimate_text_tokens(&calls))
                     .unwrap_or(0),
             );
-            (input, output, true)
+            (input, output, true, true)
+        } else {
+            (0, 0, true, false)
         };
-        let cost = usage_cost(input_tokens, output_tokens, input_price, output_price);
-        engine
-            .record_agent_usage(
-                &session.id,
-                &spec.id,
-                &spec.name,
-                spec.role.as_str(),
-                spec.task_id.clone(),
-                spec.department.clone(),
-                &request.model,
-                input_tokens,
-                output_tokens,
-                estimated,
-                cost,
-            )
-            .await?;
-        let actual_usage = input_tokens.saturating_add(output_tokens);
-        if token_reservation
-            .take()
-            .is_some_and(|reservation| reservation.settle(actual_usage))
-            || budget.add_cost(cost)
-        {
+        let mut budget_exceeded = false;
+        if record_usage {
+            let cost = usage_cost(input_tokens, output_tokens, input_price, output_price);
+            engine
+                .record_agent_usage(
+                    &session.id,
+                    &spec.id,
+                    &spec.name,
+                    spec.role.as_str(),
+                    spec.task_id.clone(),
+                    spec.department.clone(),
+                    &request.model,
+                    input_tokens,
+                    output_tokens,
+                    estimated,
+                    cost,
+                )
+                .await?;
+            let actual_usage = input_tokens.saturating_add(output_tokens);
+            budget_exceeded = token_reservation
+                .take()
+                .is_some_and(|reservation| reservation.settle(actual_usage))
+                || budget.add_cost(cost);
+        }
+        if stream_turn.cancelled {
+            return Ok(LoopOutcome::Cancelled);
+        }
+        if let Some(error) = stream_turn.error {
+            // Keep partial streamed output visible instead of letting the
+            // failure clear the live transcript.
+            if !stream_turn.text.is_empty() {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "agent.message",
+                    serde_json::json!({
+                        "text": stream_turn.text,
+                        "tool_calls": stream_turn.tool_calls,
+                        "partial": true,
+                    }),
+                )
+                .await?;
+            }
+            return Err(error);
+        }
+        if budget_exceeded {
             return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
         }
         if plan_budget.active() {
@@ -5450,6 +5644,8 @@ async fn run_loop(
                 return Ok(LoopOutcome::BudgetExceeded(stop));
             }
         }
+        let text = stream_turn.text;
+        let tool_calls = stream_turn.tool_calls;
 
         if text.is_empty() && tool_calls.is_empty() {
             emit(

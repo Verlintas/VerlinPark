@@ -2391,8 +2391,13 @@ final class AppModel {
         defer { providerProbeBusy = false }
         do {
             let result = try await core.probeProvider()
+            let streamDetail = if let chunks = result.chunks, let firstToken = result.firstTokenMs {
+                " · \(chunks) chunks · first token \(firstToken) ms"
+            } else {
+                ""
+            }
             providerProbeStatus =
-                "\(result.provider) / \(result.model) · \(result.latencyMs) ms · \(result.text)"
+                "\(result.provider) / \(result.model) · \(result.latencyMs) ms\(streamDetail) · \(result.text)"
         } catch {
             providerProbeStatus = error.localizedDescription
             handle(error)

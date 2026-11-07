@@ -103,6 +103,7 @@
 | [0091](adr/0091-project-task-scheduler-policy.md) | Project-level automatic task resume policy | Accepted | 调度 |
 | [0092](adr/0092-isolated-verifier-checkout.md) | Isolated Verifier checkout | Accepted | 验证/安全 |
 | [0093](adr/0093-acp-external-agent-bridge.md) | ACP external-agent bridge | Accepted | 外部 Agent/集成 |
+| [0094](adr/0094-provider-stream-resilience.md) | Provider stream retry and partial settlement | Accepted | Provider/可靠性 |
 
 ---
 

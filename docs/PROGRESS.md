@@ -12,6 +12,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | Leader Agent | ✅ | 流式对话、工具调用、审批、session 预算、取消、todo 计划 |
+| Provider 流可靠性 | ✅ | 启动前 transient retry；无任何输出前最多 3 次 stream attempts（含首次）；partial failure/cancel 保留 `partial: true` message 并结算 provider usage 或估算 usage；partial 后不 replay；`agent.probe` 返回 chunks/first-token/done；真实 OpenAI/Anthropic/local live tests 默认 ignored |
 | Session worktree | ✅ | 每个 session 独立 Git worktree + 分支；项目根只读 |
 | 四层组织 | ✅ | Leader → Manager → Worker → Labour；严格链路，Manager 必须有部门 title |
 | Agent profile | ✅ | coding / research / verification / generic；决定工具集与 prompt；Verifier 在 isolated detached clone 中运行 |
@@ -62,9 +63,10 @@
 
 ## 验证
 
-- `cargo test --workspace`：202 个测试通过（core 158、store 36、providers 8）。
+- `cargo test --workspace`：206 个测试通过（core 162、store 36、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
 - `xcodebuild test`：40 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
+- Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
 - 最近 CI：GitHub hosted macOS runner 持续排队/容量受限；本地 lint、Rust/Swift 测试与打包通过。
 - 手工 E2E 已覆盖：Leader/Manager/Worker/Labour 委派、task worktree、并行 Worker、Verifier approve/reject、TeamPlan 自动派发、Manager 圆桌、审批、diff、commit/discard、预算/取消/暂停恢复、项目 shell policy get/set；ACP 委派由 fake ACP stdio agent 测试覆盖 initialize → session/new → prompt → permission → Worktree 写入 → Verifier → merge。
 
@@ -75,8 +77,9 @@
 1. **Shell 仍非完整沙箱**：写入已由 Seatbelt 限制在 worktree/Git 元数据/scratch；常见 credential/state 路径已 read-deny，但不是完整 read jail；项目 policy 可 deny network，但默认 allow，Docker 等 daemon 介导写入仍可能；`sandbox-exec` 已废弃。见 AUDIT P1-3。
 2. **Verifier 隔离**：无 write/edit 工具，运行在 Worker commit 的 isolated detached clone 中，shell/Git 写操作不会影响 Worker worktree/branch；clone 结束删除，tracked guard 仍保留。仍不是完整网络/文件系统沙箱。见 AUDIT P1-3。
 3. **事件溯源**：关键状态已改为原子事件+投影；`session.replay` / `--repair` / `--rebuild` 可发现并重建覆盖的投影（含 agent roster）；`session.export` 可导出 bundle；数据库项目/会话创建元数据的从零导入仍未实现。见 AUDIT P1-5。
-4. **ACP 不是完整安全边界**：外部 agent 二进制是用户安装的受信任程序，运行在 Seatbelt 写沙箱和 scratch HOME 中，但仍有默认读权限与网络权限（受 shell policy 约束）；`fs/*`/`terminal/*` capability 不暴露，只支持 stdio transport；token usage 不进入 provider usage ledger。见 AUDIT P1-7。
-5. **batch abort 状态一致性**：已修复（同批 task 中止时全部结算为 cancelled/blocked）；见 AUDIT P2-7。
+4. **Provider stream 不是可恢复流**：无输出前会 retry，但一旦有 text/tool output，mid-stream 断线会失败该 turn；不会 replay prompt，也不会从断点续传。partial output 和 usage 会保留，但 stream 本身不可恢复。见 AUDIT P1-8。
+5. **ACP 不是完整安全边界**：外部 agent 二进制是用户安装的受信任程序，运行在 Seatbelt 写沙箱和 scratch HOME 中，但仍有默认读权限与网络权限（受 shell policy 约束）；`fs/*`/`terminal/*` capability 不暴露，只支持 stdio transport；token usage 不进入 provider usage ledger。见 AUDIT P1-7。
+6. **batch abort 状态一致性**：已修复（同批 task 中止时全部结算为 cancelled/blocked）；见 AUDIT P2-7。
 
 ## 当前限制（明确未实现）
 
@@ -97,7 +100,7 @@
 - Terminal 是 daemon-owned PTY，但终端输出/scrollback 不持久化、跨 daemon 重启不恢复；SwiftTerm 固定 1.10.1（新版本引入 Metal toolchain/plugin 要求）；逐 hunk review、真实 Collab 节点、web search 仍缺；Console 仍是 line-oriented；Files 文本编辑限制 512 KiB、binary/truncated 只读，保存用 expected_sha256 检测并发修改但不做三方合并。
 - Search 是 `LIKE` 扫描，无 FTS/index/ranking；非 ASCII 大小写匹配不完整，event 结果是 raw JSON snippet。
 - Transcript 不包含完整 event timeline、artifacts 或 approvals，且不可导入；超长内容会截断。
-- Provider retry 只覆盖 stream 建立前的错误；stream 中途断开不会自动续传。
+- Provider retry 覆盖 stream 建立前的 transient error，以及**尚无任何输出**时的 stream error/idle timeout（最多 3 次）；一旦已有 text/tool output，mid-stream 断开不会续传或 replay，只会保留 partial output、结算 usage 并失败该 turn。
 - Artifact preview 是只读预览：文本 64KB、hex 1KB，未做语法高亮或非 UTF-8 编码探测。
 - Roundtable 卡片只渲染当前已加载的 event window；更早的 round 需要扩大 Trace/事件加载。
 - Usage CSV 一次生成完整字符串，不支持流式导出；Homebrew cask 可发布到 tap，但没有 Sparkle 式自动更新/增量升级。
@@ -222,6 +225,7 @@
 - **M3 第九十四切片**：project-level auto-resume policy（`TaskSchedulerPolicy`、manifest、RPC/CLI/Manage Dash、per-project cooldown、scheduler 常驻按 policy 过滤）；见 ADR-0091。
 - **M3 第九十五切片**：Verifier isolated checkout（detached clone of worker commit、GIT metadata 隔离、cleanup guard、tracked guard 保留、clone commit 不影响 worker branch）；见 ADR-0092。
 - **M3 第九十六切片**：ACP external-agent bridge（agent 注册表、`delegate_acp` Leader/Manager 工具、stdio client、session/update→事件、permission→approval、scratch HOME + Seatbelt、MCP 传递、Verifier/merge 全链路、probe、Settings/CLI）；见 ADR-0093。
+- **M3 第九十七切片**：provider stream resilience（无输出前 retry、partial failure/cancel 保留 message + usage settlement、长流测试、probe chunks/first-token/done、env-gated live OpenAI/Anthropic/local E2E）；见 ADR-0094。
 
 ## 如何运行
 

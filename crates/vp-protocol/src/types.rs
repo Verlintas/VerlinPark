@@ -1369,6 +1369,12 @@ pub struct AgentProbeResult {
     pub provider: String,
     pub model: String,
     pub latency_ms: u64,
+    #[serde(default)]
+    pub first_token_ms: u64,
+    #[serde(default)]
+    pub chunks: u32,
+    #[serde(default)]
+    pub done: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub text: String,
