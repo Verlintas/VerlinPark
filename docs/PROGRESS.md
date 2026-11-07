@@ -54,7 +54,7 @@
 | Provider | ✅ | OpenAI-compatible + Anthropic；`agent.probe` / `vp provider-test` / Settings Test connection 发送一次无工具 16-token 请求，检查 endpoint/key/model/stream；429/5xx/connection 在 stream 开始前最多重试 3 次（Retry-After + 指数退避，15s connect timeout）；stream 建立后每个事件最多等待 `VERLINPARK_PROVIDER_IDLE_SECS`（默认 300，10–3600），超时使 run 失败；OpenAI-compatible 与 Anthropic 都有本地 HTTP 全链路 E2E（plan → Worker write → approval → Verifier → Integrator） |
 | Models / budgets | ✅ | 分角色 model override + input/output USD/1M price；session token / USD / wall-clock budget；project-wide shared token/USD pool；TeamPlan department/task token/USD budgets；per-call `usage_ledger`（agent/role/task/department/model/tokens/estimated/cost）+ `session.usage` / `vp usage` / Preview → Cost 分组汇总；`session.usage_csv` / `vp usage --csv` / Preview Export CSV（RFC 4180 转义，逐 call 一行）；`project.usage` / `vp project-usage` / Manage Dash 按 session 汇总 tokens/cost/calls；`agent.usage` / `agent.cost`；time 在 turn/tool 边界检查；Providers/New Session/CLI/UI |
 | CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/artifact/backfill-artifacts/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/search/transcript/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate/cleanup-worktrees/worktree-policy/worktree-policy-set/project-budget/project-budget-set/project-usage/resume-plan/memory/remember/memory-delete/memory-prune/memory-policy/memory-policy-set/questions/answer/mcp-servers/mcp-add/mcp-remove/mcp-tools/mcp-call/mcp-resources/mcp-read-resource/mcp-prompts/mcp-prompt/console/terminal/tasks/task-retry/task-skip/task-cancel/task-pause/task-resume/task-scheduler/task-scheduler-set/files/file/write-file/history/show/doctor/provider-test/db-rebuild |
-| Search | ✅ | `session.search` / `vp search` / Stage `Cmd-F`；跨 session 搜索 message content 与 raw event payload，可按 project 过滤，newest-first，`truncated` 标记；LIKE 转义 `%`/`_`/`\`，snippet 截断；无 FTS/index |
+| Search | ✅ | `session.search` / `vp search` / Stage `Cmd-F`；跨 session 搜索 message content 与 raw event payload，可按 project 过滤，newest-first，`truncated` 标记；FTS5 外部内容索引（messages/events，insert/update/delete triggers，`store_meta` 迁移重建）+ ASCII prefix 查询，无命中/非 ASCII 回退 LIKE；snippet 截断；无 BM25 排序/embedding |
 | Transcript | ✅ | `session.transcript` / `vp transcript` / Session menu Export Transcript…；Markdown 包含 session 元数据、按 department 的 TeamPlan、按时间排序的 conversation 与 tool calls；单 message 8KB、tool args 1KB 截断；不是可导入 bundle |
 | Distribution | ✅ | `just package` 生成 Release app + bundled `verlinpadd` + `vp` + docs 的 DMG 和 SHA-256；默认 ad-hoc，**Developer ID/公证已明确暂缓，不作为近期目标**；ad-hoc DMG 是当前支持的发布路径。可选 `VERLINPARK_SIGN_IDENTITY` / `VERLINPARK_NOTARY_PROFILE` 代码保留但不投入；`just cask` / tag workflow 生成 cask，并可用 `HOMEBREW_TAP_REPO` + `HOMEBREW_TAP_TOKEN` 自动提交到 tap（未配置时只留在 GitHub release）；release workflow 使用 arm64 runner；仍无 Sparkle 自动更新 |
 | Project budget | ✅ | `project.budget.get/set` / `vp project-budget*` / Manage Dash；跨 session 共享 token/USD pool，使用同一 `BudgetRegistry` `project:<id>` 原子 reservation；project 超限终止当前 run |
@@ -63,7 +63,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：208 个测试通过（core 164、store 36、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `cargo test --workspace`：211 个测试通过（core 164、store 39、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
 - `xcodebuild test`：40 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
@@ -98,7 +98,7 @@
 - 历史 session 只有在新事件带 `usage_id` 后才会被 replay 比较；repair 可用 legacy event 的 synthetic id 回填 ledger。
 - 没有 context compaction、checkpoint/resume；暂停状态只在内存中，daemon 重启会把 running/paused session 标为 failed。
 - Terminal 是 daemon-owned PTY，但终端输出/scrollback 不持久化、跨 daemon 重启不恢复；SwiftTerm 固定 1.10.1（新版本引入 Metal toolchain/plugin 要求）；逐 hunk review、真实 Collab 节点、web search 仍缺；Console 仍是 line-oriented；Files 文本编辑限制 512 KiB、binary/truncated 只读，保存用 expected_sha256 检测并发修改但不做三方合并。
-- Search 是 `LIKE` 扫描，无 FTS/index/ranking；非 ASCII 大小写匹配不完整，event 结果是 raw JSON snippet。
+- Search 主路径是 FTS5 word/prefix 索引，空结果或非 ASCII 查询回退 LIKE；结果是 newest-first，不做 BM25/相关性排序；event 结果是 raw JSON snippet；FTS 有命中时可能漏掉另一行里的纯 substring 匹配。
 - Transcript 不包含完整 event timeline、artifacts 或 approvals，且不可导入；超长内容会截断。
 - Provider retry 覆盖 stream 建立前的 transient error，以及**尚无任何输出**时的 stream error/idle timeout（最多 3 次）；一旦已有 text/tool output，mid-stream 断开不会续传或 replay，只会保留 partial output、结算 usage 并失败该 turn。
 - Artifact preview 是只读预览：文本 64KB、hex 1KB，未做语法高亮或非 UTF-8 编码探测。
@@ -227,6 +227,7 @@
 - **M3 第九十六切片**：ACP external-agent bridge（agent 注册表、`delegate_acp` Leader/Manager 工具、stdio client、session/update→事件、permission→approval、scratch HOME + Seatbelt、MCP 传递、Verifier/merge 全链路、probe、Settings/CLI）；见 ADR-0093。
 - **M3 第九十七切片**：provider stream resilience（无输出前 retry、partial failure/cancel 保留 message + usage settlement、长流测试、probe chunks/first-token/done、env-gated live OpenAI/Anthropic/local E2E）；见 ADR-0094。
 - **M3 第九十八切片**：per-task dispatch mode（`TaskSchedulerPolicy.dispatch_tasks`、one-task-per-tick、`task.dispatch`/CLI/Manage Dash、limited plan execution 不扩散 abort、policy/manifest/UI/tests）；见 ADR-0095。
+- **M3 第九十九切片**：session search FTS5（messages/events 外部内容索引、triggers、旧库 one-time rebuild、ASCII prefix 查询、空结果/非 ASCII LIKE fallback、跨 project filter、测试）；见 ADR-0096。
 
 ## 如何运行
 

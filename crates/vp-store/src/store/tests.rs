@@ -540,6 +540,133 @@ fn creates_and_filters_project_memories() {
 }
 
 #[test]
+fn searches_messages_with_fts_prefix_and_like_fallback() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("search"))
+        .unwrap();
+    let session = store.create_session(&project.id, "search").unwrap();
+    store
+        .append_message(
+            &session.id,
+            "assistant",
+            "hyperparameterization works well",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    store
+        .append_message(
+            &session.id,
+            "user",
+            "a wormhole is unrelated",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+
+    let prefix = store.search("hyper", Some(&project.id), 10).unwrap();
+    assert_eq!(prefix.len(), 1);
+    assert!(prefix[0].snippet.contains("hyperparameterization"));
+
+    // No FTS token starts with "param"; the LIKE fallback still finds the
+    // substring inside "hyperparameterization".
+    let substring = store.search("param", Some(&project.id), 10).unwrap();
+    assert_eq!(substring.len(), 1);
+    assert!(substring[0].snippet.contains("hyperparameterization"));
+
+    store
+        .append_message(
+            &session.id,
+            "user",
+            "部署流程已经完成",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    let cjk = store.search("流程", Some(&project.id), 10).unwrap();
+    assert_eq!(cjk.len(), 1);
+    assert!(cjk[0].snippet.contains("部署流程"));
+}
+
+#[test]
+fn rebuilds_the_search_index_for_an_existing_database() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("legacy"))
+        .unwrap();
+    let session = store.create_session(&project.id, "legacy").unwrap();
+    store
+        .append_message(
+            &session.id,
+            "user",
+            "archived telescope notes",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    drop(store);
+
+    let conn = Connection::open(data.path().join("verlinpark.db")).unwrap();
+    for statement in [
+        "DROP TRIGGER IF EXISTS messages_fts_insert",
+        "DROP TRIGGER IF EXISTS messages_fts_delete",
+        "DROP TRIGGER IF EXISTS messages_fts_update",
+        "DROP TRIGGER IF EXISTS events_fts_insert",
+        "DROP TRIGGER IF EXISTS events_fts_delete",
+        "DROP TRIGGER IF EXISTS events_fts_update",
+        "DROP TABLE IF EXISTS messages_fts",
+        "DROP TABLE IF EXISTS events_fts",
+        "DELETE FROM store_meta WHERE key = 'search_fts'",
+    ] {
+        conn.execute(statement, []).unwrap();
+    }
+    drop(conn);
+
+    let reopened = Store::open(data.path()).unwrap();
+    let hits = reopened.search("telescope", Some(&project.id), 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].snippet.contains("telescope"));
+}
+
+#[test]
+fn searches_event_payloads_and_filters_projects() {
+    let (_data, store, repo) = test_store();
+    let first = store
+        .add_project(repo.path().to_str().unwrap(), Some("one"))
+        .unwrap();
+    let second_repo = TempDir::new().unwrap();
+    let second = store
+        .add_project(second_repo.path().to_str().unwrap(), Some("two"))
+        .unwrap();
+    let first_session = store.create_session(&first.id, "one").unwrap();
+    let second_session = store.create_session(&second.id, "two").unwrap();
+    store
+        .append_event(
+            &first_session.id,
+            "tool.finished",
+            serde_json::json!({"output": "quasar reached"}),
+        )
+        .unwrap();
+    store
+        .append_event(
+            &second_session.id,
+            "tool.finished",
+            serde_json::json!({"output": "quasar elsewhere"}),
+        )
+        .unwrap();
+
+    let filtered = store.search("quasar", Some(&first.id), 10).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].source, "event");
+    assert_eq!(filtered[0].session_id, first_session.id);
+    assert_eq!(filtered[0].kind.as_deref(), Some("tool.finished"));
+
+    let all = store.search("quasar", None, 10).unwrap();
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
 fn searches_memories_with_fts_and_falls_back_to_like() {
     let (_data, store, repo) = test_store();
     let project = store

@@ -105,6 +105,7 @@
 | [0093](adr/0093-acp-external-agent-bridge.md) | ACP external-agent bridge | Accepted | 外部 Agent/集成 |
 | [0094](adr/0094-provider-stream-resilience.md) | Provider stream retry and partial settlement | Accepted | Provider/可靠性 |
 | [0095](adr/0095-per-task-dispatch.md) | Per-task dispatch mode | Accepted | 调度 |
+| [0096](adr/0096-session-search-fts5.md) | FTS5 index for session search | Accepted | 搜索 |
 
 ---
 

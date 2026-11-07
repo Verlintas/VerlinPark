@@ -199,6 +199,62 @@ impl Store {
                 created_at   TEXT NOT NULL
             );
 
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content,
+                tool_calls,
+                content='messages',
+                content_rowid='rowid',
+                tokenize='unicode61'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_insert
+            AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content, tool_calls)
+                VALUES (new.rowid, new.content, new.tool_calls);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_delete
+            AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content, tool_calls)
+                VALUES ('delete', old.rowid, old.content, old.tool_calls);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_update
+            AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content, tool_calls)
+                VALUES ('delete', old.rowid, old.content, old.tool_calls);
+                INSERT INTO messages_fts(rowid, content, tool_calls)
+                VALUES (new.rowid, new.content, new.tool_calls);
+            END;
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+                type,
+                payload,
+                content='events',
+                content_rowid='rowid',
+                tokenize='unicode61'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS events_fts_insert
+            AFTER INSERT ON events BEGIN
+                INSERT INTO events_fts(rowid, type, payload)
+                VALUES (new.rowid, new.type, new.payload);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS events_fts_delete
+            AFTER DELETE ON events BEGIN
+                INSERT INTO events_fts(events_fts, rowid, type, payload)
+                VALUES ('delete', old.rowid, old.type, old.payload);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS events_fts_update
+            AFTER UPDATE ON events BEGIN
+                INSERT INTO events_fts(events_fts, rowid, type, payload)
+                VALUES ('delete', old.rowid, old.type, old.payload);
+                INSERT INTO events_fts(rowid, type, payload)
+                VALUES (new.rowid, new.type, new.payload);
+            END;
+
             CREATE TABLE IF NOT EXISTS agent_messages (
                 id            TEXT PRIMARY KEY,
                 session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -492,6 +548,25 @@ impl Store {
             )?;
             conn.execute(
                 "INSERT INTO store_meta (key, value) VALUES ('memory_fts', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+        }
+        let search_fts_migrated = conn
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'search_fts'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if search_fts_migrated.is_none() {
+            conn.execute(
+                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')",
+                [],
+            )?;
+            conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')", [])?;
+            conn.execute(
+                "INSERT INTO store_meta (key, value) VALUES ('search_fts', '1')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [],
             )?;
@@ -3087,7 +3162,104 @@ impl Store {
     /// Search session messages and event payloads. Returns up to `limit` rows,
     /// newest first. Callers that need to know whether more rows exist should
     /// pass `limit + 1`.
+    /// Search message content and raw event payloads. The FTS5 index handles
+    /// word/prefix queries; a plain `LIKE` scan is retained as a fallback for
+    /// short or punctuation-only queries and substring-only matches.
     pub fn search(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>> {
+        let limit = limit.clamp(1, 500);
+        // unicode61 groups CJK runs into single tokens, so a substring query
+        // such as "流程" would miss "部署流程" unless it is a token prefix.
+        // Keep the substring scan for non-ASCII queries to preserve recall.
+        if query.is_ascii() {
+            let hits = self.search_fts(query, project_id, limit as i64)?;
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+        self.search_like(query, project_id, limit)
+    }
+
+    fn search_fts(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>> {
+        let Some(fts) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let conn = self.lock()?;
+        let mut hits = Vec::new();
+
+        let mut message_stmt = conn.prepare(
+            "SELECT m.id, m.session_id, s.project_id, s.goal, m.role, m.content, m.created_at
+             FROM messages_fts
+             JOIN messages m ON m.rowid = messages_fts.rowid
+             JOIN sessions s ON s.id = m.session_id
+             WHERE messages_fts MATCH ?1
+               AND (?2 IS NULL OR s.project_id = ?2)
+             ORDER BY m.created_at DESC LIMIT ?3",
+        )?;
+        let messages = message_stmt.query_map(params![fts, project_id, limit], |row| {
+            let content: String = row.get(5)?;
+            Ok(SearchHit {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                project_id: row.get(2)?,
+                session_goal: row.get(3)?,
+                source: "message".to_string(),
+                role: Some(row.get(4)?),
+                kind: None,
+                seq: None,
+                snippet: search_snippet(&content, query),
+                created_at: row.get(6)?,
+            })
+        })?;
+        for hit in messages {
+            hits.push(hit?);
+        }
+
+        let mut event_stmt = conn.prepare(
+            "SELECT e.session_id, s.project_id, s.goal, e.type, e.payload, e.seq, e.created_at
+             FROM events_fts
+             JOIN events e ON e.rowid = events_fts.rowid
+             JOIN sessions s ON s.id = e.session_id
+             WHERE events_fts MATCH ?1
+               AND (?2 IS NULL OR s.project_id = ?2)
+             ORDER BY e.created_at DESC LIMIT ?3",
+        )?;
+        let events = event_stmt.query_map(params![fts, project_id, limit], |row| {
+            let payload: String = row.get(4)?;
+            let session_id: String = row.get(0)?;
+            let seq = row.get::<_, i64>(5)? as u64;
+            Ok(SearchHit {
+                id: format!("{session_id}:{seq}"),
+                session_id,
+                project_id: row.get(1)?,
+                session_goal: row.get(2)?,
+                source: "event".to_string(),
+                role: None,
+                kind: Some(row.get(3)?),
+                seq: Some(seq),
+                snippet: search_snippet(&payload, query),
+                created_at: row.get(6)?,
+            })
+        })?;
+        for hit in events {
+            hits.push(hit?);
+        }
+
+        hits.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        hits.truncate(limit as usize);
+        Ok(hits)
+    }
+
+    fn search_like(
         &self,
         query: &str,
         project_id: Option<&str>,
@@ -6232,7 +6404,7 @@ fn fts_query(input: &str) -> Option<String> {
             if term.is_empty() {
                 None
             } else {
-                Some(format!("\"{}\"", term.replace('"', "\"\"")))
+                Some(format!("\"{}\"*", term.replace('"', "\"\"")))
             }
         })
         .collect::<Vec<_>>();
@@ -6298,12 +6470,16 @@ fn escape_like(query: &str) -> String {
 
 fn search_snippet(text: &str, query: &str) -> String {
     let lower = text.to_lowercase();
-    let needle = query.to_lowercase();
+    let needle = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .find(|term| !term.is_empty() && lower.contains(term))
+        .unwrap_or_else(|| query.to_lowercase());
     let start = lower.find(&needle).unwrap_or(0);
     let char_start = lower[..start].chars().count();
     let chars = text.chars().collect::<Vec<_>>();
     let from = char_start.saturating_sub(60).min(chars.len());
-    let to = (char_start + query.chars().count() + 120).min(chars.len());
+    let to = (char_start + needle.chars().count() + 120).min(chars.len());
     let mut snippet = chars[from..to]
         .iter()
         .collect::<String>()
