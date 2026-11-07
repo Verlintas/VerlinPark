@@ -1414,7 +1414,11 @@ pub struct AgentInfo {
     pub context_window: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+fn default_context_calibration() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContextUsage {
     #[serde(default)]
     pub estimated_tokens: u64,
@@ -1426,8 +1430,66 @@ pub struct ContextUsage {
     pub hard_limit_tokens: u64,
     #[serde(default)]
     pub messages: usize,
+    /// Multiplier applied to the heuristic active-context estimate. 1.0 means
+    /// raw heuristic; values above 1.0 are evidence-based safety scaling.
+    #[serde(default = "default_context_calibration")]
+    pub calibration: f64,
     #[serde(default)]
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextMeasurement {
+    #[serde(default)]
+    pub estimated_tokens: u64,
+    #[serde(default)]
+    pub actual_input_tokens: u64,
+    #[serde(default)]
+    pub actual_output_tokens: u64,
+    /// Raw provider-reported input divided by the heuristic request estimate.
+    #[serde(default)]
+    pub ratio: f64,
+    /// Clamped multiplier actually applied to future context estimates.
+    #[serde(default = "default_context_calibration")]
+    pub calibration: f64,
+    #[serde(default)]
+    pub samples: u64,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub messages: usize,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+impl Default for ContextUsage {
+    fn default() -> Self {
+        Self {
+            estimated_tokens: 0,
+            context_window: 0,
+            threshold_tokens: 0,
+            hard_limit_tokens: 0,
+            messages: 0,
+            calibration: 1.0,
+            created_at: String::new(),
+        }
+    }
+}
+
+impl Default for ContextMeasurement {
+    fn default() -> Self {
+        Self {
+            estimated_tokens: 0,
+            actual_input_tokens: 0,
+            actual_output_tokens: 0,
+            ratio: 1.0,
+            calibration: 1.0,
+            samples: 0,
+            model: String::new(),
+            messages: 0,
+            created_at: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1453,6 +1515,7 @@ pub struct SessionContextStatus {
     pub session_id: String,
     pub usage: Option<ContextUsage>,
     pub last_compaction: Option<ContextCompactionSummary>,
+    pub last_measurement: Option<ContextMeasurement>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

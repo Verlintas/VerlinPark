@@ -14,8 +14,8 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
     AgentInfo, AgentProbeResult, CapacityInfo, ConfigureAgentParams, ContextCompactionSummary,
-    MergeQueueEntry, PlanDepartment, PlanTask, Project, RoleModels, Session, SessionCompactResult,
-    StoredMessage, TeamPlan, TodoItem,
+    ContextMeasurement, MergeQueueEntry, PlanDepartment, PlanTask, Project, RoleModels, Session,
+    SessionCompactResult, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -2891,6 +2891,8 @@ impl AgentService {
                     .iter()
                     .map(|binding| binding.schema.clone()),
             );
+            let model_name = model_for(&config, spec.role);
+            let calibration = load_context_calibration(&self.engine, session_id, &model_name).await;
             let system_tokens = estimate_context_tokens(&system);
             let tool_tokens = serde_json::to_string(&tools)
                 .map(|schema| estimate_context_tokens(&schema))
@@ -2934,6 +2936,7 @@ impl AgentService {
                 threshold,
                 hard_limit,
                 system_tokens.saturating_add(tool_tokens),
+                calibration.factor,
                 true,
             )
             .await?;
@@ -2946,13 +2949,17 @@ impl AgentService {
                         &spec,
                         "context.usage",
                         serde_json::json!({
-                            "estimated_tokens": estimate_messages_tokens(&conversation)
-                                .saturating_add(system_tokens)
-                                .saturating_add(tool_tokens),
+                            "estimated_tokens": calibrate_context_tokens(
+                                estimate_messages_tokens(&conversation)
+                                    .saturating_add(system_tokens)
+                                    .saturating_add(tool_tokens),
+                                calibration.factor,
+                            ),
                             "context_window": context_window,
                             "threshold_tokens": threshold,
                             "hard_limit_tokens": hard_limit,
                             "messages": conversation.len(),
+                            "calibration": calibration.factor,
                         }),
                     )
                     .await?;
@@ -3604,6 +3611,83 @@ fn estimate_context_tokens(text: &str) -> u64 {
         .div_ceil(4)
         .saturating_add(non_ascii.saturating_mul(3).div_ceil(2))
         .max(1)
+}
+
+const MAX_CONTEXT_CALIBRATION: f64 = 2.0;
+
+/// Provider usage is the only exact token count we get. The heuristic estimate
+/// is usually close, but CJK text, tool schemas, and provider-side formatting
+/// can make it low. Calibration therefore only scales estimates upward: a
+/// provider that reports fewer input tokens than the heuristic never makes
+/// compaction later than it already was.
+#[derive(Clone, Copy, Debug)]
+struct ContextCalibration {
+    factor: f64,
+    ratio: f64,
+    samples: u64,
+}
+
+impl Default for ContextCalibration {
+    fn default() -> Self {
+        Self {
+            factor: 1.0,
+            ratio: 1.0,
+            samples: 0,
+        }
+    }
+}
+
+impl ContextCalibration {
+    fn observe(&mut self, estimated: u64, actual: u64) {
+        if estimated == 0 || actual == 0 {
+            return;
+        }
+        let sample = (actual as f64 / estimated as f64).clamp(1.0, 4.0);
+        self.ratio = if self.samples == 0 {
+            sample
+        } else {
+            (self.ratio * 0.7 + sample * 0.3).min(MAX_CONTEXT_CALIBRATION * 2.0)
+        };
+        self.factor = self.ratio.clamp(1.0, MAX_CONTEXT_CALIBRATION);
+        self.samples = self.samples.saturating_add(1).min(1000);
+    }
+}
+
+fn calibrate_context_tokens(tokens: u64, factor: f64) -> u64 {
+    if !factor.is_finite() || factor <= 1.0 {
+        return tokens;
+    }
+    let scaled = (tokens as f64 * factor.clamp(1.0, MAX_CONTEXT_CALIBRATION)).round();
+    if scaled.is_finite() && scaled > tokens as f64 {
+        scaled.min(u64::MAX as f64) as u64
+    } else {
+        tokens
+    }
+}
+
+async fn load_context_calibration(
+    engine: &Engine,
+    session_id: &str,
+    model: &str,
+) -> ContextCalibration {
+    let Ok(Some(event)) = engine
+        .latest_event_of_kind(session_id, "context.measured")
+        .await
+    else {
+        return ContextCalibration::default();
+    };
+    let Ok(measurement) = serde_json::from_value::<ContextMeasurement>(event.payload) else {
+        return ContextCalibration::default();
+    };
+    if measurement.model != model || !measurement.calibration.is_finite() {
+        return ContextCalibration::default();
+    }
+    let factor = measurement.calibration.clamp(1.0, MAX_CONTEXT_CALIBRATION);
+    ContextCalibration {
+        factor,
+        ratio: factor,
+        samples: measurement.samples,
+    }
 }
 
 fn estimate_request_tokens(request: &ChatRequest) -> u64 {
@@ -5749,6 +5833,7 @@ async fn compact_context_if_needed(
     compact_threshold: u64,
     hard_limit: u64,
     base_tokens: u64,
+    calibration: f64,
     force: bool,
 ) -> Result<bool> {
     if budget.exhausted() {
@@ -5765,7 +5850,10 @@ async fn compact_context_if_needed(
     // comparison must include the system prompt and tool schemas too. Using
     // messages alone could defer compaction until the provider request is
     // already over the model window.
-    let estimated_before = estimate_messages_tokens(conversation).saturating_add(base_tokens);
+    let estimated_before = calibrate_context_tokens(
+        estimate_messages_tokens(conversation).saturating_add(base_tokens),
+        calibration,
+    );
     if !force && estimated_before < compact_threshold && estimated_before <= hard_limit {
         return Ok(false);
     }
@@ -5792,11 +5880,18 @@ async fn compact_context_if_needed(
     {
         let summary_window = context_window_for(config, spec.role);
         let summary_budget = if summary_window > 0 {
-            summary_window
+            let budget = summary_window
                 .saturating_sub(1024)
                 .saturating_sub(estimate_context_tokens(COMPACTION_SYSTEM_PROMPT))
                 .saturating_sub(512)
-                .max(512)
+                .max(512);
+            // If provider usage showed that the heuristic undercounts, leave
+            // proportionally more room for the summary request too.
+            if calibration > 1.0 {
+                (budget as f64 / calibration).round().max(512.0) as u64
+            } else {
+                budget
+            }
         } else {
             60_000
         };
@@ -5877,8 +5972,10 @@ async fn compact_context_if_needed(
                             through_id = Some(through);
                             usage_tokens = (input_tokens, output_tokens);
                             usage_estimated = estimated_usage;
-                            estimated =
-                                estimate_messages_tokens(conversation).saturating_add(base_tokens);
+                            estimated = calibrate_context_tokens(
+                                estimate_messages_tokens(conversation).saturating_add(base_tokens),
+                                calibration,
+                            );
                         }
                     }
                     Err(error) => {
@@ -5922,7 +6019,10 @@ async fn compact_context_if_needed(
         }
         dropped_messages = dropped_messages.saturating_add(removed);
         through_id = Some(through);
-        estimated = estimate_messages_tokens(conversation).saturating_add(base_tokens);
+        estimated = calibrate_context_tokens(
+            estimate_messages_tokens(conversation).saturating_add(base_tokens),
+            calibration,
+        );
     }
 
     if summarized_messages == 0 && dropped_messages == 0 {
@@ -5950,6 +6050,7 @@ async fn compact_context_if_needed(
             "estimated_tokens_after": estimated,
             "threshold_tokens": compact_threshold,
             "hard_limit_tokens": hard_limit,
+            "calibration": calibration,
             "input_tokens": usage_tokens.0,
             "output_tokens": usage_tokens.1,
             "estimated": usage_estimated,
@@ -6102,6 +6203,12 @@ async fn run_loop(
         .unwrap_or(0);
     let (context_threshold, context_hard_limit) =
         context_limits(config, spec.role, system_tokens, tool_tokens);
+    let model_name = model_for(config, spec.role);
+    let mut calibration = if top_level {
+        load_context_calibration(engine, &session.id, &model_name).await
+    } else {
+        ContextCalibration::default()
+    };
     let mut team_plan = engine.get_team_plan(&session.id).await?;
     let project_budget = engine.get_project_budget(&project.id).await?;
     let plan_budget = PlanBudgetScope::from_plan(
@@ -6153,6 +6260,7 @@ async fn run_loop(
                 context_threshold,
                 context_hard_limit,
                 system_tokens.saturating_add(tool_tokens),
+                calibration.factor,
                 false,
             )
             .await?;
@@ -6164,9 +6272,12 @@ async fn run_loop(
             }
             let context_window = context_window_for(config, spec.role);
             if context_window > 0 {
-                let estimated_context = estimate_messages_tokens(conversation)
-                    .saturating_add(system_tokens)
-                    .saturating_add(tool_tokens);
+                let estimated_context = calibrate_context_tokens(
+                    estimate_messages_tokens(conversation)
+                        .saturating_add(system_tokens)
+                        .saturating_add(tool_tokens),
+                    calibration.factor,
+                );
                 emit(
                     engine,
                     &session.id,
@@ -6178,13 +6289,14 @@ async fn run_loop(
                         "threshold_tokens": context_threshold,
                         "hard_limit_tokens": context_hard_limit,
                         "messages": conversation.len(),
+                        "calibration": calibration.factor,
                     }),
                 )
                 .await?;
             }
         }
         let mut request = ChatRequest {
-            model: model_for(config, spec.role),
+            model: model_name.clone(),
             messages: conversation.clone(),
             system: Some(system.clone()),
             max_tokens: config.max_tokens,
@@ -6294,6 +6406,35 @@ async fn run_loop(
             Duration::from_secs(config.provider_idle_timeout_secs),
         )
         .await?;
+        if top_level && stream_turn.usage.0 > 0 {
+            let estimated_request = estimate_messages_tokens(&request.messages)
+                .saturating_add(system_tokens)
+                .saturating_add(tool_tokens);
+            let ratio = stream_turn.usage.0 as f64 / estimated_request.max(1) as f64;
+            calibration.observe(estimated_request, stream_turn.usage.0);
+            // Measurement is diagnostic; a failed append must not discard the
+            // provider call's accounting or the turn output.
+            if let Err(error) = emit(
+                engine,
+                &session.id,
+                spec,
+                "context.measured",
+                serde_json::json!({
+                    "estimated_tokens": estimated_request,
+                    "actual_input_tokens": stream_turn.usage.0,
+                    "actual_output_tokens": stream_turn.usage.1,
+                    "ratio": ratio,
+                    "calibration": calibration.factor,
+                    "samples": calibration.samples,
+                    "model": request.model.clone(),
+                    "messages": request.messages.len(),
+                }),
+            )
+            .await
+            {
+                tracing::warn!(%error, "could not persist context measurement");
+            }
+        }
         let has_output = !stream_turn.text.is_empty() || !stream_turn.tool_calls.is_empty();
         let (input_tokens, output_tokens, estimated, record_usage) = if stream_turn.usage != (0, 0)
         {

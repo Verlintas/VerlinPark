@@ -1010,6 +1010,7 @@ Scout 产出的结构化摘要：
 5. 压缩失败或仍超 hard limit → 发 `context.compact_failed` / `context.compacted(mode=trim)`，在安全 user/assistant 边界滚动裁剪；不删除原始消息。真正的 provider context overflow 仍由 provider 返回错误。
 6. 每个 top-level turn 在调用 provider 前写 `context.usage`（active tokens / window / threshold / hard limit / messages）；`session.context` / `vp context` / Stage header 读取最新 usage 和最近一次 compaction/trim。
 7. `session.compact` / `vp compact` / Stage context popover 可对非运行 session 强制对 active conversation 做 summary/trim；复用同一 event/usage pipeline，运行中/暂停/等待输入拒绝，手动 compaction 期间阻止新 prompt。
+8. top-level provider 返回 usage 后写 `context.measured`；heuristic estimate 与实际 input 的比值以 upward-only EWMA（1.0–2.0，按 model/session）校准后续 active context、compaction 阈值和 summary transcript budget；无 usage 的端点保持 heuristic。
 
 ### 12.4 Prompt 结构
 

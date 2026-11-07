@@ -66,6 +66,10 @@ private struct ProjectStageView: View {
             help +=
                 " Last \(compaction.mode): summarized \(compaction.summarizedMessages), dropped \(compaction.droppedMessages), kept \(compaction.keptMessages)."
         }
+        if let measurement = model.contextStatus?.lastMeasurement {
+            help +=
+                " Last provider call: estimated \(measurement.estimatedTokens), actual \(measurement.actualInputTokens) input tokens, calibration ×\(String(format: "%.2f", measurement.calibration))."
+        }
         return help
     }
 
@@ -316,6 +320,32 @@ private struct ContextPopoverView: View {
                 Text("\(usage.messages) active messages. Estimates are refreshed before each provider call.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if let measurement = status.lastMeasurement {
+                    Divider()
+                    Text("LAST PROVIDER CALL")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    HStack(spacing: 18) {
+                        metric("Estimated", contextTokenLabel(measurement.estimatedTokens))
+                        metric("Actual input", contextTokenLabel(measurement.actualInputTokens))
+                        metric("Calibration", String(format: "×%.2f", measurement.calibration))
+                    }
+                    Text(
+                        "\(measurement.model) · \(measurement.samples) samples · ratio \(String(format: "%.2f", measurement.ratio))"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(
+                        measurement.ratio > 1.1
+                            ? Color.orange
+                            : Color.secondary
+                    )
+                    if measurement.ratio > 1.1 {
+                        Text("The heuristic is undercounting this provider; compaction is scaled up safely.")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                }
 
                 Divider()
 

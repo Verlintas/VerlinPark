@@ -1141,6 +1141,7 @@ struct ContextUsage: Codable, Sendable {
     let thresholdTokens: Int
     let hardLimitTokens: Int
     let messages: Int
+    let calibration: Double?
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -1148,6 +1149,31 @@ struct ContextUsage: Codable, Sendable {
         case contextWindow = "context_window"
         case thresholdTokens = "threshold_tokens"
         case hardLimitTokens = "hard_limit_tokens"
+        case messages
+        case calibration
+        case createdAt = "created_at"
+    }
+}
+
+struct ContextMeasurement: Codable, Sendable {
+    let estimatedTokens: Int
+    let actualInputTokens: Int
+    let actualOutputTokens: Int
+    let ratio: Double
+    let calibration: Double
+    let samples: Int
+    let model: String
+    let messages: Int
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case estimatedTokens = "estimated_tokens"
+        case actualInputTokens = "actual_input_tokens"
+        case actualOutputTokens = "actual_output_tokens"
+        case ratio
+        case calibration
+        case samples
+        case model
         case messages
         case createdAt = "created_at"
     }
@@ -1177,11 +1203,13 @@ struct SessionContextStatus: Codable, Sendable {
     let sessionID: String
     let usage: ContextUsage?
     let lastCompaction: ContextCompactionSummary?
+    let lastMeasurement: ContextMeasurement?
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
         case usage
         case lastCompaction = "last_compaction"
+        case lastMeasurement = "last_measurement"
     }
 }
 

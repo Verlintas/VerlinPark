@@ -2855,7 +2855,7 @@ final class AppModel {
         }
 
         if event.sessionId == selectedSessionID,
-           ["context.usage", "context.compacted"].contains(event.type)
+           ["context.usage", "context.compacted", "context.measured"].contains(event.type)
         {
             Task { await self.loadContextStatus() }
         }

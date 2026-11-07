@@ -60,6 +60,47 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(status.usage?.contextWindow, 128_000)
         XCTAssertEqual(status.lastCompaction?.mode, "summary")
         XCTAssertEqual(status.lastCompaction?.summarizedMessages, 18)
+        // Legacy events predate calibration and provider measurements.
+        XCTAssertNil(status.usage?.calibration)
+        XCTAssertNil(status.lastMeasurement)
+    }
+
+    func testContextMeasurementDecodes() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "usage": {
+            "estimated_tokens": 91000,
+            "context_window": 128000,
+            "threshold_tokens": 90000,
+            "hard_limit_tokens": 120000,
+            "messages": 42,
+            "calibration": 1.25,
+            "created_at": "2026-11-08T00:00:00Z"
+          },
+          "last_compaction": null,
+          "last_measurement": {
+            "estimated_tokens": 80000,
+            "actual_input_tokens": 100000,
+            "actual_output_tokens": 512,
+            "ratio": 1.25,
+            "calibration": 1.25,
+            "samples": 3,
+            "model": "test-model",
+            "messages": 42,
+            "created_at": "2026-11-08T00:00:02Z"
+          }
+        }
+        """
+        let status = try JSONDecoder().decode(
+            SessionContextStatus.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(status.usage?.calibration, 1.25)
+        XCTAssertEqual(status.lastMeasurement?.estimatedTokens, 80000)
+        XCTAssertEqual(status.lastMeasurement?.actualInputTokens, 100_000)
+        XCTAssertEqual(status.lastMeasurement?.calibration, 1.25)
+        XCTAssertEqual(status.lastMeasurement?.samples, 3)
     }
 
     func testSessionCompactResultDecodes() throws {

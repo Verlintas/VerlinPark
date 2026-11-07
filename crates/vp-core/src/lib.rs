@@ -14,21 +14,21 @@ use vp_protocol::types::{
     AcpAgent, AcpAgentListResult, AcpProbeResult, AgentMessage, AgentRecord, Approval, Artifact,
     ArtifactBackfillResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
     ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
-    ConsoleWriteResult, ContextCompactionSummary, ContextUsage, DoctorCheck, Event, GitLogResult,
-    GitShowResult, IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult,
-    McpGetPromptResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult,
-    McpServer, McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem,
-    MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry,
-    Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
-    QuestionListResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCommit,
-    SessionContextStatus, SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus,
-    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
-    ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
-    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
-    TerminalWriteResult, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
-    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
-    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
-    WriteLease,
+    ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement, ContextUsage, DoctorCheck,
+    Event, GitLogResult, GitShowResult, IntegrationPolicy, MailboxGcResult, MailboxPolicy,
+    McpCallResult, McpGetPromptResult, McpPromptListResult, McpReadResourceResult,
+    McpResourceListResult, McpServer, McpServerListResult, McpToolListResult, MemoryDeleteResult,
+    MemoryItem, MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult,
+    MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult,
+    PullRequestResult, Question, QuestionListResult, ScheduledTask, SearchResult, Session,
+    SessionBundle, SessionCommit, SessionContextStatus, SessionDiff, SessionImportResult,
+    SessionLandResult, SessionLogStatus, SessionPriorityResult, SessionRehydrateResult,
+    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TaskQueueResult,
+    TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult,
+    TerminalOpenResult, TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem,
+    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
+    WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
+    WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -2311,10 +2311,22 @@ impl Engine {
                     summary
                 })
         });
+        let measurement_event = self
+            .latest_event_of_kind(session_id, "context.measured")
+            .await?;
+        let last_measurement = measurement_event.and_then(|event| {
+            serde_json::from_value::<ContextMeasurement>(event.payload.clone())
+                .ok()
+                .map(|mut measurement| {
+                    measurement.created_at = event.created_at;
+                    measurement
+                })
+        });
         Ok(SessionContextStatus {
             session_id: session_id.to_string(),
             usage,
             last_compaction,
+            last_measurement,
         })
     }
 

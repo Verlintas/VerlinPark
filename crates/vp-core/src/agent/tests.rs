@@ -6329,6 +6329,7 @@ async fn trims_older_messages_when_summarization_fails() {
         10,
         50,
         0,
+        1.0,
         false,
     )
     .await
@@ -6428,6 +6429,7 @@ async fn compaction_counts_system_and_tool_tokens() {
         0,
         50,
         40,
+        1.0,
         false,
     )
     .await
@@ -6463,6 +6465,193 @@ fn truncate_does_not_split_utf8_characters() {
     assert!(truncated.chars().count() < value.chars().count());
     let value = "a".repeat(8_000);
     assert_eq!(truncate(&value), value);
+}
+
+#[tokio::test]
+async fn compaction_applies_context_calibration() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "calibrated context".into(), None)
+        .await
+        .unwrap();
+    let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+    config.compact_keep_messages = 2;
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    );
+    let control = RunControl::new();
+    let mut conversation = Vec::new();
+    let mut conversation_ids = Vec::new();
+    for index in 0..6 {
+        conversation.push(ChatMessage::user("context payload"));
+        conversation_ids.push(Some(format!("message-{index}")));
+    }
+    let raw = estimate_messages_tokens(&conversation).saturating_add(40);
+    assert!(raw < 100, "raw estimate should fit the hard limit");
+
+    let changed = compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        0,
+        100,
+        40,
+        2.0,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let compacted = events
+        .iter()
+        .find(|event| event.kind == "context.compacted")
+        .expect("calibrated trim event");
+    assert_eq!(
+        compacted.payload["estimated_tokens_before"].as_u64(),
+        Some(calibrate_context_tokens(raw, 2.0))
+    );
+    assert_eq!(compacted.payload["calibration"].as_f64(), Some(2.0));
+    assert!(
+        compacted.payload["estimated_tokens_after"]
+            .as_u64()
+            .is_some_and(|tokens| tokens < calibrate_context_tokens(raw, 2.0))
+    );
+}
+
+#[test]
+fn context_calibration_only_scales_up_and_caps() {
+    let mut calibration = ContextCalibration::default();
+    calibration.observe(1_000, 800);
+    assert_eq!(calibration.factor, 1.0);
+    assert_eq!(calibration.samples, 1);
+
+    calibration.observe(1_000, 1_500);
+    assert!(calibration.factor > 1.0);
+    for _ in 0..20 {
+        calibration.observe(1_000, 4_000);
+    }
+    assert_eq!(calibration.factor, 2.0);
+
+    assert_eq!(calibrate_context_tokens(1_000, 1.0), 1_000);
+    assert_eq!(calibrate_context_tokens(1_000, 0.5), 1_000);
+    assert_eq!(calibrate_context_tokens(1_000, 2.0), 2_000);
+    assert_eq!(calibrate_context_tokens(1_000, f64::NAN), 1_000);
+}
+
+#[tokio::test]
+async fn provider_usage_calibrates_future_context_estimates() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("first answer".into()),
+                StreamEvent::Usage {
+                    input_tokens: 20_000,
+                    output_tokens: 10,
+                },
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("second answer".into()),
+                StreamEvent::Usage {
+                    input_tokens: 20_000,
+                    output_tokens: 10,
+                },
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    {
+        let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+        config.context_window = 200_000;
+        config.compact_keep_messages = 4;
+        *service.config.write().unwrap() = Some(config);
+    }
+    let session = engine
+        .create_session(project.id, "measure context".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+
+    service.start(&session.id, "measure this").await.unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let measured = events
+        .iter()
+        .find(|event| event.kind == "context.measured")
+        .expect("context.measured event");
+    assert_eq!(measured.payload["actual_input_tokens"], 20_000);
+    assert_eq!(measured.payload["actual_output_tokens"], 10);
+    assert!(
+        measured.payload["estimated_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0)
+    );
+    assert!(
+        measured.payload["calibration"]
+            .as_f64()
+            .is_some_and(|calibration| calibration > 1.0)
+    );
+
+    service.start(&session.id, "measure again").await.unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "context.usage"
+            && event.payload["calibration"]
+                .as_f64()
+                .is_some_and(|calibration| calibration > 1.0)
+    }));
+    let status = engine.session_context_status(&session.id).await.unwrap();
+    let measurement = status.last_measurement.expect("last measurement");
+    assert_eq!(measurement.actual_input_tokens, 20_000);
+    assert!(measurement.calibration >= 1.0);
+    assert!(measurement.samples >= 1);
 }
 
 #[test]
