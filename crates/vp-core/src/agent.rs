@@ -5109,10 +5109,8 @@ async fn delegate_acp(
         .servers
         .into_iter()
         .filter(|server| server.enabled)
-        .map(|server| {
-            acp::mcp_stdio_server(&server.name, &server.command, &server.args, &server.env)
-        })
-        .collect();
+        .map(|server| acp::mcp_server(&server))
+        .collect::<Result<Vec<_>>>()?;
     let scope_note = if write_scope.is_empty() {
         "No explicit write scope was declared.".to_string()
     } else {

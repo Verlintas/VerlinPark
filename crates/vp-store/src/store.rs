@@ -10,10 +10,11 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy,
-    CheckpointRetentionPolicy, Event, IntegrationPolicy, MailboxPolicy, McpServer, MemoryItem,
-    MemoryPolicy, MergeQueueEntry, ModelPreset, Project, ProjectBudget, ProjectUsageSession,
-    Question, ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage,
-    TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
+    CheckpointRetentionPolicy, Event, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig,
+    McpTransport, MemoryItem, MemoryPolicy, MergeQueueEntry, ModelPreset, Project, ProjectBudget,
+    ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy,
+    StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy,
+    WriteLease,
 };
 
 use crate::paths;
@@ -400,7 +401,10 @@ impl Store {
                 args        TEXT NOT NULL,
                 env         TEXT NOT NULL,
                 enabled     INTEGER NOT NULL DEFAULT 1,
-                created_at  TEXT NOT NULL
+                created_at  TEXT NOT NULL,
+                transport   TEXT NOT NULL DEFAULT 'stdio',
+                url         TEXT,
+                headers     TEXT NOT NULL DEFAULT '{}'
             );
 
             CREATE TABLE IF NOT EXISTS acp_agents (
@@ -665,6 +669,19 @@ impl Store {
             "sessions",
             "tokens_out",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "mcp_servers",
+            "transport",
+            "TEXT NOT NULL DEFAULT 'stdio'",
+        )?;
+        ensure_column(&conn, "mcp_servers", "url", "TEXT")?;
+        ensure_column(
+            &conn,
+            "mcp_servers",
+            "headers",
+            "TEXT NOT NULL DEFAULT '{}'",
         )?;
 
         Ok(Self {
@@ -2343,7 +2360,7 @@ impl Store {
     pub fn list_mcp_servers(&self) -> Result<Vec<McpServer>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, command, args, env, enabled, created_at
+            "SELECT id, name, command, args, env, enabled, created_at, transport, url, headers
              FROM mcp_servers ORDER BY name ASC",
         )?;
         let rows = stmt.query_map([], map_mcp_server)?;
@@ -2353,7 +2370,7 @@ impl Store {
     pub fn get_mcp_server(&self, server_id: &str) -> Result<Option<McpServer>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, command, args, env, enabled, created_at
+            "SELECT id, name, command, args, env, enabled, created_at, transport, url, headers
              FROM mcp_servers WHERE id = ?1",
             params![server_id],
             map_mcp_server,
@@ -2362,27 +2379,24 @@ impl Store {
         .map_err(Into::into)
     }
 
-    pub fn add_mcp_server(
-        &self,
-        name: &str,
-        command: &str,
-        args: &[String],
-        env: &std::collections::BTreeMap<String, String>,
-        enabled: bool,
-    ) -> Result<McpServer> {
+    pub fn add_mcp_server(&self, config: &McpServerConfig) -> Result<McpServer> {
         let server = McpServer {
             id: Uuid::now_v7().to_string(),
-            name: name.to_string(),
-            command: command.to_string(),
-            args: args.to_vec(),
-            env: env.clone(),
-            enabled,
+            name: config.name.clone(),
+            transport: config.transport,
+            command: config.command.clone(),
+            args: config.args.clone(),
+            env: config.env.clone(),
+            url: config.url.clone(),
+            headers: config.headers.clone(),
+            enabled: config.enabled,
             created_at: now_rfc3339(),
         };
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO mcp_servers (id, name, command, args, env, enabled, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO mcp_servers
+                (id, name, command, args, env, enabled, created_at, transport, url, headers)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 server.id,
                 server.name,
@@ -2390,7 +2404,10 @@ impl Store {
                 serde_json::to_string(&server.args)?,
                 serde_json::to_string(&server.env)?,
                 if server.enabled { 1 } else { 0 },
-                server.created_at
+                server.created_at,
+                transport_name(server.transport),
+                server.url,
+                serde_json::to_string(&server.headers)?,
             ],
         )?;
         Ok(server)
@@ -2399,22 +2416,23 @@ impl Store {
     pub fn update_mcp_server(
         &self,
         server_id: &str,
-        name: &str,
-        command: &str,
-        args: &[String],
-        env: &std::collections::BTreeMap<String, String>,
-        enabled: bool,
+        config: &McpServerConfig,
     ) -> Result<Option<McpServer>> {
         let conn = self.lock()?;
         let changed = conn.execute(
-            "UPDATE mcp_servers SET name = ?1, command = ?2, args = ?3, env = ?4, enabled = ?5
-             WHERE id = ?6",
+            "UPDATE mcp_servers
+             SET name = ?1, command = ?2, args = ?3, env = ?4, enabled = ?5,
+                 transport = ?6, url = ?7, headers = ?8
+             WHERE id = ?9",
             params![
-                name,
-                command,
-                serde_json::to_string(args)?,
-                serde_json::to_string(env)?,
-                if enabled { 1 } else { 0 },
+                config.name,
+                config.command,
+                serde_json::to_string(&config.args)?,
+                serde_json::to_string(&config.env)?,
+                if config.enabled { 1 } else { 0 },
+                transport_name(config.transport),
+                config.url,
+                serde_json::to_string(&config.headers)?,
                 server_id
             ],
         )?;
@@ -6657,6 +6675,8 @@ fn map_acp_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AcpAgent> {
 fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServer> {
     let args: String = row.get(3)?;
     let env: String = row.get(4)?;
+    let transport: String = row.get(7)?;
+    let headers: String = row.get(9)?;
     Ok(McpServer {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -6665,7 +6685,22 @@ fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServer> {
         env: serde_json::from_str(&env).unwrap_or_default(),
         enabled: row.get::<_, i64>(5)? != 0,
         created_at: row.get(6)?,
+        transport: match transport.as_str() {
+            "http" => McpTransport::Http,
+            "sse" => McpTransport::Sse,
+            _ => McpTransport::Stdio,
+        },
+        url: row.get(8)?,
+        headers: serde_json::from_str(&headers).unwrap_or_default(),
     })
+}
+
+fn transport_name(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Http => "http",
+        McpTransport::Sse => "sse",
+    }
 }
 
 fn map_question(row: &rusqlite::Row<'_>) -> rusqlite::Result<Question> {

@@ -894,27 +894,64 @@ actor CoreClient {
             .servers
     }
 
-    func addMcpServer(name: String, command: String, args: [String]) async throws -> McpServer {
-        let params: [String: JSONValue] = [
+    func probeMcpServer(serverID: String) async throws -> McpProbeResult {
+        try await request(
+            method: "mcp.server.probe",
+            params: ["server_id": .string(serverID)]
+        )
+        .decode(McpProbeResult.self)
+    }
+
+    func addMcpServer(
+        name: String,
+        transport: String,
+        command: String,
+        args: [String],
+        env: [String: String],
+        url: String?,
+        headers: [String: String]
+    ) async throws -> McpServer {
+        var params: [String: JSONValue] = [
             "name": .string(name),
+            "transport": .string(transport),
             "command": .string(command),
             "args": .array(args.map(JSONValue.string)),
+            "env": .object(env.mapValues(JSONValue.string)),
+            "headers": .object(headers.mapValues(JSONValue.string)),
             "enabled": .bool(true),
         ]
+        if let url {
+            params["url"] = .string(url)
+        }
         return try await request(method: "mcp.server.add", params: params)
             .decode(McpServerResult.self)
             .server
     }
 
-    func updateMcpServer(_ server: McpServer, enabled: Bool) async throws -> McpServer {
-        let params: [String: JSONValue] = [
-            "id": .string(server.id),
-            "name": .string(server.name),
-            "command": .string(server.command),
-            "args": .array(server.args.map(JSONValue.string)),
-            "env": .object(server.env.mapValues(JSONValue.string)),
+    func updateMcpServer(
+        id: String,
+        name: String,
+        transport: String,
+        command: String,
+        args: [String],
+        env: [String: String],
+        url: String?,
+        headers: [String: String],
+        enabled: Bool
+    ) async throws -> McpServer {
+        var params: [String: JSONValue] = [
+            "id": .string(id),
+            "name": .string(name),
+            "transport": .string(transport),
+            "command": .string(command),
+            "args": .array(args.map(JSONValue.string)),
+            "env": .object(env.mapValues(JSONValue.string)),
+            "headers": .object(headers.mapValues(JSONValue.string)),
             "enabled": .bool(enabled),
         ]
+        if let url {
+            params["url"] = .string(url)
+        }
         return try await request(method: "mcp.server.update", params: params)
             .decode(McpServerResult.self)
             .server

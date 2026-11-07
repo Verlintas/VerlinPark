@@ -4079,13 +4079,16 @@ for line in sys.stdin:
     let (engine, service, project) = test_service_with_provider(&dir, provider);
     engine
         .store()
-        .add_mcp_server(
-            "mock",
-            "python3",
-            &[script.to_string_lossy().to_string()],
-            &std::collections::BTreeMap::new(),
-            true,
-        )
+        .add_mcp_server(&vp_protocol::types::McpServerConfig {
+            name: "mock".into(),
+            transport: Default::default(),
+            command: "python3".into(),
+            args: vec![script.to_string_lossy().to_string()],
+            env: Default::default(),
+            url: None,
+            headers: Default::default(),
+            enabled: true,
+        })
         .unwrap();
     let session = engine
         .create_session(project.id, "mcp tools".into(), None)
@@ -4181,13 +4184,16 @@ for line in sys.stdin:
     let (engine, service, project) = test_service_with_provider(&dir, provider);
     engine
         .store()
-        .add_mcp_server(
-            "mock",
-            "python3",
-            &[script.to_string_lossy().to_string()],
-            &std::collections::BTreeMap::new(),
-            true,
-        )
+        .add_mcp_server(&vp_protocol::types::McpServerConfig {
+            name: "mock".into(),
+            transport: Default::default(),
+            command: "python3".into(),
+            args: vec![script.to_string_lossy().to_string()],
+            env: Default::default(),
+            url: None,
+            headers: Default::default(),
+            enabled: true,
+        })
         .unwrap();
     let session = engine
         .create_session(project.id, "dynamic mcp".into(), None)

@@ -1313,4 +1313,71 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertFalse(result.files[0].binary)
         XCTAssertTrue(result.patch.hasPrefix("diff --git"))
     }
+
+    func testMcpServerDecodesHttpTransportAndHeaders() throws {
+        let json = """
+        {
+          "server": {
+            "id": "server-1",
+            "name": "remote",
+            "transport": "http",
+            "command": "",
+            "args": [],
+            "env": {},
+            "url": "https://mcp.example.test/acp",
+            "headers": {"x-test": "verlinpark"},
+            "enabled": true,
+            "created_at": "2026-11-08T00:00:00Z"
+          }
+        }
+        """
+        let result = try JSONDecoder().decode(McpServerResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.server.transportKind, "http")
+        XCTAssertEqual(result.server.url, "https://mcp.example.test/acp")
+        XCTAssertEqual(result.server.headerCount, 1)
+        XCTAssertEqual(result.server.headers?["x-test"], "verlinpark")
+    }
+
+    func testLegacyMcpServerWithoutTransportStillDecodes() throws {
+        let json = """
+        {
+          "id": "server-1",
+          "name": "local",
+          "command": "mcp-files",
+          "args": ["--root", "/tmp"],
+          "env": {},
+          "enabled": true,
+          "created_at": "2026-11-08T00:00:00Z"
+        }
+        """
+        let server = try JSONDecoder().decode(McpServer.self, from: Data(json.utf8))
+        XCTAssertEqual(server.transportKind, "stdio")
+        XCTAssertNil(server.url)
+        XCTAssertNil(server.headers)
+        XCTAssertEqual(server.args, ["--root", "/tmp"])
+    }
+
+    func testMcpProbeResultDecodesTransportAndCapabilities() throws {
+        let json = """
+        {
+          "server_id": "server-1",
+          "name": "remote",
+          "transport": "http",
+          "server_name": "test-mcp",
+          "server_version": "1.2.3",
+          "protocol_version": "2025-06-18",
+          "tools": 4,
+          "resources": 2,
+          "prompts": 1,
+          "resources_supported": true,
+          "prompts_supported": false
+        }
+        """
+        let result = try JSONDecoder().decode(McpProbeResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.transport, "http")
+        XCTAssertEqual(result.serverName, "test-mcp")
+        XCTAssertEqual(result.tools, 4)
+        XCTAssertTrue(result.resourcesSupported)
+        XCTAssertFalse(result.promptsSupported)
+    }
 }

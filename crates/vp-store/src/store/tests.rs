@@ -411,13 +411,16 @@ fn manages_mcp_server_configs() {
     let mut env = std::collections::BTreeMap::new();
     env.insert("TOKEN".to_string(), "hidden".to_string());
     let server = store
-        .add_mcp_server(
-            "files",
-            "mcp-files",
-            &["--root".to_string(), "/tmp".to_string()],
-            &env,
-            true,
-        )
+        .add_mcp_server(&vp_protocol::types::McpServerConfig {
+            name: "files".into(),
+            transport: vp_protocol::types::McpTransport::Stdio,
+            command: "mcp-files".into(),
+            args: vec!["--root".into(), "/tmp".into()],
+            env: env.clone(),
+            url: None,
+            headers: Default::default(),
+            enabled: true,
+        })
         .unwrap();
     assert_eq!(server.name, "files");
     assert_eq!(store.list_mcp_servers().unwrap().len(), 1);
@@ -428,16 +431,30 @@ fn manages_mcp_server_configs() {
     let updated = store
         .update_mcp_server(
             &server.id,
-            "files-2",
-            "mcp-files",
-            &[],
-            &std::collections::BTreeMap::new(),
-            false,
+            &vp_protocol::types::McpServerConfig {
+                name: "files-2".into(),
+                transport: vp_protocol::types::McpTransport::Http,
+                command: String::new(),
+                args: Vec::new(),
+                env: Default::default(),
+                url: Some("https://mcp.example.test/acp".into()),
+                headers: std::collections::BTreeMap::from([(
+                    "authorization".into(),
+                    "Bearer ${MCP_TOKEN}".into(),
+                )]),
+                enabled: false,
+            },
         )
         .unwrap()
         .unwrap();
     assert_eq!(updated.name, "files-2");
     assert!(!updated.enabled);
+    assert_eq!(updated.transport, vp_protocol::types::McpTransport::Http);
+    assert_eq!(updated.url.as_deref(), Some("https://mcp.example.test/acp"));
+    assert_eq!(
+        updated.headers.get("authorization").map(String::as_str),
+        Some("Bearer ${MCP_TOKEN}")
+    );
     assert!(store.remove_mcp_server(&server.id).unwrap());
     assert!(store.list_mcp_servers().unwrap().is_empty());
 }
@@ -1575,4 +1592,35 @@ fn model_presets_round_trip_and_delete() {
     assert!(store.delete_model_preset("preset-1").unwrap());
     assert!(store.list_model_presets().unwrap().is_empty());
     assert!(!store.delete_model_preset("preset-1").unwrap());
+}
+
+#[test]
+fn migrates_legacy_mcp_servers_to_transport_columns() {
+    let data = TempDir::new().unwrap();
+    let conn = rusqlite::Connection::open(data.path().join("verlinpark.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE mcp_servers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            command TEXT NOT NULL,
+            args TEXT NOT NULL,
+            env TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO mcp_servers (id, name, command, args, env, enabled, created_at)
+        VALUES ('legacy', 'legacy', 'mcp-files', '[]', '{}', 1, '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(data.path()).unwrap();
+    let servers = store.list_mcp_servers().unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(
+        servers[0].transport,
+        vp_protocol::types::McpTransport::Stdio
+    );
+    assert_eq!(servers[0].command, "mcp-files");
+    assert!(servers[0].url.is_none());
+    assert!(servers[0].headers.is_empty());
 }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::RpcResponse;
@@ -21,6 +21,23 @@ struct Cli {
     data_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum McpTransportArg {
+    Stdio,
+    Http,
+    Sse,
+}
+
+impl McpTransportArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+            Self::Sse => "sse",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -57,16 +74,47 @@ enum Command {
     },
     /// List configured MCP servers.
     McpServers,
-    /// Add an MCP stdio server.
+    /// Add an MCP server (stdio by default, or HTTP/SSE with --transport).
     McpAdd {
         name: String,
-        command: String,
+        /// Stdio command. Omit for HTTP/SSE.
+        command: Option<String>,
+        #[arg(long, value_enum, default_value_t = McpTransportArg::Stdio)]
+        transport: McpTransportArg,
         #[arg(long = "arg")]
         args: Vec<String>,
-        /// Environment override as KEY=VALUE (repeatable).
+        /// Environment override as KEY=VALUE (repeatable, stdio only).
         #[arg(long = "env")]
         env: Vec<String>,
+        /// HTTP/SSE endpoint URL.
+        #[arg(long)]
+        url: Option<String>,
+        /// HTTP header as KEY=VALUE (repeatable; use ${ENV_VAR} for secrets).
+        #[arg(long = "header")]
+        headers: Vec<String>,
     },
+    /// Update an MCP server's full configuration.
+    McpUpdate {
+        server_id: String,
+        name: String,
+        #[arg(long, value_enum)]
+        transport: McpTransportArg,
+        /// Stdio command. Omit for HTTP/SSE.
+        command: Option<String>,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[arg(long = "env")]
+        env: Vec<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// Explicitly enable or disable; omitted preserves the current value.
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
+    /// Initialize an MCP server and count the tools/resources/prompts it exposes.
+    McpProbe { server_id: String },
     /// Remove an MCP server by id.
     McpRemove { server_id: String },
     /// List tools exposed by an MCP server.
@@ -667,14 +715,68 @@ async fn main() -> Result<()> {
         Command::McpAdd {
             name,
             command,
+            transport,
             args,
             env,
+            url,
+            headers,
         } => {
             let env = parse_env_pairs(&env)?;
+            let headers = parse_env_pairs(&headers)?;
             rpc(
                 &discovery,
                 "mcp.server.add",
-                json!({"name": name, "command": command, "args": args, "env": env}),
+                json!({
+                    "name": name,
+                    "transport": transport.as_str(),
+                    "command": command.unwrap_or_default(),
+                    "args": args,
+                    "env": env,
+                    "url": url,
+                    "headers": headers,
+                }),
+            )
+            .await?
+        }
+        Command::McpUpdate {
+            server_id,
+            name,
+            transport,
+            command,
+            args,
+            env,
+            url,
+            headers,
+            enabled,
+        } => {
+            let env = parse_env_pairs(&env)?;
+            let headers = parse_env_pairs(&headers)?;
+            let enabled = match enabled {
+                Some(enabled) => enabled,
+                None => mcp_server_enabled(&discovery, &server_id).await?,
+            };
+            rpc(
+                &discovery,
+                "mcp.server.update",
+                json!({
+                    "id": server_id,
+                    "name": name,
+                    "transport": transport.as_str(),
+                    "command": command.unwrap_or_default(),
+                    "args": args,
+                    "env": env,
+                    "url": url,
+                    "headers": headers,
+                    "enabled": enabled,
+                }),
+            )
+            .await?
+        }
+        Command::McpProbe { server_id } => {
+            rpc(
+                &discovery,
+                "mcp.server.probe",
+                json!({"server_id": server_id}),
             )
             .await?
         }
@@ -1873,6 +1975,20 @@ fn print_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
+async fn mcp_server_enabled(discovery: &Discovery, server_id: &str) -> Result<bool> {
+    let value = rpc(discovery, "mcp.server.list", json!({})).await?;
+    value
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| {
+            servers
+                .iter()
+                .find(|server| server.get("id").and_then(Value::as_str) == Some(server_id))
+        })
+        .and_then(|server| server.get("enabled").and_then(Value::as_bool))
+        .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))
+}
+
 fn parse_env_pairs(values: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
     let mut env = std::collections::BTreeMap::new();
     for value in values {
@@ -2148,22 +2264,57 @@ fn print_human(value: &Value) {
     }
     if let Some(servers) = value.get("servers").and_then(Value::as_array) {
         for server in servers {
+            let transport = server["transport"].as_str().unwrap_or("stdio");
+            let target = server["url"]
+                .as_str()
+                .or_else(|| server["command"].as_str())
+                .unwrap_or("?");
             println!(
-                "{}  {}  {}  enabled={}",
+                "{}  {}  {}  {}  enabled={}",
                 server["id"].as_str().unwrap_or("?"),
                 server["name"].as_str().unwrap_or("?"),
-                server["command"].as_str().unwrap_or("?"),
+                transport,
+                target,
                 server["enabled"].as_bool().unwrap_or(false)
             );
         }
         return;
     }
+    if let Some(server_name) = value.get("server_name").and_then(Value::as_str)
+        && value.get("tools").is_some()
+    {
+        let name = value["name"].as_str().unwrap_or("?");
+        let transport = value["transport"].as_str().unwrap_or("?");
+        let version = value["server_version"].as_str().unwrap_or("");
+        let protocol = value["protocol_version"].as_str().unwrap_or("?");
+        let resources = value["resources"].as_u64().unwrap_or(0);
+        let prompts = value["prompts"].as_u64().unwrap_or(0);
+        let resource_note = if value["resources_supported"].as_bool().unwrap_or(false) {
+            format!("{resources} resources")
+        } else {
+            "resources unsupported".to_string()
+        };
+        let prompt_note = if value["prompts_supported"].as_bool().unwrap_or(false) {
+            format!("{prompts} prompts")
+        } else {
+            "prompts unsupported".to_string()
+        };
+        println!(
+            "{name}  {transport}  {server_name} {version}  protocol={protocol}  {} tools  {resource_note}  {prompt_note}",
+            value["tools"].as_u64().unwrap_or(0)
+        );
+        return;
+    }
     if let Some(server) = value.get("server") {
         println!(
-            "{}  {}  {}",
+            "{}  {}  {}  {}",
             server["id"].as_str().unwrap_or("?"),
             server["name"].as_str().unwrap_or("?"),
-            server["command"].as_str().unwrap_or("?")
+            server["transport"].as_str().unwrap_or("stdio"),
+            server["url"]
+                .as_str()
+                .or_else(|| server["command"].as_str())
+                .unwrap_or("?")
         );
         return;
     }

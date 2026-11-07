@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::{
-    CancelNotification, ContentBlock, EnvVariable, InitializeRequest, McpServer, McpServerStdio,
-    NewSessionRequest, PermissionOption, PermissionOptionKind, PromptRequest, ProtocolVersion,
+    AgentCapabilities, CancelNotification, ContentBlock, EnvVariable, HttpHeader,
+    InitializeRequest, McpServer, McpServerHttp, McpServerSse, McpServerStdio, NewSessionRequest,
+    PermissionOption, PermissionOptionKind, PromptRequest, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
 };
@@ -29,6 +30,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::tools::ToolContext;
+use vp_protocol::types::{McpServer as ManagedMcpServer, McpTransport};
 
 /// One permission option offered by the external agent.
 #[derive(Debug, Clone)]
@@ -132,7 +134,7 @@ pub async fn run_prompt(
 ) -> Result<AcpRunOutcome> {
     let timeout = launch.timeout;
     let cwd = launch.cwd.clone();
-    let mcp_servers = launch.mcp_servers.clone();
+    let mcp_server_configs = launch.mcp_servers.clone();
     let outcome = connect(
         launch,
         host.clone(),
@@ -163,6 +165,8 @@ pub async fn run_prompt(
                     .to_string()
                     .parse()
                     .unwrap_or(1);
+                let mcp_servers =
+                    supported_mcp_servers(&initialized.agent_capabilities, &mcp_server_configs);
                 let session = connection
                     .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers))
                     .block_task()
@@ -244,7 +248,7 @@ pub async fn run_prompt(
 /// the safe connectivity check used by `vpx acp-probe` / Settings.
 pub async fn probe(launch: AcpLaunch) -> Result<AcpProbeOutcome> {
     let cwd = launch.cwd.clone();
-    let mcp_servers = launch.mcp_servers.clone();
+    let mcp_server_configs = launch.mcp_servers.clone();
     connect(
         launch,
         Arc::new(NoopHost),
@@ -254,6 +258,8 @@ pub async fn probe(launch: AcpLaunch) -> Result<AcpProbeOutcome> {
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
+                let mcp_servers =
+                    supported_mcp_servers(&initialized.agent_capabilities, &mcp_server_configs);
                 let session = connection
                     .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers))
                     .block_task()
@@ -570,19 +576,81 @@ fn truncate(content: &str, max: usize) -> String {
     format!("{}… (truncated)", &content[..end])
 }
 
-pub fn mcp_stdio_server(
-    name: &str,
-    command: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-) -> McpServer {
-    McpServer::Stdio(
-        McpServerStdio::new(name, command).args(args.to_vec()).env(
-            env.iter()
-                .map(|(name, value)| EnvVariable::new(name, value))
-                .collect(),
-        ),
-    )
+/// Convert a stored MCP server into the ACP session configuration.
+///
+/// Header values are expanded from the daemon environment before they are sent
+/// to the external agent. The expansion result is never logged.
+pub fn mcp_server(server: &ManagedMcpServer) -> Result<McpServer> {
+    match server.transport {
+        McpTransport::Stdio => Ok(McpServer::Stdio(
+            McpServerStdio::new(&server.name, &server.command)
+                .args(server.args.clone())
+                .env(
+                    server
+                        .env
+                        .iter()
+                        .map(|(name, value)| EnvVariable::new(name, value))
+                        .collect(),
+                ),
+        )),
+        McpTransport::Http => {
+            let url = server
+                .url
+                .as_deref()
+                .ok_or_else(|| anyhow!("MCP HTTP server {} has no url", server.name))?;
+            Ok(McpServer::Http(
+                McpServerHttp::new(&server.name, url).headers(acp_headers(server)?),
+            ))
+        }
+        McpTransport::Sse => {
+            let url = server
+                .url
+                .as_deref()
+                .ok_or_else(|| anyhow!("MCP SSE server {} has no url", server.name))?;
+            Ok(McpServer::Sse(
+                McpServerSse::new(&server.name, url).headers(acp_headers(server)?),
+            ))
+        }
+    }
+}
+
+fn acp_headers(server: &ManagedMcpServer) -> Result<Vec<HttpHeader>> {
+    let headers = crate::mcp::build_http_headers(&server.headers)?;
+    Ok(headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| HttpHeader::new(name.as_str(), value))
+        })
+        .collect())
+}
+
+fn supported_mcp_servers(
+    capabilities: &AgentCapabilities,
+    servers: &[McpServer],
+) -> Vec<McpServer> {
+    servers
+        .iter()
+        .filter_map(|server| {
+            let (supported, name) = match server {
+                McpServer::Stdio(server) => (true, server.name.as_str()),
+                McpServer::Http(server) => {
+                    (capabilities.mcp_capabilities.http, server.name.as_str())
+                }
+                McpServer::Sse(server) => (capabilities.mcp_capabilities.sse, server.name.as_str()),
+                _ => (false, "unknown"),
+            };
+            if !supported {
+                tracing::warn!(
+                    mcp_server = name,
+                    "ACP agent does not support this MCP transport; skipping it"
+                );
+            }
+            supported.then(|| server.clone())
+        })
+        .collect()
 }
 
 struct NoopHost;
@@ -621,6 +689,7 @@ impl Drop for ProcessGroupGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::McpCapabilities;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -909,6 +978,37 @@ for line in sys.stdin:
         assert_eq!(outcome.protocol_version, 1);
         assert!(outcome.session_created);
         assert!(!project.path().join("acp.txt").exists());
+    }
+
+    #[test]
+    fn filters_mcp_servers_by_agent_capabilities() {
+        let servers = vec![
+            McpServer::Stdio(McpServerStdio::new("local", "mcp-files")),
+            McpServer::Http(McpServerHttp::new("remote", "https://mcp.example.test/acp")),
+            McpServer::Sse(McpServerSse::new("legacy", "https://mcp.example.test/sse")),
+        ];
+        assert_eq!(
+            supported_mcp_servers(&AgentCapabilities::default(), &servers).len(),
+            1
+        );
+        assert_eq!(
+            supported_mcp_servers(
+                &AgentCapabilities::default()
+                    .mcp_capabilities(McpCapabilities::default().http(true)),
+                &servers
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            supported_mcp_servers(
+                &AgentCapabilities::default()
+                    .mcp_capabilities(McpCapabilities::default().http(true).sse(true)),
+                &servers
+            )
+            .len(),
+            3
+        );
     }
 
     #[test]

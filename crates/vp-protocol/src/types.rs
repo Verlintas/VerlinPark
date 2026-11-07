@@ -794,15 +794,54 @@ pub struct AnswerQuestionResult {
     pub answered: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct McpServer {
-    pub id: String,
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    /// MCP Streamable HTTP: POST JSON-RPC to one endpoint, optionally receiving
+    /// a JSON or SSE response, with an `Mcp-Session-Id` for session affinity.
+    Http,
+    /// Legacy HTTP+SSE transport: a long-lived SSE stream plus a POST endpoint
+    /// announced by the stream's `endpoint` event.
+    Sse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerConfig {
     pub name: String,
+    #[serde(default)]
+    pub transport: McpTransport,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServer {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub transport: McpTransport,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub enabled: bool,
     pub created_at: String,
@@ -810,27 +849,38 @@ pub struct McpServer {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddMcpServerParams {
-    pub name: String,
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: std::collections::BTreeMap<String, String>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    #[serde(flatten)]
+    pub config: McpServerConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateMcpServerParams {
     pub id: String,
+    #[serde(flatten)]
+    pub config: McpServerConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpProbeParams {
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpProbeResult {
+    pub server_id: String,
     pub name: String,
-    pub command: String,
+    pub transport: McpTransport,
     #[serde(default)]
-    pub args: Vec<String>,
+    pub server_name: String,
     #[serde(default)]
-    pub env: std::collections::BTreeMap<String, String>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    pub server_version: String,
+    #[serde(default)]
+    pub protocol_version: String,
+    pub tools: usize,
+    pub resources: usize,
+    pub prompts: usize,
+    pub resources_supported: bool,
+    pub prompts_supported: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2646,4 +2696,39 @@ pub struct TeamPlanParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct TeamPlanResult {
     pub plan: Option<TeamPlan>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mcp_add_params_preserve_flat_wire_shape() {
+        let remote: AddMcpServerParams = serde_json::from_value(json!({
+            "name": "remote",
+            "transport": "http",
+            "url": "https://mcp.example.test/acp",
+            "headers": {"authorization": "Bearer ${MCP_TOKEN}"},
+            "enabled": true
+        }))
+        .unwrap();
+        assert_eq!(remote.config.name, "remote");
+        assert_eq!(remote.config.transport, McpTransport::Http);
+        assert_eq!(
+            remote.config.url.as_deref(),
+            Some("https://mcp.example.test/acp")
+        );
+
+        let legacy: AddMcpServerParams = serde_json::from_value(json!({
+            "name": "local",
+            "command": "npx",
+            "args": ["-y", "server"]
+        }))
+        .unwrap();
+        assert_eq!(legacy.config.transport, McpTransport::Stdio);
+        assert_eq!(legacy.config.command, "npx");
+        assert!(legacy.config.enabled);
+        assert!(legacy.config.url.is_none());
+    }
 }

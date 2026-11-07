@@ -19,20 +19,20 @@ use vp_protocol::types::{
     ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult, ContextCompactionSummary,
     ContextMeasurement, ContextUsage, CreateModelPresetParams, DoctorCheck, Event, GitLogResult,
     GitShowResult, IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult,
-    McpGetPromptResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult,
-    McpServer, McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem,
-    MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry,
-    ModelPreset, ModelPresetListResult, Project, ProjectBudget, ProjectBudgetResult,
-    ProjectUsageResult, PullRequestResult, Question, QuestionListResult, ScheduledTask,
-    SearchResult, Session, SessionBundle, SessionCheckpoint, SessionCheckpointDeleteResult,
-    SessionCheckpointDiffResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
-    SessionCheckpointRestoreResult, SessionCheckpointStatsResult, SessionCommit,
-    SessionCompareFile, SessionCompareResult, SessionContextStatus, SessionDiff, SessionForkResult,
-    SessionForkTreeNode, SessionForkTreeResult, SessionImportResult, SessionLandResult,
-    SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPriorityResult,
-    SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
-    StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan,
-    TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    McpGetPromptResult, McpProbeResult, McpPromptListResult, McpReadResourceResult,
+    McpResourceListResult, McpServer, McpServerConfig, McpServerListResult, McpToolListResult,
+    MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPolicy, MemoryPolicyResult,
+    MemoryPruneResult, MergeQueueEntry, ModelPreset, ModelPresetListResult, Project, ProjectBudget,
+    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
+    ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
+    SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
+    SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
+    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus, SessionDiff,
+    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
+    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
+    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
+    ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
+    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
     TerminalWriteResult, TodoItem, UpdateModelPresetParams, UsageBucket, UsageCsvResult,
     UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult, WorkspaceTreeResult,
     WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
@@ -5702,55 +5702,33 @@ impl Engine {
         Ok(McpServerListResult { servers })
     }
 
-    pub async fn add_mcp_server(
-        &self,
-        name: &str,
-        command: &str,
-        args: Vec<String>,
-        env: std::collections::BTreeMap<String, String>,
-        enabled: bool,
-    ) -> Result<McpServer> {
-        if name.trim().is_empty() || command.trim().is_empty() {
-            anyhow::bail!("MCP server name and command are required");
-        }
+    pub async fn probe_mcp_server(&self, server_id: &str) -> Result<McpProbeResult> {
         let store = self.store.clone();
-        let name = name.trim().to_string();
-        let command = command.trim().to_string();
-        tokio::task::spawn_blocking(move || {
-            store.add_mcp_server(&name, &command, &args, &env, enabled)
-        })
-        .await?
+        let id = server_id.to_string();
+        let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
+        self.mcp.probe(&server).await
+    }
+
+    pub async fn add_mcp_server(&self, config: McpServerConfig) -> Result<McpServer> {
+        let config = crate::mcp::normalize_config(config)?;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.add_mcp_server(&config)).await?
     }
 
     pub async fn update_mcp_server(
         &self,
         id: &str,
-        name: &str,
-        command: &str,
-        args: Vec<String>,
-        env: std::collections::BTreeMap<String, String>,
-        enabled: bool,
+        config: McpServerConfig,
     ) -> Result<Option<McpServer>> {
-        if name.trim().is_empty() || command.trim().is_empty() {
-            anyhow::bail!("MCP server name and command are required");
-        }
+        let config = crate::mcp::normalize_config(config)?;
         let store = self.store.clone();
         let id = id.to_string();
-        let name = name.trim().to_string();
-        let command = command.trim().to_string();
-        let updated = tokio::task::spawn_blocking(move || {
-            store.update_mcp_server(&id, &name, &command, &args, &env, enabled)
-        })
-        .await??;
-        if updated.is_some() {
-            self.mcp
-                .invalidate(
-                    &updated
-                        .as_ref()
-                        .map(|server| server.id.clone())
-                        .unwrap_or_default(),
-                )
-                .await;
+        let updated =
+            tokio::task::spawn_blocking(move || store.update_mcp_server(&id, &config)).await??;
+        if let Some(server) = &updated {
+            self.mcp.invalidate(&server.id).await;
         }
         Ok(updated)
     }
@@ -5872,10 +5850,8 @@ impl Engine {
             .await??
             .into_iter()
             .filter(|server| server.enabled)
-            .map(|server| {
-                acp::mcp_stdio_server(&server.name, &server.command, &server.args, &server.env)
-            })
-            .collect();
+            .map(|server| acp::mcp_server(&server))
+            .collect::<Result<Vec<_>>>()?;
         // Probe in an isolated scratch directory. The agent is initialized and
         // gets a session, but must not be able to write into the project, the
         // project's Git metadata, or the daemon data directory.

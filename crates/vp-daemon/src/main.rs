@@ -35,7 +35,7 @@ use vp_protocol::types::{
     GitShowParams, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
     ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams,
     MailboxListResult, MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams,
-    McpCallParams, McpGetPromptParams, McpReadResourceParams, McpServerIdParams,
+    McpCallParams, McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
     MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams, MemoryListParams,
     MemoryPolicyParams, MemoryPruneParams, MergeQueueListParams, MergeQueueListResult,
     OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectForkForestParams,
@@ -1352,17 +1352,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(error) => internal_error(id, error),
         },
         "mcp.server.add" => match parse_params::<AddMcpServerParams>(request.params) {
-            Ok(params) => match state
-                .engine
-                .add_mcp_server(
-                    &params.name,
-                    &params.command,
-                    params.args,
-                    params.env,
-                    params.enabled,
-                )
-                .await
-            {
+            Ok(params) => match state.engine.add_mcp_server(params.config).await {
                 Ok(server) => RpcResponse::success(id, json!({"server": server})),
                 Err(error) => internal_error(id, error),
             },
@@ -1371,14 +1361,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "mcp.server.update" => match parse_params::<UpdateMcpServerParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .update_mcp_server(
-                    &params.id,
-                    &params.name,
-                    &params.command,
-                    params.args,
-                    params.env,
-                    params.enabled,
-                )
+                .update_mcp_server(&params.id, params.config)
                 .await
             {
                 Ok(Some(server)) => RpcResponse::success(id, json!({"server": server})),
@@ -1386,6 +1369,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     id,
                     RpcError::new(codes::INVALID_PARAMS, "MCP server not found"),
                 ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.server.probe" => match parse_params::<McpProbeParams>(request.params) {
+            Ok(params) => match state.engine.probe_mcp_server(&params.server_id).await {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

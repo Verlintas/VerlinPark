@@ -4212,3 +4212,71 @@ async fn dashboard_snapshot_aggregates_pending_work_and_filters_by_project() {
     );
     assert_eq!(checkpoint.session_id, session_a.id);
 }
+
+#[tokio::test]
+async fn mcp_server_transport_configs_are_validated_and_persisted() {
+    let data = TempDir::new().unwrap();
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let server = engine
+        .add_mcp_server(vp_protocol::types::McpServerConfig {
+            name: "remote".into(),
+            transport: vp_protocol::types::McpTransport::Http,
+            command: String::new(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: Some("https://mcp.example.test/acp".into()),
+            headers: std::collections::BTreeMap::from([(
+                "Authorization".into(),
+                "Bearer ${MCP_TOKEN}".into(),
+            )]),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(server.transport, vp_protocol::types::McpTransport::Http);
+    assert_eq!(
+        server.headers.get("authorization").map(String::as_str),
+        Some("Bearer ${MCP_TOKEN}")
+    );
+    let listed = engine.list_mcp_servers().await.unwrap();
+    assert_eq!(listed.servers.len(), 1);
+    assert_eq!(
+        listed.servers[0].transport,
+        vp_protocol::types::McpTransport::Http
+    );
+
+    let invalid = engine
+        .add_mcp_server(vp_protocol::types::McpServerConfig {
+            name: "bad".into(),
+            transport: vp_protocol::types::McpTransport::Stdio,
+            command: "runner".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: Some("https://mcp.example.test".into()),
+            headers: std::collections::BTreeMap::new(),
+            enabled: true,
+        })
+        .await;
+    assert!(invalid.is_err());
+
+    let updated = engine
+        .update_mcp_server(
+            &server.id,
+            vp_protocol::types::McpServerConfig {
+                name: "remote-sse".into(),
+                transport: vp_protocol::types::McpTransport::Sse,
+                command: String::new(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                url: Some("https://mcp.example.test/sse".into()),
+                headers: std::collections::BTreeMap::new(),
+                enabled: false,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.transport, vp_protocol::types::McpTransport::Sse);
+    assert!(!updated.enabled);
+    assert!(engine.remove_mcp_server(&server.id).await.unwrap());
+}

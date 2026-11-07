@@ -92,6 +92,8 @@ final class AppModel {
     var mcpServers: [McpServer] = []
     var mcpBusy = false
     var mcpStatus: String?
+    var mcpProbeBusy: Set<String> = []
+    var mcpProbeStatus: [String: String] = [:]
     var mcpTools: [String: [McpTool]] = [:]
     var mcpResources: [String: McpResourceListResult] = [:]
     var mcpPrompts: [String: McpPromptListResult] = [:]
@@ -1105,6 +1107,22 @@ final class AppModel {
         }
     }
 
+    func probeMcpServer(id: String) async {
+        mcpProbeBusy.insert(id)
+        mcpProbeStatus[id] = "probing…"
+        defer { mcpProbeBusy.remove(id) }
+        do {
+            let result = try await core.probeMcpServer(serverID: id)
+            let server = [result.serverName, result.serverVersion]
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            mcpProbeStatus[id] =
+                "ok · \(server.isEmpty ? "server" : server) · \(result.tools) tools · \(result.resources) resources · \(result.prompts) prompts · \(result.protocolVersion)"
+        } catch {
+            mcpProbeStatus[id] = error.localizedDescription
+        }
+    }
+
     func loadMcpServers() async {
         mcpBusy = true
         defer { mcpBusy = false }
@@ -1116,28 +1134,93 @@ final class AppModel {
         }
     }
 
-    func addMcpServer(name: String, command: String, args: [String]) async {
+    @discardableResult
+    func addMcpServer(
+        name: String,
+        transport: String,
+        command: String,
+        args: [String],
+        env: [String: String],
+        url: String?,
+        headers: [String: String]
+    ) async -> Bool {
         mcpBusy = true
         defer { mcpBusy = false }
         do {
-            _ = try await core.addMcpServer(name: name, command: command, args: args)
+            _ = try await core.addMcpServer(
+                name: name,
+                transport: transport,
+                command: command,
+                args: args,
+                env: env,
+                url: url,
+                headers: headers
+            )
             mcpStatus = "MCP server added."
             await loadMcpServers()
+            return true
         } catch {
             mcpStatus = error.localizedDescription
             handle(error)
+            return false
         }
     }
 
     func setMcpServerEnabled(_ server: McpServer, enabled: Bool) async {
+        let updated = await updateMcpServer(
+            id: server.id,
+            name: server.name,
+            transport: server.transportKind,
+            command: server.command,
+            args: server.args,
+            env: server.env,
+            url: server.url,
+            headers: server.headers ?? [:],
+            enabled: enabled
+        )
+        if !updated {
+            await loadMcpServers()
+        }
+    }
+
+    @discardableResult
+    func updateMcpServer(
+        id: String,
+        name: String,
+        transport: String,
+        command: String,
+        args: [String],
+        env: [String: String],
+        url: String?,
+        headers: [String: String],
+        enabled: Bool
+    ) async -> Bool {
         mcpBusy = true
         defer { mcpBusy = false }
         do {
-            _ = try await core.updateMcpServer(server, enabled: enabled)
+            _ = try await core.updateMcpServer(
+                id: id,
+                name: name,
+                transport: transport,
+                command: command,
+                args: args,
+                env: env,
+                url: url,
+                headers: headers,
+                enabled: enabled
+            )
+            mcpStatus = "MCP server updated."
+            mcpProbeStatus[id] = nil
+            mcpTools[id] = nil
+            mcpResources[id] = nil
+            mcpPrompts[id] = nil
+            mcpToolStatus[id] = nil
             await loadMcpServers()
+            return true
         } catch {
             mcpStatus = error.localizedDescription
             handle(error)
+            return false
         }
     }
 
@@ -1146,6 +1229,7 @@ final class AppModel {
         defer { mcpBusy = false }
         do {
             _ = try await core.removeMcpServer(id: id)
+            mcpProbeStatus[id] = nil
             mcpTools[id] = nil
             mcpResources[id] = nil
             mcpPrompts[id] = nil

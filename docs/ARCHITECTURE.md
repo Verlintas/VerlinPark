@@ -46,7 +46,7 @@ flowchart TB
     SQL["SQLite projections"]
     GIT["Git / worktree engine"]
     PTY["PTY manager"]
-    MCP["MCP client (v0.2)"]
+    MCP["MCP client (stdio/HTTP/SSE)"]
     ACP["ACP client (stdio, implemented)"]
   end
 
@@ -1013,6 +1013,26 @@ Scout 产出的结构化摘要：
 8. top-level provider 返回 usage 后写 `context.measured`；heuristic estimate 与实际 input 的比值以 upward-only EWMA（1.0–2.0，按 model/session）校准后续 active context、compaction 阈值和 summary transcript budget；无 usage 的端点保持 heuristic。
 9. session checkpoint/fork：checkpoint 要求预期 branch，允许 dirty worktree；用临时 index 把 tracked + untracked（非 ignored）变更写成 snapshot commit，并用 `refs/verlinpark/checkpoints/*` 保持可达；记录 snapshot commit 和 active conversation 的 summary/start/through ids；fork 在 checkpoint commit 上创建新 session/worktree/branch，复制 active conversation 和 budgets/priority，重建 assistant/tool 显示事件，但不复制 plan/todos/merge queue/approvals/usage；source 不变。 删除 checkpoint 用 `session.checkpoint.deleted` tombstone 并释放 snapshot ref；prune 支持 `older_than_days` / `keep_latest` / dry-run，已有 fork branch 不受影响。项目级 `CheckpointRetentionPolicy`（默认关闭）+ daemon sweep 可按 30 天/keep 5 自动 prune，manifest/db-rebuild 保留策略。 `session.lineage` 从 `session.created` fork metadata 与 source `session.forked` 事件返回 parent/siblings/children；`session.compare` 在项目 repo 中解析两个 session branch tip，返回 numstat + 200k chars capped patch，只读且仅比较 committed branch。 `session.fork.merge` 只允许 direct child、同项目、quiescent、source clean；`--no-ff` merge，冲突 abort，diff check/可选 integration command 失败 reset hard，并记录 `session.fork.merge` 事件。 `session.fork.tree` 提供 depth 32 / nodes 200 capped 的递归 fork 视图；`project.fork.forest` 提供 project-wide forest + checkpoint counts，`project.fork.audit/repair` 检查/回填 fork link 和 checkpoint ref；`session.checkpoint.stats` 给出近似 object 字节。`session.checkpoint.diff` 预览 current HEAD→checkpoint 的 tracked numstat/patch 与 clean 状态；`session.checkpoint.restore` 只允许 quiescent、clean、branch 匹配的 session 把 worktree/branch reset 到 checkpoint commit，记录 previous/restored commit，不恢复 conversation/plan。`update.check/download` 手动查询并下载校验 DMG，不自动安装。`model.preset.*` 只存模型元数据并客户端应用到 role 字段。`dashboard.snapshot` 只读汇总跨 project sessions/tasks/leases/approvals/questions/checkpoints/forks 与 severity-sorted alerts（≤100），支持 project filter，daemon 附加 capacity；Manage Dash 使用该快照显示 Overview metrics/pending/attention/badges。
 
+### 12.3.1 MCP transports
+
+`McpTransport` supports stdio, Streamable HTTP, and legacy HTTP+SSE. Stdio
+keeps one process group per server with an allowlisted environment. Streamable
+HTTP POSTs JSON-RPC with JSON or SSE responses, carries `Mcp-Session-Id` and
+`MCP-Protocol-Version` after initialization, and closes with DELETE. Legacy SSE
+opens a GET stream, requires an `endpoint` event on the same origin, POSTs
+JSON-RPC to that endpoint, and reads responses from the stream. All transports
+serialize calls per server, reconnect once for idempotent reads, never retry
+tool calls, answer unsupported server-initiated methods with JSON-RPC -32601,
+and are reaped by the same idle sweep. HTTP/SSE URLs are http/https with no
+credentials or fragments; redirects and legacy endpoints must stay on the
+configured origin; reserved transport headers cannot be overridden; sensitive
+headers must use `${ENV_VAR}` expansion from the daemon environment and are
+never stored expanded or logged. Request bodies and SSE events are capped at
+8 MiB with 60s operation and 15s connect timeouts. `mcp.server.probe` reports
+server identity, negotiated protocol, and tool/resource/prompt counts. ACP
+delegations pass stdio MCP servers always and HTTP/SSE servers only when the
+agent advertises the corresponding `mcpCapabilities`.
+
 ### 12.4 Prompt 结构
 
 ```text
@@ -1247,7 +1267,7 @@ for await event in core.events {
 6. **网络**：默认询问；本地 endpoint 允许；可配置域名 allowlist。
 7. **密钥**：Keychain；日志脱敏；artifact 扫描。
 8. **IPC**：loopback + token + 0600 discovery；不对外。
-9. **MCP/ACP**：trust prompt；工具 allowlist；独立进程；超时。
+9. **MCP/ACP**：trust prompt；工具 allowlist；stdio 独立进程/process group；HTTP/SSE 仅 http(s)、same-origin redirect/endpoint、敏感 header `${ENV_VAR}` 展开；超时与 8MiB cap。
 10. **审计**：所有副作用事件；不可修改；导出脱敏。
 
 ### 16.3 Prompt injection

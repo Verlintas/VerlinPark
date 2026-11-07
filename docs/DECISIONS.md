@@ -122,6 +122,7 @@
 | [0110](adr/0110-manage-dash-information-architecture.md) | Manage Dash information architecture | Accepted | UI |
 | [0111](adr/0111-checkpoint-restore.md) | Restore a session worktree to a checkpoint | Accepted | Session/Git |
 | [0112](adr/0112-cross-project-dashboard-snapshot.md) | Cross-project Manage Dash snapshot | Accepted | UI/API |
+| [0113](adr/0113-mcp-http-and-sse-transports.md) | MCP HTTP and SSE transports | Accepted | MCP/Transport |
 
 ---
 

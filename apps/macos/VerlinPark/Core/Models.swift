@@ -128,18 +128,32 @@ struct ProjectUsageResult: Codable, Sendable {
 struct McpServer: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let name: String
+    let transport: String?
     let command: String
     let args: [String]
     let env: [String: String]
+    let url: String?
+    let headers: [String: String]?
     let enabled: Bool
     let createdAt: String
+
+    var transportKind: String {
+        transport ?? "stdio"
+    }
+
+    var headerCount: Int {
+        headers?.count ?? 0
+    }
 
     enum CodingKeys: String, CodingKey {
         case id
         case name
+        case transport
         case command
         case args
         case env
+        case url
+        case headers
         case enabled
         case createdAt = "created_at"
     }
@@ -203,6 +217,34 @@ struct McpRemoveResult: Codable, Sendable {
 
 struct McpServerListResult: Codable, Sendable {
     let servers: [McpServer]
+}
+
+struct McpProbeResult: Codable, Sendable {
+    let serverID: String
+    let name: String
+    let transport: String
+    let serverName: String
+    let serverVersion: String
+    let protocolVersion: String
+    let tools: Int
+    let resources: Int
+    let prompts: Int
+    let resourcesSupported: Bool
+    let promptsSupported: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case serverID = "server_id"
+        case name
+        case transport
+        case serverName = "server_name"
+        case serverVersion = "server_version"
+        case protocolVersion = "protocol_version"
+        case tools
+        case resources
+        case prompts
+        case resourcesSupported = "resources_supported"
+        case promptsSupported = "prompts_supported"
+    }
 }
 
 struct McpServerResult: Codable, Sendable {
