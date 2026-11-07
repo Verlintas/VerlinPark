@@ -3405,6 +3405,27 @@ async fn checkpoint_delete_hides_it_and_removes_the_snapshot_ref() {
             .unwrap()
             .removed
     );
+
+    engine
+        .update_session_status(&session.id, "imported")
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .delete_checkpoint(&session.id, &checkpoint.id)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read-only")
+    );
+    assert!(
+        engine
+            .prune_checkpoints(&session.id, None, Some(1), false)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read-only")
+    );
 }
 
 #[tokio::test]

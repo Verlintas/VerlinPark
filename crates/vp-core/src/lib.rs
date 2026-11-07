@@ -716,11 +716,24 @@ impl Engine {
             .collect())
     }
 
+    async fn ensure_checkpoint_mutable(&self, session_id: &str) -> Result<()> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        Ok(())
+    }
+
     pub async fn delete_checkpoint(
         &self,
         session_id: &str,
         checkpoint_id: &str,
     ) -> Result<SessionCheckpointDeleteResult> {
+        self.ensure_checkpoint_mutable(session_id).await?;
         let checkpoint = self
             .active_checkpoints(session_id)
             .await?
@@ -794,6 +807,7 @@ impl Engine {
         if older_than_days.is_none() && keep_latest.is_none() {
             anyhow::bail!("checkpoint prune requires older_than_days or keep_latest");
         }
+        self.ensure_checkpoint_mutable(session_id).await?;
         let checkpoints = self.active_checkpoints(session_id).await?;
         let keep_latest = keep_latest.unwrap_or(0) as usize;
         let cutoff = older_than_days
@@ -895,6 +909,9 @@ impl Engine {
                     .await??;
             let days = policy.older_than_secs.div_ceil(86_400) as u32;
             for session in sessions {
+                if session.status == "imported" {
+                    continue;
+                }
                 removed += self
                     .prune_checkpoints(&session.id, Some(days), Some(policy.keep_latest), false)
                     .await?
