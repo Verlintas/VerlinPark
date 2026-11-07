@@ -215,6 +215,12 @@ final class AppModel {
     var cleanupBusy = false
     var cleanupStatus: String?
     var cleanupResult: WorktreeCleanupResult?
+    var checkpointPolicy = CheckpointRetentionPolicy.disabled
+    var checkpointPolicyEnabled = false
+    var checkpointPolicyOlderDaysText = "30"
+    var checkpointPolicyKeepLatestText = "5"
+    var checkpointPolicyBusy = false
+    var checkpointPolicyStatus: String?
     var worktreePolicy = WorktreeRetentionPolicy.disabled
     var worktreePolicyEnabled = false
     var worktreePolicyOlderDaysText = "7"
@@ -433,6 +439,7 @@ final class AppModel {
         Task { await loadProjectBudget() }
         Task { await loadProjectUsage() }
         Task { await loadMemories() }
+        Task { await loadCheckpointPolicy() }
         Task { await loadWorktreePolicy() }
         teamPlan = nil
         planTaskStatuses = [:]
@@ -2360,6 +2367,52 @@ final class AppModel {
             let materialized = try await core.materializeArtifact(artifactID: artifact.id)
             NSWorkspace.shared.open(URL(fileURLWithPath: materialized.path))
         } catch {
+            handle(error)
+        }
+    }
+
+    func loadCheckpointPolicy() async {
+        guard let projectID = selectedProjectID else {
+            checkpointPolicy = .disabled
+            return
+        }
+        checkpointPolicyBusy = true
+        defer { checkpointPolicyBusy = false }
+        do {
+            let result = try await core.checkpointPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            checkpointPolicy = result.policy
+            checkpointPolicyEnabled = result.policy.enabled
+            checkpointPolicyOlderDaysText = "\(max(0, result.policy.olderThanSecs / 86400))"
+            checkpointPolicyKeepLatestText = "\(result.policy.keepLatest)"
+            checkpointPolicyStatus = nil
+        } catch {
+            checkpointPolicyStatus = error.localizedDescription
+        }
+    }
+
+    func saveCheckpointPolicy() async {
+        guard let projectID = selectedProjectID else {
+            checkpointPolicyStatus = "Select a project first."
+            return
+        }
+        let days = Int(checkpointPolicyOlderDaysText.trimmingCharacters(in: .whitespaces)) ?? 30
+        let keepLatest = Int(checkpointPolicyKeepLatestText.trimmingCharacters(in: .whitespaces)) ?? 5
+        let policy = CheckpointRetentionPolicy(
+            enabled: checkpointPolicyEnabled,
+            olderThanSecs: max(0, days) * 86400,
+            keepLatest: max(0, keepLatest)
+        )
+        checkpointPolicyBusy = true
+        defer { checkpointPolicyBusy = false }
+        do {
+            let result = try await core.setCheckpointPolicy(projectID: projectID, policy: policy)
+            checkpointPolicy = result.policy
+            checkpointPolicyStatus = result.policy.enabled
+                ? "Automatic checkpoint retention enabled"
+                : "Automatic checkpoint retention disabled"
+        } catch {
+            checkpointPolicyStatus = error.localizedDescription
             handle(error)
         }
     }

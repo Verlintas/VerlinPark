@@ -16,7 +16,7 @@
 | Context compaction | ✅ | 按模型 context window 自适应：`VERLINPARK_CONTEXT_WINDOW` 默认 128k（0 关闭），`RoleModelConfig.context_window` 可按角色覆盖；hard limit = window - output - system/tools - 512，summary threshold = 75% hard limit，`VERLINPARK_COMPACT_AFTER_TOKENS` 可显式覆盖；threshold/hard-limit 比较计入 system/tool tokens（与 provider request 一致），并应用 provider usage calibration；每个 top-level turn 前检查；context 估算按 4 ASCII chars/token + 1.5 non-ASCII tokens/char，summary transcript 也受模型窗口约束；summary + retained tail 为主，失败/仍超 hard limit 时按 user/assistant 安全边界滚动裁剪；`context.compacted` 记录 `mode: summary|trim` + `through_message_id`，原消息保留；usage 记为 `compaction`；`session.compact` / `vp compact` / popover 可对 idle/failed/cancelled/landed session 手动强制 compaction（同一 summary/trim pipeline，运行中/暂停/等待输入拒绝）；不做 compaction checkpoint/resume；session checkpoint/fork 见 ADR-0101 |
 | Provider 流可靠性 | ✅ | 启动前 transient retry；无任何输出前最多 3 次 stream attempts（含首次）；partial failure/cancel 保留 `partial: true` message 并结算 provider usage 或估算 usage；partial 后不 replay；`agent.probe` 返回 chunks/first-token/done；真实 OpenAI/Anthropic/local live tests 默认 ignored |
 | Session worktree | ✅ | 每个 session 独立 Git worktree + 分支；项目根只读 |
-| Session checkpoint / fork | ✅ | `session.checkpoint` / `vp checkpoint` 在预期 branch + 非运行 session 上记录 snapshot commit、dirty flag、active conversation 的 summary/start/through message ids、message count、label；dirty worktree 通过临时 index 把 tracked + untracked（非 ignored）变更写成一个 checkpoint commit（`refs/verlinpark/checkpoints/*` 保持可达），不移动 source HEAD/index；`session.fork` / `vp fork` 从 checkpoint commit 创建新 session/worktree/branch，复制 source budgets/priority 和 active conversation（summary + tail），重建 assistant/tool display events，seed Leader，写 `session.forked` lineage；不复制 plan/todos/merge queue/approvals/usage，source 不变；Stage「Fork Session…」可选择当前 worktree snapshot 或历史 checkpoint（dirty checkpoint 会标记）；`session.checkpoint.delete` / `vp checkpoint-delete` 用 tombstone 隐藏并删除 snapshot ref；`session.checkpoint.prune` / `vp checkpoint-prune` 支持 `older_than_days` / `keep_latest` / dry-run；Manage Dash 列出并删除/prune；见 ADR-0101/0102 |
+| Session checkpoint / fork | ✅ | `session.checkpoint` / `vp checkpoint` 在预期 branch + 非运行 session 上记录 snapshot commit、dirty flag、active conversation 的 summary/start/through message ids、message count、label；dirty worktree 通过临时 index 把 tracked + untracked（非 ignored）变更写成一个 checkpoint commit（`refs/verlinpark/checkpoints/*` 保持可达），不移动 source HEAD/index；`session.fork` / `vp fork` 从 checkpoint commit 创建新 session/worktree/branch，复制 source budgets/priority 和 active conversation（summary + tail），重建 assistant/tool display events，seed Leader，写 `session.forked` lineage；不复制 plan/todos/merge queue/approvals/usage，source 不变；Stage「Fork Session…」可选择当前 worktree snapshot 或历史 checkpoint（dirty checkpoint 会标记）；`session.checkpoint.delete` / `vp checkpoint-delete` 用 tombstone 隐藏并删除 snapshot ref；`session.checkpoint.prune` / `vp checkpoint-prune` 支持 `older_than_days` / `keep_latest` / dry-run；Manage Dash 列出并删除/prune；项目级 `CheckpointRetentionPolicy`（默认关闭、30 天、keep 5，最多 365 天/100 个）+ daemon sweep（`VERLINPARK_CHECKPOINT_SWEEP_SECS` 默认 3600，0 关闭）自动 prune；见 ADR-0101/0102/0103 |
 | 四层组织 | ✅ | Leader → Manager → Worker → Labour；严格链路，Manager 必须有部门 title |
 | Agent profile | ✅ | coding / research / verification / generic；决定工具集与 prompt；Verifier 在 isolated detached clone 中运行 |
 | ACP 外部 Agent | ✅ | `acp.agent.*` / `vp acp-*` / Settings ACP；Leader/Manager 用 `delegate_acp` 委派外部 stdio agent；Worker slot、task worktree、global capacity/write lease、Seatbelt 写沙箱 + scratch HOME、MCP 传递、permission→approval、timeout/cancel、Verifier/Integrator 全链路；probe 在隔离 scratch cwd 中初始化且不发送 prompt |
@@ -66,8 +66,8 @@
 
 ## 验证
 
-- `cargo test --workspace`：232 个测试通过（core 185、store 39、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
-- `xcodebuild test`：46 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
+- `cargo test --workspace`：233 个测试通过（core 186、store 39、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `xcodebuild test`：47 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
 - 最近 CI：GitHub hosted macOS runner 持续排队/容量受限；本地 lint、Rust/Swift 测试与打包通过。
@@ -238,6 +238,7 @@
 - **M3 第一百零四切片**：provider-usage context calibration（`context.measured`、estimate vs actual、raw ratio、upward-only EWMA clamp 1.0–2.0、按 model/session 持久化、用于 usage/threshold/summary budget/manual compaction、Stage popover 显示 last measurement、legacy event 解码兼容；Rust/Swift tests）；见 ADR-0100。
 - **M3 第一百零五切片**：session checkpoint/fork（temporary-index dirty worktree snapshot + checkpoint ref、active conversation snapshot、checkpoint 事件/列表、fork 新 worktree/branch、message copy + tool/assistant display reconstruction、lineage events、budgets/priority copy、CLI/Stage UI；Rust/Swift tests）；见 ADR-0101。
 - **M3 第一百零六切片**：checkpoint retention（`session.checkpoint.deleted` tombstone、snapshot ref 删除、`session.checkpoint.prune` + dry-run、CLI/Manage Dash 列表/删除/prune；Rust/Swift tests）；见 ADR-0102。
+- **M3 第一百零七切片**：automatic checkpoint retention（`CheckpointRetentionPolicy` 项目级持久化 + manifest/db-rebuild、`project.checkpoint_policy.get/set`、CLI/Manage Dash 控件、daemon sweep `VERLINPARK_CHECKPOINT_SWEEP_SECS`、engine sweep；Rust/Swift tests）；见 ADR-0103。
 
 ## 如何运行
 

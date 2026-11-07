@@ -455,6 +455,28 @@ actor CoreClient {
             .decode(WorktreeCleanupResult.self)
     }
 
+    func checkpointPolicy(projectID: String) async throws -> CheckpointPolicyResult {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "project.checkpoint_policy.get", params: params)
+            .decode(CheckpointPolicyResult.self)
+    }
+
+    func setCheckpointPolicy(
+        projectID: String,
+        policy: CheckpointRetentionPolicy
+    ) async throws -> CheckpointPolicyResult {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object([
+                "enabled": .bool(policy.enabled),
+                "older_than_secs": .number(Double(policy.olderThanSecs)),
+                "keep_latest": .number(Double(policy.keepLatest)),
+            ]),
+        ]
+        return try await request(method: "project.checkpoint_policy.set", params: params)
+            .decode(CheckpointPolicyResult.self)
+    }
+
     func worktreePolicy(projectID: String) async throws -> WorktreePolicyResult {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "project.worktree_policy.get", params: params)

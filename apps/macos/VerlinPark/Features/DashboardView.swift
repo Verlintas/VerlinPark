@@ -929,6 +929,7 @@ private struct CheckpointsCard: View {
     @State private var deleting: SessionCheckpoint?
 
     var body: some View {
+        @Bindable var model = model
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
@@ -953,6 +954,54 @@ private struct CheckpointsCard: View {
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)
+
+            Divider().opacity(0.2)
+            Text("AUTOMATIC RETENTION")
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            HStack(spacing: 10) {
+                Toggle("Enabled", isOn: $model.checkpointPolicyEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Older than days")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("30", text: $model.checkpointPolicyOlderDaysText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 60)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Keep latest")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("5", text: $model.checkpointPolicyKeepLatestText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 50)
+                }
+                Spacer()
+                if model.checkpointPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Save policy") {
+                    Task { await model.saveCheckpointPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.checkpointPolicyBusy)
+            }
+            if let status = model.checkpointPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider().opacity(0.2)
+            Text("MANUAL CLEANUP")
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
 
             if model.selectedSession == nil {
                 Text("Select a session to inspect its checkpoints.")

@@ -1609,6 +1609,51 @@ pub struct SessionCheckpointPruneResult {
     pub checkpoints: Vec<SessionCheckpoint>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointRetentionPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_checkpoint_older_secs")]
+    pub older_than_secs: u64,
+    #[serde(default = "default_checkpoint_keep_latest")]
+    pub keep_latest: u32,
+}
+
+impl Default for CheckpointRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            older_than_secs: default_checkpoint_older_secs(),
+            keep_latest: default_checkpoint_keep_latest(),
+        }
+    }
+}
+
+fn default_checkpoint_older_secs() -> u64 {
+    30 * 24 * 60 * 60
+}
+
+fn default_checkpoint_keep_latest() -> u32 {
+    5
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckpointPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetCheckpointPolicyParams {
+    pub project_id: String,
+    pub policy: CheckpointRetentionPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckpointPolicyResult {
+    pub project_id: String,
+    pub policy: CheckpointRetentionPolicy,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionForkParams {
     pub session_id: String,

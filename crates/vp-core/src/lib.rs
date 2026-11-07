@@ -13,24 +13,24 @@ use uuid::Uuid;
 use vp_protocol::types::{
     AcpAgent, AcpAgentListResult, AcpProbeResult, AgentMessage, AgentRecord, Approval, Artifact,
     ArtifactBackfillResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
-    ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
-    ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement, ContextUsage, DoctorCheck,
-    Event, GitLogResult, GitShowResult, IntegrationPolicy, MailboxGcResult, MailboxPolicy,
-    McpCallResult, McpGetPromptResult, McpPromptListResult, McpReadResourceResult,
-    McpResourceListResult, McpServer, McpServerListResult, McpToolListResult, MemoryDeleteResult,
-    MemoryItem, MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult,
-    MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult,
-    PullRequestResult, Question, QuestionListResult, ScheduledTask, SearchResult, Session,
-    SessionBundle, SessionCheckpoint, SessionCheckpointDeleteResult, SessionCheckpointListResult,
-    SessionCheckpointPruneResult, SessionCommit, SessionContextStatus, SessionDiff,
-    SessionForkResult, SessionImportResult, SessionLandResult, SessionLogStatus,
-    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
-    ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
-    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
-    TerminalWriteResult, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
-    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
-    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
-    WriteLease,
+    CheckpointPolicyResult, CheckpointRetentionPolicy, ConsoleCloseResult, ConsoleOpenResult,
+    ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult, ContextCompactionSummary,
+    ContextMeasurement, ContextUsage, DoctorCheck, Event, GitLogResult, GitShowResult,
+    IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult,
+    McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer,
+    McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult,
+    MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, Project, ProjectBudget,
+    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
+    ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
+    SessionCheckpointDeleteResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
+    SessionCommit, SessionContextStatus, SessionDiff, SessionForkResult, SessionImportResult,
+    SessionLandResult, SessionLogStatus, SessionPriorityResult, SessionRehydrateResult,
+    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TaskQueueResult,
+    TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult,
+    TerminalOpenResult, TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem,
+    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
+    WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
+    WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -835,6 +835,73 @@ impl Engine {
             dry_run: false,
             checkpoints: candidates,
         })
+    }
+
+    pub async fn get_checkpoint_policy(
+        &self,
+        project_id: &str,
+    ) -> Result<CheckpointRetentionPolicy> {
+        let store = self.store.clone();
+        let id = project_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            store
+                .get_project(&id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {id}"))?;
+            store.get_checkpoint_policy(&id)
+        })
+        .await?
+    }
+
+    pub async fn set_checkpoint_policy(
+        &self,
+        project_id: &str,
+        policy: &CheckpointRetentionPolicy,
+    ) -> Result<CheckpointPolicyResult> {
+        if policy.older_than_secs > 365 * 24 * 60 * 60 {
+            anyhow::bail!("checkpoint retention must be at most 365 days");
+        }
+        if policy.keep_latest > 100 {
+            anyhow::bail!("checkpoint keep_latest must be at most 100");
+        }
+        let store = self.store.clone();
+        let id = project_id.to_string();
+        let policy = policy.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            store
+                .get_project(&id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {id}"))?;
+            store.set_checkpoint_policy(&id, &policy)?;
+            store.get_checkpoint_policy(&id)
+        })
+        .await??;
+        Ok(CheckpointPolicyResult {
+            project_id: project_id.to_string(),
+            policy: saved,
+        })
+    }
+
+    /// Run the opt-in checkpoint retention policy for every project. Deletes
+    /// only checkpoints older than the policy threshold and beyond its
+    /// keep-latest count. Existing fork branches are unaffected.
+    pub async fn sweep_checkpoint_retention(&self) -> Result<usize> {
+        let store = self.store.clone();
+        let policies =
+            tokio::task::spawn_blocking(move || store.list_enabled_checkpoint_policies()).await??;
+        let mut removed = 0usize;
+        for (project_id, policy) in policies {
+            let store = self.store.clone();
+            let sessions =
+                tokio::task::spawn_blocking(move || store.list_sessions(Some(&project_id)))
+                    .await??;
+            let days = policy.older_than_secs.div_ceil(86_400) as u32;
+            for session in sessions {
+                removed += self
+                    .prune_checkpoints(&session.id, Some(days), Some(policy.keep_latest), false)
+                    .await?
+                    .removed;
+            }
+        }
+        Ok(removed)
     }
 
     /// Create a new session/worktree from a checkpoint. Without an explicit

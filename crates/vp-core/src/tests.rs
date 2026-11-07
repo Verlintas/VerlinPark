@@ -3480,3 +3480,77 @@ async fn checkpoint_prune_keeps_the_latest_and_can_dry_run() {
         &checkpoints[2].id
     ));
 }
+
+#[tokio::test]
+async fn checkpoint_policy_round_trips_and_sweeps_old_snapshots() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("policy".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "policy source".into(), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    for index in 0..2 {
+        std::fs::write(worktree.join("snapshot.txt"), format!("dirty {index}\n")).unwrap();
+        engine
+            .checkpoint_session(&session.id, Some(format!("checkpoint {index}")))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        engine.get_checkpoint_policy(&project.id).await.unwrap(),
+        CheckpointRetentionPolicy::default()
+    );
+    let policy = CheckpointRetentionPolicy {
+        enabled: true,
+        older_than_secs: 0,
+        keep_latest: 1,
+    };
+    let saved = engine
+        .set_checkpoint_policy(&project.id, &policy)
+        .await
+        .unwrap();
+    assert_eq!(saved.policy, policy);
+    assert_eq!(engine.sweep_checkpoint_retention().await.unwrap(), 1);
+    let remaining = engine
+        .list_checkpoints(&session.id)
+        .await
+        .unwrap()
+        .checkpoints;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].label, "checkpoint 1");
+
+    let error = engine
+        .set_checkpoint_policy(
+            &project.id,
+            &CheckpointRetentionPolicy {
+                enabled: true,
+                older_than_secs: 366 * 86_400,
+                keep_latest: 5,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("365 days"));
+    let error = engine
+        .set_checkpoint_policy(
+            &project.id,
+            &CheckpointRetentionPolicy {
+                enabled: true,
+                older_than_secs: 86_400,
+                keep_latest: 101,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("keep_latest"));
+}

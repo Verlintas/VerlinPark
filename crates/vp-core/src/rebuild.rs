@@ -84,6 +84,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
         store.set_artifact_policy(&snapshot.project.id, &snapshot.artifact_policy)?;
         store.set_mailbox_policy(&snapshot.project.id, &snapshot.mailbox_policy)?;
         store.set_worktree_policy(&snapshot.project.id, &snapshot.worktree_policy)?;
+        store.set_checkpoint_policy(&snapshot.project.id, &snapshot.checkpoint_policy)?;
         store.set_project_budget(&snapshot.project.id, &snapshot.budget)?;
         store.set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
     }

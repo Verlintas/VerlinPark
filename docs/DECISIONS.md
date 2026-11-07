@@ -112,6 +112,7 @@
 | [0100](adr/0100-context-estimate-calibration.md) | Calibrate context estimates with provider usage | Accepted | Agent/上下文 |
 | [0101](adr/0101-session-checkpoints-and-forks.md) | Session checkpoints and forks | Accepted | Session/Git |
 | [0102](adr/0102-checkpoint-retention-and-deletion.md) | Checkpoint retention and deletion | Accepted | Session/Git |
+| [0103](adr/0103-automatic-checkpoint-retention.md) | Automatic checkpoint retention policy | Accepted | Session/Git |
 
 ---
 

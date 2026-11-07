@@ -159,6 +159,24 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(checkpoint.dirty, true)
     }
 
+    func testCheckpointPolicyResultDecodes() throws {
+        let json = """
+        {
+          "project_id": "project-1",
+          "policy": {
+            "enabled": true,
+            "older_than_secs": 2592000,
+            "keep_latest": 5
+          }
+        }
+        """
+        let result = try JSONDecoder().decode(CheckpointPolicyResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.projectId, "project-1")
+        XCTAssertTrue(result.policy.enabled)
+        XCTAssertEqual(result.policy.olderThanSecs, 2_592_000)
+        XCTAssertEqual(result.policy.keepLatest, 5)
+    }
+
     func testCheckpointPruneResultDecodes() throws {
         let json = """
         {

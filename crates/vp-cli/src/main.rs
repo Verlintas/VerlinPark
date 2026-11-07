@@ -173,6 +173,19 @@ enum Command {
         #[arg(long)]
         read_jail: bool,
     },
+    /// Show the project's automatic checkpoint retention policy.
+    CheckpointPolicy { project: String },
+    /// Update the project's automatic checkpoint retention policy.
+    CheckpointPolicySet {
+        project: String,
+        /// Enable the background sweep (omitting this disables it).
+        #[arg(long)]
+        enabled: bool,
+        #[arg(long, default_value_t = 30)]
+        older_than_days: u64,
+        #[arg(long, default_value_t = 5)]
+        keep_latest: u32,
+    },
     /// Show the project's automatic worktree retention policy.
     WorktreePolicy { project: String },
     /// Update the project's automatic worktree retention policy.
@@ -767,6 +780,32 @@ async fn main() -> Result<()> {
                         "read_jail": read_jail,
                     }
                 }),
+            )
+            .await?
+        }
+        Command::CheckpointPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.checkpoint_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::CheckpointPolicySet {
+            project,
+            enabled,
+            older_than_days,
+            keep_latest,
+        } => {
+            let policy = json!({
+                "enabled": enabled,
+                "older_than_secs": older_than_days.saturating_mul(86_400),
+                "keep_latest": keep_latest
+            });
+            rpc(
+                &discovery,
+                "project.checkpoint_policy.set",
+                json!({"project_id": project, "policy": policy}),
             )
             .await?
         }

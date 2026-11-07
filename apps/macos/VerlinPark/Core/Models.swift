@@ -513,6 +513,34 @@ struct SearchResult: Codable, Sendable {
     let truncated: Bool
 }
 
+struct CheckpointRetentionPolicy: Codable, Hashable, Sendable {
+    var enabled: Bool
+    var olderThanSecs: Int
+    var keepLatest: Int
+
+    static let disabled = CheckpointRetentionPolicy(
+        enabled: false,
+        olderThanSecs: 30 * 86400,
+        keepLatest: 5
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case olderThanSecs = "older_than_secs"
+        case keepLatest = "keep_latest"
+    }
+}
+
+struct CheckpointPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: CheckpointRetentionPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
 struct WorktreeRetentionPolicy: Codable, Hashable, Sendable {
     var enabled: Bool
     var olderThanSecs: Int

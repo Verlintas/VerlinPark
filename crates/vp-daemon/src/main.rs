@@ -27,10 +27,10 @@ use vp_protocol::types::{
     AnswerQuestionResult, ApprovalListResult, ArtifactBackfillParams, ArtifactGcParams,
     ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactMaterializeParams,
     ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult, AuthParams, AuthResult,
-    CancelSessionParams, CancelSessionResult, CleanupWorktreesParams, CommitSessionParams,
-    ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams, ConsoleReadParams,
-    ConsoleSignalParams, ConsoleWriteParams, CreateSessionParams, DiscardSessionParams,
-    DoctorCheck, DoctorReport, EventListResult, GitLogParams, GitShowParams,
+    CancelSessionParams, CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams,
+    CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
+    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, CreateSessionParams,
+    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, GitLogParams, GitShowParams,
     IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
     ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
     MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
@@ -46,15 +46,15 @@ use vp_protocol::types::{
     SessionForkParams, SessionImportParams, SessionListResult, SessionLogParams,
     SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
     SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
-    SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
-    SetSessionPriorityParams, SetShellPolicyParams, SetTaskSchedulerPolicyParams,
-    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams,
-    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    UpdateAcpAgentParams, UpdateMcpServerParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
+    SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
+    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
+    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams, UpdateAcpAgentParams, UpdateMcpServerParams, UsageLedgerParams,
+    WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
     state.agent.start_auto_resolver();
     state.agent.start_task_scheduler();
     spawn_worktree_sweeper(state.engine.clone());
+    spawn_checkpoint_sweeper(state.engine.clone());
     spawn_memory_sweeper(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
@@ -1097,6 +1098,34 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "project.checkpoint_policy.get" => {
+            match parse_params::<CheckpointPolicyParams>(request.params) {
+                Ok(params) => match state.engine.get_checkpoint_policy(&params.project_id).await {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        vp_protocol::types::CheckpointPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "project.checkpoint_policy.set" => {
+            match parse_params::<SetCheckpointPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_checkpoint_policy(&params.project_id, &params.policy)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.log_status" => match parse_params::<SessionLogParams>(request.params) {
             Ok(params) => match state.engine.session_log_status(&params.session_id).await {
                 Ok(status) => RpcResponse::success(id, status),
@@ -1697,6 +1726,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "project.integration_policy.set"
             | "project.budget.set"
             | "project.worktree_policy.set"
+            | "project.checkpoint_policy.set"
             | "mailbox.policy.set"
             | "artifact.policy.set"
             | "session.import"
@@ -1740,6 +1770,32 @@ fn spawn_worktree_sweeper(engine: Engine) {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(error = %error, "automatic worktree retention failed");
+                }
+            }
+        }
+    });
+}
+
+fn spawn_checkpoint_sweeper(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_CHECKPOINT_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3600);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine.sweep_checkpoint_retention().await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, "automatic checkpoint retention pruned checkpoints");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "automatic checkpoint retention failed");
                 }
             }
         }

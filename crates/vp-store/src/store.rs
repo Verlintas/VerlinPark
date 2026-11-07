@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AcpAgent, AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event,
-    IntegrationPolicy, MailboxPolicy, McpServer, MemoryItem, MemoryPolicy, MergeQueueEntry,
-    Project, ProjectBudget, ProjectUsageSession, Question, ScheduledTask, SearchHit, Session,
-    SessionBundle, ShellPolicy, StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry,
-    WorktreeRetentionPolicy, WriteLease,
+    AcpAgent, AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy,
+    CheckpointRetentionPolicy, Event, IntegrationPolicy, MailboxPolicy, McpServer, MemoryItem,
+    MemoryPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectUsageSession, Question,
+    ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage,
+    TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
 };
 
 use crate::paths;
@@ -54,6 +54,8 @@ pub struct ProjectManifestSnapshot {
     pub artifact_policy: ArtifactPolicy,
     pub mailbox_policy: MailboxPolicy,
     pub worktree_policy: WorktreeRetentionPolicy,
+    #[serde(default)]
+    pub checkpoint_policy: CheckpointRetentionPolicy,
     pub budget: ProjectBudget,
     #[serde(default)]
     pub task_scheduler_policy: TaskSchedulerPolicy,
@@ -417,6 +419,13 @@ impl Store {
                 keep_failed      INTEGER NOT NULL DEFAULT 1
             );
 
+            CREATE TABLE IF NOT EXISTS project_checkpoint_policies (
+                project_id       TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled          INTEGER NOT NULL DEFAULT 0,
+                older_than_secs  INTEGER NOT NULL DEFAULT 2592000,
+                keep_latest      INTEGER NOT NULL DEFAULT 5
+            );
+
             CREATE TABLE IF NOT EXISTS project_artifact_policies (
                 project_id   TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                 auto_gc      INTEGER NOT NULL,
@@ -776,6 +785,7 @@ impl Store {
                 artifact_policy: self.get_artifact_policy(&project.id)?,
                 mailbox_policy: self.get_mailbox_policy(&project.id)?,
                 worktree_policy: self.get_worktree_policy(&project.id)?,
+                checkpoint_policy: self.get_checkpoint_policy(&project.id)?,
                 budget: self.get_project_budget(&project.id)?,
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 project,
@@ -1566,6 +1576,74 @@ impl Store {
             paths::ensure_private_file(&path)?;
         }
         Ok(Some(path))
+    }
+
+    pub fn get_checkpoint_policy(&self, project_id: &str) -> Result<CheckpointRetentionPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT enabled, older_than_secs, keep_latest
+                 FROM project_checkpoint_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(CheckpointRetentionPolicy {
+                        enabled: row.get::<_, i64>(0)? != 0,
+                        older_than_secs: row.get::<_, i64>(1)? as u64,
+                        keep_latest: row.get::<_, i64>(2)? as u32,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn set_checkpoint_policy(
+        &self,
+        project_id: &str,
+        policy: &CheckpointRetentionPolicy,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_checkpoint_policies
+             (project_id, enabled, older_than_secs, keep_latest)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                older_than_secs = excluded.older_than_secs,
+                keep_latest = excluded.keep_latest",
+            params![
+                project_id,
+                i64::from(policy.enabled),
+                policy.older_than_secs as i64,
+                policy.keep_latest as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_enabled_checkpoint_policies(
+        &self,
+    ) -> Result<Vec<(String, CheckpointRetentionPolicy)>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT project_id, enabled, older_than_secs, keep_latest
+             FROM project_checkpoint_policies WHERE enabled = 1",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                CheckpointRetentionPolicy {
+                    enabled: row.get::<_, i64>(1)? != 0,
+                    older_than_secs: row.get::<_, i64>(2)? as u64,
+                    keep_latest: row.get::<_, i64>(3)? as u32,
+                },
+            ))
+        })?;
+        let mut policies = Vec::new();
+        for row in rows {
+            policies.push(row?);
+        }
+        Ok(policies)
     }
 
     pub fn get_artifact_policy(&self, project_id: &str) -> Result<ArtifactPolicy> {
