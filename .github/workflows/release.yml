@@ -10,16 +10,87 @@ permissions:
 
 jobs:
   dmg:
-    runs-on: macos-15
+    runs-on: macos-15-arm64
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: brew install xcodegen swiftformat just
+      - name: Import Developer ID certificate (optional)
+        env:
+          CERT_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+        run: |
+          if [[ -z "$CERT_BASE64" ]]; then
+            echo "No Developer ID certificate configured; using ad-hoc signing."
+            exit 0
+          fi
+          KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:-$(openssl rand -hex 16)}"
+          CERT_PATH="$RUNNER_TEMP/verlinpark-cert.p12"
+          echo "$CERT_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import "$CERT_PATH" -k build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain >/dev/null
+          security list-keychains -d user -s build.keychain login.keychain-db
+          if [[ -z "$SIGN_IDENTITY" ]]; then
+            SIGN_IDENTITY="$(security find-identity -v -p codesigning build.keychain | sed -n 's/.*"\(.*\)".*/\1/p' | head -1)"
+          fi
+          if [[ -z "$SIGN_IDENTITY" ]]; then
+            echo "No signing identity found after certificate import." >&2
+            exit 1
+          fi
+          echo "Using signing identity: $SIGN_IDENTITY"
+          echo "VERLINPARK_SIGN_IDENTITY=$SIGN_IDENTITY" >> "$GITHUB_ENV"
+          echo "VERLINPARK_SIGNED=1" >> "$GITHUB_ENV"
+          rm -f "$CERT_PATH"
+      - name: Configure notarization (optional)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          if [[ -z "$APPLE_ID" || -z "$APPLE_TEAM_ID" || -z "$APPLE_APP_PASSWORD" ]]; then
+            echo "No notarization credentials configured; skipping notarization."
+            exit 0
+          fi
+          PROFILE="verlinpark-notary"
+          xcrun notarytool store-credentials "$PROFILE" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID"
+          echo "VERLINPARK_NOTARY_PROFILE=$PROFILE" >> "$GITHUB_ENV"
+          echo "VERLINPARK_NOTARIZED=1" >> "$GITHUB_ENV"
       - run: just package
       - name: Generate Homebrew cask
         run: scripts/generate-homebrew-cask.sh "$GITHUB_REF_NAME"
+      - name: Publish Homebrew tap (optional)
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_REPO: ${{ secrets.HOMEBREW_TAP_REPO }}
+        run: |
+          if [[ -z "$HOMEBREW_TAP_TOKEN" || -z "$HOMEBREW_TAP_REPO" ]]; then
+            echo "No Homebrew tap repository configured; cask stays on the GitHub release."
+            exit 0
+          fi
+          TAP_DIR="$RUNNER_TEMP/homebrew-tap"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${HOMEBREW_TAP_REPO}.git" "$TAP_DIR"
+          mkdir -p "$TAP_DIR/Casks"
+          cp dist/verlinpark.rb "$TAP_DIR/Casks/verlinpark.rb"
+          cd "$TAP_DIR"
+          git config user.name "VerlinPark Release"
+          git config user.email "release@verlinpark.local"
+          if git diff --quiet; then
+            echo "Homebrew tap already current."
+            exit 0
+          fi
+          git add Casks/verlinpark.rb
+          git commit -m "verlinpark ${GITHUB_REF_NAME}"
+          git push
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

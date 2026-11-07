@@ -99,6 +99,7 @@
 | [0087](adr/0087-pty-terminal.md) | PTY terminal with SwiftTerm | Accepted | 终端/UI |
 | [0088](adr/0088-persistent-task-dag-and-leases.md) | Persistent task-DAG queue and write leases | Accepted | 调度/存储 |
 | [0089](adr/0089-user-read-jail.md) | Opt-in user/volume read jail | Accepted | 安全 |
+| [0090](adr/0090-optional-signing-notarization-tap.md) | Optional signing/notarization/tap publish | Accepted | 发布 |
 
 ---
 

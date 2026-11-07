@@ -127,9 +127,15 @@ just run
 just package   # release app + DMG under dist/
 ```
 
-`just package` builds a Release app, bundles `verlinpadd`, ad-hoc signs the
-bundle, stages `verlinpadd`/`vp`/docs, and writes a `dist/*.dmg` plus SHA-256.
-It is direct distribution, not notarized with a Developer ID.
+`just package` builds a Release app, bundles `verlinpadd`, signs the bundle
+(ad-hoc by default), stages `verlinpadd`/`vp`/docs, and writes a `dist/*.dmg`
+plus SHA-256. Set `VERLINPARK_SIGN_IDENTITY` for Developer ID signing and
+`VERLINPARK_NOTARY_PROFILE` for app notarization/staple. The tag workflow reads
+`APPLE_CERTIFICATE_P12_BASE64`, `APPLE_CERTIFICATE_PASSWORD`,
+`APPLE_SIGN_IDENTITY`, `APPLE_NOTARY_APPLE_ID`, `APPLE_NOTARY_TEAM_ID`, and
+`APPLE_NOTARY_APPLE_PASSWORD` when present; otherwise it stays ad-hoc. Set
+`HOMEBREW_TAP_REPO` (`owner/repo`) and `HOMEBREW_TAP_TOKEN` to publish the cask
+to a real tap. There is still no Sparkle auto-updater.
 
 Configure a model in **Settings → Providers** (and adjust the per-session Manager/Worker/Labour caps under Team capacity) (any OpenAI-compatible endpoint, including LM Studio/Ollama/llama.cpp, or Anthropic). The API key is stored in Keychain and sent only to the local daemon. For headless runs, set `VERLINPARK_BASE_URL` and `VERLINPARK_MODEL` (plus `VERLINPARK_API_KEY` if needed). Set `VERLINPARK_INTEGRATION_COMMAND` to add a project-specific post-merge check (for example `cargo test`); without it the Integrator still runs `git diff --check`. `VERLINPARK_GLOBAL_SESSION_CAP` bounds concurrent session runs across the daemon (default 4, range 1–32); excess prompts queue as `queued`. `VERLINPARK_GLOBAL_WORKERS` (default 12) and `VERLINPARK_GLOBAL_LABOUR` (default 24) bound Worker/Labour runs across all sessions; the snapshot is available in Settings and `agent.info`. `VERLINPARK_AUTO_EXPAND_WORKERS` (or the Settings toggle) lets a TeamPlan expand Workers up to 10 when at least 20% of the session token budget remains. Plan tasks and global write leases are persisted; `vp tasks` (or `task.queue`) shows the queue and active leases. `VERLINPARK_TASK_SCHEDULER=1` turns on the opt-in global resume scheduler; `VERLINPARK_TASK_SCHEDULER_SECS` (default 5) controls its tick and `VERLINPARK_TASK_SCHEDULER_COOLDOWN_SECS` (default 60) prevents hot retries after a failed resume. Session priority is set with `--priority` (or the New Session picker); `VERLINPARK_PRIORITY_AGING_SECS` (default 60; 0 disables) raises low-priority waiters one point per interval up to +100 so they cannot starve forever. `VERLINPARK_WORKTREE_SWEEP_SECS` (default 3600; 0 disables) controls the opt-in per-project worktree retention sweep. `VERLINPARK_PROVIDER_IDLE_SECS` (default 300, range 10–3600) bounds the wait between provider stream events. `VERLINPARK_QUESTION_TIMEOUT_SECS` (default 1800, range 60–86400) bounds a blocking `ask_user` question. PR/MR flow requires an `origin` remote and an authenticated `gh` (GitHub) or `glab` (GitLab) CLI; set `VERLINPARK_PR_PROVIDER=gitlab` for self-hosted GitLab hosts without `gitlab` in the hostname. Local landing does not need either.
 

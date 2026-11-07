@@ -1,6 +1,6 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-06
+> 最后更新：2026-11-07
 > 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
@@ -54,7 +54,7 @@
 | CLI | ✅ | ping/info/projects/shell-policy/shell-policy-set/integration-policy/integration-policy-set/artifact-policy/artifact-policy-set/gc/artifact/backfill-artifacts/mailbox-policy/mailbox-policy-set/mailbox-gc/session-new/prompt/events/search/transcript/approvals/approve/deny/diff/commit/discard/cancel/pause/resume/todos/agents/team-plan/usage/mailbox/read-message/artifacts/artifact/backfill-artifacts/queue/retry/resolve/land/pr/replay [--repair|--rebuild]/log-status/restore-log/export/import/rehydrate/cleanup-worktrees/worktree-policy/worktree-policy-set/project-budget/project-budget-set/project-usage/resume-plan/memory/remember/memory-delete/memory-prune/memory-policy/memory-policy-set/questions/answer/mcp-servers/mcp-add/mcp-remove/mcp-tools/mcp-call/mcp-resources/mcp-read-resource/mcp-prompts/mcp-prompt/console/terminal/tasks/task-retry/task-skip/files/file/write-file/history/show/doctor/provider-test/db-rebuild |
 | Search | ✅ | `session.search` / `vp search` / Stage `Cmd-F`；跨 session 搜索 message content 与 raw event payload，可按 project 过滤，newest-first，`truncated` 标记；LIKE 转义 `%`/`_`/`\`，snippet 截断；无 FTS/index |
 | Transcript | ✅ | `session.transcript` / `vp transcript` / Session menu Export Transcript…；Markdown 包含 session 元数据、按 department 的 TeamPlan、按时间排序的 conversation 与 tool calls；单 message 8KB、tool args 1KB 截断；不是可导入 bundle |
-| Distribution | ✅ | `just package` 生成 Release app + bundled `verlinpadd` + `vp` + docs 的 ad-hoc signed DMG 和 SHA-256；`just cask` / release workflow 生成并上传 Homebrew cask（DMG URL + SHA-256，arm64/macOS 15+）；`v*` tag 触发 GitHub Release workflow；未 Developer ID 公证，暂无 tap |
+| Distribution | ✅ | `just package` 生成 Release app + bundled `verlinpadd` + `vp` + docs 的 DMG 和 SHA-256；默认 ad-hoc，`VERLINPARK_SIGN_IDENTITY` 可 Developer ID 签名，`VERLINPARK_NOTARY_PROFILE` 可 notarize+staple app 后再打 DMG；`just cask` / tag workflow 生成 cask，并可用 `HOMEBREW_TAP_REPO` + `HOMEBREW_TAP_TOKEN` 自动提交到 tap（未配置时只留在 GitHub release）；release workflow 使用 arm64 runner；仍无 Sparkle 自动更新 |
 | Project budget | ✅ | `project.budget.get/set` / `vp project-budget*` / Manage Dash；跨 session 共享 token/USD pool，使用同一 `BudgetRegistry` `project:<id>` 原子 reservation；project 超限终止当前 run |
 | Project usage | ✅ | `project.usage` / `vp project-usage` / Manage Dash：按 session 返回 goal/status/calls/input/output/cost 和项目 totals；与 project budget 使用同一 session 投影 |
 | Worktree cleanup | ✅ | `project.cleanup_worktrees` / `vp cleanup-worktrees` / Manage Dash：仅终端 session、默认 7 天、dry-run、dirty 保护、默认保留 branch、`--delete-branches` 显式删除、`--keep-failed`；项目级 `WorktreeRetentionPolicy`（默认关闭、≤365 天、keep failed、keep branches）+ daemon 定时 sweep（`VERLINPARK_WORKTREE_SWEEP_SECS` 默认 3600，0 关闭）；移除 worktree 时同时清 `sandbox/<session>`，worktree 已缺失时也清孤儿 scratch |
@@ -97,7 +97,7 @@
 - Provider retry 只覆盖 stream 建立前的错误；stream 中途断开不会自动续传。
 - Artifact preview 是只读预览：文本 64KB、hex 1KB，未做语法高亮或非 UTF-8 编码探测。
 - Roundtable 卡片只渲染当前已加载的 event window；更早的 round 需要扩大 Trace/事件加载。
-- Usage CSV 一次生成完整字符串，不支持流式导出；Homebrew cask 不是 tap，不能 `brew upgrade`。
+- Usage CSV 一次生成完整字符串，不支持流式导出；Homebrew cask 可发布到 tap，但没有 Sparkle 式自动更新/增量升级。
 - `project.usage` 只按 session 汇总，没有按天/model 的时间序列；UI 只展示前 8 个 session。
 - 审批中心在打开 Manage Dash 时拉取；有 macOS 本地系统通知（后台时发送，点击回到 session），但没有远程推送；自动 resolve 的审批需要手动刷新。
 - Diff 文件选择基于 unified diff 文本；不处理 Git 的 quoted path，也不支持逐 hunk stage。
@@ -114,7 +114,7 @@
 - Shell 只做写入隔离与常见 credential read-deny；项目 policy 只能收窄不能放宽、只对后续 run 生效，且不随 session bundle 导出；不是完整 read jail，network allow 下仍可外发，`sandbox-exec` 是废弃 API；task worktree/branch 有显式 `cleanup-worktrees`，但没有自动/定时清理；shell scratch 仍无统一回收。
 - `IntegrationPolicy` 与 auto-resolve attempt 计数是项目/队列元数据，不随 session bundle 导出；自动触发必须有 provider 配置，且仍受 session token budget 与 per-resolution cap 限制。
 - Aviiya 仍是 NovaBAIC 外部桥接占位，不在本仓库实现人格/记忆。
-- 有 ad-hoc signed DMG，但没有 Developer ID 签名/公证、Sparkle 更新器或 Homebrew tap。
+- 有可选 Developer ID 签名/公证和可选 tap 发布；没有 Sparkle 更新器，未配置证书时仍是 ad-hoc DMG。
 
 ## 历史里程碑
 
@@ -214,6 +214,7 @@
 - **M3 第八十九切片**：PTY terminal（portable-pty、SwiftTerm、Terminal tab、`vp terminal`、resize/process-group）；见 ADR-0087。
 - **M3 第九十切片**：持久 task-DAG 队列 + SQLite global write leases + opt-in global resume scheduler（`task.queue`/`vp tasks`/Manage Dash、aging/round-robin、恢复清理）；task 行 replay/repair/bundle/db-rebuild 已补齐；task skip/retry + Manage Dash actions 已完成；见 ADR-0088。
 - **M3 第九十一切片**：opt-in user/volume read jail（`ShellPolicy.read_jail`、HOME parent + `/Volumes` deny、toolchain/worktree allowlist、Manage Dash/CLI/RPC、Agent/Console/PTY 统一）；见 ADR-0089。
+- **M3 第九十二切片**：可选 Developer ID 签名/notarization + cask tap 发布 + arm64 release runner；见 ADR-0090。
 
 ## 如何运行
 

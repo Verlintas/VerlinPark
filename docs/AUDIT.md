@@ -30,7 +30,7 @@
 - 修复 P2-7：plan batch 中止时同批未处理 task 现在会结算为 `cancelled`/`blocked` 并发出 `plan_task.finished`，不再留下 running 投影；新增取消 batch 回归。
 - P2-10 已修复：Collab 新增 Manager roundtable 卡片，按轮次显示 title/profile/position。
 - 新增 `session.usage_csv` / `vp usage --csv` / Preview Export CSV。
-- 新增 Homebrew cask 生成脚本和 release asset（`just cask`），仍不是 tap。
+- 新增 Homebrew cask 生成脚本和 release asset（`just cask`）；release workflow 现在可选发布到 tap。
 - 新增 `project.usage` / `vp project-usage` / Manage Dash 按 session 用量汇总。
 - 新增 Manage Dash 跨 project pending approvals 卡片，可直接 Approve/Deny。
 - 新增 Preview Changes 文件选择（unified diff parser + 4 个 Swift 测试）。
@@ -57,6 +57,7 @@
 - MCP 工具现在会以 `mcp_<server>_<tool>` 动态 schema 注入 Leader/Worker/Labour；Manager/Verifier 保持只读，不注入动态工具。
 - 新增 daemon-owned line-oriented Console：session worktree Seatbelt sandbox、streaming chunks、signals、Preview tab 与 `vp console`；不是 PTY。
 - 新增 workspace file browser：tree/file 路径 jail、Preview Files tab、`vp files` / `vp file`、binary/large preview；后续切片加入 expected_sha256 冲突检测的文本编辑、atomic write 与 `workspace.file_saved` 事件。
+- 新增可选 Developer ID 签名/notarization、cask tap 发布和 arm64 release runner；见 ADR-0090。
 - 新增 opt-in user/volume read jail：`ShellPolicy.read_jail`、HOME parent + `/Volumes` deny、toolchain/worktree allowlist、Manage Dash/CLI，Agent/Console/PTY 统一；见 ADR-0089。
 - 新增持久 task-DAG 队列与全局 write leases：`plan_tasks`/`write_leases`、plan lifecycle rebuild、priority+aging ready order、`task.queue`/`vp tasks`/Manage Dash、recovery 将 in-flight task 标为 interrupted 并清 lease；task 行已进入 replay/repair/bundle/db-rebuild；非 active session 可通过 `task.skip` / `task.retry` 和 Manage Dash 按钮跳过/重试 task，事件为 `plan_task.skipped` / `plan_task.retried`；opt-in `VERLINPARK_TASK_SCHEDULER` 可按 effective priority/round-robin resume 待办 session plan；见 ADR-0088。
 
@@ -89,7 +90,7 @@
 | 可观测性 | B | 事件很丰富，Collab/Plan/Trace、Console、Terminal、Files、History、Doctor、cleanup、roundtable、跨 session approvals、project usage、按文件 diff、Rail 通知中心（历史持久化）可用；系统通知已支持（后台本地通知），更早的 round 受已加载 event window 限制 |
 | 可维护性 | C− | `agent.rs` 8,058 行（测试移到 `agent/tests.rs`）、`vp-core/lib.rs` 4,548 行（测试移到 `tests.rs`）、`store.rs` 5,002 行（测试移到 `store/tests.rs`）、`StudioView.swift` 约 2.4k 行；核心逻辑模块边界仍需治理 |
 | 测试 | B− | 190 Rust + 38 Swift 全绿；并发/scope/SSRF/shell sandbox/policy/home read jail/queue retry/auto-resolve/global admission/global Worker-Labour capacity/models/session+task+department budgets/usage ledger replay/mailbox retention/binary artifacts/GC/landing/PR/recovery/replay/provider retry/idle timeout/search/transcript/preview/plan batch abort/plan resume/project memory delete-prune-FTS-retention-policy/mid-run questions/MCP stdio persistent-pagination-resources-prompts-dynamic-tools/sandboxed console/PTY terminal/task-DAG queue/global write leases/opt-in global resume scheduler/task queue replay-bundle-rebuild/task skip-retry/user-volume read jail/usage CSV/project usage/worktree retention/diff parser/OpenAI+Anthropic HTTP adapter E2E/queued recovery/db rebuild 已有回归，真实外部 Provider 路径仍缺 |
-| 发布准备 | C | `just package` 生成 ad-hoc signed DMG + checksum，release workflow 同时生成并上传 Homebrew cask；仍无 Developer ID/公证、更新器和可持续升级的 Homebrew tap |
+| 发布准备 | C+ | `just package` 默认 ad-hoc DMG + checksum；可选 Developer ID 签名、notarize+staple、tap 发布；仍无 Sparkle 更新器和无证书环境下的 Gatekeeper 免打扰 |
 
 **一句话：架构骨架是对的，执行层还有几个必须补的洞，产品叙事需要从“已经有 agent team”收敛到“先把一条可合并的交付链做硬”。**
 

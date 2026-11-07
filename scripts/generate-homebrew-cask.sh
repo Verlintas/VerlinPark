@@ -20,6 +20,15 @@ if [[ ! -f "$DMG" ]]; then
 fi
 
 SHA="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+SIGNED="${VERLINPARK_SIGNED:-0}"
+NOTARIZED="${VERLINPARK_NOTARIZED:-0}"
+if [[ "$NOTARIZED" == "1" ]]; then
+  CAVEAT="This build is Developer ID signed and notarized."
+elif [[ "$SIGNED" == "1" ]]; then
+  CAVEAT="This build is Developer ID signed but not notarized. Gatekeeper may still require an override."
+else
+  CAVEAT="This build is ad-hoc signed and is not notarized with an Apple Developer ID. On first launch, macOS may require System Settings -> Privacy & Security -> Open Anyway. The app starts its bundled verlinpadd helper and writes local state under ~/Library/Application Support/VerlinPark."
+fi
 
 cat > "$OUT" <<EOF
 cask "verlinpark" do
@@ -37,10 +46,7 @@ cask "verlinpark" do
   app "VerlinPark.app"
 
   caveats <<~EOS
-    This build is ad-hoc signed and is not notarized with an Apple Developer ID.
-    On first launch, macOS may require System Settings -> Privacy & Security ->
-    "Open Anyway". The app starts its bundled verlinpadd helper and writes local
-    state under ~/Library/Application Support/VerlinPark.
+    ${CAVEAT}
   EOS
 end
 EOF

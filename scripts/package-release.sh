@@ -8,6 +8,10 @@ VERSION="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
 ARCH="$(uname -m)"
 STAGE="$ROOT/dist/VerlinPark-${VERSION}-${ARCH}"
 DMG="$ROOT/dist/VerlinPark-${VERSION}-${ARCH}.dmg"
+SIGN_IDENTITY="${VERLINPARK_SIGN_IDENTITY:-}"
+NOTARY_PROFILE="${VERLINPARK_NOTARY_PROFILE:-}"
+SIGNED=0
+NOTARIZED=0
 
 if [[ -z "$VERSION" ]]; then
   echo "could not read workspace version" >&2
@@ -42,9 +46,33 @@ mkdir -p "$HELPER_DIR"
 cp "$ROOT/target/release/verlinpadd" "$HELPER_DIR/verlinpadd"
 chmod +x "$HELPER_DIR/verlinpadd"
 
-echo "==> ad-hoc signing"
-codesign --force --sign - "$HELPER_DIR/verlinpadd"
-codesign --force --deep --sign - "$APP"
+if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
+  echo "==> Developer ID signing: $SIGN_IDENTITY"
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$HELPER_DIR/verlinpadd"
+  codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+  codesign --verify --deep --strict --verbose=2 "$APP"
+  SIGNED=1
+else
+  echo "==> ad-hoc signing"
+  codesign --force --sign - "$HELPER_DIR/verlinpadd"
+  codesign --force --deep --sign - "$APP"
+fi
+
+if [[ -n "$NOTARY_PROFILE" ]]; then
+  if [[ "$SIGNED" != "1" ]]; then
+    echo "VERLINPARK_NOTARY_PROFILE is set but no Developer ID identity was configured" >&2
+    exit 1
+  fi
+  echo "==> notarizing app"
+  NOTARY_ZIP="$ROOT/dist/VerlinPark-${VERSION}-${ARCH}.zip"
+  rm -f "$NOTARY_ZIP"
+  ditto -c -k --keepParent "$APP" "$NOTARY_ZIP"
+  xcrun notarytool submit "$NOTARY_ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$APP"
+  xcrun stapler validate "$APP"
+  rm -f "$NOTARY_ZIP"
+  NOTARIZED=1
+fi
 
 echo "==> staging"
 rm -rf "$STAGE" "$DMG"
@@ -59,7 +87,17 @@ cp "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/THIRD_PARTY_NOTICES.md"
 cp "$ROOT/docs/PROGRESS.md" "$STAGE/docs/PROGRESS.md"
 cp "$ROOT/docs/AUDIT.md" "$STAGE/docs/AUDIT.md"
 
-cat > "$STAGE/INSTALL.txt" <<'EOF'
+INSTALL_NOTE="This build is ad-hoc signed. It is not notarized with an Apple Developer ID.
+On first launch macOS may require System Settings -> Privacy & Security ->
+\"Open Anyway\". No App Store account is required."
+if [[ "$SIGNED" == "1" ]]; then
+  INSTALL_NOTE="This build is signed with a Developer ID. It is not notarized."
+fi
+if [[ "$NOTARIZED" == "1" ]]; then
+  INSTALL_NOTE="This build is Developer ID signed and notarized. Gatekeeper should
+accept it without a privacy override."
+fi
+cat > "$STAGE/INSTALL.txt" <<EOF
 VerlinPark is distributed directly (GPL-3.0-only), not through the App Store.
 
 1. Drag VerlinPark.app into /Applications.
@@ -67,9 +105,7 @@ VerlinPark is distributed directly (GPL-3.0-only), not through the App Store.
    discovery token under ~/Library/Application Support/VerlinPark.
 3. For CLI use, copy bin/verlinpadd and bin/vp somewhere on PATH.
 
-This build is ad-hoc signed. It is not notarized with an Apple Developer ID.
-On first launch macOS may require System Settings -> Privacy & Security ->
-"Open Anyway". No App Store account is required.
+${INSTALL_NOTE}
 EOF
 
 echo "==> creating DMG"
@@ -88,6 +124,8 @@ echo "==> checksums"
 )
 
 echo
-echo "package:  $DMG"
-echo "checksum: $DMG.sha256"
-echo "staged:   $STAGE"
+echo "package:   $DMG"
+echo "checksum:  $DMG.sha256"
+echo "staged:    $STAGE"
+echo "signed:    $SIGNED"
+echo "notarized: $NOTARIZED"
