@@ -297,6 +297,22 @@ enum Command {
     Context { session: String },
     /// Summarize or trim an idle session's active conversation now.
     Compact { session: String },
+    /// Create a committed, clean-worktree checkpoint of an idle session.
+    Checkpoint {
+        session: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List checkpoints for a session.
+    Checkpoints { session: String },
+    /// Fork a new session from the latest checkpoint (or --checkpoint).
+    Fork {
+        session: String,
+        #[arg(long)]
+        checkpoint: Option<String>,
+        #[arg(long)]
+        goal: Option<String>,
+    },
     /// Show the session plan/todo list.
     Todos { session: String },
     /// Show the per-call usage/cost ledger.
@@ -1125,6 +1141,38 @@ async fn main() -> Result<()> {
                 &discovery,
                 "session.compact",
                 json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Checkpoint { session, label } => {
+            rpc(
+                &discovery,
+                "session.checkpoint",
+                json!({"session_id": session, "label": label}),
+            )
+            .await?
+        }
+        Command::Checkpoints { session } => {
+            rpc(
+                &discovery,
+                "session.checkpoints",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Fork {
+            session,
+            checkpoint,
+            goal,
+        } => {
+            rpc(
+                &discovery,
+                "session.fork",
+                json!({
+                    "session_id": session,
+                    "checkpoint_id": checkpoint,
+                    "goal": goal
+                }),
             )
             .await?
         }

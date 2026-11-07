@@ -171,6 +171,8 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_events_session_seq
                 ON events(session_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_events_session_type_seq
+                ON events(session_id, type, seq);
             CREATE INDEX IF NOT EXISTS idx_sessions_project
                 ON sessions(project_id);
 
@@ -3114,6 +3116,36 @@ impl Store {
             |row| row.get::<_, i64>(0),
         )?;
         Ok(seq.max(0) as u64)
+    }
+
+    pub fn list_events_by_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+        limit: u32,
+    ) -> Result<Vec<Event>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, seq, type, payload, created_at
+             FROM events WHERE session_id = ?1 AND type = ?2
+             ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let rows =
+            statement.query_map(params![session_id, kind, limit.clamp(1, 10_000)], |row| {
+                let payload: String = row.get(3)?;
+                Ok(Event {
+                    session_id: row.get(0)?,
+                    seq: row.get::<_, i64>(1)? as u64,
+                    kind: row.get(2)?,
+                    payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                    created_at: row.get(4)?,
+                })
+            })?;
+        let mut events = Vec::new();
+        for event in rows {
+            events.push(event?);
+        }
+        Ok(events)
     }
 
     pub fn latest_event_by_kind(&self, session_id: &str, kind: &str) -> Result<Option<Event>> {

@@ -15,7 +15,7 @@ use tokio::time::timeout;
 use vp_protocol::types::{
     AgentInfo, AgentProbeResult, CapacityInfo, ConfigureAgentParams, ContextCompactionSummary,
     ContextMeasurement, MergeQueueEntry, PlanDepartment, PlanTask, Project, RoleModels, Session,
-    SessionCompactResult, StoredMessage, TeamPlan, TodoItem,
+    SessionCheckpoint, SessionCompactResult, SessionForkResult, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -494,18 +494,23 @@ struct RunControl {
     paused: watch::Sender<bool>,
     finalized: tokio::sync::Mutex<Option<String>>,
     manual: bool,
+    cancellable: bool,
 }
 
 impl RunControl {
     fn new() -> Self {
-        Self::with_manual(false)
+        Self::with_manual(false, true)
     }
 
     fn new_manual() -> Self {
-        Self::with_manual(true)
+        Self::with_manual(true, true)
     }
 
-    fn with_manual(manual: bool) -> Self {
+    fn new_operation() -> Self {
+        Self::with_manual(true, false)
+    }
+
+    fn with_manual(manual: bool, cancellable: bool) -> Self {
         let (cancelled, _) = watch::channel(false);
         let (paused, _) = watch::channel(false);
         Self {
@@ -513,6 +518,7 @@ impl RunControl {
             paused,
             finalized: tokio::sync::Mutex::new(None),
             manual,
+            cancellable,
         }
     }
 
@@ -2804,6 +2810,71 @@ impl AgentService {
         Ok(started)
     }
 
+    /// Serialize a checkpoint with prompt/plan/compaction operations. The
+    /// checkpoint itself is provider-free but reads Git state and messages, so
+    /// it must not race a run.
+    pub async fn checkpoint_now(
+        &self,
+        session_id: &str,
+        label: Option<String>,
+    ) -> Result<SessionCheckpoint> {
+        self.begin_operation(session_id)?;
+        let result = self.engine.checkpoint_session(session_id, label).await;
+        self.end_operation(session_id);
+        result
+    }
+
+    /// Serialize a fork with prompt/plan/compaction operations on the source
+    /// session. The new session is created only after the source is quiescent.
+    pub async fn fork_now(
+        &self,
+        source_session_id: &str,
+        checkpoint_id: Option<&str>,
+        goal: Option<String>,
+    ) -> Result<SessionForkResult> {
+        self.begin_operation(source_session_id)?;
+        let result = self
+            .engine
+            .fork_session(source_session_id, checkpoint_id, goal)
+            .await;
+        self.end_operation(source_session_id);
+        result
+    }
+
+    fn begin_manual_operation(&self, session_id: &str) -> Result<Arc<RunControl>> {
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| anyhow!("agent run mutex poisoned"))?;
+        if runs.contains_key(session_id) {
+            anyhow::bail!("session is already running");
+        }
+        let control = Arc::new(RunControl::new_manual());
+        runs.insert(session_id.to_string(), control.clone());
+        Ok(control)
+    }
+
+    fn begin_operation(&self, session_id: &str) -> Result<()> {
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| anyhow!("agent run mutex poisoned"))?;
+        if runs.contains_key(session_id) {
+            anyhow::bail!("session is already running");
+        }
+        runs.insert(
+            session_id.to_string(),
+            Arc::new(RunControl::new_operation()),
+        );
+        Ok(())
+    }
+
+    fn end_operation(&self, session_id: &str) {
+        if let Ok(mut runs) = self.runs.lock() {
+            runs.remove(session_id);
+        }
+    }
+
     /// Resume a stored TeamPlan without another Leader model call. Completed
     /// tasks are skipped; failed/blocked/cancelled/pending tasks are retried in
     /// dependency batches.
@@ -2835,19 +2906,10 @@ impl AgentService {
                 "session must not be queued, running, paused, or waiting for input while compacting context"
             );
         }
-        let control = Arc::new(RunControl::new_manual());
-        {
-            let mut runs = self
-                .runs
-                .lock()
-                .map_err(|_| anyhow!("agent run mutex poisoned"))?;
-            if runs.contains_key(session_id) {
-                anyhow::bail!("session is already running");
-            }
-            // Reuse the run registry so a prompt cannot start while the
-            // compaction call is in flight.
-            runs.insert(session_id.to_string(), control.clone());
-        }
+        // Reuse the run registry so a prompt cannot start while the
+        // compaction call is in flight. The manual control is cancellable but
+        // not pausable.
+        let control = self.begin_manual_operation(session_id)?;
         let result = async {
             let agents = self.engine.list_agents(session_id).await?;
             let leader = agents.into_iter().find(|agent| agent.role == "leader");
@@ -3004,9 +3066,7 @@ impl AgentService {
             })
         }
         .await;
-        if let Ok(mut runs) = self.runs.lock() {
-            runs.remove(session_id);
-        }
+        self.end_operation(session_id);
         result
     }
 
@@ -3183,6 +3243,9 @@ impl AgentService {
         if let Ok(runs) = self.runs.lock()
             && let Some(control) = runs.get(session_id)
         {
+            if !control.cancellable {
+                return false;
+            }
             control.cancel();
             return true;
         }

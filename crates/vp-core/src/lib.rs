@@ -21,12 +21,13 @@ use vp_protocol::types::{
     MemoryItem, MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult,
     MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult,
     PullRequestResult, Question, QuestionListResult, ScheduledTask, SearchResult, Session,
-    SessionBundle, SessionCommit, SessionContextStatus, SessionDiff, SessionImportResult,
-    SessionLandResult, SessionLogStatus, SessionPriorityResult, SessionRehydrateResult,
-    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TaskQueueResult,
-    TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult,
-    TerminalOpenResult, TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem,
-    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
+    SessionBundle, SessionCheckpoint, SessionCheckpointListResult, SessionCommit,
+    SessionContextStatus, SessionDiff, SessionForkResult, SessionImportResult, SessionLandResult,
+    SessionLogStatus, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
+    SessionTranscriptResult, ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy,
+    TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult, TerminalOpenResult,
+    TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem, UsageBucket,
+    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
     WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
     WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
 };
@@ -584,6 +585,405 @@ impl Engine {
             .append_event(&session.id, "session.created", payload)
             .await?;
         Ok(session)
+    }
+
+    /// Snapshot the active conversation and committed session branch. The
+    /// worktree must be clean so the checkpoint commit is reproducible.
+    pub async fn checkpoint_session(
+        &self,
+        session_id: &str,
+        label: Option<String>,
+    ) -> Result<SessionCheckpoint> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        ensure_session_quiescent(&session, "create a checkpoint")?;
+        let worktree = PathBuf::from(
+            session
+                .worktree
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?,
+        );
+        if !worktree.is_dir() {
+            anyhow::bail!("session worktree is missing: {}", worktree.display());
+        }
+        let git_lock = self.git_lock.clone();
+        let head_path = worktree.clone();
+        let status_path = worktree.clone();
+        let (commit, status) = tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            Ok::<_, anyhow::Error>((
+                worktree::head_commit(&head_path)?,
+                worktree::status_porcelain(&status_path)?,
+            ))
+        })
+        .await??;
+        if !status.is_empty() {
+            anyhow::bail!(
+                "session worktree has uncommitted changes; commit or discard them before creating a checkpoint"
+            );
+        }
+        let (messages, start, summary) = self.load_active_snapshot(session_id).await?;
+        let start_message_id = messages.get(start).map(|message| message.id.clone());
+        let through_message_id = if start < messages.len() {
+            messages.last().map(|message| message.id.clone())
+        } else {
+            None
+        };
+        let message_count = messages.len().saturating_sub(start);
+        let checkpoint_id = Uuid::now_v7().to_string();
+        let label = label
+            .map(|label| label.trim().chars().take(120).collect::<String>())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| format!("checkpoint {}", &commit[..commit.len().min(8)]));
+        let payload = serde_json::json!({
+            "checkpoint_id": checkpoint_id,
+            "label": label,
+            "commit": commit,
+            "branch": session.branch,
+            "worktree": session.worktree,
+            "start_message_id": start_message_id,
+            "through_message_id": through_message_id,
+            "message_count": message_count,
+            "summary": summary,
+        });
+        let event = self
+            .append_event(session_id, "session.checkpoint", payload)
+            .await?;
+        checkpoint_from_event(&event)
+            .ok_or_else(|| anyhow::anyhow!("could not decode checkpoint event"))
+    }
+
+    pub async fn list_checkpoints(&self, session_id: &str) -> Result<SessionCheckpointListResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let events = tokio::task::spawn_blocking(move || {
+            store.list_events_by_kind(&id, "session.checkpoint", 1000)
+        })
+        .await??;
+        Ok(SessionCheckpointListResult {
+            checkpoints: events.iter().filter_map(checkpoint_from_event).collect(),
+        })
+    }
+
+    /// Create a new session/worktree from a checkpoint. Without an explicit
+    /// checkpoint, one is created at the source's current clean HEAD.
+    pub async fn fork_session(
+        &self,
+        source_session_id: &str,
+        checkpoint_id: Option<&str>,
+        goal: Option<String>,
+    ) -> Result<SessionForkResult> {
+        let store = self.store.clone();
+        let source_id = source_session_id.to_string();
+        let source = tokio::task::spawn_blocking(move || store.get_session(&source_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {source_session_id}"))?;
+        ensure_session_quiescent(&source, "fork a session")?;
+        let checkpoint = if let Some(checkpoint_id) = checkpoint_id {
+            self.list_checkpoints(source_session_id)
+                .await?
+                .checkpoints
+                .into_iter()
+                .find(|checkpoint| checkpoint.id == checkpoint_id)
+                .ok_or_else(|| anyhow::anyhow!("checkpoint not found: {checkpoint_id}"))?
+        } else {
+            self.checkpoint_session(source_session_id, None).await?
+        };
+        let store = self.store.clone();
+        let project_id = source.project_id.clone();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found: {}", source.project_id))?;
+        let goal = goal
+            .map(|goal| goal.trim().to_string())
+            .filter(|goal| !goal.is_empty())
+            .unwrap_or_else(|| format!("{} (fork)", source.goal));
+        let session_id = Uuid::now_v7().to_string();
+        let root = PathBuf::from(&project.root);
+        let data_dir = self.store.data_dir().to_path_buf();
+        let project_id_for_worktree = project.id.clone();
+        let session_id_for_worktree = session_id.clone();
+        let commit = checkpoint.commit.clone();
+        let git_lock = self.git_lock.clone();
+        let worktree = tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            worktree::create_from_commit(
+                &root,
+                &data_dir,
+                &project_id_for_worktree,
+                &session_id_for_worktree,
+                &commit,
+            )
+        })
+        .await??;
+        let worktree_path = worktree.path.to_string_lossy().to_string();
+        let branch = worktree.branch.clone();
+        let base_commit = worktree.base_commit.clone();
+        let store = self.store.clone();
+        let new_session = {
+            let session_id = session_id.clone();
+            let project_id = project.id.clone();
+            let goal = goal.clone();
+            let worktree_path = worktree_path.clone();
+            let branch = branch.clone();
+            let base_commit = base_commit.clone();
+            let token_budget = source.token_budget;
+            let cost_budget = source.cost_budget_usd;
+            let time_budget = source.time_budget_secs;
+            let priority = source.priority;
+            tokio::task::spawn_blocking(move || {
+                store.create_session_with_worktree(
+                    &session_id,
+                    &project_id,
+                    &goal,
+                    &worktree_path,
+                    &branch,
+                    token_budget,
+                    cost_budget,
+                    time_budget,
+                    &base_commit,
+                    priority,
+                )
+            })
+            .await?
+        };
+        let new_session = match new_session {
+            Ok(session) => session,
+            Err(error) => {
+                worktree::remove(&PathBuf::from(&project.root), &worktree.path, &branch);
+                return Err(error);
+            }
+        };
+
+        let created = serde_json::json!({
+            "goal": new_session.goal,
+            "project_id": new_session.project_id,
+            "worktree": new_session.worktree,
+            "branch": new_session.branch,
+            "priority": new_session.priority,
+            "token_budget": new_session.token_budget,
+            "cost_budget_usd": new_session.cost_budget_usd,
+            "time_budget_secs": new_session.time_budget_secs,
+            "base_commit": new_session.base_commit,
+            "created_at": new_session.created_at,
+            "forked_from_session_id": source.id,
+            "forked_from_checkpoint_id": checkpoint.id,
+            "forked_from_commit": checkpoint.commit,
+        });
+        self.append_event(&new_session.id, "session.created", created)
+            .await?;
+        let source_leader = self
+            .list_agents(source_session_id)
+            .await?
+            .into_iter()
+            .find(|agent| agent.role == "leader");
+        let model = source_leader
+            .map(|agent| agent.model)
+            .unwrap_or_else(|| "unconfigured".to_string());
+        if let Err(error) = self.create_leader_agent(&new_session.id, &model).await {
+            tracing::warn!(%error, session_id = %new_session.id, "could not seed forked leader agent");
+        }
+        self.append_event(
+            &new_session.id,
+            "session.forked",
+            serde_json::json!({
+                "source_session_id": source.id,
+                "source_goal": source.goal,
+                "checkpoint_id": checkpoint.id,
+                "commit": checkpoint.commit,
+                "message_count": checkpoint.message_count,
+                "has_summary": checkpoint.summary.is_some(),
+            }),
+        )
+        .await?;
+        self.copy_checkpoint_messages(source_session_id, &new_session.id, &checkpoint)
+            .await?;
+        if let Err(error) = self
+            .append_event(
+                source_session_id,
+                "session.forked",
+                serde_json::json!({
+                    "fork_session_id": new_session.id,
+                    "fork_goal": new_session.goal,
+                    "checkpoint_id": checkpoint.id,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%error, session_id = %source.id, "could not record source fork event");
+        }
+        Ok(SessionForkResult {
+            source_session_id: source.id,
+            checkpoint_id: checkpoint.id,
+            session: new_session,
+        })
+    }
+
+    async fn load_active_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<(Vec<StoredMessage>, usize, Option<String>)> {
+        let messages = self.list_messages(session_id).await?;
+        let mut start = 0usize;
+        let mut summary = None;
+        if let Some(event) = self
+            .latest_event_of_kind(session_id, "context.compacted")
+            .await?
+        {
+            let mode = event
+                .payload
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("summary");
+            let through = event
+                .payload
+                .get("through_message_id")
+                .and_then(serde_json::Value::as_str);
+            let text = event
+                .payload
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.trim().is_empty());
+            if let Some(through) = through
+                && let Some(index) = messages.iter().position(|message| message.id == through)
+            {
+                start = index.saturating_add(1);
+                if mode == "summary" {
+                    summary = text.map(str::to_string);
+                }
+            }
+        }
+        Ok((messages, start, summary))
+    }
+
+    async fn copy_checkpoint_messages(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        checkpoint: &SessionCheckpoint,
+    ) -> Result<usize> {
+        let messages = self.list_messages(source_session_id).await?;
+        let mut tool_names = std::collections::HashMap::new();
+        if let Some(summary) = &checkpoint.summary {
+            self.append_message(
+                target_session_id,
+                "user",
+                summary,
+                serde_json::json!([]),
+                None,
+            )
+            .await?;
+        }
+        let (start, end) = match (
+            checkpoint.start_message_id.as_deref(),
+            checkpoint.through_message_id.as_deref(),
+        ) {
+            (Some(start_id), Some(end_id)) => {
+                let start = messages
+                    .iter()
+                    .position(|message| message.id == start_id)
+                    .ok_or_else(|| anyhow::anyhow!("checkpoint start message is missing"))?;
+                let end = messages
+                    .iter()
+                    .position(|message| message.id == end_id)
+                    .ok_or_else(|| anyhow::anyhow!("checkpoint through message is missing"))?;
+                if end < start {
+                    anyhow::bail!("checkpoint message range is invalid");
+                }
+                (start, end)
+            }
+            (None, None) => return Ok(0),
+            _ => anyhow::bail!("checkpoint message range is incomplete"),
+        };
+
+        let mut copied = 0usize;
+        for message in &messages[start..=end] {
+            let tool_calls = message.tool_calls.clone();
+            self.append_message(
+                target_session_id,
+                &message.role,
+                &message.content,
+                tool_calls.clone(),
+                message.tool_call_id.clone(),
+            )
+            .await?;
+            if message.role == "assistant" {
+                if !message.content.trim().is_empty() {
+                    self.append_event(
+                        target_session_id,
+                        "agent.message",
+                        serde_json::json!({
+                            "text": message.content,
+                            "agent_role": "leader",
+                            "agent_name": "Leader",
+                            "forked": true,
+                        }),
+                    )
+                    .await?;
+                }
+                if let Some(calls) = tool_calls.as_array() {
+                    for call in calls {
+                        let Some(id) = call.get("id").and_then(serde_json::Value::as_str) else {
+                            continue;
+                        };
+                        let name = call
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("tool");
+                        let arguments = call
+                            .get("arguments")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        tool_names.insert(id.to_string(), name.to_string());
+                        let input = serde_json::from_str::<serde_json::Value>(arguments)
+                            .unwrap_or(serde_json::Value::Null);
+                        self.append_event(
+                            target_session_id,
+                            "tool.started",
+                            serde_json::json!({
+                                "tool_call_id": id,
+                                "name": name,
+                                "input": input,
+                                "agent_role": "leader",
+                                "agent_name": "Leader",
+                                "forked": true,
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+            } else if message.role == "tool"
+                && let Some(tool_call_id) = &message.tool_call_id
+            {
+                let name = tool_names
+                    .get(tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| "tool".to_string());
+                self.append_event(
+                    target_session_id,
+                    "tool.finished",
+                    serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "name": name,
+                        "output": message.content,
+                        "is_error": false,
+                        "agent_role": "leader",
+                        "agent_name": "Leader",
+                        "forked": true,
+                    }),
+                )
+                .await?;
+            }
+            copied += 1;
+        }
+        Ok(copied)
     }
 
     pub async fn ensure_session_worktree(&self, session_id: &str) -> Result<Session> {
@@ -5408,6 +5808,61 @@ fn validate_acp_agent_fields(
         anyhow::bail!("ACP agent timeout must be between 30 and 14400 seconds");
     }
     Ok(name.to_string())
+}
+
+fn ensure_session_quiescent(session: &Session, action: &str) -> Result<()> {
+    if session.status == "imported" {
+        anyhow::bail!("imported sessions are read-only archives");
+    }
+    if matches!(
+        session.status.as_str(),
+        "queued" | "running" | "paused" | "waiting_input"
+    ) {
+        anyhow::bail!(
+            "session must not be queued, running, paused, or waiting for input to {action}"
+        );
+    }
+    Ok(())
+}
+
+fn checkpoint_from_event(event: &Event) -> Option<SessionCheckpoint> {
+    let payload = event.payload.as_object()?;
+    Some(SessionCheckpoint {
+        id: payload.get("checkpoint_id")?.as_str()?.to_string(),
+        session_id: event.session_id.clone(),
+        label: payload
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("checkpoint")
+            .to_string(),
+        commit: payload.get("commit")?.as_str()?.to_string(),
+        branch: payload
+            .get("branch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        start_message_id: payload
+            .get("start_message_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        through_message_id: payload
+            .get("through_message_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        message_count: payload
+            .get("message_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        summary: payload
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        created_at: payload
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&event.created_at)
+            .to_string(),
+    })
 }
 
 #[cfg(test)]

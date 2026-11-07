@@ -110,6 +110,7 @@
 | [0098](adr/0098-model-aware-context-budget.md) | Model-aware context budgets, rolling trim, and context usage observability | Accepted | Agent/上下文 |
 | [0099](adr/0099-manual-context-compaction.md) | Manual context compaction for idle sessions | Accepted | Agent/上下文 |
 | [0100](adr/0100-context-estimate-calibration.md) | Calibrate context estimates with provider usage | Accepted | Agent/上下文 |
+| [0101](adr/0101-session-checkpoints-and-forks.md) | Session checkpoints and forks | Accepted | Session/Git |
 
 ---
 

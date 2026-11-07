@@ -36,6 +36,7 @@ private struct ProjectStageView: View {
     @State private var draft = ""
     @State private var showingSearch = false
     @State private var showingContext = false
+    @State private var showingFork = false
     @FocusState private var composerFocused: Bool
 
     var body: some View {
@@ -52,6 +53,12 @@ private struct ProjectStageView: View {
         .sheet(isPresented: $showingSearch) {
             SearchSheet()
                 .environment(model)
+        }
+        .sheet(isPresented: $showingFork) {
+            if let session = model.selectedSession {
+                ForkSessionSheet(session: session)
+                    .environment(model)
+            }
         }
     }
 
@@ -147,6 +154,9 @@ private struct ProjectStageView: View {
                     }
                     if model.selectedSession != nil {
                         Divider()
+                        Button("Fork Session…") {
+                            showingFork = true
+                        }
                         Button("Export Transcript…") {
                             Task { await model.exportTranscript() }
                         }
@@ -415,6 +425,83 @@ private struct ContextPopoverView: View {
     }
 }
 
+private struct ForkSessionSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let session: Session
+    @State private var goal = ""
+    @State private var error: String?
+    @State private var busy = false
+    @State private var checkpointID = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Fork Session")
+                .font(.title3.weight(.semibold))
+            Text(
+                "Creates a new session from a clean checkpoint of the committed branch and active conversation. Commit or discard uncommitted worktree changes first."
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            Picker("Start from", selection: $checkpointID) {
+                Text("Current clean HEAD").tag("")
+                ForEach(model.checkpoints) { checkpoint in
+                    Text(
+                        "\(checkpoint.label) · \(String(checkpoint.commit.prefix(8))) · \(checkpoint.messageCount) msgs"
+                    )
+                    .tag(checkpoint.id)
+                }
+            }
+            .pickerStyle(.menu)
+            TextField("Goal", text: $goal, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(2 ... 4)
+            if let error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button(busy ? "Forking…" : "Fork Session") {
+                    Task { await fork() }
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(busy || model.forkBusy || goal.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 500)
+        .onAppear {
+            goal = "\(session.goal) (fork)"
+            checkpointID = ""
+            error = nil
+            Task { await model.loadCheckpoints() }
+        }
+    }
+
+    private func fork() async {
+        busy = true
+        error = nil
+        let success = await model.forkSession(
+            goal: goal,
+            checkpointID: checkpointID.isEmpty ? nil : checkpointID
+        )
+        busy = false
+        if success {
+            dismiss()
+        } else {
+            error = "Fork failed. The session must be idle and its worktree must be clean."
+        }
+    }
+}
+
 struct SessionChatView: View {
     @Environment(AppModel.self) private var model
     let session: Session
@@ -426,6 +513,24 @@ struct SessionChatView: View {
 
         for event in model.events {
             switch event.type {
+            case "session.forked":
+                if let source = event.payload.objectValue?["source_session_id"]?.stringValue,
+                   let commit = event.payload.objectValue?["commit"]?.stringValue
+                {
+                    result.append(
+                        .notice(
+                            id: event.id,
+                            text: "Forked from \(String(source.prefix(8))) at \(String(commit.prefix(8)))"
+                        )
+                    )
+                } else if let target = event.payload.objectValue?["fork_session_id"]?.stringValue {
+                    result.append(
+                        .notice(
+                            id: event.id,
+                            text: "Forked to session \(String(target.prefix(8)))"
+                        )
+                    )
+                }
             case "message.created":
                 guard event.payload.objectValue?["role"]?.stringValue == "user",
                       let content = event.payload.objectValue?["content"]?.stringValue

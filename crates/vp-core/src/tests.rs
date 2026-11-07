@@ -3008,3 +3008,303 @@ for line in sys.stdin:
     .unwrap();
     path
 }
+
+fn commit_worktree_file(worktree: &Path, name: &str, content: &str) {
+    std::fs::write(worktree.join(name), content).unwrap();
+    for args in [vec!["add", name], vec!["commit", "-q", "-m", "checkpoint"]] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+#[tokio::test]
+async fn checkpoints_and_forks_preserve_committed_branch_and_active_conversation() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("fork".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "fork source".into(), None)
+        .await
+        .unwrap();
+    engine
+        .append_message(&session.id, "user", "first", serde_json::json!([]), None)
+        .await
+        .unwrap();
+    engine
+        .append_message(
+            &session.id,
+            "assistant",
+            "answer one",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .append_message(
+            &session.id,
+            "assistant",
+            "",
+            serde_json::json!([{
+                "id": "call_1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }]),
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .append_message(
+            &session.id,
+            "tool",
+            "file body",
+            serde_json::json!([]),
+            Some("call_1".into()),
+        )
+        .await
+        .unwrap();
+    engine
+        .append_message(&session.id, "user", "second", serde_json::json!([]), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    commit_worktree_file(&worktree, "checkpoint.txt", "committed state\n");
+    let commit = crate::worktree::head_commit(&worktree).unwrap();
+    let source_messages = engine.list_messages(&session.id).await.unwrap();
+
+    let checkpoint = engine
+        .checkpoint_session(&session.id, Some("before fork".into()))
+        .await
+        .unwrap();
+    assert_eq!(checkpoint.commit, commit);
+    assert_eq!(checkpoint.label, "before fork");
+    assert_eq!(checkpoint.message_count, source_messages.len());
+    assert_eq!(checkpoint.summary, None);
+    assert_eq!(
+        checkpoint.start_message_id.as_deref(),
+        Some(source_messages.first().unwrap().id.as_str())
+    );
+    assert_eq!(
+        checkpoint.through_message_id.as_deref(),
+        Some(source_messages.last().unwrap().id.as_str())
+    );
+    assert_eq!(
+        engine
+            .list_checkpoints(&session.id)
+            .await
+            .unwrap()
+            .checkpoints
+            .len(),
+        1
+    );
+
+    engine
+        .append_message(
+            &session.id,
+            "user",
+            "after checkpoint",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    let fork = engine
+        .fork_session(
+            &session.id,
+            Some(&checkpoint.id),
+            Some("explore alternative".into()),
+        )
+        .await
+        .unwrap();
+    assert_ne!(fork.session.id, session.id);
+    assert_eq!(fork.session.goal, "explore alternative");
+    assert_eq!(fork.session.status, "draft");
+    assert_eq!(fork.session.base_commit.as_deref(), Some(commit.as_str()));
+    assert_ne!(fork.session.branch, session.branch);
+    let fork_worktree = PathBuf::from(fork.session.worktree.clone().unwrap());
+    assert!(fork_worktree.is_dir());
+    assert_eq!(
+        crate::worktree::head_commit(&fork_worktree).unwrap(),
+        commit
+    );
+
+    let copied = engine.list_messages(&fork.session.id).await.unwrap();
+    assert_eq!(copied.len(), source_messages.len());
+    for (source, target) in source_messages.iter().zip(&copied) {
+        assert_eq!(source.role, target.role);
+        assert_eq!(source.content, target.content);
+        assert_eq!(source.tool_call_id, target.tool_call_id);
+    }
+    assert!(
+        !copied
+            .iter()
+            .any(|message| message.content == "after checkpoint")
+    );
+    let fork_events = engine
+        .list_events(fork.session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        fork_events
+            .iter()
+            .any(|event| event.kind == "session.forked")
+    );
+    assert!(fork_events.iter().any(|event| event.kind == "tool.started"));
+    assert!(
+        fork_events
+            .iter()
+            .any(|event| event.kind == "tool.finished")
+    );
+    assert!(
+        fork_events
+            .iter()
+            .any(|event| event.kind == "agent.message")
+    );
+    let source_events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(source_events.iter().any(|event| {
+        event.kind == "session.checkpoint" && event.payload["label"] == "before fork"
+    }));
+    assert!(source_events.iter().any(|event| {
+        event.kind == "session.forked" && event.payload["fork_session_id"] == fork.session.id
+    }));
+}
+
+#[tokio::test]
+async fn forks_copy_a_compaction_summary_and_tail_only() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("summary fork".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "summary source".into(), None)
+        .await
+        .unwrap();
+    let _one = engine
+        .append_message(&session.id, "user", "one", serde_json::json!([]), None)
+        .await
+        .unwrap();
+    let two = engine
+        .append_message(&session.id, "assistant", "two", serde_json::json!([]), None)
+        .await
+        .unwrap();
+    let three = engine
+        .append_message(&session.id, "user", "three", serde_json::json!([]), None)
+        .await
+        .unwrap();
+    let four = engine
+        .append_message(
+            &session.id,
+            "assistant",
+            "four",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    let summary = "Earlier conversation summary (auto-compacted from 2 messages):\nkeep this";
+    engine
+        .append_event(
+            &session.id,
+            "context.compacted",
+            serde_json::json!({
+                "mode": "summary",
+                "through_message_id": two.id,
+                "summary": summary,
+                "summarized_messages": 2,
+                "dropped_messages": 0,
+                "kept_messages": 2,
+                "estimated_tokens_before": 100,
+                "estimated_tokens_after": 50,
+            }),
+        )
+        .await
+        .unwrap();
+    let checkpoint = engine.checkpoint_session(&session.id, None).await.unwrap();
+    assert_eq!(checkpoint.summary.as_deref(), Some(summary));
+    assert_eq!(checkpoint.message_count, 2);
+    assert_eq!(
+        checkpoint.start_message_id.as_deref(),
+        Some(three.id.as_str())
+    );
+    assert_eq!(
+        checkpoint.through_message_id.as_deref(),
+        Some(four.id.as_str())
+    );
+
+    let fork = engine
+        .fork_session(&session.id, Some(&checkpoint.id), None)
+        .await
+        .unwrap();
+    let copied = engine.list_messages(&fork.session.id).await.unwrap();
+    assert_eq!(copied.len(), 3);
+    assert_eq!(copied[0].role, "user");
+    assert_eq!(copied[0].content, summary);
+    assert_eq!(copied[1].content, "three");
+    assert_eq!(copied[2].content, "four");
+}
+
+#[tokio::test]
+async fn checkpoints_reject_dirty_or_active_sessions() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("dirty".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "dirty source".into(), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    std::fs::write(worktree.join("dirty.txt"), "not committed\n").unwrap();
+    let error = engine
+        .checkpoint_session(&session.id, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("uncommitted changes"));
+
+    std::fs::remove_file(worktree.join("dirty.txt")).unwrap();
+    engine
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    let error = engine
+        .checkpoint_session(&session.id, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("session must not be queued"));
+    let error = engine
+        .fork_session(&session.id, None, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("session must not be queued"));
+}

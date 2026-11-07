@@ -1535,6 +1535,60 @@ pub struct SessionCompactParams {
     pub session_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionCheckpoint {
+    pub id: String,
+    pub session_id: String,
+    pub label: String,
+    pub commit: String,
+    pub branch: String,
+    #[serde(default)]
+    pub start_message_id: Option<String>,
+    #[serde(default)]
+    pub through_message_id: Option<String>,
+    #[serde(default)]
+    pub message_count: usize,
+    /// Prefixed summary injected at the head of the active conversation, if
+    /// the source had already been compacted.
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCheckpointParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCheckpointListParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCheckpointListResult {
+    pub checkpoints: Vec<SessionCheckpoint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionForkParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionForkResult {
+    pub source_session_id: String,
+    pub checkpoint_id: String,
+    pub session: Session,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptParams {
     pub session_id: String,

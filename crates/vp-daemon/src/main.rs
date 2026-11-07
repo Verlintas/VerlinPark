@@ -40,11 +40,12 @@ use vp_protocol::types::{
     PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams, PromptParams,
     PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
     ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
-    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionCompactParams,
-    SessionContextParams, SessionDiffParams, SessionExportParams, SessionImportParams,
-    SessionListResult, SessionLogParams, SessionPauseParams, SessionPauseResult,
-    SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
-    SessionTodosParams, SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
+    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionCheckpointListParams,
+    SessionCheckpointParams, SessionCompactParams, SessionContextParams, SessionDiffParams,
+    SessionExportParams, SessionForkParams, SessionImportParams, SessionListResult,
+    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
+    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
+    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
     SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
     SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
     SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
@@ -895,6 +896,41 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "session.compact" => match parse_params::<SessionCompactParams>(request.params) {
             Ok(params) => match state.agent.compact_now(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.checkpoint" => match parse_params::<SessionCheckpointParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .checkpoint_now(&params.session_id, params.label)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.checkpoints" => {
+            match parse_params::<SessionCheckpointListParams>(request.params) {
+                Ok(params) => match state.engine.list_checkpoints(&params.session_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.fork" => match parse_params::<SessionForkParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .fork_now(
+                    &params.session_id,
+                    params.checkpoint_id.as_deref(),
+                    params.goal,
+                )
+                .await
+            {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },

@@ -103,6 +103,60 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(status.lastMeasurement?.samples, 3)
     }
 
+    func testSessionForkResultDecodes() throws {
+        let json = """
+        {
+          "source_session_id": "source-1",
+          "checkpoint_id": "checkpoint-1",
+          "session": {
+            "id": "fork-1",
+            "project_id": "project-1",
+            "goal": "forked task",
+            "status": "draft",
+            "priority": 5,
+            "worktree": "/tmp/worktree",
+            "branch": "verlinpark/fork-1",
+            "token_budget": 100000,
+            "cost_budget_usd": 2.5,
+            "time_budget_secs": 3600,
+            "cost_spent_usd": 0.0,
+            "base_commit": "abc123",
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "created_at": "2026-11-08T00:00:00Z"
+          }
+        }
+        """
+        let result = try JSONDecoder().decode(SessionForkResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.sourceSessionID, "source-1")
+        XCTAssertEqual(result.checkpointID, "checkpoint-1")
+        XCTAssertEqual(result.session.id, "fork-1")
+        XCTAssertEqual(result.session.baseCommit, "abc123")
+        XCTAssertEqual(result.session.branch, "verlinpark/fork-1")
+    }
+
+    func testSessionCheckpointDecodes() throws {
+        let json = """
+        {
+          "id": "checkpoint-1",
+          "session_id": "session-1",
+          "label": "before fork",
+          "commit": "abc123",
+          "branch": "verlinpark/session-1",
+          "start_message_id": "message-1",
+          "through_message_id": "message-4",
+          "message_count": 4,
+          "summary": "Earlier conversation summary",
+          "created_at": "2026-11-08T00:00:00Z"
+        }
+        """
+        let checkpoint = try JSONDecoder().decode(SessionCheckpoint.self, from: Data(json.utf8))
+        XCTAssertEqual(checkpoint.id, "checkpoint-1")
+        XCTAssertEqual(checkpoint.messageCount, 4)
+        XCTAssertEqual(checkpoint.startMessageID, "message-1")
+        XCTAssertEqual(checkpoint.summary, "Earlier conversation summary")
+    }
+
     func testSessionCompactResultDecodes() throws {
         let json = """
         {

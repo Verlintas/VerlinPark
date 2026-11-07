@@ -1213,6 +1213,48 @@ struct SessionContextStatus: Codable, Sendable {
     }
 }
 
+struct SessionCheckpoint: Codable, Sendable, Identifiable {
+    let id: String
+    let sessionID: String
+    let label: String
+    let commit: String
+    let branch: String
+    let startMessageID: String?
+    let throughMessageID: String?
+    let messageCount: Int
+    let summary: String?
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionID = "session_id"
+        case label
+        case commit
+        case branch
+        case startMessageID = "start_message_id"
+        case throughMessageID = "through_message_id"
+        case messageCount = "message_count"
+        case summary
+        case createdAt = "created_at"
+    }
+}
+
+struct SessionCheckpointListResult: Codable, Sendable {
+    let checkpoints: [SessionCheckpoint]
+}
+
+struct SessionForkResult: Codable, Sendable {
+    let sourceSessionID: String
+    let checkpointID: String
+    let session: Session
+
+    enum CodingKeys: String, CodingKey {
+        case sourceSessionID = "source_session_id"
+        case checkpointID = "checkpoint_id"
+        case session
+    }
+}
+
 struct SessionCompactResult: Codable, Sendable {
     let sessionID: String
     let compacted: Bool

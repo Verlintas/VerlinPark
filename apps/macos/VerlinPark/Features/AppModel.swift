@@ -176,6 +176,8 @@ final class AppModel {
     var contextStatus: SessionContextStatus?
     var compactBusy = false
     var compactNotice: String?
+    var forkBusy = false
+    var checkpoints: [SessionCheckpoint] = []
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -355,6 +357,7 @@ final class AppModel {
             events = []
             contextStatus = nil
             compactNotice = nil
+            checkpoints = []
             sessionDiff = nil
             todos = []
             agents = []
@@ -409,6 +412,7 @@ final class AppModel {
         events = []
         contextStatus = nil
         compactNotice = nil
+        checkpoints = []
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -445,6 +449,7 @@ final class AppModel {
         streamingText = ""
         contextStatus = nil
         compactNotice = nil
+        checkpoints = []
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -2599,6 +2604,40 @@ final class AppModel {
             }
         } catch {
             // Context status is diagnostic; do not surface a transient RPC error.
+        }
+    }
+
+    func forkSession(goal: String, checkpointID: String? = nil) async -> Bool {
+        guard let sourceSessionID = selectedSessionID else { return false }
+        forkBusy = true
+        defer { forkBusy = false }
+        do {
+            let result = try await core.forkSession(
+                sessionID: sourceSessionID,
+                checkpointID: checkpointID,
+                goal: goal
+            )
+            await loadSessions()
+            selectSession(result.session.id)
+            return true
+        } catch {
+            handle(error)
+            return false
+        }
+    }
+
+    func loadCheckpoints() async {
+        guard let sessionID = selectedSessionID else {
+            checkpoints = []
+            return
+        }
+        do {
+            let loaded = try await core.listCheckpoints(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                checkpoints = loaded
+            }
+        } catch {
+            checkpoints = []
         }
     }
 

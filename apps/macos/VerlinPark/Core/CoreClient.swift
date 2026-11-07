@@ -221,6 +221,42 @@ actor CoreClient {
             .decode(Session.self)
     }
 
+    func checkpointSession(sessionID: String, label: String?) async throws -> SessionCheckpoint {
+        try await request(
+            method: "session.checkpoint",
+            params: [
+                "session_id": .string(sessionID),
+                "label": label.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(SessionCheckpoint.self)
+    }
+
+    func listCheckpoints(sessionID: String) async throws -> [SessionCheckpoint] {
+        try await request(
+            method: "session.checkpoints",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionCheckpointListResult.self)
+        .checkpoints
+    }
+
+    func forkSession(
+        sessionID: String,
+        checkpointID: String?,
+        goal: String?
+    ) async throws -> SessionForkResult {
+        try await request(
+            method: "session.fork",
+            params: [
+                "session_id": .string(sessionID),
+                "checkpoint_id": checkpointID.map(JSONValue.string) ?? .null,
+                "goal": goal.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(SessionForkResult.self)
+    }
+
     func compactSession(sessionID: String) async throws -> SessionCompactResult {
         try await request(
             method: "session.compact",

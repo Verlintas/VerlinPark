@@ -82,6 +82,76 @@ pub fn create(
     })
 }
 
+/// Create a session worktree at an exact commit. Used by session forks so the
+/// new branch starts from the checkpoint's committed tree, not current HEAD.
+pub fn create_from_commit(
+    project_root: &Path,
+    data_dir: &Path,
+    project_id: &str,
+    session_id: &str,
+    commit: &str,
+) -> Result<WorktreeInfo> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving project root {}", project_root.display()))?;
+    let branch = format!("verlinpark/{session_id}");
+    let path = data_dir
+        .join("worktrees")
+        .join(project_id)
+        .join(session_id)
+        .join("leader");
+    let resolved = git_output(
+        &root,
+        &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+    )
+    .with_context(|| format!("resolving checkpoint commit {commit}"))?;
+
+    if path.join(".git").is_file() {
+        return Ok(WorktreeInfo {
+            path,
+            branch,
+            base_commit: resolved,
+        });
+    }
+
+    run_git(&root, &["worktree", "prune"])?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating worktree directory {}", parent.display()))?;
+    }
+    if branch_exists(&root, &branch)? {
+        bail!("fork branch already exists: {branch}");
+    }
+    run_git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            path.to_str()
+                .ok_or_else(|| anyhow!("worktree path is not valid UTF-8"))?,
+            &resolved,
+        ],
+    )?;
+    Ok(WorktreeInfo {
+        path,
+        branch,
+        base_commit: resolved,
+    })
+}
+
+/// Porcelain status for a worktree. Ignored files do not appear, so normal
+/// build outputs do not block checkpoints.
+pub fn status_porcelain(worktree: &Path) -> Result<String> {
+    git_output(worktree, &["status", "--porcelain"])
+}
+
+/// Current branch name for a session worktree.
+pub fn current_branch(worktree: &Path) -> Result<String> {
+    git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+}
+
 /// Create a Worker worktree based on the session branch.
 pub fn create_task(
     project_root: &Path,
