@@ -2871,3 +2871,135 @@ async fn updates_session_priority_and_rebuilds_the_projection() {
         50
     );
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn manages_and_probes_acp_agents() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("acp".into()),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        engine
+            .add_acp_agent(
+                "",
+                "npx",
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                true,
+                false,
+                900,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .add_acp_agent(
+                "short-timeout",
+                "npx",
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                true,
+                false,
+                10,
+            )
+            .await
+            .is_err()
+    );
+    let agent = engine
+        .add_acp_agent(
+            "fake",
+            "/usr/bin/python3",
+            vec![script_path(&data, &project).to_string_lossy().to_string()],
+            std::collections::BTreeMap::new(),
+            true,
+            true,
+            120,
+        )
+        .await
+        .unwrap();
+    assert_eq!(engine.list_acp_agents().await.unwrap().agents.len(), 1);
+    assert_eq!(
+        engine.resolve_acp_agent("fake").await.unwrap().unwrap().id,
+        agent.id
+    );
+    assert!(
+        engine
+            .add_acp_agent(
+                "fake",
+                "npx",
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                true,
+                false,
+                900,
+            )
+            .await
+            .is_err(),
+        "ACP agent names are unique"
+    );
+    let updated = engine
+        .update_acp_agent(
+            &agent.id,
+            "fake-2",
+            "/usr/bin/python3",
+            agent.args.clone(),
+            std::collections::BTreeMap::new(),
+            true,
+            true,
+            120,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.name, "fake-2");
+    assert!(updated.auto_approve);
+
+    let probe = engine
+        .probe_acp_agent("fake-2", Some(project.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(probe.agent_name, "probe-acp");
+    assert_eq!(probe.protocol_version, 1);
+    assert!(probe.session_created);
+    assert!(engine.remove_acp_agent(&agent.id).await.unwrap());
+    assert!(engine.list_acp_agents().await.unwrap().agents.is_empty());
+}
+
+fn script_path(data: &TempDir, _project: &vp_protocol::types::Project) -> std::path::PathBuf {
+    let path = data.path().join("probe-acp-agent.py");
+    std::fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json, sys
+
+def reply(req, result):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req.get("id"), "result": result}) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        reply(req, {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": [], "agentInfo": {"name": "probe-acp", "version": "1.2.3"}})
+    elif method == "session/new":
+        reply(req, {"sessionId": "probe-session"})
+    else:
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32601, "message": "not found"}}) + "\n")
+        sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+    path
+}

@@ -529,6 +529,70 @@ actor CoreClient {
             .decode(UsageLedgerResult.self)
     }
 
+    func listAcpAgents() async throws -> [AcpAgent] {
+        try await request(method: "acp.agent.list", params: [:])
+            .decode(AcpAgentListResult.self)
+            .agents
+    }
+
+    func addAcpAgent(
+        name: String,
+        command: String,
+        args: [String],
+        autoApprove: Bool,
+        timeoutSecs: Int
+    ) async throws -> AcpAgent {
+        let params: [String: JSONValue] = [
+            "name": .string(name),
+            "command": .string(command),
+            "args": .array(args.map(JSONValue.string)),
+            "enabled": .bool(true),
+            "auto_approve": .bool(autoApprove),
+            "timeout_secs": .number(Double(timeoutSecs)),
+        ]
+        return try await request(method: "acp.agent.add", params: params)
+            .decode(AcpAgentResult.self)
+            .agent
+    }
+
+    func updateAcpAgent(
+        _ agent: AcpAgent,
+        enabled: Bool,
+        autoApprove: Bool
+    ) async throws -> AcpAgent {
+        let params: [String: JSONValue] = [
+            "id": .string(agent.id),
+            "name": .string(agent.name),
+            "command": .string(agent.command),
+            "args": .array(agent.args.map(JSONValue.string)),
+            "env": .object(agent.env.mapValues(JSONValue.string)),
+            "enabled": .bool(enabled),
+            "auto_approve": .bool(autoApprove),
+            "timeout_secs": .number(Double(agent.timeoutSecs)),
+        ]
+        return try await request(method: "acp.agent.update", params: params)
+            .decode(AcpAgentResult.self)
+            .agent
+    }
+
+    func removeAcpAgent(id: String) async throws -> Bool {
+        try await request(
+            method: "acp.agent.remove",
+            params: ["agent_id": .string(id)]
+        )
+        .decode(AcpRemoveResult.self)
+        .removed
+    }
+
+    func probeAcpAgent(id: String, projectID: String?) async throws -> AcpProbeResult {
+        var params: [String: JSONValue] = ["agent_id": .string(id)]
+        if let projectID {
+            params["project_id"] = .string(projectID)
+        }
+        return try await request(method: "acp.agent.probe", params: params)
+            .decode(AcpProbeResult.self)
+    }
+
     func listMcpServers() async throws -> [McpServer] {
         try await request(method: "mcp.server.list", params: [:])
             .decode(McpServerListResult.self)

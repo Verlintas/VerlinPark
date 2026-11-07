@@ -850,6 +850,93 @@ pub struct McpToolListResult {
     pub tools: Vec<McpTool>,
 }
 
+/// A configured external agent that speaks the Agent Client Protocol over stdio.
+///
+/// ACP agents run as user-installed executables, are spawned inside the same
+/// Seatbelt write sandbox as shell work, and are recorded as Worker agents when
+/// they are delegated a task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpAgent {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub enabled: bool,
+    /// Skip VerlinPark approval prompts for this agent's own permission requests.
+    #[serde(default)]
+    pub auto_approve: bool,
+    #[serde(default = "default_acp_timeout")]
+    pub timeout_secs: u64,
+    pub created_at: String,
+}
+
+fn default_acp_timeout() -> u64 {
+    1_800
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddAcpAgentParams {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_approve: bool,
+    #[serde(default = "default_acp_timeout")]
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateAcpAgentParams {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_approve: bool,
+    #[serde(default = "default_acp_timeout")]
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcpAgentIdParams {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcpProbeParams {
+    pub agent_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AcpAgentListResult {
+    pub agents: Vec<AcpAgent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AcpProbeResult {
+    pub agent_id: String,
+    pub agent_name: String,
+    pub version: String,
+    pub protocol_version: u16,
+    pub session_created: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpResource {
     pub uri: String,

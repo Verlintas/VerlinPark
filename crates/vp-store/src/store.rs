@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
-    MailboxPolicy, McpServer, MemoryItem, MemoryPolicy, MergeQueueEntry, Project, ProjectBudget,
-    ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy,
-    StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy,
-    WriteLease,
+    AcpAgent, AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event,
+    IntegrationPolicy, MailboxPolicy, McpServer, MemoryItem, MemoryPolicy, MergeQueueEntry,
+    Project, ProjectBudget, ProjectUsageSession, Question, ScheduledTask, SearchHit, Session,
+    SessionBundle, ShellPolicy, StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry,
+    WorktreeRetentionPolicy, WriteLease,
 };
 
 use crate::paths;
@@ -329,6 +329,18 @@ impl Store {
                 env         TEXT NOT NULL,
                 enabled     INTEGER NOT NULL DEFAULT 1,
                 created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS acp_agents (
+                id           TEXT PRIMARY KEY,
+                name         TEXT NOT NULL UNIQUE,
+                command      TEXT NOT NULL,
+                args         TEXT NOT NULL,
+                env          TEXT NOT NULL,
+                enabled      INTEGER NOT NULL DEFAULT 1,
+                auto_approve INTEGER NOT NULL DEFAULT 0,
+                timeout_secs INTEGER NOT NULL DEFAULT 1800,
+                created_at   TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_memory_policies (
@@ -2239,6 +2251,122 @@ impl Store {
     pub fn remove_mcp_server(&self, server_id: &str) -> Result<bool> {
         let conn = self.lock()?;
         Ok(conn.execute("DELETE FROM mcp_servers WHERE id = ?1", params![server_id])? > 0)
+    }
+
+    pub fn list_acp_agents(&self) -> Result<Vec<AcpAgent>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at
+             FROM acp_agents ORDER BY name ASC",
+        )?;
+        let rows = stmt.query_map([], map_acp_agent)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_acp_agent(&self, agent_id: &str) -> Result<Option<AcpAgent>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at
+             FROM acp_agents WHERE id = ?1",
+            params![agent_id],
+            map_acp_agent,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn find_acp_agent(&self, identifier: &str) -> Result<Option<AcpAgent>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at
+             FROM acp_agents WHERE id = ?1 OR name = ?1",
+            params![identifier],
+            map_acp_agent,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_acp_agent(
+        &self,
+        name: &str,
+        command: &str,
+        args: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+        enabled: bool,
+        auto_approve: bool,
+        timeout_secs: u64,
+    ) -> Result<AcpAgent> {
+        let agent = AcpAgent {
+            id: Uuid::now_v7().to_string(),
+            name: name.to_string(),
+            command: command.to_string(),
+            args: args.to_vec(),
+            env: env.clone(),
+            enabled,
+            auto_approve,
+            timeout_secs,
+            created_at: now_rfc3339(),
+        };
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO acp_agents
+             (id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                agent.id,
+                agent.name,
+                agent.command,
+                serde_json::to_string(&agent.args)?,
+                serde_json::to_string(&agent.env)?,
+                if agent.enabled { 1 } else { 0 },
+                if agent.auto_approve { 1 } else { 0 },
+                agent.timeout_secs as i64,
+                agent.created_at
+            ],
+        )?;
+        Ok(agent)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_acp_agent(
+        &self,
+        agent_id: &str,
+        name: &str,
+        command: &str,
+        args: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+        enabled: bool,
+        auto_approve: bool,
+        timeout_secs: u64,
+    ) -> Result<Option<AcpAgent>> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE acp_agents SET name = ?1, command = ?2, args = ?3, env = ?4,
+                enabled = ?5, auto_approve = ?6, timeout_secs = ?7
+             WHERE id = ?8",
+            params![
+                name,
+                command,
+                serde_json::to_string(args)?,
+                serde_json::to_string(env)?,
+                if enabled { 1 } else { 0 },
+                if auto_approve { 1 } else { 0 },
+                timeout_secs as i64,
+                agent_id
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_acp_agent(agent_id)
+    }
+
+    pub fn remove_acp_agent(&self, agent_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        Ok(conn.execute("DELETE FROM acp_agents WHERE id = ?1", params![agent_id])? > 0)
     }
 
     pub fn get_worktree_policy(&self, project_id: &str) -> Result<WorktreeRetentionPolicy> {
@@ -6103,6 +6231,22 @@ fn fts_query(input: &str) -> Option<String> {
     } else {
         Some(terms.join(" "))
     }
+}
+
+fn map_acp_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AcpAgent> {
+    let args: String = row.get(3)?;
+    let env: String = row.get(4)?;
+    Ok(AcpAgent {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        command: row.get(2)?,
+        args: serde_json::from_str(&args).unwrap_or_default(),
+        env: serde_json::from_str(&env).unwrap_or_default(),
+        enabled: row.get::<_, i64>(5)? != 0,
+        auto_approve: row.get::<_, i64>(6)? != 0,
+        timeout_secs: row.get::<_, i64>(7)? as u64,
+        created_at: row.get(8)?,
+    })
 }
 
 fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServer> {

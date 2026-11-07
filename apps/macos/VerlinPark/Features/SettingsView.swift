@@ -14,6 +14,8 @@ struct SettingsView: View {
                 .tabItem { Label("Resident", systemImage: "sparkles") }
             ProvidersSettingsView()
                 .tabItem { Label("Providers", systemImage: "network") }
+            AcpSettingsView()
+                .tabItem { Label("ACP", systemImage: "person.crop.rectangle.stack") }
             McpSettingsView()
                 .tabItem { Label("MCP", systemImage: "puzzlepiece.extension") }
             NotificationsSettingsView()

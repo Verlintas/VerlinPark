@@ -106,6 +106,48 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(tools.tools.first?.description, "Echo text")
     }
 
+    func testAcpAgentsAndProbeDecode() throws {
+        let agentsJSON = """
+        {
+          "agents": [{
+            "id": "agent-1",
+            "name": "gemini",
+            "command": "npx",
+            "args": ["-y", "@google/gemini-cli"],
+            "env": {"GEMINI_API_KEY": "hidden"},
+            "enabled": true,
+            "auto_approve": false,
+            "timeout_secs": 900,
+            "created_at": "2026-11-07T00:00:00Z"
+          }]
+        }
+        """
+        let agents = try JSONDecoder().decode(
+            AcpAgentListResult.self,
+            from: Data(agentsJSON.utf8)
+        )
+        XCTAssertEqual(agents.agents.first?.name, "gemini")
+        XCTAssertEqual(agents.agents.first?.timeoutSecs, 900)
+        XCTAssertEqual(agents.agents.first?.autoApprove, false)
+
+        let probeJSON = """
+        {
+          "agent_id": "agent-1",
+          "agent_name": "gemini",
+          "version": "0.12.0",
+          "protocol_version": 1,
+          "session_created": true
+        }
+        """
+        let probe = try JSONDecoder().decode(
+            AcpProbeResult.self,
+            from: Data(probeJSON.utf8)
+        )
+        XCTAssertEqual(probe.agentName, "gemini")
+        XCTAssertEqual(probe.protocolVersion, 1)
+        XCTAssertTrue(probe.sessionCreated)
+    }
+
     func testMcpResourcesAndPromptsDecode() throws {
         let resourcesJSON = """
         {

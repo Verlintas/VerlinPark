@@ -5100,3 +5100,223 @@ fn worker_auto_expansion_respects_budget_and_hard_cap() {
     let tight = SessionBudget::new(Some(1_000), 900, caps);
     assert!(!tight.can_expand_workers());
 }
+
+fn write_acp_agent(path: &Path) {
+    std::fs::write(
+        path,
+        r#"#!/usr/bin/env python3
+import json, os, sys
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+def reply(req, result):
+    send({"jsonrpc": "2.0", "id": req.get("id"), "result": result})
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        reply(req, {
+            "protocolVersion": 1,
+            "agentCapabilities": {},
+            "authMethods": [],
+            "agentInfo": {"name": "fake-acp", "version": "0.0.1"},
+        })
+    elif method == "session/new":
+        reply(req, {"sessionId": "fake-session"})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "fake-session",
+            "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "writing acp.txt "}},
+        }})
+        send({"jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission", "params": {
+            "sessionId": "fake-session",
+            "toolCall": {"toolCallId": "tool-1", "title": "Write acp.txt", "kind": "edit", "rawInput": {"path": "acp.txt"}},
+            "options": [
+                {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "deny", "name": "Reject", "kind": "reject_once"},
+            ],
+        }})
+        while True:
+            response = json.loads(sys.stdin.readline())
+            if response.get("id") == "perm-1":
+                outcome = (response.get("result") or {}).get("outcome") or {}
+                if outcome.get("outcome") != "selected" or outcome.get("optionId") != "allow":
+                    reply(req, {"stopReason": "refusal"})
+                    break
+                with open(os.path.join(os.getcwd(), "acp.txt"), "w") as handle:
+                    handle.write("from acp\n")
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": "fake-session",
+                    "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "done"}},
+                }})
+                reply(req, {"stopReason": "end_turn"})
+                break
+        else:
+            continue
+        continue
+    elif method == "session/cancel":
+        pass
+    else:
+        send({"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32601, "message": "not found"}})
+"#,
+    )
+    .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn delegates_to_an_external_acp_agent_and_integrates_it() {
+    let dir = TempDir::new().unwrap();
+    let script = dir.path().join("fake-acp-agent.py");
+    write_acp_agent(&script);
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_manager".into(),
+                    name: "delegate".into(),
+                    arguments: serde_json::json!({
+                        "role": "manager",
+                        "title": "Implementation",
+                        "objective": "use the external agent"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_acp".into(),
+                    name: "delegate_acp".into(),
+                    arguments: serde_json::json!({
+                        "agent": "fake-acp",
+                        "objective": "write acp.txt",
+                        "write_scope": ["acp.txt"]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_verdict".into(),
+                    name: "submit_verdict".into(),
+                    arguments: serde_json::json!({
+                        "approved": true,
+                        "summary": "acp.txt exists with the expected content"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("manager done".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .add_acp_agent(
+            "fake-acp",
+            "/usr/bin/python3",
+            vec![script.to_string_lossy().to_string()],
+            std::collections::BTreeMap::new(),
+            true,
+            false,
+            120,
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "external".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+
+    let approver_engine = engine.clone();
+    let approver_session = session.id.clone();
+    let approver = tokio::spawn(async move {
+        for _ in 0..300 {
+            if let Ok(approvals) = approver_engine
+                .list_approvals(Some(approver_session.clone()))
+                .await
+            {
+                for approval in approvals
+                    .iter()
+                    .filter(|approval| approval.status == "pending")
+                {
+                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    let worktree = session.worktree.clone().unwrap();
+    service.start(&session.id, "external").await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if std::fs::read_to_string(std::path::Path::new(&worktree).join("acp.txt"))
+            .ok()
+            .as_deref()
+            == Some("from acp\n")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "external ACP changes were not integrated"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = wait_until_idle(&engine, &session).await;
+    approver.abort();
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&worktree).join("acp.txt")).unwrap(),
+        "from acp\n"
+    );
+    let agents = engine.list_agents(&session.id).await.unwrap();
+    let external = agents
+        .iter()
+        .find(|agent| agent.model == "acp:fake-acp")
+        .expect("external ACP worker is recorded as a worker");
+    assert_eq!(external.role, "worker");
+    assert_eq!(external.status, "idle");
+    assert_eq!(external.title.as_deref(), Some("ACP · fake-acp"));
+    let queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].status, "merged");
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.kind == "agent.spawned" && event.payload["backend"] == "acp" })
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "approval.requested"
+            && event.payload["tool"]
+                .as_str()
+                .is_some_and(|tool| tool.starts_with("acp."))
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.finished"
+            && event.payload["agent_role"] == "worker"
+            && event.payload["merged"] == true
+    }));
+}

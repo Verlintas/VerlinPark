@@ -145,6 +145,58 @@ struct McpServer: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+struct AcpAgent: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+    let command: String
+    let args: [String]
+    let env: [String: String]
+    let enabled: Bool
+    let autoApprove: Bool
+    let timeoutSecs: Int
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case command
+        case args
+        case env
+        case enabled
+        case autoApprove = "auto_approve"
+        case timeoutSecs = "timeout_secs"
+        case createdAt = "created_at"
+    }
+}
+
+struct AcpAgentListResult: Codable, Sendable {
+    let agents: [AcpAgent]
+}
+
+struct AcpAgentResult: Codable, Sendable {
+    let agent: AcpAgent
+}
+
+struct AcpProbeResult: Codable, Sendable {
+    let agentId: String
+    let agentName: String
+    let version: String
+    let protocolVersion: Int
+    let sessionCreated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case version
+        case protocolVersion = "protocol_version"
+        case sessionCreated = "session_created"
+    }
+}
+
+struct AcpRemoveResult: Codable, Sendable {
+    let removed: Bool
+}
+
 struct McpRemoveResult: Codable, Sendable {
     let removed: Bool
 }

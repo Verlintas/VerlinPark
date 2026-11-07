@@ -29,6 +29,32 @@ enum Command {
     Ping,
     /// Show daemon information.
     Info,
+    /// List configured external ACP agents.
+    AcpAgents,
+    /// Add an external Agent Client Protocol (ACP) agent.
+    AcpAdd {
+        name: String,
+        command: String,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// Environment override as KEY=VALUE (repeatable).
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// Auto-approve this agent's own permission requests.
+        #[arg(long)]
+        auto_approve: bool,
+        /// Per-delegation timeout in seconds.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+    },
+    /// Remove an ACP agent by id.
+    AcpRemove { agent_id: String },
+    /// Initialize an ACP agent and create a session without prompting.
+    AcpProbe {
+        agent: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// List configured MCP servers.
     McpServers,
     /// Add an MCP stdio server.
@@ -480,6 +506,47 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::Info => rpc(&discovery, "server.info", json!({})).await?,
+        Command::AcpAgents => rpc(&discovery, "acp.agent.list", json!({})).await?,
+        Command::AcpAdd {
+            name,
+            command,
+            args,
+            env,
+            auto_approve,
+            timeout,
+        } => {
+            let env = parse_env_pairs(&env)?;
+            rpc(
+                &discovery,
+                "acp.agent.add",
+                json!({
+                    "name": name,
+                    "command": command,
+                    "args": args,
+                    "env": env,
+                    "enabled": true,
+                    "auto_approve": auto_approve,
+                    "timeout_secs": timeout
+                }),
+            )
+            .await?
+        }
+        Command::AcpRemove { agent_id } => {
+            rpc(
+                &discovery,
+                "acp.agent.remove",
+                json!({"agent_id": agent_id}),
+            )
+            .await?
+        }
+        Command::AcpProbe { agent, project } => {
+            rpc(
+                &discovery,
+                "acp.agent.probe",
+                json!({"agent_id": agent, "project_id": project}),
+            )
+            .await?
+        }
         Command::McpServers => rpc(&discovery, "mcp.server.list", json!({})).await?,
         Command::McpAdd {
             name,

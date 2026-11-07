@@ -443,6 +443,52 @@ fn manages_mcp_server_configs() {
 }
 
 #[test]
+fn manages_acp_agent_configs() {
+    let (_data, store, _repo) = test_store();
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("API_KEY".to_string(), "hidden".to_string());
+    let agent = store
+        .add_acp_agent(
+            "gemini",
+            "npx",
+            &["-y".to_string(), "gemini".to_string()],
+            &env,
+            true,
+            false,
+            900,
+        )
+        .unwrap();
+    assert_eq!(agent.name, "gemini");
+    assert_eq!(agent.timeout_secs, 900);
+    assert!(!agent.auto_approve);
+    assert_eq!(store.list_acp_agents().unwrap().len(), 1);
+    assert_eq!(
+        store.find_acp_agent("gemini").unwrap().unwrap().args,
+        vec!["-y", "gemini"]
+    );
+    assert!(store.find_acp_agent("missing").unwrap().is_none());
+
+    let updated = store
+        .update_acp_agent(
+            &agent.id,
+            "gemini-cli",
+            "npx",
+            &[],
+            &std::collections::BTreeMap::new(),
+            false,
+            true,
+            120,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.name, "gemini-cli");
+    assert!(updated.auto_approve);
+    assert!(!updated.enabled);
+    assert!(store.remove_acp_agent(&agent.id).unwrap());
+    assert!(store.list_acp_agents().unwrap().is_empty());
+}
+
+#[test]
 fn creates_and_filters_project_memories() {
     let (_data, store, repo) = test_store();
     let project = store

@@ -11,16 +11,17 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    AgentMessage, AgentRecord, Approval, Artifact, ArtifactBackfillResult, ArtifactGcResult,
-    ArtifactMaterialization, ArtifactPolicy, ConsoleCloseResult, ConsoleOpenResult,
-    ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult, DoctorCheck, Event, GitLogResult,
-    GitShowResult, IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult,
-    McpGetPromptResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult,
-    McpServer, McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem,
-    MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry,
-    Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
-    QuestionListResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCommit,
-    SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus, SessionPriorityResult,
+    AcpAgent, AcpAgentListResult, AcpProbeResult, AgentMessage, AgentRecord, Approval, Artifact,
+    ArtifactBackfillResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
+    ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
+    ConsoleWriteResult, DoctorCheck, Event, GitLogResult, GitShowResult, IntegrationPolicy,
+    MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult, McpPromptListResult,
+    McpReadResourceResult, McpResourceListResult, McpServer, McpServerListResult,
+    McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPolicy,
+    MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, Project, ProjectBudget,
+    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
+    ScheduledTask, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
+    SessionImportResult, SessionLandResult, SessionLogStatus, SessionPriorityResult,
     SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
     StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan,
     TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
@@ -34,6 +35,7 @@ use vp_store::store::SessionRepair;
 
 use crate::budget::BudgetRegistry;
 
+pub mod acp;
 pub mod agent;
 pub mod budget;
 pub mod console;
@@ -4429,6 +4431,163 @@ impl Engine {
         Ok(removed)
     }
 
+    pub async fn list_acp_agents(&self) -> Result<AcpAgentListResult> {
+        let store = self.store.clone();
+        let agents = tokio::task::spawn_blocking(move || store.list_acp_agents()).await??;
+        Ok(AcpAgentListResult { agents })
+    }
+
+    /// Resolve an ACP agent by id or by its unique display name.
+    pub async fn resolve_acp_agent(&self, identifier: &str) -> Result<Option<AcpAgent>> {
+        let store = self.store.clone();
+        let identifier = identifier.to_string();
+        tokio::task::spawn_blocking(move || store.find_acp_agent(&identifier)).await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_acp_agent(
+        &self,
+        name: &str,
+        command: &str,
+        args: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        enabled: bool,
+        auto_approve: bool,
+        timeout_secs: u64,
+    ) -> Result<AcpAgent> {
+        let name = validate_acp_agent_fields(name, command, &args, &env, timeout_secs)?;
+        let store = self.store.clone();
+        let command = command.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            store.add_acp_agent(
+                &name,
+                &command,
+                &args,
+                &env,
+                enabled,
+                auto_approve,
+                timeout_secs,
+            )
+        })
+        .await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_acp_agent(
+        &self,
+        id: &str,
+        name: &str,
+        command: &str,
+        args: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        enabled: bool,
+        auto_approve: bool,
+        timeout_secs: u64,
+    ) -> Result<Option<AcpAgent>> {
+        let name = validate_acp_agent_fields(name, command, &args, &env, timeout_secs)?;
+        let store = self.store.clone();
+        let id = id.to_string();
+        let command = command.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            store.update_acp_agent(
+                &id,
+                &name,
+                &command,
+                &args,
+                &env,
+                enabled,
+                auto_approve,
+                timeout_secs,
+            )
+        })
+        .await?
+    }
+
+    pub async fn remove_acp_agent(&self, id: &str) -> Result<bool> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.remove_acp_agent(&id)).await?
+    }
+
+    /// Spawn an external ACP agent, initialize it, and create a session without
+    /// sending a prompt. This validates the executable and protocol handshake.
+    pub async fn probe_acp_agent(
+        &self,
+        agent_id: &str,
+        project_id: Option<String>,
+    ) -> Result<AcpProbeResult> {
+        let agent = self
+            .resolve_acp_agent(agent_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ACP agent not found: {agent_id}"))?;
+        let store = self.store.clone();
+        let pid = project_id.clone();
+        let project = tokio::task::spawn_blocking(move || match pid {
+            Some(project_id) => store.get_project(&project_id),
+            None => Ok(None),
+        })
+        .await??;
+        let policy = match &project {
+            Some(project) => self.get_shell_policy(&project.id).await?,
+            None => ShellPolicy::default(),
+        };
+        let mut secret_roots = crate::agent::shell_secret_roots(self.store.data_dir());
+        secret_roots.extend(policy.read_deny.iter().map(PathBuf::from));
+        let store = self.store.clone();
+        let mcp_servers = tokio::task::spawn_blocking(move || store.list_mcp_servers())
+            .await??
+            .into_iter()
+            .filter(|server| server.enabled)
+            .map(|server| {
+                acp::mcp_stdio_server(&server.name, &server.command, &server.args, &server.env)
+            })
+            .collect();
+        // Probe in an isolated scratch directory. The agent is initialized and
+        // gets a session, but must not be able to write into the project, the
+        // project's Git metadata, or the daemon data directory.
+        // A unique probe directory avoids sharing HOME/cwd between
+        // concurrent probes and lets us remove all probe state afterwards.
+        let probe_root = self
+            .store
+            .data_dir()
+            .join("sandbox")
+            .join("acp-probe")
+            .join(&agent.id)
+            .join(Uuid::now_v7().to_string());
+        let cwd = probe_root.join("cwd");
+        tokio::fs::create_dir_all(&cwd).await?;
+        let launch = acp::AcpLaunch {
+            name: agent.name.clone(),
+            command: agent.command.clone(),
+            args: agent.args.clone(),
+            env: agent.env.clone(),
+            cwd: cwd.clone(),
+            project_root: cwd.clone(),
+            sandbox_root: probe_root.join("scratch"),
+            secret_roots,
+            network_allowed: policy.network != "deny",
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            restrict_home: policy.restrict_home,
+            read_jail: policy.read_jail,
+            mcp_servers,
+            timeout: std::time::Duration::from_secs(agent.timeout_secs.min(120)),
+        };
+        let result = acp::probe(launch).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&probe_root).await {
+            tracing::warn!(%error, path = %probe_root.display(), "failed to remove ACP probe scratch");
+        }
+        let result = result?;
+        Ok(AcpProbeResult {
+            agent_id: agent.id,
+            agent_name: result.agent_name,
+            version: result.agent_version,
+            protocol_version: result.protocol_version,
+            session_created: result.session_created,
+        })
+    }
+
     pub async fn mcp_tools(&self, server_id: &str) -> Result<McpToolListResult> {
         let store = self.store.clone();
         let id = server_id.to_string();
@@ -5160,6 +5319,42 @@ fn clip_transcript(text: &str, limit: usize) -> String {
     } else {
         text.chars().take(limit).collect::<String>() + "\n… truncated"
     }
+}
+
+fn validate_acp_agent_fields(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    timeout_secs: u64,
+) -> Result<String> {
+    let name = name.trim();
+    let command = command.trim();
+    if name.is_empty() || name.chars().count() > 100 {
+        anyhow::bail!("ACP agent name must be 1-100 characters");
+    }
+    if command.is_empty() || command.chars().count() > 4_096 {
+        anyhow::bail!("ACP agent command must be 1-4096 characters");
+    }
+    if args.len() > 128 || args.iter().any(|arg| arg.chars().count() > 4_096) {
+        anyhow::bail!("ACP agent arguments are limited to 128 values of 4096 characters");
+    }
+    if env.len() > 64
+        || env.iter().any(|(key, value)| {
+            key.is_empty()
+                || key.chars().count() > 256
+                || key.contains('=')
+                || key.contains('\0')
+                || value.chars().count() > 16_384
+                || value.contains('\0')
+        })
+    {
+        anyhow::bail!("ACP agent environment is limited to 64 valid variables of 16 KiB each");
+    }
+    if !(30..=14_400).contains(&timeout_secs) {
+        anyhow::bail!("ACP agent timeout must be between 30 and 14400 seconds");
+    }
+    Ok(name.to_string())
 }
 
 #[cfg(test)]

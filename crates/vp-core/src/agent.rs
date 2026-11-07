@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_recursion::async_recursion;
+use async_trait::async_trait;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
@@ -22,6 +23,7 @@ use vp_providers::{
 use vp_store::Store;
 
 use crate::Engine;
+use crate::acp;
 use crate::budget::{BudgetReason, Rejection, ScopeRequest, Spend};
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::worktree;
@@ -3836,6 +3838,651 @@ async fn verify_worker(
     }
 }
 
+enum AcpDelegation {
+    Output(ToolOutput),
+    Cancelled,
+    BudgetExceeded(BudgetStop),
+}
+
+struct AcpWorkerHost {
+    engine: Engine,
+    session: Session,
+    spec: AgentSpec,
+    acp_name: String,
+    auto_approve: bool,
+    cancel: watch::Receiver<bool>,
+    text: Mutex<String>,
+    started_tools: Mutex<HashSet<String>>,
+    finished_tools: Mutex<HashSet<String>>,
+}
+
+impl AcpWorkerHost {
+    fn final_summary(&self) -> String {
+        let text = self
+            .text
+            .lock()
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        if text.is_empty() {
+            "external agent completed without a summary".to_string()
+        } else {
+            truncate(&text)
+        }
+    }
+
+    async fn finish_tool(
+        &self,
+        id: &str,
+        status: &str,
+        content: Option<serde_json::Value>,
+        raw_output: Option<serde_json::Value>,
+        title: Option<&str>,
+    ) {
+        let first = self
+            .started_tools
+            .lock()
+            .map(|mut started| started.insert(id.to_string()))
+            .unwrap_or(false);
+        let tool_call_id = format!("acp:{}:{id}", self.spec.id);
+        if first {
+            let _ = emit(
+                &self.engine,
+                &self.session.id,
+                &self.spec,
+                "tool.started",
+                serde_json::json!({
+                    "tool_call_id": tool_call_id,
+                    "name": "acp.tool",
+                    "input": {
+                        "title": title.unwrap_or("External agent tool"),
+                    },
+                }),
+            )
+            .await;
+        }
+        if status != "completed" && status != "failed" {
+            return;
+        }
+        let first_finish = self
+            .finished_tools
+            .lock()
+            .map(|mut finished| finished.insert(id.to_string()))
+            .unwrap_or(false);
+        if !first_finish {
+            return;
+        }
+        let output = raw_output
+            .or(content)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let _ = emit(
+            &self.engine,
+            &self.session.id,
+            &self.spec,
+            "tool.finished",
+            serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "name": "acp.tool",
+                "output": truncate(&output),
+                "is_error": status == "failed",
+            }),
+        )
+        .await;
+    }
+}
+
+#[async_trait]
+impl acp::AcpHost for AcpWorkerHost {
+    async fn update(&self, update: acp::AcpUpdate) {
+        match update {
+            acp::AcpUpdate::Message(text) => {
+                if let Ok(mut full) = self.text.lock()
+                    && full.len() < 64 * 1024
+                {
+                    full.push_str(&text);
+                }
+                let _ = emit(
+                    &self.engine,
+                    &self.session.id,
+                    &self.spec,
+                    "agent.message_delta",
+                    serde_json::json!({"text": text, "acp_agent": self.acp_name}),
+                )
+                .await;
+            }
+            acp::AcpUpdate::Thought(text) => {
+                let _ = emit(
+                    &self.engine,
+                    &self.session.id,
+                    &self.spec,
+                    "agent.thought_delta",
+                    serde_json::json!({"text": text, "acp_agent": self.acp_name}),
+                )
+                .await;
+            }
+            acp::AcpUpdate::ToolCall {
+                id,
+                title,
+                kind,
+                status,
+                raw_input,
+                content,
+                raw_output,
+            } => {
+                let first = self
+                    .started_tools
+                    .lock()
+                    .map(|mut started| started.insert(id.clone()))
+                    .unwrap_or(false);
+                if first {
+                    let _ = emit(
+                        &self.engine,
+                        &self.session.id,
+                        &self.spec,
+                        "tool.started",
+                        serde_json::json!({
+                            "tool_call_id": format!("acp:{}:{id}", self.spec.id),
+                            "name": format!("acp.{kind}"),
+                            "input": {
+                                "title": title,
+                                "input": raw_input,
+                            },
+                        }),
+                    )
+                    .await;
+                }
+                if status == "completed" || status == "failed" {
+                    self.finish_tool(&id, &status, content, raw_output, Some(&title))
+                        .await;
+                }
+            }
+            acp::AcpUpdate::ToolCallUpdate {
+                id,
+                title,
+                status,
+                content,
+                raw_output,
+            } => {
+                let status = status.unwrap_or_else(|| "in_progress".to_string());
+                self.finish_tool(&id, &status, content, raw_output, title.as_deref())
+                    .await;
+            }
+        }
+    }
+
+    async fn permission(&self, request: acp::AcpPermissionRequest) -> acp::AcpPermissionDecision {
+        if self.auto_approve {
+            return acp::AcpPermissionDecision::Approve;
+        }
+        let tool_call_id = format!("acp:{}:{}", self.spec.id, request.tool_call_id);
+        let options = request
+            .options
+            .iter()
+            .map(|option| {
+                serde_json::json!({
+                    "id": option.id,
+                    "name": option.name,
+                    "kind": option.kind,
+                })
+            })
+            .collect::<Vec<_>>();
+        let input = serde_json::json!({
+            "title": request.title,
+            "kind": request.kind,
+            "input": request.raw_input,
+            "options": options,
+            "agent": self.acp_name,
+        });
+        let mut context = serde_json::json!({});
+        agent_fields(&mut context, &self.spec);
+        context["acp_agent"] = serde_json::json!(self.acp_name);
+        let approval = self
+            .engine
+            .request_approval(
+                &self.session.id,
+                &tool_call_id,
+                &format!("acp.{}", self.acp_name),
+                input,
+                Some(context),
+            )
+            .await;
+        let Ok((approval, receiver)) = approval else {
+            return acp::AcpPermissionDecision::Deny;
+        };
+        match wait_for_approval_with(self.cancel.clone(), receiver).await {
+            ApprovalOutcome::Approved => acp::AcpPermissionDecision::Approve,
+            ApprovalOutcome::Denied => acp::AcpPermissionDecision::Deny,
+            ApprovalOutcome::TimedOut => {
+                let _ = self.engine.resolve_approval(&approval.id, false).await;
+                acp::AcpPermissionDecision::Deny
+            }
+            ApprovalOutcome::Cancelled => {
+                let _ = self.engine.resolve_approval(&approval.id, false).await;
+                acp::AcpPermissionDecision::Cancelled
+            }
+        }
+    }
+}
+
+struct AcpDelegateRequest {
+    agent: String,
+    name: Option<String>,
+    objective: String,
+    instructions: String,
+    timeout: Option<u64>,
+}
+
+fn parse_acp_delegate(input: &serde_json::Value) -> Result<AcpDelegateRequest> {
+    let agent = input
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("agent is required"))?
+        .to_string();
+    let objective = input
+        .get("objective")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("objective is required"))?
+        .to_string();
+    let name = input
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let instructions = input
+        .get("instructions")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let timeout = input
+        .get("timeout_secs")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|seconds| *seconds >= 30);
+    Ok(AcpDelegateRequest {
+        agent,
+        name,
+        objective,
+        instructions,
+        timeout,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn delegate_acp(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    control: &RunControl,
+    budget: &SessionBudget,
+    parent_spec: &AgentSpec,
+    input: &serde_json::Value,
+) -> Result<AcpDelegation> {
+    let request = match parse_acp_delegate(input) {
+        Ok(parsed) => parsed,
+        Err(error) => return Ok(AcpDelegation::Output(ToolOutput::error(error.to_string()))),
+    };
+    let AcpDelegateRequest {
+        agent: agent_ref,
+        name: requested_name,
+        objective,
+        instructions,
+        timeout,
+    } = request;
+    let Some(acp_agent) = engine.resolve_acp_agent(&agent_ref).await? else {
+        return Ok(AcpDelegation::Output(ToolOutput::error(format!(
+            "ACP agent not found: {agent_ref}"
+        ))));
+    };
+    if !acp_agent.enabled {
+        return Ok(AcpDelegation::Output(ToolOutput::error(format!(
+            "ACP agent {} is disabled",
+            acp_agent.name
+        ))));
+    }
+    let Some((ordinal, _slot)) = budget.reserve_slot(AgentRole::Worker) else {
+        return Ok(AcpDelegation::Output(ToolOutput::error(
+            "the Worker cap for this session has been reached",
+        )));
+    };
+    let write_scope = match parse_write_scope(input) {
+        Ok(scope) => scope,
+        Err(error) => return Ok(AcpDelegation::Output(ToolOutput::error(error.to_string()))),
+    };
+    let child_name = requested_name.unwrap_or_else(|| format!("{} {}", acp_agent.name, ordinal));
+    let child = engine
+        .create_agent(
+            &session.id,
+            "worker",
+            &child_name,
+            Some(format!("ACP · {}", acp_agent.name)),
+            Some(parent_spec.id.clone()),
+            &format!("acp:{}", acp_agent.name),
+        )
+        .await?;
+    engine
+        .set_agent_profile(&child.id, AgentProfile::Coding.as_str())
+        .await?;
+    let info = engine
+        .create_task_worktree(
+            &project.root,
+            &project.id,
+            &session.id,
+            &child.id,
+            &parent_spec.session_branch,
+        )
+        .await?;
+    engine
+        .set_agent_worktree(&child.id, &info.path.to_string_lossy(), &info.branch)
+        .await?;
+    let child_spec = AgentSpec {
+        id: child.id.clone(),
+        role: AgentRole::Worker,
+        name: child_name.clone(),
+        depth: parent_spec.depth.saturating_add(1),
+        parent_name: Some(parent_spec.name.clone()),
+        title: Some(format!("ACP · {}", acp_agent.name)),
+        task_id: None,
+        department: parent_spec.department.clone(),
+        profile: AgentProfile::Coding,
+        allow_delegation: false,
+        auto_approve: acp_agent.auto_approve,
+        worktree: info.path.clone(),
+        branch: info.branch.clone(),
+        session_worktree: parent_spec.session_worktree.clone(),
+        session_branch: parent_spec.session_branch.clone(),
+        write_scope: write_scope.clone(),
+        base_commit: info.base_commit.clone(),
+    };
+    emit(
+        engine,
+        &session.id,
+        &child_spec,
+        "agent.spawned",
+        serde_json::json!({
+            "parent_id": parent_spec.id,
+            "parent_name": parent_spec.name,
+            "objective": truncate(&objective),
+            "acp_agent": acp_agent.name,
+            "acp_command": acp_agent.command,
+            "backend": "acp",
+        }),
+    )
+    .await?;
+
+    let capacity_priority = task_capacity_priority(session.priority, 0);
+    let _capacity_permit = match config.capacity.try_acquire(AgentRole::Worker, &session.id) {
+        Some(permit) => Some(permit),
+        None => {
+            let snapshot = config.capacity.snapshot();
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.capacity_wait",
+                serde_json::json!({
+                    "role": "worker",
+                    "limit": snapshot.worker_limit,
+                    "available": snapshot.worker_available,
+                    "backend": "acp",
+                }),
+            )
+            .await?;
+            engine.update_agent_status(&child.id, "queued").await?;
+            let permit = match config
+                .capacity
+                .acquire(AgentRole::Worker, &session.id, capacity_priority, control)
+                .await
+            {
+                Some(permit) => permit,
+                None => {
+                    engine.update_agent_status(&child.id, "cancelled").await?;
+                    return Ok(AcpDelegation::Cancelled);
+                }
+            };
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.capacity_ready",
+                serde_json::json!({"role": "worker", "waited": true, "backend": "acp"}),
+            )
+            .await?;
+            Some(permit)
+        }
+    };
+    let _scope_guard = match config
+        .scope_locks
+        .acquire(&project.id, &session.id, &child.id, &write_scope, control)
+        .await?
+    {
+        Some(guard) => guard,
+        None => {
+            engine.update_agent_status(&child.id, "cancelled").await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.finished",
+                serde_json::json!({"status": "cancelled", "backend": "acp"}),
+            )
+            .await?;
+            return Ok(AcpDelegation::Cancelled);
+        }
+    };
+    engine.update_agent_status(&child.id, "running").await?;
+
+    let shell_policy = engine.get_shell_policy(&project.id).await?;
+    let mut secret_roots = shell_secret_roots(engine.store().data_dir());
+    secret_roots.extend(shell_policy.read_deny.iter().map(PathBuf::from));
+    let mcp_servers = engine
+        .list_mcp_servers()
+        .await?
+        .servers
+        .into_iter()
+        .filter(|server| server.enabled)
+        .map(|server| {
+            acp::mcp_stdio_server(&server.name, &server.command, &server.args, &server.env)
+        })
+        .collect();
+    let scope_note = if write_scope.is_empty() {
+        "No explicit write scope was declared.".to_string()
+    } else {
+        format!("Write scope: {}.", write_scope.join(", "))
+    };
+    let instructions = if instructions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "
+Additional instructions:
+{instructions}
+"
+        )
+    };
+    let prompt = format!(
+        "You are an external ACP agent delegated by {} inside VerlinPark.
+         Objective: {objective}
+{instructions}         Work only in the current Git worktree at {} on branch {} (base commit {}).
+         {scope_note}
+         Make the requested changes directly, run relevant checks, and do not ask the user questions.          Finish with a concise summary of what changed and which checks ran.",
+        parent_spec.name,
+        child_spec.worktree.to_string_lossy(),
+        child_spec.branch,
+        child_spec.base_commit,
+    );
+    let launch = acp::AcpLaunch {
+        name: acp_agent.name.clone(),
+        command: acp_agent.command.clone(),
+        args: acp_agent.args.clone(),
+        env: acp_agent.env.clone(),
+        cwd: child_spec.worktree.clone(),
+        project_root: PathBuf::from(&project.root),
+        sandbox_root: engine
+            .store()
+            .data_dir()
+            .join("sandbox")
+            .join(&session.id)
+            .join(&child.id),
+        secret_roots,
+        network_allowed: shell_policy.network != "deny",
+        home: std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+        restrict_home: shell_policy.restrict_home,
+        read_jail: shell_policy.read_jail,
+        mcp_servers,
+        timeout: Duration::from_secs(
+            timeout
+                .unwrap_or(acp_agent.timeout_secs)
+                .min(acp_agent.timeout_secs),
+        ),
+    };
+    let host = Arc::new(AcpWorkerHost {
+        engine: engine.clone(),
+        session: session.clone(),
+        spec: child_spec.clone(),
+        acp_name: acp_agent.name.clone(),
+        auto_approve: acp_agent.auto_approve,
+        cancel: control.subscribe(),
+        text: Mutex::new(String::new()),
+        started_tools: Mutex::new(HashSet::new()),
+        finished_tools: Mutex::new(HashSet::new()),
+    });
+    let result = acp::run_prompt(launch, prompt, host.clone(), control.subscribe()).await;
+    if control.is_cancelled() {
+        engine.update_agent_status(&child.id, "cancelled").await?;
+        emit(
+            engine,
+            &session.id,
+            &child_spec,
+            "agent.finished",
+            serde_json::json!({
+                "status": "cancelled",
+                "backend": "acp",
+                "acp_agent": acp_agent.name,
+            }),
+        )
+        .await?;
+        return Ok(AcpDelegation::Cancelled);
+    }
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let summary = format!("external ACP agent failed: {error:#}");
+            engine.update_agent_status(&child.id, "failed").await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "summary": truncate(&summary),
+                    "backend": "acp",
+                    "acp_agent": acp_agent.name,
+                }),
+            )
+            .await?;
+            return Ok(AcpDelegation::Output(ToolOutput::error(summary)));
+        }
+    };
+    if outcome.cancelled {
+        engine.update_agent_status(&child.id, "cancelled").await?;
+        emit(
+            engine,
+            &session.id,
+            &child_spec,
+            "agent.finished",
+            serde_json::json!({
+                "status": "cancelled",
+                "backend": "acp",
+                "acp_agent": acp_agent.name,
+            }),
+        )
+        .await?;
+        return Ok(AcpDelegation::Cancelled);
+    }
+    if outcome.stop_reason != "end_turn" {
+        let summary = format!(
+            "external ACP agent stopped with {} without completing the task",
+            outcome.stop_reason
+        );
+        engine.update_agent_status(&child.id, "failed").await?;
+        emit(
+            engine,
+            &session.id,
+            &child_spec,
+            "agent.finished",
+            serde_json::json!({
+                "status": "failed",
+                "summary": summary,
+                "backend": "acp",
+                "acp_agent": outcome.agent_name,
+                "stop_reason": outcome.stop_reason,
+            }),
+        )
+        .await?;
+        return Ok(AcpDelegation::Output(ToolOutput::error(summary)));
+    }
+    let summary = host.final_summary();
+    emit(
+        engine,
+        &session.id,
+        &child_spec,
+        "agent.message",
+        serde_json::json!({
+            "text": summary,
+            "backend": "acp",
+            "acp_agent": outcome.agent_name,
+            "acp_version": outcome.agent_version,
+            "protocol_version": outcome.protocol_version,
+        }),
+    )
+    .await?;
+    match finish_worker(
+        engine,
+        config,
+        session,
+        project,
+        control,
+        budget,
+        parent_spec,
+        &child_spec,
+        &objective,
+        &summary,
+        None,
+    )
+    .await?
+    {
+        WorkerFinish::Done { report, success } => {
+            let report = format!(
+                "External worker {} finished:
+{}",
+                child_name, report
+            );
+            if success {
+                Ok(AcpDelegation::Output(ToolOutput::ok(report)))
+            } else {
+                Ok(AcpDelegation::Output(ToolOutput::error(report)))
+            }
+        }
+        WorkerFinish::Cancelled => Ok(AcpDelegation::Cancelled),
+        WorkerFinish::BudgetExceeded(stop) => {
+            if stop.is_abortive() {
+                Ok(AcpDelegation::BudgetExceeded(stop))
+            } else {
+                Ok(AcpDelegation::Output(ToolOutput::error(stop.summary())))
+            }
+        }
+    }
+}
+
 enum WorkerFinish {
     Done { report: String, success: bool },
     Cancelled,
@@ -4883,6 +5530,9 @@ async fn run_loop(
             let input: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
             let is_delegate = call.name == "delegate" && spec.allow_delegation;
+            let is_acp_delegate = call.name == "delegate_acp"
+                && spec.allow_delegation
+                && matches!(spec.role, AgentRole::Leader | AgentRole::Manager);
             let is_delegate_many = call.name == "delegate_many"
                 && spec.role == AgentRole::Manager
                 && spec.allow_delegation;
@@ -4912,6 +5562,7 @@ async fn run_loop(
                 .filter(|_| spec.role.allows_tool(spec.profile, &call.name));
             let requires_approval = !spec.auto_approve
                 && if is_delegate
+                    || is_acp_delegate
                     || is_delegate_many
                     || is_verdict
                     || is_team_plan
@@ -5512,6 +6163,30 @@ async fn run_loop(
                         }
                     }
                     Err(error) => ToolOutput::error(error.to_string()),
+                }
+            } else if is_acp_delegate {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match delegate_acp(
+                    engine, config, session, project, control, budget, spec, &input,
+                )
+                .await?
+                {
+                    AcpDelegation::Output(output) => output,
+                    AcpDelegation::Cancelled => return Ok(LoopOutcome::Cancelled),
+                    AcpDelegation::BudgetExceeded(stop) => {
+                        return Ok(LoopOutcome::BudgetExceeded(stop));
+                    }
                 }
             } else if is_todo {
                 emit(
@@ -6391,6 +7066,38 @@ fn tool_schemas(
                     }
                 },
                 "required": ["role", "objective"]
+            }),
+        });
+    }
+    if matches!(role, AgentRole::Leader | AgentRole::Manager) && allow_delegation {
+        tools.push(ToolSchema {
+            name: "delegate_acp".to_string(),
+            description: "Delegate a focused task to a configured external Agent Client Protocol (ACP) agent. It runs in an isolated task worktree, its permission requests use the approval center, and its committed changes are verified and merged like a Worker.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Configured ACP agent id or name (see Settings > ACP)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional Worker display name"
+                    },
+                    "objective": {"type": "string"},
+                    "instructions": {"type": "string"},
+                    "write_scope": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string"}
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 30,
+                        "description": "Optional timeout, capped by the configured agent timeout"
+                    }
+                },
+                "required": ["agent", "objective"]
             }),
         });
     }
@@ -8490,10 +9197,16 @@ async fn wait_for_approval(
     receiver: oneshot::Receiver<bool>,
     control: &RunControl,
 ) -> ApprovalOutcome {
-    if control.is_cancelled() {
+    wait_for_approval_with(control.subscribe(), receiver).await
+}
+
+async fn wait_for_approval_with(
+    mut cancel_rx: watch::Receiver<bool>,
+    receiver: oneshot::Receiver<bool>,
+) -> ApprovalOutcome {
+    if *cancel_rx.borrow() {
         return ApprovalOutcome::Cancelled;
     }
-    let mut cancel_rx = control.subscribe();
     tokio::select! {
         _ = cancel_rx.changed() => ApprovalOutcome::Cancelled,
         result = timeout(Duration::from_secs(600), receiver) => match result {

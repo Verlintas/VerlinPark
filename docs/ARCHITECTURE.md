@@ -47,7 +47,7 @@ flowchart TB
     GIT["Git / worktree engine"]
     PTY["PTY manager"]
     MCP["MCP client (v0.2)"]
-    ACP["ACP client (v0.2)"]
+    ACP["ACP client (stdio, implemented)"]
   end
 
   subgraph External

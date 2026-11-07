@@ -22,14 +22,15 @@ use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
-    AddMcpServerParams, AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult,
-    AnswerQuestionParams, AnswerQuestionResult, ApprovalListResult, ArtifactBackfillParams,
-    ArtifactGcParams, ArtifactGetParams, ArtifactListParams, ArtifactListResult,
-    ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult,
-    AuthParams, AuthResult, CancelSessionParams, CancelSessionResult, CleanupWorktreesParams,
-    CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
-    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, CreateSessionParams,
-    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, GitLogParams, GitShowParams,
+    AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams, AddProjectParams,
+    AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
+    AnswerQuestionResult, ApprovalListResult, ArtifactBackfillParams, ArtifactGcParams,
+    ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactMaterializeParams,
+    ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult, AuthParams, AuthResult,
+    CancelSessionParams, CancelSessionResult, CleanupWorktreesParams, CommitSessionParams,
+    ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams, ConsoleReadParams,
+    ConsoleSignalParams, ConsoleWriteParams, CreateSessionParams, DiscardSessionParams,
+    DoctorCheck, DoctorReport, EventListResult, GitLogParams, GitShowParams,
     IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
     ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
     MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
@@ -49,8 +50,9 @@ use vp_protocol::types::{
     SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams,
     TaskActionParams, TaskActionResult, TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams,
     TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
-    TerminalResizeParams, TerminalWriteParams, UpdateMcpServerParams, UsageLedgerParams,
-    WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    TerminalResizeParams, TerminalWriteParams, UpdateAcpAgentParams, UpdateMcpServerParams,
+    UsageLedgerParams, WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams,
+    WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -1116,6 +1118,71 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "mcp.server.remove" => match parse_params::<McpServerIdParams>(request.params) {
             Ok(params) => match state.engine.remove_mcp_server(&params.server_id).await {
                 Ok(removed) => RpcResponse::success(id, json!({"removed": removed})),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "acp.agent.list" => match state.engine.list_acp_agents().await {
+            Ok(result) => RpcResponse::success(id, result),
+            Err(error) => internal_error(id, error),
+        },
+        "acp.agent.add" => match parse_params::<AddAcpAgentParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .add_acp_agent(
+                    &params.name,
+                    &params.command,
+                    params.args,
+                    params.env,
+                    params.enabled,
+                    params.auto_approve,
+                    params.timeout_secs,
+                )
+                .await
+            {
+                Ok(agent) => RpcResponse::success(id, json!({"agent": agent})),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "acp.agent.update" => match parse_params::<UpdateAcpAgentParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .update_acp_agent(
+                    &params.id,
+                    &params.name,
+                    &params.command,
+                    params.args,
+                    params.env,
+                    params.enabled,
+                    params.auto_approve,
+                    params.timeout_secs,
+                )
+                .await
+            {
+                Ok(Some(agent)) => RpcResponse::success(id, json!({"agent": agent})),
+                Ok(None) => RpcResponse::error(
+                    id,
+                    RpcError::new(codes::INVALID_PARAMS, "ACP agent not found".to_string()),
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "acp.agent.remove" => match parse_params::<AcpAgentIdParams>(request.params) {
+            Ok(params) => match state.engine.remove_acp_agent(&params.agent_id).await {
+                Ok(removed) => RpcResponse::success(id, json!({"removed": removed})),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "acp.agent.probe" => match parse_params::<AcpProbeParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .probe_acp_agent(&params.agent_id, params.project_id)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

@@ -85,6 +85,10 @@ final class AppModel {
     var pendingQuestions: [Question] = []
     var questionCenterBusy = false
     var questionCenterStatus: String?
+    var acpAgents: [AcpAgent] = []
+    var acpBusy = false
+    var acpStatus: String?
+    var acpProbeStatus: [String: String] = [:]
     var mcpServers: [McpServer] = []
     var mcpBusy = false
     var mcpStatus: String?
@@ -324,6 +328,7 @@ final class AppModel {
             await loadArtifactPolicy()
             await loadMailboxPolicy()
             await loadProjectBudget()
+            await loadAcpAgents()
             await loadMcpServers()
             await loadMemoryPolicy()
         } catch {
@@ -891,6 +896,98 @@ final class AppModel {
         } catch {
             approvalCenterStatus = error.localizedDescription
             handle(error)
+        }
+    }
+
+    func loadAcpAgents() async {
+        acpBusy = true
+        defer { acpBusy = false }
+        do {
+            acpAgents = try await core.listAcpAgents()
+            acpStatus = nil
+        } catch {
+            acpStatus = error.localizedDescription
+        }
+    }
+
+    func addAcpAgent(
+        name: String,
+        command: String,
+        args: [String],
+        autoApprove: Bool,
+        timeoutSecs: Int
+    ) async {
+        acpBusy = true
+        defer { acpBusy = false }
+        do {
+            _ = try await core.addAcpAgent(
+                name: name,
+                command: command,
+                args: args,
+                autoApprove: autoApprove,
+                timeoutSecs: timeoutSecs
+            )
+            acpStatus = "ACP agent added."
+            await loadAcpAgents()
+        } catch {
+            acpStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func setAcpAgentEnabled(_ agent: AcpAgent, enabled: Bool) async {
+        acpBusy = true
+        defer { acpBusy = false }
+        do {
+            _ = try await core.updateAcpAgent(
+                agent,
+                enabled: enabled,
+                autoApprove: agent.autoApprove
+            )
+            await loadAcpAgents()
+        } catch {
+            acpStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func setAcpAgentAutoApprove(_ agent: AcpAgent, autoApprove: Bool) async {
+        acpBusy = true
+        defer { acpBusy = false }
+        do {
+            _ = try await core.updateAcpAgent(
+                agent,
+                enabled: agent.enabled,
+                autoApprove: autoApprove
+            )
+            await loadAcpAgents()
+        } catch {
+            acpStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func removeAcpAgent(id: String) async {
+        acpBusy = true
+        defer { acpBusy = false }
+        do {
+            _ = try await core.removeAcpAgent(id: id)
+            acpProbeStatus[id] = nil
+            await loadAcpAgents()
+        } catch {
+            acpStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func probeAcpAgent(id: String) async {
+        acpProbeStatus[id] = "probing…"
+        do {
+            let result = try await core.probeAcpAgent(id: id, projectID: selectedProjectID)
+            acpProbeStatus[id] =
+                "ok · \(result.agentName) \(result.version) · protocol \(result.protocolVersion)"
+        } catch {
+            acpProbeStatus[id] = error.localizedDescription
         }
     }
 
