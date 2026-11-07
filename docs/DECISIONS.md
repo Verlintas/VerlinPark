@@ -117,6 +117,8 @@
 | [0105](adr/0105-fork-merge-back.md) | Explicit fork merge-back | Accepted | Session/Git |
 | [0106](adr/0106-recursive-fork-tree.md) | Recursive fork tree | Accepted | Session/Git |
 | [0107](adr/0107-release-update-check.md) | Manual release update check | Accepted | Distribution |
+| [0108](adr/0108-project-fork-forest-and-audit.md) | Project fork forest, audit, and checkpoint stats | Accepted | Session/Git |
+| [0109](adr/0109-model-preset-catalog.md) | Model preset catalog | Accepted | Models/Config |
 
 ---
 

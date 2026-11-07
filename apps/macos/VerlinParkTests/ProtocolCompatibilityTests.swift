@@ -121,6 +121,127 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(result.repo, "owner/repo")
     }
 
+    func testProjectForkForestDecodes() throws {
+        let json = """
+        {
+          "project_id": "project-1",
+          "total": 1,
+          "checkpoints": 2,
+          "dirty_checkpoints": 1,
+          "truncated": false,
+          "roots": [
+            {
+              "session": {
+                "id": "root-1",
+                "project_id": "project-1",
+                "goal": "root",
+                "status": "idle",
+                "priority": 0,
+                "worktree": "/tmp/root",
+                "branch": "verlinpark/root-1",
+                "token_budget": null,
+                "cost_budget_usd": null,
+                "time_budget_secs": null,
+                "cost_spent_usd": 0.0,
+                "base_commit": "aaa111",
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "created_at": "2026-11-08T00:00:00Z"
+              },
+              "checkpoint_id": null,
+              "commit": null,
+              "children": []
+            }
+          ]
+        }
+        """
+        let result = try JSONDecoder().decode(ProjectForkForestResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.total, 1)
+        XCTAssertEqual(result.checkpoints, 2)
+        XCTAssertEqual(result.dirtyCheckpoints, 1)
+        XCTAssertEqual(result.roots.first?.session.id, "root-1")
+    }
+
+    func testForkAuditResultDecodes() throws {
+        let json = """
+        {
+          "project_id": "project-1",
+          "sessions": 3,
+          "checkpoints": 2,
+          "issues": [
+            {
+              "kind": "missing_fork_link",
+              "session_id": "parent-1",
+              "related_session_id": "child-1",
+              "checkpoint_id": "checkpoint-1",
+              "commit": "abc123",
+              "detail": "missing source event",
+              "repairable": true
+            }
+          ]
+        }
+        """
+        let result = try JSONDecoder().decode(ForkAuditResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.issues.count, 1)
+        XCTAssertEqual(result.issues.first?.kind, "missing_fork_link")
+        XCTAssertEqual(result.issues.first?.relatedSessionID, "child-1")
+        XCTAssertTrue(result.issues.first?.repairable == true)
+    }
+
+    func testCheckpointStatsDecodes() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "checkpoints": 2,
+          "dirty": 1,
+          "refs": 1,
+          "commit_bytes": 512,
+          "snapshot_bytes": 4096,
+          "unique_blobs": 2
+        }
+        """
+        let result = try JSONDecoder().decode(SessionCheckpointStatsResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.checkpoints, 2)
+        XCTAssertEqual(result.dirty, 1)
+        XCTAssertEqual(result.snapshotBytes, 4096)
+    }
+
+    func testModelPresetDecodes() throws {
+        let json = """
+        {
+          "id": "preset-1",
+          "name": "Local 8k",
+          "provider": "openai-compatible",
+          "model": "local-8k",
+          "context_window": 8000,
+          "input_usd_per_million": 0.0,
+          "output_usd_per_million": 0.0,
+          "notes": "local",
+          "created_at": "2026-11-08T00:00:00Z"
+        }
+        """
+        let preset = try JSONDecoder().decode(ModelPreset.self, from: Data(json.utf8))
+        XCTAssertEqual(preset.name, "Local 8k")
+        XCTAssertEqual(preset.contextWindow, 8000)
+        XCTAssertEqual(preset.provider, "openai-compatible")
+    }
+
+    func testUpdateDownloadResultDecodes() throws {
+        let json = """
+        {
+          "version": "0.2.0",
+          "path": "/Users/test/Downloads/VerlinPark-0.2.0.dmg",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 123456,
+          "verified": true
+        }
+        """
+        let result = try JSONDecoder().decode(UpdateDownloadResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.version, "0.2.0")
+        XCTAssertTrue(result.verified)
+        XCTAssertEqual(result.size, 123_456)
+    }
+
     func testSessionForkTreeResultDecodes() throws {
         let json = """
         {

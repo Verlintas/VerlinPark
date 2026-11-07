@@ -1577,6 +1577,22 @@ pub struct SessionCheckpointListResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SessionCheckpointStatsParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCheckpointStatsResult {
+    pub session_id: String,
+    pub checkpoints: usize,
+    pub dirty: usize,
+    pub refs: usize,
+    pub commit_bytes: u64,
+    pub snapshot_bytes: u64,
+    pub unique_blobs: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SessionCheckpointDeleteParams {
     pub session_id: String,
     pub checkpoint_id: String,
@@ -1716,6 +1732,124 @@ pub struct SessionForkTreeParams {
     pub session_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectForkForestParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectForkForestResult {
+    pub project_id: String,
+    pub roots: Vec<SessionForkTreeNode>,
+    pub total: usize,
+    pub checkpoints: usize,
+    pub dirty_checkpoints: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForkAuditParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForkAuditIssue {
+    pub kind: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub related_session_id: Option<String>,
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    pub detail: String,
+    pub repairable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForkAuditResult {
+    pub project_id: String,
+    pub sessions: usize,
+    pub checkpoints: usize,
+    pub issues: Vec<ForkAuditIssue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForkRepairParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForkRepairResult {
+    pub project_id: String,
+    pub repaired: usize,
+    pub failed: usize,
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelPreset {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub input_usd_per_million: Option<f64>,
+    #[serde(default)]
+    pub output_usd_per_million: Option<f64>,
+    #[serde(default)]
+    pub notes: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelPresetListResult {
+    pub presets: Vec<ModelPreset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateModelPresetParams {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub input_usd_per_million: Option<f64>,
+    #[serde(default)]
+    pub output_usd_per_million: Option<f64>,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateModelPresetParams {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub input_usd_per_million: Option<f64>,
+    #[serde(default)]
+    pub output_usd_per_million: Option<f64>,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteModelPresetParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteModelPresetResult {
+    pub removed: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct UpdateCheckParams {
     #[serde(default)]
@@ -1734,6 +1868,29 @@ pub struct UpdateCheckResult {
     pub release_url: Option<String>,
     #[serde(default)]
     pub published_at: Option<String>,
+    #[serde(default)]
+    pub dmg_name: Option<String>,
+    #[serde(default)]
+    pub dmg_url: Option<String>,
+    #[serde(default)]
+    pub sha256_name: Option<String>,
+    #[serde(default)]
+    pub sha256_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct UpdateDownloadParams {
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateDownloadResult {
+    pub version: String,
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -17,24 +17,25 @@ use vp_protocol::types::{
     ArtifactBackfillResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
     CheckpointPolicyResult, CheckpointRetentionPolicy, ConsoleCloseResult, ConsoleOpenResult,
     ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult, ContextCompactionSummary,
-    ContextMeasurement, ContextUsage, DoctorCheck, Event, GitLogResult, GitShowResult,
-    IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult,
-    McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer,
-    McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult,
-    MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
-    ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
-    SessionCheckpointDeleteResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
+    ContextMeasurement, ContextUsage, CreateModelPresetParams, DoctorCheck, Event, GitLogResult,
+    GitShowResult, IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult,
+    McpGetPromptResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult,
+    McpServer, McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem,
+    MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry,
+    ModelPreset, ModelPresetListResult, Project, ProjectBudget, ProjectBudgetResult,
+    ProjectUsageResult, PullRequestResult, Question, QuestionListResult, ScheduledTask,
+    SearchResult, Session, SessionBundle, SessionCheckpoint, SessionCheckpointDeleteResult,
+    SessionCheckpointListResult, SessionCheckpointPruneResult, SessionCheckpointStatsResult,
     SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus, SessionDiff,
     SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
     SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
     SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
     ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
     TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
-    TerminalWriteResult, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
-    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
-    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
-    WriteLease,
+    TerminalWriteResult, TodoItem, UpdateModelPresetParams, UsageBucket, UsageCsvResult,
+    UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult, WorkspaceTreeResult,
+    WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
+    WorktreeRetentionPolicy, WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -49,6 +50,7 @@ pub mod history;
 pub mod mcp;
 pub mod rebuild;
 pub mod scheduler;
+mod session_graph;
 pub mod terminal;
 pub mod update;
 pub mod workspace;
@@ -694,7 +696,10 @@ impl Engine {
         })
     }
 
-    async fn active_checkpoints(&self, session_id: &str) -> Result<Vec<SessionCheckpoint>> {
+    pub(crate) async fn active_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionCheckpoint>> {
         let store = self.store.clone();
         let id = session_id.to_string();
         let (created, deleted) = tokio::task::spawn_blocking(move || {
@@ -731,6 +736,93 @@ impl Engine {
             anyhow::bail!("imported sessions are read-only archives");
         }
         Ok(())
+    }
+
+    pub async fn checkpoint_stats(&self, session_id: &str) -> Result<SessionCheckpointStatsResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (session, project) = tokio::task::spawn_blocking(move || {
+            let session = store
+                .get_session(&id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+            let project = store
+                .get_project(&session.project_id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {}", session.project_id))?;
+            Ok::<_, anyhow::Error>((session, project))
+        })
+        .await??;
+        let checkpoints = self.active_checkpoints(session_id).await?;
+        let dirty = checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.dirty)
+            .count();
+        let project_root = PathBuf::from(&project.root);
+        let git_lock = self.git_lock.clone();
+        let id = session.id.clone();
+        let checkpoints_for_git = checkpoints.clone();
+        let (commit_bytes, snapshot_bytes, unique_blobs, refs) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let _guard = git_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+                let mut commit_bytes = 0u64;
+                let mut snapshot_bytes = 0u64;
+                let mut seen = std::collections::HashSet::new();
+                for checkpoint in &checkpoints_for_git {
+                    if let Ok(size) =
+                        worktree::git_output(&project_root, &["cat-file", "-s", &checkpoint.commit])
+                    {
+                        commit_bytes =
+                            commit_bytes.saturating_add(size.trim().parse().unwrap_or(0));
+                    }
+                    let parent = format!("{}^", checkpoint.commit);
+                    if let Ok(parent) = worktree::git_output(&project_root, &["rev-parse", &parent])
+                    {
+                        let range = format!("{parent}..{}", checkpoint.commit);
+                        if let Ok(paths) =
+                            worktree::git_output(&project_root, &["diff", "--name-only", &range])
+                        {
+                            for path in paths.lines().filter(|path| !path.trim().is_empty()) {
+                                let spec = format!("{}:{}", checkpoint.commit, path);
+                                if let Ok(blob) =
+                                    worktree::git_output(&project_root, &["rev-parse", &spec])
+                                    && seen.insert(blob.clone())
+                                    && let Ok(size) = worktree::git_output(
+                                        &project_root,
+                                        &["cat-file", "-s", &blob],
+                                    )
+                                {
+                                    snapshot_bytes = snapshot_bytes
+                                        .saturating_add(size.trim().parse().unwrap_or(0));
+                                }
+                            }
+                        }
+                    }
+                }
+                let prefix = format!("refs/verlinpark/checkpoints/{id}/");
+                let refs = worktree::git_output(
+                    &project_root,
+                    &["for-each-ref", "--format=%(refname)", &prefix],
+                )
+                .map(|output| {
+                    output
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .count()
+                })
+                .unwrap_or(0);
+                Ok((commit_bytes, snapshot_bytes, seen.len(), refs))
+            })
+            .await??;
+        Ok(SessionCheckpointStatsResult {
+            session_id: session.id,
+            checkpoints: checkpoints.len(),
+            dirty,
+            refs,
+            commit_bytes,
+            snapshot_bytes,
+            unique_blobs,
+        })
     }
 
     pub async fn delete_checkpoint(
@@ -854,6 +946,83 @@ impl Engine {
             dry_run: false,
             checkpoints: candidates,
         })
+    }
+
+    pub async fn list_model_presets(&self) -> Result<ModelPresetListResult> {
+        let store = self.store.clone();
+        let presets = tokio::task::spawn_blocking(move || store.list_model_presets()).await??;
+        Ok(ModelPresetListResult { presets })
+    }
+
+    pub async fn create_model_preset(
+        &self,
+        params: CreateModelPresetParams,
+    ) -> Result<ModelPreset> {
+        validate_model_preset(
+            &params.name,
+            &params.provider,
+            &params.model,
+            params.context_window,
+            params.input_usd_per_million,
+            params.output_usd_per_million,
+            &params.notes,
+        )?;
+        let preset = ModelPreset {
+            id: Uuid::now_v7().to_string(),
+            name: params.name.trim().to_string(),
+            provider: params.provider.trim().to_string(),
+            model: params.model.trim().to_string(),
+            context_window: params.context_window,
+            input_usd_per_million: params.input_usd_per_million,
+            output_usd_per_million: params.output_usd_per_million,
+            notes: params.notes.trim().to_string(),
+            created_at: vp_protocol::now_rfc3339(),
+        };
+        let store = self.store.clone();
+        let saved = preset.clone();
+        tokio::task::spawn_blocking(move || store.create_model_preset(&saved)).await??;
+        Ok(preset)
+    }
+
+    pub async fn update_model_preset(
+        &self,
+        params: UpdateModelPresetParams,
+    ) -> Result<ModelPreset> {
+        validate_model_preset(
+            &params.name,
+            &params.provider,
+            &params.model,
+            params.context_window,
+            params.input_usd_per_million,
+            params.output_usd_per_million,
+            &params.notes,
+        )?;
+        let store = self.store.clone();
+        let id = params.id.clone();
+        let existing = tokio::task::spawn_blocking(move || store.get_model_preset(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("model preset not found: {}", params.id))?;
+        let preset = ModelPreset {
+            id: existing.id,
+            name: params.name.trim().to_string(),
+            provider: params.provider.trim().to_string(),
+            model: params.model.trim().to_string(),
+            context_window: params.context_window,
+            input_usd_per_million: params.input_usd_per_million,
+            output_usd_per_million: params.output_usd_per_million,
+            notes: params.notes.trim().to_string(),
+            created_at: existing.created_at,
+        };
+        let store = self.store.clone();
+        let saved = preset.clone();
+        tokio::task::spawn_blocking(move || store.update_model_preset(&saved)).await??;
+        Ok(preset)
+    }
+
+    pub async fn delete_model_preset(&self, id: &str) -> Result<bool> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.delete_model_preset(&id)).await?
     }
 
     pub async fn get_checkpoint_policy(
@@ -6373,6 +6542,41 @@ fn validate_acp_agent_fields(
     Ok(name.to_string())
 }
 
+fn validate_model_preset(
+    name: &str,
+    provider: &str,
+    model: &str,
+    context_window: Option<u64>,
+    input_price: Option<f64>,
+    output_price: Option<f64>,
+    notes: &str,
+) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 100 {
+        anyhow::bail!("model preset name must be 1-100 characters");
+    }
+    let provider = provider.trim();
+    if !matches!(provider, "openai-compatible" | "anthropic") {
+        anyhow::bail!("model preset provider must be openai-compatible or anthropic");
+    }
+    let model = model.trim();
+    if model.is_empty() || model.chars().count() > 200 {
+        anyhow::bail!("model preset model must be 1-200 characters");
+    }
+    if context_window.is_some_and(|window| window > 10_000_000) {
+        anyhow::bail!("model preset context window must be at most 10,000,000");
+    }
+    for price in [input_price, output_price].into_iter().flatten() {
+        if !price.is_finite() || price < 0.0 || price > 100_000.0 {
+            anyhow::bail!("model preset prices must be finite and between 0 and 100,000");
+        }
+    }
+    if notes.chars().count() > 2_000 {
+        anyhow::bail!("model preset notes must be at most 2,000 characters");
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_session_quiescent(session: &Session, action: &str) -> Result<()> {
     if session.status == "imported" {
         anyhow::bail!("imported sessions are read-only archives");
@@ -6388,7 +6592,7 @@ pub(crate) fn ensure_session_quiescent(session: &Session, action: &str) -> Resul
     Ok(())
 }
 
-fn checkpoint_from_event(event: &Event) -> Option<SessionCheckpoint> {
+pub(crate) fn checkpoint_from_event(event: &Event) -> Option<SessionCheckpoint> {
     let payload = event.payload.as_object()?;
     Some(SessionCheckpoint {
         id: payload.get("checkpoint_id")?.as_str()?.to_string(),

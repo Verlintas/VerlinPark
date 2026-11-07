@@ -152,6 +152,58 @@ pub fn current_branch(worktree: &Path) -> Result<String> {
     git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
+/// Whether a dirty-snapshot checkpoint ref currently exists.
+pub fn checkpoint_ref_exists(project_root: &Path, session_id: &str, checkpoint_id: &str) -> bool {
+    let Ok(root) = project_root.canonicalize() else {
+        return false;
+    };
+    let reference = format!("refs/verlinpark/checkpoints/{session_id}/{checkpoint_id}");
+    Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--verify", "--quiet", &reference])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Recreate a checkpoint ref after an interrupted deletion or manual cleanup.
+pub fn ensure_checkpoint_ref(
+    project_root: &Path,
+    session_id: &str,
+    checkpoint_id: &str,
+    commit: &str,
+) -> Result<()> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving project root {}", project_root.display()))?;
+    let reference = format!("refs/verlinpark/checkpoints/{session_id}/{checkpoint_id}");
+    run_git(&root, &["update-ref", &reference, commit])
+}
+
+/// Whether a commit-ish exists in the repository object database.
+pub fn commit_exists(project_root: &Path, commit: &str) -> bool {
+    let Ok(root) = project_root.canonicalize() else {
+        return false;
+    };
+    Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{commit}^{{commit}}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// Delete the checkpoint ref that keeps a dirty snapshot commit reachable.
 /// Clean checkpoints point at the session branch commit and have no ref.
 pub fn delete_checkpoint_ref(

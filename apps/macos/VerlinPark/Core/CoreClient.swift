@@ -241,6 +241,14 @@ actor CoreClient {
         .checkpoints
     }
 
+    func checkpointStats(sessionID: String) async throws -> SessionCheckpointStatsResult {
+        try await request(
+            method: "session.checkpoint.stats",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionCheckpointStatsResult.self)
+    }
+
     func deleteCheckpoint(
         sessionID: String,
         checkpointID: String
@@ -287,12 +295,105 @@ actor CoreClient {
         .decode(SessionMergeForkResult.self)
     }
 
+    func downloadUpdate(repo: String? = nil) async throws -> UpdateDownloadResult {
+        try await request(
+            method: "update.download",
+            params: ["repo": repo.map(JSONValue.string) ?? .null]
+        )
+        .decode(UpdateDownloadResult.self)
+    }
+
     func checkForUpdates(repo: String? = nil) async throws -> UpdateCheckResult {
         try await request(
             method: "update.check",
             params: ["repo": repo.map(JSONValue.string) ?? .null]
         )
         .decode(UpdateCheckResult.self)
+    }
+
+    func listModelPresets() async throws -> [ModelPreset] {
+        try await request(method: "model.preset.list", params: [:])
+            .decode(ModelPresetListResult.self)
+            .presets
+    }
+
+    func createModelPreset(
+        name: String,
+        provider: String,
+        model: String,
+        contextWindow: Int?,
+        inputPrice: Double?,
+        outputPrice: Double?,
+        notes: String
+    ) async throws -> ModelPreset {
+        try await request(
+            method: "model.preset.create",
+            params: [
+                "name": .string(name),
+                "provider": .string(provider),
+                "model": .string(model),
+                "context_window": contextWindow.map { .number(Double($0)) } ?? .null,
+                "input_usd_per_million": inputPrice.map(JSONValue.number) ?? .null,
+                "output_usd_per_million": outputPrice.map(JSONValue.number) ?? .null,
+                "notes": .string(notes),
+            ]
+        )
+        .decode(ModelPreset.self)
+    }
+
+    func updateModelPreset(
+        id: String,
+        name: String,
+        provider: String,
+        model: String,
+        contextWindow: Int?,
+        inputPrice: Double?,
+        outputPrice: Double?,
+        notes: String
+    ) async throws -> ModelPreset {
+        try await request(
+            method: "model.preset.update",
+            params: [
+                "id": .string(id),
+                "name": .string(name),
+                "provider": .string(provider),
+                "model": .string(model),
+                "context_window": contextWindow.map { .number(Double($0)) } ?? .null,
+                "input_usd_per_million": inputPrice.map(JSONValue.number) ?? .null,
+                "output_usd_per_million": outputPrice.map(JSONValue.number) ?? .null,
+                "notes": .string(notes),
+            ]
+        )
+        .decode(ModelPreset.self)
+    }
+
+    func deleteModelPreset(id: String) async throws -> DeleteModelPresetResult {
+        try await request(method: "model.preset.delete", params: ["id": .string(id)])
+            .decode(DeleteModelPresetResult.self)
+    }
+
+    func projectForkForest(projectID: String) async throws -> ProjectForkForestResult {
+        try await request(
+            method: "project.fork.forest",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ProjectForkForestResult.self)
+    }
+
+    func auditProjectForks(projectID: String) async throws -> ForkAuditResult {
+        try await request(
+            method: "project.fork.audit",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ForkAuditResult.self)
+    }
+
+    func repairProjectForks(projectID: String) async throws -> ForkRepairResult {
+        try await request(
+            method: "project.fork.repair",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ForkRepairResult.self)
     }
 
     func sessionForkTree(sessionID: String) async throws -> SessionForkTreeResult {

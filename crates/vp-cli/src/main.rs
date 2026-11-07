@@ -173,6 +173,44 @@ enum Command {
         #[arg(long)]
         read_jail: bool,
     },
+    /// List saved model presets.
+    ModelPresets,
+    /// Create a model preset (no API key is stored).
+    ModelPresetCreate {
+        name: String,
+        #[arg(long, default_value = "openai-compatible")]
+        provider: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        context_window: Option<u64>,
+        #[arg(long)]
+        input_price: Option<f64>,
+        #[arg(long)]
+        output_price: Option<f64>,
+        #[arg(long, default_value = "")]
+        notes: String,
+    },
+    /// Update a model preset.
+    ModelPresetUpdate {
+        id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "openai-compatible")]
+        provider: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        context_window: Option<u64>,
+        #[arg(long)]
+        input_price: Option<f64>,
+        #[arg(long)]
+        output_price: Option<f64>,
+        #[arg(long, default_value = "")]
+        notes: String,
+    },
+    /// Delete a model preset.
+    ModelPresetDelete { id: String },
     /// Check the latest GitHub release without installing it.
     UpdateCheck {
         #[arg(long)]
@@ -323,6 +361,8 @@ enum Command {
     },
     /// List checkpoints for a session.
     Checkpoints { session: String },
+    /// Show approximate checkpoint storage stats for a session.
+    CheckpointStats { session: String },
     /// Delete one checkpoint and its snapshot ref.
     CheckpointDelete { session: String, checkpoint: String },
     /// Prune checkpoints older than --older-than-days while keeping the latest N.
@@ -347,6 +387,12 @@ enum Command {
     Lineage { session: String },
     /// Show the recursive fork tree rooted at a session.
     ForkTree { session: String },
+    /// Show the whole project's fork forest and checkpoint count.
+    ForkForest { project: String },
+    /// Audit project fork/checkpoint integrity.
+    ForkAudit { project: String },
+    /// Repair missing fork links and checkpoint refs.
+    ForkRepair { project: String },
     /// Compare two session branches in the same project.
     Compare { session: String, other: String },
     /// Merge a direct child fork branch into the source session.
@@ -796,6 +842,60 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::ModelPresets => rpc(&discovery, "model.preset.list", json!({})).await?,
+        Command::ModelPresetCreate {
+            name,
+            provider,
+            model,
+            context_window,
+            input_price,
+            output_price,
+            notes,
+        } => {
+            rpc(
+                &discovery,
+                "model.preset.create",
+                json!({
+                    "name": name,
+                    "provider": provider,
+                    "model": model,
+                    "context_window": context_window,
+                    "input_usd_per_million": input_price,
+                    "output_usd_per_million": output_price,
+                    "notes": notes
+                }),
+            )
+            .await?
+        }
+        Command::ModelPresetUpdate {
+            id,
+            name,
+            provider,
+            model,
+            context_window,
+            input_price,
+            output_price,
+            notes,
+        } => {
+            rpc(
+                &discovery,
+                "model.preset.update",
+                json!({
+                    "id": id,
+                    "name": name,
+                    "provider": provider,
+                    "model": model,
+                    "context_window": context_window,
+                    "input_usd_per_million": input_price,
+                    "output_usd_per_million": output_price,
+                    "notes": notes
+                }),
+            )
+            .await?
+        }
+        Command::ModelPresetDelete { id } => {
+            rpc(&discovery, "model.preset.delete", json!({"id": id})).await?
+        }
         Command::UpdateCheck { repo } => {
             rpc(&discovery, "update.check", json!({"repo": repo})).await?
         }
@@ -1227,6 +1327,14 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::CheckpointStats { session } => {
+            rpc(
+                &discovery,
+                "session.checkpoint.stats",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
         Command::CheckpointDelete {
             session,
             checkpoint,
@@ -1285,6 +1393,30 @@ async fn main() -> Result<()> {
                 &discovery,
                 "session.fork.tree",
                 json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::ForkForest { project } => {
+            rpc(
+                &discovery,
+                "project.fork.forest",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ForkAudit { project } => {
+            rpc(
+                &discovery,
+                "project.fork.audit",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ForkRepair { project } => {
+            rpc(
+                &discovery,
+                "project.fork.repair",
+                json!({"project_id": project}),
             )
             .await?
         }

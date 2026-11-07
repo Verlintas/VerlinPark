@@ -29,34 +29,36 @@ use vp_protocol::types::{
     ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult, AuthParams, AuthResult,
     CancelSessionParams, CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams,
     CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
-    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, CreateSessionParams,
-    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, GitLogParams, GitShowParams,
+    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, CreateModelPresetParams,
+    CreateSessionParams, DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport,
+    EventListResult, ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams,
     IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
     ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
     MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
     McpGetPromptParams, McpReadResourceParams, McpServerIdParams, MemoryCreateParams,
     MemoryCreateResult, MemoryDeleteParams, MemoryListParams, MemoryPolicyParams,
     MemoryPruneParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
-    PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams, PromptParams,
-    PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
-    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
-    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionCheckpointDeleteParams,
-    SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
-    SessionCompactParams, SessionCompareParams, SessionContextParams, SessionDiffParams,
-    SessionExportParams, SessionForkParams, SessionForkTreeParams, SessionImportParams,
-    SessionLineageParams, SessionListResult, SessionLogParams, SessionMergeForkParams,
-    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
-    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
-    SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
-    SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
-    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
-    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
-    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, UpdateAcpAgentParams, UpdateCheckParams, UpdateMcpServerParams,
-    UsageLedgerParams, WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams,
-    WorktreePolicyParams,
+    PingResult, ProjectBudgetParams, ProjectForkForestParams, ProjectListResult,
+    ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
+    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
+    ResolveMergeResult, RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo,
+    SessionCheckpointDeleteParams, SessionCheckpointListParams, SessionCheckpointParams,
+    SessionCheckpointPruneParams, SessionCheckpointStatsParams, SessionCompactParams,
+    SessionCompareParams, SessionContextParams, SessionDiffParams, SessionExportParams,
+    SessionForkParams, SessionForkTreeParams, SessionImportParams, SessionLineageParams,
+    SessionListResult, SessionLogParams, SessionMergeForkParams, SessionPauseParams,
+    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams,
+    SessionResumeResult, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
+    SetArtifactPolicyParams, SetCheckpointPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
+    SetSessionPriorityParams, SetShellPolicyParams, SetTaskSchedulerPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams,
+    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
+    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
+    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
+    UpdateModelPresetParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceTreeParams,
+    WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -925,6 +927,15 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.checkpoint.stats" => {
+            match parse_params::<SessionCheckpointStatsParams>(request.params) {
+                Ok(params) => match state.engine.checkpoint_stats(&params.session_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.checkpoint.delete" => {
             match parse_params::<SessionCheckpointDeleteParams>(request.params) {
                 Ok(params) => match state
@@ -1164,8 +1175,64 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "model.preset.list" => match state.engine.list_model_presets().await {
+            Ok(result) => RpcResponse::success(id, result),
+            Err(error) => internal_error(id, error),
+        },
+        "model.preset.create" => match parse_params::<CreateModelPresetParams>(request.params) {
+            Ok(params) => match state.engine.create_model_preset(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "model.preset.update" => match parse_params::<UpdateModelPresetParams>(request.params) {
+            Ok(params) => match state.engine.update_model_preset(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "model.preset.delete" => match parse_params::<DeleteModelPresetParams>(request.params) {
+            Ok(params) => match state.engine.delete_model_preset(&params.id).await {
+                Ok(removed) => RpcResponse::success(
+                    id,
+                    vp_protocol::types::DeleteModelPresetResult { removed },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "update.download" => match parse_params::<UpdateDownloadParams>(request.params) {
+            Ok(params) => match vp_core::update::download_update(params.repo.as_deref()).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "update.check" => match parse_params::<UpdateCheckParams>(request.params) {
             Ok(params) => match vp_core::update::check_for_update(params.repo.as_deref()).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.fork.forest" => match parse_params::<ProjectForkForestParams>(request.params) {
+            Ok(params) => match state.engine.project_fork_forest(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.fork.audit" => match parse_params::<ForkAuditParams>(request.params) {
+            Ok(params) => match state.engine.audit_project_forks(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.fork.repair" => match parse_params::<ForkRepairParams>(request.params) {
+            Ok(params) => match state.engine.repair_project_forks(&params.project_id).await {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },

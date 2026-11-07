@@ -30,14 +30,22 @@ unsigned or unexpected binary.
 6. **No silent network activity.** The check runs only on explicit user action;
    it is not part of startup or the scheduler.
 
+7. **Verified DMG download.** `update.download` resolves the latest release,
+   requires both a `.dmg` and `.sha256` asset, validates GitHub HTTPS asset
+   URLs, streams to a temporary file under `~/Downloads` with a 512 MB cap,
+   verifies SHA-256, then atomically renames the final DMG. It never installs
+   or launches the download. Settings → About exposes Download DMG and Show in
+   Finder.
+
 ## Consequences
 
 - Users can discover releases without trusting an auto-updater with install
   privileges.
 - GitHub rate limits or network failures are visible errors.
 - The feature remains honest about the deferred signing/notarization path.
-- No update is installed automatically; users still download the DMG and
-  replace the app themselves.
+- No update is installed automatically; users still download and mount the DMG
+  and replace the app themselves.
+- Downloads without a SHA-256 asset are rejected rather than trusted.
 - The check exposes only public release metadata; no API key is sent.
 
 ## Alternatives considered

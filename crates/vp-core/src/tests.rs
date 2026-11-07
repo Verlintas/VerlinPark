@@ -3725,3 +3725,285 @@ async fn session_fork_tree_recurses_through_grandchildren() {
             .any(|node| node.session.id == second.session.id)
     );
 }
+
+#[tokio::test]
+async fn project_fork_forest_includes_all_roots_and_descendants() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("forest".into()),
+        )
+        .await
+        .unwrap();
+    let source = engine
+        .create_session(project.id.clone(), "forest root".into(), None)
+        .await
+        .unwrap();
+    let first = engine
+        .fork_session(&source.id, None, Some("first".into()))
+        .await
+        .unwrap();
+    let _grandchild = engine
+        .fork_session(&first.session.id, None, Some("grandchild".into()))
+        .await
+        .unwrap();
+    let second = engine
+        .fork_session(&source.id, None, Some("second".into()))
+        .await
+        .unwrap();
+    let unrelated = engine
+        .create_session(project.id, "unrelated root".into(), None)
+        .await
+        .unwrap();
+
+    let forest = engine
+        .project_fork_forest(&source.project_id)
+        .await
+        .unwrap();
+    assert_eq!(forest.total, 5);
+    assert_eq!(forest.roots.len(), 2);
+    assert!(forest.checkpoints >= 3);
+    assert!(!forest.truncated);
+    let source_node = forest
+        .roots
+        .iter()
+        .find(|node| node.session.id == source.id)
+        .expect("source root");
+    assert_eq!(source_node.children.len(), 2);
+    assert!(
+        source_node
+            .children
+            .iter()
+            .any(|node| node.session.id == first.session.id && node.children.len() == 1)
+    );
+    assert!(
+        forest
+            .roots
+            .iter()
+            .any(|node| node.session.id == second.session.id)
+            || source_node
+                .children
+                .iter()
+                .any(|node| node.session.id == second.session.id)
+    );
+    assert!(
+        forest
+            .roots
+            .iter()
+            .any(|node| node.session.id == unrelated.id)
+    );
+}
+
+#[tokio::test]
+async fn fork_audit_detects_missing_checkpoint_ref_and_repairs_it() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("audit".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "audit source".into(), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    std::fs::write(worktree.join("snapshot.txt"), "dirty\n").unwrap();
+    let checkpoint = engine
+        .checkpoint_session(&session.id, Some("audit checkpoint".into()))
+        .await
+        .unwrap();
+    crate::worktree::delete_checkpoint_ref(repo.path(), &session.id, &checkpoint.id).unwrap();
+    assert!(!crate::worktree::checkpoint_ref_exists(
+        repo.path(),
+        &session.id,
+        &checkpoint.id
+    ));
+
+    let audit = engine.audit_project_forks(&project.id).await.unwrap();
+    assert!(audit.issues.iter().any(|issue| {
+        issue.kind == "missing_checkpoint_ref"
+            && issue.repairable
+            && issue.checkpoint_id.as_deref() == Some(checkpoint.id.as_str())
+    }));
+    let repair = engine.repair_project_forks(&project.id).await.unwrap();
+    assert_eq!(repair.repaired, 1);
+    assert_eq!(repair.failed, 0);
+    assert!(crate::worktree::checkpoint_ref_exists(
+        repo.path(),
+        &session.id,
+        &checkpoint.id
+    ));
+    let audit = engine.audit_project_forks(&project.id).await.unwrap();
+    assert!(
+        !audit
+            .issues
+            .iter()
+            .any(|issue| issue.kind == "missing_checkpoint_ref")
+    );
+}
+
+#[tokio::test]
+async fn model_presets_round_trip_and_validate() {
+    let data = TempDir::new().unwrap();
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let preset = engine
+        .create_model_preset(vp_protocol::types::CreateModelPresetParams {
+            name: "Local 8k".into(),
+            provider: "openai-compatible".into(),
+            model: "local-8k".into(),
+            context_window: Some(8_000),
+            input_usd_per_million: Some(0.0),
+            output_usd_per_million: Some(0.0),
+            notes: "local".into(),
+        })
+        .await
+        .unwrap();
+    assert!(!preset.id.is_empty());
+    let listed = engine.list_model_presets().await.unwrap();
+    assert_eq!(listed.presets.len(), 1);
+    assert_eq!(listed.presets[0].model, "local-8k");
+
+    let updated = engine
+        .update_model_preset(vp_protocol::types::UpdateModelPresetParams {
+            id: preset.id.clone(),
+            name: "Local 16k".into(),
+            provider: "openai-compatible".into(),
+            model: "local-16k".into(),
+            context_window: Some(16_000),
+            input_usd_per_million: Some(0.5),
+            output_usd_per_million: Some(1.5),
+            notes: "updated".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.name, "Local 16k");
+    assert_eq!(updated.context_window, Some(16_000));
+
+    let error = engine
+        .create_model_preset(vp_protocol::types::CreateModelPresetParams {
+            name: "bad".into(),
+            provider: "other".into(),
+            model: "bad".into(),
+            context_window: None,
+            input_usd_per_million: None,
+            output_usd_per_million: None,
+            notes: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("provider"));
+    let error = engine
+        .create_model_preset(vp_protocol::types::CreateModelPresetParams {
+            name: "bad price".into(),
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            context_window: Some(200_000),
+            input_usd_per_million: Some(-1.0),
+            output_usd_per_million: None,
+            notes: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("prices"));
+
+    assert!(engine.delete_model_preset(&preset.id).await.unwrap());
+    assert!(
+        engine
+            .list_model_presets()
+            .await
+            .unwrap()
+            .presets
+            .is_empty()
+    );
+    assert!(!engine.delete_model_preset(&preset.id).await.unwrap());
+}
+
+#[tokio::test]
+async fn checkpoint_stats_report_dirty_refs_and_snapshot_bytes() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("stats".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "stats source".into(), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    std::fs::write(worktree.join("stats.txt"), "some snapshot bytes\n").unwrap();
+    engine
+        .checkpoint_session(&session.id, Some("stats checkpoint".into()))
+        .await
+        .unwrap();
+    let stats = engine.checkpoint_stats(&session.id).await.unwrap();
+    assert_eq!(stats.checkpoints, 1);
+    assert_eq!(stats.dirty, 1);
+    assert_eq!(stats.refs, 1);
+    assert!(stats.commit_bytes > 0);
+    assert!(stats.snapshot_bytes > 0);
+    assert!(stats.unique_blobs > 0);
+}
+
+#[tokio::test]
+async fn fork_audit_removes_a_stale_ref_for_a_deleted_checkpoint() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("stale".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "stale source".into(), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    std::fs::write(worktree.join("snapshot.txt"), "dirty\n").unwrap();
+    let checkpoint = engine
+        .checkpoint_session(&session.id, Some("stale checkpoint".into()))
+        .await
+        .unwrap();
+    engine
+        .delete_checkpoint(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    crate::worktree::ensure_checkpoint_ref(
+        repo.path(),
+        &session.id,
+        &checkpoint.id,
+        &checkpoint.commit,
+    )
+    .unwrap();
+    let audit = engine.audit_project_forks(&project.id).await.unwrap();
+    assert!(audit.issues.iter().any(|issue| {
+        issue.kind == "stale_checkpoint_ref"
+            && issue.repairable
+            && issue.checkpoint_id.as_deref() == Some(checkpoint.id.as_str())
+    }));
+    let repair = engine.repair_project_forks(&project.id).await.unwrap();
+    assert!(repair.repaired >= 1);
+    assert!(!crate::worktree::checkpoint_ref_exists(
+        repo.path(),
+        &session.id,
+        &checkpoint.id
+    ));
+}

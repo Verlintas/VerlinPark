@@ -354,6 +354,7 @@ struct ResidentSettingsView: View {
 struct ProvidersSettingsView: View {
     @Environment(AppModel.self) private var model
     @AppStorage("verlinpark.session.tokenBudget") private var tokenBudget = 200_000
+    @State private var showingModelPresets = false
 
     private func defaultBaseURL(for kind: String) -> String {
         kind == "anthropic"
@@ -455,6 +456,11 @@ struct ProvidersSettingsView: View {
                 RoleModelRow(title: "Worker", config: $model.roleModels.worker)
                 RoleModelRow(title: "Verifier", config: $model.roleModels.verifier)
                 RoleModelRow(title: "Labour", config: $model.roleModels.labour)
+                Button("Manage Model Presets…") {
+                    showingModelPresets = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
 
             Section("Team capacity") {
@@ -538,6 +544,175 @@ struct ProvidersSettingsView: View {
         }
         .formStyle(.grouped)
         .padding(24)
+        .sheet(isPresented: $showingModelPresets) {
+            ModelPresetsSheet()
+                .environment(model)
+        }
+    }
+}
+
+private struct ModelPresetsSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmingDelete = false
+
+    private let roles = ["leader", "manager", "worker", "verifier", "labour"]
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Model presets")
+                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                    Text("Reusable role metadata. No API key is stored.")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.modelPresetsBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(18)
+            Divider().opacity(0.35)
+            HSplitView {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Button("New") { model.newModelPresetDraft() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        Button("Refresh") {
+                            Task { await model.loadModelPresets() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(model.modelPresets) { preset in
+                                Button {
+                                    model.selectModelPreset(preset)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(preset.name)
+                                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                        Text("\(preset.provider) · \(preset.model)")
+                                            .font(.system(size: 8, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(7)
+                                    .background(
+                                        model.selectedModelPresetID == preset.id
+                                            ? Color.accentColor.opacity(0.18)
+                                            : Color.white.opacity(0.03),
+                                        in: RoundedRectangle(cornerRadius: 7)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            if model.modelPresets.isEmpty {
+                                Text("No presets yet.")
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                }
+                .padding(16)
+                .frame(minWidth: 220, maxWidth: 260)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("PRESET")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        TextField("Name", text: $model.modelPresetName)
+                            .textFieldStyle(.roundedBorder)
+                        Picker("Provider", selection: $model.modelPresetProvider) {
+                            Text("OpenAI-compatible").tag("openai-compatible")
+                            Text("Anthropic").tag("anthropic")
+                        }
+                        TextField("Model", text: $model.modelPresetModel)
+                            .textFieldStyle(.roundedBorder)
+                        HStack(spacing: 8) {
+                            TextField("Context window", text: $model.modelPresetContextText)
+                                .textFieldStyle(.roundedBorder)
+                            TextField("Input $/1M", text: $model.modelPresetInputPriceText)
+                                .textFieldStyle(.roundedBorder)
+                            TextField("Output $/1M", text: $model.modelPresetOutputPriceText)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                        TextField("Notes", text: $model.modelPresetNotes, axis: .vertical)
+                            .textFieldStyle(.roundedBorder)
+                            .lineLimit(2 ... 3)
+                        HStack {
+                            Button("Save preset") {
+                                Task { await model.saveModelPreset() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.modelPresetsBusy)
+                            Button("Delete") { confirmingDelete = true }
+                                .buttonStyle(.bordered)
+                                .disabled(model.selectedModelPresetID == nil || model.modelPresetsBusy)
+                            Spacer()
+                        }
+                        Divider().opacity(0.25)
+                        Text("APPLY TO ROLE")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        HStack(spacing: 6) {
+                            ForEach(roles, id: \.self) { role in
+                                Button(role.capitalized) {
+                                    if let preset = model.modelPresets.first(where: {
+                                        $0.id == model.selectedModelPresetID
+                                    }) {
+                                        model.applyModelPreset(preset, to: role)
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(model.selectedModelPresetID == nil)
+                            }
+                        }
+                        Text(
+                            "Applying fills the role model/context/price fields. Provider and API key are unchanged; use Save & Connect on the Providers tab to persist."
+                        )
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        if let status = model.modelPresetsStatus {
+                            Text(status)
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(18)
+                }
+                .frame(minWidth: 420)
+            }
+        }
+        .frame(width: 760, height: 640)
+        .onAppear {
+            Task {
+                await model.loadModelPresets()
+                if model.modelPresets.isEmpty {
+                    model.newModelPresetDraft()
+                }
+            }
+        }
+        .confirmationDialog(
+            "Delete this model preset?",
+            isPresented: $confirmingDelete
+        ) {
+            Button("Delete", role: .destructive) {
+                Task { await model.deleteModelPreset() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This does not change the current provider or role configuration.")
+        }
     }
 }
 
@@ -730,8 +905,25 @@ struct AboutSettingsView: View {
                             Button("Open Release Page") {
                                 NSWorkspace.shared.open(parsed)
                             }
-                            .buttonStyle(.borderedProminent)
+                            .buttonStyle(.bordered)
                             .controlSize(.small)
+                        }
+                        if update.dmgUrl != nil, update.sha256Url != nil {
+                            HStack(spacing: 8) {
+                                Button(model.updateDownloadBusy ? "Downloading…" : "Download DMG") {
+                                    Task { await model.downloadUpdate() }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .disabled(model.updateDownloadBusy)
+                                if model.updateDownloadBusy {
+                                    ProgressView().controlSize(.small)
+                                }
+                            }
+                        } else {
+                            Text("Release does not provide both DMG and SHA-256 assets.")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.tertiary)
                         }
                     } else {
                         Text("You're up to date.")
@@ -741,6 +933,26 @@ struct AboutSettingsView: View {
                     Text("\(update.repo) · latest \(update.latestVersion)")
                         .font(.system(size: 8, design: .monospaced))
                         .foregroundStyle(.tertiary)
+                    if let downloaded = model.updateDownloadResult {
+                        Text("Saved \(downloaded.version) to \(downloaded.path)")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([
+                                URL(fileURLWithPath: downloaded.path),
+                            ])
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    if let error = model.updateDownloadError {
+                        Text(error)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.orange)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 380)
+                    }
                 }
             }
             Spacer()

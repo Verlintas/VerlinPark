@@ -11,8 +11,8 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy,
     CheckpointRetentionPolicy, Event, IntegrationPolicy, MailboxPolicy, McpServer, MemoryItem,
-    MemoryPolicy, MergeQueueEntry, Project, ProjectBudget, ProjectUsageSession, Question,
-    ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage,
+    MemoryPolicy, MergeQueueEntry, ModelPreset, Project, ProjectBudget, ProjectUsageSession,
+    Question, ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage,
     TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
 };
 
@@ -124,6 +124,18 @@ impl Store {
                 root          TEXT NOT NULL UNIQUE,
                 default_branch TEXT NOT NULL,
                 created_at    TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS model_presets (
+                id                    TEXT PRIMARY KEY,
+                name                  TEXT NOT NULL,
+                provider              TEXT NOT NULL,
+                model                 TEXT NOT NULL,
+                context_window        INTEGER,
+                input_usd_per_million REAL,
+                output_usd_per_million REAL,
+                notes                 TEXT NOT NULL DEFAULT '',
+                created_at            TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_shell_policies (
@@ -2532,6 +2544,85 @@ impl Store {
     pub fn remove_acp_agent(&self, agent_id: &str) -> Result<bool> {
         let conn = self.lock()?;
         Ok(conn.execute("DELETE FROM acp_agents WHERE id = ?1", params![agent_id])? > 0)
+    }
+
+    pub fn list_model_presets(&self) -> Result<Vec<ModelPreset>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT id, name, provider, model, context_window,
+                    input_usd_per_million, output_usd_per_million, notes, created_at
+             FROM model_presets ORDER BY name COLLATE NOCASE, created_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ModelPreset {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                context_window: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                input_usd_per_million: row.get(5)?,
+                output_usd_per_million: row.get(6)?,
+                notes: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        let mut presets = Vec::new();
+        for preset in rows {
+            presets.push(preset?);
+        }
+        Ok(presets)
+    }
+
+    pub fn create_model_preset(&self, preset: &ModelPreset) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO model_presets
+             (id, name, provider, model, context_window, input_usd_per_million,
+              output_usd_per_million, notes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                preset.id,
+                preset.name,
+                preset.provider,
+                preset.model,
+                preset.context_window.map(|value| value as i64),
+                preset.input_usd_per_million,
+                preset.output_usd_per_million,
+                preset.notes,
+                preset.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_model_preset(&self, preset: &ModelPreset) -> Result<bool> {
+        let conn = self.lock()?;
+        Ok(conn.execute(
+            "UPDATE model_presets SET
+                name = ?2, provider = ?3, model = ?4, context_window = ?5,
+                input_usd_per_million = ?6, output_usd_per_million = ?7, notes = ?8
+             WHERE id = ?1",
+            params![
+                preset.id,
+                preset.name,
+                preset.provider,
+                preset.model,
+                preset.context_window.map(|value| value as i64),
+                preset.input_usd_per_million,
+                preset.output_usd_per_million,
+                preset.notes
+            ],
+        )? > 0)
+    }
+
+    pub fn delete_model_preset(&self, id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        Ok(conn.execute("DELETE FROM model_presets WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn get_model_preset(&self, id: &str) -> Result<Option<ModelPreset>> {
+        let presets = self.list_model_presets()?;
+        Ok(presets.into_iter().find(|preset| preset.id == id))
     }
 
     pub fn get_worktree_policy(&self, project_id: &str) -> Result<WorktreeRetentionPolicy> {

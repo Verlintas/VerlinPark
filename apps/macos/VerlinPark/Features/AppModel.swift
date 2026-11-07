@@ -180,10 +180,17 @@ final class AppModel {
     var checkpoints: [SessionCheckpoint] = []
     var checkpointBusy = false
     var checkpointNotice: String?
+    var checkpointStats: SessionCheckpointStatsResult?
+    var checkpointStatsBusy = false
     var sessionLineage: SessionLineageResult?
     var lineageBusy = false
     var forkTree: SessionForkTreeResult?
     var forkTreeBusy = false
+    var projectForkForest: ProjectForkForestResult?
+    var projectForkForestBusy = false
+    var forkAudit: ForkAuditResult?
+    var forkAuditBusy = false
+    var forkRepairNotice: String?
     var compareResult: SessionCompareResult?
     var compareBusy = false
     var compareError: String?
@@ -207,6 +214,17 @@ final class AppModel {
     var providerContextWindowText =
         UserDefaults.standard.string(forKey: "provider.contextWindow") ?? "128000"
     var roleModels = AppModel.loadRoleModels()
+    var modelPresets: [ModelPreset] = []
+    var modelPresetsBusy = false
+    var modelPresetsStatus: String?
+    var selectedModelPresetID: String?
+    var modelPresetName = ""
+    var modelPresetProvider = "openai-compatible"
+    var modelPresetModel = ""
+    var modelPresetContextText = ""
+    var modelPresetInputPriceText = ""
+    var modelPresetOutputPriceText = ""
+    var modelPresetNotes = ""
     var orgManagers = 4
     var orgWorkers = 6
     var orgLabour = 12
@@ -240,6 +258,9 @@ final class AppModel {
     var updateResult: UpdateCheckResult?
     var updateBusy = false
     var updateError: String?
+    var updateDownloadBusy = false
+    var updateDownloadResult: UpdateDownloadResult?
+    var updateDownloadError: String?
     var doctorReport: DoctorReport?
     var doctorBusy = false
     var doctorStatus: String?
@@ -379,8 +400,12 @@ final class AppModel {
             compactNotice = nil
             checkpoints = []
             checkpointNotice = nil
+            checkpointStats = nil
             sessionLineage = nil
             forkTree = nil
+            projectForkForest = nil
+            forkAudit = nil
+            forkRepairNotice = nil
             compareResult = nil
             compareError = nil
             forkMergeNotice = nil
@@ -440,8 +465,12 @@ final class AppModel {
         compactNotice = nil
         checkpoints = []
         checkpointNotice = nil
+        checkpointStats = nil
         sessionLineage = nil
         forkTree = nil
+        projectForkForest = nil
+        forkAudit = nil
+        forkRepairNotice = nil
         compareResult = nil
         compareError = nil
         forkMergeNotice = nil
@@ -460,6 +489,7 @@ final class AppModel {
         Task { await loadMailboxPolicy() }
         Task { await loadProjectBudget() }
         Task { await loadProjectUsage() }
+        Task { await loadProjectForkForest() }
         Task { await loadMemories() }
         Task { await loadCheckpointPolicy() }
         Task { await loadWorktreePolicy() }
@@ -484,8 +514,12 @@ final class AppModel {
         compactNotice = nil
         checkpoints = []
         checkpointNotice = nil
+        checkpointStats = nil
         sessionLineage = nil
         forkTree = nil
+        projectForkForest = nil
+        forkAudit = nil
+        forkRepairNotice = nil
         compareResult = nil
         compareError = nil
         forkMergeNotice = nil
@@ -2399,6 +2433,142 @@ final class AppModel {
         }
     }
 
+    private func optionalPresetInt(_ text: String) -> Int? {
+        let value = text.trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty else { return nil }
+        return Int(value)
+    }
+
+    private func optionalPresetDouble(_ text: String) -> Double? {
+        let value = text.trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty else { return nil }
+        return Double(value)
+    }
+
+    func loadModelPresets() async {
+        modelPresetsBusy = true
+        defer { modelPresetsBusy = false }
+        do {
+            modelPresets = try await core.listModelPresets()
+            if let selectedModelPresetID,
+               !modelPresets.contains(where: { $0.id == selectedModelPresetID })
+            {
+                self.selectedModelPresetID = nil
+            }
+        } catch {
+            modelPresetsStatus = error.localizedDescription
+        }
+    }
+
+    func newModelPresetDraft() {
+        selectedModelPresetID = nil
+        modelPresetName = ""
+        modelPresetProvider = providerKind
+        modelPresetModel = providerModel
+        modelPresetContextText = providerContextWindowText
+        modelPresetInputPriceText = ""
+        modelPresetOutputPriceText = ""
+        modelPresetNotes = ""
+        modelPresetsStatus = nil
+    }
+
+    func selectModelPreset(_ preset: ModelPreset) {
+        selectedModelPresetID = preset.id
+        modelPresetName = preset.name
+        modelPresetProvider = preset.provider
+        modelPresetModel = preset.model
+        modelPresetContextText = preset.contextWindow.map(String.init) ?? ""
+        modelPresetInputPriceText = preset.inputUsdPerMillion.map { String($0) } ?? ""
+        modelPresetOutputPriceText = preset.outputUsdPerMillion.map { String($0) } ?? ""
+        modelPresetNotes = preset.notes
+        modelPresetsStatus = nil
+    }
+
+    func saveModelPreset() async {
+        let name = modelPresetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = modelPresetModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !model.isEmpty else {
+            modelPresetsStatus = "Name and model are required."
+            return
+        }
+        let context = optionalPresetInt(modelPresetContextText)
+        let input = optionalPresetDouble(modelPresetInputPriceText)
+        let output = optionalPresetDouble(modelPresetOutputPriceText)
+        modelPresetsBusy = true
+        defer { modelPresetsBusy = false }
+        do {
+            let saved: ModelPreset = if let selectedModelPresetID {
+                try await core.updateModelPreset(
+                    id: selectedModelPresetID,
+                    name: name,
+                    provider: modelPresetProvider,
+                    model: model,
+                    contextWindow: context,
+                    inputPrice: input,
+                    outputPrice: output,
+                    notes: modelPresetNotes
+                )
+            } else {
+                try await core.createModelPreset(
+                    name: name,
+                    provider: modelPresetProvider,
+                    model: model,
+                    contextWindow: context,
+                    inputPrice: input,
+                    outputPrice: output,
+                    notes: modelPresetNotes
+                )
+            }
+            selectedModelPresetID = saved.id
+            await loadModelPresets()
+            selectModelPreset(saved)
+            modelPresetsStatus = "Saved model preset."
+        } catch {
+            modelPresetsStatus = error.localizedDescription
+        }
+    }
+
+    func deleteModelPreset() async {
+        guard let id = selectedModelPresetID else { return }
+        modelPresetsBusy = true
+        defer { modelPresetsBusy = false }
+        do {
+            let result = try await core.deleteModelPreset(id: id)
+            await loadModelPresets()
+            newModelPresetDraft()
+            modelPresetsStatus = result.removed ? "Deleted preset." : "Preset was already removed."
+        } catch {
+            modelPresetsStatus = error.localizedDescription
+        }
+    }
+
+    func applyModelPreset(_ preset: ModelPreset, to role: String) {
+        guard preset.provider == providerKind else {
+            modelPresetsStatus =
+                "Preset provider \(preset.provider) does not match the configured provider \(providerKind)."
+            return
+        }
+        var config = RoleModelConfig()
+        config.model = role == "leader" ? nil : preset.model
+        config.contextWindow = preset.contextWindow
+        config.inputUsdPerMillion = preset.inputUsdPerMillion
+        config.outputUsdPerMillion = preset.outputUsdPerMillion
+        if role == "leader" {
+            providerModel = preset.model
+        }
+        switch role {
+        case "leader": roleModels.leader = config
+        case "manager": roleModels.manager = config
+        case "worker": roleModels.worker = config
+        case "verifier": roleModels.verifier = config
+        case "labour": roleModels.labour = config
+        default:
+            modelPresetsStatus = "Unknown role: \(role)"
+            return
+        }
+        modelPresetsStatus = "Applied \(preset.name) to \(role). Save provider settings to persist."
+    }
+
     func checkForUpdates() async {
         updateBusy = true
         updateError = nil
@@ -2407,6 +2577,18 @@ final class AppModel {
             updateResult = try await core.checkForUpdates()
         } catch {
             updateError = error.localizedDescription
+        }
+    }
+
+    func downloadUpdate() async {
+        updateDownloadBusy = true
+        updateDownloadError = nil
+        updateDownloadResult = nil
+        defer { updateDownloadBusy = false }
+        do {
+            updateDownloadResult = try await core.downloadUpdate()
+        } catch {
+            updateDownloadError = error.localizedDescription
         }
     }
 
@@ -2739,6 +2921,23 @@ final class AppModel {
         }
     }
 
+    func loadCheckpointStats() async {
+        guard let sessionID = selectedSessionID else {
+            checkpointStats = nil
+            return
+        }
+        checkpointStatsBusy = true
+        defer { checkpointStatsBusy = false }
+        do {
+            let result = try await core.checkpointStats(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                checkpointStats = result
+            }
+        } catch {
+            checkpointStats = nil
+        }
+    }
+
     func deleteCheckpoint(_ checkpointID: String) async {
         guard let sessionID = selectedSessionID else { return }
         checkpointBusy = true
@@ -2806,6 +3005,54 @@ final class AppModel {
             }
         } catch {
             forkTree = nil
+        }
+    }
+
+    func loadProjectForkForest() async {
+        guard let projectID = selectedProjectID else {
+            projectForkForest = nil
+            return
+        }
+        projectForkForestBusy = true
+        defer { projectForkForestBusy = false }
+        do {
+            let result = try await core.projectForkForest(projectID: projectID)
+            if projectID == selectedProjectID {
+                projectForkForest = result
+            }
+        } catch {
+            projectForkForest = nil
+        }
+    }
+
+    func auditProjectForks() async {
+        guard let projectID = selectedProjectID else { return }
+        forkAuditBusy = true
+        forkRepairNotice = nil
+        defer { forkAuditBusy = false }
+        do {
+            let result = try await core.auditProjectForks(projectID: projectID)
+            if projectID == selectedProjectID {
+                forkAudit = result
+            }
+        } catch {
+            forkAudit = nil
+            forkRepairNotice = error.localizedDescription
+        }
+    }
+
+    func repairProjectForks() async {
+        guard let projectID = selectedProjectID else { return }
+        forkAuditBusy = true
+        forkRepairNotice = nil
+        defer { forkAuditBusy = false }
+        do {
+            let result = try await core.repairProjectForks(projectID: projectID)
+            forkRepairNotice = "Repaired \(result.repaired), failed \(result.failed)"
+            await auditProjectForks()
+            await loadProjectForkForest()
+        } catch {
+            forkRepairNotice = error.localizedDescription
         }
     }
 
@@ -3129,6 +3376,7 @@ final class AppModel {
                 if self.forkTree != nil {
                     await self.loadForkTree()
                 }
+                await self.loadProjectForkForest()
             }
         }
 

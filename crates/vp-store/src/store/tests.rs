@@ -1539,3 +1539,40 @@ fn round_trips_task_scheduler_policy_and_manifest() {
     assert_eq!(snapshot[0].task_scheduler_policy.cooldown_secs, 15);
     assert!(snapshot[0].task_scheduler_policy.dispatch_tasks);
 }
+
+#[test]
+fn model_presets_round_trip_and_delete() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let preset = vp_protocol::types::ModelPreset {
+        id: "preset-1".into(),
+        name: "Claude".into(),
+        provider: "anthropic".into(),
+        model: "claude-sonnet".into(),
+        context_window: Some(200_000),
+        input_usd_per_million: Some(3.0),
+        output_usd_per_million: Some(15.0),
+        notes: "test".into(),
+        created_at: "2026-11-08T00:00:00Z".into(),
+    };
+    store.create_model_preset(&preset).unwrap();
+    let listed = store.list_model_presets().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].model, "claude-sonnet");
+    assert_eq!(store.get_model_preset("preset-1").unwrap().unwrap(), preset);
+
+    let updated = vp_protocol::types::ModelPreset {
+        name: "Claude fast".into(),
+        model: "claude-haiku".into(),
+        context_window: Some(100_000),
+        ..preset
+    };
+    assert!(store.update_model_preset(&updated).unwrap());
+    assert_eq!(
+        store.get_model_preset("preset-1").unwrap().unwrap().name,
+        "Claude fast"
+    );
+    assert!(store.delete_model_preset("preset-1").unwrap());
+    assert!(store.list_model_presets().unwrap().is_empty());
+    assert!(!store.delete_model_preset("preset-1").unwrap());
+}

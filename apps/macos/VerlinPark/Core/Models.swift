@@ -513,6 +513,38 @@ struct SearchResult: Codable, Sendable {
     let truncated: Bool
 }
 
+struct ModelPreset: Codable, Sendable, Identifiable {
+    let id: String
+    let name: String
+    let provider: String
+    let model: String
+    let contextWindow: Int?
+    let inputUsdPerMillion: Double?
+    let outputUsdPerMillion: Double?
+    let notes: String
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case provider
+        case model
+        case contextWindow = "context_window"
+        case inputUsdPerMillion = "input_usd_per_million"
+        case outputUsdPerMillion = "output_usd_per_million"
+        case notes
+        case createdAt = "created_at"
+    }
+}
+
+struct ModelPresetListResult: Codable, Sendable {
+    let presets: [ModelPreset]
+}
+
+struct DeleteModelPresetResult: Codable, Sendable {
+    let removed: Bool
+}
+
 struct CheckpointRetentionPolicy: Codable, Hashable, Sendable {
     var enabled: Bool
     var olderThanSecs: Int
@@ -1273,6 +1305,26 @@ struct SessionCheckpointListResult: Codable, Sendable {
     let checkpoints: [SessionCheckpoint]
 }
 
+struct SessionCheckpointStatsResult: Codable, Sendable {
+    let sessionID: String
+    let checkpoints: Int
+    let dirty: Int
+    let refs: Int
+    let commitBytes: Int
+    let snapshotBytes: Int
+    let uniqueBlobs: Int
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case checkpoints
+        case dirty
+        case refs
+        case commitBytes = "commit_bytes"
+        case snapshotBytes = "snapshot_bytes"
+        case uniqueBlobs = "unique_blobs"
+    }
+}
+
 struct SessionCheckpointDeleteResult: Codable, Sendable {
     let sessionID: String
     let checkpointID: String
@@ -1309,6 +1361,10 @@ struct UpdateCheckResult: Codable, Sendable {
     let releaseName: String?
     let releaseUrl: String?
     let publishedAt: String?
+    let dmgName: String?
+    let dmgUrl: String?
+    let sha256Name: String?
+    let sha256Url: String?
 
     enum CodingKeys: String, CodingKey {
         case currentVersion = "current_version"
@@ -1318,7 +1374,19 @@ struct UpdateCheckResult: Codable, Sendable {
         case releaseName = "release_name"
         case releaseUrl = "release_url"
         case publishedAt = "published_at"
+        case dmgName = "dmg_name"
+        case dmgUrl = "dmg_url"
+        case sha256Name = "sha256_name"
+        case sha256Url = "sha256_url"
     }
+}
+
+struct UpdateDownloadResult: Codable, Sendable {
+    let version: String
+    let path: String
+    let sha256: String
+    let size: Int
+    let verified: Bool
 }
 
 struct SessionForkTreeNode: Codable, Sendable, Identifiable {
@@ -1336,6 +1404,76 @@ struct SessionForkTreeNode: Codable, Sendable, Identifiable {
         case checkpointID = "checkpoint_id"
         case commit
         case children
+    }
+}
+
+struct ProjectForkForestResult: Codable, Sendable {
+    let projectID: String
+    let roots: [SessionForkTreeNode]
+    let total: Int
+    let checkpoints: Int
+    let dirtyCheckpoints: Int
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case roots
+        case total
+        case checkpoints
+        case dirtyCheckpoints = "dirty_checkpoints"
+        case truncated
+    }
+}
+
+struct ForkAuditIssue: Codable, Sendable, Identifiable {
+    let kind: String
+    let sessionID: String
+    let relatedSessionID: String?
+    let checkpointID: String?
+    let commit: String?
+    let detail: String
+    let repairable: Bool
+
+    var id: String {
+        "\(kind)-\(sessionID)-\(checkpointID ?? "")-\(relatedSessionID ?? "")"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case sessionID = "session_id"
+        case relatedSessionID = "related_session_id"
+        case checkpointID = "checkpoint_id"
+        case commit
+        case detail
+        case repairable
+    }
+}
+
+struct ForkAuditResult: Codable, Sendable {
+    let projectID: String
+    let sessions: Int
+    let checkpoints: Int
+    let issues: [ForkAuditIssue]
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case sessions
+        case checkpoints
+        case issues
+    }
+}
+
+struct ForkRepairResult: Codable, Sendable {
+    let projectID: String
+    let repaired: Int
+    let failed: Int
+    let details: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case repaired
+        case failed
+        case details
     }
 }
 

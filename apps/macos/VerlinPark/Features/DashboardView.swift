@@ -112,6 +112,9 @@ struct DashboardView: View {
                     ForksCard()
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    ProjectForkForestCard()
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                     ArtifactPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
@@ -822,6 +825,13 @@ private struct WorktreeCleanupCard: View {
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)
+            if let stats = model.checkpointStats {
+                Text(
+                    "\(stats.checkpoints) checkpoints · \(stats.dirty) dirty · \(stats.refs) refs · ~\(ByteCountFormatter.string(fromByteCount: Int64(stats.snapshotBytes), countStyle: .file)) snapshot"
+                )
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+            }
 
             Divider().opacity(0.2)
             Text("AUTOMATIC RETENTION")
@@ -942,9 +952,15 @@ private struct CheckpointsCard: View {
                         .lineLimit(1)
                 }
                 Spacer()
-                if model.checkpointBusy {
+                if model.checkpointBusy || model.checkpointStatsBusy {
                     ProgressView().controlSize(.small)
                 }
+                Button("Stats") {
+                    Task { await model.loadCheckpointStats() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.selectedSession == nil || model.checkpointStatsBusy)
                 Button("Prune >30d, keep 5") {
                     Task { await model.pruneCheckpoints() }
                 }
@@ -1242,6 +1258,203 @@ private struct ForksCard: View {
                         .disabled(model.forkMergeBusy || model.compareBusy)
                     }
                 }
+            }
+        }
+    }
+}
+
+private struct ProjectForkForestCard: View {
+    @Environment(AppModel.self) private var model
+    @State private var showingForest = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Project fork forest")
+                    Text(model.selectedProject?.name ?? "No project selected")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.projectForkForestBusy || model.forkAuditBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Forest") { showingForest = true }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.selectedProject == nil)
+                Button("Audit") {
+                    Task { await model.auditProjectForks() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.forkAuditBusy || model.selectedProject == nil)
+                Button("Repair") {
+                    Task { await model.repairProjectForks() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.forkAuditBusy || model.selectedProject == nil)
+            }
+            Text(
+                "All roots, fork descendants, checkpoint counts, and integrity issues for this project. Repair backfills missing fork links and checkpoint refs; it never rewrites historical events."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let forest = model.projectForkForest {
+                HStack(spacing: 14) {
+                    Text("\(forest.total) sessions")
+                    Text("\(forest.roots.count) roots")
+                    Text("\(forest.checkpoints) checkpoints")
+                    if forest.dirtyCheckpoints > 0 {
+                        Text("\(forest.dirtyCheckpoints) dirty").foregroundStyle(.orange)
+                    }
+                    if forest.truncated {
+                        Text("truncated").foregroundStyle(.orange)
+                    }
+                }
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+            }
+            if let audit = model.forkAudit {
+                Text(
+                    "\(audit.issues.count) issues · \(audit.checkpoints) checkpoints · \(audit.sessions) sessions"
+                )
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(audit.issues.isEmpty ? Color.secondary : Color.orange)
+            }
+            if let notice = model.forkRepairNotice {
+                Text(notice)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .sheet(isPresented: $showingForest) {
+            ProjectForkForestSheet()
+                .environment(model)
+        }
+    }
+}
+
+private struct ProjectForkForestSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Project fork forest")
+                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                    Text("All session roots and checkpoint descendants")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.projectForkForestBusy || model.forkAuditBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Audit") {
+                    Task { await model.auditProjectForks() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Button("Repair") {
+                    Task { await model.repairProjectForks() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(18)
+            Divider().opacity(0.35)
+            HSplitView {
+                ScrollView {
+                    if let forest = model.projectForkForest {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(spacing: 14) {
+                                Text("\(forest.total) sessions")
+                                Text("\(forest.roots.count) roots")
+                                Text("\(forest.checkpoints) checkpoints")
+                                if forest.truncated {
+                                    Text("truncated").foregroundStyle(.orange)
+                                }
+                            }
+                            .font(.system(size: 10, design: .monospaced))
+                            ForEach(forest.roots) { root in
+                                ForkTreeRowView(node: root, depth: 0)
+                            }
+                        }
+                        .padding(18)
+                    } else {
+                        ProgressView().controlSize(.small)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .frame(minWidth: 420)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("INTEGRITY AUDIT")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    if let audit = model.forkAudit {
+                        Text(
+                            "\(audit.issues.count) issues · \(audit.sessions) sessions · \(audit.checkpoints) checkpoints"
+                        )
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(audit.issues.isEmpty ? Color.secondary : Color.orange)
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(audit.issues) { issue in
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack(spacing: 6) {
+                                            Text(issue.kind)
+                                                .font(.system(
+                                                    size: 9,
+                                                    weight: .semibold,
+                                                    design: .monospaced
+                                                ))
+                                                .foregroundStyle(issue.repairable ? Color.orange : Color.red)
+                                            Text(issue.repairable ? "repairable" : "manual")
+                                                .font(.system(size: 8, design: .monospaced))
+                                                .foregroundStyle(.tertiary)
+                                        }
+                                        Text(issue.detail)
+                                            .font(.system(size: 9, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    .padding(8)
+                                    .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+                                }
+                            }
+                        }
+                    } else {
+                        Text("Run Audit to inspect fork links and checkpoint refs.")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    if let notice = model.forkRepairNotice {
+                        Text(notice)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(18)
+                .frame(minWidth: 300)
+            }
+        }
+        .frame(width: 980, height: 700)
+        .onAppear {
+            Task {
+                await model.loadProjectForkForest()
+                await model.auditProjectForks()
             }
         }
     }
