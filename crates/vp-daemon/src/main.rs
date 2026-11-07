@@ -45,9 +45,10 @@ use vp_protocol::types::{
     SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
     SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
-    SetSessionPriorityParams, SetShellPolicyParams, SetWorktreePolicyParams, ShellPolicyParams,
-    ShellPolicyResult, SubscribeParams, TaskActionParams, TaskActionResult, TaskQueueParams,
-    TeamPlanParams, TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
+    SetSessionPriorityParams, SetShellPolicyParams, SetTaskSchedulerPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams,
+    TaskActionParams, TaskActionResult, TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams,
+    TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
     TerminalResizeParams, TerminalWriteParams, UpdateMcpServerParams, UsageLedgerParams,
     WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
@@ -403,6 +404,32 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Ok(projects) => RpcResponse::success(id, ProjectListResult { projects }),
             Err(error) => internal_error(id, error),
         },
+        "project.task_scheduler.get" => {
+            match parse_params::<TaskSchedulerPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .get_task_scheduler_policy(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "project.task_scheduler.set" => {
+            match parse_params::<SetTaskSchedulerPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_task_scheduler_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "project.shell_policy.get" => match parse_params::<ShellPolicyParams>(request.params) {
             Ok(params) => match state.engine.get_shell_policy(&params.project_id).await {
                 Ok(policy) => RpcResponse::success(

@@ -85,6 +85,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
         store.set_mailbox_policy(&snapshot.project.id, &snapshot.mailbox_policy)?;
         store.set_worktree_policy(&snapshot.project.id, &snapshot.worktree_policy)?;
         store.set_project_budget(&snapshot.project.id, &snapshot.budget)?;
+        store.set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
     }
     let engine = Engine::new(store);
     let mut sessions = 0usize;
@@ -287,6 +288,16 @@ mod tests {
             .unwrap();
             engine.set_team_plan(&session.id, &plan).await.unwrap();
             engine
+                .set_task_scheduler_policy(
+                    &project.id,
+                    vp_protocol::types::TaskSchedulerPolicy {
+                        enabled: true,
+                        cooldown_secs: 30,
+                    },
+                )
+                .await
+                .unwrap();
+            engine
                 .append_event(
                     &session.id,
                     "plan_task.started",
@@ -338,6 +349,9 @@ mod tests {
         assert_eq!(tasks[0].task_id, "T1");
         assert_eq!(tasks[0].status, "completed");
         assert_eq!(tasks[0].attempts, 1);
+        let policy = store.get_task_scheduler_policy(&project_id).unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.cooldown_secs, 30);
     }
 
     #[tokio::test]

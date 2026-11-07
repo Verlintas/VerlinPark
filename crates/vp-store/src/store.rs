@@ -12,7 +12,8 @@ use vp_protocol::types::{
     AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy, Event, IntegrationPolicy,
     MailboxPolicy, McpServer, MemoryItem, MemoryPolicy, MergeQueueEntry, Project, ProjectBudget,
     ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy,
-    StoredMessage, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
+    StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy,
+    WriteLease,
 };
 
 use crate::paths;
@@ -41,7 +42,7 @@ pub struct SessionRepair {
     pub artifact_warnings: Vec<String>,
 }
 
-pub type PendingTaskSessionRow = (String, String, i32, usize, String, i32);
+pub type PendingTaskSessionRow = (String, String, i32, usize, String, i32, u64);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectManifestSnapshot {
@@ -54,6 +55,8 @@ pub struct ProjectManifestSnapshot {
     pub mailbox_policy: MailboxPolicy,
     pub worktree_policy: WorktreeRetentionPolicy,
     pub budget: ProjectBudget,
+    #[serde(default)]
+    pub task_scheduler_policy: TaskSchedulerPolicy,
 }
 
 /// Read the latest project snapshot for each project from `projects.jsonl`.
@@ -358,6 +361,13 @@ impl Store {
                 token_budget   INTEGER,
                 cost_budget_usd REAL,
                 updated_at     TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_task_scheduler_policies (
+                project_id    TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled       INTEGER NOT NULL DEFAULT 0,
+                cooldown_secs INTEGER NOT NULL DEFAULT 60,
+                updated_at    TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_mailbox_policies (
@@ -671,6 +681,7 @@ impl Store {
                 mailbox_policy: self.get_mailbox_policy(&project.id)?,
                 worktree_policy: self.get_worktree_policy(&project.id)?,
                 budget: self.get_project_budget(&project.id)?,
+                task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 project,
             };
             serde_json::to_writer(&mut file, &snapshot)?;
@@ -775,6 +786,48 @@ impl Store {
                 read_deny,
                 if policy.restrict_home { 1 } else { 0 },
                 if policy.read_jail { 1 } else { 0 },
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_task_scheduler_policy(&self, project_id: &str) -> Result<TaskSchedulerPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT enabled, cooldown_secs FROM project_task_scheduler_policies
+                 WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(TaskSchedulerPolicy {
+                        enabled: row.get::<_, i64>(0)? != 0,
+                        cooldown_secs: row.get::<_, i64>(1)?.max(1) as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn set_task_scheduler_policy(
+        &self,
+        project_id: &str,
+        policy: &TaskSchedulerPolicy,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_task_scheduler_policies
+             (project_id, enabled, cooldown_secs, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                cooldown_secs = excluded.cooldown_secs,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                if policy.enabled { 1 } else { 0 },
+                policy.cooldown_secs as i64,
                 now_rfc3339()
             ],
         )?;
@@ -3845,28 +3898,41 @@ impl Store {
 
     /// Sessions with retryable DAG tasks that are idle/failed/cancelled and
     /// therefore safe for the opt-in global resume scheduler to pick up.
-    pub fn pending_task_sessions(&self) -> Result<Vec<PendingTaskSessionRow>> {
+    pub fn pending_task_sessions(
+        &self,
+        global_enabled: bool,
+        default_cooldown_secs: u64,
+    ) -> Result<Vec<PendingTaskSessionRow>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT t.session_id, t.project_id, s.priority, COUNT(*), MIN(t.enqueued_at),
-                    MAX(t.priority)
+                    MAX(t.priority), COALESCE(p.cooldown_secs, ?2)
              FROM plan_tasks t
              JOIN sessions s ON s.id = t.session_id
+             LEFT JOIN project_task_scheduler_policies p ON p.project_id = t.project_id
              WHERE t.status IN ('pending', 'interrupted', 'failed', 'blocked', 'cancelled')
                AND s.status IN ('idle', 'failed', 'cancelled')
-             GROUP BY t.session_id, t.project_id, s.priority
+               AND COALESCE(p.enabled, ?1) = 1
+             GROUP BY t.session_id, t.project_id, s.priority, p.cooldown_secs
              ORDER BY s.priority DESC, MIN(t.enqueued_at) ASC, t.session_id ASC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i32>(2)?,
-                row.get::<_, i64>(3)?.max(0) as usize,
-                row.get::<_, String>(4)?,
-                row.get::<_, i32>(5)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![
+                if global_enabled { 1 } else { 0 },
+                default_cooldown_secs as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, i64>(3)?.max(0) as usize,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i32>(5)?,
+                    row.get::<_, i64>(6)?.max(1) as u64,
+                ))
+            },
+        )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 

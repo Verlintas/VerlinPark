@@ -43,12 +43,11 @@ one ready batch inside one session.
    write leases, because no agent from the previous process is still running.
    A session that reaches a terminal state during normal operation also clears
    its own leftover running task rows and appends `plan_task.interrupted`.
-6. **Opt-in global resume scheduler.** With `VERLINPARK_TASK_SCHEDULER=1`, a
-   background loop selects one idle/failed/cancelled session with retryable
-   tasks using effective priority, aging, and a session round-robin tie-break,
-   then calls the existing `resume_plan`. A cooldown
-   (`VERLINPARK_TASK_SCHEDULER_COOLDOWN_SECS`, default 60) prevents hot retry
-   loops. It is off by default because resuming a plan spends the session budget.
+6. **Opt-in resume scheduler.** A background loop selects one
+   idle/failed/cancelled session with retryable tasks using effective priority,
+   aging, and a session round-robin tie-break, then calls the existing
+   `resume_plan`. Superseded in ADR-0091 by a persisted per-project
+   `TaskSchedulerPolicy`; the original env flag remains as a fallback default.
 7. **Observability.** `task.queue` returns rows plus active leases; `vp tasks`
    and the Manage Dash scheduler card expose them. `Sync_plan_tasks` remains the
    repair point for the operational projection.

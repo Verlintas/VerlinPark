@@ -61,17 +61,6 @@ fn auto_expand_workers() -> bool {
         })
 }
 
-fn task_scheduler_enabled() -> bool {
-    env::var("VERLINPARK_TASK_SCHEDULER")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes"
-            )
-        })
-}
-
 fn priority_aging() -> Duration {
     let seconds = env::var("VERLINPARK_PRIORITY_AGING_SECS")
         .ok()
@@ -2331,9 +2320,6 @@ impl AgentService {
     /// priority and session round-robin, then resumes its stored plan. This is
     /// intentionally not default-on: resuming a plan spends the session budget.
     pub fn start_task_scheduler(&self) {
-        if !task_scheduler_enabled() {
-            return;
-        }
         if self.task_scheduler_started.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -2342,11 +2328,6 @@ impl AgentService {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(5)
             .clamp(1, 3600);
-        let cooldown_secs = env::var("VERLINPARK_TASK_SCHEDULER_COOLDOWN_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(60)
-            .clamp(1, 86_400);
         let service = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -2375,7 +2356,7 @@ impl AgentService {
                 };
                 cooldowns.insert(
                     candidate.session_id.clone(),
-                    now + Duration::from_secs(cooldown_secs),
+                    now + Duration::from_secs(candidate.cooldown_secs),
                 );
                 tracing::info!(
                     session_id = %candidate.session_id,
@@ -2384,6 +2365,7 @@ impl AgentService {
                     session_priority = candidate.priority,
                     task_priority = candidate.task_priority,
                     effective_priority = candidate.effective_priority,
+                    cooldown_secs = candidate.cooldown_secs,
                     "global task scheduler resuming a plan"
                 );
                 match service.resume_plan(&candidate.session_id).await {

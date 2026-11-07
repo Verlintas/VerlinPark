@@ -22,11 +22,12 @@ use vp_protocol::types::{
     QuestionListResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCommit,
     SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus, SessionPriorityResult,
     SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
-    StoredMessage, TaskQueueResult, TeamPlan, TerminalCloseResult, TerminalOpenResult,
-    TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem, UsageBucket,
-    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
-    WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
-    WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
+    StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan,
+    TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    TerminalWriteResult, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
+    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
+    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
+    WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -315,6 +316,49 @@ impl Engine {
         .await??
         .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
         tokio::task::spawn_blocking(move || store.get_shell_policy(&project_id)).await?
+    }
+
+    pub async fn get_task_scheduler_policy(
+        &self,
+        project_id: &str,
+    ) -> Result<TaskSchedulerPolicyResult> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let id = project_id.clone();
+        let policy =
+            tokio::task::spawn_blocking(move || store.get_task_scheduler_policy(&id)).await??;
+        Ok(TaskSchedulerPolicyResult { project_id, policy })
+    }
+
+    pub async fn set_task_scheduler_policy(
+        &self,
+        project_id: &str,
+        policy: TaskSchedulerPolicy,
+    ) -> Result<TaskSchedulerPolicyResult> {
+        if !(1..=86_400).contains(&policy.cooldown_secs) {
+            anyhow::bail!("task scheduler cooldown must be between 1 and 86400 seconds");
+        }
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let stored = policy.clone();
+        let id = project_id.clone();
+        tokio::task::spawn_blocking(move || store.set_task_scheduler_policy(&id, &stored))
+            .await??;
+        Ok(TaskSchedulerPolicyResult { project_id, policy })
     }
 
     pub async fn set_shell_policy(

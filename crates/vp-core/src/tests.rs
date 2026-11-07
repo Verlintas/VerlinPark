@@ -244,6 +244,65 @@ async fn skips_and_retries_plan_tasks_with_replay() {
 }
 
 #[tokio::test]
+async fn task_scheduler_policy_round_trips_and_validates() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("scheduler policy".into()),
+        )
+        .await
+        .unwrap();
+    let default = engine.get_task_scheduler_policy(&project.id).await.unwrap();
+    assert!(!default.policy.enabled);
+    assert_eq!(default.policy.cooldown_secs, 60);
+
+    let saved = engine
+        .set_task_scheduler_policy(
+            &project.id,
+            vp_protocol::types::TaskSchedulerPolicy {
+                enabled: true,
+                cooldown_secs: 12,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(saved.policy.enabled);
+    assert_eq!(saved.policy.cooldown_secs, 12);
+    assert_eq!(
+        engine.get_task_scheduler_policy(&project.id).await.unwrap(),
+        saved
+    );
+    assert!(
+        engine
+            .set_task_scheduler_policy(
+                &project.id,
+                vp_protocol::types::TaskSchedulerPolicy {
+                    enabled: true,
+                    cooldown_secs: 0,
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .set_task_scheduler_policy(
+                "missing-project",
+                vp_protocol::types::TaskSchedulerPolicy {
+                    enabled: true,
+                    cooldown_secs: 60,
+                },
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn records_memories_and_repairs_their_projection() {
     let data = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();

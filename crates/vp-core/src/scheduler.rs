@@ -17,6 +17,8 @@ pub struct TaskScheduler {
     store: Store,
     aging: Duration,
     state: watch::Sender<u64>,
+    global_enabled: bool,
+    default_cooldown_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -28,19 +30,36 @@ pub struct PendingSession {
     pub task_priority: i32,
     pub enqueued_at: String,
     pub effective_priority: i64,
+    pub cooldown_secs: u64,
 }
 
 impl TaskScheduler {
     pub fn new(store: Store) -> Self {
-        Self::new_with_aging(store, task_aging())
+        Self::new_with_aging_and_policy(
+            store,
+            task_aging(),
+            task_scheduler_global_default(),
+            task_scheduler_cooldown_default(),
+        )
     }
 
     pub fn new_with_aging(store: Store, aging: Duration) -> Self {
+        Self::new_with_aging_and_policy(store, aging, false, 60)
+    }
+
+    pub fn new_with_aging_and_policy(
+        store: Store,
+        aging: Duration,
+        global_enabled: bool,
+        default_cooldown_secs: u64,
+    ) -> Self {
         let (state, _) = watch::channel(0);
         Self {
             store,
             aging,
             state,
+            global_enabled,
+            default_cooldown_secs: default_cooldown_secs.max(1),
         }
     }
 
@@ -190,16 +209,26 @@ impl TaskScheduler {
     ) -> Result<Option<PendingSession>> {
         let store = self.store.clone();
         let aging = self.aging;
+        let global_enabled = self.global_enabled;
+        let default_cooldown_secs = self.default_cooldown_secs;
         let last_session = last_session.map(ToOwned::to_owned);
         let excluded = excluded.to_vec();
         tokio::task::spawn_blocking(move || {
             let now = OffsetDateTime::now_utc();
             let mut candidates = store
-                .pending_task_sessions()?
+                .pending_task_sessions(global_enabled, default_cooldown_secs)?
                 .into_iter()
-                .filter(|(session_id, _, _, _, _, _)| !excluded.contains(session_id))
+                .filter(|(session_id, _, _, _, _, _, _)| !excluded.contains(session_id))
                 .map(
-                    |(session_id, project_id, priority, pending, enqueued_at, task_priority)| {
+                    |(
+                        session_id,
+                        project_id,
+                        priority,
+                        pending,
+                        enqueued_at,
+                        task_priority,
+                        cooldown_secs,
+                    )| {
                         let effective_priority = session_effective_priority(
                             priority.saturating_add(task_priority).clamp(-100, 100),
                             &enqueued_at,
@@ -214,6 +243,7 @@ impl TaskScheduler {
                             task_priority,
                             enqueued_at,
                             effective_priority,
+                            cooldown_secs,
                         }
                     },
                 )
@@ -268,6 +298,25 @@ impl TaskScheduler {
         })
         .await?
     }
+}
+
+fn task_scheduler_global_default() -> bool {
+    env::var("VERLINPARK_TASK_SCHEDULER")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+}
+
+fn task_scheduler_cooldown_default() -> u64 {
+    env::var("VERLINPARK_TASK_SCHEDULER_COOLDOWN_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(1, 86_400)
 }
 
 fn task_aging() -> Duration {
@@ -420,6 +469,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_resume_requires_a_project_policy() {
+        let (_dir, store, project, session) = store();
+        store.update_session_status(&session.id, "idle").unwrap();
+        let scheduler = TaskScheduler::new_with_aging(store.clone(), Duration::ZERO);
+        scheduler
+            .sync_plan(&session, &plan(vec![task("T1", 0, vec![])]))
+            .await
+            .unwrap();
+        assert!(
+            scheduler
+                .next_pending_session(None, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .set_task_scheduler_policy(
+                &project.id,
+                &vp_protocol::types::TaskSchedulerPolicy {
+                    enabled: true,
+                    cooldown_secs: 20,
+                },
+            )
+            .unwrap();
+        let picked = scheduler
+            .next_pending_session(None, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.session_id, session.id);
+        assert_eq!(picked.cooldown_secs, 20);
+    }
+
+    #[tokio::test]
     async fn picks_pending_sessions_with_round_robin_and_exclusions() {
         let (_dir, store, project, first) = store();
         let second = store.create_session(&project.id, "second").unwrap();
@@ -428,7 +511,16 @@ mod tests {
             .unwrap();
         store.update_session_status(&first.id, "idle").unwrap();
         store.update_session_status(&second.id, "idle").unwrap();
-        let scheduler = TaskScheduler::new_with_aging(store, Duration::ZERO);
+        let scheduler = TaskScheduler::new_with_aging(store.clone(), Duration::ZERO);
+        store
+            .set_task_scheduler_policy(
+                &project.id,
+                &vp_protocol::types::TaskSchedulerPolicy {
+                    enabled: true,
+                    cooldown_secs: 60,
+                },
+            )
+            .unwrap();
         let plan = plan(vec![task("T1", 0, vec![])]);
         scheduler.sync_plan(&first, &plan).await.unwrap();
         scheduler.sync_plan(&second, &plan).await.unwrap();
@@ -456,7 +548,16 @@ mod tests {
             .unwrap();
         store.update_session_status(&first.id, "idle").unwrap();
         store.update_session_status(&second.id, "idle").unwrap();
-        let scheduler = TaskScheduler::new_with_aging(store, Duration::ZERO);
+        let scheduler = TaskScheduler::new_with_aging(store.clone(), Duration::ZERO);
+        store
+            .set_task_scheduler_policy(
+                &project.id,
+                &vp_protocol::types::TaskSchedulerPolicy {
+                    enabled: true,
+                    cooldown_secs: 60,
+                },
+            )
+            .unwrap();
         scheduler
             .sync_plan(&first, &plan(vec![task("low", -20, vec![])]))
             .await

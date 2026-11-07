@@ -43,6 +43,44 @@ fn default_shell_network() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskSchedulerPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_task_scheduler_cooldown")]
+    pub cooldown_secs: u64,
+}
+
+impl Default for TaskSchedulerPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cooldown_secs: default_task_scheduler_cooldown(),
+        }
+    }
+}
+
+fn default_task_scheduler_cooldown() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskSchedulerPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetTaskSchedulerPolicyParams {
+    pub project_id: String,
+    pub policy: TaskSchedulerPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskSchedulerPolicyResult {
+    pub project_id: String,
+    pub policy: TaskSchedulerPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IntegrationPolicy {
     #[serde(default)]
     pub auto_resolve: bool,

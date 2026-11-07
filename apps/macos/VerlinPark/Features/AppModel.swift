@@ -163,6 +163,11 @@ final class AppModel {
     var taskQueueStatus: String?
     var taskActionBusyID: String?
     var taskActionStatus: String?
+    var taskSchedulerPolicy = TaskSchedulerPolicy.disabled
+    var taskSchedulerEnabled = false
+    var taskSchedulerCooldownText = "60"
+    var taskSchedulerPolicyBusy = false
+    var taskSchedulerPolicyStatus: String?
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -2005,6 +2010,57 @@ final class AppModel {
             taskQueueStatus = nil
         } catch {
             taskQueueStatus = error.localizedDescription
+        }
+    }
+
+    func loadTaskSchedulerPolicy() async {
+        guard let projectID = selectedProjectID else {
+            taskSchedulerPolicy = .disabled
+            taskSchedulerEnabled = false
+            taskSchedulerCooldownText = "60"
+            return
+        }
+        do {
+            let policy = try await core.taskSchedulerPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            taskSchedulerPolicy = policy
+            taskSchedulerEnabled = policy.enabled
+            taskSchedulerCooldownText = String(policy.cooldownSecs)
+            taskSchedulerPolicyStatus = nil
+        } catch {
+            taskSchedulerPolicyStatus = error.localizedDescription
+        }
+    }
+
+    func saveTaskSchedulerPolicy() async {
+        guard let projectID = selectedProjectID else {
+            taskSchedulerPolicyStatus = "Select a project first."
+            return
+        }
+        let cooldown = UInt64(taskSchedulerCooldownText.trimmingCharacters(in: .whitespaces)) ?? 60
+        guard (1 ... 86400).contains(cooldown) else {
+            taskSchedulerPolicyStatus = "Cooldown must be between 1 and 86400 seconds."
+            return
+        }
+        taskSchedulerPolicyBusy = true
+        defer { taskSchedulerPolicyBusy = false }
+        do {
+            let policy = try await core.setTaskSchedulerPolicy(
+                projectID: projectID,
+                policy: TaskSchedulerPolicy(
+                    enabled: taskSchedulerEnabled,
+                    cooldownSecs: cooldown
+                )
+            )
+            guard projectID == selectedProjectID else { return }
+            taskSchedulerPolicy = policy
+            taskSchedulerEnabled = policy.enabled
+            taskSchedulerCooldownText = String(policy.cooldownSecs)
+            taskSchedulerPolicyStatus =
+                policy.enabled ? "Auto-resume enabled · cooldown \(policy.cooldownSecs)s" : "Auto-resume disabled"
+            await loadTaskQueue()
+        } catch {
+            taskSchedulerPolicyStatus = error.localizedDescription
         }
     }
 

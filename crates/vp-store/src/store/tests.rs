@@ -1333,3 +1333,32 @@ fn interrupts_only_the_finished_sessions_tasks() {
         "running"
     );
 }
+
+#[test]
+fn round_trips_task_scheduler_policy_and_manifest() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("scheduler policy"))
+        .unwrap();
+    let default = store.get_task_scheduler_policy(&project.id).unwrap();
+    assert!(!default.enabled);
+    assert_eq!(default.cooldown_secs, 60);
+
+    store
+        .set_task_scheduler_policy(
+            &project.id,
+            &TaskSchedulerPolicy {
+                enabled: true,
+                cooldown_secs: 15,
+            },
+        )
+        .unwrap();
+    let policy = store.get_task_scheduler_policy(&project.id).unwrap();
+    assert!(policy.enabled);
+    assert_eq!(policy.cooldown_secs, 15);
+    store.record_project_manifest().unwrap();
+
+    let snapshot = read_project_manifest(data.path()).unwrap();
+    assert!(snapshot[0].task_scheduler_policy.enabled);
+    assert_eq!(snapshot[0].task_scheduler_policy.cooldown_secs, 15);
+}

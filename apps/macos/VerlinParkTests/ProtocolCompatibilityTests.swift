@@ -260,6 +260,19 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(written.sha256, "def456")
     }
 
+    func testTaskSchedulerPolicyDecodes() throws {
+        let result = try JSONDecoder().decode(
+            TaskSchedulerPolicyResult.self,
+            from: Data(
+                #"{"project_id":"project-1","policy":{"enabled":true,"cooldown_secs":15}}"#
+                    .utf8
+            )
+        )
+        XCTAssertEqual(result.projectID, "project-1")
+        XCTAssertTrue(result.policy.enabled)
+        XCTAssertEqual(result.policy.cooldownSecs, 15)
+    }
+
     func testShellPolicyReadsOptionalReadJail() throws {
         let legacy = try JSONDecoder().decode(
             ShellPolicy.self,

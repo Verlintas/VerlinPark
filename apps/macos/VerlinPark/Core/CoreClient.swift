@@ -99,6 +99,33 @@ actor CoreClient {
             .projects
     }
 
+    func taskSchedulerPolicy(projectID: String) async throws -> TaskSchedulerPolicy {
+        try await request(
+            method: "project.task_scheduler.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(TaskSchedulerPolicyResult.self)
+        .policy
+    }
+
+    func setTaskSchedulerPolicy(
+        projectID: String,
+        policy: TaskSchedulerPolicy
+    ) async throws -> TaskSchedulerPolicy {
+        try await request(
+            method: "project.task_scheduler.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": .object([
+                    "enabled": .bool(policy.enabled),
+                    "cooldown_secs": .number(Double(policy.cooldownSecs)),
+                ]),
+            ]
+        )
+        .decode(TaskSchedulerPolicyResult.self)
+        .policy
+    }
+
     func shellPolicy(projectID: String) async throws -> ShellPolicy {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "project.shell_policy.get", params: params)

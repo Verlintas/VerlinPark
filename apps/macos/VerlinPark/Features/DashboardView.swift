@@ -1372,6 +1372,7 @@ private struct TaskSchedulerCard: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        @Bindable var model = model
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
@@ -1391,8 +1392,37 @@ private struct TaskSchedulerCard: View {
                 .disabled(model.taskQueueBusy)
             }
 
+            HStack(spacing: 12) {
+                Toggle("Auto-resume pending plans", isOn: $model.taskSchedulerEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                TextField("cooldown secs", text: $model.taskSchedulerCooldownText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 90)
+                Text("1–86400s")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                if model.taskSchedulerPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Spacer()
+                Button("Save policy") {
+                    Task { await model.saveTaskSchedulerPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.taskSchedulerPolicyBusy)
+            }
+
+            if let status = model.taskSchedulerPolicyStatus {
+                Text(status)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
             Text(
-                "Ready tasks are ordered by task priority plus session priority, with aging so low-priority work cannot starve. Write leases are stored by the daemon and enforce overlapping path scopes across sessions; the same session may share its worktree."
+                "Ready tasks are ordered by task priority plus session priority, with aging so low-priority work cannot starve. When auto-resume is enabled for this project, the daemon can resume idle/failed plans with pending tasks after the cooldown. Write leases are stored by the daemon and enforce overlapping path scopes across sessions; the same session may share its worktree."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)
@@ -1545,8 +1575,9 @@ private struct TaskSchedulerCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
-        .task {
+        .task(id: model.selectedProjectID) {
             await model.loadTaskQueue()
+            await model.loadTaskSchedulerPolicy()
         }
     }
 

@@ -116,6 +116,16 @@ enum Command {
         #[arg(long)]
         keep_failed: bool,
     },
+    /// Show the project's automatic task-resume policy.
+    TaskScheduler { project: String },
+    /// Update the project's automatic task-resume policy.
+    TaskSchedulerSet {
+        project: String,
+        #[arg(long)]
+        enabled: bool,
+        #[arg(long, default_value_t = 60)]
+        cooldown_secs: u64,
+    },
     /// Show the project's shell permission policy.
     ShellPolicy { project: String },
     /// Update the project's shell network/read-deny policy.
@@ -594,6 +604,32 @@ async fn main() -> Result<()> {
                     "force": force,
                     "delete_branches": delete_branches,
                     "keep_failed": keep_failed,
+                }),
+            )
+            .await?
+        }
+        Command::TaskScheduler { project } => {
+            rpc(
+                &discovery,
+                "project.task_scheduler.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::TaskSchedulerSet {
+            project,
+            enabled,
+            cooldown_secs,
+        } => {
+            rpc(
+                &discovery,
+                "project.task_scheduler.set",
+                json!({
+                    "project_id": project,
+                    "policy": {
+                        "enabled": enabled,
+                        "cooldown_secs": cooldown_secs,
+                    }
                 }),
             )
             .await?
@@ -1924,6 +1960,18 @@ fn print_human(value: &Value) {
             );
             println!("  {}", memory["body"].as_str().unwrap_or(""));
         }
+        return;
+    }
+    if let Some(policy) = value.get("policy")
+        && value.get("project_id").is_some()
+        && policy.get("cooldown_secs").is_some()
+    {
+        println!(
+            "project {}  task-scheduler enabled={} cooldown={}s",
+            value["project_id"].as_str().unwrap_or("?"),
+            policy["enabled"].as_bool().unwrap_or(false),
+            policy["cooldown_secs"].as_u64().unwrap_or(0)
+        );
         return;
     }
     if let Some(policy) = value.get("policy")

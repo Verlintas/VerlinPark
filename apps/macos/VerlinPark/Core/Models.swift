@@ -1227,6 +1227,28 @@ struct SchedulerTask: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+struct TaskSchedulerPolicy: Codable, Hashable, Sendable {
+    var enabled: Bool
+    var cooldownSecs: UInt64
+
+    static let disabled = TaskSchedulerPolicy(enabled: false, cooldownSecs: 60)
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case cooldownSecs = "cooldown_secs"
+    }
+}
+
+struct TaskSchedulerPolicyResult: Codable, Sendable {
+    let projectID: String
+    let policy: TaskSchedulerPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case policy
+    }
+}
+
 struct TaskActionResult: Codable, Sendable {
     let task: SchedulerTask
 }
