@@ -287,6 +287,22 @@ actor CoreClient {
         .decode(SessionMergeForkResult.self)
     }
 
+    func checkForUpdates(repo: String? = nil) async throws -> UpdateCheckResult {
+        try await request(
+            method: "update.check",
+            params: ["repo": repo.map(JSONValue.string) ?? .null]
+        )
+        .decode(UpdateCheckResult.self)
+    }
+
+    func sessionForkTree(sessionID: String) async throws -> SessionForkTreeResult {
+        try await request(
+            method: "session.fork.tree",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionForkTreeResult.self)
+    }
+
     func sessionLineage(sessionID: String) async throws -> SessionLineageResult {
         try await request(
             method: "session.lineage",

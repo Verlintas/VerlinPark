@@ -4,10 +4,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::tools::ToolContext;
 use anyhow::{Context, Result};
+use async_recursion::async_recursion;
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
@@ -24,14 +26,15 @@ use vp_protocol::types::{
     ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
     SessionCheckpointDeleteResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
     SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus, SessionDiff,
-    SessionForkResult, SessionImportResult, SessionLandResult, SessionLineageEntry,
-    SessionLineageResult, SessionLogStatus, SessionPriorityResult, SessionRehydrateResult,
-    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TaskQueueResult,
-    TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult,
-    TerminalOpenResult, TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem,
-    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
-    WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
-    WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
+    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
+    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
+    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
+    ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
+    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    TerminalWriteResult, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
+    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
+    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
+    WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -47,6 +50,7 @@ pub mod mcp;
 pub mod rebuild;
 pub mod scheduler;
 pub mod terminal;
+pub mod update;
 pub mod workspace;
 
 pub use rebuild::rebuild_database;
@@ -1077,6 +1081,96 @@ impl Engine {
             checkpoint_id: checkpoint.id,
             session: new_session,
         })
+    }
+
+    pub async fn session_fork_tree(&self, session_id: &str) -> Result<SessionForkTreeResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let created = tokio::task::spawn_blocking(move || {
+            store.list_events_by_kind(&id, "session.created", 1)
+        })
+        .await??;
+        let created_payload = created.first().map(|event| event.payload.clone());
+        let checkpoint_id = created_payload
+            .as_ref()
+            .and_then(|payload| payload.get("forked_from_checkpoint_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let commit = created_payload
+            .as_ref()
+            .and_then(|payload| payload.get("forked_from_commit"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let total = Arc::new(AtomicUsize::new(1));
+        let truncated = Arc::new(AtomicBool::new(false));
+        let children = self
+            .build_fork_children(session_id, 0, total.clone(), truncated.clone())
+            .await?;
+        let total = total.load(Ordering::Relaxed);
+        let truncated = truncated.load(Ordering::Relaxed);
+        Ok(SessionForkTreeResult {
+            session_id: session.id.clone(),
+            root: SessionForkTreeNode {
+                session,
+                checkpoint_id,
+                commit,
+                children,
+            },
+            total,
+            truncated,
+        })
+    }
+
+    #[async_recursion]
+    async fn build_fork_children(
+        &self,
+        session_id: &str,
+        depth: u32,
+        total: Arc<AtomicUsize>,
+        truncated: Arc<AtomicBool>,
+    ) -> Result<Vec<SessionForkTreeNode>> {
+        if depth >= 32 {
+            truncated.store(true, Ordering::Relaxed);
+            return Ok(Vec::new());
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let events = tokio::task::spawn_blocking(move || {
+            store.list_events_by_kind(&id, "session.forked", 1000)
+        })
+        .await??;
+        let mut nodes = Vec::new();
+        for event in events {
+            if total.load(Ordering::Relaxed) >= 200 {
+                truncated.store(true, Ordering::Relaxed);
+                break;
+            }
+            let Some(entry) = self.lineage_entry_from_fork_event(&event).await else {
+                continue;
+            };
+            total.fetch_add(1, Ordering::Relaxed);
+            let children = self
+                .build_fork_children(
+                    &entry.session.id,
+                    depth + 1,
+                    total.clone(),
+                    truncated.clone(),
+                )
+                .await?;
+            nodes.push(SessionForkTreeNode {
+                session: entry.session,
+                checkpoint_id: entry.checkpoint_id,
+                commit: entry.commit,
+                children,
+            });
+        }
+        nodes.sort_by(|left, right| left.session.created_at.cmp(&right.session.created_at));
+        Ok(nodes)
     }
 
     pub async fn session_lineage(&self, session_id: &str) -> Result<SessionLineageResult> {

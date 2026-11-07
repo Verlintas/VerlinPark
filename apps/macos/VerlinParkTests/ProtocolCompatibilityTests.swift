@@ -103,6 +103,83 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(status.lastMeasurement?.samples, 3)
     }
 
+    func testUpdateCheckResultDecodes() throws {
+        let json = """
+        {
+          "current_version": "0.1.0-dev",
+          "latest_version": "0.2.0",
+          "update_available": true,
+          "repo": "owner/repo",
+          "release_name": "VerlinPark 0.2.0",
+          "release_url": "https://example.com/release",
+          "published_at": "2026-11-08T00:00:00Z"
+        }
+        """
+        let result = try JSONDecoder().decode(UpdateCheckResult.self, from: Data(json.utf8))
+        XCTAssertTrue(result.updateAvailable)
+        XCTAssertEqual(result.latestVersion, "0.2.0")
+        XCTAssertEqual(result.repo, "owner/repo")
+    }
+
+    func testSessionForkTreeResultDecodes() throws {
+        let json = """
+        {
+          "session_id": "root-1",
+          "total": 2,
+          "truncated": false,
+          "root": {
+            "session": {
+              "id": "root-1",
+              "project_id": "project-1",
+              "goal": "root",
+              "status": "idle",
+              "priority": 0,
+              "worktree": "/tmp/root",
+              "branch": "verlinpark/root-1",
+              "token_budget": null,
+              "cost_budget_usd": null,
+              "time_budget_secs": null,
+              "cost_spent_usd": 0.0,
+              "base_commit": "aaa111",
+              "tokens_in": 0,
+              "tokens_out": 0,
+              "created_at": "2026-11-08T00:00:00Z"
+            },
+            "checkpoint_id": null,
+            "commit": null,
+            "children": [
+              {
+                "session": {
+                  "id": "fork-1",
+                  "project_id": "project-1",
+                  "goal": "fork",
+                  "status": "draft",
+                  "priority": 0,
+                  "worktree": "/tmp/fork",
+                  "branch": "verlinpark/fork-1",
+                  "token_budget": null,
+                  "cost_budget_usd": null,
+                  "time_budget_secs": null,
+                  "cost_spent_usd": 0.0,
+                  "base_commit": "aaa111",
+                  "tokens_in": 0,
+                  "tokens_out": 0,
+                  "created_at": "2026-11-08T00:00:01Z"
+                },
+                "checkpoint_id": "checkpoint-1",
+                "commit": "aaa111",
+                "children": []
+              }
+            ]
+          }
+        }
+        """
+        let result = try JSONDecoder().decode(SessionForkTreeResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.total, 2)
+        XCTAssertEqual(result.root.children.first?.session.id, "fork-1")
+        XCTAssertEqual(result.root.children.first?.checkpointID, "checkpoint-1")
+    }
+
     func testSessionMergeForkResultDecodes() throws {
         let json = """
         {

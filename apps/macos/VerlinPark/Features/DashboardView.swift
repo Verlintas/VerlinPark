@@ -1092,6 +1092,7 @@ private struct CheckpointsCard: View {
 private struct ForksCard: View {
     @Environment(AppModel.self) private var model
     @State private var showingCompare = false
+    @State private var showingTree = false
     @State private var merging: SessionLineageEntry?
 
     var body: some View {
@@ -1107,6 +1108,12 @@ private struct ForksCard: View {
                 if model.lineageBusy || model.forkMergeBusy {
                     ProgressView().controlSize(.small)
                 }
+                Button("Tree") {
+                    showingTree = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.selectedSession == nil)
                 Button("Refresh") {
                     Task { await model.loadLineage() }
                 }
@@ -1159,6 +1166,10 @@ private struct ForksCard: View {
         }
         .sheet(isPresented: $showingCompare) {
             CompareSessionsSheet()
+                .environment(model)
+        }
+        .sheet(isPresented: $showingTree) {
+            ForkTreeSheet()
                 .environment(model)
         }
         .confirmationDialog(
@@ -1231,6 +1242,110 @@ private struct ForksCard: View {
                         .disabled(model.forkMergeBusy || model.compareBusy)
                     }
                 }
+            }
+        }
+    }
+}
+
+private struct ForkTreeSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Fork tree")
+                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                    Text("Recursive checkpoint descendants")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.forkTreeBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task { await model.loadForkTree() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(18)
+            Divider().opacity(0.35)
+            if let tree = model.forkTree {
+                HStack(spacing: 14) {
+                    Text("\(tree.total) sessions")
+                        .font(.system(size: 10, design: .monospaced))
+                    if tree.truncated {
+                        Text("truncated")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 10)
+                ScrollView {
+                    ForkTreeRowView(node: tree.root, depth: 0)
+                        .padding(18)
+                }
+            } else if model.forkTreeBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                StudioEmptyView(
+                    icon: "point.3.connected.trianglepath.dotted",
+                    title: "No tree loaded",
+                    detail: "Select a session and refresh."
+                )
+            }
+        }
+        .frame(width: 760, height: 620)
+        .onAppear {
+            Task { await model.loadForkTree() }
+        }
+    }
+}
+
+private struct ForkTreeRowView: View {
+    @Environment(AppModel.self) private var model
+    let node: SessionForkTreeNode
+    let depth: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(String(repeating: "  ", count: min(depth, 12)))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(node.session.goal)
+                        .font(.system(
+                            size: 11,
+                            weight: depth == 0 ? .semibold : .regular,
+                            design: .monospaced
+                        ))
+                        .lineLimit(1)
+                    Text(
+                        "\(node.session.status) · \(node.commit.map { String($0.prefix(8)) } ?? "no commit") · \(node.checkpointID.map { String($0.prefix(8)) } ?? "no checkpoint")"
+                    )
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if node.session.id != model.selectedSessionID {
+                    Button("Open") {
+                        model.selectSession(node.session.id)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            ForEach(node.children) { child in
+                ForkTreeRowView(node: child, depth: depth + 1)
             }
         }
     }

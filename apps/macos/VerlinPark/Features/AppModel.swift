@@ -182,6 +182,8 @@ final class AppModel {
     var checkpointNotice: String?
     var sessionLineage: SessionLineageResult?
     var lineageBusy = false
+    var forkTree: SessionForkTreeResult?
+    var forkTreeBusy = false
     var compareResult: SessionCompareResult?
     var compareBusy = false
     var compareError: String?
@@ -235,6 +237,9 @@ final class AppModel {
     var worktreePolicyKeepFailed = true
     var worktreePolicyBusy = false
     var worktreePolicyStatus: String?
+    var updateResult: UpdateCheckResult?
+    var updateBusy = false
+    var updateError: String?
     var doctorReport: DoctorReport?
     var doctorBusy = false
     var doctorStatus: String?
@@ -375,6 +380,7 @@ final class AppModel {
             checkpoints = []
             checkpointNotice = nil
             sessionLineage = nil
+            forkTree = nil
             compareResult = nil
             compareError = nil
             forkMergeNotice = nil
@@ -435,6 +441,7 @@ final class AppModel {
         checkpoints = []
         checkpointNotice = nil
         sessionLineage = nil
+        forkTree = nil
         compareResult = nil
         compareError = nil
         forkMergeNotice = nil
@@ -478,6 +485,7 @@ final class AppModel {
         checkpoints = []
         checkpointNotice = nil
         sessionLineage = nil
+        forkTree = nil
         compareResult = nil
         compareError = nil
         forkMergeNotice = nil
@@ -2391,6 +2399,17 @@ final class AppModel {
         }
     }
 
+    func checkForUpdates() async {
+        updateBusy = true
+        updateError = nil
+        defer { updateBusy = false }
+        do {
+            updateResult = try await core.checkForUpdates()
+        } catch {
+            updateError = error.localizedDescription
+        }
+    }
+
     func loadCheckpointPolicy() async {
         guard let projectID = selectedProjectID else {
             checkpointPolicy = .disabled
@@ -2773,6 +2792,23 @@ final class AppModel {
         }
     }
 
+    func loadForkTree() async {
+        guard let sessionID = selectedSessionID else {
+            forkTree = nil
+            return
+        }
+        forkTreeBusy = true
+        defer { forkTreeBusy = false }
+        do {
+            let result = try await core.sessionForkTree(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                forkTree = result
+            }
+        } catch {
+            forkTree = nil
+        }
+    }
+
     func compareSessions(otherID: String) async {
         guard let sessionID = selectedSessionID else { return }
         compareBusy = true
@@ -3088,7 +3124,12 @@ final class AppModel {
         }
 
         if event.sessionId == selectedSessionID, event.type == "session.forked" {
-            Task { await self.loadLineage() }
+            Task {
+                await self.loadLineage()
+                if self.forkTree != nil {
+                    await self.loadForkTree()
+                }
+            }
         }
 
         if event.sessionId == selectedSessionID, event.type == "session.fork.merge" {

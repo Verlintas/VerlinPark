@@ -1692,6 +1692,50 @@ pub struct SessionLineageParams {
     pub session_id: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionForkTreeNode {
+    pub session: Session,
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub children: Vec<SessionForkTreeNode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionForkTreeResult {
+    pub session_id: String,
+    pub root: SessionForkTreeNode,
+    pub total: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionForkTreeParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct UpdateCheckParams {
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateCheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub repo: String,
+    #[serde(default)]
+    pub release_name: Option<String>,
+    #[serde(default)]
+    pub release_url: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionCompareParams {
     pub session_id: String,

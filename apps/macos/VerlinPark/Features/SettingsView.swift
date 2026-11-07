@@ -679,6 +679,7 @@ struct NotificationsSettingsView: View {
 
 struct AboutSettingsView: View {
     @Environment(BrandStore.self) private var brand
+    @Environment(AppModel.self) private var model
 
     var body: some View {
         VStack(spacing: 16) {
@@ -689,11 +690,59 @@ struct AboutSettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 7) {
-                GridRow { Text("Version"); Text("0.1.0-dev").foregroundStyle(.secondary) }
+                GridRow {
+                    Text("Version")
+                    Text(model.updateResult?.currentVersion ?? "0.1.0-dev")
+                        .foregroundStyle(.secondary)
+                }
                 GridRow { Text("License"); Text("GPL-3.0-only").foregroundStyle(.secondary) }
                 GridRow { Text("Protocol"); Text("1").foregroundStyle(.secondary) }
             }
             .font(.system(size: 11, design: .monospaced))
+
+            Divider().opacity(0.3).frame(maxWidth: 320)
+            VStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    Button("Check for Updates") {
+                        Task { await model.checkForUpdates() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.updateBusy)
+                    if model.updateBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                if let error = model.updateError {
+                    Text(error)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 360)
+                } else if let update = model.updateResult {
+                    if update.updateAvailable {
+                        Text("Update available: \(update.latestVersion)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.orange)
+                        if let url = update.releaseUrl,
+                           let parsed = URL(string: url)
+                        {
+                            Button("Open Release Page") {
+                                NSWorkspace.shared.open(parsed)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+                    } else {
+                        Text("You're up to date.")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("\(update.repo) · latest \(update.latestVersion)")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
             Spacer()
             Text("Agent teams, not chat tabs.")
                 .font(.system(size: 10, design: .monospaced))

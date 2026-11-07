@@ -173,6 +173,11 @@ enum Command {
         #[arg(long)]
         read_jail: bool,
     },
+    /// Check the latest GitHub release without installing it.
+    UpdateCheck {
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Show the project's automatic checkpoint retention policy.
     CheckpointPolicy { project: String },
     /// Update the project's automatic checkpoint retention policy.
@@ -340,6 +345,8 @@ enum Command {
     },
     /// Show parent/sibling/child fork lineage for a session.
     Lineage { session: String },
+    /// Show the recursive fork tree rooted at a session.
+    ForkTree { session: String },
     /// Compare two session branches in the same project.
     Compare { session: String, other: String },
     /// Merge a direct child fork branch into the source session.
@@ -788,6 +795,9 @@ async fn main() -> Result<()> {
                 }),
             )
             .await?
+        }
+        Command::UpdateCheck { repo } => {
+            rpc(&discovery, "update.check", json!({"repo": repo})).await?
         }
         Command::CheckpointPolicy { project } => {
             rpc(
@@ -1266,6 +1276,14 @@ async fn main() -> Result<()> {
             rpc(
                 &discovery,
                 "session.lineage",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::ForkTree { session } => {
+            rpc(
+                &discovery,
+                "session.fork.tree",
                 json!({"session_id": session}),
             )
             .await?

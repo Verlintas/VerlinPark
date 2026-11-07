@@ -3675,3 +3675,53 @@ async fn session_compare_reports_committed_branch_difference() {
         .unwrap_err();
     assert!(error.to_string().contains("different sessions"));
 }
+
+#[tokio::test]
+async fn session_fork_tree_recurses_through_grandchildren() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("tree".into()),
+        )
+        .await
+        .unwrap();
+    let source = engine
+        .create_session(project.id, "tree root".into(), None)
+        .await
+        .unwrap();
+    let first = engine
+        .fork_session(&source.id, None, Some("first child".into()))
+        .await
+        .unwrap();
+    let grandchild = engine
+        .fork_session(&first.session.id, None, Some("grandchild".into()))
+        .await
+        .unwrap();
+    let second = engine
+        .fork_session(&source.id, None, Some("second child".into()))
+        .await
+        .unwrap();
+
+    let tree = engine.session_fork_tree(&source.id).await.unwrap();
+    assert_eq!(tree.total, 4);
+    assert!(!tree.truncated);
+    assert_eq!(tree.root.children.len(), 2);
+    let first_node = tree
+        .root
+        .children
+        .iter()
+        .find(|node| node.session.id == first.session.id)
+        .expect("first fork in tree");
+    assert_eq!(first_node.children.len(), 1);
+    assert_eq!(first_node.children[0].session.id, grandchild.session.id);
+    assert!(
+        tree.root
+            .children
+            .iter()
+            .any(|node| node.session.id == second.session.id)
+    );
+}

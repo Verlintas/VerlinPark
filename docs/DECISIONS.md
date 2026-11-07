@@ -115,6 +115,8 @@
 | [0103](adr/0103-automatic-checkpoint-retention.md) | Automatic checkpoint retention policy | Accepted | Session/Git |
 | [0104](adr/0104-fork-lineage-and-comparison.md) | Fork lineage and branch comparison | Accepted | Session/Git |
 | [0105](adr/0105-fork-merge-back.md) | Explicit fork merge-back | Accepted | Session/Git |
+| [0106](adr/0106-recursive-fork-tree.md) | Recursive fork tree | Accepted | Session/Git |
+| [0107](adr/0107-release-update-check.md) | Manual release update check | Accepted | Distribution |
 
 ---
 

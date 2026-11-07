@@ -43,19 +43,20 @@ use vp_protocol::types::{
     RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionCheckpointDeleteParams,
     SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
     SessionCompactParams, SessionCompareParams, SessionContextParams, SessionDiffParams,
-    SessionExportParams, SessionForkParams, SessionImportParams, SessionLineageParams,
-    SessionListResult, SessionLogParams, SessionMergeForkParams, SessionPauseParams,
-    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams,
-    SessionResumeResult, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
-    SetArtifactPolicyParams, SetCheckpointPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
-    SetSessionPriorityParams, SetShellPolicyParams, SetTaskSchedulerPolicyParams,
-    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams,
-    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    UpdateAcpAgentParams, UpdateMcpServerParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    SessionExportParams, SessionForkParams, SessionForkTreeParams, SessionImportParams,
+    SessionLineageParams, SessionListResult, SessionLogParams, SessionMergeForkParams,
+    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
+    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
+    SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
+    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
+    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams, UpdateAcpAgentParams, UpdateCheckParams, UpdateMcpServerParams,
+    UsageLedgerParams, WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams,
+    WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -955,6 +956,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.fork.tree" => match parse_params::<SessionForkTreeParams>(request.params) {
+            Ok(params) => match state.engine.session_fork_tree(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "session.lineage" => match parse_params::<SessionLineageParams>(request.params) {
             Ok(params) => match state.engine.session_lineage(&params.session_id).await {
                 Ok(result) => RpcResponse::success(id, result),
@@ -1156,6 +1164,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "update.check" => match parse_params::<UpdateCheckParams>(request.params) {
+            Ok(params) => match vp_core::update::check_for_update(params.repo.as_deref()).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "session.log_status" => match parse_params::<SessionLogParams>(request.params) {
             Ok(params) => match state.engine.session_log_status(&params.session_id).await {
                 Ok(status) => RpcResponse::success(id, status),

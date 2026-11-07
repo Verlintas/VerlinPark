@@ -1301,6 +1301,58 @@ struct SessionCheckpointPruneResult: Codable, Sendable {
     }
 }
 
+struct UpdateCheckResult: Codable, Sendable {
+    let currentVersion: String
+    let latestVersion: String
+    let updateAvailable: Bool
+    let repo: String
+    let releaseName: String?
+    let releaseUrl: String?
+    let publishedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case currentVersion = "current_version"
+        case latestVersion = "latest_version"
+        case updateAvailable = "update_available"
+        case repo
+        case releaseName = "release_name"
+        case releaseUrl = "release_url"
+        case publishedAt = "published_at"
+    }
+}
+
+struct SessionForkTreeNode: Codable, Sendable, Identifiable {
+    let session: Session
+    let checkpointID: String?
+    let commit: String?
+    let children: [SessionForkTreeNode]
+
+    var id: String {
+        session.id
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case session
+        case checkpointID = "checkpoint_id"
+        case commit
+        case children
+    }
+}
+
+struct SessionForkTreeResult: Codable, Sendable {
+    let sessionID: String
+    let root: SessionForkTreeNode
+    let total: Int
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case root
+        case total
+        case truncated
+    }
+}
+
 struct SessionLineageEntry: Codable, Sendable, Identifiable {
     let session: Session
     let checkpointID: String?
