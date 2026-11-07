@@ -1763,10 +1763,8 @@ async fn rejects_a_verifier_that_modifies_tracked_files() {
     assert_eq!(verifier.status, "failed");
     let verifier_worktree = PathBuf::from(verifier.worktree.clone().unwrap());
     assert!(
-        worktree::tracked_changes(&verifier_worktree)
-            .unwrap()
-            .is_empty(),
-        "verifier edits must be reset"
+        !verifier_worktree.exists(),
+        "the isolated verification checkout must be removed after the run"
     );
     let session_worktree = session.worktree.clone().unwrap();
     assert!(

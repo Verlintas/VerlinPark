@@ -101,6 +101,7 @@
 | [0089](adr/0089-user-read-jail.md) | Opt-in user/volume read jail | Accepted | 安全 |
 | [0090](adr/0090-optional-signing-notarization-tap.md) | Optional signing/notarization/tap publish | Accepted | 发布 |
 | [0091](adr/0091-project-task-scheduler-policy.md) | Project-level automatic task resume policy | Accepted | 调度 |
+| [0092](adr/0092-isolated-verifier-checkout.md) | Isolated Verifier checkout | Accepted | 验证/安全 |
 
 ---
 

@@ -14,7 +14,7 @@
 | Leader Agent | ✅ | 流式对话、工具调用、审批、session 预算、取消、todo 计划 |
 | Session worktree | ✅ | 每个 session 独立 Git worktree + 分支；项目根只读 |
 | 四层组织 | ✅ | Leader → Manager → Worker → Labour；严格链路，Manager 必须有部门 title |
-| Agent profile | ✅ | coding / research / verification / generic；决定工具集与 prompt |
+| Agent profile | ✅ | coding / research / verification / generic；决定工具集与 prompt；Verifier 在 isolated detached clone 中运行 |
 | TeamPlan | ✅ | Leader 定义 departments / Manager titles / profiles / task DAG / task priority（-100..100）；runtime 校验结构、依赖、优先级和 scope 语法并持久化 |
 | Manager 圆桌 | ✅ | `deliberate_team_plan`，1–3 轮，只读，后一轮看到前一轮所有 peer positions；Collab 显示按 round 分组的 Manager 立场卡片 |
 | 自动派发 | ✅ | `run_team_plan` 按依赖批次执行 ready tasks；ready task 按 priority desc + id 排序；同批筛选不重叠 scope；Manager 懒创建；失败阻塞依赖；batch abort 时先结算同批全部 task（cancelled/blocked），不留下 running 投影；`session.plan_resume` / `vp resume-plan` / Preview Resume plan 可跳过 completed task，重跑 unfinished task |
@@ -61,7 +61,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：195 个测试通过（core 152、store 35、providers 8）。
+- `cargo test --workspace`：196 个测试通过（core 153、store 35、providers 8）。
 - `xcodebuild test`：39 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - 最近 CI：GitHub hosted macOS runner 持续排队/容量受限；本地 lint、Rust/Swift 测试与打包通过。
@@ -72,7 +72,7 @@
 第一轮硬化（2026-10-30）已修复 plan scope/caps、token reservation 和 fetch_url 的 DNS 绕过。仍然存在的：
 
 1. **Shell 仍非完整沙箱**：写入已由 Seatbelt 限制在 worktree/Git 元数据/scratch；常见 credential/state 路径已 read-deny，但不是完整 read jail；项目 policy 可 deny network，但默认 allow，Docker 等 daemon 介导写入仍可能；`sandbox-exec` 已废弃。见 AUDIT P1-3。
-2. **Verifier 只读**：无 write/edit 工具，运行后会检查 tracked diff 并 reset/拒绝；但 shell 仍可创建 untracked/ignored 文件、读取任意路径，不是完整文件系统沙箱。见 AUDIT P1-3。
+2. **Verifier 隔离**：无 write/edit 工具，运行在 Worker commit 的 isolated detached clone 中，shell/Git 写操作不会影响 Worker worktree/branch；clone 结束删除，tracked guard 仍保留。仍不是完整网络/文件系统沙箱。见 AUDIT P1-3。
 3. **事件溯源**：关键状态已改为原子事件+投影；`session.replay` / `--repair` / `--rebuild` 可发现并重建覆盖的投影（含 agent roster）；`session.export` 可导出 bundle；数据库项目/会话创建元数据的从零导入仍未实现。见 AUDIT P1-5。
 4. **batch abort 状态一致性**：已修复（同批 task 中止时全部结算为 cancelled/blocked）；见 AUDIT P2-7。
 
@@ -217,6 +217,7 @@
 - **M3 第九十二切片**：可选 Developer ID 签名/notarization + cask tap 发布 + arm64 release runner；见 ADR-0090。
 - **M3 第九十三切片**：running task cooperative cancel + pause/resume（`task.cancel` / `task.pause` / `task.resume`、`plan_task.cancelling/pausing/paused/resumed`、Worker 边界检查、兄弟 task 继续、Manage Dash/CLI、replay/recovery）；见 ADR-0088 更新。
 - **M3 第九十四切片**：project-level auto-resume policy（`TaskSchedulerPolicy`、manifest、RPC/CLI/Manage Dash、per-project cooldown、scheduler 常驻按 policy 过滤）；见 ADR-0091。
+- **M3 第九十五切片**：Verifier isolated checkout（detached clone of worker commit、GIT metadata 隔离、cleanup guard、tracked guard 保留、clone commit 不影响 worker branch）；见 ADR-0092。
 
 ## 如何运行
 

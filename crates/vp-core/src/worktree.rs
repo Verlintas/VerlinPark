@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct WorktreeInfo {
@@ -380,6 +381,47 @@ pub fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
 
 /// Tracked files changed in a worktree. Untracked build/test outputs are
 /// ignored so a read-only Verifier can still run tests.
+/// Create an isolated detached clone of one committed task tree for Verifier
+/// runs. The clone has its own refs/Git metadata and is discarded afterwards, so
+/// Verifier shell activity cannot mutate the Worker worktree or branch.
+pub fn create_verification_checkout(
+    project_root: &Path,
+    data_dir: &Path,
+    session_id: &str,
+    commit: &str,
+) -> Result<PathBuf> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving project root {}", project_root.display()))?;
+    let path = data_dir
+        .join("verify")
+        .join(session_id)
+        .join(Uuid::now_v7().to_string());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating verification directory {}", parent.display()))?;
+    }
+    let output = Command::new("git")
+        .arg("clone")
+        .arg("--shared")
+        .arg("--no-checkout")
+        .arg(&root)
+        .arg(&path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .context("cloning verification checkout")?;
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("git clone verification checkout failed: {stderr}");
+    }
+    if let Err(error) = git_output(&path, &["checkout", "--detach", commit]) {
+        let _ = std::fs::remove_dir_all(&path);
+        return Err(error).context("checking out verification commit");
+    }
+    Ok(path)
+}
+
 pub fn tracked_changes(root: &Path) -> Result<Vec<String>> {
     let output = git_output(root, &["status", "--porcelain", "--untracked-files=no"])?;
     Ok(output
@@ -455,6 +497,32 @@ mod tests {
             .args(["commit", "-q", "-m", "initial"])
             .status()
             .unwrap();
+    }
+
+    #[test]
+    fn creates_an_isolated_verification_checkout() {
+        let repo = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        init_repo(repo.path());
+        std::fs::write(repo.path().join("tracked.txt"), "committed\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-m", "tracked"]).unwrap();
+        let commit = head_commit(repo.path()).unwrap();
+        let checkout =
+            create_verification_checkout(repo.path(), data.path(), "session-verify", &commit)
+                .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+            "committed\n"
+        );
+        std::fs::write(checkout.join("verifier-only.txt"), "ephemeral\n").unwrap();
+        assert!(!repo.path().join("verifier-only.txt").exists());
+        assert!(checkout.join("verifier-only.txt").exists());
+        run_git(&checkout, &["add", "verifier-only.txt"]).unwrap();
+        run_git(&checkout, &["commit", "-q", "-m", "verifier mutation"]).unwrap();
+        assert_eq!(head_commit(repo.path()).unwrap(), commit);
+        assert_ne!(head_commit(&checkout).unwrap(), commit);
+        std::fs::remove_dir_all(checkout).unwrap();
     }
 
     #[test]

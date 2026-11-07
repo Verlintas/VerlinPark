@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -2198,6 +2198,7 @@ impl AgentService {
             &budget,
             &manager_spec,
             &worker_spec,
+            &commit,
             &format!("Resolve integration conflict for queue entry {}", entry.id),
             &outcome,
             Some("No conflict markers; both sides' intent is preserved; relevant tests pass"),
@@ -3557,6 +3558,18 @@ enum VerificationOutcome {
     Error(String),
 }
 
+struct VerificationCheckout {
+    path: PathBuf,
+}
+
+impl Drop for VerificationCheckout {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            tracing::warn!(%error, path = %self.path.display(), "failed to remove verification checkout");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn verify_worker(
     engine: &Engine,
@@ -3567,6 +3580,7 @@ async fn verify_worker(
     budget: &SessionBudget,
     manager_spec: &AgentSpec,
     worker_spec: &AgentSpec,
+    commit: &str,
     objective: &str,
     worker_summary: &str,
     acceptance: Option<&str>,
@@ -3578,6 +3592,23 @@ async fn verify_worker(
         ));
     };
     let verifier_name = format!("Verifier {ordinal}");
+    let checkout_path = match worktree::create_verification_checkout(
+        Path::new(&project.root),
+        engine.store().data_dir(),
+        &session.id,
+        commit,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(VerificationOutcome::Error(format!(
+                "could not create isolated verification checkout: {error}"
+            )));
+        }
+    };
+    let _checkout = VerificationCheckout {
+        path: checkout_path.clone(),
+    };
+    let verifier_branch = format!("verify/{}", truncate_to(commit, 12));
     let verifier = engine
         .create_agent(
             &session.id,
@@ -3591,8 +3622,8 @@ async fn verify_worker(
     engine
         .set_agent_worktree(
             &verifier.id,
-            &worker_spec.worktree.to_string_lossy(),
-            &worker_spec.branch,
+            &checkout_path.to_string_lossy(),
+            &verifier_branch,
         )
         .await?;
     engine
@@ -3610,8 +3641,8 @@ async fn verify_worker(
         profile: AgentProfile::Verification,
         allow_delegation: false,
         auto_approve,
-        worktree: worker_spec.worktree.clone(),
-        branch: worker_spec.branch.clone(),
+        worktree: checkout_path.clone(),
+        branch: verifier_branch,
         session_worktree: manager_spec.session_worktree.clone(),
         session_branch: manager_spec.session_branch.clone(),
         write_scope: Vec::new(),
@@ -3633,12 +3664,12 @@ async fn verify_worker(
         .unwrap_or_default();
     let prompt = format!(
         "Verify Worker {} for this task. Objective: {objective}.{acceptance_note} \
-         Worker summary: {worker_summary}. The worktree is {} on branch {}; base commit {}. \
+         Worker summary: {worker_summary}. The isolated verification worktree is {} on branch {}; base commit {}. \
          {focus} Do not edit files. Then call submit_verdict with approved and summary.",
         worker_spec.name,
-        worker_spec.worktree.to_string_lossy(),
-        worker_spec.branch,
-        worker_spec.base_commit
+        verifier_spec.worktree.to_string_lossy(),
+        verifier_spec.branch,
+        verifier_spec.base_commit
     );
     emit(
         engine,
@@ -3884,6 +3915,7 @@ async fn finish_worker(
         budget,
         manager_spec,
         worker_spec,
+        &commit,
         objective,
         summary,
         acceptance,
