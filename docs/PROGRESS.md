@@ -60,6 +60,7 @@
 | Search | ✅ | `session.search` / `vp search` / Stage `Cmd-F`；跨 session 搜索 message content 与 raw event payload，可按 project 过滤，newest-first，`truncated` 标记；FTS5 外部内容索引（messages/events，insert/update/delete triggers，`store_meta` 迁移重建）+ ASCII prefix 查询，无命中/非 ASCII 回退 LIKE；snippet 截断；无 BM25 排序/embedding |
 | Transcript | ✅ | `session.transcript` / `vp transcript` / Session menu Export Transcript…；Markdown 包含 session 元数据、按 department 的 TeamPlan、按时间排序的 conversation 与 tool calls；单 message 8KB、tool args 1KB 截断；不是可导入 bundle |
 | Update check | ✅ | `update.check` / `vp update-check` 查询 GitHub latest release；默认 `Verlintas/VerlinPark`，可 `VERLINPARK_UPDATE_REPO` 或 `owner/repo` 覆盖；只比较版本并返回 release name/url/time；`update.download` / `vp update-download` 要求 `.dmg` + `.sha256`，流式下载到 `~/Downloads`、512MB cap、SHA-256 校验、原子 rename，不自动安装；Settings → About 手动检查、下载、Show in Finder；见 ADR-0107 |
+| Manage Dash | ✅ | 侧边栏 9 个分区（Overview/Inbox/Team & Tasks/Usage & Budget/Git & Forks/Checkpoints/Storage & Memory/Policies/Diagnostics）+ live badges；1080×740；项目/session picker 自带；Overview 显示 metrics/pending actions/runtime/recent activity；分区过滤 + AppStorage 记忆；卡片拆分为 Overview/Team/Git/Policy 文件；Team 新增 Agents roster；见 ADR-0110 |
 | Model presets | ✅ | 全局 SQLite `model_presets`；`model.preset.list/create/update/delete` / `vp model-presets` / Settings Providers 模态；只存 name/provider/model/context/prices/notes，不存 API key/base URL；provider 匹配时客户端填充 role model/context/price 字段，仍需 Save & Connect 持久化；无自动 routing |
 | Distribution | ✅ | `just package` 生成 Release app + bundled `verlinpadd` + `vp` + docs 的 DMG 和 SHA-256；默认 ad-hoc，**Developer ID/公证已明确暂缓，不作为近期目标**；ad-hoc DMG 是当前支持的发布路径。可选 `VERLINPARK_SIGN_IDENTITY` / `VERLINPARK_NOTARY_PROFILE` 代码保留但不投入；`just cask` / tag workflow 生成 cask，并可用 `HOMEBREW_TAP_REPO` + `HOMEBREW_TAP_TOKEN` 自动提交到 tap（未配置时只留在 GitHub release）；release workflow 使用 arm64 runner；仍无 Sparkle 自动更新 |
 | Project budget | ✅ | `project.budget.get/set` / `vp project-budget*` / Manage Dash；跨 session 共享 token/USD pool，使用同一 `BudgetRegistry` `project:<id>` 原子 reservation；project 超限终止当前 run |
@@ -69,7 +70,7 @@
 ## 验证
 
 - `cargo test --workspace`：253 个测试通过（core 205、store 40、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
-- `xcodebuild test`：57 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
+- `xcodebuild test`：59 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
 - 最近 CI：GitHub hosted macOS runner 持续排队/容量受限；本地 lint、Rust/Swift 测试与打包通过。
@@ -248,6 +249,7 @@
 - **M3 第一百一十二切片**：project fork forest + audit/repair + checkpoint stats（session.created-derived forest roots、missing link/child/parent/checkpoint ref audit、append-only repair、object-size stats、CLI/Manage Dash；Rust/Swift tests）；见 ADR-0108。
 - **M3 第一百一十三切片**：verified update download（`.dmg` + `.sha256`、GitHub URL/redirect allowlist、512MB cap、streaming SHA-256、atomic rename、Settings Download/Show in Finder；Rust/Swift tests）；见 ADR-0107 更新。
 - **M3 第一百一十四切片**：model preset catalog（global SQLite presets、CRUD RPC/CLI、provider-scoped apply to role fields、no secrets、Settings modal；Rust/Swift tests）；见 ADR-0109。
+- **M3 第一百一十五切片**：Manage Dash IA 重构（sidebar 9 sections + badges、project/session pickers、overview metrics/pending/runtime/recent、section filter/persistence、Agents roster、card file split；Swift tests）；见 ADR-0110。
 
 ## 如何运行
 

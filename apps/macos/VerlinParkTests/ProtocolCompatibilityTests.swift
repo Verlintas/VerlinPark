@@ -1160,4 +1160,28 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertNil(task.tokenBudget)
         XCTAssertNil(task.costBudgetUsd)
     }
+
+    func testJSONValueShortDescriptionCoversPayloadShapes() {
+        XCTAssertEqual(JSONValue.string("hello").shortDescription, "hello")
+        XCTAssertEqual(JSONValue.bool(true).shortDescription, "true")
+        XCTAssertEqual(JSONValue.number(3).shortDescription, "3")
+        XCTAssertEqual(
+            JSONValue.array([.string("a"), .string("b")]).shortDescription,
+            "2 items"
+        )
+        XCTAssertEqual(
+            JSONValue.object(["b": .number(1), "a": .number(2)]).shortDescription,
+            "a, b"
+        )
+        XCTAssertEqual(JSONValue.null.shortDescription, "null")
+    }
+
+    func testDashboardSectionsAreUniqueAndOrdered() {
+        let sections = DashboardSection.allCases
+        XCTAssertEqual(sections.count, 9)
+        XCTAssertEqual(sections.first, .overview)
+        XCTAssertEqual(sections.last, .diagnostics)
+        XCTAssertEqual(Set(sections.map(\.title)).count, sections.count)
+        XCTAssertTrue(sections.allSatisfy { !$0.detail.isEmpty && !$0.icon.isEmpty })
+    }
 }

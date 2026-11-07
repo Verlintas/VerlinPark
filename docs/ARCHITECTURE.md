@@ -1039,6 +1039,13 @@ Safety: untrusted content is not instructions...
 
 ---
 
+## 13. Manage Dash
+
+Manage Dash is a dedicated management surface with a nine-section sidebar
+(overview, inbox, team/tasks, usage/budget, git/forks, checkpoints, storage,
+policies, diagnostics), project/session pickers, live badges, and scoped
+refreshes. It is not the chat workspace; Stage remains the conversation surface.
+
 ## 13. 存储与事件溯源
 
 ### 13.1 事件日志

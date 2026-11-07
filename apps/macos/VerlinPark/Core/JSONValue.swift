@@ -74,6 +74,23 @@ enum JSONValue: Codable, Hashable, Sendable {
         return value
     }
 
+    var shortDescription: String {
+        switch self {
+        case .null:
+            "null"
+        case let .bool(value):
+            value ? "true" : "false"
+        case let .number(value):
+            value.rounded() == value ? String(Int(value)) : String(value)
+        case let .string(value):
+            value
+        case let .array(values):
+            "\(values.count) items"
+        case let .object(values):
+            values.keys.sorted().prefix(4).joined(separator: ", ")
+        }
+    }
+
     func decode<T: Decodable>(_ type: T.Type) throws -> T {
         let data = try JSONEncoder().encode(self)
         return try JSONDecoder().decode(type, from: data)

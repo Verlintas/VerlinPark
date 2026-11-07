@@ -1,0 +1,752 @@
+import SwiftUI
+
+struct MemoryRow: View {
+    @Environment(AppModel.self) private var model
+    let memory: MemoryItem
+    @State private var confirmDelete = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(memory.kind.uppercased())
+                    .font(.system(size: 8, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.cyan)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.cyan.opacity(0.1), in: Capsule())
+                Text(memory.title)
+                    .font(.system(size: 9, weight: .medium))
+                Spacer()
+                Text(memory.agentName)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Button {
+                    confirmDelete = true
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 8))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Delete memory")
+                .disabled(model.memoryBusy)
+            }
+            Text(memory.body)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+            if !memory.tags.isEmpty {
+                Text(memory.tags.map { "#\($0)" }.joined(separator: " "))
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+        .confirmationDialog(
+            "Delete this memory?",
+            isPresented: $confirmDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                Task { await model.deleteMemory(memory) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(memory.title)
+        }
+    }
+}
+
+struct MemoryPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Memory retention")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.memoryPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Save") {
+                    Task { await model.saveMemoryPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.memoryPolicyBusy)
+            }
+            Toggle("Automatic prune", isOn: $model.memoryPolicyEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+            HStack(spacing: 8) {
+                TextField("max items", text: $model.memoryPolicyMaxItems)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 110)
+                TextField("max age days", text: $model.memoryPolicyMaxAgeDays)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 110)
+                Text("leave blank to disable a limit")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            Text(
+                "Off by default. The daemon sweeps enabled policies periodically (default hourly) and emits event-backed deletions. At least one limit is required to enable."
+            )
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let status = model.memoryPolicyStatus {
+                Text(status)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task {
+            await model.loadMemoryPolicy()
+        }
+    }
+}
+
+struct ShellPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Shell policy")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.shellPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Picker("", selection: $model.shellPolicyNetwork) {
+                    Text("Allow network").tag("allow")
+                    Text("Deny network").tag("deny")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 210)
+            }
+
+            HStack(spacing: 16) {
+                Toggle("Restrict home reads", isOn: $model.shellPolicyRestrictHome)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help(
+                        "Deny reads under HOME except the worktree, scratch, Git metadata, and known toolchain/cache paths."
+                    )
+                Toggle("Read jail (all users + volumes)", isOn: $model.shellPolicyReadJail)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help(
+                        "Deny reads under the home parent (normally /Users) and /Volumes except the worktree, scratch, Git metadata, toolchains, and read-deny exceptions. System paths remain readable."
+                    )
+            }
+
+            Text(
+                "Writes remain confined to the worktree, Git metadata, and runtime scratch. Network deny blocks outbound sockets. Restrict home reads denies HOME; Read jail also denies sibling user homes and /Volumes. Both allow the worktree, scratch, Git metadata, and known toolchains. Read-deny paths are additive and must be absolute or start with ~/. This is not a full filesystem read sandbox."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            TextEditor(text: $model.shellPolicyReadDenyText)
+                .font(.system(size: 10, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .frame(height: 74)
+                .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+                }
+
+            HStack(spacing: 8) {
+                Text("One read-deny path per line · empty means no extra denials")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button("Reset") {
+                    Task { await model.resetShellPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.shellPolicyBusy)
+                Button("Save policy") {
+                    Task { await model.saveShellPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.shellPolicyBusy)
+            }
+
+            if let status = model.shellPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadShellPolicy()
+        }
+    }
+}
+
+struct IntegrationPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Integration policy")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.integrationPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Toggle("Auto-resolve conflicts", isOn: $model.integrationAutoResolve)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+
+            Text(
+                "When enabled, a conflict re-enters an internal resolver + Verifier without per-tool approvals. The shell sandbox still applies. Attempts and tokens are capped; manual Auto-resolve remains available."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 14) {
+                HStack(spacing: 6) {
+                    Text("Max automatic attempts")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Stepper(
+                        "\(model.integrationMaxAutoAttempts)",
+                        value: $model.integrationMaxAutoAttempts,
+                        in: 0 ... 5
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                }
+                HStack(spacing: 6) {
+                    Text("Max tokens / resolution")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    TextField("session budget", text: $model.integrationMaxTokensText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 120)
+                        .font(.system(size: 9, design: .monospaced))
+                }
+                Spacer()
+                Button("Reset") {
+                    Task { await model.resetIntegrationPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.integrationPolicyBusy)
+                Button("Save policy") {
+                    Task { await model.saveIntegrationPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.integrationPolicyBusy)
+            }
+
+            if let status = model.integrationPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadIntegrationPolicy()
+        }
+    }
+}
+
+struct ArtifactPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Artifact policy")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.artifactPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Toggle("Auto GC", isOn: $model.artifactAutoGc)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+
+            Text(
+                "Retention uses the oldest artifacts first. Binary artifacts are copied into the data directory; text artifacts stay inline in SQLite. Limits are optional."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                limitField("Max bytes", text: $model.artifactMaxBytesText)
+                limitField("Max age secs", text: $model.artifactMaxAgeText)
+                limitField("Max count", text: $model.artifactMaxCountText)
+                Spacer()
+                Button("GC now") {
+                    Task { await model.gcArtifacts() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.artifactPolicyBusy)
+                Button("Reset") {
+                    Task { await model.resetArtifactPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.artifactPolicyBusy)
+                Button("Save policy") {
+                    Task { await model.saveArtifactPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.artifactPolicyBusy)
+            }
+
+            if let status = model.artifactPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadArtifactPolicy()
+        }
+    }
+
+    private func limitField(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            TextField("unlimited", text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 9, design: .monospaced))
+                .frame(width: 90)
+        }
+    }
+}
+
+struct MailboxPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Mailbox retention")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.mailboxPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Toggle("Auto GC", isOn: $model.mailboxAutoGc)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Toggle("Delete unread", isOn: $model.mailboxDeleteUnread)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+
+            Text(
+                "Mailbox GC removes oldest messages first. Auto GC runs after sending or marking a message read. Unread messages are protected unless Delete unread is enabled. Limits are optional."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                limitField("Max age secs", text: $model.mailboxMaxAgeText)
+                limitField("Max count", text: $model.mailboxMaxCountText)
+                Spacer()
+                Button("GC now") {
+                    Task { await model.gcMailbox() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.mailboxPolicyBusy)
+                Button("Reset") {
+                    Task { await model.resetMailboxPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.mailboxPolicyBusy)
+                Button("Save policy") {
+                    Task { await model.saveMailboxPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.mailboxPolicyBusy)
+            }
+
+            if let status = model.mailboxPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadMailboxPolicy()
+        }
+    }
+
+    private func limitField(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            TextField("unlimited", text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 9, design: .monospaced))
+                .frame(width: 90)
+        }
+    }
+}
+
+struct ProjectBudgetCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Project shared budget")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.projectBudgetBusy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            Text(
+                "A project-wide token/USD pool shared by all sessions. Concurrent calls reserve against it atomically. Empty means unlimited."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Token budget")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("unlimited", text: $model.projectTokenBudgetText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 110)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("USD budget")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("unlimited", text: $model.projectCostBudgetText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 90)
+                }
+                Spacer()
+                Button("Reset") {
+                    Task { await model.resetProjectBudget() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.projectBudgetBusy)
+                Button("Save budget") {
+                    Task { await model.saveProjectBudget() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.projectBudgetBusy)
+            }
+            Text(
+                "Spent: \(model.projectSpentTokens) tokens · \(String(format: "$%.4f", model.projectSpentCostUsd))"
+            )
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let status = model.projectBudgetStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .task(id: project.id) {
+            await model.loadProjectBudget()
+        }
+    }
+}
+
+struct DoctorCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Diagnostics")
+                    Text("Local doctor")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.doctorBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Run diagnostics") {
+                    Task { await model.runDoctor() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.doctorBusy)
+            }
+            Text(
+                "Checks SQLite integrity, data permissions, project roots, worktrees, event mirrors, sandbox availability, and provider configuration."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let report = model.doctorReport {
+                Text(report.ok ? "All checks passed" : "Warnings or errors found")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(report.ok ? Color.green : Color.orange)
+                ForEach(report.checks) { check in
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(check.status.uppercased())
+                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .foregroundStyle(color(for: check.status))
+                            .frame(width: 44, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(check.name)
+                                .font(.system(size: 9, weight: .medium))
+                            Text(check.detail)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            } else if let status = model.doctorStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private func color(for status: String) -> Color {
+        switch status {
+        case "ok": .green
+        case "warn": .orange
+        default: .red
+        }
+    }
+}
+
+struct WorktreeCleanupCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Worktree cleanup")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.cleanupBusy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            Text(
+                "Terminal-session worktrees only. Dirty worktrees are skipped; branches are kept unless explicitly deleted."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let stats = model.checkpointStats {
+                Text(
+                    "\(stats.checkpoints) checkpoints · \(stats.dirty) dirty · \(stats.refs) refs · ~\(ByteCountFormatter.string(fromByteCount: Int64(stats.snapshotBytes), countStyle: .file)) snapshot"
+                )
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+            }
+
+            Divider().opacity(0.2)
+            Text("AUTOMATIC RETENTION")
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            HStack(spacing: 10) {
+                Toggle("Enabled", isOn: $model.worktreePolicyEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Older than days")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("7", text: $model.worktreePolicyOlderDaysText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 70)
+                }
+                Toggle("Delete branches", isOn: $model.worktreePolicyDeleteBranches)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Toggle("Keep failed", isOn: $model.worktreePolicyKeepFailed)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Spacer()
+                if model.worktreePolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Save policy") {
+                    Task { await model.saveWorktreePolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.worktreePolicyBusy)
+            }
+            if let status = model.worktreePolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider().opacity(0.2)
+            Text("MANUAL CLEANUP")
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Older than days")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    TextField("7", text: $model.cleanupOlderDaysText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 70)
+                }
+                Toggle("Dry run", isOn: $model.cleanupDryRun)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Toggle("Delete branches", isOn: $model.cleanupDeleteBranches)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Toggle("Keep failed", isOn: $model.cleanupKeepFailed)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Spacer()
+                Button("Run cleanup") {
+                    Task { await model.runWorktreeCleanup() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.cleanupBusy)
+            }
+            if let status = model.cleanupStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            if let result = model.cleanupResult {
+                ForEach(result.entries) { entry in
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(entry.removed ? "removed" : "skipped")
+                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .foregroundStyle(entry.removed ? Color.green : Color.secondary)
+                            .frame(width: 52, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(entry.sessionId)
+                                .font(.system(size: 8, design: .monospaced))
+                            Text("\(entry.branch) · \(entry.reason)")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+}

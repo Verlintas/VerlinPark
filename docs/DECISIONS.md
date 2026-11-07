@@ -119,6 +119,7 @@
 | [0107](adr/0107-release-update-check.md) | Manual release update check | Accepted | Distribution |
 | [0108](adr/0108-project-fork-forest-and-audit.md) | Project fork forest, audit, and checkpoint stats | Accepted | Session/Git |
 | [0109](adr/0109-model-preset-catalog.md) | Model preset catalog | Accepted | Models/Config |
+| [0110](adr/0110-manage-dash-information-architecture.md) | Manage Dash information architecture | Accepted | UI |
 
 ---
 
