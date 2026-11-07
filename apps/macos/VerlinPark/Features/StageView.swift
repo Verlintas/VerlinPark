@@ -439,16 +439,16 @@ private struct ForkSessionSheet: View {
             Text("Fork Session")
                 .font(.title3.weight(.semibold))
             Text(
-                "Creates a new session from a clean checkpoint of the committed branch and active conversation. Commit or discard uncommitted worktree changes first."
+                "Creates a new session from a checkpoint of the active conversation and worktree. Uncommitted tracked and untracked (non-ignored) changes are snapshotted into the checkpoint commit; the source session is not modified."
             )
             .font(.callout)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
             Picker("Start from", selection: $checkpointID) {
-                Text("Current clean HEAD").tag("")
+                Text("Current worktree").tag("")
                 ForEach(model.checkpoints) { checkpoint in
                     Text(
-                        "\(checkpoint.label) · \(String(checkpoint.commit.prefix(8))) · \(checkpoint.messageCount) msgs"
+                        "\(checkpoint.label) · \(String(checkpoint.commit.prefix(8))) · \(checkpoint.messageCount) msgs\(checkpoint.dirty == true ? " · dirty" : "")"
                     )
                     .tag(checkpoint.id)
                 }
@@ -497,7 +497,7 @@ private struct ForkSessionSheet: View {
         if success {
             dismiss()
         } else {
-            error = "Fork failed. The session must be idle and its worktree must be clean."
+            error = "Fork failed. The session must be idle and its worktree must be available."
         }
     }
 }

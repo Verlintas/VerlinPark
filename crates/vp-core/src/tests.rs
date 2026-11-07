@@ -3094,6 +3094,7 @@ async fn checkpoints_and_forks_preserve_committed_branch_and_active_conversation
     assert_eq!(checkpoint.label, "before fork");
     assert_eq!(checkpoint.message_count, source_messages.len());
     assert_eq!(checkpoint.summary, None);
+    assert!(!checkpoint.dirty);
     assert_eq!(
         checkpoint.start_message_id.as_deref(),
         Some(source_messages.first().unwrap().id.as_str())
@@ -3246,6 +3247,7 @@ async fn forks_copy_a_compaction_summary_and_tail_only() {
     let checkpoint = engine.checkpoint_session(&session.id, None).await.unwrap();
     assert_eq!(checkpoint.summary.as_deref(), Some(summary));
     assert_eq!(checkpoint.message_count, 2);
+    assert!(!checkpoint.dirty);
     assert_eq!(
         checkpoint.start_message_id.as_deref(),
         Some(three.id.as_str())
@@ -3268,7 +3270,7 @@ async fn forks_copy_a_compaction_summary_and_tail_only() {
 }
 
 #[tokio::test]
-async fn checkpoints_reject_dirty_or_active_sessions() {
+async fn checkpoints_snapshot_dirty_worktrees_and_reject_active_sessions() {
     let data = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();
     init_repo(repo.path());
@@ -3285,14 +3287,33 @@ async fn checkpoints_reject_dirty_or_active_sessions() {
         .await
         .unwrap();
     let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    let head_before = crate::worktree::head_commit(&worktree).unwrap();
     std::fs::write(worktree.join("dirty.txt"), "not committed\n").unwrap();
-    let error = engine
-        .checkpoint_session(&session.id, None)
+    let checkpoint = engine
+        .checkpoint_session(&session.id, Some("dirty snapshot".into()))
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("uncommitted changes"));
+        .unwrap();
+    assert!(checkpoint.dirty);
+    assert_ne!(checkpoint.commit, head_before);
+    assert_eq!(
+        crate::worktree::head_commit(&worktree).unwrap(),
+        head_before,
+        "snapshot must not move the source HEAD"
+    );
+    let fork = engine
+        .fork_session(&session.id, Some(&checkpoint.id), None)
+        .await
+        .unwrap();
+    let fork_worktree = PathBuf::from(fork.session.worktree.clone().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(fork_worktree.join("dirty.txt")).unwrap(),
+        "not committed\n"
+    );
+    assert_eq!(
+        crate::worktree::head_commit(&fork_worktree).unwrap(),
+        checkpoint.commit
+    );
 
-    std::fs::remove_file(worktree.join("dirty.txt")).unwrap();
     engine
         .update_session_status(&session.id, "running")
         .await

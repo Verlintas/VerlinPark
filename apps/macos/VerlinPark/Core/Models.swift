@@ -1223,6 +1223,7 @@ struct SessionCheckpoint: Codable, Sendable, Identifiable {
     let throughMessageID: String?
     let messageCount: Int
     let summary: String?
+    let dirty: Bool?
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -1235,6 +1236,7 @@ struct SessionCheckpoint: Codable, Sendable, Identifiable {
         case throughMessageID = "through_message_id"
         case messageCount = "message_count"
         case summary
+        case dirty
         case createdAt = "created_at"
     }
 }

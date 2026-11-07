@@ -152,6 +152,67 @@ pub fn current_branch(worktree: &Path) -> Result<String> {
     git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
+/// Snapshot the worktree, including uncommitted tracked changes and untracked
+/// non-ignored files, into a commit object without touching the real index or
+/// HEAD. The commit stays reachable through a checkpoint ref so Git GC cannot
+/// prune it before a fork.
+pub fn snapshot_worktree(
+    worktree: &Path,
+    data_dir: &Path,
+    session_id: &str,
+    checkpoint_id: &str,
+    label: &str,
+) -> Result<String> {
+    let head = head_commit(worktree)?;
+    let temp_dir = data_dir.join("tmp");
+    std::fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("creating {}", temp_dir.display()))?;
+    let index_path = temp_dir.join(format!("checkpoint-{checkpoint_id}.index"));
+    let _ = std::fs::remove_file(&index_path);
+    let result = (|| -> Result<String> {
+        git_output_with_index(worktree, &index_path, &["read-tree", "HEAD"])?;
+        git_output_with_index(worktree, &index_path, &["add", "-A"])?;
+        let tree = git_output_with_index(worktree, &index_path, &["write-tree"])?;
+        let head_tree = git_output(worktree, &["rev-parse", "HEAD^{tree}"])?;
+        if tree == head_tree {
+            return Ok(head);
+        }
+        let message = format!("VerlinPark checkpoint {checkpoint_id}: {label}");
+        let commit = git_output_with_index(
+            worktree,
+            &index_path,
+            &["commit-tree", &tree, "-p", &head, "-m", &message],
+        )?;
+        let reference = format!("refs/verlinpark/checkpoints/{session_id}/{checkpoint_id}");
+        git_output_with_index(worktree, &index_path, &["update-ref", &reference, &commit])?;
+        Ok(commit)
+    })();
+    let _ = std::fs::remove_file(&index_path);
+    result
+}
+
+fn git_output_with_index(root: &Path, index: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_AUTHOR_NAME", "VerlinPark")
+        .env("GIT_AUTHOR_EMAIL", "verlinpark@localhost")
+        .env("GIT_COMMITTER_NAME", "VerlinPark")
+        .env("GIT_COMMITTER_EMAIL", "verlinpark@localhost")
+        .output()
+        .context("running git")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        bail!("git {} failed: {detail}", args.join(" "));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Create a Worker worktree based on the session branch.
 pub fn create_task(
     project_root: &Path,

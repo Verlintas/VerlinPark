@@ -17,13 +17,17 @@ both a committed tree and a bounded conversation snapshot.
 
 1. **Checkpoint event.** `session.checkpoint` requires a quiescent session
    (draft/idle/failed/cancelled/landed; not running/queued/paused/waiting_input/
-   imported) and a clean session worktree on the expected session branch.
-   Ignored files do not count as dirty. The checkpoint captures:
-   - current `HEAD` and branch;
+   imported) on the expected session branch. The worktree may be dirty:
+   a temporary index (`GIT_INDEX_FILE`) stages the tracked working tree plus
+   untracked non-ignored files, `write-tree`/`commit-tree` creates a snapshot
+   commit with `HEAD` as parent, and `refs/verlinpark/checkpoints/<session>/<id>`
+   keeps it reachable. The real index/HEAD/worktree are not modified. Ignored
+   files are excluded. The checkpoint captures:
+   - the snapshot commit and branch;
    - the active-conversation start/through message IDs (after the latest
      `context.compacted`, if any);
    - the prefixed summary text when the source is in summary mode;
-   - the active raw message count and a label.
+   - the active raw message count, label, and a `dirty` flag.
    It is persisted as `session.checkpoint`; `session.checkpoints` lists them.
 2. **Fork event.** `session.fork` creates a new session and worktree from a
    checkpoint commit on a new `verlinpark/<id>` branch. Without an explicit
@@ -49,14 +53,17 @@ both a committed tree and a bounded conversation snapshot.
    the snapshotted conversation and committed tree only.
 7. **Interfaces.** RPC/CLI (`vp checkpoint`, `vp checkpoints`, `vp fork`) and
    the Stage session menu "Fork Session…" expose the flow. The fork sheet can
-   choose the current clean HEAD or a listed checkpoint and edit the new goal.
+   choose the current worktree snapshot or a listed checkpoint and edit the new
+   goal. Dirty snapshots are labeled in the picker.
 
 ## Consequences
 
 - Users can explore alternatives from a committed, reproducible tree without
   disturbing the source session.
-- Dirty worktrees are rejected rather than silently excluding uncommitted work.
-  Users must commit or discard first (or fork an older checkpoint).
+- Dirty worktrees are supported: the checkpoint commit includes tracked and
+  untracked non-ignored changes without touching the source index. Ignored
+  build outputs are not included, and uncommitted secrets not covered by
+  `.gitignore` will be snapshotted if the user checkpoints them.
 - Forks are not full history clones: pre-compaction messages are summarized,
   and plan/integration state is intentionally fresh. The source remains the
   audit record.
@@ -72,8 +79,9 @@ both a committed tree and a bounded conversation snapshot.
 - **Fork raw history:** preserves everything but duplicates large histories and
   ignores the source's active compaction window. Rejected for the first
   checkpoint model.
-- **Snapshot dirty worktrees:** requires temporary-index/commit plumbing and
-  risks including ignored artifacts. Rejected; require a clean commit.
+- **Require a clean worktree:** simpler, but forces users to commit half-done
+  exploration before forking. Rejected; the temporary-index snapshot gives a
+  deterministic commit without mutating the source.
 - **Reuse the source branch:** unsafe; two sessions would mutate the same
   branch. Each fork gets its own branch/worktree.
 - **Copy plan and integration state:** task worktrees, statuses, and merge

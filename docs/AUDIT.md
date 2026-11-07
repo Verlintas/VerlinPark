@@ -331,7 +331,7 @@
 - `session.context` / `vp context` 读取最新 `context.usage`、`context.compacted` 和 `context.measured`；Stage header 显示 active context 与 threshold，点击打开 popover，显示 window/hard limit/last compaction/last provider measurement。
 - Provider 报告 usage 后写 `context.measured`，记录 heuristic estimate、actual input/output、raw ratio、upward-only EWMA calibration 和 samples；calibration 按 session/model 从事件恢复，clamp 1.0–2.0，并用于 active context estimate、compaction threshold/hard-limit 和 summary transcript budget。
 - `session.compact` / `vp compact` / popover 可对 idle 等非运行 session 强制 compaction；复用 summary/trim pipeline 和 usage ledger，运行中/暂停/等待输入/imported 拒绝。手动 compaction 注册 manual run control，阻止并发 prompt；pause 返回 false，cancel 仍可取消 summary stream；失败返回 RPC error 并保留 `context.compact_failed`。
-- `session.checkpoint` / `session.checkpoints` / `session.fork` / `vp checkpoint|checkpoints|fork` / Stage Fork Session 支持 checkpoint/fork。Checkpoint 要求 clean worktree、预期 branch、非运行 session；fork 从 checkpoint commit 创建独立 worktree/branch，复制 active conversation（summary + tail）并重建显示事件，source 不变；不复制 plan/todos/merge queue/approvals/usage。
+- `session.checkpoint` / `session.checkpoints` / `session.fork` / `vp checkpoint|checkpoints|fork` / Stage Fork Session 支持 checkpoint/fork。Checkpoint 要求预期 branch、非运行 session，允许 dirty worktree（临时 index snapshot tracked + untracked 非 ignored 变更，checkpoint ref 保持可达）；fork 从 checkpoint commit 创建独立 worktree/branch，复制 active conversation（summary + tail）并重建显示事件，source 不变；不复制 plan/todos/merge queue/approvals/usage。
 
 **影响**
 

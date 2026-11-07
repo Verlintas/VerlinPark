@@ -609,24 +609,52 @@ impl Engine {
         if !worktree.is_dir() {
             anyhow::bail!("session worktree is missing: {}", worktree.display());
         }
+        let checkpoint_id = Uuid::now_v7().to_string();
+        let label = label
+            .map(|label| {
+                label
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            })
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| format!("checkpoint {}", &checkpoint_id[..8]));
         let git_lock = self.git_lock.clone();
-        let head_path = worktree.clone();
         let status_path = worktree.clone();
+        let branch_path = worktree.clone();
+        let snapshot_path = worktree.clone();
+        let data_dir = self.store.data_dir().to_path_buf();
+        let session_id_for_snapshot = session.id.clone();
+        let checkpoint_id_for_snapshot = checkpoint_id.clone();
+        let label_for_snapshot = label.clone();
+        let expected_branch = session.branch.clone();
         let (commit, status) = tokio::task::spawn_blocking(move || {
             let _guard = git_lock
                 .lock()
                 .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
-            Ok::<_, anyhow::Error>((
-                worktree::head_commit(&head_path)?,
-                worktree::status_porcelain(&status_path)?,
-            ))
+            let status = worktree::status_porcelain(&status_path)?;
+            let branch = worktree::current_branch(&branch_path)?;
+            if let Some(expected) = expected_branch.as_deref()
+                && branch != expected
+            {
+                anyhow::bail!(
+                    "session worktree is on branch {branch}; expected {expected}. Check it out before creating a checkpoint"
+                );
+            }
+            let commit = worktree::snapshot_worktree(
+                &snapshot_path,
+                &data_dir,
+                &session_id_for_snapshot,
+                &checkpoint_id_for_snapshot,
+                &label_for_snapshot,
+            )?;
+            Ok::<_, anyhow::Error>((commit, status))
         })
         .await??;
-        if !status.is_empty() {
-            anyhow::bail!(
-                "session worktree has uncommitted changes; commit or discard them before creating a checkpoint"
-            );
-        }
+        let dirty = !status.is_empty();
         let (messages, start, summary) = self.load_active_snapshot(session_id).await?;
         let start_message_id = messages.get(start).map(|message| message.id.clone());
         let through_message_id = if start < messages.len() {
@@ -635,11 +663,6 @@ impl Engine {
             None
         };
         let message_count = messages.len().saturating_sub(start);
-        let checkpoint_id = Uuid::now_v7().to_string();
-        let label = label
-            .map(|label| label.trim().chars().take(120).collect::<String>())
-            .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| format!("checkpoint {}", &commit[..commit.len().min(8)]));
         let payload = serde_json::json!({
             "checkpoint_id": checkpoint_id,
             "label": label,
@@ -650,6 +673,7 @@ impl Engine {
             "through_message_id": through_message_id,
             "message_count": message_count,
             "summary": summary,
+            "dirty": dirty,
         });
         let event = self
             .append_event(session_id, "session.checkpoint", payload)
@@ -671,7 +695,7 @@ impl Engine {
     }
 
     /// Create a new session/worktree from a checkpoint. Without an explicit
-    /// checkpoint, one is created at the source's current clean HEAD.
+    /// checkpoint, one is created from the source's current worktree state.
     pub async fn fork_session(
         &self,
         source_session_id: &str,
@@ -5857,6 +5881,10 @@ fn checkpoint_from_event(event: &Event) -> Option<SessionCheckpoint> {
             .get("summary")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        dirty: payload
+            .get("dirty")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         created_at: payload
             .get("created_at")
             .and_then(serde_json::Value::as_str)

@@ -1552,6 +1552,9 @@ pub struct SessionCheckpoint {
     /// the source had already been compacted.
     #[serde(default)]
     pub summary: Option<String>,
+    /// True when the checkpoint commit includes uncommitted worktree changes.
+    #[serde(default)]
+    pub dirty: bool,
     #[serde(default)]
     pub created_at: String,
 }
