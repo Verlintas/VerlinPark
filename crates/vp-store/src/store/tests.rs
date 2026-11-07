@@ -1389,6 +1389,7 @@ fn round_trips_task_scheduler_policy_and_manifest() {
     let default = store.get_task_scheduler_policy(&project.id).unwrap();
     assert!(!default.enabled);
     assert_eq!(default.cooldown_secs, 60);
+    assert!(!default.dispatch_tasks);
 
     store
         .set_task_scheduler_policy(
@@ -1396,15 +1397,18 @@ fn round_trips_task_scheduler_policy_and_manifest() {
             &TaskSchedulerPolicy {
                 enabled: true,
                 cooldown_secs: 15,
+                dispatch_tasks: true,
             },
         )
         .unwrap();
     let policy = store.get_task_scheduler_policy(&project.id).unwrap();
     assert!(policy.enabled);
     assert_eq!(policy.cooldown_secs, 15);
+    assert!(policy.dispatch_tasks);
     store.record_project_manifest().unwrap();
 
     let snapshot = read_project_manifest(data.path()).unwrap();
     assert!(snapshot[0].task_scheduler_policy.enabled);
     assert_eq!(snapshot[0].task_scheduler_policy.cooldown_secs, 15);
+    assert!(snapshot[0].task_scheduler_policy.dispatch_tasks);
 }

@@ -376,10 +376,11 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS project_task_scheduler_policies (
-                project_id    TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-                enabled       INTEGER NOT NULL DEFAULT 0,
-                cooldown_secs INTEGER NOT NULL DEFAULT 60,
-                updated_at    TEXT NOT NULL
+                project_id     TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled        INTEGER NOT NULL DEFAULT 0,
+                cooldown_secs  INTEGER NOT NULL DEFAULT 60,
+                dispatch_tasks INTEGER NOT NULL DEFAULT 0,
+                updated_at     TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_mailbox_policies (
@@ -495,6 +496,12 @@ impl Store {
                 [],
             )?;
         }
+        ensure_column(
+            &conn,
+            "project_task_scheduler_policies",
+            "dispatch_tasks",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&conn, "sessions", "priority", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "sessions", "worktree", "TEXT")?;
         ensure_column(&conn, "sessions", "branch", "TEXT")?;
@@ -808,13 +815,14 @@ impl Store {
         let conn = self.lock()?;
         let stored = conn
             .query_row(
-                "SELECT enabled, cooldown_secs FROM project_task_scheduler_policies
-                 WHERE project_id = ?1",
+                "SELECT enabled, cooldown_secs, dispatch_tasks
+                 FROM project_task_scheduler_policies WHERE project_id = ?1",
                 params![project_id],
                 |row| {
                     Ok(TaskSchedulerPolicy {
                         enabled: row.get::<_, i64>(0)? != 0,
                         cooldown_secs: row.get::<_, i64>(1)?.max(1) as u64,
+                        dispatch_tasks: row.get::<_, i64>(2).unwrap_or(0) != 0,
                     })
                 },
             )
@@ -830,16 +838,18 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO project_task_scheduler_policies
-             (project_id, enabled, cooldown_secs, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+             (project_id, enabled, cooldown_secs, dispatch_tasks, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(project_id) DO UPDATE SET
                 enabled = excluded.enabled,
                 cooldown_secs = excluded.cooldown_secs,
+                dispatch_tasks = excluded.dispatch_tasks,
                 updated_at = excluded.updated_at",
             params![
                 project_id,
                 if policy.enabled { 1 } else { 0 },
                 policy.cooldown_secs as i64,
+                if policy.dispatch_tasks { 1 } else { 0 },
                 now_rfc3339()
             ],
         )?;

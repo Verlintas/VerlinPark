@@ -1396,6 +1396,12 @@ private struct TaskSchedulerCard: View {
                 Toggle("Auto-resume pending plans", isOn: $model.taskSchedulerEnabled)
                     .toggleStyle(.switch)
                     .controlSize(.small)
+                Toggle("One task per tick", isOn: $model.taskSchedulerDispatchTasks)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help(
+                        "Dispatch one ready task per daemon tick instead of resuming the entire stored plan"
+                    )
                 TextField("cooldown secs", text: $model.taskSchedulerCooldownText)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 9, design: .monospaced))
@@ -1407,6 +1413,12 @@ private struct TaskSchedulerCard: View {
                     ProgressView().controlSize(.small)
                 }
                 Spacer()
+                Button("Dispatch one task") {
+                    Task { await model.dispatchScheduledTaskNow() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.taskQueueBusy || model.taskActionBusyID != nil)
                 Button("Save policy") {
                     Task { await model.saveTaskSchedulerPolicy() }
                 }
@@ -1422,7 +1434,7 @@ private struct TaskSchedulerCard: View {
             }
 
             Text(
-                "Ready tasks are ordered by task priority plus session priority, with aging so low-priority work cannot starve. When auto-resume is enabled for this project, the daemon can resume idle/failed plans with pending tasks after the cooldown. Write leases are stored by the daemon and enforce overlapping path scopes across sessions; the same session may share its worktree."
+                "Ready tasks are ordered by task priority plus session priority, with aging so low-priority work cannot starve. When auto-resume is enabled, the daemon can resume idle/failed plans after the cooldown. With one-task-per-tick enabled it claims and runs a single ready task, then releases the session so other sessions can make progress; the project cooldown still applies between dispatches, so use a small value such as 5s for continuous progress. Otherwise it resumes the whole stored plan. Write leases are stored by the daemon and enforce overlapping path scopes across sessions; the same session may share its worktree."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)

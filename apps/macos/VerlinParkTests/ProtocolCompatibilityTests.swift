@@ -313,6 +313,16 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(result.projectID, "project-1")
         XCTAssertTrue(result.policy.enabled)
         XCTAssertEqual(result.policy.cooldownSecs, 15)
+        XCTAssertFalse(result.policy.dispatchTasks)
+
+        let perTask = try JSONDecoder().decode(
+            TaskSchedulerPolicyResult.self,
+            from: Data(
+                #"{"project_id":"project-1","policy":{"enabled":true,"cooldown_secs":15,"dispatch_tasks":true}}"#
+                    .utf8
+            )
+        )
+        XCTAssertTrue(perTask.policy.dispatchTasks)
     }
 
     func testShellPolicyReadsOptionalReadJail() throws {

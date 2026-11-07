@@ -259,6 +259,7 @@ async fn task_scheduler_policy_round_trips_and_validates() {
     let default = engine.get_task_scheduler_policy(&project.id).await.unwrap();
     assert!(!default.policy.enabled);
     assert_eq!(default.policy.cooldown_secs, 60);
+    assert!(!default.policy.dispatch_tasks);
 
     let saved = engine
         .set_task_scheduler_policy(
@@ -266,12 +267,14 @@ async fn task_scheduler_policy_round_trips_and_validates() {
             vp_protocol::types::TaskSchedulerPolicy {
                 enabled: true,
                 cooldown_secs: 12,
+                dispatch_tasks: true,
             },
         )
         .await
         .unwrap();
     assert!(saved.policy.enabled);
     assert_eq!(saved.policy.cooldown_secs, 12);
+    assert!(saved.policy.dispatch_tasks);
     assert_eq!(
         engine.get_task_scheduler_policy(&project.id).await.unwrap(),
         saved
@@ -283,6 +286,7 @@ async fn task_scheduler_policy_round_trips_and_validates() {
                 vp_protocol::types::TaskSchedulerPolicy {
                     enabled: true,
                     cooldown_secs: 0,
+                    dispatch_tasks: false,
                 },
             )
             .await
@@ -295,6 +299,7 @@ async fn task_scheduler_policy_round_trips_and_validates() {
                 vp_protocol::types::TaskSchedulerPolicy {
                     enabled: true,
                     cooldown_secs: 60,
+                    dispatch_tasks: false,
                 },
             )
             .await

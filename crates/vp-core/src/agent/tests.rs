@@ -5520,3 +5520,274 @@ async fn handles_a_long_provider_stream_without_losing_chunks() {
             .any(|message| message.role == "assistant" && message.content == expected)
     );
 }
+
+#[tokio::test]
+async fn dispatches_one_ready_plan_task_per_call() {
+    let dir = TempDir::new().unwrap();
+    fn write_task(path: &str, content: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: format!("write_{path}"),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": path, "content": content}).to_string(),
+            }),
+            StreamEvent::Done,
+        ]
+    }
+    fn verdict(task: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: format!("verdict_{task}"),
+                name: "submit_verdict".into(),
+                arguments: serde_json::json!({
+                    "approved": true,
+                    "summary": format!("{task} matches the task")
+                })
+                .to_string(),
+            }),
+            StreamEvent::Done,
+        ]
+    }
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            write_task("src/t1.txt", "one\n"),
+            vec![StreamEvent::TextDelta("T1 done".into()), StreamEvent::Done],
+            verdict("T1"),
+            write_task("src/t2.txt", "two\n"),
+            vec![StreamEvent::TextDelta("T2 done".into()), StreamEvent::Done],
+            verdict("T2"),
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id.clone(), "dispatch tasks".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan = TeamPlan {
+        goal: "dispatch tasks".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "build".into(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![
+            PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "One".into(),
+                kind: "coding".into(),
+                priority: 10,
+                profile: None,
+                deps: Vec::new(),
+                write_scope: vec!["src/t1.txt".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+            PlanTask {
+                id: "T2".into(),
+                department: "impl".into(),
+                title: "Two".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: Vec::new(),
+                write_scope: vec!["src/t2.txt".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+        ],
+    };
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+
+    let approver_engine = engine.clone();
+    let approver_session = session.id.clone();
+    let approver = tokio::spawn(async move {
+        for _ in 0..600 {
+            if let Ok(approvals) = approver_engine
+                .list_approvals(Some(approver_session.clone()))
+                .await
+            {
+                for approval in approvals
+                    .iter()
+                    .filter(|approval| approval.status == "pending")
+                {
+                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    async fn wait_for_task(engine: &Engine, session: &Session, task_id: &str, status: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let events = engine
+                .list_events(session.id.clone(), 0, 500)
+                .await
+                .unwrap();
+            if events.iter().any(|event| {
+                event.kind == "plan_task.finished"
+                    && event.payload["task_id"] == task_id
+                    && event.payload["task_status"] == status
+            }) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task {task_id} did not finish with {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    assert!(service.dispatch_next_task(&session.id).await.unwrap());
+    wait_for_task(&engine, &session, "T1", "completed").await;
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let queue = engine
+        .task_queue(Some(project.id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    let t1 = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T1")
+        .unwrap();
+    let t2 = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T2")
+        .unwrap();
+    assert_eq!(t1.status, "completed");
+    assert_eq!(t2.status, "pending");
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "plan_task.started")
+            .count(),
+        1,
+        "only one task should be dispatched per call"
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.task_dispatched" && event.payload["task_limit"] == 1
+    }));
+
+    assert!(service.dispatch_next_task(&session.id).await.unwrap());
+    wait_for_task(&engine, &session, "T2", "completed").await;
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let queue = engine
+        .task_queue(Some(project.id), Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert!(queue.tasks.iter().all(|task| task.status == "completed"));
+    approver.abort();
+}
+
+#[tokio::test]
+async fn cancelling_a_dispatched_task_does_not_cancel_the_rest_of_the_plan() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(SlowProvider);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id.clone(), "cancel dispatch".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan = TeamPlan {
+        goal: "cancel dispatch".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "build".into(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![
+            PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "One".into(),
+                kind: "coding".into(),
+                priority: 10,
+                profile: None,
+                deps: Vec::new(),
+                write_scope: vec!["src/t1".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+            PlanTask {
+                id: "T2".into(),
+                department: "impl".into(),
+                title: "Two".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: Vec::new(),
+                write_scope: vec!["src/t2".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+        ],
+    };
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+
+    assert!(service.dispatch_next_task(&session.id).await.unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        if events
+            .iter()
+            .any(|event| event.kind == "plan_task.started" && event.payload["task_id"] == "T1")
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "T1 did not start");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(service.cancel(&session.id));
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "cancelled");
+    let queue = engine
+        .task_queue(Some(project.id), Some(session.id.clone()))
+        .await
+        .unwrap();
+    let t1 = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T1")
+        .unwrap();
+    let t2 = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T2")
+        .unwrap();
+    assert_eq!(t1.status, "cancelled");
+    assert_eq!(
+        t2.status, "pending",
+        "limited dispatch must not cancel tasks it did not claim"
+    );
+}

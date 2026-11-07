@@ -169,6 +169,7 @@ final class AppModel {
     var taskActionStatus: String?
     var taskSchedulerPolicy = TaskSchedulerPolicy.disabled
     var taskSchedulerEnabled = false
+    var taskSchedulerDispatchTasks = false
     var taskSchedulerCooldownText = "60"
     var taskSchedulerPolicyBusy = false
     var taskSchedulerPolicyStatus: String?
@@ -2114,6 +2115,7 @@ final class AppModel {
         guard let projectID = selectedProjectID else {
             taskSchedulerPolicy = .disabled
             taskSchedulerEnabled = false
+            taskSchedulerDispatchTasks = false
             taskSchedulerCooldownText = "60"
             return
         }
@@ -2122,6 +2124,7 @@ final class AppModel {
             guard projectID == selectedProjectID else { return }
             taskSchedulerPolicy = policy
             taskSchedulerEnabled = policy.enabled
+            taskSchedulerDispatchTasks = policy.dispatchTasks
             taskSchedulerCooldownText = String(policy.cooldownSecs)
             taskSchedulerPolicyStatus = nil
         } catch {
@@ -2146,18 +2149,46 @@ final class AppModel {
                 projectID: projectID,
                 policy: TaskSchedulerPolicy(
                     enabled: taskSchedulerEnabled,
-                    cooldownSecs: cooldown
+                    cooldownSecs: cooldown,
+                    dispatchTasks: taskSchedulerDispatchTasks
                 )
             )
             guard projectID == selectedProjectID else { return }
             taskSchedulerPolicy = policy
             taskSchedulerEnabled = policy.enabled
+            taskSchedulerDispatchTasks = policy.dispatchTasks
             taskSchedulerCooldownText = String(policy.cooldownSecs)
-            taskSchedulerPolicyStatus =
-                policy.enabled ? "Auto-resume enabled · cooldown \(policy.cooldownSecs)s" : "Auto-resume disabled"
+            if policy.enabled {
+                let mode = policy.dispatchTasks ? "per-task dispatch" : "full plan resume"
+                taskSchedulerPolicyStatus =
+                    "Scheduler enabled · \(mode) · cooldown \(policy.cooldownSecs)s"
+            } else {
+                taskSchedulerPolicyStatus = "Auto-resume disabled"
+            }
             await loadTaskQueue()
         } catch {
             taskSchedulerPolicyStatus = error.localizedDescription
+        }
+    }
+
+    func dispatchScheduledTaskNow() async {
+        guard let task = taskQueue?.tasks.first(where: {
+            ["pending", "interrupted", "failed", "blocked", "cancelled"].contains($0.status)
+        }) else {
+            taskActionStatus = "No dispatchable task."
+            return
+        }
+        taskActionBusyID = task.id
+        defer { taskActionBusyID = nil }
+        do {
+            let started = try await core.dispatchTask(sessionID: task.sessionID)
+            taskActionStatus = started
+                ? "Dispatch queued for \(task.sessionID)"
+                : "Session is already running."
+            await loadTaskQueue()
+        } catch {
+            taskActionStatus = error.localizedDescription
+            handle(error)
         }
     }
 

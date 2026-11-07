@@ -2377,6 +2377,12 @@ impl AgentService {
                     candidate.session_id.clone(),
                     now + Duration::from_secs(candidate.cooldown_secs),
                 );
+                let dispatch_tasks = service
+                    .engine
+                    .get_task_scheduler_policy(&candidate.project_id)
+                    .await
+                    .map(|policy| policy.policy.dispatch_tasks)
+                    .unwrap_or(false);
                 tracing::info!(
                     session_id = %candidate.session_id,
                     project_id = %candidate.project_id,
@@ -2385,9 +2391,15 @@ impl AgentService {
                     task_priority = candidate.task_priority,
                     effective_priority = candidate.effective_priority,
                     cooldown_secs = candidate.cooldown_secs,
-                    "global task scheduler resuming a plan"
+                    dispatch_tasks,
+                    "global task scheduler dispatching work"
                 );
-                match service.resume_plan(&candidate.session_id).await {
+                let result = if dispatch_tasks {
+                    service.dispatch_next_task(&candidate.session_id).await
+                } else {
+                    service.resume_plan(&candidate.session_id).await
+                };
+                match result {
                     Ok(true) => {
                         last_session = Some(candidate.session_id);
                     }
@@ -2395,8 +2407,9 @@ impl AgentService {
                     Err(error) => {
                         tracing::warn!(
                             session_id = %candidate.session_id,
+                            dispatch_tasks,
                             %error,
-                            "global task scheduler could not resume a plan"
+                            "global task scheduler could not dispatch work"
                         );
                     }
                 }
@@ -2740,6 +2753,17 @@ impl AgentService {
     /// tasks are skipped; failed/blocked/cancelled/pending tasks are retried in
     /// dependency batches.
     pub async fn resume_plan(&self, session_id: &str) -> Result<bool> {
+        self.start_plan_run(session_id, None).await
+    }
+
+    /// Dispatch exactly one ready task from a stored TeamPlan. The session is
+    /// released after the task settles so the global scheduler can make fair
+    /// progress across sessions instead of running an entire plan at once.
+    pub async fn dispatch_next_task(&self, session_id: &str) -> Result<bool> {
+        self.start_plan_run(session_id, Some(1)).await
+    }
+
+    async fn start_plan_run(&self, session_id: &str, max_tasks: Option<usize>) -> Result<bool> {
         let config = self
             .config
             .read()
@@ -2795,15 +2819,29 @@ impl AgentService {
             self.engine
                 .update_session_status(session_id, "queued")
                 .await?;
-            self.engine
-                .append_event(
-                    session_id,
+            let (event_kind, mut payload) = if max_tasks.is_some() {
+                (
+                    "agent.task_dispatch_queued",
+                    serde_json::json!({
+                        "goal": plan.goal,
+                        "remaining_tasks": plan.tasks.len().saturating_sub(terminal.len()),
+                        "task_limit": 1,
+                    }),
+                )
+            } else {
+                (
                     "agent.plan_resume_queued",
                     serde_json::json!({
                         "goal": plan.goal,
                         "remaining_tasks": plan.tasks.len().saturating_sub(terminal.len()),
                     }),
                 )
+            };
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("task_limit".into(), serde_json::json!(max_tasks));
+            }
+            self.engine
+                .append_event(session_id, event_kind, payload)
                 .await?;
             Ok(())
         }
@@ -2860,8 +2898,14 @@ impl AgentService {
                 "running"
             };
             let _ = engine.update_session_status(&session_id, status).await;
-            let result =
-                run_plan_resume(engine.clone(), config, &session_id, control.clone()).await;
+            let result = run_plan_resume(
+                engine.clone(),
+                config,
+                &session_id,
+                control.clone(),
+                max_tasks,
+            )
+            .await;
             if let Err(error) = &result {
                 let _ = engine
                     .append_event(
@@ -2953,6 +2997,7 @@ async fn run_plan_resume(
     config: AgentConfig,
     session_id: &str,
     control: Arc<RunControl>,
+    max_tasks: Option<usize>,
 ) -> Result<()> {
     let store = engine.store().clone();
     let (_, project) = load_session_project(store, session_id).await?;
@@ -3031,23 +3076,29 @@ async fn run_plan_resume(
     if let Some(agent_id) = &leader_id {
         engine.update_agent_status(agent_id, "running").await?;
     }
+    let event_kind = if max_tasks.is_some() {
+        "agent.task_dispatched"
+    } else {
+        "agent.plan_resumed"
+    };
     emit(
         &engine,
         session_id,
         &spec,
-        "agent.plan_resumed",
+        event_kind,
         serde_json::json!({
             "goal": plan.goal,
             "model": model_for(&config, spec.role),
             "provider": config.provider_name,
             "worktree": session.worktree,
             "branch": session.branch,
+            "task_limit": max_tasks,
         }),
     )
     .await?;
 
     let result = execute_team_plan(
-        &engine, &config, &session, &project, &control, &budget, &spec, &plan,
+        &engine, &config, &session, &project, &control, &budget, &spec, &plan, max_tasks,
     )
     .await;
     match result? {
@@ -5862,7 +5913,7 @@ async fn run_loop(
                 match engine.get_team_plan(&session.id).await? {
                     None => ToolOutput::error("no TeamPlan submitted; call submit_team_plan first"),
                     Some(plan) => match execute_team_plan(
-                        engine, config, session, project, control, budget, spec, &plan,
+                        engine, config, session, project, control, budget, spec, &plan, None,
                     )
                     .await?
                     {
@@ -8511,7 +8562,11 @@ async fn execute_team_plan(
     budget: &SessionBudget,
     leader_spec: &AgentSpec,
     plan: &TeamPlan,
+    max_tasks: Option<usize>,
 ) -> Result<PlanRunResult> {
+    let limited = max_tasks.is_some();
+    let limit = max_tasks.unwrap_or(usize::MAX).max(1);
+    let mut executed = 0usize;
     let original_worker_cap = budget.worker_cap();
     let _worker_cap_guard = config.auto_expand_workers.then(|| WorkerCapGuard {
         budget,
@@ -8564,7 +8619,13 @@ async fn execute_team_plan(
         .collect::<Vec<_>>();
 
     while !remaining.is_empty() {
+        if executed >= limit {
+            break;
+        }
         if control.is_cancelled() {
+            if limited {
+                return Ok(PlanRunResult::Cancelled);
+            }
             for task in &remaining {
                 statuses.insert(task.id.clone(), "cancelled".to_string());
                 emit(
@@ -8591,6 +8652,9 @@ async fn execute_team_plan(
             return Ok(PlanRunResult::Cancelled);
         }
         if budget.exhausted() {
+            if limited {
+                return Ok(PlanRunResult::BudgetExceeded(BudgetStop::session(budget)));
+            }
             for task in &remaining {
                 statuses.insert(task.id.clone(), "blocked".to_string());
                 emit(
@@ -8648,7 +8712,7 @@ async fn execute_team_plan(
             }
             break;
         }
-        if config.auto_expand_workers && ready.len() > budget.worker_cap() {
+        if !limited && config.auto_expand_workers && ready.len() > budget.worker_cap() {
             let target = ready.len().min(HARD_WORKER_CAP);
             if budget.can_expand_workers() {
                 budget.expand_workers(target);
@@ -8665,8 +8729,13 @@ async fn execute_team_plan(
                 .await?;
             }
         }
-        let capacity = budget.available(AgentRole::Worker);
+        let capacity = budget
+            .available(AgentRole::Worker)
+            .min(limit.saturating_sub(executed));
         if capacity == 0 {
+            if limited {
+                break;
+            }
             for task in &remaining {
                 statuses.insert(task.id.clone(), "blocked".to_string());
                 emit(
@@ -9123,6 +9192,12 @@ async fn execute_team_plan(
         }
 
         if let Some(abort) = abort {
+            if limited {
+                return Ok(match abort {
+                    PlanAbort::Cancelled => PlanRunResult::Cancelled,
+                    PlanAbort::Budget(stop) => PlanRunResult::BudgetExceeded(stop),
+                });
+            }
             let status = abort.task_status();
             let reason = abort.reason();
             for task in remaining
@@ -9155,7 +9230,21 @@ async fn execute_team_plan(
             });
         }
 
+        executed = executed.saturating_add(batch.len());
         remaining.retain(|task| !batch_ids.contains(&task.id));
+    }
+
+    if limited {
+        if executed == 0 {
+            return Ok(PlanRunResult::Done(
+                "No ready task was dispatched.".to_string(),
+            ));
+        }
+        let summary = reports
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "Task dispatch finished.".to_string());
+        return Ok(PlanRunResult::Done(summary));
     }
 
     let completed = statuses

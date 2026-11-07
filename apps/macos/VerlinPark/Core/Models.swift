@@ -1288,12 +1288,31 @@ struct SchedulerTask: Codable, Identifiable, Hashable, Sendable {
 struct TaskSchedulerPolicy: Codable, Hashable, Sendable {
     var enabled: Bool
     var cooldownSecs: UInt64
+    var dispatchTasks: Bool
 
-    static let disabled = TaskSchedulerPolicy(enabled: false, cooldownSecs: 60)
+    static let disabled = TaskSchedulerPolicy(
+        enabled: false,
+        cooldownSecs: 60,
+        dispatchTasks: false
+    )
+
+    init(enabled: Bool, cooldownSecs: UInt64, dispatchTasks: Bool) {
+        self.enabled = enabled
+        self.cooldownSecs = cooldownSecs
+        self.dispatchTasks = dispatchTasks
+    }
 
     enum CodingKeys: String, CodingKey {
         case enabled
         case cooldownSecs = "cooldown_secs"
+        case dispatchTasks = "dispatch_tasks"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        cooldownSecs = try container.decode(UInt64.self, forKey: .cooldownSecs)
+        dispatchTasks = try container.decodeIfPresent(Bool.self, forKey: .dispatchTasks) ?? false
     }
 }
 
@@ -1305,6 +1324,10 @@ struct TaskSchedulerPolicyResult: Codable, Sendable {
         case projectID = "project_id"
         case policy
     }
+}
+
+struct TaskDispatchResult: Codable, Sendable {
+    let started: Bool
 }
 
 struct TaskActionResult: Codable, Sendable {

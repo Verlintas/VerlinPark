@@ -151,6 +151,9 @@ enum Command {
         enabled: bool,
         #[arg(long, default_value_t = 60)]
         cooldown_secs: u64,
+        /// Dispatch one ready task per tick instead of resuming the whole plan.
+        #[arg(long)]
+        dispatch_tasks: bool,
     },
     /// Show the project's shell permission policy.
     ShellPolicy { project: String },
@@ -213,6 +216,8 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Dispatch one ready task from a session's stored TeamPlan.
+    TaskDispatch { session: String },
     /// Retry a failed, blocked, interrupted, cancelled, or skipped plan task.
     TaskRetry { session: String, task: String },
     /// Skip a queued plan task for the current plan revision.
@@ -687,6 +692,7 @@ async fn main() -> Result<()> {
             project,
             enabled,
             cooldown_secs,
+            dispatch_tasks,
         } => {
             rpc(
                 &discovery,
@@ -696,6 +702,7 @@ async fn main() -> Result<()> {
                     "policy": {
                         "enabled": enabled,
                         "cooldown_secs": cooldown_secs,
+                        "dispatch_tasks": dispatch_tasks,
                     }
                 }),
             )
@@ -797,6 +804,9 @@ async fn main() -> Result<()> {
                 json!({"project_id": project, "session_id": session}),
             )
             .await?
+        }
+        Command::TaskDispatch { session } => {
+            rpc(&discovery, "task.dispatch", json!({"session_id": session})).await?
         }
         Command::TaskRetry { session, task } => {
             rpc(

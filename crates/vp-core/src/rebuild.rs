@@ -293,6 +293,7 @@ mod tests {
                     vp_protocol::types::TaskSchedulerPolicy {
                         enabled: true,
                         cooldown_secs: 30,
+                        dispatch_tasks: false,
                     },
                 )
                 .await

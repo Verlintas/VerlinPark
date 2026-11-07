@@ -48,6 +48,10 @@ pub struct TaskSchedulerPolicy {
     pub enabled: bool,
     #[serde(default = "default_task_scheduler_cooldown")]
     pub cooldown_secs: u64,
+    /// When enabled, the scheduler dispatches one ready task per tick instead
+    /// of resuming the whole stored plan.
+    #[serde(default)]
+    pub dispatch_tasks: bool,
 }
 
 impl Default for TaskSchedulerPolicy {
@@ -55,6 +59,7 @@ impl Default for TaskSchedulerPolicy {
         Self {
             enabled: false,
             cooldown_secs: default_task_scheduler_cooldown(),
+            dispatch_tasks: false,
         }
     }
 }
@@ -1973,6 +1978,16 @@ pub struct TaskQueueResult {
 pub struct TaskActionParams {
     pub session_id: String,
     pub task_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskDispatchParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskDispatchResult {
+    pub started: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -104,6 +104,7 @@
 | [0092](adr/0092-isolated-verifier-checkout.md) | Isolated Verifier checkout | Accepted | 验证/安全 |
 | [0093](adr/0093-acp-external-agent-bridge.md) | ACP external-agent bridge | Accepted | 外部 Agent/集成 |
 | [0094](adr/0094-provider-stream-resilience.md) | Provider stream retry and partial settlement | Accepted | Provider/可靠性 |
+| [0095](adr/0095-per-task-dispatch.md) | Per-task dispatch mode | Accepted | 调度 |
 
 ---
 

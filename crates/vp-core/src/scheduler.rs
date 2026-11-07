@@ -490,6 +490,7 @@ mod tests {
                 &vp_protocol::types::TaskSchedulerPolicy {
                     enabled: true,
                     cooldown_secs: 20,
+                    dispatch_tasks: false,
                 },
             )
             .unwrap();
@@ -518,6 +519,7 @@ mod tests {
                 &vp_protocol::types::TaskSchedulerPolicy {
                     enabled: true,
                     cooldown_secs: 60,
+                    dispatch_tasks: false,
                 },
             )
             .unwrap();
@@ -555,6 +557,7 @@ mod tests {
                 &vp_protocol::types::TaskSchedulerPolicy {
                     enabled: true,
                     cooldown_secs: 60,
+                    dispatch_tasks: false,
                 },
             )
             .unwrap();

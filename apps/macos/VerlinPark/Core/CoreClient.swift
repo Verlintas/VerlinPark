@@ -731,6 +731,15 @@ actor CoreClient {
         .decode(TaskQueueResult.self)
     }
 
+    func dispatchTask(sessionID: String) async throws -> Bool {
+        try await request(
+            method: "task.dispatch",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(TaskDispatchResult.self)
+        .started
+    }
+
     func retryTask(sessionID: String, taskID: String) async throws -> SchedulerTask {
         try await request(
             method: "task.retry",
