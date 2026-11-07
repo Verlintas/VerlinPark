@@ -305,6 +305,18 @@ enum Command {
     },
     /// List checkpoints for a session.
     Checkpoints { session: String },
+    /// Delete one checkpoint and its snapshot ref.
+    CheckpointDelete { session: String, checkpoint: String },
+    /// Prune checkpoints older than --older-than-days while keeping the latest N.
+    CheckpointPrune {
+        session: String,
+        #[arg(long)]
+        older_than_days: Option<u32>,
+        #[arg(long, default_value_t = 5)]
+        keep_latest: u32,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Fork a new session from the latest checkpoint (or --checkpoint).
     Fork {
         session: String,
@@ -1157,6 +1169,35 @@ async fn main() -> Result<()> {
                 &discovery,
                 "session.checkpoints",
                 json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::CheckpointDelete {
+            session,
+            checkpoint,
+        } => {
+            rpc(
+                &discovery,
+                "session.checkpoint.delete",
+                json!({"session_id": session, "checkpoint_id": checkpoint}),
+            )
+            .await?
+        }
+        Command::CheckpointPrune {
+            session,
+            older_than_days,
+            keep_latest,
+            dry_run,
+        } => {
+            rpc(
+                &discovery,
+                "session.checkpoint.prune",
+                json!({
+                    "session_id": session,
+                    "older_than_days": older_than_days,
+                    "keep_latest": keep_latest,
+                    "dry_run": dry_run
+                }),
             )
             .await?
         }

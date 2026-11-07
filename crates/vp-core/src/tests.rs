@@ -3329,3 +3329,154 @@ async fn checkpoints_snapshot_dirty_worktrees_and_reject_active_sessions() {
         .unwrap_err();
     assert!(error.to_string().contains("session must not be queued"));
 }
+
+fn checkpoint_ref_exists(project_root: &Path, session_id: &str, checkpoint_id: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/verlinpark/checkpoints/{session_id}/{checkpoint_id}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn checkpoint_delete_hides_it_and_removes_the_snapshot_ref() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("delete".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "delete source".into(), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    std::fs::write(worktree.join("snapshot.txt"), "dirty\n").unwrap();
+    let checkpoint = engine
+        .checkpoint_session(&session.id, Some("delete me".into()))
+        .await
+        .unwrap();
+    assert!(checkpoint_ref_exists(
+        repo.path(),
+        &session.id,
+        &checkpoint.id
+    ));
+
+    let deleted = engine
+        .delete_checkpoint(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert!(deleted.removed);
+    assert!(
+        engine
+            .list_checkpoints(&session.id)
+            .await
+            .unwrap()
+            .checkpoints
+            .is_empty()
+    );
+    assert!(!checkpoint_ref_exists(
+        repo.path(),
+        &session.id,
+        &checkpoint.id
+    ));
+    let error = engine
+        .fork_session(&session.id, Some(&checkpoint.id), None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("checkpoint not found"));
+    assert!(
+        !engine
+            .delete_checkpoint(&session.id, &checkpoint.id)
+            .await
+            .unwrap()
+            .removed
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_prune_keeps_the_latest_and_can_dry_run() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("prune".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "prune source".into(), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    let mut checkpoints = Vec::new();
+    for index in 0..3 {
+        std::fs::write(worktree.join("snapshot.txt"), format!("dirty {index}\n")).unwrap();
+        checkpoints.push(
+            engine
+                .checkpoint_session(&session.id, Some(format!("checkpoint {index}")))
+                .await
+                .unwrap(),
+        );
+    }
+    let dry = engine
+        .prune_checkpoints(&session.id, None, Some(1), true)
+        .await
+        .unwrap();
+    assert_eq!(dry.candidates, 2);
+    assert_eq!(dry.removed, 0);
+    assert_eq!(
+        engine
+            .list_checkpoints(&session.id)
+            .await
+            .unwrap()
+            .checkpoints
+            .len(),
+        3
+    );
+
+    let pruned = engine
+        .prune_checkpoints(&session.id, None, Some(1), false)
+        .await
+        .unwrap();
+    assert_eq!(pruned.candidates, 2);
+    assert_eq!(pruned.removed, 2);
+    let remaining = engine
+        .list_checkpoints(&session.id)
+        .await
+        .unwrap()
+        .checkpoints;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, checkpoints[2].id);
+    assert!(!checkpoint_ref_exists(
+        repo.path(),
+        &session.id,
+        &checkpoints[0].id
+    ));
+    assert!(!checkpoint_ref_exists(
+        repo.path(),
+        &session.id,
+        &checkpoints[1].id
+    ));
+    assert!(checkpoint_ref_exists(
+        repo.path(),
+        &session.id,
+        &checkpoints[2].id
+    ));
+}

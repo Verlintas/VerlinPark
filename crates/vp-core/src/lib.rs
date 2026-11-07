@@ -21,15 +21,16 @@ use vp_protocol::types::{
     MemoryItem, MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult,
     MergeQueueEntry, Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult,
     PullRequestResult, Question, QuestionListResult, ScheduledTask, SearchResult, Session,
-    SessionBundle, SessionCheckpoint, SessionCheckpointListResult, SessionCommit,
-    SessionContextStatus, SessionDiff, SessionForkResult, SessionImportResult, SessionLandResult,
-    SessionLogStatus, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
-    SessionTranscriptResult, ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy,
-    TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult, TerminalOpenResult,
-    TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem, UsageBucket,
-    UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
-    WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult,
-    WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
+    SessionBundle, SessionCheckpoint, SessionCheckpointDeleteResult, SessionCheckpointListResult,
+    SessionCheckpointPruneResult, SessionCommit, SessionContextStatus, SessionDiff,
+    SessionForkResult, SessionImportResult, SessionLandResult, SessionLogStatus,
+    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
+    ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
+    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    TerminalWriteResult, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
+    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
+    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
+    WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -683,14 +684,156 @@ impl Engine {
     }
 
     pub async fn list_checkpoints(&self, session_id: &str) -> Result<SessionCheckpointListResult> {
+        Ok(SessionCheckpointListResult {
+            checkpoints: self.active_checkpoints(session_id).await?,
+        })
+    }
+
+    async fn active_checkpoints(&self, session_id: &str) -> Result<Vec<SessionCheckpoint>> {
         let store = self.store.clone();
         let id = session_id.to_string();
-        let events = tokio::task::spawn_blocking(move || {
-            store.list_events_by_kind(&id, "session.checkpoint", 1000)
+        let (created, deleted) = tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>((
+                store.list_events_by_kind(&id, "session.checkpoint", 1000)?,
+                store.list_events_by_kind(&id, "session.checkpoint.deleted", 1000)?,
+            ))
         })
         .await??;
-        Ok(SessionCheckpointListResult {
-            checkpoints: events.iter().filter_map(checkpoint_from_event).collect(),
+        let deleted_ids = deleted
+            .iter()
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("checkpoint_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        Ok(created
+            .iter()
+            .filter_map(checkpoint_from_event)
+            .filter(|checkpoint| !deleted_ids.contains(&checkpoint.id))
+            .collect())
+    }
+
+    pub async fn delete_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<SessionCheckpointDeleteResult> {
+        let checkpoint = self
+            .active_checkpoints(session_id)
+            .await?
+            .into_iter()
+            .find(|checkpoint| checkpoint.id == checkpoint_id);
+        let Some(checkpoint) = checkpoint else {
+            return Ok(SessionCheckpointDeleteResult {
+                session_id: session_id.to_string(),
+                checkpoint_id: checkpoint_id.to_string(),
+                removed: false,
+            });
+        };
+        self.delete_checkpoint_record(session_id, &checkpoint, "manual")
+            .await?;
+        Ok(SessionCheckpointDeleteResult {
+            session_id: session_id.to_string(),
+            checkpoint_id: checkpoint_id.to_string(),
+            removed: true,
+        })
+    }
+
+    async fn delete_checkpoint_record(
+        &self,
+        session_id: &str,
+        checkpoint: &SessionCheckpoint,
+        reason: &str,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let project_root = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+            let session = store
+                .get_session(&id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+            let project = store
+                .get_project(&session.project_id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {}", session.project_id))?;
+            Ok(PathBuf::from(project.root))
+        })
+        .await??;
+        self.append_event(
+            session_id,
+            "session.checkpoint.deleted",
+            serde_json::json!({
+                "checkpoint_id": checkpoint.id,
+                "label": checkpoint.label,
+                "commit": checkpoint.commit,
+                "reason": reason,
+            }),
+        )
+        .await?;
+        if let Err(error) =
+            worktree::delete_checkpoint_ref(&project_root, session_id, &checkpoint.id)
+        {
+            tracing::warn!(
+                %error,
+                session_id,
+                checkpoint_id = %checkpoint.id,
+                "could not remove checkpoint snapshot ref"
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn prune_checkpoints(
+        &self,
+        session_id: &str,
+        older_than_days: Option<u32>,
+        keep_latest: Option<u32>,
+        dry_run: bool,
+    ) -> Result<SessionCheckpointPruneResult> {
+        if older_than_days.is_none() && keep_latest.is_none() {
+            anyhow::bail!("checkpoint prune requires older_than_days or keep_latest");
+        }
+        let checkpoints = self.active_checkpoints(session_id).await?;
+        let keep_latest = keep_latest.unwrap_or(0) as usize;
+        let cutoff = older_than_days
+            .map(|days| time::OffsetDateTime::now_utc() - time::Duration::days(i64::from(days)));
+        let mut candidates = Vec::new();
+        for (index, checkpoint) in checkpoints.iter().enumerate() {
+            let beyond_keep = index < checkpoints.len().saturating_sub(keep_latest);
+            let old = cutoff.is_none_or(|cutoff| {
+                time::OffsetDateTime::parse(
+                    &checkpoint.created_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .map(|created_at| created_at < cutoff)
+                .unwrap_or(false)
+            });
+            if beyond_keep && old {
+                candidates.push(checkpoint.clone());
+            }
+        }
+        if dry_run {
+            return Ok(SessionCheckpointPruneResult {
+                session_id: session_id.to_string(),
+                candidates: candidates.len(),
+                removed: 0,
+                dry_run: true,
+                checkpoints: candidates,
+            });
+        }
+        let mut removed = 0usize;
+        for checkpoint in &candidates {
+            self.delete_checkpoint_record(session_id, checkpoint, "prune")
+                .await?;
+            removed += 1;
+        }
+        Ok(SessionCheckpointPruneResult {
+            session_id: session_id.to_string(),
+            candidates: candidates.len(),
+            removed,
+            dry_run: false,
+            checkpoints: candidates,
         })
     }
 

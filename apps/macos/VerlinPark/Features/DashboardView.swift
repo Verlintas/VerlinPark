@@ -106,6 +106,9 @@ struct DashboardView: View {
                     WorktreeCleanupCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    CheckpointsCard()
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                     ArtifactPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
@@ -917,6 +920,119 @@ private struct WorktreeCleanupCard: View {
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+}
+
+private struct CheckpointsCard: View {
+    @Environment(AppModel.self) private var model
+    @State private var deleting: SessionCheckpoint?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Session checkpoints")
+                    Text(model.selectedSession?.goal ?? "No session selected")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                }
+                Spacer()
+                if model.checkpointBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Prune >30d, keep 5") {
+                    Task { await model.pruneCheckpoints() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.checkpointBusy || model.selectedSession == nil || model.checkpoints.isEmpty)
+            }
+            Text(
+                "Checkpoints snapshot the active conversation and worktree, including uncommitted tracked/untracked non-ignored changes. Forks already created keep their branch commits."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            if model.selectedSession == nil {
+                Text("Select a session to inspect its checkpoints.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else if model.checkpoints.isEmpty {
+                Text("No checkpoints yet. Use Fork Session… to create one.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(model.checkpoints.suffix(8).reversed()) { checkpoint in
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(checkpoint.label)
+                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                    .lineLimit(1)
+                                if checkpoint.dirty == true {
+                                    Text("dirty")
+                                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                            Text(
+                                "\(String(checkpoint.commit.prefix(8))) · \(checkpoint.messageCount) msgs · \(checkpoint.createdAt.prefix(19))"
+                            )
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button {
+                            deleting = checkpoint
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.system(size: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Delete checkpoint")
+                        .disabled(model.checkpointBusy)
+                    }
+                }
+                if model.checkpoints.count > 8 {
+                    Text("Showing the 8 most recent of \(model.checkpoints.count).")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            if let notice = model.checkpointNotice {
+                Text(notice)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .confirmationDialog(
+            "Delete checkpoint?",
+            isPresented: Binding(
+                get: { deleting != nil },
+                set: {
+                    if !$0 {
+                        deleting = nil
+                    }
+                }
+            ),
+            presenting: deleting
+        ) { checkpoint in
+            Button("Delete \(checkpoint.label)", role: .destructive) {
+                Task { await model.deleteCheckpoint(checkpoint.id) }
+                deleting = nil
+            }
+            Button("Cancel", role: .cancel) { deleting = nil }
+        } message: { _ in
+            Text(
+                "This removes the checkpoint event and its snapshot ref. Existing fork branches are unaffected."
+            )
         }
     }
 }

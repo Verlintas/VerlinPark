@@ -147,6 +147,7 @@ final class ProtocolCompatibilityTests: XCTestCase {
           "through_message_id": "message-4",
           "message_count": 4,
           "summary": "Earlier conversation summary",
+          "dirty": true,
           "created_at": "2026-11-08T00:00:00Z"
         }
         """
@@ -155,6 +156,36 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(checkpoint.messageCount, 4)
         XCTAssertEqual(checkpoint.startMessageID, "message-1")
         XCTAssertEqual(checkpoint.summary, "Earlier conversation summary")
+        XCTAssertEqual(checkpoint.dirty, true)
+    }
+
+    func testCheckpointPruneResultDecodes() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "candidates": 2,
+          "removed": 2,
+          "dry_run": false,
+          "checkpoints": [
+            {
+              "id": "checkpoint-1",
+              "session_id": "session-1",
+              "label": "old",
+              "commit": "abc123",
+              "branch": "verlinpark/session-1",
+              "message_count": 2,
+              "summary": null,
+              "dirty": false,
+              "created_at": "2026-11-01T00:00:00Z"
+            }
+          ]
+        }
+        """
+        let result = try JSONDecoder().decode(SessionCheckpointPruneResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.candidates, 2)
+        XCTAssertEqual(result.removed, 2)
+        XCTAssertEqual(result.checkpoints.first?.id, "checkpoint-1")
+        XCTAssertFalse(result.dryRun)
     }
 
     func testSessionCompactResultDecodes() throws {

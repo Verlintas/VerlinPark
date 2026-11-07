@@ -241,6 +241,38 @@ actor CoreClient {
         .checkpoints
     }
 
+    func deleteCheckpoint(
+        sessionID: String,
+        checkpointID: String
+    ) async throws -> SessionCheckpointDeleteResult {
+        try await request(
+            method: "session.checkpoint.delete",
+            params: [
+                "session_id": .string(sessionID),
+                "checkpoint_id": .string(checkpointID),
+            ]
+        )
+        .decode(SessionCheckpointDeleteResult.self)
+    }
+
+    func pruneCheckpoints(
+        sessionID: String,
+        olderThanDays: Int?,
+        keepLatest: Int?,
+        dryRun: Bool
+    ) async throws -> SessionCheckpointPruneResult {
+        try await request(
+            method: "session.checkpoint.prune",
+            params: [
+                "session_id": .string(sessionID),
+                "older_than_days": olderThanDays.map { .number(Double($0)) } ?? .null,
+                "keep_latest": keepLatest.map { .number(Double($0)) } ?? .null,
+                "dry_run": .bool(dryRun),
+            ]
+        )
+        .decode(SessionCheckpointPruneResult.self)
+    }
+
     func forkSession(
         sessionID: String,
         checkpointID: String?,

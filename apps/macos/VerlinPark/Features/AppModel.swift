@@ -178,6 +178,8 @@ final class AppModel {
     var compactNotice: String?
     var forkBusy = false
     var checkpoints: [SessionCheckpoint] = []
+    var checkpointBusy = false
+    var checkpointNotice: String?
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -358,6 +360,7 @@ final class AppModel {
             contextStatus = nil
             compactNotice = nil
             checkpoints = []
+            checkpointNotice = nil
             sessionDiff = nil
             todos = []
             agents = []
@@ -413,6 +416,7 @@ final class AppModel {
         contextStatus = nil
         compactNotice = nil
         checkpoints = []
+        checkpointNotice = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -450,6 +454,7 @@ final class AppModel {
         contextStatus = nil
         compactNotice = nil
         checkpoints = []
+        checkpointNotice = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -463,6 +468,7 @@ final class AppModel {
         Task {
             await loadEvents()
             await loadContextStatus()
+            await loadCheckpoints()
             await loadTodos()
             await loadAgents()
             await loadMergeQueue()
@@ -2641,6 +2647,42 @@ final class AppModel {
         }
     }
 
+    func deleteCheckpoint(_ checkpointID: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        checkpointBusy = true
+        checkpointNotice = nil
+        defer { checkpointBusy = false }
+        do {
+            let result = try await core.deleteCheckpoint(
+                sessionID: sessionID,
+                checkpointID: checkpointID
+            )
+            await loadCheckpoints()
+            checkpointNotice = result.removed ? "Checkpoint deleted" : "Checkpoint was already removed"
+        } catch {
+            handle(error)
+        }
+    }
+
+    func pruneCheckpoints() async {
+        guard let sessionID = selectedSessionID else { return }
+        checkpointBusy = true
+        checkpointNotice = nil
+        defer { checkpointBusy = false }
+        do {
+            let result = try await core.pruneCheckpoints(
+                sessionID: sessionID,
+                olderThanDays: 30,
+                keepLatest: 5,
+                dryRun: false
+            )
+            await loadCheckpoints()
+            checkpointNotice = "Removed \(result.removed) of \(result.candidates) candidates"
+        } catch {
+            handle(error)
+        }
+    }
+
     func compactSession() async {
         guard let sessionID = selectedSessionID else { return }
         compactBusy = true
@@ -2897,6 +2939,12 @@ final class AppModel {
            ["context.usage", "context.compacted", "context.measured"].contains(event.type)
         {
             Task { await self.loadContextStatus() }
+        }
+
+        if event.sessionId == selectedSessionID,
+           ["session.checkpoint", "session.checkpoint.deleted"].contains(event.type)
+        {
+            Task { await self.loadCheckpoints() }
         }
 
         if event.sessionId == selectedSessionID {

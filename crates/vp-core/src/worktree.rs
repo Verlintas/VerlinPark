@@ -152,6 +152,30 @@ pub fn current_branch(worktree: &Path) -> Result<String> {
     git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
+/// Delete the checkpoint ref that keeps a dirty snapshot commit reachable.
+/// Clean checkpoints point at the session branch commit and have no ref.
+pub fn delete_checkpoint_ref(
+    project_root: &Path,
+    session_id: &str,
+    checkpoint_id: &str,
+) -> Result<()> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving project root {}", project_root.display()))?;
+    let reference = format!("refs/verlinpark/checkpoints/{session_id}/{checkpoint_id}");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--verify", "--quiet", &reference])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .context("checking for an existing checkpoint ref")?;
+    if status.success() {
+        run_git(&root, &["update-ref", "-d", &reference])?;
+    }
+    Ok(())
+}
+
 /// Snapshot the worktree, including uncommitted tracked changes and untracked
 /// non-ignored files, into a commit object without touching the real index or
 /// HEAD. The commit stays reachable through a checkpoint ref so Git GC cannot

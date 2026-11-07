@@ -40,20 +40,21 @@ use vp_protocol::types::{
     PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams, PromptParams,
     PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
     ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
-    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionCheckpointListParams,
-    SessionCheckpointParams, SessionCompactParams, SessionContextParams, SessionDiffParams,
-    SessionExportParams, SessionForkParams, SessionImportParams, SessionListResult,
-    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
-    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
-    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
-    SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
-    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
-    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
-    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, UpdateAcpAgentParams, UpdateMcpServerParams, UsageLedgerParams,
-    WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionCheckpointDeleteParams,
+    SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
+    SessionCompactParams, SessionContextParams, SessionDiffParams, SessionExportParams,
+    SessionForkParams, SessionImportParams, SessionListResult, SessionLogParams,
+    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
+    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
+    SetSessionPriorityParams, SetShellPolicyParams, SetTaskSchedulerPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams,
+    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
+    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
+    UpdateAcpAgentParams, UpdateMcpServerParams, UsageLedgerParams, WorkspaceFileParams,
+    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -915,6 +916,37 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.checkpoints" => {
             match parse_params::<SessionCheckpointListParams>(request.params) {
                 Ok(params) => match state.engine.list_checkpoints(&params.session_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.checkpoint.delete" => {
+            match parse_params::<SessionCheckpointDeleteParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .delete_checkpoint(&params.session_id, &params.checkpoint_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.checkpoint.prune" => {
+            match parse_params::<SessionCheckpointPruneParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .prune_checkpoints(
+                        &params.session_id,
+                        params.older_than_days,
+                        params.keep_latest,
+                        params.dry_run,
+                    )
+                    .await
+                {
                     Ok(result) => RpcResponse::success(id, result),
                     Err(error) => internal_error(id, error),
                 },

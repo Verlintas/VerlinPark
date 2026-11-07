@@ -1245,6 +1245,34 @@ struct SessionCheckpointListResult: Codable, Sendable {
     let checkpoints: [SessionCheckpoint]
 }
 
+struct SessionCheckpointDeleteResult: Codable, Sendable {
+    let sessionID: String
+    let checkpointID: String
+    let removed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case checkpointID = "checkpoint_id"
+        case removed
+    }
+}
+
+struct SessionCheckpointPruneResult: Codable, Sendable {
+    let sessionID: String
+    let candidates: Int
+    let removed: Int
+    let dryRun: Bool
+    let checkpoints: [SessionCheckpoint]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case candidates
+        case removed
+        case dryRun = "dry_run"
+        case checkpoints
+    }
+}
+
 struct SessionForkResult: Codable, Sendable {
     let sourceSessionID: String
     let checkpointID: String
