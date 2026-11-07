@@ -381,10 +381,26 @@ struct ProvidersSettingsView: View {
                     .textFieldStyle(.roundedBorder)
                 TextField("Model", text: $model.providerModel)
                     .textFieldStyle(.roundedBorder)
-                TextField("Context window (tokens)", text: $model.providerContextWindowText)
-                    .textFieldStyle(.roundedBorder)
+                HStack(spacing: 8) {
+                    TextField("Context window (tokens)", text: $model.providerContextWindowText)
+                        .textFieldStyle(.roundedBorder)
+                    Menu("Presets") {
+                        Button("Off") { model.providerContextWindowText = "0" }
+                        Button("8k") { model.providerContextWindowText = "8000" }
+                        Button("16k") { model.providerContextWindowText = "16000" }
+                        Button("32k") { model.providerContextWindowText = "32000" }
+                        Button("64k") { model.providerContextWindowText = "64000" }
+                        Button("128k (default)") { model.providerContextWindowText = "128000" }
+                        Button("200k") { model.providerContextWindowText = "200000" }
+                        Button("1M") { model.providerContextWindowText = "1000000" }
+                        Button("2M") { model.providerContextWindowText = "2000000" }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .controlSize(.small)
+                }
                 Text(
-                    "Used to derive compaction and rolling-window limits. A 1M-token model can use 1000000; a local 8k model should use 8000. Leave blank or 0 to disable automatic context management."
+                    "Used to derive compaction and rolling-window limits. A 1M-token model can use 1000000; a local 8k model should use 8000 and a lower max_tokens. 0 disables automatic context management."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

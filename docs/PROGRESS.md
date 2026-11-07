@@ -12,7 +12,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | Leader Agent | ✅ | 流式对话、工具调用、审批、session 预算、取消、todo 计划 |
-| Context compaction | ✅ | 按模型 context window 自适应：`VERLINPARK_CONTEXT_WINDOW` 默认 128k（0 关闭），`RoleModelConfig.context_window` 可按角色覆盖；hard limit = window - output - system/tools - 512，summary threshold = 75% hard limit，`VERLINPARK_COMPACT_AFTER_TOKENS` 可显式覆盖；每个 top-level turn 前检查；summary + retained tail 为主，失败/仍超 hard limit 时按 user/assistant 安全边界滚动裁剪；`context.compacted` 记录 `mode: summary|trim` + `through_message_id`，原消息保留；usage 记为 `compaction`；不做 checkpoint/resume |
+| Context compaction | ✅ | 按模型 context window 自适应：`VERLINPARK_CONTEXT_WINDOW` 默认 128k（0 关闭），`RoleModelConfig.context_window` 可按角色覆盖；hard limit = window - output - system/tools - 512，summary threshold = 75% hard limit，`VERLINPARK_COMPACT_AFTER_TOKENS` 可显式覆盖；每个 top-level turn 前检查；context 估算按 4 ASCII chars/token + 1.5 non-ASCII tokens/char，summary transcript 也受模型窗口约束；summary + retained tail 为主，失败/仍超 hard limit 时按 user/assistant 安全边界滚动裁剪；`context.compacted` 记录 `mode: summary|trim` + `through_message_id`，原消息保留；usage 记为 `compaction`；不做 checkpoint/resume |
 | Provider 流可靠性 | ✅ | 启动前 transient retry；无任何输出前最多 3 次 stream attempts（含首次）；partial failure/cancel 保留 `partial: true` message 并结算 provider usage 或估算 usage；partial 后不 replay；`agent.probe` 返回 chunks/first-token/done；真实 OpenAI/Anthropic/local live tests 默认 ignored |
 | Session worktree | ✅ | 每个 session 独立 Git worktree + 分支；项目根只读 |
 | 四层组织 | ✅ | Leader → Manager → Worker → Labour；严格链路，Manager 必须有部门 title |
@@ -64,7 +64,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：215 个测试通过（core 168、store 39、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `cargo test --workspace`：217 个测试通过（core 170、store 39、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
 - `xcodebuild test`：40 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。

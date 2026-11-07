@@ -3376,6 +3376,27 @@ fn estimate_text_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(2).max(1)
 }
 
+/// Context-window estimates should be closer to the tokenizer than the
+/// conservative budget reservation above. English/code averages ~4 ASCII
+/// characters per token; CJK and other non-ASCII text is roughly 1.5 tokens
+/// per character. This avoids compacting a 1M-token model at half its usable
+/// window while still leaving headroom for tokenizer differences.
+fn estimate_context_tokens(text: &str) -> u64 {
+    let mut ascii = 0u64;
+    let mut non_ascii = 0u64;
+    for character in text.chars() {
+        if character.is_ascii() {
+            ascii = ascii.saturating_add(1);
+        } else {
+            non_ascii = non_ascii.saturating_add(1);
+        }
+    }
+    ascii
+        .div_ceil(4)
+        .saturating_add(non_ascii.saturating_mul(3).div_ceil(2))
+        .max(1)
+}
+
 fn estimate_request_tokens(request: &ChatRequest) -> u64 {
     let mut bytes = request.system.as_deref().map_or(0, str::len);
     for message in &request.messages {
@@ -5386,38 +5407,51 @@ fn estimate_messages_tokens(messages: &[ChatMessage]) -> u64 {
             .tool_calls
             .as_ref()
             .and_then(|calls| serde_json::to_string(calls).ok())
-            .map(|calls| estimate_text_tokens(&calls))
+            .map(|calls| estimate_context_tokens(&calls))
             .unwrap_or(0);
         total
-            .saturating_add(estimate_text_tokens(&message.content))
+            .saturating_add(estimate_context_tokens(&message.content))
             .saturating_add(tool_tokens)
     })
 }
 
-fn compaction_transcript(messages: &[ChatMessage]) -> String {
-    const MAX_CHARS: usize = 80_000;
+fn compaction_transcript(messages: &[ChatMessage], max_tokens: u64) -> String {
     const PER_MESSAGE: usize = 4_000;
-    let mut transcript = String::new();
-    for message in messages {
-        transcript.push_str(&message.role);
-        transcript.push_str(": ");
-        transcript.push_str(&truncate_to(&message.content, PER_MESSAGE));
-        transcript.push('\n');
+    let mut rendered = Vec::new();
+    let mut used = 0u64;
+    let mut omitted = false;
+    // Keep the most recent (most relevant) summarized messages when the
+    // transcript would not fit the summarizer's own context window.
+    for message in messages.iter().rev() {
+        let mut part = String::new();
+        part.push_str(&message.role);
+        part.push_str(": ");
+        part.push_str(&truncate_to(&message.content, PER_MESSAGE));
+        part.push('\n');
         if let Some(tool_calls) = &message.tool_calls {
-            transcript.push_str("tool_calls: ");
-            transcript.push_str(&serde_json::to_string(tool_calls).unwrap_or_default());
-            transcript.push('\n');
+            part.push_str("tool_calls: ");
+            part.push_str(&serde_json::to_string(tool_calls).unwrap_or_default());
+            part.push('\n');
         }
         if let Some(tool_call_id) = &message.tool_call_id {
-            transcript.push_str("tool_call_id: ");
-            transcript.push_str(tool_call_id);
-            transcript.push('\n');
+            part.push_str("tool_call_id: ");
+            part.push_str(tool_call_id);
+            part.push('\n');
         }
-        if transcript.len() >= MAX_CHARS {
-            transcript.push_str("… transcript truncated at the compaction limit …\n");
+        let tokens = estimate_context_tokens(&part);
+        if used.saturating_add(tokens) > max_tokens && !rendered.is_empty() {
+            omitted = true;
             break;
         }
+        used = used.saturating_add(tokens);
+        rendered.push(part);
     }
+    rendered.reverse();
+    let mut transcript = String::new();
+    if omitted {
+        transcript.push_str("… older messages omitted at the compaction limit …\n");
+    }
+    transcript.extend(rendered);
     transcript
 }
 
@@ -5539,7 +5573,17 @@ async fn compact_context_if_needed(
             .cloned()
             .flatten()
     {
-        let transcript = compaction_transcript(&conversation[..cut]);
+        let summary_window = context_window_for(config, spec.role);
+        let summary_budget = if summary_window > 0 {
+            summary_window
+                .saturating_sub(1024)
+                .saturating_sub(estimate_context_tokens(COMPACTION_SYSTEM_PROMPT))
+                .saturating_sub(512)
+                .max(512)
+        } else {
+            60_000
+        };
+        let transcript = compaction_transcript(&conversation[..cut], summary_budget);
         if !transcript.trim().is_empty() {
             let request = ChatRequest {
                 model: model_for(config, spec.role),
@@ -5556,10 +5600,10 @@ async fn compact_context_if_needed(
                     budget.reserve_tokens(estimate_request_tokens(&request).saturating_add(1024))
                 })
                 .flatten();
-            if reservation.is_none() && budget.limit.is_some() {
-                // Not enough token budget for a safe summary; the hard-limit
-                // trim below still keeps the run alive.
-            } else {
+            // When a token limit exists but the reservation cannot be granted,
+            // skip the summary call; the rolling trim below still protects the
+            // provider context and keeps the run alive.
+            if budget.limit.is_none() || reservation.is_some() {
                 let outcome = collect_compaction_completion(
                     config.provider.as_ref(),
                     &request,
@@ -5834,9 +5878,9 @@ async fn run_loop(
             .iter()
             .map(|binding| binding.schema.clone()),
     );
-    let system_tokens = estimate_text_tokens(&system);
+    let system_tokens = estimate_context_tokens(&system);
     let tool_tokens = serde_json::to_string(&tools)
-        .map(|schema| estimate_text_tokens(&schema))
+        .map(|schema| estimate_context_tokens(&schema))
         .unwrap_or(0);
     let (context_threshold, context_hard_limit) =
         context_limits(config, spec.role, system_tokens, tool_tokens);

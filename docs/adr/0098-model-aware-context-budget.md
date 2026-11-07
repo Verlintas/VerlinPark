@@ -26,7 +26,10 @@ rolling-window fallback for small or failing models.
    the base window and a per-role `ctx` field.
 2. **Derived limits.** The hard limit is:
    `window - max_output_tokens - system_prompt_tokens - tool_schema_tokens - 512`.
-   The summarization threshold is 75% of that hard limit. An explicit
+   The summarization threshold is 75% of that hard limit. Context estimates
+   use 4 ASCII characters per token and 1.5 tokens per non-ASCII character,
+   closer to a real tokenizer than the conservative bytes/2 budget estimate;
+   the summary transcript is capped by the same model window. An explicit
    `VERLINPARK_COMPACT_AFTER_TOKENS` still overrides the threshold (clamped to
    the hard limit); 0 means derive it from the window. A 1M model gets a
    ~750k threshold; an 8k model gets a small one based on its actual reserve.

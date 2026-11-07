@@ -6094,8 +6094,8 @@ async fn trims_older_messages_when_summarization_fails() {
         &control,
         &mut conversation,
         &mut conversation_ids,
+        10,
         50,
-        200,
     )
     .await
     .unwrap();
@@ -6127,4 +6127,50 @@ async fn trims_older_messages_when_summarization_fails() {
             .content
             .starts_with("Earlier conversation summary")
     );
+}
+
+#[test]
+fn context_estimator_is_closer_than_the_conservative_budget_estimate() {
+    let english = "the quick brown fox jumps over the lazy dog";
+    assert!(estimate_context_tokens(english) < estimate_text_tokens(english));
+    assert!(estimate_context_tokens(english) >= 8);
+    assert_eq!(estimate_context_tokens("你好世界"), 6);
+    assert!(estimate_context_tokens("") >= 1);
+}
+
+#[test]
+fn context_cuts_never_start_at_a_tool_message() {
+    let messages = vec![
+        ChatMessage::user("one"),
+        ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }]),
+            tool_call_id: None,
+        },
+        ChatMessage::tool("call_1", "file contents"),
+        ChatMessage {
+            role: "assistant".into(),
+            content: "done".into(),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        ChatMessage::user("two"),
+        ChatMessage {
+            role: "assistant".into(),
+            content: "again".into(),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+    for keep in 2..messages.len() {
+        if let Some(cut) = safe_context_cut(&messages, keep, 0) {
+            assert_ne!(messages[cut].role, "tool");
+            assert!(matches!(messages[cut].role.as_str(), "user" | "assistant"));
+        }
+    }
 }
