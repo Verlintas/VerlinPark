@@ -707,6 +707,17 @@ fn take_admission_waiter(
     Some(waiters.remove(index))
 }
 
+async fn plan_task_cancel_requested(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+) -> Result<bool> {
+    let Some(task_id) = &spec.task_id else {
+        return Ok(false);
+    };
+    engine.plan_task_cancel_requested(session_id, task_id).await
+}
+
 async fn wait_for_resume(control: &RunControl) -> bool {
     let mut paused = control.subscribe_paused();
     let mut cancelled = control.subscribe();
@@ -4491,6 +4502,9 @@ async fn run_loop(
         if control.is_cancelled() {
             return Ok(LoopOutcome::Cancelled);
         }
+        if plan_task_cancel_requested(engine, &session.id, spec).await? {
+            return Ok(LoopOutcome::Cancelled);
+        }
         if budget.exhausted() {
             return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
         }
@@ -4784,6 +4798,9 @@ async fn run_loop(
             tool_call_id: None,
         });
 
+        if plan_task_cancel_requested(engine, &session.id, spec).await? {
+            return Ok(LoopOutcome::Cancelled);
+        }
         if tool_calls.is_empty() {
             emit(
                 engine,
@@ -4801,6 +4818,9 @@ async fn run_loop(
                 return Ok(LoopOutcome::Cancelled);
             }
             if control.is_cancelled() {
+                return Ok(LoopOutcome::Cancelled);
+            }
+            if plan_task_cancel_requested(engine, &session.id, spec).await? {
                 return Ok(LoopOutcome::Cancelled);
             }
             if budget.exhausted() {
@@ -7922,6 +7942,39 @@ async fn execute_team_plan(
                     } else {
                         summary
                     };
+                    if !control.is_cancelled()
+                        && engine
+                            .plan_task_cancel_requested(&session.id, &task.id)
+                            .await?
+                    {
+                        engine
+                            .update_agent_status(&worker_spec.id, "cancelled")
+                            .await?;
+                        statuses.insert(task.id.clone(), "cancelled".to_string());
+                        emit(
+                            engine,
+                            &session.id,
+                            worker_spec,
+                            "plan_task.finished",
+                            serde_json::json!({
+                                "task_id": task.id,
+                                "task_status": "cancelled",
+                                "reason": "cancel requested by user",
+                            }),
+                        )
+                        .await?;
+                        record_scheduled_task_finish(
+                            engine,
+                            &session.id,
+                            plan_seq,
+                            &task.id,
+                            "cancelled",
+                            Some("cancel requested by user"),
+                        )
+                        .await?;
+                        reports.push(format!("{} [cancelled]: cancel requested", task.id));
+                        continue;
+                    }
                     match finish_worker(
                         engine,
                         config,
@@ -8020,6 +8073,10 @@ async fn execute_team_plan(
                     }
                 }
                 Ok(LoopOutcome::Cancelled) => {
+                    let task_cancel = !control.is_cancelled()
+                        && engine
+                            .plan_task_cancel_requested(&session.id, &task.id)
+                            .await?;
                     engine
                         .update_agent_status(&worker_spec.id, "cancelled")
                         .await?;
@@ -8032,6 +8089,7 @@ async fn execute_team_plan(
                         serde_json::json!({
                             "task_id": task.id,
                             "task_status": "cancelled",
+                            "reason": if task_cancel { "cancel requested by user" } else { "session cancelled" },
                         }),
                     )
                     .await?;
@@ -8041,10 +8099,14 @@ async fn execute_team_plan(
                         plan_seq,
                         &task.id,
                         "cancelled",
-                        None,
+                        task_cancel.then_some("cancel requested by user"),
                     )
                     .await?;
-                    abort = Some(PlanAbort::Cancelled);
+                    if task_cancel {
+                        reports.push(format!("{} [cancelled]: cancel requested", task.id));
+                    } else {
+                        abort = Some(PlanAbort::Cancelled);
+                    }
                 }
                 Ok(LoopOutcome::BudgetExceeded(stop)) => {
                     engine

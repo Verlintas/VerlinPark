@@ -58,6 +58,11 @@ one ready batch inside one session.
    task is terminal for scheduling and is not picked up by the global scheduler;
    its dependants remain blocked. Both transitions are atomic with events and
    replay/repair/bundle aware.
+9. **Running task cancel.** `task.cancel` moves a running task to `cancelling`
+   (`plan_task.cancelling`). The Worker checks this state at turn/tool boundaries
+   and returns cancellation; the plan executor marks only that task cancelled and
+   continues siblings. It is cooperative: an in-flight provider stream is not
+   preempted mid-response, and there is no single-task pause yet.
 
 ## Consequences
 
@@ -72,8 +77,9 @@ one ready batch inside one session.
   plans; it does not run a single task from an inactive session without a plan
   run, and it executes ready tasks in batches rather than a fully autonomous
   per-task dispatcher.
-- Tasks can be skipped or retried without restarting a session; running tasks
-  still require session pause/cancel.
+- Tasks can be skipped, retried, or cooperatively cancelled without restarting a
+  session; running cancellation is boundary-based, and single-task pause remains
+  unimplemented.
 - Task rows are part of `session.replay` drift checks and
   `--repair`/`--rebuild`, session bundle export/import, and `db-rebuild`.
   They are regenerated from the plan and plan events. Write leases are ephemeral

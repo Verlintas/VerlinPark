@@ -181,6 +181,8 @@ enum Command {
     TaskRetry { session: String, task: String },
     /// Skip a queued plan task for the current plan revision.
     TaskSkip { session: String, task: String },
+    /// Request cooperative cancellation of a running plan task.
+    TaskCancel { session: String, task: String },
     /// Create a session for a project.
     SessionNew {
         project: String,
@@ -701,6 +703,14 @@ async fn main() -> Result<()> {
             rpc(
                 &discovery,
                 "task.skip",
+                json!({"session_id": session, "task_id": task}),
+            )
+            .await?
+        }
+        Command::TaskCancel { session, task } => {
+            rpc(
+                &discovery,
+                "task.cancel",
                 json!({"session_id": session, "task_id": task}),
             )
             .await?

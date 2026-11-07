@@ -2020,6 +2020,18 @@ final class AppModel {
         }
     }
 
+    func cancelRunningTask(_ task: SchedulerTask) async {
+        taskActionBusyID = task.id
+        defer { taskActionBusyID = nil }
+        do {
+            let updated = try await core.cancelTask(sessionID: task.sessionID, taskID: task.taskID)
+            taskActionStatus = "\(updated.taskID) -> \(updated.status)"
+            await loadTaskQueue()
+        } catch {
+            taskActionStatus = error.localizedDescription
+        }
+    }
+
     func skipScheduledTask(_ task: SchedulerTask) async {
         taskActionBusyID = task.id
         defer { taskActionBusyID = nil }

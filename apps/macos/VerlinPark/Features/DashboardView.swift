@@ -1443,6 +1443,17 @@ private struct TaskSchedulerCard: View {
                                     .controlSize(.mini)
                                     .frame(width: 16)
                             } else {
+                                if canCancel(task.status) {
+                                    Button {
+                                        Task { await model.cancelRunningTask(task) }
+                                    } label: {
+                                        Image(systemName: "stop.circle")
+                                            .font(.system(size: 8))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(.red)
+                                    .help("Request cancellation of this running task")
+                                }
                                 if canRetry(task.status) {
                                     Button {
                                         Task { await model.retryScheduledTask(task) }
@@ -1523,6 +1534,10 @@ private struct TaskSchedulerCard: View {
         }
     }
 
+    private func canCancel(_ status: String) -> Bool {
+        status == "running"
+    }
+
     private func canRetry(_ status: String) -> Bool {
         ["failed", "blocked", "interrupted", "cancelled", "skipped"].contains(status)
     }
@@ -1536,7 +1551,7 @@ private struct TaskSchedulerCard: View {
         case "running": .green
         case "completed": .cyan
         case "failed", "blocked": .orange
-        case "interrupted": .yellow
+        case "interrupted", "cancelling": .yellow
         case "cancelled", "skipped": .secondary
         default: .secondary
         }

@@ -193,6 +193,7 @@ just cli terminal <session-id> "cargo test"
 just cli tasks --project <project-id>
 just cli task-retry <session-id> T1
 just cli task-skip <session-id> T2
+just cli task-cancel <session-id> T3
 just cli files <session-id>
 just cli file <session-id> src/main.rs
 echo "new content" | just cli write-file <session-id> src/main.rs

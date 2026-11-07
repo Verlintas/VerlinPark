@@ -661,6 +661,39 @@ impl Engine {
         Ok(task)
     }
 
+    pub async fn request_plan_task_cancel(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<ScheduledTask> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let (task, event) = tokio::task::spawn_blocking(move || {
+            store.request_plan_task_cancel_with_event(&session_id, &task_id)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(task)
+    }
+
+    pub async fn plan_task_cancel_requested(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<bool> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let status =
+            tokio::task::spawn_blocking(move || store.plan_task_status(&session_id, &task_id))
+                .await??;
+        Ok(matches!(
+            status.as_deref(),
+            Some("cancelling" | "cancelled")
+        ))
+    }
+
     pub async fn interrupt_running_plan_tasks(&self, session_id: &str) -> Result<usize> {
         let store = self.store.clone();
         let id = session_id.to_string();

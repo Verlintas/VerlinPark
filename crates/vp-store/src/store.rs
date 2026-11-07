@@ -3686,7 +3686,7 @@ impl Store {
                  WHERE session_id = ?1 AND seq > ?2
                    AND type IN ('plan_task.started', 'plan_task.finished',
                                 'plan_task.interrupted', 'plan_task.retried',
-                                'plan_task.skipped')
+                                'plan_task.skipped', 'plan_task.cancelling')
                  ORDER BY seq ASC",
             )?;
             let rows = stmt.query_map(params![session_id, plan_seq as i64], |row| {
@@ -3741,6 +3741,11 @@ impl Store {
                         state.status = "pending".to_string();
                         state.finished_at = None;
                         state.last_error = None;
+                    }
+                    "plan_task.cancelling" => {
+                        state.status = "cancelling".to_string();
+                        state.finished_at = None;
+                        state.last_error = payload["reason"].as_str().map(str::to_string);
                     }
                     "plan_task.skipped" => {
                         state.status = "skipped".to_string();
@@ -3990,6 +3995,74 @@ impl Store {
         Ok((task, event))
     }
 
+    /// Request cooperative cancellation of a running plan task. The worker
+    /// checks this status at turn/tool boundaries and exits without aborting
+    /// sibling tasks.
+    pub fn request_plan_task_cancel_with_event(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(ScheduledTask, Event)> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let (plan_seq, status) = tx
+            .query_row(
+                "SELECT plan_seq, status FROM plan_tasks
+                 WHERE session_id = ?1 AND task_id = ?2
+                 ORDER BY plan_seq DESC LIMIT 1",
+                params![session_id, task_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("task not found: {task_id}"))?;
+        if status != "running" {
+            return Err(anyhow!("task {task_id} is {status}, not running"));
+        }
+        tx.execute(
+            "UPDATE plan_tasks
+             SET status = 'cancelling', last_error = 'cancel requested by user', updated_at = ?1
+             WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4",
+            params![now, session_id, plan_seq, task_id],
+        )?;
+        let task = tx.query_row(
+            "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
+                    status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
+                    last_error
+             FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
+            params![session_id, plan_seq, task_id],
+            map_scheduled_task,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "plan_task.cancelling",
+            serde_json::json!({
+                "task_id": task_id,
+                "task_status": "cancelling",
+                "reason": "cancel requested by user",
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((task, event))
+    }
+
+    pub fn plan_task_status(&self, session_id: &str, task_id: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT status FROM plan_tasks
+             WHERE session_id = ?1 AND task_id = ?2
+             ORDER BY plan_seq DESC LIMIT 1",
+            params![session_id, task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Skip a queued/blocked task for the current plan revision. A skipped task
     /// is terminal for scheduling and is not picked up by the global scheduler;
     /// downstream dependencies remain blocked rather than silently running.
@@ -4075,7 +4148,7 @@ impl Store {
                 "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                         status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
                         last_error
-                 FROM plan_tasks WHERE status IN ('running', 'claimed')
+                 FROM plan_tasks WHERE status IN ('running', 'claimed', 'cancelling')
                  ORDER BY session_id ASC, plan_seq ASC, task_id ASC",
             )?;
             let rows = stmt.query_map([], map_scheduled_task)?;
@@ -4086,7 +4159,7 @@ impl Store {
              SET status = 'interrupted',
                  last_error = 'daemon restarted while the task was active',
                  finished_at = ?1, updated_at = ?1
-             WHERE status IN ('running', 'claimed')",
+             WHERE status IN ('running', 'claimed', 'cancelling')",
             params![now],
         )?;
         tx.execute("DELETE FROM write_leases", [])?;
@@ -4111,7 +4184,7 @@ impl Store {
                         status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
                         last_error
                  FROM plan_tasks
-                 WHERE session_id = ?1 AND status IN ('running', 'claimed')
+                 WHERE session_id = ?1 AND status IN ('running', 'claimed', 'cancelling')
                  ORDER BY plan_seq ASC, task_id ASC",
             )?;
             let rows = stmt.query_map(params![session_id], map_scheduled_task)?;
@@ -4120,7 +4193,7 @@ impl Store {
         tx.execute(
             "UPDATE plan_tasks
              SET status = 'interrupted', last_error = ?1, finished_at = ?2, updated_at = ?2
-             WHERE session_id = ?3 AND status IN ('running', 'claimed')",
+             WHERE session_id = ?3 AND status IN ('running', 'claimed', 'cancelling')",
             params![reason, now, session_id],
         )?;
         tx.commit()?;
@@ -4381,7 +4454,7 @@ impl Store {
         let interrupted_tasks = {
             let mut stmt = tx.prepare(
                 "SELECT session_id, task_id FROM plan_tasks
-                 WHERE status IN ('running', 'claimed')
+                 WHERE status IN ('running', 'claimed', 'cancelling')
                  ORDER BY session_id ASC, plan_seq ASC, task_id ASC",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -4394,7 +4467,7 @@ impl Store {
              SET status = 'interrupted',
                  last_error = 'daemon restarted while the task was active',
                  finished_at = ?1, updated_at = ?1
-             WHERE status IN ('running', 'claimed')",
+             WHERE status IN ('running', 'claimed', 'cancelling')",
             params![now],
         )?;
         tx.execute("DELETE FROM write_leases", [])?;
