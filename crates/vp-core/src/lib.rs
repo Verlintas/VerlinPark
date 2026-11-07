@@ -2277,6 +2277,17 @@ impl Engine {
         })
     }
 
+    pub async fn latest_event_of_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+    ) -> Result<Option<Event>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let kind = kind.to_string();
+        tokio::task::spawn_blocking(move || store.latest_event_by_kind(&session_id, &kind)).await?
+    }
+
     pub async fn list_events(
         &self,
         session_id: String,

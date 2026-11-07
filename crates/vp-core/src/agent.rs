@@ -52,6 +52,22 @@ fn global_labour_cap() -> usize {
         .clamp(1, 100)
 }
 
+fn compact_after_tokens() -> u64 {
+    env::var("VERLINPARK_COMPACT_AFTER_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(24_000)
+        .min(2_000_000)
+}
+
+fn compact_keep_messages() -> usize {
+    env::var("VERLINPARK_COMPACT_KEEP_MESSAGES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8)
+        .clamp(2, 100)
+}
+
 fn auto_expand_workers() -> bool {
     env::var("VERLINPARK_AUTO_EXPAND_WORKERS")
         .ok()
@@ -116,6 +132,11 @@ pub struct AgentConfig {
     pub provider_idle_timeout_secs: u64,
     /// Maximum time a blocking user question may wait for an answer.
     pub question_timeout_secs: u64,
+    /// Compact the active conversation after this many estimated tokens.
+    /// Zero disables compaction.
+    pub compact_after_tokens: u64,
+    /// Number of recent messages to retain outside the compacted summary.
+    pub compact_keep_messages: usize,
 }
 
 /// Daemon-wide admission control for Worker/Labour runs. Per-session caps still
@@ -1432,6 +1453,8 @@ impl AgentService {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(1800)
                     .clamp(60, 86400),
+                compact_after_tokens: compact_after_tokens(),
+                compact_keep_messages: compact_keep_messages(),
             },
         )
     }
@@ -1526,6 +1549,8 @@ impl AgentService {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1800)
                 .clamp(60, 86400),
+            compact_after_tokens: compact_after_tokens(),
+            compact_keep_messages: compact_keep_messages(),
         };
         *self
             .config
@@ -2025,6 +2050,7 @@ impl AgentService {
             &resolver_spec,
             &prompt,
             &mut conversation,
+            &[],
             false,
         )
         .await;
@@ -3249,7 +3275,9 @@ async fn run_agent(
     )
     .await?;
 
-    let mut conversation = load_conversation(&engine, session_id).await?;
+    let loaded = load_conversation(&engine, session_id).await?;
+    let mut conversation = loaded.messages;
+    let conversation_ids = loaded.ids;
     let result = run_loop(
         &engine,
         &config,
@@ -3260,6 +3288,7 @@ async fn run_agent(
         &spec,
         prompt,
         &mut conversation,
+        &conversation_ids,
         true,
     )
     .await;
@@ -3764,6 +3793,7 @@ async fn verify_worker(
         &verifier_spec,
         &prompt,
         &mut conversation,
+        &[],
         false,
     )
     .await;
@@ -5325,6 +5355,266 @@ async fn consume_stream(
     Ok(turn)
 }
 
+const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting an AI coding agent conversation. \
+Summarize the transcript so another agent can continue without the full history. Preserve: \
+the user's goal and constraints, decisions and their reasons, files and paths changed or inspected, \
+important tool results and test outcomes, open tasks and blockers, and exact identifiers or commands \
+that would be costly to rediscover. Be concise and factual. Do not invent work, results, or files. \
+Return only the summary text.";
+
+fn estimate_messages_tokens(messages: &[ChatMessage]) -> u64 {
+    messages.iter().fold(0u64, |total, message| {
+        let tool_tokens = message
+            .tool_calls
+            .as_ref()
+            .and_then(|calls| serde_json::to_string(calls).ok())
+            .map(|calls| estimate_text_tokens(&calls))
+            .unwrap_or(0);
+        total
+            .saturating_add(estimate_text_tokens(&message.content))
+            .saturating_add(tool_tokens)
+    })
+}
+
+fn compaction_transcript(messages: &[ChatMessage]) -> String {
+    const MAX_CHARS: usize = 80_000;
+    const PER_MESSAGE: usize = 4_000;
+    let mut transcript = String::new();
+    for message in messages {
+        transcript.push_str(&message.role);
+        transcript.push_str(": ");
+        transcript.push_str(&truncate_to(&message.content, PER_MESSAGE));
+        transcript.push('\n');
+        if let Some(tool_calls) = &message.tool_calls {
+            transcript.push_str("tool_calls: ");
+            transcript.push_str(&serde_json::to_string(tool_calls).unwrap_or_default());
+            transcript.push('\n');
+        }
+        if let Some(tool_call_id) = &message.tool_call_id {
+            transcript.push_str("tool_call_id: ");
+            transcript.push_str(tool_call_id);
+            transcript.push('\n');
+        }
+        if transcript.len() >= MAX_CHARS {
+            transcript.push_str("… transcript truncated at the compaction limit …\n");
+            break;
+        }
+    }
+    transcript
+}
+
+async fn collect_compaction_completion(
+    provider: &dyn Provider,
+    request: &ChatRequest,
+    idle_timeout: Duration,
+    control: &RunControl,
+) -> Result<(String, (u64, u64))> {
+    let mut stream = provider
+        .stream_chat(request.clone())
+        .await
+        .context("starting context compaction stream")?;
+    let mut cancel_rx = control.subscribe();
+    let mut text = String::new();
+    let mut usage = (0u64, 0u64);
+    loop {
+        if control.is_cancelled() {
+            anyhow::bail!("context compaction cancelled");
+        }
+        let item = tokio::select! {
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() {
+                    anyhow::bail!("context compaction cancelled");
+                }
+                continue;
+            }
+            item = tokio::time::timeout(idle_timeout, stream.next()) => match item {
+                Ok(item) => item,
+                Err(_) => anyhow::bail!(
+                    "context compaction stream was idle for {}s",
+                    idle_timeout.as_secs()
+                ),
+            },
+        };
+        let Some(item) = item else {
+            break;
+        };
+        match item? {
+            StreamEvent::TextDelta(delta) => {
+                text.push_str(&delta);
+                if text.len() >= 32_768 {
+                    break;
+                }
+            }
+            StreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                usage = (
+                    usage.0.saturating_add(input_tokens as u64),
+                    usage.1.saturating_add(output_tokens as u64),
+                );
+            }
+            StreamEvent::ToolCall(_) | StreamEvent::Done => {}
+        }
+    }
+    Ok((text, usage))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compact_context_if_needed(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    spec: &AgentSpec,
+    budget: &SessionBudget,
+    control: &RunControl,
+    conversation: &mut Vec<ChatMessage>,
+    conversation_ids: &[Option<String>],
+) -> Result<bool> {
+    if config.compact_after_tokens == 0 || budget.exhausted() {
+        return Ok(false);
+    }
+    let keep = config.compact_keep_messages.max(2);
+    if conversation.len() <= keep.saturating_add(1) {
+        return Ok(false);
+    }
+    let estimated = estimate_messages_tokens(conversation);
+    if estimated < config.compact_after_tokens {
+        return Ok(false);
+    }
+    let Some(protected_from) = conversation
+        .iter()
+        .rposition(|message| message.role == "user")
+    else {
+        return Ok(false);
+    };
+    let min_cut = conversation.len().saturating_sub(keep);
+    if min_cut == 0 || min_cut >= protected_from {
+        return Ok(false);
+    }
+    let Some(cut) = (min_cut..protected_from).find(|index| conversation[*index].role == "user")
+    else {
+        return Ok(false);
+    };
+    if cut == 0 {
+        return Ok(false);
+    }
+    let Some(through_id) = conversation_ids.get(cut - 1).cloned().flatten() else {
+        return Ok(false);
+    };
+    let transcript = compaction_transcript(&conversation[..cut]);
+    if transcript.trim().is_empty() {
+        return Ok(false);
+    }
+    let request = ChatRequest {
+        model: model_for(config, spec.role),
+        messages: vec![ChatMessage::user(transcript)],
+        system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
+        max_tokens: Some(1024),
+        temperature: Some(0.2),
+        tools: Vec::new(),
+    };
+    let reservation = if budget.limit.is_some() {
+        match budget.reserve_tokens(estimate_request_tokens(&request).saturating_add(1024)) {
+            Some(reservation) => Some(reservation),
+            None => return Ok(false),
+        }
+    } else {
+        None
+    };
+    let outcome = collect_compaction_completion(
+        config.provider.as_ref(),
+        &request,
+        Duration::from_secs(config.provider_idle_timeout_secs),
+        control,
+    )
+    .await;
+    let (summary, usage) = match outcome {
+        Ok(value) => value,
+        Err(error) => {
+            drop(reservation);
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "context.compact_failed",
+                serde_json::json!({
+                    "error": truncate(&format!("{error:#}")),
+                }),
+            )
+            .await?;
+            return Ok(false);
+        }
+    };
+    let summary = summary.trim();
+    if summary.is_empty() {
+        drop(reservation);
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "context.compact_failed",
+            serde_json::json!({"error": "context compaction returned an empty summary"}),
+        )
+        .await?;
+        return Ok(false);
+    }
+    let (input_tokens, output_tokens, estimated_usage) = if usage != (0, 0) {
+        (usage.0, usage.1, false)
+    } else {
+        (
+            estimate_request_tokens(&request),
+            estimate_text_tokens(summary),
+            true,
+        )
+    };
+    let (input_price, output_price) = role_price(config, spec.role);
+    let cost = usage_cost(input_tokens, output_tokens, input_price, output_price);
+    engine
+        .record_agent_usage(
+            &session.id,
+            &spec.id,
+            &spec.name,
+            "compaction",
+            spec.task_id.clone(),
+            spec.department.clone(),
+            &request.model,
+            input_tokens,
+            output_tokens,
+            estimated_usage,
+            cost,
+        )
+        .await?;
+    if let Some(reservation) = reservation {
+        let _ = reservation.settle(input_tokens.saturating_add(output_tokens));
+    }
+    budget.add_cost(cost);
+    let kept = conversation.len().saturating_sub(cut);
+    let summary =
+        format!("Earlier conversation summary (auto-compacted from {cut} messages):\n{summary}");
+    emit(
+        engine,
+        &session.id,
+        spec,
+        "context.compacted",
+        serde_json::json!({
+            "through_message_id": through_id,
+            "summary": summary,
+            "summarized_messages": cut,
+            "kept_messages": kept,
+            "estimated_tokens_before": estimated,
+            "threshold_tokens": config.compact_after_tokens,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "estimated": estimated_usage,
+        }),
+    )
+    .await?;
+    conversation.drain(..cut);
+    conversation.insert(0, ChatMessage::user(summary));
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[async_recursion]
 async fn run_loop(
@@ -5337,6 +5627,7 @@ async fn run_loop(
     spec: &AgentSpec,
     objective: &str,
     conversation: &mut Vec<ChatMessage>,
+    conversation_ids: &[Option<String>],
     top_level: bool,
 ) -> Result<LoopOutcome> {
     let task_priority = if let Some(task_id) = &spec.task_id {
@@ -5449,6 +5740,19 @@ async fn run_loop(
         read_jail: shell_policy.read_jail,
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
+    if top_level {
+        compact_context_if_needed(
+            engine,
+            config,
+            session,
+            spec,
+            budget,
+            control,
+            conversation,
+            conversation_ids,
+        )
+        .await?;
+    }
     let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;
     let mut tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
     tools.extend(
@@ -6289,6 +6593,7 @@ async fn run_loop(
                                     &child_spec,
                                     &child_objective,
                                     &mut child_conversation,
+                                    &[],
                                     false,
                                 )
                                 .await;
@@ -7786,6 +8091,7 @@ async fn run_parallel_workers(
                 child_spec,
                 objective,
                 conversation,
+                &[],
                 false,
             )
         });
@@ -8276,6 +8582,7 @@ async fn deliberate_team_plan(
                 manager,
                 prompt,
                 conversation,
+                &[],
                 false,
             )
         });
@@ -8913,6 +9220,7 @@ async fn execute_team_plan(
                     worker_spec,
                     objective,
                     conversation,
+                    &[],
                     false,
                 )
             });
@@ -9394,10 +9702,47 @@ async fn load_session_project(store: Store, session_id: &str) -> Result<(Session
     .await?
 }
 
-async fn load_conversation(engine: &Engine, session_id: &str) -> Result<Vec<ChatMessage>> {
+struct LoadedConversation {
+    messages: Vec<ChatMessage>,
+    ids: Vec<Option<String>>,
+}
+
+async fn load_conversation(engine: &Engine, session_id: &str) -> Result<LoadedConversation> {
     let messages: Vec<StoredMessage> = engine.list_messages(session_id).await?;
-    Ok(messages
+    let mut start = 0usize;
+    let mut summary = None;
+    // A context.compacted event points at the last summarized message. The
+    // summary text lives in the event; the active conversation becomes
+    // [summary] + messages after that point. Older messages stay in the
+    // database for search, replay, and transcript.
+    if let Some(event) = engine
+        .latest_event_of_kind(session_id, "context.compacted")
+        .await?
+    {
+        let through = event
+            .payload
+            .get("through_message_id")
+            .and_then(serde_json::Value::as_str);
+        let text = event
+            .payload
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty());
+        if let (Some(through), Some(text)) = (through, text)
+            && let Some(index) = messages.iter().position(|message| message.id == through)
+        {
+            start = index.saturating_add(1);
+            summary = Some(text.to_string());
+        }
+    }
+    let mut ids = messages
+        .iter()
+        .skip(start)
+        .map(|message| Some(message.id.clone()))
+        .collect::<Vec<_>>();
+    let mut messages = messages
         .into_iter()
+        .skip(start)
         .map(|message| {
             let tool_calls: Vec<ToolCall> =
                 serde_json::from_value(message.tool_calls).unwrap_or_default();
@@ -9412,7 +9757,13 @@ async fn load_conversation(engine: &Engine, session_id: &str) -> Result<Vec<Chat
                 tool_call_id: message.tool_call_id,
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+    if let Some(summary) = summary {
+        // The event stores the already-prefixed summary text.
+        messages.insert(0, ChatMessage::user(summary));
+        ids.insert(0, None);
+    }
+    Ok(LoadedConversation { messages, ids })
 }
 
 fn parse_todos(input: &serde_json::Value) -> Result<Vec<TodoItem>> {

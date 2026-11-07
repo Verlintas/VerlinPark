@@ -94,6 +94,8 @@ fn test_service_with_provider_cap(
         )),
         provider_idle_timeout_secs: 300,
         question_timeout_secs: 1800,
+        compact_after_tokens: 0,
+        compact_keep_messages: 8,
     };
     let service = AgentService::configured(engine.clone(), config);
     (engine, service, project)
@@ -108,6 +110,19 @@ fn set_worker_cap(service: &AgentService, max_workers: usize) {
         .expect("test service is configured")
         .clone();
     config.max_workers = max_workers;
+    *service.config.write().unwrap() = Some(config);
+}
+
+fn set_compaction(service: &AgentService, after_tokens: u64, keep_messages: usize) {
+    let mut config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service is configured")
+        .clone();
+    config.compact_after_tokens = after_tokens;
+    config.compact_keep_messages = keep_messages;
     *service.config.write().unwrap() = Some(config);
 }
 
@@ -5790,4 +5805,178 @@ async fn cancelling_a_dispatched_task_does_not_cancel_the_rest_of_the_plan() {
         t2.status, "pending",
         "limited dispatch must not cancel tasks it did not claim"
     );
+}
+
+#[tokio::test]
+async fn compacts_long_conversations_and_resumes_from_the_summary() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta(
+                    "The user investigated the release pipeline. Files a.rs and b.rs were inspected; tests passed."
+                        .into(),
+                ),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("compaction complete".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_compaction(&service, 50, 4);
+    let session = engine
+        .create_session(project.id, "long context".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..20 {
+        let role = if index % 2 == 0 { "user" } else { "assistant" };
+        engine
+            .append_message(
+                &session.id,
+                role,
+                &format!(
+                    "message {index}: the release pipeline investigation includes enough detail to exceed the tiny test threshold"
+                ),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    service
+        .start(&session.id, "current prompt after compaction")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let compacted = events
+        .iter()
+        .find(|event| event.kind == "context.compacted")
+        .expect("context.compacted event");
+    assert_eq!(compacted.payload["threshold_tokens"], 50);
+    assert!(
+        compacted.payload["summarized_messages"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        compacted.payload["through_message_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(
+        compacted.payload["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.starts_with("Earlier conversation summary"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "context.compact_failed")
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message" && event.payload["text"] == "compaction complete"
+    }));
+
+    let stored = engine.list_messages(&session.id).await.unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|message| message.content == "message 0: the release pipeline investigation includes enough detail to exceed the tiny test threshold")
+            .count(),
+        1,
+        "pre-compaction history must remain stored"
+    );
+    let loaded = load_conversation(&engine, &session.id).await.unwrap();
+    assert!(
+        loaded.messages[0]
+            .content
+            .starts_with("Earlier conversation summary")
+    );
+    assert!(
+        loaded
+            .messages
+            .iter()
+            .any(|message| message.content == "current prompt after compaction")
+    );
+    assert!(
+        loaded.messages.len() < stored.len() + 1,
+        "active conversation should be smaller than the stored history"
+    );
+    let ledger = engine.usage_ledger(&session.id).await.unwrap();
+    assert!(
+        ledger
+            .entries
+            .iter()
+            .any(|entry| entry.role == "compaction")
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.consistent, "compaction replay drifted: {replay:?}");
+}
+
+#[tokio::test]
+async fn compaction_failure_does_not_abort_the_run() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![Err(ProviderError::Stream("compaction unavailable".into()))],
+            vec![
+                Ok(StreamEvent::TextDelta("normal answer".into())),
+                Ok(StreamEvent::Done),
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_compaction(&service, 20, 3);
+    let session = engine
+        .create_session(project.id, "failed compaction".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..8 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                "enough context to trigger the tiny compaction threshold",
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    service
+        .start(&session.id, "continue without compaction")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "context.compact_failed")
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message" && event.payload["text"] == "normal answer"
+    }));
 }

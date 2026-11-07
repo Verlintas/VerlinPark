@@ -3116,6 +3116,28 @@ impl Store {
         Ok(seq.max(0) as u64)
     }
 
+    pub fn latest_event_by_kind(&self, session_id: &str, kind: &str) -> Result<Option<Event>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT session_id, seq, type, payload, created_at
+             FROM events WHERE session_id = ?1 AND type = ?2
+             ORDER BY seq DESC LIMIT 1",
+            params![session_id, kind],
+            |row| {
+                let payload: String = row.get(3)?;
+                Ok(Event {
+                    session_id: row.get(0)?,
+                    seq: row.get::<_, i64>(1)? as u64,
+                    kind: row.get(2)?,
+                    payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                    created_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn list_all_events(&self, session_id: &str) -> Result<Vec<Event>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
