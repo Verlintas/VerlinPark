@@ -23,8 +23,9 @@ use vp_protocol::types::{
     ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
     ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
     SessionCheckpointDeleteResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
-    SessionCommit, SessionContextStatus, SessionDiff, SessionForkResult, SessionImportResult,
-    SessionLandResult, SessionLogStatus, SessionPriorityResult, SessionRehydrateResult,
+    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus, SessionDiff,
+    SessionForkResult, SessionImportResult, SessionLandResult, SessionLineageEntry,
+    SessionLineageResult, SessionLogStatus, SessionPriorityResult, SessionRehydrateResult,
     SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TaskQueueResult,
     TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult,
     TerminalOpenResult, TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem,
@@ -1064,6 +1065,7 @@ impl Engine {
                     "fork_session_id": new_session.id,
                     "fork_goal": new_session.goal,
                     "checkpoint_id": checkpoint.id,
+                    "commit": checkpoint.commit,
                 }),
             )
             .await
@@ -1074,6 +1076,222 @@ impl Engine {
             source_session_id: source.id,
             checkpoint_id: checkpoint.id,
             session: new_session,
+        })
+    }
+
+    pub async fn session_lineage(&self, session_id: &str) -> Result<SessionLineageResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let created = tokio::task::spawn_blocking(move || {
+            store.list_events_by_kind(&id, "session.created", 1)
+        })
+        .await??;
+        let created_payload = created.first().map(|event| event.payload.clone());
+        let parent_id = created_payload
+            .as_ref()
+            .and_then(|payload| payload.get("forked_from_session_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let parent_checkpoint = created_payload
+            .as_ref()
+            .and_then(|payload| payload.get("forked_from_checkpoint_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let parent_commit = created_payload
+            .as_ref()
+            .and_then(|payload| payload.get("forked_from_commit"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let mut parent = None;
+        let mut siblings = Vec::new();
+        if let Some(parent_id) = &parent_id {
+            let store = self.store.clone();
+            let parent_for_load = parent_id.clone();
+            if let Some(parent_session) =
+                tokio::task::spawn_blocking(move || store.get_session(&parent_for_load)).await??
+            {
+                parent = Some(SessionLineageEntry {
+                    session: parent_session,
+                    checkpoint_id: parent_checkpoint,
+                    commit: parent_commit,
+                });
+            }
+            let store = self.store.clone();
+            let parent_for_events = parent_id.clone();
+            let events = tokio::task::spawn_blocking(move || {
+                store.list_events_by_kind(&parent_for_events, "session.forked", 1000)
+            })
+            .await??;
+            for event in events {
+                let Some(entry) = self.lineage_entry_from_fork_event(&event).await else {
+                    continue;
+                };
+                if entry.session.id != session_id {
+                    siblings.push(entry);
+                }
+            }
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let events = tokio::task::spawn_blocking(move || {
+            store.list_events_by_kind(&id, "session.forked", 1000)
+        })
+        .await??;
+        let mut children = Vec::new();
+        for event in events {
+            if let Some(entry) = self.lineage_entry_from_fork_event(&event).await {
+                children.push(entry);
+            }
+        }
+        siblings.sort_by(|left, right| left.session.created_at.cmp(&right.session.created_at));
+        children.sort_by(|left, right| left.session.created_at.cmp(&right.session.created_at));
+        Ok(SessionLineageResult {
+            session_id: session.id,
+            parent,
+            siblings,
+            children,
+        })
+    }
+
+    async fn lineage_entry_from_fork_event(&self, event: &Event) -> Option<SessionLineageEntry> {
+        let fork_id = event
+            .payload
+            .get("fork_session_id")
+            .and_then(serde_json::Value::as_str)?
+            .to_string();
+        let checkpoint_id = event
+            .payload
+            .get("checkpoint_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let mut commit = event
+            .payload
+            .get("commit")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let store = self.store.clone();
+        let session_id = fork_id.clone();
+        let session =
+            match tokio::task::spawn_blocking(move || store.get_session(&session_id)).await {
+                Ok(Ok(Some(session))) => session,
+                _ => return None,
+            };
+        if commit.is_none() {
+            let store = self.store.clone();
+            let session_id = fork_id.clone();
+            if let Ok(Ok(events)) = tokio::task::spawn_blocking(move || {
+                store.list_events_by_kind(&session_id, "session.created", 1)
+            })
+            .await
+                && let Some(created) = events.first()
+            {
+                commit = created
+                    .payload
+                    .get("forked_from_commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+        Some(SessionLineageEntry {
+            session,
+            checkpoint_id,
+            commit,
+        })
+    }
+
+    pub async fn compare_sessions(
+        &self,
+        session_id: &str,
+        other_session_id: &str,
+    ) -> Result<SessionCompareResult> {
+        if session_id == other_session_id {
+            anyhow::bail!("choose two different sessions to compare");
+        }
+        let store = self.store.clone();
+        let left_id = session_id.to_string();
+        let right_id = other_session_id.to_string();
+        let (left, right) = tokio::task::spawn_blocking(move || {
+            let left = store
+                .get_session(&left_id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {left_id}"))?;
+            let right = store
+                .get_session(&right_id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {right_id}"))?;
+            Ok::<_, anyhow::Error>((left, right))
+        })
+        .await??;
+        if left.project_id != right.project_id {
+            anyhow::bail!("sessions must belong to the same project");
+        }
+        let left_branch = left
+            .branch
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("source session has no branch"))?;
+        let right_branch = right
+            .branch
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("other session has no branch"))?;
+        let store = self.store.clone();
+        let project_id = left.project_id.clone();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found: {}", left.project_id))?;
+        let root = PathBuf::from(&project.root);
+        let git_lock = self.git_lock.clone();
+        let left_branch_for_git = left_branch.clone();
+        let right_branch_for_git = right_branch.clone();
+        let root_for_git = root.clone();
+        let (left_commit, right_commit, numstat, patch) = tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            let left_commit =
+                worktree::git_output(&root_for_git, &["rev-parse", &left_branch_for_git])?;
+            let right_commit =
+                worktree::git_output(&root_for_git, &["rev-parse", &right_branch_for_git])?;
+            let range = format!("{left_commit}..{right_commit}");
+            let numstat = worktree::git_output(
+                &root_for_git,
+                &["diff", "--numstat", "--no-color", "--no-ext-diff", &range],
+            )?;
+            let patch = worktree::git_output(
+                &root_for_git,
+                &["diff", "--no-color", "--no-ext-diff", &range],
+            )?;
+            Ok::<_, anyhow::Error>((left_commit, right_commit, numstat, patch))
+        })
+        .await??;
+        let mut files = Vec::new();
+        for line in numstat.lines() {
+            let mut parts = line.splitn(3, '\t');
+            let additions = parts.next().unwrap_or("-");
+            let deletions = parts.next().unwrap_or("-");
+            let path = parts.next().unwrap_or("");
+            if path.is_empty() {
+                continue;
+            }
+            let binary = additions == "-" || deletions == "-";
+            files.push(SessionCompareFile {
+                path: path.to_string(),
+                additions: additions.parse().unwrap_or(0),
+                deletions: deletions.parse().unwrap_or(0),
+                binary,
+            });
+        }
+        let truncated = patch.chars().count() > 200_000;
+        Ok(SessionCompareResult {
+            session_id: session_id.to_string(),
+            other_session_id: other_session_id.to_string(),
+            left_commit,
+            right_commit,
+            files,
+            patch: clip_transcript(&patch, 200_000),
+            truncated,
         })
     }
 

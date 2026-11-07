@@ -109,6 +109,9 @@ struct DashboardView: View {
                     CheckpointsCard()
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
+                    ForksCard()
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 12)
                     ArtifactPolicyCard(project: project)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 12)
@@ -1083,6 +1086,199 @@ private struct CheckpointsCard: View {
                 "This removes the checkpoint event and its snapshot ref. Existing fork branches are unaffected."
             )
         }
+    }
+}
+
+private struct ForksCard: View {
+    @Environment(AppModel.self) private var model
+    @State private var showingCompare = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Fork lineage")
+                    Text(model.selectedSession?.goal ?? "No session selected")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                }
+                Spacer()
+                if model.lineageBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task { await model.loadLineage() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.lineageBusy || model.selectedSession == nil)
+            }
+            Text(
+                "Parent, sibling, and child sessions created through checkpoint forks. Compare committed branch differences without changing either worktree."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            if model.selectedSession == nil {
+                Text("Select a session to inspect its fork lineage.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else if let lineage = model.sessionLineage {
+                lineageSection("PARENT", entries: lineage.parent.map { [$0] } ?? [])
+                lineageSection("SIBLINGS", entries: lineage.siblings)
+                lineageSection("FORKS", entries: lineage.children)
+                if lineage.parent == nil, lineage.siblings.isEmpty, lineage.children.isEmpty {
+                    Text("No fork lineage. Use Session → Fork Session… to start one.")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            } else if !model.lineageBusy {
+                Text("Lineage unavailable.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            if let error = model.compareError {
+                Text(error)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .sheet(isPresented: $showingCompare) {
+            CompareSessionsSheet()
+                .environment(model)
+        }
+    }
+
+    @ViewBuilder
+    private func lineageSection(_ title: String, entries: [SessionLineageEntry]) -> some View {
+        if !entries.isEmpty {
+            Text(title)
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            ForEach(entries) { entry in
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(entry.session.goal)
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .lineLimit(1)
+                        Text(
+                            "\(entry.session.status) · \(entry.commit.map { String($0.prefix(8)) } ?? "no commit") · \(entry.checkpointID.map { String($0.prefix(8)) } ?? "no checkpoint")"
+                        )
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Open") {
+                        model.selectSession(entry.session.id)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Button("Compare") {
+                        Task {
+                            await model.compareSessions(otherID: entry.session.id)
+                            showingCompare = true
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.compareBusy)
+                }
+            }
+        }
+    }
+}
+
+private struct CompareSessionsSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Compare sessions")
+                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                    Text("Committed branch difference")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(18)
+            Divider().opacity(0.35)
+            if model.compareBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let error = model.compareError {
+                StudioEmptyView(
+                    icon: "exclamationmark.triangle",
+                    title: "Comparison unavailable",
+                    detail: error
+                )
+            } else if let result = model.compareResult {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 16) {
+                        Text(
+                            "\(String(result.leftCommit.prefix(8))) → \(String(result.rightCommit.prefix(8)))"
+                        )
+                        .font(.system(size: 10, design: .monospaced))
+                        Text("\(result.files.count) files")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        if result.truncated {
+                            Text("patch truncated")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 12) {
+                            ForEach(result.files) { file in
+                                Text(
+                                    "\(file.path) +\(file.binary ? "bin" : "\(file.additions)") / -\(file.binary ? "bin" : "\(file.deletions)")"
+                                )
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(file.binary ? Color.orange : Color.secondary)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 40)
+                    Divider().opacity(0.3)
+                    if result.patch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        StudioEmptyView(
+                            icon: "equal.circle",
+                            title: "No committed difference",
+                            detail: "The session branches point at the same tree."
+                        )
+                    } else {
+                        ScrollView([.vertical, .horizontal]) {
+                            Text(result.patch)
+                                .font(.system(size: 10, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(12)
+                        }
+                        .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+                .padding(18)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(width: 820, height: 680)
     }
 }
 

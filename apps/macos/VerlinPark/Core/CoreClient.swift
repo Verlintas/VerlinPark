@@ -273,6 +273,28 @@ actor CoreClient {
         .decode(SessionCheckpointPruneResult.self)
     }
 
+    func sessionLineage(sessionID: String) async throws -> SessionLineageResult {
+        try await request(
+            method: "session.lineage",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionLineageResult.self)
+    }
+
+    func compareSessions(
+        sessionID: String,
+        otherSessionID: String
+    ) async throws -> SessionCompareResult {
+        try await request(
+            method: "session.compare",
+            params: [
+                "session_id": .string(sessionID),
+                "other_session_id": .string(otherSessionID),
+            ]
+        )
+        .decode(SessionCompareResult.self)
+    }
+
     func forkSession(
         sessionID: String,
         checkpointID: String?,

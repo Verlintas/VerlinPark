@@ -103,6 +103,65 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(status.lastMeasurement?.samples, 3)
     }
 
+    func testSessionCompareResultDecodes() throws {
+        let json = """
+        {
+          "session_id": "left",
+          "other_session_id": "right",
+          "left_commit": "aaa111",
+          "right_commit": "bbb222",
+          "files": [
+            {"path": "Sources/App.swift", "additions": 12, "deletions": 3, "binary": false}
+          ],
+          "patch": "diff --git a/Sources/App.swift b/Sources/App.swift\\n",
+          "truncated": false
+        }
+        """
+        let result = try JSONDecoder().decode(SessionCompareResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.sessionID, "left")
+        XCTAssertEqual(result.otherSessionID, "right")
+        XCTAssertEqual(result.files.first?.path, "Sources/App.swift")
+        XCTAssertEqual(result.files.first?.additions, 12)
+        XCTAssertFalse(result.truncated)
+    }
+
+    func testSessionLineageResultDecodes() throws {
+        let json = """
+        {
+          "session_id": "fork-1",
+          "parent": {
+            "session": {
+              "id": "source-1",
+              "project_id": "project-1",
+              "goal": "source",
+              "status": "idle",
+              "priority": 0,
+              "worktree": "/tmp/source",
+              "branch": "verlinpark/source-1",
+              "token_budget": null,
+              "cost_budget_usd": null,
+              "time_budget_secs": null,
+              "cost_spent_usd": 0.0,
+              "base_commit": "aaa111",
+              "tokens_in": 0,
+              "tokens_out": 0,
+              "created_at": "2026-11-08T00:00:00Z"
+            },
+            "checkpoint_id": "checkpoint-1",
+            "commit": "aaa111"
+          },
+          "siblings": [],
+          "children": []
+        }
+        """
+        let result = try JSONDecoder().decode(SessionLineageResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.sessionID, "fork-1")
+        XCTAssertEqual(result.parent?.session.id, "source-1")
+        XCTAssertEqual(result.parent?.checkpointID, "checkpoint-1")
+        XCTAssertEqual(result.parent?.commit, "aaa111")
+        XCTAssertTrue(result.siblings.isEmpty)
+    }
+
     func testSessionForkResultDecodes() throws {
         let json = """
         {

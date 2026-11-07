@@ -113,6 +113,7 @@
 | [0101](adr/0101-session-checkpoints-and-forks.md) | Session checkpoints and forks | Accepted | Session/Git |
 | [0102](adr/0102-checkpoint-retention-and-deletion.md) | Checkpoint retention and deletion | Accepted | Session/Git |
 | [0103](adr/0103-automatic-checkpoint-retention.md) | Automatic checkpoint retention policy | Accepted | Session/Git |
+| [0104](adr/0104-fork-lineage-and-comparison.md) | Fork lineage and branch comparison | Accepted | Session/Git |
 
 ---
 

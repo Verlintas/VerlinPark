@@ -1301,6 +1301,67 @@ struct SessionCheckpointPruneResult: Codable, Sendable {
     }
 }
 
+struct SessionLineageEntry: Codable, Sendable, Identifiable {
+    let session: Session
+    let checkpointID: String?
+    let commit: String?
+
+    var id: String {
+        session.id
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case session
+        case checkpointID = "checkpoint_id"
+        case commit
+    }
+}
+
+struct SessionLineageResult: Codable, Sendable {
+    let sessionID: String
+    let parent: SessionLineageEntry?
+    let siblings: [SessionLineageEntry]
+    let children: [SessionLineageEntry]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case parent
+        case siblings
+        case children
+    }
+}
+
+struct SessionCompareFile: Codable, Sendable, Identifiable {
+    let path: String
+    let additions: Int
+    let deletions: Int
+    let binary: Bool
+
+    var id: String {
+        path
+    }
+}
+
+struct SessionCompareResult: Codable, Sendable {
+    let sessionID: String
+    let otherSessionID: String
+    let leftCommit: String
+    let rightCommit: String
+    let files: [SessionCompareFile]
+    let patch: String
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case otherSessionID = "other_session_id"
+        case leftCommit = "left_commit"
+        case rightCommit = "right_commit"
+        case files
+        case patch
+        case truncated
+    }
+}
+
 struct SessionForkResult: Codable, Sendable {
     let sourceSessionID: String
     let checkpointID: String

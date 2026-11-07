@@ -180,6 +180,11 @@ final class AppModel {
     var checkpoints: [SessionCheckpoint] = []
     var checkpointBusy = false
     var checkpointNotice: String?
+    var sessionLineage: SessionLineageResult?
+    var lineageBusy = false
+    var compareResult: SessionCompareResult?
+    var compareBusy = false
+    var compareError: String?
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -367,6 +372,9 @@ final class AppModel {
             compactNotice = nil
             checkpoints = []
             checkpointNotice = nil
+            sessionLineage = nil
+            compareResult = nil
+            compareError = nil
             sessionDiff = nil
             todos = []
             agents = []
@@ -423,6 +431,9 @@ final class AppModel {
         compactNotice = nil
         checkpoints = []
         checkpointNotice = nil
+        sessionLineage = nil
+        compareResult = nil
+        compareError = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -462,6 +473,9 @@ final class AppModel {
         compactNotice = nil
         checkpoints = []
         checkpointNotice = nil
+        sessionLineage = nil
+        compareResult = nil
+        compareError = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -476,6 +490,7 @@ final class AppModel {
             await loadEvents()
             await loadContextStatus()
             await loadCheckpoints()
+            await loadLineage()
             await loadTodos()
             await loadAgents()
             await loadMergeQueue()
@@ -2736,6 +2751,45 @@ final class AppModel {
         }
     }
 
+    func loadLineage() async {
+        guard let sessionID = selectedSessionID else {
+            sessionLineage = nil
+            return
+        }
+        lineageBusy = true
+        defer { lineageBusy = false }
+        do {
+            let result = try await core.sessionLineage(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                sessionLineage = result
+            }
+        } catch {
+            sessionLineage = nil
+        }
+    }
+
+    func compareSessions(otherID: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        compareBusy = true
+        compareError = nil
+        compareResult = nil
+        defer { compareBusy = false }
+        do {
+            let result = try await core.compareSessions(
+                sessionID: sessionID,
+                otherSessionID: otherID
+            )
+            if sessionID == selectedSessionID {
+                compareResult = result
+            }
+        } catch {
+            if sessionID == selectedSessionID {
+                compareError = error.localizedDescription
+            }
+            handle(error)
+        }
+    }
+
     func compactSession() async {
         guard let sessionID = selectedSessionID else { return }
         compactBusy = true
@@ -2998,6 +3052,10 @@ final class AppModel {
            ["session.checkpoint", "session.checkpoint.deleted"].contains(event.type)
         {
             Task { await self.loadCheckpoints() }
+        }
+
+        if event.sessionId == selectedSessionID, event.type == "session.forked" {
+            Task { await self.loadLineage() }
         }
 
         if event.sessionId == selectedSessionID {

@@ -1670,6 +1670,53 @@ pub struct SessionForkResult {
     pub session: Session,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionLineageEntry {
+    pub session: Session,
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionLineageResult {
+    pub session_id: String,
+    pub parent: Option<SessionLineageEntry>,
+    pub siblings: Vec<SessionLineageEntry>,
+    pub children: Vec<SessionLineageEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionLineageParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCompareParams {
+    pub session_id: String,
+    pub other_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCompareFile {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCompareResult {
+    pub session_id: String,
+    pub other_session_id: String,
+    pub left_commit: String,
+    pub right_commit: String,
+    pub files: Vec<SessionCompareFile>,
+    pub patch: String,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptParams {
     pub session_id: String,

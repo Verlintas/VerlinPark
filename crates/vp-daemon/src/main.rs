@@ -42,13 +42,13 @@ use vp_protocol::types::{
     ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
     RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionCheckpointDeleteParams,
     SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
-    SessionCompactParams, SessionContextParams, SessionDiffParams, SessionExportParams,
-    SessionForkParams, SessionImportParams, SessionListResult, SessionLogParams,
-    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
-    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
-    SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
-    SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
+    SessionCompactParams, SessionCompareParams, SessionContextParams, SessionDiffParams,
+    SessionExportParams, SessionForkParams, SessionImportParams, SessionLineageParams,
+    SessionListResult, SessionLogParams, SessionPauseParams, SessionPauseResult,
+    SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
+    SessionTodosParams, SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
+    SetCheckpointPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
+    SetMemoryPolicyParams, SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
     SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
     SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
     TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
@@ -954,6 +954,24 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.lineage" => match parse_params::<SessionLineageParams>(request.params) {
+            Ok(params) => match state.engine.session_lineage(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.compare" => match parse_params::<SessionCompareParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .compare_sessions(&params.session_id, &params.other_session_id)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "session.fork" => match parse_params::<SessionForkParams>(request.params) {
             Ok(params) => match state
                 .agent

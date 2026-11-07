@@ -3575,3 +3575,103 @@ async fn checkpoint_policy_round_trips_and_sweeps_old_snapshots() {
         .unwrap_err();
     assert!(error.to_string().contains("keep_latest"));
 }
+
+#[tokio::test]
+async fn session_lineage_reports_parent_siblings_and_children() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("lineage".into()),
+        )
+        .await
+        .unwrap();
+    let source = engine
+        .create_session(project.id, "lineage root".into(), None)
+        .await
+        .unwrap();
+    let first = engine
+        .fork_session(&source.id, None, Some("first fork".into()))
+        .await
+        .unwrap();
+    let second = engine
+        .fork_session(&source.id, None, Some("second fork".into()))
+        .await
+        .unwrap();
+
+    let root = engine.session_lineage(&source.id).await.unwrap();
+    assert!(root.parent.is_none());
+    assert!(root.siblings.is_empty());
+    assert_eq!(root.children.len(), 2);
+    assert!(root.children.iter().all(|entry| entry.commit.is_some()));
+    assert!(
+        root.children
+            .iter()
+            .any(|entry| entry.session.id == first.session.id)
+    );
+    assert!(
+        root.children
+            .iter()
+            .any(|entry| entry.session.id == second.session.id)
+    );
+
+    let fork = engine.session_lineage(&first.session.id).await.unwrap();
+    assert_eq!(
+        fork.parent
+            .as_ref()
+            .map(|parent| parent.session.id.as_str()),
+        Some(source.id.as_str())
+    );
+    assert_eq!(fork.siblings.len(), 1);
+    assert_eq!(fork.siblings[0].session.id, second.session.id);
+    assert!(fork.children.is_empty());
+}
+
+#[tokio::test]
+async fn session_compare_reports_committed_branch_difference() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("compare".into()),
+        )
+        .await
+        .unwrap();
+    let source = engine
+        .create_session(project.id, "compare source".into(), None)
+        .await
+        .unwrap();
+    let fork = engine
+        .fork_session(&source.id, None, Some("compare fork".into()))
+        .await
+        .unwrap();
+    let fork_worktree = PathBuf::from(fork.session.worktree.clone().unwrap());
+    commit_worktree_file(&fork_worktree, "fork-change.txt", "from the fork\n");
+
+    let comparison = engine
+        .compare_sessions(&source.id, &fork.session.id)
+        .await
+        .unwrap();
+    assert_eq!(comparison.session_id, source.id);
+    assert_eq!(comparison.other_session_id, fork.session.id);
+    assert_ne!(comparison.left_commit, comparison.right_commit);
+    assert!(
+        comparison
+            .files
+            .iter()
+            .any(|file| file.path == "fork-change.txt" && file.additions > 0)
+    );
+    assert!(comparison.patch.contains("fork-change.txt"));
+    assert!(!comparison.truncated);
+    let error = engine
+        .compare_sessions(&source.id, &source.id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("different sessions"));
+}

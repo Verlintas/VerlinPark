@@ -338,6 +338,10 @@ enum Command {
         #[arg(long)]
         goal: Option<String>,
     },
+    /// Show parent/sibling/child fork lineage for a session.
+    Lineage { session: String },
+    /// Compare two session branches in the same project.
+    Compare { session: String, other: String },
     /// Show the session plan/todo list.
     Todos { session: String },
     /// Show the per-call usage/cost ledger.
@@ -1253,6 +1257,22 @@ async fn main() -> Result<()> {
                     "checkpoint_id": checkpoint,
                     "goal": goal
                 }),
+            )
+            .await?
+        }
+        Command::Lineage { session } => {
+            rpc(
+                &discovery,
+                "session.lineage",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Compare { session, other } => {
+            rpc(
+                &discovery,
+                "session.compare",
+                json!({"session_id": session, "other_session_id": other}),
             )
             .await?
         }
