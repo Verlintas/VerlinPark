@@ -44,17 +44,18 @@ use vp_protocol::types::{
     SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
     SessionCompactParams, SessionCompareParams, SessionContextParams, SessionDiffParams,
     SessionExportParams, SessionForkParams, SessionImportParams, SessionLineageParams,
-    SessionListResult, SessionLogParams, SessionPauseParams, SessionPauseResult,
-    SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
-    SessionTodosParams, SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
-    SetCheckpointPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
-    SetMemoryPolicyParams, SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
-    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
-    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
-    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, UpdateAcpAgentParams, UpdateMcpServerParams, UsageLedgerParams,
-    WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    SessionListResult, SessionLogParams, SessionMergeForkParams, SessionPauseParams,
+    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams,
+    SessionResumeResult, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
+    SetArtifactPolicyParams, SetCheckpointPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
+    SetSessionPriorityParams, SetShellPolicyParams, SetTaskSchedulerPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams,
+    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
+    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
+    UpdateAcpAgentParams, UpdateMcpServerParams, UsageLedgerParams, WorkspaceFileParams,
+    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -965,6 +966,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Ok(params) => match state
                 .engine
                 .compare_sessions(&params.session_id, &params.other_session_id)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.fork.merge" => match parse_params::<SessionMergeForkParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .merge_fork_now(&params.source_session_id, &params.fork_session_id)
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),

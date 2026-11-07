@@ -349,6 +349,62 @@ pub fn merge_branch(session_worktree: &Path, branch: &str, message: &str) -> Res
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ForkMergeOutcome {
+    pub merged: bool,
+    pub conflicts: Vec<String>,
+    pub detail: String,
+}
+
+/// Merge a fork branch into a session worktree. Conflicts are returned as a
+/// normal outcome after aborting the merge; branch/checkout failures remain
+/// errors. This keeps conflict reporting separate from infrastructure errors.
+pub fn merge_fork_branch(
+    session_worktree: &Path,
+    branch: &str,
+    message: &str,
+) -> Result<ForkMergeOutcome> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(session_worktree)
+        .args(["merge", "--no-ff", branch, "-m", message])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .context("merging fork branch")?;
+    if output.status.success() {
+        return Ok(ForkMergeOutcome {
+            merged: true,
+            conflicts: Vec::new(),
+            detail: String::new(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    let conflicts = git_output(
+        session_worktree,
+        &["diff", "--name-only", "--diff-filter=U"],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let _ = run_git(session_worktree, &["merge", "--abort"]);
+    if !conflicts.is_empty()
+        || detail.contains("CONFLICT")
+        || detail.contains("Automatic merge failed")
+    {
+        Ok(ForkMergeOutcome {
+            merged: false,
+            conflicts,
+            detail,
+        })
+    } else {
+        Err(anyhow!("fork merge failed: {detail}"))
+    }
+}
+
 /// Create a worktree for an imported session at an explicit path. If the
 /// session branch already exists it is attached; otherwise it is created at the
 /// bundle's base commit.

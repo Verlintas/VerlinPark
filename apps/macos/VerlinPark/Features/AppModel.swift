@@ -185,6 +185,8 @@ final class AppModel {
     var compareResult: SessionCompareResult?
     var compareBusy = false
     var compareError: String?
+    var forkMergeBusy = false
+    var forkMergeNotice: String?
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -375,6 +377,7 @@ final class AppModel {
             sessionLineage = nil
             compareResult = nil
             compareError = nil
+            forkMergeNotice = nil
             sessionDiff = nil
             todos = []
             agents = []
@@ -434,6 +437,7 @@ final class AppModel {
         sessionLineage = nil
         compareResult = nil
         compareError = nil
+        forkMergeNotice = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -476,6 +480,7 @@ final class AppModel {
         sessionLineage = nil
         compareResult = nil
         compareError = nil
+        forkMergeNotice = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -2790,6 +2795,34 @@ final class AppModel {
         }
     }
 
+    func mergeFork(_ forkID: String) async {
+        guard let sourceID = selectedSessionID else { return }
+        forkMergeBusy = true
+        forkMergeNotice = nil
+        defer { forkMergeBusy = false }
+        do {
+            let result = try await core.mergeFork(
+                sourceSessionID: sourceID,
+                forkSessionID: forkID
+            )
+            await loadLineage()
+            await loadEvents()
+            await loadDiff()
+            switch result.status {
+            case "merged":
+                forkMergeNotice =
+                    "Merged \(String(result.forkCommit.prefix(8))) → \(String(result.mergeCommit?.prefix(8) ?? "?"))"
+            case "conflict":
+                forkMergeNotice = "Conflict: \(result.conflicts.joined(separator: ", "))"
+            default:
+                forkMergeNotice = "Merge failed: \(result.detail)"
+            }
+        } catch {
+            forkMergeNotice = "Merge failed: \(error.localizedDescription)"
+            handle(error)
+        }
+    }
+
     func compactSession() async {
         guard let sessionID = selectedSessionID else { return }
         compactBusy = true
@@ -3056,6 +3089,14 @@ final class AppModel {
 
         if event.sessionId == selectedSessionID, event.type == "session.forked" {
             Task { await self.loadLineage() }
+        }
+
+        if event.sessionId == selectedSessionID, event.type == "session.fork.merge" {
+            Task {
+                await self.loadLineage()
+                await self.loadEvents()
+                await self.loadDiff()
+            }
         }
 
         if event.sessionId == selectedSessionID {

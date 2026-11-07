@@ -1092,6 +1092,7 @@ private struct CheckpointsCard: View {
 private struct ForksCard: View {
     @Environment(AppModel.self) private var model
     @State private var showingCompare = false
+    @State private var merging: SessionLineageEntry?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1103,7 +1104,7 @@ private struct ForksCard: View {
                         .lineLimit(1)
                 }
                 Spacer()
-                if model.lineageBusy {
+                if model.lineageBusy || model.forkMergeBusy {
                     ProgressView().controlSize(.small)
                 }
                 Button("Refresh") {
@@ -1124,9 +1125,9 @@ private struct ForksCard: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
             } else if let lineage = model.sessionLineage {
-                lineageSection("PARENT", entries: lineage.parent.map { [$0] } ?? [])
-                lineageSection("SIBLINGS", entries: lineage.siblings)
-                lineageSection("FORKS", entries: lineage.children)
+                lineageSection("PARENT", entries: lineage.parent.map { [$0] } ?? [], mergeable: false)
+                lineageSection("SIBLINGS", entries: lineage.siblings, mergeable: false)
+                lineageSection("FORKS", entries: lineage.children, mergeable: true)
                 if lineage.parent == nil, lineage.siblings.isEmpty, lineage.children.isEmpty {
                     Text("No fork lineage. Use Session → Fork Session… to start one.")
                         .font(.system(size: 10, design: .monospaced))
@@ -1143,6 +1144,12 @@ private struct ForksCard: View {
                     .foregroundStyle(.orange)
                     .lineLimit(2)
             }
+            if let notice = model.forkMergeNotice {
+                Text(notice)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
         }
         .padding(14)
         .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -1154,10 +1161,36 @@ private struct ForksCard: View {
             CompareSessionsSheet()
                 .environment(model)
         }
+        .confirmationDialog(
+            "Merge fork into this session?",
+            isPresented: Binding(
+                get: { merging != nil },
+                set: {
+                    if !$0 {
+                        merging = nil
+                    }
+                }
+            ),
+            presenting: merging
+        ) { entry in
+            Button("Merge \(entry.session.goal)") {
+                Task { await model.mergeFork(entry.session.id) }
+                merging = nil
+            }
+            Button("Cancel", role: .cancel) { merging = nil }
+        } message: { _ in
+            Text(
+                "Merges the fork's committed branch into the current session. The source worktree must be clean; conflicts abort without changing the source branch."
+            )
+        }
     }
 
     @ViewBuilder
-    private func lineageSection(_ title: String, entries: [SessionLineageEntry]) -> some View {
+    private func lineageSection(
+        _ title: String,
+        entries: [SessionLineageEntry],
+        mergeable: Bool
+    ) -> some View {
         if !entries.isEmpty {
             Text(title)
                 .font(.system(size: 8, weight: .semibold, design: .monospaced))
@@ -1189,6 +1222,14 @@ private struct ForksCard: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .disabled(model.compareBusy)
+                    if mergeable {
+                        Button("Merge") {
+                            merging = entry
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(model.forkMergeBusy || model.compareBusy)
+                    }
                 }
             }
         }

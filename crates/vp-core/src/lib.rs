@@ -6279,7 +6279,7 @@ fn validate_acp_agent_fields(
     Ok(name.to_string())
 }
 
-fn ensure_session_quiescent(session: &Session, action: &str) -> Result<()> {
+pub(crate) fn ensure_session_quiescent(session: &Session, action: &str) -> Result<()> {
     if session.status == "imported" {
         anyhow::bail!("imported sessions are read-only archives");
     }

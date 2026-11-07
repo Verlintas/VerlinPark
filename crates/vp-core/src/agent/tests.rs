@@ -6699,3 +6699,117 @@ fn context_cuts_never_start_at_a_tool_message() {
         }
     }
 }
+
+fn commit_worktree_file(worktree: &Path, name: &str, content: &str) {
+    std::fs::write(worktree.join(name), content).unwrap();
+    for args in [vec!["add", name], vec!["commit", "-q", "-m", "test commit"]] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+#[tokio::test]
+async fn fork_merge_merges_committed_changes_into_source() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let source = engine
+        .create_session(project.id, "merge source".into(), None)
+        .await
+        .unwrap();
+    let fork = engine
+        .fork_session(&source.id, None, Some("merge fork".into()))
+        .await
+        .unwrap();
+    let source_worktree = PathBuf::from(source.worktree.clone().unwrap());
+    let pre_merge = crate::worktree::head_commit(&source_worktree).unwrap();
+    let fork_worktree = PathBuf::from(fork.session.worktree.clone().unwrap());
+    commit_worktree_file(&fork_worktree, "merged.txt", "from fork\n");
+
+    let result = service
+        .merge_fork_now(&source.id, &fork.session.id)
+        .await
+        .unwrap();
+    assert_eq!(result.status, "merged");
+    assert_eq!(result.pre_merge_commit, pre_merge);
+    assert!(result.merge_commit.is_some());
+    assert!(
+        std::fs::read_to_string(source_worktree.join("merged.txt"))
+            .unwrap()
+            .contains("from fork")
+    );
+    assert_ne!(
+        crate::worktree::head_commit(&source_worktree).unwrap(),
+        pre_merge
+    );
+    let events = engine.list_events(source.id.clone(), 0, 300).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.fork.merge"
+            && event.payload["status"] == "merged"
+            && event.payload["fork_session_id"] == fork.session.id
+    }));
+}
+
+#[tokio::test]
+async fn fork_merge_conflict_aborts_and_restores_source() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let source = engine
+        .create_session(project.id, "conflict source".into(), None)
+        .await
+        .unwrap();
+    let source_worktree = PathBuf::from(source.worktree.clone().unwrap());
+    let fork = engine
+        .fork_session(&source.id, None, Some("conflict fork".into()))
+        .await
+        .unwrap();
+    let fork_worktree = PathBuf::from(fork.session.worktree.clone().unwrap());
+    commit_worktree_file(&source_worktree, "README.md", "source side\n");
+    commit_worktree_file(&fork_worktree, "README.md", "fork side\n");
+    let pre_merge = crate::worktree::head_commit(&source_worktree).unwrap();
+
+    let result = service
+        .merge_fork_now(&source.id, &fork.session.id)
+        .await
+        .unwrap();
+    assert_eq!(result.status, "conflict");
+    assert!(result.conflicts.iter().any(|path| path == "README.md"));
+    assert_eq!(
+        crate::worktree::head_commit(&source_worktree).unwrap(),
+        pre_merge
+    );
+    assert_eq!(
+        std::fs::read_to_string(source_worktree.join("README.md"))
+            .unwrap()
+            .trim(),
+        "source side"
+    );
+    let events = engine.list_events(source.id.clone(), 0, 300).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.fork.merge" && event.payload["status"] == "conflict"
+    }));
+}
+
+#[tokio::test]
+async fn fork_merge_rejects_a_dirty_source_worktree() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let source = engine
+        .create_session(project.id, "dirty source".into(), None)
+        .await
+        .unwrap();
+    let fork = engine
+        .fork_session(&source.id, None, Some("dirty fork".into()))
+        .await
+        .unwrap();
+    let source_worktree = PathBuf::from(source.worktree.clone().unwrap());
+    std::fs::write(source_worktree.join("dirty.txt"), "not committed\n").unwrap();
+    let error = service
+        .merge_fork_now(&source.id, &fork.session.id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("uncommitted changes"));
+}

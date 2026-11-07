@@ -103,6 +103,27 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(status.lastMeasurement?.samples, 3)
     }
 
+    func testSessionMergeForkResultDecodes() throws {
+        let json = """
+        {
+          "source_session_id": "source-1",
+          "fork_session_id": "fork-1",
+          "status": "merged",
+          "pre_merge_commit": "aaa111",
+          "fork_commit": "bbb222",
+          "merge_commit": "ccc333",
+          "conflicts": [],
+          "detail": "diff check passed"
+        }
+        """
+        let result = try JSONDecoder().decode(SessionMergeForkResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.sourceSessionID, "source-1")
+        XCTAssertEqual(result.forkSessionID, "fork-1")
+        XCTAssertEqual(result.status, "merged")
+        XCTAssertEqual(result.mergeCommit, "ccc333")
+        XCTAssertTrue(result.conflicts.isEmpty)
+    }
+
     func testSessionCompareResultDecodes() throws {
         let json = """
         {

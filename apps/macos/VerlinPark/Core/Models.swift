@@ -1362,6 +1362,28 @@ struct SessionCompareResult: Codable, Sendable {
     }
 }
 
+struct SessionMergeForkResult: Codable, Sendable {
+    let sourceSessionID: String
+    let forkSessionID: String
+    let status: String
+    let preMergeCommit: String
+    let forkCommit: String
+    let mergeCommit: String?
+    let conflicts: [String]
+    let detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case sourceSessionID = "source_session_id"
+        case forkSessionID = "fork_session_id"
+        case status
+        case preMergeCommit = "pre_merge_commit"
+        case forkCommit = "fork_commit"
+        case mergeCommit = "merge_commit"
+        case conflicts
+        case detail
+    }
+}
+
 struct SessionForkResult: Codable, Sendable {
     let sourceSessionID: String
     let checkpointID: String

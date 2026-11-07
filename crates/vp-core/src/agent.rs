@@ -15,7 +15,8 @@ use tokio::time::timeout;
 use vp_protocol::types::{
     AgentInfo, AgentProbeResult, CapacityInfo, ConfigureAgentParams, ContextCompactionSummary,
     ContextMeasurement, MergeQueueEntry, PlanDepartment, PlanTask, Project, RoleModels, Session,
-    SessionCheckpoint, SessionCompactResult, SessionForkResult, StoredMessage, TeamPlan, TodoItem,
+    SessionCheckpoint, SessionCompactResult, SessionForkResult, SessionMergeForkResult,
+    StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -2841,6 +2842,281 @@ impl AgentService {
         result
     }
 
+    /// Merge a direct fork's committed branch into its source session. The
+    /// source worktree must be clean; conflicts are aborted and reported.
+    pub async fn merge_fork_now(
+        &self,
+        source_session_id: &str,
+        fork_session_id: &str,
+    ) -> Result<SessionMergeForkResult> {
+        self.begin_operations(&[source_session_id, fork_session_id])?;
+        let result = async {
+            let integration_command = self.config.read().ok().and_then(|config| {
+                config
+                    .as_ref()
+                    .and_then(|config| config.integration_command.clone())
+            });
+            let (source, project) =
+                load_session_project(self.engine.store().clone(), source_session_id).await?;
+            let (fork, fork_project) =
+                load_session_project(self.engine.store().clone(), fork_session_id).await?;
+            if source.project_id != fork.project_id || project.id != fork_project.id {
+                anyhow::bail!("sessions must belong to the same project");
+            }
+            crate::ensure_session_quiescent(&source, "merge a fork")?;
+            crate::ensure_session_quiescent(&fork, "merge a fork")?;
+            let lineage = self.engine.session_lineage(fork_session_id).await?;
+            if lineage
+                .parent
+                .as_ref()
+                .map(|parent| parent.session.id.as_str())
+                != Some(source_session_id)
+            {
+                anyhow::bail!("fork is not a direct child of the source session");
+            }
+            self.merge_fork_inner(&source, &project, &fork, integration_command)
+                .await
+        }
+        .await;
+        self.end_operations(&[source_session_id, fork_session_id]);
+        result
+    }
+
+    async fn merge_fork_inner(
+        &self,
+        source: &Session,
+        project: &Project,
+        fork: &Session,
+        integration_command: Option<String>,
+    ) -> Result<SessionMergeForkResult> {
+        let source_worktree = PathBuf::from(
+            source
+                .worktree
+                .clone()
+                .ok_or_else(|| anyhow!("source session has no worktree"))?,
+        );
+        let source_branch = source
+            .branch
+            .clone()
+            .ok_or_else(|| anyhow!("source session has no branch"))?;
+        let fork_branch = fork
+            .branch
+            .clone()
+            .ok_or_else(|| anyhow!("fork session has no branch"))?;
+        if !source_worktree.is_dir() {
+            anyhow::bail!("source session worktree is missing");
+        }
+        let git_lock = self.engine.git_lock.clone();
+        let status_path = source_worktree.clone();
+        let branch_path = source_worktree.clone();
+        let head_path = source_worktree.clone();
+        let expected_branch = source_branch.clone();
+        let (status, branch, pre_merge_commit) = tokio::task::spawn_blocking(move || {
+            let _guard = git_lock.lock().map_err(|_| anyhow!("git mutex poisoned"))?;
+            Ok::<_, anyhow::Error>((
+                worktree::status_porcelain(&status_path)?,
+                worktree::current_branch(&branch_path)?,
+                worktree::head_commit(&head_path)?,
+            ))
+        })
+        .await??;
+        if branch != expected_branch {
+            anyhow::bail!("source worktree is on branch {branch}; expected {expected_branch}");
+        }
+        if !status.is_empty() {
+            anyhow::bail!(
+                "source worktree has uncommitted changes; commit or discard them before merging a fork"
+            );
+        }
+        if let Some(fork_worktree) = &fork.worktree {
+            let fork_path = PathBuf::from(fork_worktree);
+            if fork_path.is_dir() {
+                let git_lock = self.engine.git_lock.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    let _guard = git_lock.lock().map_err(|_| anyhow!("git mutex poisoned"))?;
+                    worktree::status_porcelain(&fork_path)
+                })
+                .await??;
+                if !status.is_empty() {
+                    anyhow::bail!(
+                        "fork worktree has uncommitted changes; commit them before merging"
+                    );
+                }
+            }
+        }
+        let root = PathBuf::from(&project.root);
+        let fork_branch_for_git = fork_branch.clone();
+        let root_for_git = root.clone();
+        let fork_commit = tokio::task::spawn_blocking(move || {
+            worktree::git_output(&root_for_git, &["rev-parse", &fork_branch_for_git])
+        })
+        .await??;
+        let message = format!("merge fork {}", fork.id);
+        let merge_worktree = source_worktree.clone();
+        let merge_lock = self.engine.git_lock.clone();
+        let merge_outcome = tokio::task::spawn_blocking(move || {
+            let _guard = merge_lock
+                .lock()
+                .map_err(|_| anyhow!("git mutex poisoned"))?;
+            worktree::merge_fork_branch(&merge_worktree, &fork_branch, &message)
+        })
+        .await??;
+        if !merge_outcome.merged {
+            let detail = truncate(&format!("merge conflict: {}", merge_outcome.detail));
+            self.record_fork_merge(
+                source,
+                fork,
+                "conflict",
+                &pre_merge_commit,
+                &fork_commit,
+                None,
+                &merge_outcome.conflicts,
+                &detail,
+            )
+            .await?;
+            return Ok(SessionMergeForkResult {
+                source_session_id: source.id.clone(),
+                fork_session_id: fork.id.clone(),
+                status: "conflict".to_string(),
+                pre_merge_commit,
+                fork_commit,
+                merge_commit: None,
+                conflicts: merge_outcome.conflicts,
+                detail,
+            });
+        }
+
+        let merge_worktree = source_worktree.clone();
+        let check_base = pre_merge_commit.clone();
+        let check_lock = self.engine.git_lock.clone();
+        let check = tokio::task::spawn_blocking(move || {
+            let _guard = check_lock
+                .lock()
+                .map_err(|_| anyhow!("git mutex poisoned"))?;
+            worktree::check_merged_diff(&merge_worktree, &check_base)
+        })
+        .await?;
+        let integration = match check {
+            Ok(()) => {
+                if let Some(command) = integration_command {
+                    run_integration_command(source_worktree.clone(), command).await
+                } else {
+                    Ok("diff check passed".to_string())
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let integration = match integration {
+            Ok(detail) => detail,
+            Err(error) => {
+                let reset_worktree = source_worktree.clone();
+                let reset_base = pre_merge_commit.clone();
+                let reset_lock = self.engine.git_lock.clone();
+                let reset = tokio::task::spawn_blocking(move || {
+                    let _guard = reset_lock
+                        .lock()
+                        .map_err(|_| anyhow!("git mutex poisoned"))?;
+                    worktree::reset_hard(&reset_worktree, &reset_base)
+                })
+                .await?;
+                let detail = truncate(&match reset {
+                    Ok(()) => format!("integration check failed: {error}"),
+                    Err(reset_error) => {
+                        format!("integration check failed: {error}; rollback failed: {reset_error}")
+                    }
+                });
+                self.record_fork_merge(
+                    source,
+                    fork,
+                    "failed",
+                    &pre_merge_commit,
+                    &fork_commit,
+                    None,
+                    &[],
+                    &detail,
+                )
+                .await?;
+                return Ok(SessionMergeForkResult {
+                    source_session_id: source.id.clone(),
+                    fork_session_id: fork.id.clone(),
+                    status: "failed".to_string(),
+                    pre_merge_commit,
+                    fork_commit,
+                    merge_commit: None,
+                    conflicts: Vec::new(),
+                    detail,
+                });
+            }
+        };
+        let head_path = source_worktree.clone();
+        let merge_commit =
+            tokio::task::spawn_blocking(move || worktree::head_commit(&head_path)).await??;
+        let detail = truncate(&integration);
+        self.record_fork_merge(
+            source,
+            fork,
+            "merged",
+            &pre_merge_commit,
+            &fork_commit,
+            Some(&merge_commit),
+            &[],
+            &detail,
+        )
+        .await?;
+        Ok(SessionMergeForkResult {
+            source_session_id: source.id.clone(),
+            fork_session_id: fork.id.clone(),
+            status: "merged".to_string(),
+            pre_merge_commit,
+            fork_commit,
+            merge_commit: Some(merge_commit),
+            conflicts: Vec::new(),
+            detail,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_fork_merge(
+        &self,
+        source: &Session,
+        fork: &Session,
+        status: &str,
+        pre_merge_commit: &str,
+        fork_commit: &str,
+        merge_commit: Option<&str>,
+        conflicts: &[String],
+        detail: &str,
+    ) -> Result<()> {
+        self.engine
+            .append_event(
+                &source.id,
+                "session.fork.merge",
+                serde_json::json!({
+                    "fork_session_id": fork.id,
+                    "status": status,
+                    "pre_merge_commit": pre_merge_commit,
+                    "fork_commit": fork_commit,
+                    "merge_commit": merge_commit,
+                    "conflicts": conflicts,
+                    "detail": detail,
+                }),
+            )
+            .await?;
+        let _ = self
+            .engine
+            .append_event(
+                &fork.id,
+                "session.fork.merge",
+                serde_json::json!({
+                    "source_session_id": source.id,
+                    "status": status,
+                    "merge_commit": merge_commit,
+                }),
+            )
+            .await;
+        Ok(())
+    }
+
     fn begin_manual_operation(&self, session_id: &str) -> Result<Arc<RunControl>> {
         let mut runs = self
             .runs
@@ -2872,6 +3148,33 @@ impl AgentService {
     fn end_operation(&self, session_id: &str) {
         if let Ok(mut runs) = self.runs.lock() {
             runs.remove(session_id);
+        }
+    }
+
+    fn begin_operations(&self, session_ids: &[&str]) -> Result<()> {
+        let mut ids = session_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| anyhow!("agent run mutex poisoned"))?;
+        for id in &ids {
+            if runs.contains_key(*id) {
+                anyhow::bail!("session is already running: {id}");
+            }
+        }
+        for id in ids {
+            runs.insert(id.to_string(), Arc::new(RunControl::new_operation()));
+        }
+        Ok(())
+    }
+
+    fn end_operations(&self, session_ids: &[&str]) {
+        if let Ok(mut runs) = self.runs.lock() {
+            for id in session_ids {
+                runs.remove(*id);
+            }
         }
     }
 

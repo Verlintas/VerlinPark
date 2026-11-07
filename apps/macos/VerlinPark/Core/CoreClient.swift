@@ -273,6 +273,20 @@ actor CoreClient {
         .decode(SessionCheckpointPruneResult.self)
     }
 
+    func mergeFork(
+        sourceSessionID: String,
+        forkSessionID: String
+    ) async throws -> SessionMergeForkResult {
+        try await request(
+            method: "session.fork.merge",
+            params: [
+                "source_session_id": .string(sourceSessionID),
+                "fork_session_id": .string(forkSessionID),
+            ]
+        )
+        .decode(SessionMergeForkResult.self)
+    }
+
     func sessionLineage(sessionID: String) async throws -> SessionLineageResult {
         try await request(
             method: "session.lineage",

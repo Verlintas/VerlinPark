@@ -342,6 +342,8 @@ enum Command {
     Lineage { session: String },
     /// Compare two session branches in the same project.
     Compare { session: String, other: String },
+    /// Merge a direct child fork branch into the source session.
+    ForkMerge { session: String, fork: String },
     /// Show the session plan/todo list.
     Todos { session: String },
     /// Show the per-call usage/cost ledger.
@@ -1273,6 +1275,14 @@ async fn main() -> Result<()> {
                 &discovery,
                 "session.compare",
                 json!({"session_id": session, "other_session_id": other}),
+            )
+            .await?
+        }
+        Command::ForkMerge { session, fork } => {
+            rpc(
+                &discovery,
+                "session.fork.merge",
+                json!({"source_session_id": session, "fork_session_id": fork}),
             )
             .await?
         }

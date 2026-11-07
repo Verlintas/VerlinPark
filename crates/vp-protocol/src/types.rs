@@ -1718,6 +1718,27 @@ pub struct SessionCompareResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SessionMergeForkParams {
+    pub source_session_id: String,
+    pub fork_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionMergeForkResult {
+    pub source_session_id: String,
+    pub fork_session_id: String,
+    /// merged | conflict | failed
+    pub status: String,
+    pub pre_merge_commit: String,
+    pub fork_commit: String,
+    #[serde(default)]
+    pub merge_commit: Option<String>,
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PromptParams {
     pub session_id: String,
     pub content: String,
