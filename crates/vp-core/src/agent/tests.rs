@@ -96,6 +96,7 @@ fn test_service_with_provider_cap(
         question_timeout_secs: 1800,
         compact_after_tokens: 0,
         compact_keep_messages: 8,
+        context_window: 0,
     };
     let service = AgentService::configured(engine.clone(), config);
     (engine, service, project)
@@ -228,6 +229,7 @@ fn configures_provider_without_persisting_secrets() {
             max_workers: None,
             max_labour: None,
             auto_expand_workers: None,
+            context_window: None,
         })
         .unwrap();
     assert!(info.configured);
@@ -247,6 +249,7 @@ fn configures_provider_without_persisting_secrets() {
             max_workers: None,
             max_labour: None,
             auto_expand_workers: None,
+            context_window: None,
         })
         .unwrap_err();
     assert!(error.to_string().contains("model is required"));
@@ -5979,4 +5982,149 @@ async fn compaction_failure_does_not_abort_the_run() {
     assert!(events.iter().any(|event| {
         event.kind == "agent.message" && event.payload["text"] == "normal answer"
     }));
+}
+
+#[test]
+fn derives_context_limits_from_the_configured_model_window() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+
+    config.context_window = 128_000;
+    let (threshold_128k, hard_128k) = context_limits(&config, AgentRole::Leader, 2_000, 2_000);
+    assert!(threshold_128k > 80_000, "128k model threshold too low");
+    assert!(hard_128k > threshold_128k);
+
+    config.context_window = 1_000_000;
+    let (threshold_1m, hard_1m) = context_limits(&config, AgentRole::Leader, 2_000, 2_000);
+    assert!(threshold_1m > 700_000, "1M model threshold too low");
+    assert!(hard_1m > threshold_1m);
+
+    config.context_window = 8_000;
+    config.max_tokens = Some(2_048);
+    let (threshold_8k, hard_8k) = context_limits(&config, AgentRole::Leader, 1_000, 1_000);
+    assert!(threshold_8k < 4_000, "8k model threshold too high");
+    assert!(hard_8k < 5_000);
+
+    config.context_window = 8_000;
+    config.role_models.worker.context_window = Some(200_000);
+    assert!(
+        context_window_for(&config, AgentRole::Worker)
+            > context_window_for(&config, AgentRole::Leader)
+    );
+
+    config.context_window = 0;
+    let (threshold_off, hard_off) = context_limits(&config, AgentRole::Leader, 0, 0);
+    assert_eq!(threshold_off, 0);
+    assert_eq!(hard_off, u64::MAX);
+}
+
+#[tokio::test]
+async fn trims_older_messages_when_summarization_fails() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![Err(ProviderError::Stream(
+            "summary unavailable".into(),
+        ))]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "trim context".into(), None)
+        .await
+        .unwrap();
+    let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+    config.compact_keep_messages = 2;
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    );
+    let control = RunControl::new();
+    let mut conversation = Vec::new();
+    let mut conversation_ids = Vec::new();
+    for index in 0..10 {
+        let message = engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                "this message contains enough text to make the context exceed the tiny hard limit",
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        conversation.push(ChatMessage {
+            role: message.role,
+            content: message.content,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        conversation_ids.push(Some(message.id));
+    }
+
+    let changed = compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        50,
+        200,
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+    assert!(conversation.len() < 10);
+    assert_eq!(conversation.len(), conversation_ids.len());
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "context.compact_failed")
+    );
+    let compacted = events
+        .iter()
+        .find(|event| event.kind == "context.compacted" && event.payload["mode"] == "trim")
+        .expect("trim event");
+    assert!(
+        compacted.payload["dropped_messages"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    let loaded = load_conversation(&engine, &session.id).await.unwrap();
+    assert!(loaded.messages.len() < 10);
+    assert!(
+        !loaded.messages[0]
+            .content
+            .starts_with("Earlier conversation summary")
+    );
 }

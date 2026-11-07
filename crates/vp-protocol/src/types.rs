@@ -117,6 +117,9 @@ pub struct RoleModelConfig {
     pub input_usd_per_million: Option<f64>,
     #[serde(default)]
     pub output_usd_per_million: Option<f64>,
+    /// Optional context window for this role's model, in tokens.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1407,6 +1410,8 @@ pub struct AgentInfo {
     pub role_models: RoleModels,
     #[serde(default)]
     pub capacity: CapacityInfo,
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1464,6 +1469,10 @@ pub struct ConfigureAgentParams {
     pub max_labour: Option<u32>,
     #[serde(default)]
     pub auto_expand_workers: Option<bool>,
+    /// Context window for the base model, in tokens. 0 disables automatic
+    /// context management.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -381,6 +381,13 @@ struct ProvidersSettingsView: View {
                     .textFieldStyle(.roundedBorder)
                 TextField("Model", text: $model.providerModel)
                     .textFieldStyle(.roundedBorder)
+                TextField("Context window (tokens)", text: $model.providerContextWindowText)
+                    .textFieldStyle(.roundedBorder)
+                Text(
+                    "Used to derive compaction and rolling-window limits. A 1M-token model can use 1000000; a local 8k model should use 8000. Leave blank or 0 to disable automatic context management."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 SecureField("API key", text: $model.providerAPIKey)
                     .textFieldStyle(.roundedBorder)
                 Text(
@@ -423,7 +430,7 @@ struct ProvidersSettingsView: View {
 
             Section("Role model overrides") {
                 Text(
-                    "Blank uses the base Leader model. Prices are USD per 1M tokens and are only used when a USD session budget is set."
+                    "Blank uses the base Leader model. Prices are USD per 1M tokens and are only used when a USD session budget is set. Per-role context window overrides the global value; blank uses the global model window."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -538,7 +545,25 @@ private struct RoleModelRow: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 11, design: .monospaced))
                 .frame(width: 80)
+            TextField("ctx", text: contextBinding)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+                .frame(width: 72)
         }
+    }
+
+    private var contextBinding: Binding<String> {
+        Binding(
+            get: {
+                guard let value = config.contextWindow else { return "" }
+                return String(value)
+            },
+            set: {
+                let trimmed = $0.trimmingCharacters(in: .whitespaces)
+                config.contextWindow =
+                    (Int(trimmed).flatMap { $0 > 0 ? min($0, 10_000_000) : nil })
+            }
+        )
     }
 
     private var modelBinding: Binding<String> {

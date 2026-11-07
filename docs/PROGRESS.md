@@ -12,7 +12,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | Leader Agent | ✅ | 流式对话、工具调用、审批、session 预算、取消、todo 计划 |
-| Context compaction | ✅ | top-level run 开始前按估算 token 触发；默认 `VERLINPARK_COMPACT_AFTER_TOKENS=24000`（0 关闭），保留最近 `VERLINPARK_COMPACT_KEEP_MESSAGES=8` 条；用当前 provider/model 生成 summary；`context.compacted` 事件保存 summary + `through_message_id`，原消息保留；失败发 `context.compact_failed` 并继续完整上下文；usage 记为 `compaction`；不做 checkpoint/resume |
+| Context compaction | ✅ | 按模型 context window 自适应：`VERLINPARK_CONTEXT_WINDOW` 默认 128k（0 关闭），`RoleModelConfig.context_window` 可按角色覆盖；hard limit = window - output - system/tools - 512，summary threshold = 75% hard limit，`VERLINPARK_COMPACT_AFTER_TOKENS` 可显式覆盖；每个 top-level turn 前检查；summary + retained tail 为主，失败/仍超 hard limit 时按 user/assistant 安全边界滚动裁剪；`context.compacted` 记录 `mode: summary|trim` + `through_message_id`，原消息保留；usage 记为 `compaction`；不做 checkpoint/resume |
 | Provider 流可靠性 | ✅ | 启动前 transient retry；无任何输出前最多 3 次 stream attempts（含首次）；partial failure/cancel 保留 `partial: true` message 并结算 provider usage 或估算 usage；partial 后不 replay；`agent.probe` 返回 chunks/first-token/done；真实 OpenAI/Anthropic/local live tests 默认 ignored |
 | Session worktree | ✅ | 每个 session 独立 Git worktree + 分支；项目根只读 |
 | 四层组织 | ✅ | Leader → Manager → Worker → Labour；严格链路，Manager 必须有部门 title |
@@ -64,7 +64,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：213 个测试通过（core 166、store 39、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `cargo test --workspace`：215 个测试通过（core 168、store 39、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
 - `xcodebuild test`：40 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
@@ -97,7 +97,7 @@
 - ACP 只支持 stdio transport；HTTP/SSE、`session/resume`、ACP `fs/*`/`terminal/*` client capability、auth/login 流程未实现；外部 agent 的 token usage 不写入 usage ledger；scratch HOME 意味着 ambient `~/.claude`、`~/.config/gemini` 等状态不可见，凭据必须显式配置 env；外部 agent 仍是受信任二进制，不是网络/凭证沙箱。ACP 委派是同步的 Leader/Manager 工具，不是 plan task kind，因此 plan auto-dispatch 不会调度 ACP Worker；session pause 不会在 ACP 运行中生效，session cancel 会发送 `session/cancel` 并终止进程组。
 - Task/department/project budget 已有进程内原子 reservation，但不跨 daemon 重启持久化；手动 delegate 任务没有 plan task id 时只受 session/project budget 约束。
 - 历史 session 只有在新事件带 `usage_id` 后才会被 replay 比较；repair 可用 legacy event 的 synthetic id 回填 ledger。
-- Context compaction 只发生在 top-level run 开始前，不在 run 中压缩；summary 可能丢失细节，原消息仍保留；没有 checkpoint/resume；暂停状态只在内存中，daemon 重启会把 running/paused session 标为 failed。
+- Context compaction 在每个 top-level turn 前检查，但只在 user/assistant 边界切割；summary 可能丢失细节，hard-limit 的 rolling trim 更会丢失未进 summary 的消息（事件记录 dropped_messages）；原消息仍保留。`RoleModelConfig.context_window` 需要用户按模型正确配置，否则仍可能过早压缩或 provider overflow；没有 checkpoint/resume；暂停状态只在内存中，daemon 重启会把 running/paused session 标为 failed。
 - Terminal 是 daemon-owned PTY，但终端输出/scrollback 不持久化、跨 daemon 重启不恢复；SwiftTerm 固定 1.10.1（新版本引入 Metal toolchain/plugin 要求）；逐 hunk review、真实 Collab 节点、web search 仍缺；Console 仍是 line-oriented；Files 文本编辑限制 512 KiB、binary/truncated 只读，保存用 expected_sha256 检测并发修改但不做三方合并。
 - Search 主路径是 FTS5 word/prefix 索引，空结果或非 ASCII 查询回退 LIKE；结果是 newest-first，不做 BM25/相关性排序；event 结果是 raw JSON snippet；FTS 有命中时可能漏掉另一行里的纯 substring 匹配。
 - Transcript 不包含完整 event timeline、artifacts 或 approvals，且不可导入；超长内容会截断。
@@ -229,7 +229,8 @@
 - **M3 第九十七切片**：provider stream resilience（无输出前 retry、partial failure/cancel 保留 message + usage settlement、长流测试、probe chunks/first-token/done、env-gated live OpenAI/Anthropic/local E2E）；见 ADR-0094。
 - **M3 第九十八切片**：per-task dispatch mode（`TaskSchedulerPolicy.dispatch_tasks`、one-task-per-tick、`task.dispatch`/CLI/Manage Dash、limited plan execution 不扩散 abort、policy/manifest/UI/tests）；见 ADR-0095。
 - **M3 第九十九切片**：session search FTS5（messages/events 外部内容索引、triggers、旧库 one-time rebuild、ASCII prefix 查询、空结果/非 ASCII LIKE fallback、跨 project filter、测试）；见 ADR-0096。
-- **M3 第一百切片**：context compaction（top-level run 起始阈值、user 边界切割、summary request/usage/budget、`context.compacted` + `through_message_id`、resume 从 summary、失败继续、测试）；见 ADR-0097。
+- **M3 第一百切片**：context compaction（阈值触发、安全边界切割、summary request/usage/budget、`context.compacted` + `through_message_id`、resume 从 summary、失败继续、测试）；见 ADR-0097。
+- **M3 第一百零一切片**：model-aware context budget（global/per-role context window、75% hard-limit threshold、每个 turn 检查、message-ID tracking、summary 后 rolling trim fallback、`mode: trim` event、Settings ctx 字段、测试）；见 ADR-0098。
 
 ## 如何运行
 

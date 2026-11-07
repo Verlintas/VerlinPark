@@ -56,8 +56,16 @@ fn compact_after_tokens() -> u64 {
     env::var("VERLINPARK_COMPACT_AFTER_TOKENS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(24_000)
-        .min(2_000_000)
+        .unwrap_or(0)
+        .min(20_000_000)
+}
+
+fn context_window() -> u64 {
+    env::var("VERLINPARK_CONTEXT_WINDOW")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(128_000)
+        .min(10_000_000)
 }
 
 fn compact_keep_messages() -> usize {
@@ -137,6 +145,9 @@ pub struct AgentConfig {
     pub compact_after_tokens: u64,
     /// Number of recent messages to retain outside the compacted summary.
     pub compact_keep_messages: usize,
+    /// Base model context window in tokens. Zero disables automatic context
+    /// management. Per-role role_models can override this.
+    pub context_window: u64,
 }
 
 /// Daemon-wide admission control for Worker/Labour runs. Per-session caps still
@@ -1455,6 +1466,7 @@ impl AgentService {
                     .clamp(60, 86400),
                 compact_after_tokens: compact_after_tokens(),
                 compact_keep_messages: compact_keep_messages(),
+                context_window: context_window(),
             },
         )
     }
@@ -1551,6 +1563,10 @@ impl AgentService {
                 .clamp(60, 86400),
             compact_after_tokens: compact_after_tokens(),
             compact_keep_messages: compact_keep_messages(),
+            context_window: params
+                .context_window
+                .map(|value| value.min(10_000_000))
+                .unwrap_or_else(context_window),
         };
         *self
             .config
@@ -1573,6 +1589,7 @@ impl AgentService {
                 base_url: config.base_url.clone(),
                 role_models: config.role_models.clone(),
                 capacity: self.capacity.snapshot(),
+                context_window: Some(config.context_window),
             },
             None => AgentInfo {
                 configured: false,
@@ -1581,6 +1598,7 @@ impl AgentService {
                 base_url: None,
                 role_models: RoleModels::default(),
                 capacity: self.capacity.snapshot(),
+                context_window: None,
             },
         }
     }
@@ -2050,7 +2068,7 @@ impl AgentService {
             &resolver_spec,
             &prompt,
             &mut conversation,
-            &[],
+            None,
             false,
         )
         .await;
@@ -3277,7 +3295,7 @@ async fn run_agent(
 
     let loaded = load_conversation(&engine, session_id).await?;
     let mut conversation = loaded.messages;
-    let conversation_ids = loaded.ids;
+    let mut conversation_ids = loaded.ids;
     let result = run_loop(
         &engine,
         &config,
@@ -3288,7 +3306,7 @@ async fn run_agent(
         &spec,
         prompt,
         &mut conversation,
-        &conversation_ids,
+        Some(&mut conversation_ids),
         true,
     )
     .await;
@@ -3793,7 +3811,7 @@ async fn verify_worker(
         &verifier_spec,
         &prompt,
         &mut conversation,
-        &[],
+        None,
         false,
     )
     .await;
@@ -5460,6 +5478,21 @@ async fn collect_compaction_completion(
     Ok((text, usage))
 }
 
+fn safe_context_cut(conversation: &[ChatMessage], keep: usize, floor: usize) -> Option<usize> {
+    let len = conversation.len();
+    if len <= keep.saturating_add(floor).saturating_add(1) {
+        return None;
+    }
+    let min_cut = len.saturating_sub(keep).max(floor.saturating_add(1));
+    (min_cut..len.saturating_sub(1))
+        .find(|index| matches!(conversation[*index].role.as_str(), "user" | "assistant"))
+}
+
+/// Keep the active context under the model window. The primary strategy is a
+/// persistent summary plus a retained tail. If summarization is unavailable,
+/// fails, or the summarized context is still above the hard limit, older
+/// messages are dropped at safe user/assistant boundaries as a rolling-window
+/// fallback. Original messages remain in SQLite for search and audit.
 #[allow(clippy::too_many_arguments)]
 async fn compact_context_if_needed(
     engine: &Engine,
@@ -5469,149 +5502,198 @@ async fn compact_context_if_needed(
     budget: &SessionBudget,
     control: &RunControl,
     conversation: &mut Vec<ChatMessage>,
-    conversation_ids: &[Option<String>],
+    conversation_ids: &mut Vec<Option<String>>,
+    compact_threshold: u64,
+    hard_limit: u64,
 ) -> Result<bool> {
-    if config.compact_after_tokens == 0 || budget.exhausted() {
+    if (compact_threshold == 0 && hard_limit == u64::MAX) || budget.exhausted() {
         return Ok(false);
     }
     let keep = config.compact_keep_messages.max(2);
-    if conversation.len() <= keep.saturating_add(1) {
+    if conversation.len() <= keep {
         return Ok(false);
     }
-    let estimated = estimate_messages_tokens(conversation);
-    if estimated < config.compact_after_tokens {
+    let estimated_before = estimate_messages_tokens(conversation);
+    if estimated_before < compact_threshold && estimated_before <= hard_limit {
         return Ok(false);
     }
-    let Some(protected_from) = conversation
-        .iter()
-        .rposition(|message| message.role == "user")
-    else {
-        return Ok(false);
-    };
-    let min_cut = conversation.len().saturating_sub(keep);
-    if min_cut == 0 || min_cut >= protected_from {
-        return Ok(false);
-    }
-    let Some(cut) = (min_cut..protected_from).find(|index| conversation[*index].role == "user")
-    else {
-        return Ok(false);
-    };
-    if cut == 0 {
-        return Ok(false);
-    }
-    let Some(through_id) = conversation_ids.get(cut - 1).cloned().flatten() else {
-        return Ok(false);
-    };
-    let transcript = compaction_transcript(&conversation[..cut]);
-    if transcript.trim().is_empty() {
-        return Ok(false);
-    }
-    let request = ChatRequest {
-        model: model_for(config, spec.role),
-        messages: vec![ChatMessage::user(transcript)],
-        system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
-        max_tokens: Some(1024),
-        temperature: Some(0.2),
-        tools: Vec::new(),
-    };
-    let reservation = if budget.limit.is_some() {
-        match budget.reserve_tokens(estimate_request_tokens(&request).saturating_add(1024)) {
-            Some(reservation) => Some(reservation),
-            None => return Ok(false),
-        }
+    let mut estimated = estimated_before;
+    let mut summarized_messages = 0usize;
+    let mut dropped_messages = 0usize;
+    // Preserve a summary already loaded at the head of the conversation. A
+    // trim-only pass must carry it into the new event, or resume would lose it.
+    let mut summary_text = if conversation_ids.first().is_some_and(Option::is_none) {
+        conversation.first().map(|message| message.content.clone())
     } else {
         None
     };
-    let outcome = collect_compaction_completion(
-        config.provider.as_ref(),
-        &request,
-        Duration::from_secs(config.provider_idle_timeout_secs),
-        control,
-    )
-    .await;
-    let (summary, usage) = match outcome {
-        Ok(value) => value,
-        Err(error) => {
-            drop(reservation);
-            emit(
-                engine,
-                &session.id,
-                spec,
-                "context.compact_failed",
-                serde_json::json!({
-                    "error": truncate(&format!("{error:#}")),
-                }),
-            )
-            .await?;
-            return Ok(false);
+    let mut through_id: Option<String> = None;
+    let mut usage_tokens = (0u64, 0u64);
+    let mut usage_estimated = true;
+
+    if compact_threshold > 0
+        && estimated >= compact_threshold
+        && let Some(cut) = safe_context_cut(conversation, keep, 0)
+        && let Some(through) = conversation_ids
+            .get(cut.saturating_sub(1))
+            .cloned()
+            .flatten()
+    {
+        let transcript = compaction_transcript(&conversation[..cut]);
+        if !transcript.trim().is_empty() {
+            let request = ChatRequest {
+                model: model_for(config, spec.role),
+                messages: vec![ChatMessage::user(transcript)],
+                system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
+                max_tokens: Some(1024),
+                temperature: Some(0.2),
+                tools: Vec::new(),
+            };
+            let reservation = budget
+                .limit
+                .is_some()
+                .then(|| {
+                    budget.reserve_tokens(estimate_request_tokens(&request).saturating_add(1024))
+                })
+                .flatten();
+            if reservation.is_none() && budget.limit.is_some() {
+                // Not enough token budget for a safe summary; the hard-limit
+                // trim below still keeps the run alive.
+            } else {
+                let outcome = collect_compaction_completion(
+                    config.provider.as_ref(),
+                    &request,
+                    Duration::from_secs(config.provider_idle_timeout_secs),
+                    control,
+                )
+                .await;
+                match outcome {
+                    Ok((summary, usage)) => {
+                        let summary = summary.trim();
+                        if !summary.is_empty() {
+                            let (input_tokens, output_tokens, estimated_usage) = if usage != (0, 0)
+                            {
+                                (usage.0, usage.1, false)
+                            } else {
+                                (
+                                    estimate_request_tokens(&request),
+                                    estimate_text_tokens(summary),
+                                    true,
+                                )
+                            };
+                            let (input_price, output_price) = role_price(config, spec.role);
+                            let cost =
+                                usage_cost(input_tokens, output_tokens, input_price, output_price);
+                            engine
+                                .record_agent_usage(
+                                    &session.id,
+                                    &spec.id,
+                                    &spec.name,
+                                    "compaction",
+                                    spec.task_id.clone(),
+                                    spec.department.clone(),
+                                    &request.model,
+                                    input_tokens,
+                                    output_tokens,
+                                    estimated_usage,
+                                    cost,
+                                )
+                                .await?;
+                            if let Some(reservation) = reservation {
+                                let _ =
+                                    reservation.settle(input_tokens.saturating_add(output_tokens));
+                            }
+                            budget.add_cost(cost);
+                            let prefixed = format!(
+                                "Earlier conversation summary (auto-compacted from {cut} messages):\n{summary}"
+                            );
+                            conversation.drain(..cut);
+                            conversation_ids.drain(..cut);
+                            conversation.insert(0, ChatMessage::user(prefixed.clone()));
+                            conversation_ids.insert(0, None);
+                            summarized_messages = cut;
+                            summary_text = Some(prefixed);
+                            through_id = Some(through);
+                            usage_tokens = (input_tokens, output_tokens);
+                            usage_estimated = estimated_usage;
+                            estimated = estimate_messages_tokens(conversation);
+                        }
+                    }
+                    Err(error) => {
+                        drop(reservation);
+                        emit(
+                            engine,
+                            &session.id,
+                            spec,
+                            "context.compact_failed",
+                            serde_json::json!({
+                                "error": truncate(&format!("{error:#}")),
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+            }
         }
-    };
-    let summary = summary.trim();
-    if summary.is_empty() {
-        drop(reservation);
-        emit(
-            engine,
-            &session.id,
-            spec,
-            "context.compact_failed",
-            serde_json::json!({"error": "context compaction returned an empty summary"}),
-        )
-        .await?;
+    }
+
+    // Rolling-window fallback: keep the summary at index 0 when one exists,
+    // otherwise drop from the beginning at safe message boundaries.
+    let floor = usize::from(summary_text.is_some());
+    while estimated > hard_limit {
+        let Some(cut) = safe_context_cut(conversation, keep, floor) else {
+            break;
+        };
+        if cut <= floor {
+            break;
+        }
+        let Some(through) = conversation_ids.get(cut - 1).cloned().flatten() else {
+            break;
+        };
+        let removed = cut - floor;
+        if floor == 0 {
+            conversation.drain(..cut);
+            conversation_ids.drain(..cut);
+        } else {
+            conversation.drain(floor..cut);
+            conversation_ids.drain(floor..cut);
+        }
+        dropped_messages = dropped_messages.saturating_add(removed);
+        through_id = Some(through);
+        estimated = estimate_messages_tokens(conversation);
+    }
+
+    if summarized_messages == 0 && dropped_messages == 0 {
         return Ok(false);
     }
-    let (input_tokens, output_tokens, estimated_usage) = if usage != (0, 0) {
-        (usage.0, usage.1, false)
+    let mode = if summary_text.is_some() {
+        "summary"
     } else {
-        (
-            estimate_request_tokens(&request),
-            estimate_text_tokens(summary),
-            true,
-        )
+        "trim"
     };
-    let (input_price, output_price) = role_price(config, spec.role);
-    let cost = usage_cost(input_tokens, output_tokens, input_price, output_price);
-    engine
-        .record_agent_usage(
-            &session.id,
-            &spec.id,
-            &spec.name,
-            "compaction",
-            spec.task_id.clone(),
-            spec.department.clone(),
-            &request.model,
-            input_tokens,
-            output_tokens,
-            estimated_usage,
-            cost,
-        )
-        .await?;
-    if let Some(reservation) = reservation {
-        let _ = reservation.settle(input_tokens.saturating_add(output_tokens));
-    }
-    budget.add_cost(cost);
-    let kept = conversation.len().saturating_sub(cut);
-    let summary =
-        format!("Earlier conversation summary (auto-compacted from {cut} messages):\n{summary}");
+    let kept_messages = conversation.len();
     emit(
         engine,
         &session.id,
         spec,
         "context.compacted",
         serde_json::json!({
+            "mode": mode,
             "through_message_id": through_id,
-            "summary": summary,
-            "summarized_messages": cut,
-            "kept_messages": kept,
-            "estimated_tokens_before": estimated,
-            "threshold_tokens": config.compact_after_tokens,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "estimated": estimated_usage,
+            "summary": summary_text,
+            "summarized_messages": summarized_messages,
+            "dropped_messages": dropped_messages,
+            "kept_messages": kept_messages,
+            "estimated_tokens_before": estimated_before,
+            "estimated_tokens_after": estimated,
+            "threshold_tokens": compact_threshold,
+            "hard_limit_tokens": hard_limit,
+            "input_tokens": usage_tokens.0,
+            "output_tokens": usage_tokens.1,
+            "estimated": usage_estimated,
         }),
     )
     .await?;
-    conversation.drain(..cut);
-    conversation.insert(0, ChatMessage::user(summary));
     Ok(true)
 }
 
@@ -5627,9 +5709,14 @@ async fn run_loop(
     spec: &AgentSpec,
     objective: &str,
     conversation: &mut Vec<ChatMessage>,
-    conversation_ids: &[Option<String>],
+    conversation_ids: Option<&mut Vec<Option<String>>>,
     top_level: bool,
 ) -> Result<LoopOutcome> {
+    let mut empty_ids = Vec::new();
+    let conversation_ids: &mut Vec<Option<String>> = match conversation_ids {
+        Some(ids) => ids,
+        None => &mut empty_ids,
+    };
     let task_priority = if let Some(task_id) = &spec.task_id {
         engine
             .get_team_plan(&session.id)
@@ -5740,19 +5827,6 @@ async fn run_loop(
         read_jail: shell_policy.read_jail,
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
-    if top_level {
-        compact_context_if_needed(
-            engine,
-            config,
-            session,
-            spec,
-            budget,
-            control,
-            conversation,
-            conversation_ids,
-        )
-        .await?;
-    }
     let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;
     let mut tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
     tools.extend(
@@ -5760,6 +5834,12 @@ async fn run_loop(
             .iter()
             .map(|binding| binding.schema.clone()),
     );
+    let system_tokens = estimate_text_tokens(&system);
+    let tool_tokens = serde_json::to_string(&tools)
+        .map(|schema| estimate_text_tokens(&schema))
+        .unwrap_or(0);
+    let (context_threshold, context_hard_limit) =
+        context_limits(config, spec.role, system_tokens, tool_tokens);
     let mut team_plan = engine.get_team_plan(&session.id).await?;
     let project_budget = engine.get_project_budget(&project.id).await?;
     let plan_budget = PlanBudgetScope::from_plan(
@@ -5797,6 +5877,27 @@ async fn run_loop(
                 }),
             )
             .await?;
+        }
+        if top_level {
+            compact_context_if_needed(
+                engine,
+                config,
+                session,
+                spec,
+                budget,
+                control,
+                conversation,
+                &mut *conversation_ids,
+                context_threshold,
+                context_hard_limit,
+            )
+            .await?;
+            if control.is_cancelled() {
+                return Ok(LoopOutcome::Cancelled);
+            }
+            if budget.exhausted() {
+                return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
+            }
         }
         let mut request = ChatRequest {
             model: model_for(config, spec.role),
@@ -6020,7 +6121,7 @@ async fn run_loop(
             Some(tool_calls.clone())
         };
         if top_level {
-            engine
+            let stored = engine
                 .append_message(
                     &session.id,
                     "assistant",
@@ -6029,6 +6130,7 @@ async fn run_loop(
                     None,
                 )
                 .await?;
+            conversation_ids.push(Some(stored.id));
         }
         emit(
             engine,
@@ -6593,7 +6695,7 @@ async fn run_loop(
                                     &child_spec,
                                     &child_objective,
                                     &mut child_conversation,
-                                    &[],
+                                    None,
                                     false,
                                 )
                                 .await;
@@ -6808,7 +6910,7 @@ async fn run_loop(
             )
             .await?;
             if top_level {
-                engine
+                let stored = engine
                     .append_message(
                         &session.id,
                         "tool",
@@ -6817,6 +6919,7 @@ async fn run_loop(
                         Some(call_id.clone()),
                     )
                     .await?;
+                conversation_ids.push(Some(stored.id));
             }
             conversation.push(ChatMessage::tool(call_id, output.content));
         }
@@ -7403,6 +7506,45 @@ fn model_for(config: &AgentConfig, role: AgentRole) -> String {
         .filter(|model| !model.is_empty())
         .unwrap_or(&config.model)
         .to_string()
+}
+
+fn context_window_for(config: &AgentConfig, role: AgentRole) -> u64 {
+    config
+        .role_models
+        .for_role(role.as_str())
+        .context_window
+        .filter(|value| *value > 0)
+        .unwrap_or(config.context_window)
+        .min(10_000_000)
+}
+
+/// Derive the summarization threshold and the hard context limit from the
+/// model window, output reserve, system prompt, and tool schemas. The fixed
+/// 24k default is gone: a 1M-token model gets a ~75% window threshold while a
+/// local 8k model gets a much lower one.
+fn context_limits(
+    config: &AgentConfig,
+    role: AgentRole,
+    system_tokens: u64,
+    tool_tokens: u64,
+) -> (u64, u64) {
+    let window = context_window_for(config, role);
+    if window == 0 {
+        return (config.compact_after_tokens, u64::MAX);
+    }
+    let output = u64::from(config.max_tokens.unwrap_or(4096));
+    let fixed = output
+        .saturating_add(system_tokens)
+        .saturating_add(tool_tokens)
+        .saturating_add(512);
+    let hard_limit = window.saturating_sub(fixed).max(1024);
+    let threshold = if config.compact_after_tokens > 0 {
+        config.compact_after_tokens.min(hard_limit)
+    } else {
+        hard_limit.saturating_mul(3) / 4
+    }
+    .max(512);
+    (threshold, hard_limit)
 }
 
 fn role_price(config: &AgentConfig, role: AgentRole) -> (f64, f64) {
@@ -8091,7 +8233,7 @@ async fn run_parallel_workers(
                 child_spec,
                 objective,
                 conversation,
-                &[],
+                None,
                 false,
             )
         });
@@ -8582,7 +8724,7 @@ async fn deliberate_team_plan(
                 manager,
                 prompt,
                 conversation,
-                &[],
+                None,
                 false,
             )
         });
@@ -9220,7 +9362,7 @@ async fn execute_team_plan(
                     worker_spec,
                     objective,
                     conversation,
-                    &[],
+                    None,
                     false,
                 )
             });
@@ -9719,6 +9861,11 @@ async fn load_conversation(engine: &Engine, session_id: &str) -> Result<LoadedCo
         .latest_event_of_kind(session_id, "context.compacted")
         .await?
     {
+        let mode = event
+            .payload
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("summary");
         let through = event
             .payload
             .get("through_message_id")
@@ -9728,11 +9875,13 @@ async fn load_conversation(engine: &Engine, session_id: &str) -> Result<LoadedCo
             .get("summary")
             .and_then(serde_json::Value::as_str)
             .filter(|text| !text.trim().is_empty());
-        if let (Some(through), Some(text)) = (through, text)
+        if let Some(through) = through
             && let Some(index) = messages.iter().position(|message| message.id == through)
         {
             start = index.saturating_add(1);
-            summary = Some(text.to_string());
+            if mode == "summary" {
+                summary = text.map(str::to_string);
+            }
         }
     }
     let mut ids = messages

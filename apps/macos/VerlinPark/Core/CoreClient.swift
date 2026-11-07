@@ -1070,7 +1070,8 @@ actor CoreClient {
         maxManagers: Int,
         maxWorkers: Int,
         maxLabour: Int,
-        autoExpandWorkers: Bool = false
+        autoExpandWorkers: Bool = false,
+        contextWindow: Int? = nil
     ) async throws -> AgentInfo {
         var params: [String: JSONValue] = [
             "provider": .string(kind),
@@ -1087,6 +1088,9 @@ actor CoreClient {
         if !apiKey.isEmpty {
             params["api_key"] = .string(apiKey)
         }
+        if let contextWindow {
+            params["context_window"] = .number(Double(contextWindow))
+        }
         return try await request(method: "agent.configure", params: params)
             .decode(AgentInfo.self)
     }
@@ -1102,6 +1106,9 @@ actor CoreClient {
             }
             if let price = role.outputUsdPerMillion, price > 0 {
                 object["output_usd_per_million"] = .number(price)
+            }
+            if let contextWindow = role.contextWindow, contextWindow > 0 {
+                object["context_window"] = .number(Double(contextWindow))
             }
             return .object(object)
         }

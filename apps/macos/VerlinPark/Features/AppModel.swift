@@ -188,6 +188,8 @@ final class AppModel {
         UserDefaults.standard.string(forKey: "provider.baseURL")
             ?? "https://api.openai.com/v1"
     var providerModel = UserDefaults.standard.string(forKey: "provider.model") ?? ""
+    var providerContextWindowText =
+        UserDefaults.standard.string(forKey: "provider.contextWindow") ?? "128000"
     var roleModels = AppModel.loadRoleModels()
     var orgManagers = 4
     var orgWorkers = 6
@@ -216,6 +218,12 @@ final class AppModel {
     var doctorReport: DoctorReport?
     var doctorBusy = false
     var doctorStatus: String?
+
+    private var parsedContextWindow: Int? {
+        let trimmed = providerContextWindowText.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, let value = Int(trimmed) else { return nil }
+        return max(0, min(value, 10_000_000))
+    }
 
     private static func loadRoleModels() -> RoleModels {
         guard let data = UserDefaults.standard.data(forKey: "provider.roleModels"),
@@ -1988,7 +1996,8 @@ final class AppModel {
                 maxManagers: caps.managers,
                 maxWorkers: caps.workers,
                 maxLabour: caps.labour,
-                autoExpandWorkers: autoExpandWorkers
+                autoExpandWorkers: autoExpandWorkers,
+                contextWindow: parsedContextWindow
             )
             agentInfo = info
             roleModels = info.roleModels
@@ -2000,6 +2009,7 @@ final class AppModel {
             UserDefaults.standard.set(providerKind, forKey: "provider.kind")
             UserDefaults.standard.set(baseURL, forKey: "provider.baseURL")
             UserDefaults.standard.set(model, forKey: "provider.model")
+            UserDefaults.standard.set(providerContextWindowText, forKey: "provider.contextWindow")
             if let data = try? JSONEncoder().encode(roleModels) {
                 UserDefaults.standard.set(data, forKey: "provider.roleModels")
             }
@@ -2029,7 +2039,8 @@ final class AppModel {
                 maxManagers: caps.managers,
                 maxWorkers: caps.workers,
                 maxLabour: caps.labour,
-                autoExpandWorkers: autoExpandWorkers
+                autoExpandWorkers: autoExpandWorkers,
+                contextWindow: parsedContextWindow
             )
         } catch {
             providerStatus = error.localizedDescription
@@ -2437,7 +2448,11 @@ final class AppModel {
 
     func refreshAgentInfo() async {
         do {
-            agentInfo = try await core.agentInfo()
+            let info = try await core.agentInfo()
+            agentInfo = info
+            if let contextWindow = info.contextWindow, contextWindow > 0 {
+                providerContextWindowText = String(contextWindow)
+            }
         } catch {
             handle(error)
         }

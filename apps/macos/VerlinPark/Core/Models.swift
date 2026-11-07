@@ -1075,11 +1075,13 @@ struct RoleModelConfig: Codable, Hashable, Sendable {
     var model: String? = nil
     var inputUsdPerMillion: Double? = nil
     var outputUsdPerMillion: Double? = nil
+    var contextWindow: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case model
         case inputUsdPerMillion = "input_usd_per_million"
         case outputUsdPerMillion = "output_usd_per_million"
+        case contextWindow = "context_window"
     }
 }
 
@@ -1120,6 +1122,7 @@ struct AgentInfo: Codable, Sendable {
     let baseUrl: String?
     let roleModels: RoleModels
     let capacity: CapacityInfo?
+    let contextWindow: Int?
 
     enum CodingKeys: String, CodingKey {
         case configured
@@ -1128,6 +1131,7 @@ struct AgentInfo: Codable, Sendable {
         case baseUrl = "base_url"
         case roleModels = "role_models"
         case capacity
+        case contextWindow = "context_window"
     }
 }
 

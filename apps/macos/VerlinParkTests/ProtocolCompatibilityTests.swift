@@ -11,17 +11,21 @@ final class ProtocolCompatibilityTests: XCTestCase {
           "model": null,
           "base_url": null,
           "role_models": {
-            "leader": {},
+            "leader": {"context_window": 1000000},
             "manager": {},
-            "worker": {},
+            "worker": {"context_window": 8000},
             "verifier": {},
             "labour": {}
-          }
+          },
+          "context_window": 128000
         }
         """
         let info = try JSONDecoder().decode(AgentInfo.self, from: Data(json.utf8))
         XCTAssertFalse(info.configured)
         XCTAssertNil(info.capacity)
+        XCTAssertEqual(info.contextWindow, 128_000)
+        XCTAssertEqual(info.roleModels.leader.contextWindow, 1_000_000)
+        XCTAssertEqual(info.roleModels.worker.contextWindow, 8000)
     }
 
     func testUsageTotalsWithoutDepartmentBucketStillDecodes() throws {
