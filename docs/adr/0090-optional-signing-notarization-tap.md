@@ -1,7 +1,13 @@
 # ADR-0090: Optional Developer ID signing, notarization, and tap publish
 
-- **Status:** Accepted
+- **Status:** Accepted; Developer ID/notarization deferred by product decision
 - **Date:** 2026-11-07
+
+> **Product note (2026-11-07):** Developer ID signing and notarization are
+> explicitly out of scope for now. The ad-hoc DMG is the supported distribution
+> path and does not require an Apple Developer account. The optional code and
+> workflow hooks stay for a possible later reversal, but are not an active
+> roadmap item.
 
 ## Context
 
