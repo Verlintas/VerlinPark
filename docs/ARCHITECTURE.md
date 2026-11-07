@@ -1009,6 +1009,7 @@ Scout 产出的结构化摘要：
 4. 每个 top-level provider 调用前按 `context_window - output - system/tools` 计算 hard limit；默认 threshold 为 75%，global/per-role context window 由用户配置（默认 128k，0 关闭）。比较 threshold/hard limit 时计入 system prompt 与 tool schema，因为它们属于同一个 provider request。超过 threshold → 在安全 user/assistant 边界压缩早期消息，保留 plan/acceptance/decisions、`VERLINPARK_COMPACT_KEEP_MESSAGES` 条最近消息和 summary；原始消息仍留在 DB。
 5. 压缩失败或仍超 hard limit → 发 `context.compact_failed` / `context.compacted(mode=trim)`，在安全 user/assistant 边界滚动裁剪；不删除原始消息。真正的 provider context overflow 仍由 provider 返回错误。
 6. 每个 top-level turn 在调用 provider 前写 `context.usage`（active tokens / window / threshold / hard limit / messages）；`session.context` / `vp context` / Stage header 读取最新 usage 和最近一次 compaction/trim。
+7. `session.compact` / `vp compact` / Stage context popover 可对非运行 session 强制对 active conversation 做 summary/trim；复用同一 event/usage pipeline，运行中/暂停/等待输入拒绝，手动 compaction 期间阻止新 prompt。
 
 ### 12.4 Prompt 结构
 

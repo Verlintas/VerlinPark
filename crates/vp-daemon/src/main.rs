@@ -40,11 +40,11 @@ use vp_protocol::types::{
     PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams, PromptParams,
     PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
     ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
-    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionContextParams,
-    SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
-    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
-    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
-    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
+    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionCompactParams,
+    SessionContextParams, SessionDiffParams, SessionExportParams, SessionImportParams,
+    SessionListResult, SessionLogParams, SessionPauseParams, SessionPauseResult,
+    SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
+    SessionTodosParams, SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
     SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
     SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
     SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
@@ -888,6 +888,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .session_context_status(&params.session_id)
                 .await
             {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.compact" => match parse_params::<SessionCompactParams>(request.params) {
+            Ok(params) => match state.agent.compact_now(&params.session_id).await {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },

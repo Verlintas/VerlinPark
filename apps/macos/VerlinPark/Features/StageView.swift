@@ -35,6 +35,7 @@ private struct ProjectStageView: View {
     @Binding var showingNewSession: Bool
     @State private var draft = ""
     @State private var showingSearch = false
+    @State private var showingContext = false
     @FocusState private var composerFocused: Bool
 
     var body: some View {
@@ -54,18 +55,8 @@ private struct ProjectStageView: View {
         }
     }
 
-    private func tokenLabel(_ value: Int) -> String {
-        if value >= 1_000_000 {
-            return String(format: "%.1fM", Double(value) / 1_000_000)
-        }
-        if value >= 1000 {
-            return "\(value / 1000)k"
-        }
-        return "\(value)"
-    }
-
     private func contextLabel(_ usage: ContextUsage) -> String {
-        "ctx \(tokenLabel(usage.estimatedTokens))/\(tokenLabel(usage.thresholdTokens))"
+        "ctx \(contextTokenLabel(usage.estimatedTokens))/\(contextTokenLabel(usage.thresholdTokens))"
     }
 
     private func contextHelp(_ usage: ContextUsage) -> String {
@@ -97,13 +88,22 @@ private struct ProjectStageView: View {
                     }
                     if let usage = model.contextStatus?.usage {
                         Text("·")
-                        Text(contextLabel(usage))
-                            .foregroundStyle(
-                                usage.estimatedTokens >= usage.thresholdTokens
-                                    ? Color.orange
-                                    : Color.secondary
-                            )
-                            .help(contextHelp(usage))
+                        Button {
+                            showingContext.toggle()
+                        } label: {
+                            Text(contextLabel(usage))
+                                .foregroundStyle(
+                                    usage.estimatedTokens >= usage.thresholdTokens
+                                        ? Color.orange
+                                        : Color.secondary
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .help(contextHelp(usage))
+                        .popover(isPresented: $showingContext, arrowEdge: .bottom) {
+                            ContextPopoverView()
+                                .environment(model)
+                        }
                     }
                 }
                 .font(.system(size: 10, design: .monospaced))
@@ -247,7 +247,7 @@ private struct ProjectStageView: View {
         let textEmpty = draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let status = model.selectedSession?.status
         let running = status == "running" || status == "paused" || status == "queued"
-        return textEmpty || model.isBusy || running
+        return textEmpty || model.isBusy || model.compactBusy || running
     }
 
     private func send() {
@@ -258,6 +258,129 @@ private struct ProjectStageView: View {
             Task { await model.sendMessage(goal) }
         } else {
             Task { await model.createSession(goal: goal) }
+        }
+    }
+}
+
+private func contextTokenLabel(_ value: Int) -> String {
+    if value >= 1_000_000 {
+        return String(format: "%.1fM", Double(value) / 1_000_000)
+    }
+    if value >= 1000 {
+        return "\(value / 1000)k"
+    }
+    return "\(value)"
+}
+
+private struct ContextPopoverView: View {
+    @Environment(AppModel.self) private var model
+
+    private var sessionStatus: String {
+        model.selectedSession?.status ?? "draft"
+    }
+
+    private var compactDisabled: Bool {
+        model.compactBusy
+            || ["running", "queued", "paused", "waiting_input", "imported"].contains(sessionStatus)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let status = model.contextStatus, let usage = status.usage {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Context")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Text("\(contextTokenLabel(usage.estimatedTokens)) active")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(
+                            usage.estimatedTokens >= usage.thresholdTokens
+                                ? Color.orange
+                                : Color.secondary
+                        )
+                }
+
+                ProgressView(value: contextProgress(usage))
+                    .tint(
+                        usage.estimatedTokens >= usage.hardLimitTokens
+                            ? .red
+                            : usage.estimatedTokens >= usage.thresholdTokens ? .orange : .accentColor
+                    )
+
+                HStack(spacing: 18) {
+                    metric("Window", contextTokenLabel(usage.contextWindow))
+                    metric("Summary at", contextTokenLabel(usage.thresholdTokens))
+                    metric("Hard limit", contextTokenLabel(usage.hardLimitTokens))
+                }
+
+                Text("\(usage.messages) active messages. Estimates are refreshed before each provider call.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Divider()
+
+                if let compaction = status.lastCompaction {
+                    Text("LAST COMPACTION")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    Text(
+                        "\(compaction.mode) · \(compaction.summarizedMessages) summarized · \(compaction.droppedMessages) dropped · \(compaction.keptMessages) kept"
+                    )
+                    .font(.system(size: 11))
+                    Text(
+                        "\(contextTokenLabel(compaction.estimatedTokensBefore)) → \(contextTokenLabel(compaction.estimatedTokensAfter)) active tokens"
+                    )
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                } else {
+                    Text("No compaction yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Divider()
+
+                HStack(spacing: 10) {
+                    Button(model.compactBusy ? "Compacting…" : "Compact now") {
+                        Task { await model.compactSession() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(compactDisabled)
+                    if let notice = model.compactNotice {
+                        Text(notice)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Text(
+                    "Summarizes older messages and keeps the recent tail. Original messages remain searchable."
+                )
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            } else {
+                Text("Context usage has not been recorded for this session yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+        .frame(width: 350)
+    }
+
+    private func contextProgress(_ usage: ContextUsage) -> Double {
+        guard usage.contextWindow > 0 else { return 0 }
+        return min(1, Double(usage.estimatedTokens) / Double(usage.contextWindow))
+    }
+
+    private func metric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 11, design: .monospaced))
         }
     }
 }

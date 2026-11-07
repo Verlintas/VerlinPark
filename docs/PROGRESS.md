@@ -12,8 +12,8 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | Leader Agent | ✅ | 流式对话、工具调用、审批、session 预算、取消、todo 计划 |
-| Context usage | ✅ | 每次 top-level provider call 前写 `context.usage`（estimated/window/threshold/hard limit/messages）；`session.context` / `vp context` 返回最新 usage + last compaction；Stage header 显示 `ctx used/threshold`，超 threshold 变橙色；来源为事件，replay/CLI 可查 |
-| Context compaction | ✅ | 按模型 context window 自适应：`VERLINPARK_CONTEXT_WINDOW` 默认 128k（0 关闭），`RoleModelConfig.context_window` 可按角色覆盖；hard limit = window - output - system/tools - 512，summary threshold = 75% hard limit，`VERLINPARK_COMPACT_AFTER_TOKENS` 可显式覆盖；threshold/hard-limit 比较计入 system/tool tokens（与 provider request 一致）；每个 top-level turn 前检查；context 估算按 4 ASCII chars/token + 1.5 non-ASCII tokens/char，summary transcript 也受模型窗口约束；summary + retained tail 为主，失败/仍超 hard limit 时按 user/assistant 安全边界滚动裁剪；`context.compacted` 记录 `mode: summary|trim` + `through_message_id`，原消息保留；usage 记为 `compaction`；不做 checkpoint/resume |
+| Context usage | ✅ | 每次 top-level provider call 前写 `context.usage`（estimated/window/threshold/hard limit/messages）；`session.context` / `vp context` 返回最新 usage + last compaction；Stage header 显示 `ctx used/threshold`，超 threshold 变橙色；点击打开 context popover（window/threshold/hard limit/messages/最近 compaction/手动 compact）；来源为事件，replay/CLI 可查 |
+| Context compaction | ✅ | 按模型 context window 自适应：`VERLINPARK_CONTEXT_WINDOW` 默认 128k（0 关闭），`RoleModelConfig.context_window` 可按角色覆盖；hard limit = window - output - system/tools - 512，summary threshold = 75% hard limit，`VERLINPARK_COMPACT_AFTER_TOKENS` 可显式覆盖；threshold/hard-limit 比较计入 system/tool tokens（与 provider request 一致）；每个 top-level turn 前检查；context 估算按 4 ASCII chars/token + 1.5 non-ASCII tokens/char，summary transcript 也受模型窗口约束；summary + retained tail 为主，失败/仍超 hard limit 时按 user/assistant 安全边界滚动裁剪；`context.compacted` 记录 `mode: summary|trim` + `through_message_id`，原消息保留；usage 记为 `compaction`；`session.compact` / `vp compact` / popover 可对 idle/failed/cancelled/landed session 手动强制 compaction（同一 summary/trim pipeline，运行中/暂停/等待输入拒绝）；不做 checkpoint/resume |
 | Provider 流可靠性 | ✅ | 启动前 transient retry；无任何输出前最多 3 次 stream attempts（含首次）；partial failure/cancel 保留 `partial: true` message 并结算 provider usage 或估算 usage；partial 后不 replay；`agent.probe` 返回 chunks/first-token/done；真实 OpenAI/Anthropic/local live tests 默认 ignored |
 | Session worktree | ✅ | 每个 session 独立 Git worktree + 分支；项目根只读 |
 | 四层组织 | ✅ | Leader → Manager → Worker → Labour；严格链路，Manager 必须有部门 title |
@@ -65,8 +65,8 @@
 
 ## 验证
 
-- `cargo test --workspace`：220 个测试通过（core 173、store 39、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
-- `xcodebuild test`：41 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
+- `cargo test --workspace`：224 个测试通过（core 177、store 39、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `xcodebuild test`：42 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
 - 最近 CI：GitHub hosted macOS runner 持续排队/容量受限；本地 lint、Rust/Swift 测试与打包通过。
@@ -233,6 +233,7 @@
 - **M3 第一百切片**：context compaction（阈值触发、安全边界切割、summary request/usage/budget、`context.compacted` + `through_message_id`、resume 从 summary、失败继续、测试）；见 ADR-0097。
 - **M3 第一百零一切片**：model-aware context budget（global/per-role context window、75% hard-limit threshold、每个 turn 检查、message-ID tracking、summary 后 rolling trim fallback、`mode: trim` event、Settings ctx 字段、测试）；见 ADR-0098。
 - **M3 第一百零二切片**：context usage observability（每个 top-level turn 的 `context.usage` event、`session.context`/`vp context`、Stage header ctx pill + tooltip、最近 summary/trim；`context.usage` test 与 Swift decode）；同时修正 compaction 阈值未计入 system/tool tokens 的问题，并把 agent/ACP 的错误截断改为 UTF-8 安全；见 ADR-0098 更新。
+- **M3 第一百零三切片**：manual context compaction（`session.compact` / `vp compact` / Stage context popover；force summary/trim 复用同一 pipeline；idle-only + manual run control 阻止并发 prompt、pause 返回 false、cancel 仍生效；失败通过 RPC error + `context.compact_failed` 暴露；Rust/Swift tests）；见 ADR-0099。
 
 ## 如何运行
 

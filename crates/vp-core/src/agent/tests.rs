@@ -194,6 +194,27 @@ impl Provider for ScriptedStreamProvider {
     }
 }
 
+struct GatedSummaryProvider {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Provider for GatedSummaryProvider {
+    fn id(&self) -> &str {
+        "gated-summary"
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamEvent::TextDelta("gated summary".into())),
+            Ok(StreamEvent::Done),
+        ])))
+    }
+}
+
 struct PartialSlowProvider;
 
 #[async_trait]
@@ -5958,6 +5979,187 @@ async fn compacts_long_conversations_and_resumes_from_the_summary() {
 }
 
 #[tokio::test]
+async fn manually_compacts_an_idle_session_without_starting_a_prompt() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta(
+                "Manual summary: the user investigated the release pipeline and tests passed."
+                    .into(),
+            ),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_compaction(&service, 0, 4);
+    let session = engine
+        .create_session(project.id.clone(), "manual context".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..12 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!(
+                    "message {index}: manual compaction should summarize this history even below the automatic threshold"
+                ),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let result = service.compact_now(&session.id).await.unwrap();
+    assert!(result.compacted);
+    let compaction = result.compaction.expect("compaction summary");
+    assert_eq!(compaction.mode, "summary");
+    assert!(compaction.summarized_messages > 0);
+    assert!(compaction.estimated_tokens_after < compaction.estimated_tokens_before);
+
+    // Manual compaction must not start a prompt or change the session status.
+    let sessions = engine.list_sessions(Some(project.id)).await.unwrap();
+    assert_eq!(sessions[0].status, "draft");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "context.compacted" && event.payload["mode"] == "summary")
+    );
+    assert!(!events.iter().any(|event| event.kind == "agent.message"));
+    let loaded = load_conversation(&engine, &session.id).await.unwrap();
+    assert!(
+        loaded.messages[0]
+            .content
+            .starts_with("Earlier conversation summary")
+    );
+    let status = engine.session_context_status(&session.id).await.unwrap();
+    let usage = status.usage.expect("post-compaction usage");
+    let summary = status.last_compaction.expect("last compaction");
+    assert_eq!(usage.estimated_tokens, summary.estimated_tokens_after);
+    assert!(usage.estimated_tokens < summary.estimated_tokens_before);
+}
+
+#[tokio::test]
+async fn manual_compaction_refuses_an_active_session() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "active context".into(), None)
+        .await
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    let error = service.compact_now(&session.id).await.unwrap_err();
+    assert!(error.to_string().contains("must not be queued"));
+}
+
+#[tokio::test]
+async fn manual_compaction_surfaces_failure_and_releases_the_session() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![Err(ProviderError::Stream("summary unavailable".into()))],
+            vec![
+                Ok(StreamEvent::TextDelta("recovered summary".into())),
+                Ok(StreamEvent::Done),
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_compaction(&service, 0, 4);
+    let session = engine
+        .create_session(project.id, "manual failure".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..12 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("message {index}: manual failure should release the run registry"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let error = service.compact_now(&session.id).await.unwrap_err();
+    assert!(error.to_string().contains("context compaction failed"));
+    assert!(error.to_string().contains("summary unavailable"));
+    // The failed run must have released the registry, so a second manual
+    // compaction can proceed instead of reporting "already running".
+    let result = service.compact_now(&session.id).await.unwrap();
+    assert!(result.compacted);
+    assert_eq!(
+        result.compaction.map(|summary| summary.mode),
+        Some("summary".into())
+    );
+}
+
+#[tokio::test]
+async fn manual_compaction_cannot_be_paused() {
+    let dir = TempDir::new().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider: Arc<dyn Provider> = Arc::new(GatedSummaryProvider {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let service = Arc::new(service);
+    set_compaction(&service, 0, 4);
+    let session = engine
+        .create_session(project.id.clone(), "pausable context".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..12 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("message {index}: manual compaction must not be pausable"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let session_id = session.id.clone();
+    let compact = tokio::spawn({
+        let service = service.clone();
+        async move { service.compact_now(&session_id).await }
+    });
+    started.notified().await;
+    assert!(!service.pause(&session.id).await.unwrap());
+    release.notify_one();
+    let result = compact.await.unwrap().unwrap();
+    assert!(result.compacted);
+    let sessions = engine.list_sessions(Some(project.id)).await.unwrap();
+    assert_eq!(sessions[0].status, "draft");
+}
+
+#[tokio::test]
 async fn compaction_failure_does_not_abort_the_run() {
     let dir = TempDir::new().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
@@ -6127,6 +6329,7 @@ async fn trims_older_messages_when_summarization_fails() {
         10,
         50,
         0,
+        false,
     )
     .await
     .unwrap();
@@ -6225,6 +6428,7 @@ async fn compaction_counts_system_and_tool_tokens() {
         0,
         50,
         40,
+        false,
     )
     .await
     .unwrap();

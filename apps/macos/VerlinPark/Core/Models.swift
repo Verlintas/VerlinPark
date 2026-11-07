@@ -1185,6 +1185,18 @@ struct SessionContextStatus: Codable, Sendable {
     }
 }
 
+struct SessionCompactResult: Codable, Sendable {
+    let sessionID: String
+    let compacted: Bool
+    let compaction: ContextCompactionSummary?
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case compacted
+        case compaction
+    }
+}
+
 struct PromptResult: Codable, Sendable {
     let accepted: Bool
 }

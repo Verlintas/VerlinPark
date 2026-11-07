@@ -13,8 +13,9 @@ use futures_util::StreamExt;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
-    AgentInfo, AgentProbeResult, CapacityInfo, ConfigureAgentParams, MergeQueueEntry,
-    PlanDepartment, PlanTask, Project, RoleModels, Session, StoredMessage, TeamPlan, TodoItem,
+    AgentInfo, AgentProbeResult, CapacityInfo, ConfigureAgentParams, ContextCompactionSummary,
+    MergeQueueEntry, PlanDepartment, PlanTask, Project, RoleModels, Session, SessionCompactResult,
+    StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -492,16 +493,26 @@ struct RunControl {
     cancelled: watch::Sender<bool>,
     paused: watch::Sender<bool>,
     finalized: tokio::sync::Mutex<Option<String>>,
+    manual: bool,
 }
 
 impl RunControl {
     fn new() -> Self {
+        Self::with_manual(false)
+    }
+
+    fn new_manual() -> Self {
+        Self::with_manual(true)
+    }
+
+    fn with_manual(manual: bool) -> Self {
         let (cancelled, _) = watch::channel(false);
         let (paused, _) = watch::channel(false);
         Self {
             cancelled,
             paused,
             finalized: tokio::sync::Mutex::new(None),
+            manual,
         }
     }
 
@@ -2800,6 +2811,198 @@ impl AgentService {
         self.start_plan_run(session_id, None).await
     }
 
+    /// Force a summary/trim of an idle session's active conversation. This is
+    /// the explicit counterpart to automatic compaction: it never starts a
+    /// prompt, and it refuses to run while the session is active so the
+    /// in-memory conversation of a live run cannot diverge from the event log.
+    pub async fn compact_now(&self, session_id: &str) -> Result<SessionCompactResult> {
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned())
+            .ok_or_else(|| anyhow!("agent provider is not configured"))?;
+        let (session, project) =
+            load_session_project(self.engine.store().clone(), session_id).await?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        if matches!(
+            session.status.as_str(),
+            "queued" | "running" | "paused" | "waiting_input"
+        ) {
+            anyhow::bail!(
+                "session must not be queued, running, paused, or waiting for input while compacting context"
+            );
+        }
+        let control = Arc::new(RunControl::new_manual());
+        {
+            let mut runs = self
+                .runs
+                .lock()
+                .map_err(|_| anyhow!("agent run mutex poisoned"))?;
+            if runs.contains_key(session_id) {
+                anyhow::bail!("session is already running");
+            }
+            // Reuse the run registry so a prompt cannot start while the
+            // compaction call is in flight.
+            runs.insert(session_id.to_string(), control.clone());
+        }
+        let result = async {
+            let agents = self.engine.list_agents(session_id).await?;
+            let leader = agents.into_iter().find(|agent| agent.role == "leader");
+            let profile = leader
+                .as_ref()
+                .and_then(|agent| agent.profile.as_deref())
+                .and_then(AgentProfile::parse)
+                .unwrap_or(AgentProfile::Generic);
+            let worktree = PathBuf::from(session.worktree.clone().unwrap_or_default());
+            let branch = session.branch.clone().unwrap_or_default();
+            let spec = AgentSpec {
+                id: leader
+                    .as_ref()
+                    .map(|agent| agent.id.clone())
+                    .unwrap_or_else(|| "leader".to_string()),
+                role: AgentRole::Leader,
+                name: leader
+                    .as_ref()
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_else(|| "Leader".to_string()),
+                depth: 0,
+                parent_name: None,
+                title: leader.as_ref().and_then(|agent| agent.title.clone()),
+                task_id: None,
+                department: None,
+                profile,
+                allow_delegation: true,
+                auto_approve: false,
+                worktree: worktree.clone(),
+                branch: branch.clone(),
+                session_worktree: worktree,
+                session_branch: branch,
+                write_scope: Vec::new(),
+                base_commit: session.base_commit.clone().unwrap_or_default(),
+            };
+            let system = role_system_prompt(spec.role, &project, &session, &spec, &session.goal);
+            let mut tools = tool_schemas(&config, spec.role, spec.profile, spec.allow_delegation);
+            tools.extend(
+                collect_dynamic_mcp_tools(&self.engine, spec.role)
+                    .await
+                    .iter()
+                    .map(|binding| binding.schema.clone()),
+            );
+            let system_tokens = estimate_context_tokens(&system);
+            let tool_tokens = serde_json::to_string(&tools)
+                .map(|schema| estimate_context_tokens(&schema))
+                .unwrap_or(0);
+            let (threshold, hard_limit) =
+                context_limits(&config, spec.role, system_tokens, tool_tokens);
+            let loaded = load_conversation(&self.engine, session_id).await?;
+            let mut conversation = loaded.messages;
+            let mut conversation_ids = loaded.ids;
+            let before = self
+                .engine
+                .latest_event_of_kind(session_id, "context.compacted")
+                .await?;
+            let failed_before = self
+                .engine
+                .latest_event_of_kind(session_id, "context.compact_failed")
+                .await?;
+            let budget = SessionBudget::new(
+                session.token_budget,
+                session.tokens_in + session.tokens_out,
+                AgentCaps {
+                    managers: config.max_managers,
+                    workers: config.max_workers,
+                    labour: config.max_labour,
+                },
+            )
+            .with_cost(session.cost_budget_usd, session.cost_spent_usd)
+            .with_time(session.time_budget_secs);
+            if budget.exhausted() {
+                anyhow::bail!("session budget is exhausted; compaction needs provider tokens");
+            }
+            let changed = compact_context_if_needed(
+                &self.engine,
+                &config,
+                &session,
+                &spec,
+                &budget,
+                &control,
+                &mut conversation,
+                &mut conversation_ids,
+                threshold,
+                hard_limit,
+                system_tokens.saturating_add(tool_tokens),
+                true,
+            )
+            .await?;
+            if changed {
+                let context_window = context_window_for(&config, spec.role);
+                if context_window > 0 {
+                    emit(
+                        &self.engine,
+                        session_id,
+                        &spec,
+                        "context.usage",
+                        serde_json::json!({
+                            "estimated_tokens": estimate_messages_tokens(&conversation)
+                                .saturating_add(system_tokens)
+                                .saturating_add(tool_tokens),
+                            "context_window": context_window,
+                            "threshold_tokens": threshold,
+                            "hard_limit_tokens": hard_limit,
+                            "messages": conversation.len(),
+                        }),
+                    )
+                    .await?;
+                }
+            }
+            if !changed
+                && let Some(event) = self
+                    .engine
+                    .latest_event_of_kind(session_id, "context.compact_failed")
+                    .await?
+                && failed_before
+                    .as_ref()
+                    .is_none_or(|before| event.seq > before.seq)
+            {
+                let message = event
+                    .payload
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("context compaction failed");
+                anyhow::bail!("context compaction failed: {message}");
+            }
+            let compaction = if changed {
+                self.engine
+                    .latest_event_of_kind(session_id, "context.compacted")
+                    .await?
+                    .filter(|event| before.as_ref().is_none_or(|before| event.seq > before.seq))
+                    .and_then(|event| {
+                        serde_json::from_value::<ContextCompactionSummary>(event.payload.clone())
+                            .ok()
+                            .map(|mut summary| {
+                                summary.created_at = event.created_at;
+                                summary
+                            })
+                    })
+            } else {
+                None
+            };
+            Ok(SessionCompactResult {
+                session_id: session.id.clone(),
+                compacted: changed,
+                compaction,
+            })
+        }
+        .await;
+        if let Ok(mut runs) = self.runs.lock() {
+            runs.remove(session_id);
+        }
+        result
+    }
+
     /// Dispatch exactly one ready task from a stored TeamPlan. The session is
     /// released after the task settles so the global scheduler can make fair
     /// progress across sessions instead of running an entire plan at once.
@@ -2989,6 +3192,12 @@ impl AgentService {
         let Some(control) = control else {
             return Ok(false);
         };
+        if control.manual {
+            // Manual context compaction is a short foreground operation and
+            // has no resumable run loop; pausing it would leave the session
+            // stuck in `paused` after the compaction finishes.
+            return Ok(false);
+        }
         if control.is_paused() {
             return Ok(true);
         }
@@ -5540,8 +5749,12 @@ async fn compact_context_if_needed(
     compact_threshold: u64,
     hard_limit: u64,
     base_tokens: u64,
+    force: bool,
 ) -> Result<bool> {
-    if (compact_threshold == 0 && hard_limit == u64::MAX) || budget.exhausted() {
+    if budget.exhausted() {
+        return Ok(false);
+    }
+    if !force && compact_threshold == 0 && hard_limit == u64::MAX {
         return Ok(false);
     }
     let keep = config.compact_keep_messages.max(2);
@@ -5553,7 +5766,7 @@ async fn compact_context_if_needed(
     // messages alone could defer compaction until the provider request is
     // already over the model window.
     let estimated_before = estimate_messages_tokens(conversation).saturating_add(base_tokens);
-    if estimated_before < compact_threshold && estimated_before <= hard_limit {
+    if !force && estimated_before < compact_threshold && estimated_before <= hard_limit {
         return Ok(false);
     }
     let mut estimated = estimated_before;
@@ -5570,8 +5783,7 @@ async fn compact_context_if_needed(
     let mut usage_tokens = (0u64, 0u64);
     let mut usage_estimated = true;
 
-    if compact_threshold > 0
-        && estimated >= compact_threshold
+    if (force || (compact_threshold > 0 && estimated >= compact_threshold))
         && let Some(cut) = safe_context_cut(conversation, keep, 0)
         && let Some(through) = conversation_ids
             .get(cut.saturating_sub(1))
@@ -5941,6 +6153,7 @@ async fn run_loop(
                 context_threshold,
                 context_hard_limit,
                 system_tokens.saturating_add(tool_tokens),
+                false,
             )
             .await?;
             if control.is_cancelled() {

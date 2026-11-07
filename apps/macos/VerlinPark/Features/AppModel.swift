@@ -174,6 +174,8 @@ final class AppModel {
     var taskSchedulerPolicyBusy = false
     var taskSchedulerPolicyStatus: String?
     var contextStatus: SessionContextStatus?
+    var compactBusy = false
+    var compactNotice: String?
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -352,6 +354,7 @@ final class AppModel {
             selectedSessionID = nil
             events = []
             contextStatus = nil
+            compactNotice = nil
             sessionDiff = nil
             todos = []
             agents = []
@@ -405,6 +408,7 @@ final class AppModel {
         selectedSessionID = nil
         events = []
         contextStatus = nil
+        compactNotice = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -440,6 +444,7 @@ final class AppModel {
         selectedSessionID = id
         streamingText = ""
         contextStatus = nil
+        compactNotice = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -2597,6 +2602,34 @@ final class AppModel {
         }
     }
 
+    func compactSession() async {
+        guard let sessionID = selectedSessionID else { return }
+        compactBusy = true
+        compactNotice = nil
+        defer { compactBusy = false }
+        do {
+            let result = try await core.compactSession(sessionID: sessionID)
+            guard sessionID == selectedSessionID else { return }
+            await loadContextStatus()
+            await loadEvents()
+            if result.compacted {
+                if let compaction = result.compaction {
+                    compactNotice =
+                        "\(compaction.mode): \(compaction.summarizedMessages) summarized, \(compaction.droppedMessages) dropped"
+                } else {
+                    compactNotice = "Compacted"
+                }
+            } else {
+                compactNotice = "No change"
+            }
+        } catch {
+            if sessionID == selectedSessionID {
+                compactNotice = "Compaction failed"
+            }
+            handle(error)
+        }
+    }
+
     func loadDiff() async {
         guard let sessionID = selectedSessionID else {
             sessionDiff = nil
@@ -2693,8 +2726,11 @@ final class AppModel {
            !events.contains(where: { $0.id == event.id })
         {
             events.append(event)
-            if events.count > 1000 {
-                events.removeFirst(events.count - 1000)
+            // Context diagnostics can add one event per provider call; keep a
+            // deeper window so a long tool-heavy session does not push the
+            // visible conversation out of the in-memory event buffer.
+            if events.count > 4000 {
+                events.removeFirst(events.count - 4000)
             }
         }
 

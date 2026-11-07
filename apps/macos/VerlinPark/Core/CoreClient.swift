@@ -221,6 +221,14 @@ actor CoreClient {
             .decode(Session.self)
     }
 
+    func compactSession(sessionID: String) async throws -> SessionCompactResult {
+        try await request(
+            method: "session.compact",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionCompactResult.self)
+    }
+
     func contextStatus(sessionID: String) async throws -> SessionContextStatus {
         try await request(
             method: "session.context",

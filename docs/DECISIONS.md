@@ -108,6 +108,7 @@
 | [0096](adr/0096-session-search-fts5.md) | FTS5 index for session search | Accepted | 搜索 |
 | [0097](adr/0097-context-compaction.md) | Context compaction for long sessions | Accepted (revised by 0098) | Agent/上下文 |
 | [0098](adr/0098-model-aware-context-budget.md) | Model-aware context budgets, rolling trim, and context usage observability | Accepted | Agent/上下文 |
+| [0099](adr/0099-manual-context-compaction.md) | Manual context compaction for idle sessions | Accepted | Agent/上下文 |
 
 ---
 

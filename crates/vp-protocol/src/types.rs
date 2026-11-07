@@ -1460,6 +1460,18 @@ pub struct SessionContextParams {
     pub session_id: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCompactResult {
+    pub session_id: String,
+    pub compacted: bool,
+    pub compaction: Option<ContextCompactionSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCompactParams {
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptParams {
     pub session_id: String,

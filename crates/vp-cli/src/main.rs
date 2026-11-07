@@ -295,6 +295,8 @@ enum Command {
     ResumePlan { session: String },
     /// Show estimated context usage and the last compaction/trim.
     Context { session: String },
+    /// Summarize or trim an idle session's active conversation now.
+    Compact { session: String },
     /// Show the session plan/todo list.
     Todos { session: String },
     /// Show the per-call usage/cost ledger.
@@ -1114,6 +1116,14 @@ async fn main() -> Result<()> {
             rpc(
                 &discovery,
                 "session.context",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Compact { session } => {
+            rpc(
+                &discovery,
+                "session.compact",
                 json!({"session_id": session}),
             )
             .await?

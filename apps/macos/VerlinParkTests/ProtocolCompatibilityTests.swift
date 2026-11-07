@@ -62,6 +62,31 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(status.lastCompaction?.summarizedMessages, 18)
     }
 
+    func testSessionCompactResultDecodes() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "compacted": true,
+          "compaction": {
+            "mode": "summary",
+            "summarized_messages": 18,
+            "dropped_messages": 0,
+            "kept_messages": 4,
+            "estimated_tokens_before": 110000,
+            "estimated_tokens_after": 12000,
+            "created_at": "2026-11-08T00:00:01Z"
+          }
+        }
+        """
+        let result = try JSONDecoder().decode(
+            SessionCompactResult.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertTrue(result.compacted)
+        XCTAssertEqual(result.compaction?.mode, "summary")
+        XCTAssertEqual(result.compaction?.estimatedTokensAfter, 12000)
+    }
+
     func testUsageTotalsWithoutDepartmentBucketStillDecodes() throws {
         let json = """
         {
