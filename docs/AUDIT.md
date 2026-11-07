@@ -449,7 +449,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 **M4 — 平台化**
 1. binary artifact preview（content-addressed dedupe、zstd compression、artifact replay/repair、legacy backfill、mailbox auto GC 已实现）。
 2. project-wide budget quotas and alerts（project 共享 token/USD pool 已实现；per-project soft warning/alert 未做）。
-3. Task-DAG 行、task priority/aging 和 global write leases 已持久化；已有 project-level auto-resume policy（按 effective priority/round-robin resume plan 或 per-task dispatch）、task skip/retry/cancel/pause/resume、replay repair/bundle/db-rebuild。仍缺 default-on autonomous dispatcher、无存储 plan 的 orphan task 调度、跨进程 priority/capacity/session lease。
+3. Task-DAG 行、task priority/aging 和 global write leases 已持久化；已有 project-level auto-resume policy（按 effective priority/round-robin resume plan 或 per-task dispatch）、task skip/retry/cancel/pause/resume、replay repair/bundle/db-rebuild。仍缺 default-on autonomous dispatcher、无存储 plan 的 orphan task 调度。跨进程 priority/capacity/session lease 只有在移除当前 `run/daemon.lock` 的排他 data-dir 假设、进入 server 模式后才有意义。
 4. ACP 第一版已实现（stdio/Worker/Verifier/merge）；仍缺 HTTP/SSE、session resume、auth flow 与 usage 映射；终端、hunk review、其他 forge PR adapter 仍待做。
 
 ---
