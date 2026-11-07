@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::sync::watch;
 use vp_protocol::types::{PlanTask, ScheduledTask, Session, TaskQueueResult, TeamPlan, WriteLease};
 use vp_store::Store;
 
@@ -15,6 +16,7 @@ use vp_store::Store;
 pub struct TaskScheduler {
     store: Store,
     aging: Duration,
+    state: watch::Sender<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,7 +36,33 @@ impl TaskScheduler {
     }
 
     pub fn new_with_aging(store: Store, aging: Duration) -> Self {
-        Self { store, aging }
+        let (state, _) = watch::channel(0);
+        Self {
+            store,
+            aging,
+            state,
+        }
+    }
+
+    /// Wake workers waiting for a task pause/cancel/resume transition.
+    pub fn notify_state(&self) {
+        self.state
+            .send_modify(|value| *value = value.wrapping_add(1));
+    }
+
+    pub fn subscribe_state(&self) -> watch::Receiver<u64> {
+        self.state.subscribe()
+    }
+
+    pub async fn plan_task_status(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<String>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        tokio::task::spawn_blocking(move || store.plan_task_status(&session_id, &task_id)).await?
     }
 
     /// Rebuild the task projection from the latest `team_plan.submitted`

@@ -707,17 +707,6 @@ fn take_admission_waiter(
     Some(waiters.remove(index))
 }
 
-async fn plan_task_cancel_requested(
-    engine: &Engine,
-    session_id: &str,
-    spec: &AgentSpec,
-) -> Result<bool> {
-    let Some(task_id) = &spec.task_id else {
-        return Ok(false);
-    };
-    engine.plan_task_cancel_requested(session_id, task_id).await
-}
-
 async fn wait_for_resume(control: &RunControl) -> bool {
     let mut paused = control.subscribe_paused();
     let mut cancelled = control.subscribe();
@@ -739,6 +728,58 @@ async fn wait_for_resume(control: &RunControl) -> bool {
                     return false;
                 }
             }
+        }
+    }
+}
+
+async fn wait_for_task_resume(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+    control: &RunControl,
+) -> Result<bool> {
+    loop {
+        if !wait_for_resume(control).await {
+            return Ok(false);
+        }
+        if control.is_cancelled() {
+            return Ok(false);
+        }
+        let Some(task_id) = &spec.task_id else {
+            return Ok(true);
+        };
+        match engine
+            .plan_task_status(session_id, task_id)
+            .await?
+            .as_deref()
+        {
+            Some("cancelling" | "cancelled") => return Ok(false),
+            Some("pausing") => {
+                engine.mark_plan_task_paused(session_id, task_id).await?;
+                continue;
+            }
+            Some("paused") => {
+                let mut state = engine.scheduler().subscribe_state();
+                // Re-check after subscribing so a resume between the first
+                // status read and the subscription cannot be lost.
+                if engine
+                    .plan_task_status(session_id, task_id)
+                    .await?
+                    .as_deref()
+                    != Some("paused")
+                {
+                    continue;
+                }
+                tokio::select! {
+                    changed = state.changed() => {
+                        if changed.is_err() {
+                            return Ok(false);
+                        }
+                    }
+                    _ = wait_for_cancel(control) => return Ok(false),
+                }
+            }
+            _ => return Ok(true),
         }
     }
 }
@@ -4496,13 +4537,10 @@ async fn run_loop(
     let mut warned_project = false;
 
     for turn in 0..config.max_turns {
-        if !wait_for_resume(control).await {
+        if !wait_for_task_resume(engine, &session.id, spec, control).await? {
             return Ok(LoopOutcome::Cancelled);
         }
         if control.is_cancelled() {
-            return Ok(LoopOutcome::Cancelled);
-        }
-        if plan_task_cancel_requested(engine, &session.id, spec).await? {
             return Ok(LoopOutcome::Cancelled);
         }
         if budget.exhausted() {
@@ -4798,7 +4836,7 @@ async fn run_loop(
             tool_call_id: None,
         });
 
-        if plan_task_cancel_requested(engine, &session.id, spec).await? {
+        if !wait_for_task_resume(engine, &session.id, spec, control).await? {
             return Ok(LoopOutcome::Cancelled);
         }
         if tool_calls.is_empty() {
@@ -4814,13 +4852,10 @@ async fn run_loop(
         }
 
         for (index, call) in tool_calls.into_iter().enumerate() {
-            if !wait_for_resume(control).await {
+            if !wait_for_task_resume(engine, &session.id, spec, control).await? {
                 return Ok(LoopOutcome::Cancelled);
             }
             if control.is_cancelled() {
-                return Ok(LoopOutcome::Cancelled);
-            }
-            if plan_task_cancel_requested(engine, &session.id, spec).await? {
                 return Ok(LoopOutcome::Cancelled);
             }
             if budget.exhausted() {

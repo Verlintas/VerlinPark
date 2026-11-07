@@ -4714,6 +4714,104 @@ impl Provider for BlockingProvider {
 }
 
 #[tokio::test]
+async fn pauses_and_resumes_one_running_plan_task() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(BlockingProvider {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider.clone());
+    let session = engine
+        .create_session(project.id.clone(), "pause one task".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan = TeamPlan {
+        goal: "pause one task".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "build".into(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![PlanTask {
+            id: "T1".into(),
+            department: "impl".into(),
+            title: "One".into(),
+            kind: "coding".into(),
+            priority: 0,
+            profile: None,
+            deps: Vec::new(),
+            write_scope: vec!["worker.txt".into()],
+            acceptance: vec!["done".into()],
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+    };
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    assert!(service.resume_plan(&session.id).await.unwrap());
+    tokio::time::timeout(Duration::from_secs(2), provider.started.notified())
+        .await
+        .unwrap();
+    wait_for_task_status(&engine, &session, "T1", "running").await;
+    let pausing = engine.pause_plan_task(&session.id, "T1").await.unwrap();
+    assert_eq!(pausing.status, "pausing");
+    provider.release.notify_one();
+    wait_for_task_status(&engine, &session, "T1", "paused").await;
+    let sessions = engine
+        .list_sessions(Some(project.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(sessions[0].status, "running");
+    let resumed = engine.resume_plan_task(&session.id, "T1").await.unwrap();
+    assert_eq!(resumed.status, "running");
+    let session = wait_until_idle(&engine, &session).await;
+    assert_eq!(session.status, "idle");
+    let queue = engine
+        .task_queue(Some(project.id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(queue.tasks[0].status, "completed");
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.task_queue_matches, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+}
+
+async fn wait_for_task_status(engine: &Engine, session: &Session, task_id: &str, expected: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let queue = engine
+            .task_queue(Some(session.project_id.clone()), Some(session.id.clone()))
+            .await
+            .unwrap();
+        if queue
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .is_some_and(|task| task.status == expected)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task {task_id} did not reach {expected}: {:?}",
+            queue.tasks
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
 async fn cancels_one_running_plan_task_without_cancelling_the_session() {
     let dir = TempDir::new().unwrap();
     let provider = Arc::new(BlockingProvider {

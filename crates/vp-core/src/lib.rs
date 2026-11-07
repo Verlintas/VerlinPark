@@ -646,6 +646,7 @@ impl Engine {
         })
         .await??;
         let _ = self.events.send(event);
+        self.scheduler.notify_state();
         Ok(task)
     }
 
@@ -658,6 +659,7 @@ impl Engine {
         })
         .await??;
         let _ = self.events.send(event);
+        self.scheduler.notify_state();
         Ok(task)
     }
 
@@ -674,7 +676,62 @@ impl Engine {
         })
         .await??;
         let _ = self.events.send(event);
+        self.scheduler.notify_state();
         Ok(task)
+    }
+
+    pub async fn pause_plan_task(&self, session_id: &str, task_id: &str) -> Result<ScheduledTask> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let (task, event) = tokio::task::spawn_blocking(move || {
+            store.pause_plan_task_with_event(&session_id, &task_id)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        self.scheduler.notify_state();
+        Ok(task)
+    }
+
+    pub async fn mark_plan_task_paused(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<ScheduledTask>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.mark_plan_task_paused_with_event(&session_id, &task_id)
+        })
+        .await??;
+        let Some((task, event)) = result else {
+            return Ok(None);
+        };
+        let _ = self.events.send(event);
+        self.scheduler.notify_state();
+        Ok(Some(task))
+    }
+
+    pub async fn resume_plan_task(&self, session_id: &str, task_id: &str) -> Result<ScheduledTask> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let (task, event) = tokio::task::spawn_blocking(move || {
+            store.resume_plan_task_with_event(&session_id, &task_id)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        self.scheduler.notify_state();
+        Ok(task)
+    }
+
+    pub async fn plan_task_status(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<String>> {
+        self.scheduler.plan_task_status(session_id, task_id).await
     }
 
     pub async fn plan_task_cancel_requested(
@@ -2285,6 +2342,10 @@ impl Engine {
                     | "plan_task.interrupted"
                     | "plan_task.retried"
                     | "plan_task.skipped"
+                    | "plan_task.cancelling"
+                    | "plan_task.pausing"
+                    | "plan_task.paused"
+                    | "plan_task.resumed"
             ) {
                 continue;
             }
@@ -2334,6 +2395,26 @@ impl Engine {
                     task.status = "skipped".to_string();
                     task.finished_at = Some(event.created_at.clone());
                     task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                }
+                "plan_task.cancelling" => {
+                    task.status = "cancelling".to_string();
+                    task.finished_at = None;
+                    task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                }
+                "plan_task.pausing" => {
+                    task.status = "pausing".to_string();
+                    task.finished_at = None;
+                    task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                }
+                "plan_task.paused" => {
+                    task.status = "paused".to_string();
+                    task.finished_at = None;
+                    task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                }
+                "plan_task.resumed" => {
+                    task.status = "running".to_string();
+                    task.finished_at = None;
+                    task.last_error = None;
                 }
                 _ => {}
             }

@@ -649,6 +649,24 @@ actor CoreClient {
         .task
     }
 
+    func pauseTask(sessionID: String, taskID: String) async throws -> SchedulerTask {
+        try await request(
+            method: "task.pause",
+            params: ["session_id": .string(sessionID), "task_id": .string(taskID)]
+        )
+        .decode(TaskActionResult.self)
+        .task
+    }
+
+    func resumeTask(sessionID: String, taskID: String) async throws -> SchedulerTask {
+        try await request(
+            method: "task.resume",
+            params: ["session_id": .string(sessionID), "task_id": .string(taskID)]
+        )
+        .decode(TaskActionResult.self)
+        .task
+    }
+
     func cancelTask(sessionID: String, taskID: String) async throws -> SchedulerTask {
         try await request(
             method: "task.cancel",

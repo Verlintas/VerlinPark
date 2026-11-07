@@ -547,6 +547,28 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "task.pause" => match parse_params::<TaskActionParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .pause_plan_task(&params.session_id, &params.task_id)
+                .await
+            {
+                Ok(task) => RpcResponse::success(id, TaskActionResult { task }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "task.resume" => match parse_params::<TaskActionParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .resume_plan_task(&params.session_id, &params.task_id)
+                .await
+            {
+                Ok(task) => RpcResponse::success(id, TaskActionResult { task }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "task.cancel" => match parse_params::<TaskActionParams>(request.params) {
             Ok(params) => match state
                 .engine

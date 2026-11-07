@@ -1403,6 +1403,10 @@ private struct TaskSchedulerCard: View {
                     schedulerCount("running", queue.tasks.count(where: { $0.status == "running" }))
                     schedulerCount("completed", queue.tasks.count(where: { $0.status == "completed" }))
                     schedulerCount("blocked", queue.tasks.count(where: { $0.status == "blocked" }))
+                    schedulerCount(
+                        "paused",
+                        queue.tasks.count(where: { $0.status == "pausing" || $0.status == "paused" })
+                    )
                     schedulerCount("skipped", queue.tasks.count(where: { $0.status == "skipped" }))
                     schedulerCount("leases", queue.leases.count)
                     Spacer()
@@ -1443,6 +1447,28 @@ private struct TaskSchedulerCard: View {
                                     .controlSize(.mini)
                                     .frame(width: 16)
                             } else {
+                                if canPause(task.status) {
+                                    Button {
+                                        Task { await model.pauseRunningTask(task) }
+                                    } label: {
+                                        Image(systemName: "pause.circle")
+                                            .font(.system(size: 8))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(.yellow)
+                                    .help("Pause this task at its next turn/tool boundary")
+                                }
+                                if canResume(task.status) {
+                                    Button {
+                                        Task { await model.resumePausedTask(task) }
+                                    } label: {
+                                        Image(systemName: "play.circle")
+                                            .font(.system(size: 8))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(.green)
+                                    .help("Resume this paused task")
+                                }
                                 if canCancel(task.status) {
                                     Button {
                                         Task { await model.cancelRunningTask(task) }
@@ -1534,8 +1560,16 @@ private struct TaskSchedulerCard: View {
         }
     }
 
-    private func canCancel(_ status: String) -> Bool {
+    private func canPause(_ status: String) -> Bool {
         status == "running"
+    }
+
+    private func canResume(_ status: String) -> Bool {
+        ["pausing", "paused"].contains(status)
+    }
+
+    private func canCancel(_ status: String) -> Bool {
+        ["running", "pausing", "paused"].contains(status)
     }
 
     private func canRetry(_ status: String) -> Bool {
@@ -1551,7 +1585,7 @@ private struct TaskSchedulerCard: View {
         case "running": .green
         case "completed": .cyan
         case "failed", "blocked": .orange
-        case "interrupted", "cancelling": .yellow
+        case "interrupted", "cancelling", "pausing", "paused": .yellow
         case "cancelled", "skipped": .secondary
         default: .secondary
         }

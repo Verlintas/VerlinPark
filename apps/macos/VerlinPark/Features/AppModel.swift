@@ -2020,6 +2020,30 @@ final class AppModel {
         }
     }
 
+    func pauseRunningTask(_ task: SchedulerTask) async {
+        taskActionBusyID = task.id
+        defer { taskActionBusyID = nil }
+        do {
+            let updated = try await core.pauseTask(sessionID: task.sessionID, taskID: task.taskID)
+            taskActionStatus = "\(updated.taskID) -> \(updated.status)"
+            await loadTaskQueue()
+        } catch {
+            taskActionStatus = error.localizedDescription
+        }
+    }
+
+    func resumePausedTask(_ task: SchedulerTask) async {
+        taskActionBusyID = task.id
+        defer { taskActionBusyID = nil }
+        do {
+            let updated = try await core.resumeTask(sessionID: task.sessionID, taskID: task.taskID)
+            taskActionStatus = "\(updated.taskID) -> \(updated.status)"
+            await loadTaskQueue()
+        } catch {
+            taskActionStatus = error.localizedDescription
+        }
+    }
+
     func cancelRunningTask(_ task: SchedulerTask) async {
         taskActionBusyID = task.id
         defer { taskActionBusyID = nil }

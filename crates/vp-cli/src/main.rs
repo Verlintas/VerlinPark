@@ -183,6 +183,10 @@ enum Command {
     TaskSkip { session: String, task: String },
     /// Request cooperative cancellation of a running plan task.
     TaskCancel { session: String, task: String },
+    /// Pause a running plan task at its next turn/tool boundary.
+    TaskPause { session: String, task: String },
+    /// Resume a paused plan task.
+    TaskResume { session: String, task: String },
     /// Create a session for a project.
     SessionNew {
         project: String,
@@ -711,6 +715,22 @@ async fn main() -> Result<()> {
             rpc(
                 &discovery,
                 "task.cancel",
+                json!({"session_id": session, "task_id": task}),
+            )
+            .await?
+        }
+        Command::TaskPause { session, task } => {
+            rpc(
+                &discovery,
+                "task.pause",
+                json!({"session_id": session, "task_id": task}),
+            )
+            .await?
+        }
+        Command::TaskResume { session, task } => {
+            rpc(
+                &discovery,
+                "task.resume",
                 json!({"session_id": session, "task_id": task}),
             )
             .await?
