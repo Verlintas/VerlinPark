@@ -40,19 +40,19 @@ use vp_protocol::types::{
     PingResult, ProjectBudgetParams, ProjectListResult, ProjectUsageParams, PromptParams,
     PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
     ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
-    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionDiffParams,
-    SessionExportParams, SessionImportParams, SessionListResult, SessionLogParams,
-    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
-    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
-    SessionTranscriptParams, SetArtifactPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
-    SetSessionPriorityParams, SetShellPolicyParams, SetTaskSchedulerPolicyParams,
-    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams,
-    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    UpdateAcpAgentParams, UpdateMcpServerParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo, SessionContextParams,
+    SessionDiffParams, SessionExportParams, SessionImportParams, SessionListResult,
+    SessionLogParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
+    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionTodosParams,
+    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
+    SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
+    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
+    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams, UpdateAcpAgentParams, UpdateMcpServerParams, UsageLedgerParams,
+    WorkspaceFileParams, WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -878,6 +878,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                         paused,
                     },
                 ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.context" => match parse_params::<SessionContextParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_context_status(&params.session_id)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

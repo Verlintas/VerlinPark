@@ -5539,6 +5539,7 @@ async fn compact_context_if_needed(
     conversation_ids: &mut Vec<Option<String>>,
     compact_threshold: u64,
     hard_limit: u64,
+    base_tokens: u64,
 ) -> Result<bool> {
     if (compact_threshold == 0 && hard_limit == u64::MAX) || budget.exhausted() {
         return Ok(false);
@@ -5547,7 +5548,11 @@ async fn compact_context_if_needed(
     if conversation.len() <= keep {
         return Ok(false);
     }
-    let estimated_before = estimate_messages_tokens(conversation);
+    // Thresholds and the hard limit describe the whole active request, so the
+    // comparison must include the system prompt and tool schemas too. Using
+    // messages alone could defer compaction until the provider request is
+    // already over the model window.
+    let estimated_before = estimate_messages_tokens(conversation).saturating_add(base_tokens);
     if estimated_before < compact_threshold && estimated_before <= hard_limit {
         return Ok(false);
     }
@@ -5660,7 +5665,8 @@ async fn compact_context_if_needed(
                             through_id = Some(through);
                             usage_tokens = (input_tokens, output_tokens);
                             usage_estimated = estimated_usage;
-                            estimated = estimate_messages_tokens(conversation);
+                            estimated =
+                                estimate_messages_tokens(conversation).saturating_add(base_tokens);
                         }
                     }
                     Err(error) => {
@@ -5704,7 +5710,7 @@ async fn compact_context_if_needed(
         }
         dropped_messages = dropped_messages.saturating_add(removed);
         through_id = Some(through);
-        estimated = estimate_messages_tokens(conversation);
+        estimated = estimate_messages_tokens(conversation).saturating_add(base_tokens);
     }
 
     if summarized_messages == 0 && dropped_messages == 0 {
@@ -5934,6 +5940,7 @@ async fn run_loop(
                 &mut *conversation_ids,
                 context_threshold,
                 context_hard_limit,
+                system_tokens.saturating_add(tool_tokens),
             )
             .await?;
             if control.is_cancelled() {
@@ -5941,6 +5948,26 @@ async fn run_loop(
             }
             if budget.exhausted() {
                 return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
+            }
+            let context_window = context_window_for(config, spec.role);
+            if context_window > 0 {
+                let estimated_context = estimate_messages_tokens(conversation)
+                    .saturating_add(system_tokens)
+                    .saturating_add(tool_tokens);
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "context.usage",
+                    serde_json::json!({
+                        "estimated_tokens": estimated_context,
+                        "context_window": context_window,
+                        "threshold_tokens": context_threshold,
+                        "hard_limit_tokens": context_hard_limit,
+                        "messages": conversation.len(),
+                    }),
+                )
+                .await?;
             }
         }
         let mut request = ChatRequest {
@@ -10049,7 +10076,13 @@ async fn wait_for_approval_with(
 fn truncate(content: &str) -> String {
     const MAX: usize = 8_000;
     if content.len() > MAX {
-        format!("{}… (truncated)", &content[..MAX])
+        // Byte slicing at a fixed offset can split a UTF-8 character and
+        // panic. Walk back to the nearest character boundary instead.
+        let mut end = MAX;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}… (truncated)", &content[..end])
     } else {
         content.to_string()
     }

@@ -54,6 +54,30 @@ private struct ProjectStageView: View {
         }
     }
 
+    private func tokenLabel(_ value: Int) -> String {
+        if value >= 1_000_000 {
+            return String(format: "%.1fM", Double(value) / 1_000_000)
+        }
+        if value >= 1000 {
+            return "\(value / 1000)k"
+        }
+        return "\(value)"
+    }
+
+    private func contextLabel(_ usage: ContextUsage) -> String {
+        "ctx \(tokenLabel(usage.estimatedTokens))/\(tokenLabel(usage.thresholdTokens))"
+    }
+
+    private func contextHelp(_ usage: ContextUsage) -> String {
+        var help =
+            "Estimated context \(usage.estimatedTokens) tokens across \(usage.messages) messages. Window \(usage.contextWindow); summary threshold \(usage.thresholdTokens); hard limit \(usage.hardLimitTokens)."
+        if let compaction = model.contextStatus?.lastCompaction {
+            help +=
+                " Last \(compaction.mode): summarized \(compaction.summarizedMessages), dropped \(compaction.droppedMessages), kept \(compaction.keptMessages)."
+        }
+        return help
+    }
+
     private var header: some View {
         HStack(alignment: .center, spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
@@ -70,6 +94,16 @@ private struct ProjectStageView: View {
                         Text("·")
                         Text(info.configured ? (info.model ?? "model") : "no model")
                             .foregroundStyle(info.configured ? Color.gray : Color.orange)
+                    }
+                    if let usage = model.contextStatus?.usage {
+                        Text("·")
+                        Text(contextLabel(usage))
+                            .foregroundStyle(
+                                usage.estimatedTokens >= usage.thresholdTokens
+                                    ? Color.orange
+                                    : Color.secondary
+                            )
+                            .help(contextHelp(usage))
                     }
                 }
                 .font(.system(size: 10, design: .monospaced))

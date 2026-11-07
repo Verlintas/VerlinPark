@@ -1006,8 +1006,9 @@ Scout 产出的结构化摘要：
 1. 工具输出 > 阈值 → 截断 + artifact。
 2. 消息 > 预算 → 只保留最近 N 条 + 摘要 artifact。
 3. 长任务 → 每 N 轮生成 `progress` summary。
-4. 每个 top-level provider 调用前按 `context_window - output - system/tools` 计算 hard limit；默认 threshold 为 75%，global/per-role context window 由用户配置（默认 128k，0 关闭）。超过 threshold → 在安全 user/assistant 边界压缩早期消息，保留 plan/acceptance/decisions、`VERLINPARK_COMPACT_KEEP_MESSAGES` 条最近消息和 summary；原始消息仍留在 DB。
+4. 每个 top-level provider 调用前按 `context_window - output - system/tools` 计算 hard limit；默认 threshold 为 75%，global/per-role context window 由用户配置（默认 128k，0 关闭）。比较 threshold/hard limit 时计入 system prompt 与 tool schema，因为它们属于同一个 provider request。超过 threshold → 在安全 user/assistant 边界压缩早期消息，保留 plan/acceptance/decisions、`VERLINPARK_COMPACT_KEEP_MESSAGES` 条最近消息和 summary；原始消息仍留在 DB。
 5. 压缩失败或仍超 hard limit → 发 `context.compact_failed` / `context.compacted(mode=trim)`，在安全 user/assistant 边界滚动裁剪；不删除原始消息。真正的 provider context overflow 仍由 provider 返回错误。
+6. 每个 top-level turn 在调用 provider 前写 `context.usage`（active tokens / window / threshold / hard limit / messages）；`session.context` / `vp context` / Stage header 读取最新 usage 和最近一次 compaction/trim。
 
 ### 12.4 Prompt 结构
 

@@ -28,6 +28,40 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(info.roleModels.worker.contextWindow, 8000)
     }
 
+    func testSessionContextStatusDecodes() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "usage": {
+            "estimated_tokens": 91000,
+            "context_window": 128000,
+            "threshold_tokens": 90000,
+            "hard_limit_tokens": 120000,
+            "messages": 42,
+            "created_at": "2026-11-08T00:00:00Z"
+          },
+          "last_compaction": {
+            "mode": "summary",
+            "summarized_messages": 18,
+            "dropped_messages": 0,
+            "kept_messages": 4,
+            "estimated_tokens_before": 110000,
+            "estimated_tokens_after": 12000,
+            "created_at": "2026-11-08T00:00:01Z"
+          }
+        }
+        """
+        let status = try JSONDecoder().decode(
+            SessionContextStatus.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(status.sessionID, "session-1")
+        XCTAssertEqual(status.usage?.estimatedTokens, 91000)
+        XCTAssertEqual(status.usage?.contextWindow, 128_000)
+        XCTAssertEqual(status.lastCompaction?.mode, "summary")
+        XCTAssertEqual(status.lastCompaction?.summarizedMessages, 18)
+    }
+
     func testUsageTotalsWithoutDepartmentBucketStillDecodes() throws {
         let json = """
         {

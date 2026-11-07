@@ -173,6 +173,7 @@ final class AppModel {
     var taskSchedulerCooldownText = "60"
     var taskSchedulerPolicyBusy = false
     var taskSchedulerPolicyStatus: String?
+    var contextStatus: SessionContextStatus?
     var sessionDiff: SessionDiff?
     var diffLoading = false
     var diffError: String?
@@ -350,6 +351,7 @@ final class AppModel {
             selectedProjectID = nil
             selectedSessionID = nil
             events = []
+            contextStatus = nil
             sessionDiff = nil
             todos = []
             agents = []
@@ -402,6 +404,7 @@ final class AppModel {
         selectedProjectID = id
         selectedSessionID = nil
         events = []
+        contextStatus = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -436,6 +439,7 @@ final class AppModel {
         mode = .project
         selectedSessionID = id
         streamingText = ""
+        contextStatus = nil
         sessionDiff = nil
         diffFiles = []
         todos = []
@@ -448,6 +452,7 @@ final class AppModel {
         lastPullRequest = nil
         Task {
             await loadEvents()
+            await loadContextStatus()
             await loadTodos()
             await loadAgents()
             await loadMergeQueue()
@@ -2577,6 +2582,21 @@ final class AppModel {
         }
     }
 
+    func loadContextStatus() async {
+        guard let sessionID = selectedSessionID else {
+            contextStatus = nil
+            return
+        }
+        do {
+            let status = try await core.contextStatus(sessionID: sessionID)
+            if sessionID == selectedSessionID {
+                contextStatus = status
+            }
+        } catch {
+            // Context status is diagnostic; do not surface a transient RPC error.
+        }
+    }
+
     func loadDiff() async {
         guard let sessionID = selectedSessionID else {
             sessionDiff = nil
@@ -2796,6 +2816,12 @@ final class AppModel {
            ["agent.spawned", "agent.finished", "agent.updated"].contains(event.type)
         {
             Task { await self.loadAgents() }
+        }
+
+        if event.sessionId == selectedSessionID,
+           ["context.usage", "context.compacted"].contains(event.type)
+        {
+            Task { await self.loadContextStatus() }
         }
 
         if event.sessionId == selectedSessionID {

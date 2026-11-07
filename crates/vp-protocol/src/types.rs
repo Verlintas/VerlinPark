@@ -1414,6 +1414,52 @@ pub struct AgentInfo {
     pub context_window: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextUsage {
+    #[serde(default)]
+    pub estimated_tokens: u64,
+    #[serde(default)]
+    pub context_window: u64,
+    #[serde(default)]
+    pub threshold_tokens: u64,
+    #[serde(default)]
+    pub hard_limit_tokens: u64,
+    #[serde(default)]
+    pub messages: usize,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextCompactionSummary {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub summarized_messages: usize,
+    #[serde(default)]
+    pub dropped_messages: usize,
+    #[serde(default)]
+    pub kept_messages: usize,
+    #[serde(default)]
+    pub estimated_tokens_before: u64,
+    #[serde(default)]
+    pub estimated_tokens_after: u64,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionContextStatus {
+    pub session_id: String,
+    pub usage: Option<ContextUsage>,
+    pub last_compaction: Option<ContextCompactionSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionContextParams {
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptParams {
     pub session_id: String,

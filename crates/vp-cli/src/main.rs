@@ -293,6 +293,8 @@ enum Command {
     Resume { session: String },
     /// Resume the stored TeamPlan, skipping completed tasks.
     ResumePlan { session: String },
+    /// Show estimated context usage and the last compaction/trim.
+    Context { session: String },
     /// Show the session plan/todo list.
     Todos { session: String },
     /// Show the per-call usage/cost ledger.
@@ -1104,6 +1106,14 @@ async fn main() -> Result<()> {
             rpc(
                 &discovery,
                 "session.plan_resume",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Context { session } => {
+            rpc(
+                &discovery,
+                "session.context",
                 json!({"session_id": session}),
             )
             .await?

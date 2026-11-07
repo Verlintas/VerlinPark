@@ -561,10 +561,13 @@ fn stop_reason_name(reason: agent_client_protocol::schema::StopReason) -> String
 
 fn truncate(content: &str, max: usize) -> String {
     if content.len() <= max {
-        content.to_string()
-    } else {
-        format!("{}… (truncated)", &content[..max])
+        return content.to_string();
     }
+    let mut end = max.min(content.len());
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (truncated)", &content[..end])
 }
 
 pub fn mcp_stdio_server(
@@ -906,5 +909,14 @@ for line in sys.stdin:
         assert_eq!(outcome.protocol_version, 1);
         assert!(outcome.session_created);
         assert!(!project.path().join("acp.txt").exists());
+    }
+
+    #[test]
+    fn truncate_does_not_split_utf8_characters() {
+        let value = "界".repeat(2_000);
+        let truncated = truncate(&value, 4_000);
+        assert!(truncated.ends_with("… (truncated)"));
+        assert!(truncated.chars().count() < value.chars().count());
+        assert_eq!(truncate("short", 4_000), "short");
     }
 }

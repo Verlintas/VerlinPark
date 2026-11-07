@@ -14,17 +14,17 @@ use vp_protocol::types::{
     AcpAgent, AcpAgentListResult, AcpProbeResult, AgentMessage, AgentRecord, Approval, Artifact,
     ArtifactBackfillResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
     ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
-    ConsoleWriteResult, DoctorCheck, Event, GitLogResult, GitShowResult, IntegrationPolicy,
-    MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult, McpPromptListResult,
-    McpReadResourceResult, McpResourceListResult, McpServer, McpServerListResult,
-    McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPolicy,
-    MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
-    ScheduledTask, SearchResult, Session, SessionBundle, SessionCommit, SessionDiff,
-    SessionImportResult, SessionLandResult, SessionLogStatus, SessionPriorityResult,
-    SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
-    StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan,
-    TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    ConsoleWriteResult, ContextCompactionSummary, ContextUsage, DoctorCheck, Event, GitLogResult,
+    GitShowResult, IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult,
+    McpGetPromptResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult,
+    McpServer, McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem,
+    MemoryListResult, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry,
+    Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
+    QuestionListResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCommit,
+    SessionContextStatus, SessionDiff, SessionImportResult, SessionLandResult, SessionLogStatus,
+    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
+    ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
+    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
     TerminalWriteResult, TodoItem, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
     UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
     WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
@@ -2286,6 +2286,36 @@ impl Engine {
         let session_id = session_id.to_string();
         let kind = kind.to_string();
         tokio::task::spawn_blocking(move || store.latest_event_by_kind(&session_id, &kind)).await?
+    }
+
+    pub async fn session_context_status(&self, session_id: &str) -> Result<SessionContextStatus> {
+        let usage_event = self
+            .latest_event_of_kind(session_id, "context.usage")
+            .await?;
+        let compaction_event = self
+            .latest_event_of_kind(session_id, "context.compacted")
+            .await?;
+        let usage = usage_event.and_then(|event| {
+            serde_json::from_value::<ContextUsage>(event.payload.clone())
+                .ok()
+                .map(|mut usage| {
+                    usage.created_at = event.created_at;
+                    usage
+                })
+        });
+        let last_compaction = compaction_event.and_then(|event| {
+            serde_json::from_value::<ContextCompactionSummary>(event.payload.clone())
+                .ok()
+                .map(|mut summary| {
+                    summary.created_at = event.created_at;
+                    summary
+                })
+        });
+        Ok(SessionContextStatus {
+            session_id: session_id.to_string(),
+            usage,
+            last_compaction,
+        })
     }
 
     pub async fn list_events(

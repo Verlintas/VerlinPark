@@ -38,12 +38,17 @@ rolling-window fallback for small or failing models.
    and tool messages appended during the run, so a mid-run summary has a valid
    `through_message_id`.
 4. **Summary plus rolling trim.** The primary strategy is still a persistent
-   summary plus a retained tail. Safe cuts are at `user` or `assistant`
+   summary plus a retained tail. The summary transcript is capped by the same
+   model window minus its output reserve. Safe cuts are at `user` or `assistant`
    boundaries, never at a `tool` message. If summarization fails, is skipped for
    budget, or the active context is still above the hard limit, older messages
    are dropped at safe boundaries as a rolling window. The summary (if any) is
    kept at index 0; the trim event records `mode: "trim"`, dropped counts, and
    the final `through_message_id`. Original messages remain in SQLite.
+   Threshold and hard-limit comparisons include the system prompt and tool
+   schema tokens, because they are part of the same provider request; comparing
+   message tokens alone can defer compaction until the request already
+   overflows.
 5. **Persistence.** Both modes use `context.compacted`:
    `mode: "summary"` carries the summary text; `mode: "trim"` carries no summary.
    `load_conversation` starts after `through_message_id` and prepends the
@@ -54,6 +59,13 @@ rolling-window fallback for small or failing models.
    Setting the window to 0 disables automatic compaction/trimming, leaving the
    provider to fail on overflow.
 
+7. **Observability.** Before each top-level provider call the runtime emits
+   `context.usage` with the estimated active tokens, configured window, summary
+   threshold, hard limit, and message count. `session.context` / `vp context`
+   returns the latest usage plus the latest `context.compacted` summary, and the
+   Stage header shows `ctx used/threshold`. These are diagnostic events, not a
+   projection; original messages and compaction events remain replayable.
+
 ## Consequences
 
 - Model size is no longer hard-coded; the same runtime scales from 8k local
@@ -63,9 +75,13 @@ rolling-window fallback for small or failing models.
 - Mid-run trimming can drop messages that were not included in the summary
   (the event marks `dropped_messages`); the system prompt still carries the
   task objective.
-- The hard limit is estimated from bytes/tokens and the configured output
+- The hard limit is estimated from text length and the configured output
   reserve; tokenizers differ and tool schemas can be large, so users should
-  leave headroom or lower `max_tokens`.
+  leave headroom or lower `max_tokens`. The estimate is closer to a real
+  tokenizer than the conservative budget reservation but is not exact.
+- `context.usage` is written once per top-level turn; long runs add one event
+  per turn, which is acceptable for diagnostics and search but is not a
+  high-frequency metrics stream.
 - Each compaction/trim emits an event; no messages are deleted from storage.
 - Per-role context windows are required when a local Worker/Verifier model runs
   beside a 1M-token Leader.

@@ -1135,6 +1135,56 @@ struct AgentInfo: Codable, Sendable {
     }
 }
 
+struct ContextUsage: Codable, Sendable {
+    let estimatedTokens: Int
+    let contextWindow: Int
+    let thresholdTokens: Int
+    let hardLimitTokens: Int
+    let messages: Int
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case estimatedTokens = "estimated_tokens"
+        case contextWindow = "context_window"
+        case thresholdTokens = "threshold_tokens"
+        case hardLimitTokens = "hard_limit_tokens"
+        case messages
+        case createdAt = "created_at"
+    }
+}
+
+struct ContextCompactionSummary: Codable, Sendable {
+    let mode: String
+    let summarizedMessages: Int
+    let droppedMessages: Int
+    let keptMessages: Int
+    let estimatedTokensBefore: Int
+    let estimatedTokensAfter: Int
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case mode
+        case summarizedMessages = "summarized_messages"
+        case droppedMessages = "dropped_messages"
+        case keptMessages = "kept_messages"
+        case estimatedTokensBefore = "estimated_tokens_before"
+        case estimatedTokensAfter = "estimated_tokens_after"
+        case createdAt = "created_at"
+    }
+}
+
+struct SessionContextStatus: Codable, Sendable {
+    let sessionID: String
+    let usage: ContextUsage?
+    let lastCompaction: ContextCompactionSummary?
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case usage
+        case lastCompaction = "last_compaction"
+    }
+}
+
 struct PromptResult: Codable, Sendable {
     let accepted: Bool
 }

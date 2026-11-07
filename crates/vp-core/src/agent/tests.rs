@@ -124,6 +124,7 @@ fn set_compaction(service: &AgentService, after_tokens: u64, keep_messages: usiz
         .clone();
     config.compact_after_tokens = after_tokens;
     config.compact_keep_messages = keep_messages;
+    config.context_window = 8_000;
     *service.config.write().unwrap() = Some(config);
 }
 
@@ -5869,7 +5870,11 @@ async fn compacts_long_conversations_and_resumes_from_the_summary() {
         .iter()
         .find(|event| event.kind == "context.compacted")
         .expect("context.compacted event");
-    assert_eq!(compacted.payload["threshold_tokens"], 50);
+    assert!(
+        compacted.payload["threshold_tokens"]
+            .as_u64()
+            .is_some_and(|threshold| threshold >= 50)
+    );
     assert!(
         compacted.payload["summarized_messages"]
             .as_u64()
@@ -5889,6 +5894,28 @@ async fn compacts_long_conversations_and_resumes_from_the_summary() {
         !events
             .iter()
             .any(|event| event.kind == "context.compact_failed")
+    );
+    let usage_event = events
+        .iter()
+        .find(|event| event.kind == "context.usage")
+        .expect("context.usage event");
+    assert!(usage_event.payload["estimated_tokens"].as_u64().is_some());
+    assert!(
+        usage_event.payload["estimated_tokens"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+            <= usage_event.payload["hard_limit_tokens"]
+                .as_u64()
+                .unwrap_or(0)
+    );
+    let status = engine.session_context_status(&session.id).await.unwrap();
+    assert!(status.usage.is_some());
+    assert_eq!(
+        status
+            .last_compaction
+            .as_ref()
+            .map(|summary| summary.mode.as_str()),
+        Some("summary")
     );
     assert!(events.iter().any(|event| {
         event.kind == "agent.message" && event.payload["text"] == "compaction complete"
@@ -5952,12 +5979,14 @@ async fn compaction_failure_does_not_abort_the_run() {
         .create_leader_agent(&session.id, "test")
         .await
         .unwrap();
-    for index in 0..8 {
+    for index in 0..24 {
         engine
             .append_message(
                 &session.id,
                 if index % 2 == 0 { "user" } else { "assistant" },
-                "enough context to trigger the tiny compaction threshold",
+                &format!(
+                    "message {index}: enough context to trigger the tiny compaction threshold"
+                ),
                 serde_json::json!([]),
                 None,
             )
@@ -5974,6 +6003,7 @@ async fn compaction_failure_does_not_abort_the_run() {
         .list_events(session.id.clone(), 0, 200)
         .await
         .unwrap();
+
     assert!(
         events
             .iter()
@@ -6096,6 +6126,7 @@ async fn trims_older_messages_when_summarization_fails() {
         &mut conversation_ids,
         10,
         50,
+        0,
     )
     .await
     .unwrap();
@@ -6127,6 +6158,107 @@ async fn trims_older_messages_when_summarization_fails() {
             .content
             .starts_with("Earlier conversation summary")
     );
+}
+
+#[tokio::test]
+async fn compaction_counts_system_and_tool_tokens() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "active context".into(), None)
+        .await
+        .unwrap();
+    let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+    config.compact_keep_messages = 2;
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    );
+    let control = RunControl::new();
+    let mut conversation = Vec::new();
+    let mut conversation_ids = Vec::new();
+    for index in 0..6 {
+        conversation.push(ChatMessage::user("context payload"));
+        conversation_ids.push(Some(format!("message-{index}")));
+    }
+    let message_tokens = estimate_messages_tokens(&conversation);
+    assert!(
+        message_tokens < 50,
+        "messages alone must stay under the limit"
+    );
+
+    // System/tool tokens belong to the active request. With 40 base tokens the
+    // same conversation is over the 50-token hard limit and must be trimmed.
+    let changed = compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        0,
+        50,
+        40,
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+    assert!(conversation.len() < 6);
+    assert_eq!(conversation.len(), conversation_ids.len());
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let compacted = events
+        .iter()
+        .find(|event| event.kind == "context.compacted")
+        .expect("trim event");
+    assert_eq!(compacted.payload["mode"], "trim");
+    let before = compacted.payload["estimated_tokens_before"]
+        .as_u64()
+        .unwrap();
+    let after = compacted.payload["estimated_tokens_after"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(before, message_tokens + 40);
+    assert!(after < before);
+    assert!(after >= 40);
+}
+
+#[test]
+fn truncate_does_not_split_utf8_characters() {
+    let value = "界".repeat(3_000);
+    let truncated = truncate(&value);
+    assert!(truncated.ends_with("… (truncated)"));
+    assert!(truncated.chars().count() < value.chars().count());
+    let value = "a".repeat(8_000);
+    assert_eq!(truncate(&value), value);
 }
 
 #[test]
