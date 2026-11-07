@@ -30,20 +30,21 @@ use vp_protocol::types::{
     CancelSessionParams, CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams,
     CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
     ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, CreateModelPresetParams,
-    CreateSessionParams, DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport,
-    EventListResult, ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams,
-    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
-    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
-    McpGetPromptParams, McpReadResourceParams, McpServerIdParams, MemoryCreateParams,
-    MemoryCreateResult, MemoryDeleteParams, MemoryListParams, MemoryPolicyParams,
-    MemoryPruneParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
-    PingResult, ProjectBudgetParams, ProjectForkForestParams, ProjectListResult,
-    ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
-    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
-    ResolveMergeResult, RetryMergeParams, RetryMergeResult, SearchParams, ServerInfo,
-    SessionCheckpointDeleteParams, SessionCheckpointListParams, SessionCheckpointParams,
-    SessionCheckpointPruneParams, SessionCheckpointStatsParams, SessionCompactParams,
+    CreateSessionParams, DashboardParams, DeleteModelPresetParams, DiscardSessionParams,
+    DoctorCheck, DoctorReport, EventListResult, ForkAuditParams, ForkRepairParams, GitLogParams,
+    GitShowParams, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
+    ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams,
+    MailboxListResult, MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams,
+    McpCallParams, McpGetPromptParams, McpReadResourceParams, McpServerIdParams,
+    MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams, MemoryListParams,
+    MemoryPolicyParams, MemoryPruneParams, MergeQueueListParams, MergeQueueListResult,
+    OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectForkForestParams,
+    ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
+    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
+    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, SearchParams,
+    ServerInfo, SessionCheckpointDeleteParams, SessionCheckpointDiffParams,
+    SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
+    SessionCheckpointRestoreParams, SessionCheckpointStatsParams, SessionCompactParams,
     SessionCompareParams, SessionContextParams, SessionDiffParams, SessionExportParams,
     SessionForkParams, SessionForkTreeParams, SessionImportParams, SessionLineageParams,
     SessionListResult, SessionLogParams, SessionMergeForkParams, SessionPauseParams,
@@ -936,6 +937,32 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.checkpoint.diff" => {
+            match parse_params::<SessionCheckpointDiffParams>(request.params) {
+                Ok(params) => match state
+                    .agent
+                    .diff_checkpoint_now(&params.session_id, &params.checkpoint_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.checkpoint.restore" => {
+            match parse_params::<SessionCheckpointRestoreParams>(request.params) {
+                Ok(params) => match state
+                    .agent
+                    .restore_checkpoint_now(&params.session_id, &params.checkpoint_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.checkpoint.delete" => {
             match parse_params::<SessionCheckpointDeleteParams>(request.params) {
                 Ok(params) => match state
@@ -1213,6 +1240,20 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "update.check" => match parse_params::<UpdateCheckParams>(request.params) {
             Ok(params) => match vp_core::update::check_for_update(params.repo.as_deref()).await {
                 Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "dashboard.snapshot" => match parse_params::<DashboardParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .dashboard_snapshot(params.project_id.as_deref())
+                .await
+            {
+                Ok(mut result) => {
+                    result.summary.agent = Some(state.agent.info());
+                    RpcResponse::success(id, result)
+                }
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

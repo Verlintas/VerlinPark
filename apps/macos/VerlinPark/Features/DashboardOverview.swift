@@ -6,8 +6,14 @@ struct DashboardOverviewView: View {
     @Environment(BrandStore.self) private var brand
     @Binding var section: DashboardSection
 
+    private var summary: DashboardSummary? {
+        model.dashboardSnapshot?.summary
+    }
+
     private var runningTasks: Int {
-        model.taskQueue?.tasks.count(where: { $0.status == "running" }) ?? 0
+        summary?.runningTasks
+            ?? model.taskQueue?.tasks.count(where: { $0.status == "running" })
+            ?? 0
     }
 
     var body: some View {
@@ -22,28 +28,28 @@ struct DashboardOverviewView: View {
         ) {
             metric(
                 "Workspace",
-                value: "\(model.projects.count)",
-                detail: "\(model.sessions.count) sessions · \(model.events.count) events"
+                value: "\(summary?.projects ?? model.projects.count)",
+                detail: workspaceDetail
             )
             metric(
                 "Inbox",
-                value: "\(model.pendingApprovals.count + model.pendingQuestions.count)",
-                detail: "\(model.pendingApprovals.count) approvals · \(model.pendingQuestions.count) questions"
+                value: "\(inboxCount)",
+                detail: "\(approvalCount) approvals · \(questionCount) questions"
             )
             metric(
                 "Scheduler",
-                value: "\(model.taskQueue?.tasks.count ?? 0)",
-                detail: "\(runningTasks) running · \(model.taskQueue?.leases.count ?? 0) leases"
+                value: "\(taskCount)",
+                detail: "\(runningTasks) running · \(leaseCount) leases"
             )
             metric(
                 "Checkpoints",
-                value: "\(model.checkpoints.count)",
-                detail: "\(model.projectForkForest?.checkpoints ?? 0) project checkpoints"
+                value: "\(checkpointCount)",
+                detail: "\(dirtyCheckpointCount) dirty · \(model.checkpoints.count) current session"
             )
             metric(
                 "Fork roots",
-                value: "\(model.projectForkForest?.roots.count ?? 0)",
-                detail: "\(model.projectForkForest?.total ?? 0) sessions in forest"
+                value: "\(forkRootCount)",
+                detail: "\(forkSessionCount) forked sessions"
             )
             metric(
                 "Capacity",
@@ -64,13 +70,62 @@ struct DashboardOverviewView: View {
 
         DashboardPendingActions(section: $section)
 
+        DashboardAttentionCard(section: $section)
+
+        if model.selectedProject == nil {
+            DashboardProjectBreakdownCard()
+        }
+
         DashboardRuntimeCard()
 
         DashboardRecentActivityCard(section: $section)
     }
 
+    private var approvalCount: Int {
+        summary?.pendingApprovals ?? model.pendingApprovals.count
+    }
+
+    private var questionCount: Int {
+        summary?.pendingQuestions ?? model.pendingQuestions.count
+    }
+
+    private var inboxCount: Int {
+        approvalCount + questionCount
+    }
+
+    private var taskCount: Int {
+        summary?.tasks ?? model.taskQueue?.tasks.count ?? 0
+    }
+
+    private var leaseCount: Int {
+        summary?.writeLeases ?? model.taskQueue?.leases.count ?? 0
+    }
+
+    private var checkpointCount: Int {
+        summary?.checkpoints ?? model.projectForkForest?.checkpoints ?? model.checkpoints.count
+    }
+
+    private var dirtyCheckpointCount: Int {
+        summary?.dirtyCheckpoints ?? model.projectForkForest?.dirtyCheckpoints ?? 0
+    }
+
+    private var forkRootCount: Int {
+        summary?.forkRoots ?? model.projectForkForest?.roots.count ?? 0
+    }
+
+    private var forkSessionCount: Int {
+        summary?.forkSessions ?? model.projectForkForest?.total ?? 0
+    }
+
+    private var workspaceDetail: String {
+        guard let summary else {
+            return "\(model.sessions.count) sessions · \(model.events.count) events"
+        }
+        return "\(summary.sessions) sessions · \(summary.runningSessions) running · \(summary.queuedSessions) queued"
+    }
+
     private var capacityLabel: String {
-        guard let capacity = model.agentInfo?.capacity else { return "—" }
+        guard let capacity = (summary?.agent ?? model.agentInfo)?.capacity else { return "—" }
         return "\(capacity.workerAvailable) / \(capacity.labourAvailable)"
     }
 
@@ -99,27 +154,45 @@ private struct DashboardPendingActions: View {
     @Environment(AppModel.self) private var model
     @Binding var section: DashboardSection
 
+    private var summary: DashboardSummary? {
+        model.dashboardSnapshot?.summary
+    }
+
+    private var approvalCount: Int {
+        summary?.pendingApprovals ?? model.pendingApprovals.count
+    }
+
+    private var questionCount: Int {
+        summary?.pendingQuestions ?? model.pendingQuestions.count
+    }
+
+    private var runningTasks: Int {
+        summary?.runningTasks
+            ?? model.taskQueue?.tasks.count(where: { $0.status == "running" })
+            ?? 0
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionLabel(title: "Pending actions")
             HStack(spacing: 10) {
                 action(
                     title: "Approvals",
-                    count: model.pendingApprovals.count,
+                    count: approvalCount,
                     icon: "checkmark.shield",
                     color: .orange,
                     destination: .inbox
                 )
                 action(
                     title: "Questions",
-                    count: model.pendingQuestions.count,
+                    count: questionCount,
                     icon: "questionmark.bubble",
                     color: .cyan,
                     destination: .inbox
                 )
                 action(
                     title: "Running tasks",
-                    count: model.taskQueue?.tasks.count(where: { $0.status == "running" }) ?? 0,
+                    count: runningTasks,
                     icon: "gearshape.2",
                     color: .green,
                     destination: .team
@@ -168,6 +241,243 @@ private struct DashboardPendingActions: View {
             .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct DashboardAttentionCard: View {
+    @Environment(AppModel.self) private var model
+    @Binding var section: DashboardSection
+
+    private var alerts: [DashboardAlert] {
+        Array((model.dashboardSnapshot?.alerts ?? []).prefix(8))
+    }
+
+    private var totalAlerts: Int {
+        model.dashboardSnapshot?.alerts.count ?? 0
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Needs attention")
+                    Text(model.dashboardStatus ?? "Alerts are derived from live daemon state.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.dashboardBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            if alerts.isEmpty {
+                Text("No failed sessions, blocked tasks, pending approvals, questions, or merge conflicts.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(spacing: 5) {
+                    ForEach(alerts) { alert in
+                        row(alert)
+                    }
+                }
+            }
+            if totalAlerts > alerts.count || model.dashboardSnapshot?.alertsTruncated == true {
+                Text(
+                    "Showing \(alerts.count) of \(totalAlerts) alerts\(model.dashboardSnapshot?.alertsTruncated == true ? " (response capped)" : "")."
+                )
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private func row(_ alert: DashboardAlert) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: icon(for: alert.severity))
+                .font(.system(size: 10))
+                .foregroundStyle(color(for: alert.severity))
+                .frame(width: 14)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(alert.title)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .lineLimit(1)
+                Text(alert.detail)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 8)
+            Text(alert.kind.replacingOccurrences(of: "_", with: " "))
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            if destination(for: alert.action) != nil {
+                Button("Open") {
+                    open(alert)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(8)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func open(_ alert: DashboardAlert) {
+        if let projectID = alert.projectID, projectID != model.selectedProjectID {
+            model.selectProject(projectID)
+        }
+        if let sessionID = alert.sessionID {
+            model.selectSession(sessionID)
+        }
+        if let destination = destination(for: alert.action) {
+            section = destination
+        }
+    }
+
+    private func destination(for action: String) -> DashboardSection? {
+        switch action {
+        case "inbox":
+            .inbox
+        case "team", "session":
+            .team
+        case "git":
+            .git
+        case "usage":
+            .usage
+        case "diagnostics":
+            .diagnostics
+        default:
+            nil
+        }
+    }
+
+    private func icon(for severity: String) -> String {
+        switch severity {
+        case "critical":
+            "exclamationmark.octagon.fill"
+        case "warning":
+            "exclamationmark.triangle.fill"
+        default:
+            "info.circle.fill"
+        }
+    }
+
+    private func color(for severity: String) -> Color {
+        switch severity {
+        case "critical":
+            .red
+        case "warning":
+            .orange
+        default:
+            .blue
+        }
+    }
+}
+
+private struct DashboardProjectBreakdownCard: View {
+    @Environment(AppModel.self) private var model
+
+    private var summaries: [DashboardProjectSummary] {
+        Array((model.dashboardSnapshot?.summary.projectSummaries ?? []).prefix(8))
+    }
+
+    private var total: Int {
+        model.dashboardSnapshot?.summary.projectSummaries.count ?? 0
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Projects")
+                    Text("Activity across every local project")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("\(total)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            if summaries.isEmpty {
+                Text("No projects registered.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(spacing: 5) {
+                    ForEach(summaries) { summary in
+                        row(summary)
+                    }
+                }
+                if total > summaries.count {
+                    Text("Showing \(summaries.count) of \(total) projects with the most activity.")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private func row(_ summary: DashboardProjectSummary) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(summary.name)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .lineLimit(1)
+                    if summary.failedSessions > 0 {
+                        Text("\(summary.failedSessions) failed")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.red)
+                    }
+                }
+                Text(
+                    "\(summary.sessions) sessions · \(summary.runningSessions) running · \(summary.queuedSessions) queued"
+                )
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 6)
+            stat(
+                "checkmark.shield",
+                summary.pendingApprovals + summary.pendingQuestions,
+                color: .orange
+            )
+            stat("gearshape.2", summary.tasks, color: .secondary)
+            stat("camera", summary.checkpoints, color: .cyan)
+            stat("arrow.triangle.branch", summary.forkRoots, color: .purple)
+            Button("Open") {
+                model.selectProject(summary.projectID)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+        .padding(8)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func stat(_ symbol: String, _ value: Int, color: Color) -> some View {
+        HStack(spacing: 2) {
+            Image(systemName: symbol)
+                .font(.system(size: 8))
+                .foregroundStyle(color)
+            Text("\(value)")
+                .foregroundStyle(.secondary)
+        }
+        .font(.system(size: 8, weight: .medium, design: .monospaced))
     }
 }
 

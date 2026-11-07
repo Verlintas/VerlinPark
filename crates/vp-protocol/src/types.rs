@@ -1593,6 +1593,39 @@ pub struct SessionCheckpointStatsResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SessionCheckpointRestoreParams {
+    pub session_id: String,
+    pub checkpoint_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCheckpointRestoreResult {
+    pub session_id: String,
+    pub checkpoint_id: String,
+    pub previous_commit: String,
+    pub restored_commit: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCheckpointDiffParams {
+    pub session_id: String,
+    pub checkpoint_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCheckpointDiffResult {
+    pub session_id: String,
+    pub checkpoint_id: String,
+    pub current_commit: String,
+    pub checkpoint_commit: String,
+    pub current_branch: String,
+    pub clean: bool,
+    pub files: Vec<SessionCompareFile>,
+    pub patch: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SessionCheckpointDeleteParams {
     pub session_id: String,
     pub checkpoint_id: String,
@@ -1785,6 +1818,82 @@ pub struct ForkRepairResult {
     pub repaired: usize,
     pub failed: usize,
     pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DashboardCount {
+    pub label: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardProjectSummary {
+    pub project_id: String,
+    pub name: String,
+    pub sessions: usize,
+    pub running_sessions: usize,
+    pub queued_sessions: usize,
+    pub failed_sessions: usize,
+    pub pending_approvals: usize,
+    pub pending_questions: usize,
+    pub tasks: usize,
+    pub running_tasks: usize,
+    pub checkpoints: usize,
+    pub dirty_checkpoints: usize,
+    pub fork_roots: usize,
+    pub fork_sessions: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardSummary {
+    pub generated_at: String,
+    pub project_id: Option<String>,
+    pub projects: usize,
+    pub sessions: usize,
+    pub sessions_by_status: Vec<DashboardCount>,
+    pub pending_approvals: usize,
+    pub pending_questions: usize,
+    pub running_sessions: usize,
+    pub queued_sessions: usize,
+    pub tasks: usize,
+    pub tasks_by_status: Vec<DashboardCount>,
+    pub running_tasks: usize,
+    pub write_leases: usize,
+    pub checkpoints: usize,
+    pub dirty_checkpoints: usize,
+    pub fork_roots: usize,
+    pub fork_sessions: usize,
+    pub project_summaries: Vec<DashboardProjectSummary>,
+    #[serde(default)]
+    pub agent: Option<AgentInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardAlert {
+    pub id: String,
+    pub kind: String,
+    pub severity: String,
+    pub title: String,
+    pub detail: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// UI section hint: inbox, team, git, usage, diagnostics.
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardResult {
+    pub summary: DashboardSummary,
+    pub alerts: Vec<DashboardAlert>,
+    pub alerts_truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DashboardParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

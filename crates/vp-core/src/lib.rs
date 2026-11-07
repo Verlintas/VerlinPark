@@ -25,13 +25,14 @@ use vp_protocol::types::{
     ModelPreset, ModelPresetListResult, Project, ProjectBudget, ProjectBudgetResult,
     ProjectUsageResult, PullRequestResult, Question, QuestionListResult, ScheduledTask,
     SearchResult, Session, SessionBundle, SessionCheckpoint, SessionCheckpointDeleteResult,
-    SessionCheckpointListResult, SessionCheckpointPruneResult, SessionCheckpointStatsResult,
-    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus, SessionDiff,
-    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
-    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
-    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
-    ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
-    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    SessionCheckpointDiffResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
+    SessionCheckpointRestoreResult, SessionCheckpointStatsResult, SessionCommit,
+    SessionCompareFile, SessionCompareResult, SessionContextStatus, SessionDiff, SessionForkResult,
+    SessionForkTreeNode, SessionForkTreeResult, SessionImportResult, SessionLandResult,
+    SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPriorityResult,
+    SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult, ShellPolicy,
+    StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan,
+    TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
     TerminalWriteResult, TodoItem, UpdateModelPresetParams, UsageBucket, UsageCsvResult,
     UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult, WorkspaceTreeResult,
     WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
@@ -46,6 +47,7 @@ pub mod acp;
 pub mod agent;
 pub mod budget;
 pub mod console;
+mod dashboard;
 pub mod history;
 pub mod mcp;
 pub mod rebuild;
@@ -825,6 +827,170 @@ impl Engine {
         })
     }
 
+    pub async fn restore_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<SessionCheckpointRestoreResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (session, project) = tokio::task::spawn_blocking(move || {
+            let session = store
+                .get_session(&id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+            let project = store
+                .get_project(&session.project_id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {}", session.project_id))?;
+            Ok::<_, anyhow::Error>((session, project))
+        })
+        .await??;
+        ensure_session_quiescent(&session, "restore a checkpoint")?;
+        let checkpoint = self
+            .active_checkpoints(session_id)
+            .await?
+            .into_iter()
+            .find(|checkpoint| checkpoint.id == checkpoint_id)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint not found: {checkpoint_id}"))?;
+        let worktree = PathBuf::from(
+            session
+                .worktree
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?,
+        );
+        if !worktree.is_dir() {
+            anyhow::bail!("session worktree is missing: {}", worktree.display());
+        }
+        let expected_branch = session.branch.clone();
+        let project_root = PathBuf::from(&project.root);
+        let git_lock = self.git_lock.clone();
+        let restore_path = worktree.clone();
+        let status_path = worktree.clone();
+        let branch_path = worktree.clone();
+        let restore_commit = checkpoint.commit.clone();
+        let (previous_commit, restored_commit) = tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            let status = worktree::status_porcelain(&status_path)?;
+            let branch = worktree::current_branch(&branch_path)?;
+            if let Some(expected) = expected_branch.as_deref()
+                && branch != expected
+            {
+                anyhow::bail!(
+                    "session worktree is on branch {branch}; expected {expected}"
+                );
+            }
+            if !status.is_empty() {
+                anyhow::bail!(
+                    "session worktree has uncommitted changes; commit or discard them before restoring a checkpoint"
+                );
+            }
+            if !worktree::commit_exists(&project_root, &restore_commit) {
+                anyhow::bail!("checkpoint commit is missing: {restore_commit}");
+            }
+            let previous = worktree::head_commit(&restore_path)?;
+            worktree::reset_hard(&restore_path, &restore_commit)?;
+            Ok::<_, anyhow::Error>((previous, restore_commit))
+        })
+        .await??;
+        self.append_event(
+            session_id,
+            "session.checkpoint.restored",
+            serde_json::json!({
+                "checkpoint_id": checkpoint.id,
+                "previous_commit": previous_commit,
+                "restored_commit": restored_commit,
+            }),
+        )
+        .await?;
+        Ok(SessionCheckpointRestoreResult {
+            session_id: session.id,
+            checkpoint_id: checkpoint.id,
+            previous_commit,
+            restored_commit,
+        })
+    }
+
+    pub async fn diff_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<SessionCheckpointDiffResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (session, project) = tokio::task::spawn_blocking(move || {
+            let session = store
+                .get_session(&id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+            let project = store
+                .get_project(&session.project_id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {}", session.project_id))?;
+            Ok::<_, anyhow::Error>((session, project))
+        })
+        .await??;
+        ensure_session_quiescent(&session, "inspect a checkpoint")?;
+        let checkpoint = self
+            .active_checkpoints(session_id)
+            .await?
+            .into_iter()
+            .find(|checkpoint| checkpoint.id == checkpoint_id)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint not found: {checkpoint_id}"))?;
+        let worktree = PathBuf::from(
+            session
+                .worktree
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?,
+        );
+        if !worktree.is_dir() {
+            anyhow::bail!("session worktree is missing: {}", worktree.display());
+        }
+        let expected_branch = session.branch.clone();
+        let project_root = PathBuf::from(&project.root);
+        let git_lock = self.git_lock.clone();
+        let diff_path = worktree.clone();
+        let checkpoint_commit = checkpoint.commit.clone();
+        let (current_commit, current_branch, clean, numstat, patch) =
+            tokio::task::spawn_blocking(move || {
+                let _guard = git_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+                let branch = worktree::current_branch(&diff_path)?;
+                if let Some(expected) = expected_branch.as_deref()
+                    && branch != expected
+                {
+                    anyhow::bail!("session worktree is on branch {branch}; expected {expected}");
+                }
+                let clean = worktree::status_porcelain(&diff_path)?.is_empty();
+                if !worktree::commit_exists(&project_root, &checkpoint_commit) {
+                    anyhow::bail!("checkpoint commit is missing: {checkpoint_commit}");
+                }
+                let current = worktree::head_commit(&diff_path)?;
+                let range = format!("{current}..{checkpoint_commit}");
+                let numstat = worktree::git_output(
+                    &project_root,
+                    &["diff", "--numstat", "--no-color", "--no-ext-diff", &range],
+                )?;
+                let patch = worktree::git_output(
+                    &project_root,
+                    &["diff", "--no-color", "--no-ext-diff", &range],
+                )?;
+                Ok::<_, anyhow::Error>((current, branch, clean, numstat, patch))
+            })
+            .await??;
+        let truncated = patch.chars().count() > 200_000;
+        Ok(SessionCheckpointDiffResult {
+            session_id: session.id,
+            checkpoint_id: checkpoint.id,
+            current_commit,
+            checkpoint_commit: checkpoint.commit,
+            current_branch,
+            clean,
+            files: parse_numstat(&numstat),
+            patch: clip_transcript(&patch, 200_000),
+            truncated,
+        })
+    }
+
     pub async fn delete_checkpoint(
         &self,
         session_id: &str,
@@ -1529,30 +1695,13 @@ impl Engine {
             Ok::<_, anyhow::Error>((left_commit, right_commit, numstat, patch))
         })
         .await??;
-        let mut files = Vec::new();
-        for line in numstat.lines() {
-            let mut parts = line.splitn(3, '\t');
-            let additions = parts.next().unwrap_or("-");
-            let deletions = parts.next().unwrap_or("-");
-            let path = parts.next().unwrap_or("");
-            if path.is_empty() {
-                continue;
-            }
-            let binary = additions == "-" || deletions == "-";
-            files.push(SessionCompareFile {
-                path: path.to_string(),
-                additions: additions.parse().unwrap_or(0),
-                deletions: deletions.parse().unwrap_or(0),
-                binary,
-            });
-        }
         let truncated = patch.chars().count() > 200_000;
         Ok(SessionCompareResult {
             session_id: session_id.to_string(),
             other_session_id: other_session_id.to_string(),
             left_commit,
             right_commit,
-            files,
+            files: parse_numstat(&numstat),
             patch: clip_transcript(&patch, 200_000),
             truncated,
         })
@@ -6496,6 +6645,27 @@ fn csv_field(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn parse_numstat(numstat: &str) -> Vec<SessionCompareFile> {
+    let mut files = Vec::new();
+    for line in numstat.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let additions = parts.next().unwrap_or("-");
+        let deletions = parts.next().unwrap_or("-");
+        let path = parts.next().unwrap_or("");
+        if path.is_empty() {
+            continue;
+        }
+        let binary = additions == "-" || deletions == "-";
+        files.push(SessionCompareFile {
+            path: path.to_string(),
+            additions: additions.parse().unwrap_or(0),
+            deletions: deletions.parse().unwrap_or(0),
+            binary,
+        });
+    }
+    files
 }
 
 fn clip_transcript(text: &str, limit: usize) -> String {

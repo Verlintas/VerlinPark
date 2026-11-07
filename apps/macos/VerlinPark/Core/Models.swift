@@ -1305,6 +1305,44 @@ struct SessionCheckpointListResult: Codable, Sendable {
     let checkpoints: [SessionCheckpoint]
 }
 
+struct SessionCheckpointRestoreResult: Codable, Sendable {
+    let sessionID: String
+    let checkpointID: String
+    let previousCommit: String
+    let restoredCommit: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case checkpointID = "checkpoint_id"
+        case previousCommit = "previous_commit"
+        case restoredCommit = "restored_commit"
+    }
+}
+
+struct SessionCheckpointDiffResult: Codable, Sendable {
+    let sessionID: String
+    let checkpointID: String
+    let currentCommit: String
+    let checkpointCommit: String
+    let currentBranch: String
+    let clean: Bool
+    let files: [SessionCompareFile]
+    let patch: String
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case checkpointID = "checkpoint_id"
+        case currentCommit = "current_commit"
+        case checkpointCommit = "checkpoint_commit"
+        case currentBranch = "current_branch"
+        case clean
+        case files
+        case patch
+        case truncated
+    }
+}
+
 struct SessionCheckpointStatsResult: Codable, Sendable {
     let sessionID: String
     let checkpoints: Int
@@ -1404,6 +1442,131 @@ struct SessionForkTreeNode: Codable, Sendable, Identifiable {
         case checkpointID = "checkpoint_id"
         case commit
         case children
+    }
+}
+
+struct DashboardCount: Codable, Sendable, Identifiable {
+    var id: String {
+        label
+    }
+
+    let label: String
+    let count: Int
+}
+
+struct DashboardProjectSummary: Codable, Sendable, Identifiable {
+    var id: String {
+        projectID
+    }
+
+    let projectID: String
+    let name: String
+    let sessions: Int
+    let runningSessions: Int
+    let queuedSessions: Int
+    let failedSessions: Int
+    let pendingApprovals: Int
+    let pendingQuestions: Int
+    let tasks: Int
+    let runningTasks: Int
+    let checkpoints: Int
+    let dirtyCheckpoints: Int
+    let forkRoots: Int
+    let forkSessions: Int
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case name
+        case sessions
+        case runningSessions = "running_sessions"
+        case queuedSessions = "queued_sessions"
+        case failedSessions = "failed_sessions"
+        case pendingApprovals = "pending_approvals"
+        case pendingQuestions = "pending_questions"
+        case tasks
+        case runningTasks = "running_tasks"
+        case checkpoints
+        case dirtyCheckpoints = "dirty_checkpoints"
+        case forkRoots = "fork_roots"
+        case forkSessions = "fork_sessions"
+    }
+}
+
+struct DashboardSummary: Codable, Sendable {
+    let generatedAt: String
+    let projectID: String?
+    let projects: Int
+    let sessions: Int
+    let sessionsByStatus: [DashboardCount]
+    let pendingApprovals: Int
+    let pendingQuestions: Int
+    let runningSessions: Int
+    let queuedSessions: Int
+    let tasks: Int
+    let tasksByStatus: [DashboardCount]
+    let runningTasks: Int
+    let writeLeases: Int
+    let checkpoints: Int
+    let dirtyCheckpoints: Int
+    let forkRoots: Int
+    let forkSessions: Int
+    let projectSummaries: [DashboardProjectSummary]
+    let agent: AgentInfo?
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case projectID = "project_id"
+        case projects
+        case sessions
+        case sessionsByStatus = "sessions_by_status"
+        case pendingApprovals = "pending_approvals"
+        case pendingQuestions = "pending_questions"
+        case runningSessions = "running_sessions"
+        case queuedSessions = "queued_sessions"
+        case tasks
+        case tasksByStatus = "tasks_by_status"
+        case runningTasks = "running_tasks"
+        case writeLeases = "write_leases"
+        case checkpoints
+        case dirtyCheckpoints = "dirty_checkpoints"
+        case forkRoots = "fork_roots"
+        case forkSessions = "fork_sessions"
+        case projectSummaries = "project_summaries"
+        case agent
+    }
+}
+
+struct DashboardAlert: Codable, Sendable, Identifiable {
+    let id: String
+    let kind: String
+    let severity: String
+    let title: String
+    let detail: String
+    let projectID: String?
+    let sessionID: String?
+    let action: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case kind
+        case severity
+        case title
+        case detail
+        case projectID = "project_id"
+        case sessionID = "session_id"
+        case action
+    }
+}
+
+struct DashboardResult: Codable, Sendable {
+    let summary: DashboardSummary
+    let alerts: [DashboardAlert]
+    let alertsTruncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case summary
+        case alerts
+        case alertsTruncated = "alerts_truncated"
     }
 }
 

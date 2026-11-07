@@ -120,6 +120,8 @@
 | [0108](adr/0108-project-fork-forest-and-audit.md) | Project fork forest, audit, and checkpoint stats | Accepted | Session/Git |
 | [0109](adr/0109-model-preset-catalog.md) | Model preset catalog | Accepted | Models/Config |
 | [0110](adr/0110-manage-dash-information-architecture.md) | Manage Dash information architecture | Accepted | UI |
+| [0111](adr/0111-checkpoint-restore.md) | Restore a session worktree to a checkpoint | Accepted | Session/Git |
+| [0112](adr/0112-cross-project-dashboard-snapshot.md) | Cross-project Manage Dash snapshot | Accepted | UI/API |
 
 ---
 

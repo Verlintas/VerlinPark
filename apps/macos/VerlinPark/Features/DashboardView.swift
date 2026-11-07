@@ -90,6 +90,9 @@ struct DashboardView: View {
             if let saved = DashboardSection(rawValue: storedSection) {
                 section = saved
             }
+            if section != .overview, section != .team {
+                Task { await model.loadDashboardSnapshot() }
+            }
             Task { await refreshSection(section) }
         }
         .onChange(of: section) { _, newValue in
@@ -352,13 +355,21 @@ struct DashboardView: View {
     private func badge(for section: DashboardSection) -> Int? {
         switch section {
         case .inbox:
-            model.pendingApprovals.count + model.pendingQuestions.count
+            if let summary = model.dashboardSnapshot?.summary {
+                summary.pendingApprovals + summary.pendingQuestions
+            } else {
+                model.pendingApprovals.count + model.pendingQuestions.count
+            }
         case .team:
-            model.taskQueue?.tasks.count(where: { $0.status == "running" }) ?? 0
+            model.dashboardSnapshot?.summary.runningTasks
+                ?? model.taskQueue?.tasks.count(where: { $0.status == "running" })
+                ?? 0
         case .git:
-            model.projectForkForest?.roots.count ?? 0
+            model.dashboardSnapshot?.summary.forkRoots
+                ?? model.projectForkForest?.roots.count
+                ?? 0
         case .checkpoints:
-            model.checkpoints.count
+            model.dashboardSnapshot?.summary.checkpoints ?? model.checkpoints.count
         default:
             nil
         }
@@ -370,6 +381,7 @@ struct DashboardView: View {
             await model.refreshAgentInfo()
             await model.loadProjectUsage()
             await model.loadProjectForkForest()
+            await model.loadDashboardSnapshot()
             await model.loadAgents()
             await model.loadPendingApprovals()
             await model.loadPendingQuestions()
@@ -379,6 +391,7 @@ struct DashboardView: View {
         case .team:
             await model.loadAgents()
             await model.loadTaskQueue()
+            await model.loadDashboardSnapshot()
             await model.refreshAgentInfo()
         case .usage:
             await model.loadProjectUsage()

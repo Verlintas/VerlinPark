@@ -1184,4 +1184,133 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(Set(sections.map(\.title)).count, sections.count)
         XCTAssertTrue(sections.allSatisfy { !$0.detail.isEmpty && !$0.icon.isEmpty })
     }
+
+    func testDashboardResultDecodesCrossProjectSummaryAndAlerts() throws {
+        let json = """
+        {
+          "summary": {
+            "generated_at": "2026-11-08T00:00:00Z",
+            "project_id": null,
+            "projects": 2,
+            "sessions": 4,
+            "sessions_by_status": [
+              {"label": "failed", "count": 1},
+              {"label": "idle", "count": 3}
+            ],
+            "pending_approvals": 2,
+            "pending_questions": 1,
+            "running_sessions": 0,
+            "queued_sessions": 1,
+            "tasks": 5,
+            "tasks_by_status": [{"label": "blocked", "count": 1}],
+            "running_tasks": 0,
+            "write_leases": 1,
+            "checkpoints": 6,
+            "dirty_checkpoints": 2,
+            "fork_roots": 3,
+            "fork_sessions": 1,
+            "project_summaries": [
+              {
+                "project_id": "project-1",
+                "name": "Alpha",
+                "sessions": 4,
+                "running_sessions": 0,
+                "queued_sessions": 1,
+                "failed_sessions": 1,
+                "pending_approvals": 2,
+                "pending_questions": 1,
+                "tasks": 5,
+                "running_tasks": 0,
+                "checkpoints": 6,
+                "dirty_checkpoints": 2,
+                "fork_roots": 3,
+                "fork_sessions": 1
+              }
+            ]
+          },
+          "alerts": [
+            {
+              "id": "approval:1",
+              "kind": "approval",
+              "severity": "warning",
+              "title": "Approval pending: write_file",
+              "detail": "alpha · tool call call-1",
+              "project_id": "project-1",
+              "session_id": "session-1",
+              "action": "inbox"
+            },
+            {
+              "id": "task:session-1:T1",
+              "kind": "task",
+              "severity": "critical",
+              "title": "Task failed: Build",
+              "detail": "compiler error",
+              "project_id": "project-1",
+              "session_id": "session-1",
+              "action": "team"
+            }
+          ],
+          "alerts_truncated": false
+        }
+        """
+        let result = try JSONDecoder().decode(DashboardResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.summary.projects, 2)
+        XCTAssertEqual(result.summary.sessionsByStatus.count, 2)
+        XCTAssertEqual(result.summary.dirtyCheckpoints, 2)
+        XCTAssertEqual(result.summary.projectSummaries.count, 1)
+        XCTAssertEqual(result.summary.projectSummaries[0].name, "Alpha")
+        XCTAssertEqual(result.summary.projectSummaries[0].failedSessions, 1)
+        XCTAssertNil(result.summary.agent)
+        XCTAssertEqual(result.alerts.count, 2)
+        XCTAssertEqual(result.alerts[1].severity, "critical")
+        XCTAssertEqual(result.alerts[1].action, "team")
+        XCTAssertFalse(result.alertsTruncated)
+    }
+
+    func testCheckpointRestoreResultDecodes() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "checkpoint_id": "checkpoint-1",
+          "previous_commit": "aaaaaaaaaaaaaaaa",
+          "restored_commit": "bbbbbbbbbbbbbbbb"
+        }
+        """
+        let result = try JSONDecoder().decode(
+            SessionCheckpointRestoreResult.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(result.sessionID, "session-1")
+        XCTAssertEqual(result.checkpointID, "checkpoint-1")
+        XCTAssertEqual(result.previousCommit, "aaaaaaaaaaaaaaaa")
+        XCTAssertEqual(result.restoredCommit, "bbbbbbbbbbbbbbbb")
+    }
+
+    func testCheckpointDiffResultDecodesFilesAndDirtyState() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "checkpoint_id": "checkpoint-1",
+          "current_commit": "aaaaaaaaaaaaaaaa",
+          "checkpoint_commit": "bbbbbbbbbbbbbbbb",
+          "current_branch": "vp/session-1",
+          "clean": false,
+          "files": [
+            {"path": "src/main.rs", "additions": 3, "deletions": 1, "binary": false}
+          ],
+          "patch": "diff --git a/src/main.rs b/src/main.rs",
+          "truncated": false
+        }
+        """
+        let result = try JSONDecoder().decode(
+            SessionCheckpointDiffResult.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(result.currentBranch, "vp/session-1")
+        XCTAssertFalse(result.clean)
+        XCTAssertEqual(result.files.count, 1)
+        XCTAssertEqual(result.files[0].additions, 3)
+        XCTAssertFalse(result.files[0].binary)
+        XCTAssertTrue(result.patch.hasPrefix("diff --git"))
+    }
 }

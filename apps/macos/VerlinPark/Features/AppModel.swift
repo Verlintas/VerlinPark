@@ -180,12 +180,18 @@ final class AppModel {
     var checkpoints: [SessionCheckpoint] = []
     var checkpointBusy = false
     var checkpointNotice: String?
+    var checkpointDiff: SessionCheckpointDiffResult?
+    var checkpointDiffBusy = false
+    var checkpointDiffNotice: String?
     var checkpointStats: SessionCheckpointStatsResult?
     var checkpointStatsBusy = false
     var sessionLineage: SessionLineageResult?
     var lineageBusy = false
     var forkTree: SessionForkTreeResult?
     var forkTreeBusy = false
+    var dashboardSnapshot: DashboardResult?
+    var dashboardBusy = false
+    var dashboardStatus: String?
     var projectForkForest: ProjectForkForestResult?
     var projectForkForestBusy = false
     var forkAudit: ForkAuditResult?
@@ -401,9 +407,13 @@ final class AppModel {
             checkpoints = []
             checkpointNotice = nil
             checkpointStats = nil
+            checkpointDiff = nil
+            checkpointDiffNotice = nil
             sessionLineage = nil
             forkTree = nil
             projectForkForest = nil
+            dashboardSnapshot = nil
+            dashboardStatus = nil
             forkAudit = nil
             forkRepairNotice = nil
             compareResult = nil
@@ -466,6 +476,8 @@ final class AppModel {
         checkpoints = []
         checkpointNotice = nil
         checkpointStats = nil
+        checkpointDiff = nil
+        checkpointDiffNotice = nil
         sessionLineage = nil
         forkTree = nil
         projectForkForest = nil
@@ -490,6 +502,7 @@ final class AppModel {
         Task { await loadProjectBudget() }
         Task { await loadProjectUsage() }
         Task { await loadProjectForkForest() }
+        Task { await loadDashboardSnapshot() }
         Task { await loadMemories() }
         Task { await loadCheckpointPolicy() }
         Task { await loadWorktreePolicy() }
@@ -515,6 +528,8 @@ final class AppModel {
         checkpoints = []
         checkpointNotice = nil
         checkpointStats = nil
+        checkpointDiff = nil
+        checkpointDiffNotice = nil
         sessionLineage = nil
         forkTree = nil
         projectForkForest = nil
@@ -2938,6 +2953,50 @@ final class AppModel {
         }
     }
 
+    func loadCheckpointDiff(_ checkpointID: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        checkpointDiffBusy = true
+        checkpointDiff = nil
+        checkpointDiffNotice = nil
+        defer { checkpointDiffBusy = false }
+        do {
+            let result = try await core.checkpointDiff(
+                sessionID: sessionID,
+                checkpointID: checkpointID
+            )
+            if sessionID == selectedSessionID {
+                checkpointDiff = result
+            }
+        } catch {
+            checkpointDiffNotice = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func restoreCheckpoint(_ checkpointID: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        checkpointBusy = true
+        checkpointNotice = nil
+        defer { checkpointBusy = false }
+        do {
+            let result = try await core.restoreCheckpoint(
+                sessionID: sessionID,
+                checkpointID: checkpointID
+            )
+            await loadCheckpoints()
+            await loadCheckpointStats()
+            await loadEvents()
+            await loadDiff()
+            checkpointDiff = nil
+            checkpointDiffNotice = nil
+            checkpointNotice =
+                "Restored \(String(result.restoredCommit.prefix(8))) from \(String(result.previousCommit.prefix(8)))"
+        } catch {
+            checkpointNotice = error.localizedDescription
+            handle(error)
+        }
+    }
+
     func deleteCheckpoint(_ checkpointID: String) async {
         guard let sessionID = selectedSessionID else { return }
         checkpointBusy = true
@@ -3005,6 +3064,25 @@ final class AppModel {
             }
         } catch {
             forkTree = nil
+        }
+    }
+
+    func loadDashboardSnapshot() async {
+        let projectID = selectedProjectID
+        dashboardBusy = true
+        defer { dashboardBusy = false }
+        do {
+            let snapshot = try await core.dashboardSnapshot(projectID: projectID)
+            if projectID == selectedProjectID {
+                dashboardSnapshot = snapshot
+                dashboardStatus = snapshot.alerts.isEmpty
+                    ? "No outstanding alerts."
+                    : "\(snapshot.alerts.count) alert(s)\(snapshot.alertsTruncated ? " (truncated)" : "")"
+            }
+        } catch {
+            if projectID == selectedProjectID {
+                dashboardStatus = error.localizedDescription
+            }
         }
     }
 

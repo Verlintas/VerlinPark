@@ -173,6 +173,11 @@ enum Command {
         #[arg(long)]
         read_jail: bool,
     },
+    /// Show the cross-project Manage Dash snapshot and alerts.
+    Dashboard {
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// List saved model presets.
     ModelPresets,
     /// Create a model preset (no API key is stored).
@@ -363,6 +368,8 @@ enum Command {
     Checkpoints { session: String },
     /// Show approximate checkpoint storage stats for a session.
     CheckpointStats { session: String },
+    /// Restore a session worktree branch to a checkpoint commit.
+    CheckpointRestore { session: String, checkpoint: String },
     /// Delete one checkpoint and its snapshot ref.
     CheckpointDelete { session: String, checkpoint: String },
     /// Prune checkpoints older than --older-than-days while keeping the latest N.
@@ -839,6 +846,14 @@ async fn main() -> Result<()> {
                         "read_jail": read_jail,
                     }
                 }),
+            )
+            .await?
+        }
+        Command::Dashboard { project } => {
+            rpc(
+                &discovery,
+                "dashboard.snapshot",
+                json!({"project_id": project}),
             )
             .await?
         }
@@ -1332,6 +1347,17 @@ async fn main() -> Result<()> {
                 &discovery,
                 "session.checkpoint.stats",
                 json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::CheckpointRestore {
+            session,
+            checkpoint,
+        } => {
+            rpc(
+                &discovery,
+                "session.checkpoint.restore",
+                json!({"session_id": session, "checkpoint_id": checkpoint}),
             )
             .await?
         }

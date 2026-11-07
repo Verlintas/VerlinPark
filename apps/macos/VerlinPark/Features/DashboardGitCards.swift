@@ -3,6 +3,8 @@ import SwiftUI
 struct CheckpointsCard: View {
     @Environment(AppModel.self) private var model
     @State private var deleting: SessionCheckpoint?
+    @State private var restoring: SessionCheckpoint?
+    @State private var previewing: SessionCheckpoint?
 
     var body: some View {
         @Bindable var model = model
@@ -32,7 +34,7 @@ struct CheckpointsCard: View {
                 .disabled(model.checkpointBusy || model.selectedSession == nil || model.checkpoints.isEmpty)
             }
             Text(
-                "Checkpoints snapshot the active conversation and worktree, including uncommitted tracked/untracked non-ignored changes. Forks already created keep their branch commits."
+                "Checkpoints snapshot the active conversation and worktree, including uncommitted tracked/untracked non-ignored changes. Restore resets only the session branch/worktree to a checkpoint commit; fork branches and event history are unaffected."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)
@@ -114,14 +116,24 @@ struct CheckpointsCard: View {
                             .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button {
-                            deleting = checkpoint
+                        Menu {
+                            Button("Preview changes") {
+                                previewing = checkpoint
+                            }
+                            Button("Restore worktree") {
+                                restoring = checkpoint
+                            }
+                            Divider()
+                            Button("Delete", role: .destructive) {
+                                deleting = checkpoint
+                            }
                         } label: {
-                            Image(systemName: "trash")
-                                .font(.system(size: 10))
+                            Image(systemName: "ellipsis.circle")
+                                .font(.system(size: 11))
                         }
-                        .buttonStyle(.plain)
-                        .help("Delete checkpoint")
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("Preview, restore, or delete checkpoint")
                         .disabled(model.checkpointBusy)
                     }
                 }
@@ -164,6 +176,172 @@ struct CheckpointsCard: View {
             Text(
                 "This removes the checkpoint event and its snapshot ref. Existing fork branches are unaffected."
             )
+        }
+        .confirmationDialog(
+            "Restore worktree to checkpoint?",
+            isPresented: Binding(
+                get: { restoring != nil },
+                set: {
+                    if !$0 {
+                        restoring = nil
+                    }
+                }
+            ),
+            presenting: restoring
+        ) { checkpoint in
+            Button("Restore \(String(checkpoint.commit.prefix(8)))", role: .destructive) {
+                Task { await model.restoreCheckpoint(checkpoint.id) }
+                restoring = nil
+            }
+            Button("Cancel", role: .cancel) { restoring = nil }
+        } message: { checkpoint in
+            Text(
+                "Resets the session branch and clean worktree to \(String(checkpoint.commit.prefix(8))). Later commits remain reachable through Git reflog; the session must be idle and clean."
+            )
+        }
+        .sheet(item: $previewing) { checkpoint in
+            CheckpointDiffSheet(checkpoint: checkpoint)
+                .environment(model)
+        }
+    }
+}
+
+private struct CheckpointDiffSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let checkpoint: SessionCheckpoint
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Checkpoint diff")
+                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                    Text(checkpoint.label)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text(
+                        "Current branch → \(String(checkpoint.commit.prefix(8))) · tracked files only"
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(20)
+
+            Divider().opacity(0.3)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    content
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(width: 780, height: 640)
+        .background(.ultraThinMaterial)
+        .task(id: checkpoint.id) {
+            await model.loadCheckpointDiff(checkpoint.id)
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if model.checkpointDiffBusy {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Comparing current branch with the checkpoint…")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        } else if let notice = model.checkpointDiffNotice {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(notice)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.red)
+                Button("Retry") {
+                    Task { await model.loadCheckpointDiff(checkpoint.id) }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        } else if let diff = model.checkpointDiff {
+            HStack(spacing: 18) {
+                LabeledContent("Current", value: String(diff.currentCommit.prefix(12)))
+                LabeledContent("Checkpoint", value: String(diff.checkpointCommit.prefix(12)))
+                LabeledContent("Branch", value: diff.currentBranch)
+            }
+            .font(.system(size: 9, design: .monospaced))
+
+            if !diff.clean {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(
+                        "The worktree is dirty. Restore requires a clean worktree; commit or discard changes first."
+                    )
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.orange)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 9))
+            }
+
+            if diff.files.isEmpty {
+                Text("No tracked content differences; the checkpoint already matches the current branch.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 4) {
+                    ForEach(diff.files) { file in
+                        HStack(spacing: 8) {
+                            Text(file.path)
+                                .font(.system(size: 9, design: .monospaced))
+                                .lineLimit(1)
+                            Spacer()
+                            if file.binary {
+                                Text("binary")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text("+\(file.additions)")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.green)
+                                Text("-\(file.deletions)")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.red)
+                            }
+                        }
+                        .padding(7)
+                        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 7))
+                    }
+                }
+            }
+
+            if !diff.patch.isEmpty {
+                DisclosureGroup("Patch preview") {
+                    Text(String(diff.patch.prefix(40000)))
+                        .font(.system(size: 9, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 6)
+                    if diff.truncated || diff.patch.count > 40000 {
+                        Text("Patch preview is clipped; the daemon caps the full patch at 200k characters.")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+            }
+        } else {
+            Text("Select a session with this checkpoint to preview the restore diff.")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.tertiary)
         }
     }
 }

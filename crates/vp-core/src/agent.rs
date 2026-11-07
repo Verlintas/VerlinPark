@@ -15,8 +15,9 @@ use tokio::time::timeout;
 use vp_protocol::types::{
     AgentInfo, AgentProbeResult, CapacityInfo, ConfigureAgentParams, ContextCompactionSummary,
     ContextMeasurement, MergeQueueEntry, PlanDepartment, PlanTask, Project, RoleModels, Session,
-    SessionCheckpoint, SessionCompactResult, SessionForkResult, SessionMergeForkResult,
-    StoredMessage, TeamPlan, TodoItem,
+    SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
+    SessionCompactResult, SessionForkResult, SessionMergeForkResult, StoredMessage, TeamPlan,
+    TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -2821,6 +2822,33 @@ impl AgentService {
     ) -> Result<SessionCheckpoint> {
         self.begin_operation(session_id)?;
         let result = self.engine.checkpoint_session(session_id, label).await;
+        self.end_operation(session_id);
+        result
+    }
+
+    /// Serialize a worktree checkpoint restore with prompts/plans/compaction.
+    pub async fn restore_checkpoint_now(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<SessionCheckpointRestoreResult> {
+        self.begin_operation(session_id)?;
+        let result = self
+            .engine
+            .restore_checkpoint(session_id, checkpoint_id)
+            .await;
+        self.end_operation(session_id);
+        result
+    }
+
+    /// Serialize a checkpoint diff preview with prompts/plans/compaction.
+    pub async fn diff_checkpoint_now(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<SessionCheckpointDiffResult> {
+        self.begin_operation(session_id)?;
+        let result = self.engine.diff_checkpoint(session_id, checkpoint_id).await;
         self.end_operation(session_id);
         result
     }

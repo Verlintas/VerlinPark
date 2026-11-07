@@ -241,6 +241,34 @@ actor CoreClient {
         .checkpoints
     }
 
+    func restoreCheckpoint(
+        sessionID: String,
+        checkpointID: String
+    ) async throws -> SessionCheckpointRestoreResult {
+        try await request(
+            method: "session.checkpoint.restore",
+            params: [
+                "session_id": .string(sessionID),
+                "checkpoint_id": .string(checkpointID),
+            ]
+        )
+        .decode(SessionCheckpointRestoreResult.self)
+    }
+
+    func checkpointDiff(
+        sessionID: String,
+        checkpointID: String
+    ) async throws -> SessionCheckpointDiffResult {
+        try await request(
+            method: "session.checkpoint.diff",
+            params: [
+                "session_id": .string(sessionID),
+                "checkpoint_id": .string(checkpointID),
+            ]
+        )
+        .decode(SessionCheckpointDiffResult.self)
+    }
+
     func checkpointStats(sessionID: String) async throws -> SessionCheckpointStatsResult {
         try await request(
             method: "session.checkpoint.stats",
@@ -370,6 +398,14 @@ actor CoreClient {
     func deleteModelPreset(id: String) async throws -> DeleteModelPresetResult {
         try await request(method: "model.preset.delete", params: ["id": .string(id)])
             .decode(DeleteModelPresetResult.self)
+    }
+
+    func dashboardSnapshot(projectID: String?) async throws -> DashboardResult {
+        try await request(
+            method: "dashboard.snapshot",
+            params: ["project_id": projectID.map(JSONValue.string) ?? .null]
+        )
+        .decode(DashboardResult.self)
     }
 
     func projectForkForest(projectID: String) async throws -> ProjectForkForestResult {

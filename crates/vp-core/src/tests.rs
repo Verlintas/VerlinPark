@@ -4007,3 +4007,208 @@ async fn fork_audit_removes_a_stale_ref_for_a_deleted_checkpoint() {
         &checkpoint.id
     ));
 }
+
+#[tokio::test]
+async fn checkpoint_restore_resets_the_source_worktree_branch() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("restore".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "restore source".into(), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    std::fs::write(worktree.join("restore.txt"), "checkpoint state\n").unwrap();
+    let checkpoint = engine
+        .checkpoint_session(&session.id, Some("restore point".into()))
+        .await
+        .unwrap();
+    commit_worktree_file(&worktree, "later.txt", "later state\n");
+    std::fs::write(worktree.join("restore.txt"), "later state\n").unwrap();
+    commit_worktree_file(&worktree, "restore.txt", "later state\n");
+    let previous = crate::worktree::head_commit(&worktree).unwrap();
+    assert_ne!(previous, checkpoint.commit);
+
+    let preview = engine
+        .diff_checkpoint(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(preview.current_commit, previous);
+    assert_eq!(preview.checkpoint_commit, checkpoint.commit);
+    assert_eq!(preview.current_branch, session.branch.clone().unwrap());
+    assert!(preview.clean);
+    assert!(!preview.files.is_empty());
+    assert!(!preview.patch.is_empty());
+    assert!(!preview.truncated);
+    assert!(
+        preview
+            .files
+            .iter()
+            .any(|file| file.path == "restore.txt" || file.path == "later.txt")
+    );
+
+    let result = engine
+        .restore_checkpoint(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(result.previous_commit, previous);
+    assert_eq!(result.restored_commit, checkpoint.commit);
+    assert_eq!(
+        crate::worktree::head_commit(&worktree).unwrap(),
+        checkpoint.commit
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("restore.txt"))
+            .unwrap()
+            .trim(),
+        "checkpoint state"
+    );
+    assert!(!worktree.join("later.txt").exists());
+    std::fs::write(worktree.join("untracked.txt"), "dirty\n").unwrap();
+    let dirty_preview = engine
+        .diff_checkpoint(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert!(!dirty_preview.clean);
+    let dirty = engine
+        .restore_checkpoint(&session.id, &checkpoint.id)
+        .await
+        .unwrap_err();
+    assert!(dirty.to_string().contains("uncommitted changes"));
+    std::fs::remove_file(worktree.join("untracked.txt")).unwrap();
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.checkpoint.restored"
+            && event.payload["checkpoint_id"] == checkpoint.id
+    }));
+}
+
+#[tokio::test]
+async fn dashboard_snapshot_aggregates_pending_work_and_filters_by_project() {
+    let data = TempDir::new().unwrap();
+    let repo_a = TempDir::new().unwrap();
+    let repo_b = TempDir::new().unwrap();
+    init_repo(repo_a.path());
+    init_repo(repo_b.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project_a = engine
+        .add_project(
+            repo_a.path().to_string_lossy().to_string(),
+            Some("alpha".into()),
+        )
+        .await
+        .unwrap();
+    let project_b = engine
+        .add_project(
+            repo_b.path().to_string_lossy().to_string(),
+            Some("beta".into()),
+        )
+        .await
+        .unwrap();
+    let session_a = engine
+        .create_session(project_a.id.clone(), "alpha session".into(), None)
+        .await
+        .unwrap();
+    let session_b = engine
+        .create_session(project_b.id.clone(), "beta session".into(), None)
+        .await
+        .unwrap();
+    let (_approval, _approval_rx) = engine
+        .request_approval(
+            &session_a.id,
+            "call-1",
+            "write_file",
+            serde_json::json!({"path": "README.md"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let (_question, _question_rx) = engine
+        .request_question(
+            &session_a.id,
+            "agent-1",
+            "Leader",
+            "Proceed?",
+            vec!["yes".into()],
+        )
+        .await
+        .unwrap();
+    let worktree_a = PathBuf::from(session_a.worktree.clone().unwrap());
+    std::fs::write(worktree_a.join("checkpoint.txt"), "snapshot\n").unwrap();
+    let checkpoint = engine
+        .checkpoint_session(&session_a.id, Some("dashboard".into()))
+        .await
+        .unwrap();
+
+    let all = engine.dashboard_snapshot(None).await.unwrap();
+    assert_eq!(all.summary.projects, 2);
+    assert_eq!(all.summary.sessions, 2);
+    assert_eq!(all.summary.pending_approvals, 1);
+    assert_eq!(all.summary.pending_questions, 1);
+    assert_eq!(all.summary.checkpoints, 1);
+    assert_eq!(all.summary.dirty_checkpoints, 1);
+    assert_eq!(all.summary.fork_roots, 2);
+    assert_eq!(all.summary.fork_sessions, 0);
+    assert_eq!(all.summary.project_summaries.len(), 2);
+    let alpha = all
+        .summary
+        .project_summaries
+        .iter()
+        .find(|project| project.project_id == project_a.id)
+        .unwrap();
+    assert_eq!(alpha.sessions, 1);
+    assert_eq!(alpha.pending_approvals, 1);
+    assert_eq!(alpha.pending_questions, 1);
+    assert_eq!(alpha.checkpoints, 1);
+    assert_eq!(alpha.dirty_checkpoints, 1);
+    assert_eq!(alpha.fork_roots, 1);
+    assert_eq!(alpha.fork_sessions, 0);
+    assert_eq!(all.summary.project_summaries[0].project_id, project_a.id);
+    assert!(!all.alerts_truncated);
+    assert!(all.alerts.iter().any(|alert| alert.kind == "approval"));
+    assert!(all.alerts.iter().any(|alert| alert.kind == "question"));
+    assert_eq!(all.summary.sessions_by_status.len(), 1);
+
+    let only_b = engine
+        .dashboard_snapshot(Some(&project_b.id))
+        .await
+        .unwrap();
+    assert_eq!(only_b.summary.projects, 1);
+    assert_eq!(only_b.summary.sessions, 1);
+    assert_eq!(only_b.summary.pending_approvals, 0);
+    assert_eq!(only_b.summary.pending_questions, 0);
+    assert_eq!(only_b.summary.checkpoints, 0);
+    assert_eq!(only_b.summary.project_summaries.len(), 1);
+    assert_eq!(only_b.summary.project_summaries[0].project_id, project_b.id);
+    assert_eq!(only_b.summary.project_summaries[0].sessions, 1);
+    assert!(only_b.alerts.is_empty());
+    assert_eq!(only_b.summary.sessions_by_status[0].label, "draft");
+    assert!(
+        engine
+            .dashboard_snapshot(Some("missing-project"))
+            .await
+            .is_err()
+    );
+
+    let session_events = engine
+        .list_events(session_b.id.clone(), 0, 10)
+        .await
+        .unwrap();
+    assert!(
+        session_events
+            .iter()
+            .any(|event| event.kind == "session.created")
+    );
+    assert_eq!(checkpoint.session_id, session_a.id);
+}
