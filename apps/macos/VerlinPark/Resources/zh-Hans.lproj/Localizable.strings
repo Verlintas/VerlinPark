@@ -465,3 +465,4 @@
 "base" = "基础";
 "Leader → Manager → Worker → Labour" = "Leader → 经理 → 执行者 → 协作员";
 "local-first · user-configured models" = "本地优先 · 用户配置模型";
+"EXTERNAL" = "外部";

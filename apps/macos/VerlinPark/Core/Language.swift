@@ -48,6 +48,7 @@ final class LanguageStore {
         }
         let preferred = Locale.preferredLanguages.first?.lowercased() ?? "en"
         language = preferred.hasPrefix("zh") ? .simplifiedChinese : .english
+        UserDefaults.standard.set(language.rawValue, forKey: Self.storageKey)
     }
 
     var locale: Locale {
