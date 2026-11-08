@@ -23,6 +23,7 @@ enum KeyboardShortcutsCatalog {
             entries: [
                 KeyboardShortcutEntry(title: "Command palette", key: "K", modifiers: [.command]),
                 KeyboardShortcutEntry(title: "Focus mode", key: "F", modifiers: [.command, .shift]),
+                KeyboardShortcutEntry(title: "Toggle inspector", key: "I", modifiers: [.command, .option]),
                 KeyboardShortcutEntry(title: "Search messages", key: "F", modifiers: [.command]),
                 KeyboardShortcutEntry(title: "Refresh current panel", key: "R", modifiers: [.command]),
                 KeyboardShortcutEntry(title: "Manage Dash", key: "D", modifiers: [.command, .shift]),
@@ -67,11 +68,15 @@ struct KeyboardShortcutsSheet: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
+                    Text("SHORTCUTS")
+                        .font(VPTheme.mono(8, weight: .semibold))
+                        .tracking(1.2)
+                        .foregroundStyle(VPTheme.accent)
                     Text("Keyboard shortcuts")
-                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        .font(VPTheme.font(20, weight: .semibold, rounded: true))
                     Text("Move through the workspace without leaving the keyboard.")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .font(VPTheme.mono(8.5))
+                        .foregroundStyle(VPTheme.textSecondary)
                 }
                 Spacer()
                 Button("Close") { dismiss() }
@@ -79,8 +84,7 @@ struct KeyboardShortcutsSheet: View {
             }
             .padding(20)
 
-            VPGradientRule()
-                .frame(height: 1)
+            VPHairline()
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -91,8 +95,9 @@ struct KeyboardShortcutsSheet: View {
                 .padding(20)
             }
         }
-        .frame(width: 620, height: 600)
-        .background(.ultraThinMaterial)
+        .frame(width: 640, height: 620)
+        .background(VPTheme.canvas)
+        .tint(VPTheme.accent)
     }
 
     private func shortcutSection(_ group: KeyboardShortcutGroup) -> some View {
@@ -108,7 +113,7 @@ struct KeyboardShortcutsSheet: View {
                     }
                     .padding(.horizontal, 9)
                     .padding(.vertical, 6)
-                    .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 7))
+                    .background(VPTheme.surface.opacity(0.55), in: RoundedRectangle(cornerRadius: 7))
                     .vpHoverHighlight(radius: 7)
                     .vpAppear(index: index, animation: VPMotion.hover)
                 }
@@ -146,15 +151,15 @@ private struct ShortcutKey: View {
 
     var body: some View {
         Text(label)
-            .font(.system(size: 9, weight: .semibold, design: .monospaced))
-            .foregroundStyle(.secondary)
+            .font(VPTheme.mono(9, weight: .semibold))
+            .foregroundStyle(VPTheme.textSecondary)
             .frame(minWidth: 18)
             .padding(.horizontal, 4)
             .padding(.vertical, 2)
-            .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+            .background(VPTheme.surfaceRaised, in: RoundedRectangle(cornerRadius: 4))
             .overlay {
                 RoundedRectangle(cornerRadius: 4)
-                    .strokeBorder(.white.opacity(0.07), lineWidth: 1)
+                    .strokeBorder(VPTheme.hairline, lineWidth: 1)
             }
     }
 }

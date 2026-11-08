@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-07
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy 已跑通
+> 最后更新：2026-11-08
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Warm Graphite Atelier UI 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
 
@@ -71,7 +71,7 @@
 ## 验证
 
 - `cargo test --workspace`：267 个测试通过（core 217、protocol 1、store 41、providers 8）；另有 3 个 env-gated live provider tests 默认 ignored。
-- `xcodebuild test`：65 个 Swift 测试通过（含协议向后兼容解码与 diff parser）。
+- `xcodebuild test`：72 个 Swift 测试通过（含协议向后兼容解码、diff parser、Rail session grouping 与 design-system invariants）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
 - 最近 CI：GitHub hosted macOS runner 持续排队/容量受限；本地 lint、Rust/Swift 测试与打包通过。
@@ -254,6 +254,7 @@
 - **M3 第一百一十六切片**：checkpoint diff/restore + cross-project dashboard snapshot（`session.checkpoint.diff` / `vp checkpoint-diff` tracked diff preview；`session.checkpoint.restore` / `vp checkpoint-restore`，idle/clean/branch/commit 校验、reset hard、restored event、CLI/UI Preview/Restore；`dashboard.snapshot` / `vp dashboard` 汇总 sessions/tasks/approvals/questions/checkpoints/forks + alerts、project filter、per-project breakdown、daemon capacity、Manage Dash attention card/badges；Rust/Swift tests）；见 ADR-0111/0112。
 - **M3 第一百一十七切片**：MCP HTTP/SSE transports（`McpTransport` Stdio/Http/Sse、Streamable HTTP JSON/SSE + session id + protocol header + DELETE、legacy SSE endpoint/same-origin POST、same-origin redirect、header env indirection、8MiB caps、server-initiated -32601、transport-aware manager close/retry、ACP capability-filtered propagation、`mcp.server.probe` + CLI/Settings add/edit/probe、store migration；Rust/Swift tests）；见 ADR-0113。
 - **M3 第一百一十八切片**：UI motion/interaction system（VPMotion tokens/primitives、Rail/Dashboard/Settings matched geometry、Stage chat/composer/streaming、Studio tabs/Preview chips/Collab stagger、Settings sidebar shell、⌘K command palette、⇧⌘F focus mode、TopChrome、toast stack、Reduce Motion；Swift tests）；见 ADR-0114。
+- **M3 第一百一十九切片**：warm graphite atelier UI 重构（`VPTheme` 暖石墨表面/珊瑚强调色/语义色/角色色/项目色、Editorial+mono 排版、静态 ambient wash；Rail 内联展开项目 session、活动计数、running pulse、show-more、⌘K/new-session/inbox/settings；Stage 单 header、去重 transcript、880pt 阅读宽度、用户/助手/tool/approval/question 卡片、可展开 tool output、focus-ring composer；Inspector 持久化开关 `⌥⌘I`；Studio/Dashboard/Settings/所有 sheet/command palette/resident 面板统一重做；resident orbital mark、New Session brief+priority+budget grid；`vpStage`/`vpInspector` transitions；Swift tests）；见 ADR-0115。
 
 ## 如何运行
 

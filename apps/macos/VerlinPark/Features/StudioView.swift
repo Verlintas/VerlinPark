@@ -76,7 +76,7 @@ struct StudioView: View {
                 .padding(.vertical, 9)
             }
         }
-        .background(.ultraThinMaterial.opacity(0.55))
+        .background(VPTheme.rail)
         .sheet(isPresented: $showingOrgEditor) {
             OrgPresetSheet()
                 .environment(model)
@@ -84,32 +84,44 @@ struct StudioView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                VPKicker(text: "Studio", trailing: nil)
+
+                Spacer()
+
+                if model.mode == .project {
+                    HStack(spacing: 5) {
+                        VPStatusDot(
+                            color: model.selectedSession == nil ? VPTheme.textTertiary : VPTheme.success,
+                            pulsing: model.selectedSession != nil,
+                            size: 4
+                        )
+                        Text(model.selectedSession == nil ? "NO SESSION" : "LIVE")
+                            .font(VPTheme.mono(7.5, weight: .semibold))
+                            .tracking(0.6)
+                            .foregroundStyle(
+                                model.selectedSession == nil
+                                    ? VPTheme.textTertiary
+                                    : VPTheme.success
+                            )
+                            .contentTransition(.opacity)
+                    }
+                }
+            }
+
             VPSegmentedControl(
                 segments: [
                     VPSegment(.collab, title: "Collab", icon: "person.3"),
                     VPSegment(.preview, title: "Preview", icon: "rectangle.on.rectangle"),
                 ],
                 selection: $tab,
-                compact: true
+                compact: false
             )
-
-            if model.mode == .project {
-                HStack(spacing: 4) {
-                    VPStatusDot(
-                        color: model.selectedSession == nil ? .secondary : .green,
-                        pulsing: model.selectedSession != nil,
-                        size: 5
-                    )
-                    Text(model.selectedSession == nil ? "no session" : "live")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .contentTransition(.opacity)
-                }
-            }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.top, 12)
+        .padding(.bottom, 10)
     }
 }
 
@@ -127,7 +139,7 @@ struct CollabGraphView: View {
                     status: model.selectedSession?.status ?? "idle",
                     task: model.selectedSession?.goal ?? "Waiting for a session",
                     model: model.agents.first { $0.role == "leader" }?.model ?? "manual",
-                    accent: .green,
+                    accent: VPTheme.accent,
                     isPlaceholder: false
                 )
                 .vpAppear(index: 0, animation: VPMotion.emphasizedSpring)
@@ -213,7 +225,8 @@ struct CollabGraphView: View {
                     .vpAppear(index: 15)
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 12)
+            .padding(.top, 4)
+            .padding(.bottom, 14)
         }
     }
 
@@ -247,10 +260,10 @@ struct CollabGraphView: View {
             }
         }
         .padding(10)
-        .background(.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .background(VPTheme.surfaceSunken, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .strokeBorder(.white.opacity(0.05), lineWidth: 1)
+                .strokeBorder(VPTheme.hairline, lineWidth: 1)
         }
     }
 }
@@ -331,10 +344,10 @@ private struct PlanTaskRow: View {
 
     private var color: Color {
         switch status {
-        case "running": .orange
-        case "completed": .green
-        case "failed", "blocked", "cancelled": .red
-        default: .secondary
+        case "running": VPTheme.accent
+        case "completed": VPTheme.success
+        case "failed", "blocked", "cancelled": VPTheme.danger
+        default: VPTheme.textTertiary
         }
     }
 }
@@ -351,8 +364,9 @@ struct TeamPlanCard: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("TEAM PLAN")
-                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .font(VPTheme.mono(9, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundStyle(VPTheme.plan)
                 Spacer()
                 Text("\(completed)/\(plan.tasks.count) tasks · \(plan.departments.count) dept")
                     .font(.system(size: 8, design: .monospaced))
@@ -364,7 +378,7 @@ struct TeamPlanCard: View {
             ForEach(plan.departments) { department in
                 HStack(alignment: .top, spacing: 6) {
                     Circle()
-                        .fill(.cyan.opacity(0.7))
+                        .fill(VPTheme.plan.opacity(0.85))
                         .frame(width: 5, height: 5)
                         .padding(.top, 4)
                     VStack(alignment: .leading, spacing: 1) {
@@ -378,13 +392,13 @@ struct TeamPlanCard: View {
                 }
             }
         }
-        .padding(10)
-        .background(.cyan.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+        .padding(11)
+        .background(VPTheme.plan.opacity(0.045), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(.cyan.opacity(0.15), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(VPTheme.plan.opacity(0.16), lineWidth: 1)
         }
-        .vpHoverLift(scale: 1.005, lift: 1, glow: .cyan)
+        .vpHoverLift(scale: 1.004, lift: 1, glow: VPTheme.plan)
     }
 }
 
@@ -440,13 +454,13 @@ private struct RoundtableCard: View {
                 }
             }
         }
-        .padding(10)
-        .background(.purple.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+        .padding(11)
+        .background(VPTheme.plan.opacity(0.035), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(.purple.opacity(0.14), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(VPTheme.plan.opacity(0.12), lineWidth: 1)
         }
-        .vpHoverLift(scale: 1.005, lift: 1, glow: .purple)
+        .vpHoverLift(scale: 1.004, lift: 1, glow: VPTheme.plan)
     }
 
     private func binding(for round: Int) -> Binding<Bool> {
@@ -474,8 +488,9 @@ struct LeaderPlanCard: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("LEADER PLAN")
-                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .font(VPTheme.mono(9, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundStyle(VPTheme.textSecondary)
                 Spacer()
                 Text("\(completed)/\(todos.count)")
                     .font(.system(size: 9, design: .monospaced))
@@ -496,13 +511,13 @@ struct LeaderPlanCard: View {
                 }
             }
         }
-        .padding(10)
-        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+        .padding(11)
+        .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(VPTheme.hairline, lineWidth: 1)
         }
-        .vpHoverLift(scale: 1.005, lift: 1)
+        .vpHoverLift(scale: 1.004, lift: 1)
     }
 
     private func icon(for status: String) -> String {
@@ -515,9 +530,9 @@ struct LeaderPlanCard: View {
 
     private func color(for status: String) -> Color {
         switch status {
-        case "completed": .green
-        case "in_progress": .orange
-        default: .secondary
+        case "completed": VPTheme.success
+        case "in_progress": VPTheme.accent
+        default: VPTheme.textTertiary
         }
     }
 }
@@ -528,58 +543,62 @@ struct OrgNodeCard: View {
     let status: String
     let task: String
     let model: String
-    var accent: Color = .green
+    var accent: Color = VPTheme.accent
     var isPlaceholder = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             ZStack {
-                Circle()
-                    .fill(accent.opacity(isPlaceholder ? 0.08 : 0.16))
-                    .frame(width: 28, height: 28)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(accent.opacity(isPlaceholder ? 0.07 : 0.13))
+                    .frame(width: 30, height: 30)
                 Image(systemName: icon)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(isPlaceholder ? .secondary : accent)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(isPlaceholder ? VPTheme.textTertiary : accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(role)
-                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(VPTheme.mono(8, weight: .semibold))
+                        .tracking(0.7)
+                        .foregroundStyle(accent)
                     Text(name)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(VPTheme.font(12, weight: .semibold))
+                        .foregroundStyle(VPTheme.textPrimary)
                     Spacer()
                     if !isPlaceholder {
                         StatusPill(status: status)
                     }
                 }
                 Text(task)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                    .font(VPTheme.font(10))
+                    .foregroundStyle(VPTheme.textSecondary)
                     .lineLimit(2)
                 Text(model)
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textTertiary)
             }
 
             Button {} label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .frame(width: 18, height: 18)
+                    .background(VPTheme.surfaceRaised, in: Circle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(VPPressableButtonStyle(scale: 0.9))
             .disabled(isPlaceholder)
             .opacity(isPlaceholder ? 0.25 : 1)
             .help("Pause or retire this agent")
         }
-        .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(11)
+        .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(accent.opacity(isPlaceholder ? 0.08 : 0.16), lineWidth: 1)
+                .strokeBorder(accent.opacity(isPlaceholder ? 0.08 : 0.18), lineWidth: 1)
         }
-        .vpHoverLift(scale: 1.006, lift: 1, glow: accent)
+        .vpHoverLift(scale: 1.004, lift: 1, glow: accent)
     }
 
     private var icon: String {
@@ -600,6 +619,16 @@ struct AgentTierCard: View {
     let icon: String
     let agents: [AgentRecord]
 
+    private var tint: Color {
+        switch title.lowercased() {
+        case "managers": VPTheme.plan
+        case "workers": VPTheme.info
+        case "verifiers": VPTheme.success
+        case "labour": VPTheme.warning
+        default: VPTheme.textSecondary
+        }
+    }
+
     var body: some View {
         if agents.isEmpty {
             TierPlaceholder(
@@ -613,31 +642,33 @@ struct AgentTierCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
                     Image(systemName: icon)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(tint)
                     Text(title.uppercased())
-                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .font(VPTheme.mono(9, weight: .semibold))
+                        .tracking(0.7)
+                        .foregroundStyle(VPTheme.textSecondary)
                     Spacer()
                     Text("\(agents.count)")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
                 }
                 ForEach(agents) { agent in
                     HStack(alignment: .top, spacing: 7) {
                         VPStatusDot(
                             color: color(for: agent.status),
                             pulsing: agent.status == "running",
-                            size: 6
+                            size: 5
                         )
-                        .padding(.top, 3)
+                        .padding(.top, 4)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(agent.name)
-                                .font(.system(size: 10.5, weight: .medium))
+                                .font(VPTheme.font(10.5, weight: .medium))
+                                .foregroundStyle(VPTheme.textPrimary)
                             if let title = agent.title, title != agent.name {
                                 Text(title)
-                                    .font(.system(size: 8, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                                    .font(VPTheme.mono(8))
+                                    .foregroundStyle(VPTheme.textSecondary)
                             }
                             HStack(spacing: 4) {
                                 Text(agent.status)
@@ -645,38 +676,33 @@ struct AgentTierCard: View {
                                     Text("· \(profile)")
                                 }
                             }
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundStyle(.tertiary)
+                            .font(VPTheme.mono(7.5))
+                            .foregroundStyle(VPTheme.textTertiary)
                             if let branch = agent.branch {
                                 Text(branch)
-                                    .font(.system(size: 8, design: .monospaced))
-                                    .foregroundStyle(.tertiary)
+                                    .font(VPTheme.mono(7.5))
+                                    .foregroundStyle(VPTheme.textTertiary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                             }
                         }
                         Spacer(minLength: 0)
                     }
+                    .padding(.vertical, 2)
                 }
             }
-            .padding(10)
-            .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .padding(11)
+            .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(.white.opacity(0.07), lineWidth: 1)
+                    .strokeBorder(VPTheme.hairline, lineWidth: 1)
             }
-            .vpHoverLift(scale: 1.005, lift: 1)
+            .vpHoverLift(scale: 1.004, lift: 1)
         }
     }
 
     private func color(for status: String) -> Color {
-        switch status {
-        case "running": .orange
-        case "changes_requested": .orange
-        case "idle": .green
-        case "failed", "cancelled": .red
-        default: .secondary
-        }
+        VPTheme.statusColor(status)
     }
 }
 
@@ -687,47 +713,61 @@ struct TierPlaceholder: View {
     let detail: String
     let icon: String
 
+    private var tint: Color {
+        switch title.lowercased() {
+        case "managers": VPTheme.plan
+        case "workers": VPTheme.info
+        case "verifiers": VPTheme.success
+        case "labour": VPTheme.warning
+        default: VPTheme.textSecondary
+        }
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: icon)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
-                .background(.white.opacity(0.05), in: Circle())
+            ZStack {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(tint.opacity(0.08))
+                    .frame(width: 28, height: 28)
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(tint.opacity(0.8))
+            }
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(title)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(VPTheme.font(12, weight: .semibold))
+                        .foregroundStyle(VPTheme.textSecondary)
                     Text("× \(range)")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
                     Spacer()
                     Text(action)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.green)
+                        .font(VPTheme.mono(7.5, weight: .medium))
+                        .foregroundStyle(tint)
                 }
                 Text(detail)
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.secondary)
+                    .font(VPTheme.font(9.5))
+                    .foregroundStyle(VPTheme.textTertiary)
                     .lineLimit(2)
             }
 
             Image(systemName: "plus")
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(VPTheme.textTertiary)
                 .padding(.top, 4)
         }
-        .padding(10)
-        .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(11)
+        .background(VPTheme.surface.opacity(0.45), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(
-                    .white.opacity(0.08),
+                    VPTheme.hairline,
                     style: StrokeStyle(lineWidth: 1, dash: [4, 4])
                 )
         }
-        .vpHoverLift(scale: 1.005, lift: 1)
+        .vpHoverLift(scale: 1.004, lift: 1)
     }
 }
 
@@ -763,70 +803,108 @@ struct ExternalResidentPanel: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .top, spacing: 12) {
-                    ZStack {
-                        Circle()
-                            .fill(
-                                LinearGradient(
-                                    colors: [.green.opacity(0.55), .teal.opacity(0.35)],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .frame(width: 42, height: 42)
-                        Image(systemName: "sparkles")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.9))
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .top, spacing: 10) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(VPTheme.resident.opacity(0.12))
+                                .frame(width: 36, height: 36)
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(VPTheme.resident)
+                        }
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(bridge.displayName)
+                                    .font(VPTheme.font(16, weight: .semibold, rounded: true))
+                                    .foregroundStyle(VPTheme.textPrimary)
+                                Text("EXTERNAL")
+                                    .font(VPTheme.mono(7, weight: .semibold))
+                                    .tracking(0.6)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(VPTheme.surfaceRaised, in: Capsule())
+                                    .foregroundStyle(VPTheme.textTertiary)
+                            }
+                            Text("NovaBAIC resident bridge")
+                                .font(VPTheme.mono(8))
+                                .foregroundStyle(VPTheme.textTertiary)
+                        }
+
+                        Spacer(minLength: 0)
+
+                        StatusPill(status: bridge.status.rawValue)
                     }
 
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 6) {
-                            Text(bridge.displayName)
-                                .font(.system(size: 16, weight: .semibold))
-                            Text("EXTERNAL")
-                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(.white.opacity(0.06), in: Capsule())
-                                .foregroundStyle(.secondary)
-                        }
-                        Text(
-                            "Resident surface reserved for the NovaBAIC Aviiya bridge. Not implemented in this build."
-                        )
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                    }
+                    Text(
+                        "Resident surface reserved for the NovaBAIC Aviiya bridge. Not implemented in this build."
+                    )
+                    .font(VPTheme.font(10.5))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(12)
+                .background(
+                    VPTheme.resident.opacity(0.045),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(VPTheme.resident.opacity(0.14), lineWidth: 1)
                 }
 
-                Divider().opacity(0.3)
+                VPKicker(text: "Bridge contract", trailing: "future")
 
-                SectionLabel(title: "Future bridge")
-                VStack(alignment: .leading, spacing: 7) {
-                    bridgeRow("person.crop.circle", "Identity", "Aviiya persona from NovaBAIC")
+                VStack(spacing: 0) {
+                    bridgeRow(
+                        "person.crop.circle",
+                        "Identity",
+                        "Aviiya persona from NovaBAIC"
+                    )
+                    VPHairline().padding(.leading, 25)
                     bridgeRow("brain", "Memory", "Shared resident memory, not local")
+                    VPHairline().padding(.leading, 25)
                     bridgeRow("wrench.and.screwdriver", "Tools", "Shared tool catalog")
+                    VPHairline().padding(.leading, 25)
                     bridgeRow(
                         "bubble.left.and.bubble.right",
                         "Sessions",
                         "Cross-device conversation continuity"
                     )
                 }
-
-                Divider().opacity(0.3)
+                .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                }
 
                 Text(
                     "This is a reserved seam, not a second assistant implementation. VerlinPark's project org remains independent."
                 )
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
+                .font(VPTheme.font(9.5))
+                .foregroundStyle(VPTheme.textTertiary)
+                .lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
 
                 Link(destination: URL(string: "https://github.com/Verlintas/NovaBAIC")!) {
-                    Label("NovaBAIC", systemImage: "arrow.up.right.square")
-                        .font(.system(size: 10))
+                    HStack(spacing: 5) {
+                        Text("Open NovaBAIC")
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 7, weight: .bold))
+                    }
+                    .font(VPTheme.mono(8, weight: .medium))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(VPTheme.surface, in: Capsule())
+                    .overlay {
+                        Capsule().strokeBorder(VPTheme.hairline, lineWidth: 1)
+                    }
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .buttonStyle(VPPressableButtonStyle(scale: 0.96))
             }
             .padding(14)
         }
@@ -835,18 +913,22 @@ struct ExternalResidentPanel: View {
     private func bridgeRow(_ icon: String, _ title: String, _ detail: String) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: icon)
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(VPTheme.resident.opacity(0.8))
+                .frame(width: 17)
+                .padding(.top, 1)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.system(size: 10, weight: .medium))
+                    .font(VPTheme.font(10, weight: .medium))
+                    .foregroundStyle(VPTheme.textPrimary)
                 Text(detail)
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
             }
             Spacer()
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
     }
 }
 
@@ -1037,7 +1119,7 @@ struct PreviewPanelView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .tint(.green)
+                    .tint(VPTheme.success)
                     .disabled(model.landingBusy)
                 }
                 Button {
@@ -2310,7 +2392,7 @@ private struct ConsolePanel: View {
                     Button("Open console") {
                         Task { await model.openConsole() }
                     }
-                    .buttonStyle(VPPrimaryButtonStyle(tint: .green))
+                    .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
                     .disabled(model.selectedSessionID == nil || model.consoleBusy)
                 }
             }
@@ -2358,7 +2440,7 @@ private struct ConsolePanel: View {
                 Button("Send") {
                     Task { await model.sendConsole() }
                 }
-                .buttonStyle(VPPrimaryButtonStyle(tint: .green))
+                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
                 .disabled(
                     model.consoleID == nil
                         || model.consoleStatus != "running"

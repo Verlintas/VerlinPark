@@ -1406,6 +1406,55 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(segment.icon, "rectangle.on.rectangle")
     }
 
+    func testRailSessionListFiltersSortsLimitsAndCountsActive() {
+        let sessions = [
+            testSession(id: "a", project: "p1", status: "idle", createdAt: "2026-11-01T10:00:00Z"),
+            testSession(id: "b", project: "p2", status: "running", createdAt: "2026-11-03T10:00:00Z"),
+            testSession(id: "c", project: "p1", status: "running", createdAt: "2026-11-04T10:00:00Z"),
+            testSession(id: "d", project: "p1", status: "paused", createdAt: "2026-11-02T10:00:00Z"),
+        ]
+
+        XCTAssertEqual(
+            RailSessionList.sorted(sessions, projectID: "p1").map(\.id),
+            ["c", "d", "a"]
+        )
+        XCTAssertEqual(
+            RailSessionList.visible(sessions, projectID: "p1", expanded: false, limit: 2).map(\.id),
+            ["c", "d"]
+        )
+        XCTAssertEqual(
+            RailSessionList.visible(sessions, projectID: "p1", expanded: true, limit: 1).map(\.id),
+            ["c", "d", "a"]
+        )
+        XCTAssertEqual(RailSessionList.activeCount(sessions, projectID: "p1"), 2)
+        XCTAssertEqual(RailSessionList.activeCount(sessions, projectID: "missing"), 0)
+    }
+
+    private func testSession(
+        id: String,
+        project: String,
+        status: String,
+        createdAt: String
+    ) -> Session {
+        Session(
+            id: id,
+            projectId: project,
+            goal: "Session \(id)",
+            status: status,
+            priority: 0,
+            worktree: nil,
+            branch: nil,
+            tokenBudget: nil,
+            costBudgetUsd: nil,
+            timeBudgetSecs: nil,
+            costSpentUsd: 0,
+            baseCommit: nil,
+            tokensIn: 0,
+            tokensOut: 0,
+            createdAt: createdAt
+        )
+    }
+
     func testSettingsSectionsAreUniqueAndComplete() {
         let sections = SettingsSection.allCases
         XCTAssertEqual(sections.count, 7)

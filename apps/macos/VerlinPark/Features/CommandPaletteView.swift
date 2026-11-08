@@ -14,6 +14,7 @@ struct CommandPaletteView: View {
     let openSearch: () -> Void
     let openShortcuts: () -> Void
     let openNotifications: () -> Void
+    let toggleInspector: () -> Void
     let toggleFocusMode: () -> Void
 
     @State private var query = ""
@@ -25,7 +26,7 @@ struct CommandPaletteView: View {
     var body: some View {
         ZStack(alignment: .top) {
             Rectangle()
-                .fill(.black.opacity(0.34))
+                .fill(VPTheme.canvas.opacity(0.62))
                 .background(.ultraThinMaterial)
                 .ignoresSafeArea()
                 .onTapGesture { close() }
@@ -62,19 +63,27 @@ struct CommandPaletteView: View {
                 .frame(height: 1)
             footer
         }
-        .frame(width: 640)
-        .frame(maxHeight: 540)
+        .frame(width: 660)
+        .frame(maxHeight: 560)
         .background(
-            .regularMaterial,
+            VPTheme.surfaceRaised,
             in: RoundedRectangle(cornerRadius: 18, style: .continuous)
         )
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(.white.opacity(0.12), lineWidth: 1)
+                .strokeBorder(VPTheme.hairlineStrong, lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.42), radius: 48, y: 22)
-        .shadow(color: .green.opacity(0.08), radius: 32, y: 4)
-        .background(VPAuroraBackground().opacity(0.55).allowsHitTesting(false))
+        .overlay(alignment: .top) {
+            LinearGradient(
+                colors: [VPTheme.accent.opacity(0.55), .clear],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+            .frame(height: 1)
+            .padding(.horizontal, 40)
+        }
+        .shadow(color: .black.opacity(0.48), radius: 52, y: 24)
+        .shadow(color: VPTheme.accent.opacity(0.10), radius: 36, y: 6)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .onKeyPress(.downArrow) {
             move(1)
@@ -94,13 +103,13 @@ struct CommandPaletteView: View {
         HStack(spacing: 12) {
             Image(systemName: "command")
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
-                .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                .foregroundStyle(VPTheme.accent)
+                .frame(width: 30, height: 30)
+                .background(VPTheme.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 8))
 
             TextField("Jump to a project, session, or action…", text: $query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 15, weight: .medium, design: .rounded))
+                .font(VPTheme.font(15, weight: .medium, rounded: true))
                 .focused($queryFocused)
                 .onSubmit { executeSelected() }
 
@@ -220,11 +229,11 @@ struct CommandPaletteView: View {
             .background {
                 if selected {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(item.tint.opacity(0.12))
+                        .fill(item.tint.opacity(0.10))
                         .matchedGeometryEffect(id: "palette-selection", in: selectionNamespace)
                 } else if hoveringID == item.id {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(.white.opacity(0.045))
+                        .fill(VPTheme.surface)
                 }
             }
             .overlay {
@@ -263,7 +272,7 @@ struct CommandPaletteView: View {
                 title: "New Session",
                 subtitle: "Start a Leader with a concrete goal",
                 icon: "plus.bubble",
-                tint: .green,
+                tint: VPTheme.accent,
                 kind: .action,
                 keywords: "create start session task",
                 action: {
@@ -276,7 +285,7 @@ struct CommandPaletteView: View {
                 title: "Manage Dash",
                 subtitle: "Agents, cost, queue, checkpoints, policies",
                 icon: "rectangle.3.group",
-                tint: .cyan,
+                tint: VPTheme.resident,
                 kind: .action,
                 keywords: "dashboard manage agents usage queue",
                 action: {
@@ -289,7 +298,7 @@ struct CommandPaletteView: View {
                 title: "Search Messages & Events",
                 subtitle: "Full-text search across the current scope",
                 icon: "magnifyingglass",
-                tint: .orange,
+                tint: VPTheme.warning,
                 kind: .action,
                 keywords: "find query search transcript event",
                 action: {
@@ -302,7 +311,7 @@ struct CommandPaletteView: View {
                 title: "Settings",
                 subtitle: "Brand, providers, ACP, MCP, notifications",
                 icon: "gearshape",
-                tint: .secondary,
+                tint: VPTheme.textSecondary,
                 kind: .action,
                 keywords: "preferences configure brand provider mcp acp",
                 action: {
@@ -315,7 +324,7 @@ struct CommandPaletteView: View {
                 title: "Notifications",
                 subtitle: "Approvals, failed tasks, integrations, and stopped sessions",
                 icon: "bell",
-                tint: .orange,
+                tint: VPTheme.warning,
                 kind: .action,
                 keywords: "notifications inbox alerts approvals",
                 action: {
@@ -337,11 +346,24 @@ struct CommandPaletteView: View {
                 }
             ),
             PaletteItem(
+                id: "action-inspector",
+                title: "Toggle Inspector",
+                subtitle: "Show or hide the Collab/Preview side panel",
+                icon: "sidebar.right",
+                tint: VPTheme.info,
+                kind: .action,
+                keywords: "inspector studio collab preview sidebar panel",
+                action: {
+                    close()
+                    toggleInspector()
+                }
+            ),
+            PaletteItem(
                 id: "action-focus",
                 title: "Toggle Focus Mode",
                 subtitle: "Hide the rail and studio for a wide stage",
                 icon: "arrow.up.left.and.arrow.down.right",
-                tint: .purple,
+                tint: VPTheme.plan,
                 kind: .action,
                 keywords: "focus zen hide sidebar studio",
                 action: {
@@ -371,7 +393,7 @@ struct CommandPaletteView: View {
                     title: project.name,
                     subtitle: "\(project.root) · \(project.defaultBranch)",
                     icon: "folder",
-                    tint: .green,
+                    tint: VPTheme.resident,
                     kind: .project,
                     keywords: "project repository \(project.root)",
                     action: {
@@ -394,7 +416,7 @@ struct CommandPaletteView: View {
                     title: session.goal,
                     subtitle: "\(projectName) · \(session.status) · \(session.id)",
                     icon: "bubble.left.and.bubble.right",
-                    tint: session.status == "running" ? .green : .secondary,
+                    tint: session.status == "running" ? VPTheme.accent : VPTheme.textSecondary,
                     kind: .session,
                     keywords: "session \(projectName) \(session.status) \(session.id)",
                     action: {

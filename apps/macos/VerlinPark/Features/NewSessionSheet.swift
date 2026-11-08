@@ -8,127 +8,260 @@ struct NewSessionSheet: View {
     @State private var priority = 0
     @State private var costBudget = ""
     @State private var timeBudget = ""
+    @FocusState private var goalFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("New Session")
-                    .font(.title2.weight(.semibold))
-                Text(
-                    "Give the Lead one concrete goal. It starts in an isolated worktree and publishes its plan in Collab."
-                )
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            }
-            .vpAppear(index: 0)
+        VStack(spacing: 0) {
+            header
+            VPHairline()
 
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    goalSection
+                    prioritySection
+                    budgetSection
+                }
+                .padding(22)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            VPHairline()
+            footer
+        }
+        .frame(width: 660)
+        .frame(maxHeight: 700)
+        .background(VPTheme.canvas)
+        .tint(VPTheme.accent)
+        .onAppear {
+            budget = model.defaultTokenBudget
+            goalFocused = true
+        }
+    }
+
+    // MARK: Header
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(VPTheme.accentWash)
+                    .frame(width: 42, height: 42)
+                Image(systemName: "plus.bubble")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(VPTheme.accent)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("NEW RUN")
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .tracking(1.3)
+                    .foregroundStyle(VPTheme.accent)
+                Text("Start a session")
+                    .font(VPTheme.font(22, weight: .semibold, rounded: true))
+                    .foregroundStyle(VPTheme.textPrimary)
+                Text(
+                    "Give the Leader one concrete goal. It starts in an isolated worktree and publishes its plan in Collab."
+                )
+                .font(VPTheme.font(10.5))
+                .foregroundStyle(VPTheme.textSecondary)
+            }
+
+            Spacer(minLength: 8)
+
+            if let project = model.selectedProject {
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("PROJECT")
+                        .font(VPTheme.mono(7, weight: .semibold))
+                        .tracking(0.8)
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text(project.name)
+                        .font(VPTheme.font(10, weight: .medium))
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(22)
+        .background(VPTheme.rail)
+    }
+
+    // MARK: Goal
+
+    private var goalSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("The brief", detail: "One outcome, not a checklist.")
             TextField(
                 "e.g. Add team invitations across API, UI, and tests",
                 text: $goal,
                 axis: .vertical
             )
-            .textFieldStyle(.roundedBorder)
-            .lineLimit(3 ... 6)
-            .vpAppear(index: 1)
+            .textFieldStyle(.plain)
+            .font(VPTheme.font(13))
+            .foregroundStyle(VPTheme.textPrimary)
+            .lineLimit(3 ... 7)
+            .focused($goalFocused)
+            .padding(12)
+            .vpFieldSurface(radius: 11, focused: goalFocused)
+            .animation(VPMotion.snap, value: goalFocused)
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Priority")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                VPSegmentedControl(
-                    segments: [
-                        VPSegment(-10, title: "Low"),
-                        VPSegment(0, title: "Normal"),
-                        VPSegment(10, title: "High"),
-                        VPSegment(50, title: "Urgent"),
-                    ],
-                    selection: $priority,
-                    compact: true
-                )
-                .frame(width: 360)
-                Text(
-                    "Higher priority sessions are admitted before lower priority runs when the global session cap is full."
-                )
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+            HStack(spacing: 6) {
+                Image(systemName: "text.quote")
+                    .font(.system(size: 8))
+                Text(goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "Specific goals produce a tighter team plan."
+                    : "\(goal.count) characters · the Leader will decompose this into a task DAG.")
             }
-            .vpAppear(index: 2)
+            .font(VPTheme.mono(8))
+            .foregroundStyle(VPTheme.textTertiary)
+        }
+        .vpAppear(index: 0)
+    }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Token budget")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                TextField("200000", value: $budget, format: .number)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 160)
-                Text(
-                    "The runtime stops the Leader when input + output tokens reach this limit. Concurrent batches may overshoot by one turn."
-                )
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-            }
-            .vpAppear(index: 3)
+    // MARK: Priority
 
-            HStack(alignment: .top, spacing: 18) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("USD budget")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+    private var prioritySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel(
+                "Admission priority",
+                detail: "Higher runs start first when the session cap is full."
+            )
+            VPSegmentedControl(
+                segments: [
+                    VPSegment(-10, title: "Low"),
+                    VPSegment(0, title: "Normal"),
+                    VPSegment(10, title: "High"),
+                    VPSegment(50, title: "Urgent"),
+                ],
+                selection: $priority
+            )
+        }
+        .vpAppear(index: 1)
+    }
+
+    // MARK: Budgets
+
+    private var budgetSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("Run budgets", detail: "Checked at turn and tool boundaries.")
+            HStack(alignment: .top, spacing: 10) {
+                budgetCard(
+                    icon: "number",
+                    title: "Tokens",
+                    hint: "Input + output ceiling."
+                ) {
+                    TextField("200000", value: $budget, format: .number)
+                        .textFieldStyle(.plain)
+                        .font(VPTheme.mono(11))
+                }
+                budgetCard(
+                    icon: "dollarsign.circle",
+                    title: "USD",
+                    hint: "Needs role prices."
+                ) {
                     TextField("optional", text: $costBudget)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 130)
-                    Text("Requires per-role prices in Providers.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .textFieldStyle(.plain)
+                        .font(VPTheme.mono(11))
                 }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Wall-clock budget")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    TextField("seconds", text: $timeBudget)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 130)
-                    Text("Checked between turns/tools.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                budgetCard(
+                    icon: "clock",
+                    title: "Wall clock",
+                    hint: "Seconds per run."
+                ) {
+                    TextField("optional", text: $timeBudget)
+                        .textFieldStyle(.plain)
+                        .font(VPTheme.mono(11))
                 }
-            }
-            .vpAppear(index: 4)
-
-            HStack {
-                if let project = model.selectedProject {
-                    Label(project.name, systemImage: "folder")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("Cancel", role: .cancel) {
-                    dismiss()
-                }
-                .buttonStyle(VPPressableButtonStyle(scale: 0.96))
-                .keyboardShortcut(.cancelAction)
-
-                Button("Create") {
-                    Task {
-                        await model.createSession(
-                            goal: goal,
-                            tokenBudget: budget,
-                            costBudgetUSD: Double(costBudget),
-                            timeBudgetSecs: Int(timeBudget),
-                            priority: priority
-                        )
-                        dismiss()
-                    }
-                }
-                .buttonStyle(VPPrimaryButtonStyle(tint: .green))
-                .keyboardShortcut(.defaultAction)
-                .disabled(isCreateDisabled)
             }
         }
-        .padding(24)
-        .frame(width: 560)
-        .onAppear {
-            budget = model.defaultTokenBudget
+        .vpAppear(index: 2)
+    }
+
+    private func budgetCard(
+        icon: String,
+        title: String,
+        hint: String,
+        @ViewBuilder content: () -> some View
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(VPTheme.textTertiary)
+                Text(title.uppercased())
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundStyle(VPTheme.textSecondary)
+            }
+            content()
+                .foregroundStyle(VPTheme.textPrimary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 7)
+                .vpFieldSurface(radius: 8)
+            Text(hint)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textTertiary)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .strokeBorder(VPTheme.hairline, lineWidth: 1)
+        }
+    }
+
+    // MARK: Footer
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 5) {
+                Image(systemName: "lock.shield")
+                    .font(.system(size: 8))
+                Text("isolated worktree · verifier gate")
+            }
+            .font(VPTheme.mono(8))
+            .foregroundStyle(VPTheme.textTertiary)
+
+            Spacer()
+
+            Button("Cancel") {
+                dismiss()
+            }
+            .buttonStyle(VPPressableButtonStyle(scale: 0.97))
+            .keyboardShortcut(.cancelAction)
+
+            Button {
+                Task {
+                    await model.createSession(
+                        goal: goal,
+                        tokenBudget: budget,
+                        costBudgetUSD: Double(costBudget),
+                        timeBudgetSecs: Int(timeBudget),
+                        priority: priority
+                    )
+                    dismiss()
+                }
+            } label: {
+                Label("Create session", systemImage: "arrow.right")
+            }
+            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+            .keyboardShortcut(.defaultAction)
+            .disabled(isCreateDisabled)
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 14)
+        .background(VPTheme.rail)
+    }
+
+    private func sectionLabel(_ title: String, detail: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title.uppercased())
+                .font(VPTheme.mono(8.5, weight: .semibold))
+                .tracking(1.0)
+                .foregroundStyle(VPTheme.textSecondary)
+            Text(detail)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textTertiary)
         }
     }
 

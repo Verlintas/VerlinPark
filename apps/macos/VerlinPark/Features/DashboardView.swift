@@ -76,12 +76,10 @@ struct DashboardView: View {
     var body: some View {
         HStack(spacing: 0) {
             sidebar
-            VPGradientRule(vertical: true)
-                .frame(width: 1)
+            VPHairline(vertical: true)
             VStack(alignment: .leading, spacing: 0) {
                 contentHeader
-                VPGradientRule()
-                    .frame(height: 1)
+                VPHairline()
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
                         sectionContent
@@ -97,8 +95,9 @@ struct DashboardView: View {
                 }
             }
         }
-        .frame(width: 1080, height: 740)
-        .background(.ultraThinMaterial)
+        .frame(width: 1120, height: 760)
+        .tint(VPTheme.accent)
+        .background(VPTheme.canvas)
         .onAppear {
             if let saved = DashboardSection(rawValue: storedSection) {
                 section = saved
@@ -116,23 +115,23 @@ struct DashboardView: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                BrandMark(config: brand.config, fontSize: 18)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Manage Dash")
-                        .font(.system(size: 16, weight: .semibold, design: .rounded))
-                    Text(brand.config.effectiveName)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("MANAGE DASH")
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(VPTheme.textTertiary)
+                BrandMark(config: brand.config, fontSize: 18, maxWidth: 178)
+                Text("agent studio")
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textSecondary)
             }
-            .padding(.bottom, 6)
+            .padding(.bottom, 10)
 
             projectPicker
             sessionPicker
 
-            Divider().opacity(0.2)
-                .padding(.vertical, 4)
+            VPHairline()
+                .padding(.vertical, 6)
 
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
@@ -145,8 +144,8 @@ struct DashboardView: View {
             }
             .padding(.horizontal, 7)
             .padding(.vertical, 5)
-            .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 7))
-            .vpFocusRing(filterFocused, color: .accentColor, radius: 7)
+            .background(VPTheme.surfaceSunken, in: RoundedRectangle(cornerRadius: 7))
+            .vpFocusRing(filterFocused, color: VPTheme.accent, radius: 7)
             .padding(.bottom, 2)
             .help("Filter sections by title or description")
 
@@ -163,41 +162,43 @@ struct DashboardView: View {
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: item.icon)
-                            .font(.system(size: 11, weight: .medium))
+                            .font(.system(size: 11, weight: .semibold))
                             .frame(width: 16)
+                            .foregroundStyle(
+                                section == item ? VPTheme.accent : VPTheme.textTertiary
+                            )
                         Text(item.title)
-                            .font(.system(size: 11, weight: .medium))
+                            .font(VPTheme.font(11, weight: section == item ? .semibold : .medium))
                         Spacer(minLength: 4)
                         if let badge = badge(for: item), badge > 0 {
                             VPCountBadge(
                                 count: badge,
-                                tint: item == .inbox ? .orange : .accentColor,
+                                tint: item == .inbox ? VPTheme.warning : VPTheme.accent,
                                 compact: true
                             )
                         }
                     }
-                    .foregroundStyle(section == item ? Color.primary : Color.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
+                    .foregroundStyle(
+                        section == item ? VPTheme.textPrimary : VPTheme.textSecondary
+                    )
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 7)
                     .background {
                         if section == item {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(Color.accentColor.opacity(0.16))
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(VPTheme.accent.opacity(0.10))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                        .strokeBorder(VPTheme.accent.opacity(0.20), lineWidth: 1)
+                                }
                                 .matchedGeometryEffect(
                                     id: "dashboard-section",
                                     in: sectionNamespace
                                 )
                         } else if hoveredSection == item {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(.white.opacity(0.045))
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(VPTheme.surface)
                         }
-                    }
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 8)
-                            .strokeBorder(
-                                section == item ? Color.accentColor.opacity(0.18) : .clear,
-                                lineWidth: 1
-                            )
                     }
                     .contentShape(Rectangle())
                 }
@@ -220,17 +221,17 @@ struct DashboardView: View {
 
             Spacer(minLength: 10)
             Text("⌘1–⌘9 switch sections")
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textTertiary)
                 .padding(.bottom, 2)
             connectionFooter
             Button("Done") { dismiss() }
-                .buttonStyle(VPPrimaryButtonStyle(tint: .accentColor))
+                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
                 .keyboardShortcut(.cancelAction)
         }
-        .padding(14)
-        .frame(width: 214)
-        .background(.black.opacity(0.10))
+        .padding(15)
+        .frame(width: 224)
+        .background(VPTheme.rail)
     }
 
     private var filteredSections: [DashboardSection] {
@@ -282,37 +283,38 @@ struct DashboardView: View {
     private var connectionFooter: some View {
         HStack(spacing: 6) {
             VPStatusDot(
-                color: model.connection == .connected ? .green : .orange,
+                color: model.connection == .connected ? VPTheme.success : VPTheme.warning,
                 pulsing: model.connection == .connecting,
                 size: 6
             )
             Text(model.connection == .connected ? "daemon connected" : "daemon offline")
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.secondary)
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary)
             Spacer()
             Text("v0.1")
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary.opacity(0.7))
         }
         .padding(.bottom, 4)
     }
 
     private var contentHeader: some View {
         HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Image(systemName: section.icon)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(VPTheme.accent)
                         .contentTransition(.symbolEffect(.replace))
                     Text(section.title)
-                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        .font(VPTheme.font(20, weight: .semibold, rounded: true))
+                        .foregroundStyle(VPTheme.textPrimary)
                         .contentTransition(.opacity)
                 }
                 .animation(VPMotion.snap, value: section)
                 Text(section.detail)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
                 HStack(spacing: 8) {
                     if let project = model.selectedProject {
                         Text(project.name)
@@ -330,8 +332,8 @@ struct DashboardView: View {
                             .lineLimit(1)
                     }
                 }
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary)
             }
             Spacer()
             Button {
@@ -345,9 +347,9 @@ struct DashboardView: View {
                     .font(.system(size: 10, weight: .medium))
                     .padding(.horizontal, 9)
                     .padding(.vertical, 4)
-                    .background(.white.opacity(0.05), in: Capsule())
+                    .background(VPTheme.surface, in: Capsule())
                     .overlay {
-                        Capsule().strokeBorder(.white.opacity(0.07), lineWidth: 1)
+                        Capsule().strokeBorder(VPTheme.hairline, lineWidth: 1)
                     }
                     .rotationEffect(.degrees(refreshing && !reduceMotion ? 360 : 0))
                     .animation(
@@ -361,8 +363,9 @@ struct DashboardView: View {
             .disabled(refreshing)
             .help("Refresh the visible section · ⌘R")
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 17)
+        .background(VPTheme.surfaceSunken)
     }
 
     @ViewBuilder

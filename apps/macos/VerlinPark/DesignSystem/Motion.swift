@@ -64,6 +64,22 @@ extension AnyTransition {
         .opacity.combined(with: .offset(y: 6))
     }
 
+    /// Stage swaps settle in place instead of sliding the whole transcript.
+    static var vpStage: AnyTransition {
+        .asymmetric(
+            insertion: .opacity.combined(with: .offset(y: 8)).combined(with: .scale(scale: 0.995)),
+            removal: .opacity.combined(with: .offset(y: -4))
+        )
+    }
+
+    /// Inspector panels enter from the trailing edge with a small lift.
+    static var vpInspector: AnyTransition {
+        .asymmetric(
+            insertion: .move(edge: .trailing).combined(with: .opacity),
+            removal: .opacity.combined(with: .offset(x: 12))
+        )
+    }
+
     static var vpTop: AnyTransition {
         .move(edge: .top).combined(with: .opacity)
     }
@@ -301,7 +317,7 @@ struct VPPressableButtonStyle: ButtonStyle {
 struct VPPrimaryButtonStyle: ButtonStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.controlSize) private var controlSize
-    var tint: Color = .green
+    var tint: Color = VPTheme.accent
     @State private var hovering = false
 
     func makeBody(configuration: Configuration) -> some View {
@@ -314,22 +330,34 @@ struct VPPrimaryButtonStyle: ButtonStyle {
             .background(
                 LinearGradient(
                     colors: [
-                        tint.opacity(configuration.isPressed ? 0.68 : 0.92),
-                        tint.opacity(configuration.isPressed ? 0.48 : 0.68),
+                        tint.opacity(configuration.isPressed ? 0.75 : 1.0),
+                        tint.opacity(configuration.isPressed ? 0.58 : 0.80),
                     ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
+                    startPoint: .top,
+                    endPoint: .bottom
                 ),
-                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
             )
+            .overlay(alignment: .top) {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [.white.opacity(0.28), .white.opacity(0.04)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 1
+                    )
+            }
             .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(.white.opacity(hovering ? 0.24 : 0.12), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(.black.opacity(0.18), lineWidth: 1)
+                    .padding(1)
             }
             .shadow(
-                color: tint.opacity(hovering && !reduceMotion ? 0.26 : 0.10),
-                radius: hovering ? 14 : 5,
-                y: hovering ? 5 : 2
+                color: tint.opacity(hovering && !reduceMotion ? 0.30 : 0.14),
+                radius: hovering ? 16 : 6,
+                y: hovering ? 6 : 2
             )
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
             .animation(VPMotion.resolved(VPMotion.hover, reduceMotion: reduceMotion), value: hovering)
@@ -350,16 +378,19 @@ struct VPGlassIconButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(hovering ? Color.primary : tint)
+            .foregroundStyle(hovering ? VPTheme.textPrimary : tint)
             .frame(width: size, height: size)
             .background(
-                .ultraThinMaterial,
+                hovering ? VPTheme.surfaceHover : VPTheme.surface,
                 in: Circle()
             )
             .overlay {
-                Circle().strokeBorder(.white.opacity(hovering ? 0.16 : 0.06), lineWidth: 1)
+                Circle().strokeBorder(
+                    hovering ? VPTheme.hairlineStrong : VPTheme.hairline,
+                    lineWidth: 1
+                )
             }
-            .shadow(color: .black.opacity(hovering ? 0.24 : 0.08), radius: hovering ? 8 : 2, y: 2)
+            .shadow(color: .black.opacity(hovering ? 0.22 : 0.06), radius: hovering ? 8 : 2, y: 2)
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.92 : 1)
             .animation(VPMotion.resolved(VPMotion.hover, reduceMotion: reduceMotion), value: hovering)
             .animation(
@@ -409,10 +440,10 @@ struct VPSegmentedControl<Value: Hashable>: View {
             }
         }
         .padding(3)
-        .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(VPTheme.surfaceSunken, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+                .strokeBorder(VPTheme.hairline, lineWidth: 1)
         }
         .animation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion), value: selection)
     }
@@ -432,18 +463,24 @@ struct VPSegmentedControl<Value: Hashable>: View {
                             .font(.system(size: compact ? 9 : 10, weight: .medium, design: .rounded))
                             .lineLimit(1)
                     }
-                    .foregroundStyle(selection == segment.value ? Color.primary : Color.secondary)
+                    .foregroundStyle(
+                        selection == segment.value ? VPTheme.textPrimary : VPTheme.textSecondary
+                    )
                     .padding(.horizontal, compact ? 7 : 10)
                     .padding(.vertical, compact ? 4 : 6)
                     .frame(maxWidth: scrollable ? nil : .infinity)
                     .background {
                         if selection == segment.value {
                             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(.white.opacity(0.12))
+                                .fill(VPTheme.surfaceRaised)
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .strokeBorder(VPTheme.hairlineStrong, lineWidth: 1)
+                                }
                                 .matchedGeometryEffect(id: "vp-segment", in: selectionNamespace)
                         } else if hovered == segment.value {
                             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(.white.opacity(0.045))
+                                .fill(VPTheme.surface)
                         }
                     }
                     .contentShape(Rectangle())
@@ -503,7 +540,7 @@ struct VPStatusDot: View {
 struct VPThinkingIndicator: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let label: String
-    var tint: Color = .green
+    var tint: Color = VPTheme.accent
     @State private var animate = false
 
     var body: some View {
@@ -533,7 +570,7 @@ struct VPThinkingIndicator: View {
 
 struct VPStreamingCaret: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    var tint: Color = .green
+    var tint: Color = VPTheme.accent
     @State private var visible = true
 
     var body: some View {

@@ -149,12 +149,12 @@ struct GlassPanel<Content: View>: View {
     var body: some View {
         content
             .background(
-                .ultraThinMaterial,
+                VPTheme.surface,
                 in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
             )
             .overlay {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+                    .strokeBorder(VPTheme.hairline, lineWidth: 1)
             }
     }
 }
@@ -164,8 +164,8 @@ struct SectionLabel: View {
 
     var body: some View {
         Text(title.uppercased())
-            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-            .foregroundStyle(.secondary)
-            .tracking(0.8)
+            .font(VPTheme.mono(9, weight: .semibold))
+            .foregroundStyle(VPTheme.textTertiary)
+            .tracking(0.9)
     }
 }

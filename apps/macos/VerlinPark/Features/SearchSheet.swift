@@ -11,24 +11,29 @@ struct SearchSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Search")
-                        .font(.title3.weight(.semibold))
-                    Text("Find text in session messages and event payloads.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text("SEARCH")
+                        .font(VPTheme.mono(8, weight: .semibold))
+                        .tracking(1.2)
+                        .foregroundStyle(VPTheme.accent)
+                    Text("Find anything the team said or did")
+                        .font(VPTheme.font(20, weight: .semibold, rounded: true))
+                    Text("Full-text search across session messages and raw event payloads.")
+                        .font(VPTheme.mono(8.5))
+                        .foregroundStyle(VPTheme.textSecondary)
                 }
                 Spacer()
                 Toggle("This project", isOn: $scopeToProject)
                     .toggleStyle(.checkbox)
-                    .font(.caption)
+                    .font(VPTheme.mono(8.5))
             }
 
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(VPTheme.textTertiary)
                 TextField("Search messages and events", text: $model.searchQuery)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 14))
+                    .font(VPTheme.font(14))
+                    .foregroundStyle(VPTheme.textPrimary)
                     .focused($queryFocused)
                     .onSubmit {
                         Task { await runSearch() }
@@ -39,14 +44,12 @@ struct SearchSheet: View {
                 Button("Search") {
                     Task { await runSearch() }
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
                 .disabled(model.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .vpFocusRing(queryFocused, color: .cyan, radius: 9)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 9)
+            .vpFieldSurface(radius: 10, focused: queryFocused)
 
             if model.searchHits.isEmpty {
                 VStack(spacing: 6) {
@@ -56,8 +59,8 @@ struct SearchSheet: View {
                             ? "Type a query to search across sessions."
                             : "No matches yet."
                     )
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -87,8 +90,8 @@ struct SearchSheet: View {
                         ? "Showing the newest matches. Narrow the query for more precision."
                         : "\(model.searchHits.count) match\(model.searchHits.count == 1 ? "" : "es")"
                 )
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary)
                 .contentTransition(.numericText())
                 .animation(VPMotion.snap, value: model.searchHits.count)
                 Spacer()
@@ -98,8 +101,10 @@ struct SearchSheet: View {
                 .keyboardShortcut(.cancelAction)
             }
         }
-        .padding(20)
-        .frame(width: 720, height: 520)
+        .padding(22)
+        .frame(width: 760, height: 560)
+        .background(VPTheme.canvas)
+        .tint(VPTheme.accent)
         .onAppear {
             queryFocused = true
             if !model.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -134,38 +139,42 @@ private struct SearchHitRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Text(hit.source.uppercased())
-                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(hit.source == "event" ? Color.orange : Color.cyan)
+                    .font(VPTheme.mono(7.5, weight: .semibold))
+                    .foregroundStyle(hit.source == "event" ? VPTheme.warning : VPTheme.info)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 2)
-                    .background(.white.opacity(0.06), in: Capsule())
+                    .background(
+                        (hit.source == "event" ? VPTheme.warning : VPTheme.info).opacity(0.10),
+                        in: Capsule()
+                    )
                 Text(hit.detail)
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textSecondary)
                 Spacer()
-                Text(hit.createdAt)
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                Text(VPRelativeTime.label(hit.createdAt))
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
             }
             Text(hit.sessionGoal)
-                .font(.system(size: 11, weight: .medium))
+                .font(VPTheme.font(11, weight: .medium))
+                .foregroundStyle(VPTheme.textPrimary)
                 .lineLimit(1)
             Text(hit.snippet)
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.secondary)
+                .font(VPTheme.mono(9))
+                .foregroundStyle(VPTheme.textSecondary)
                 .lineLimit(3)
                 .multilineTextAlignment(.leading)
             Text(hit.sessionId)
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textTertiary)
         }
-        .padding(9)
+        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(.white.opacity(0.05), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(VPTheme.hairline, lineWidth: 1)
         }
-        .vpHoverLift(scale: 1.005, lift: 1, glow: .cyan)
+        .vpHoverLift(scale: 1.004, lift: 1, glow: VPTheme.info)
     }
 }

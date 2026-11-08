@@ -1,134 +1,237 @@
 import SwiftUI
 
-/// Slim draggable chrome for the full-size window: breadcrumb, connection,
-/// command palette, and focus mode all stay reachable without opening a menu.
+/// Slim draggable chrome for the full-size window. It stays visually quiet:
+/// breadcrumb on the left, operational state on the right, and no toolbar
+/// chrome that would compete with the stage.
 struct TopChromeView: View {
     @Environment(AppModel.self) private var model
     @Environment(MemoryMonitor.self) private var memory
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var showCommandPalette: Bool
     @Binding var focusMode: Bool
+    @Binding var inspectorVisible: Bool
     let openShortcuts: () -> Void
     let openNotifications: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             breadcrumb
-                .padding(.leading, 78)
+                .padding(.leading, 86)
 
             Spacer(minLength: 12)
 
-            HStack(spacing: 8) {
-                Label(memory.text, systemImage: "memorychip")
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .contentTransition(.numericText())
-                    .animation(VPMotion.snap, value: memory.text)
+            HStack(spacing: 7) {
+                runtimeState
+                memoryLabel
 
-                Button {
-                    showCommandPalette = true
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: "command")
-                            .font(.system(size: 9, weight: .semibold))
-                        Text("Jump")
-                            .font(.system(size: 9, weight: .medium, design: .monospaced))
-                        Text("⌘K")
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(.white.opacity(0.045), in: Capsule())
-                    .overlay {
-                        Capsule().strokeBorder(.white.opacity(0.07), lineWidth: 1)
-                    }
-                }
-                .buttonStyle(VPPressableButtonStyle(scale: 0.96))
-                .help("Jump to a project, session, or action · ⌘K")
+                divider
 
-                Button(action: openNotifications) {
-                    Image(systemName: model.unreadNoticeCount > 0 ? "bell.badge" : "bell")
-                        .symbolEffect(.bounce, value: model.unreadNoticeCount)
-                }
-                .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: .secondary))
-                .overlay(alignment: .topTrailing) {
-                    if model.unreadNoticeCount > 0 {
-                        VPCountBadge(
-                            count: model.unreadNoticeCount,
-                            tint: .orange,
-                            compact: true
-                        )
-                        .offset(x: 5, y: -4)
-                    }
-                }
-                .help("Notifications")
-
-                Button(action: openShortcuts) {
-                    Image(systemName: "questionmark")
-                }
-                .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: .secondary))
-                .help("Keyboard shortcuts · ⌘/")
-
-                Button {
-                    withAnimation(VPMotion.smooth) {
-                        focusMode.toggle()
-                    }
-                } label: {
-                    Image(systemName: focusMode
-                        ? "arrow.down.right.and.arrow.up.left"
-                        : "arrow.up.left.and.arrow.down.right")
-                }
-                .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: .secondary))
-                .help(focusMode ? "Exit focus mode" : "Hide rail and studio · ⇧⌘F")
+                commandButton
+                inspectorButton
+                notificationsButton
+                shortcutsButton
+                focusButton
             }
         }
         .padding(.horizontal, 14)
         .frame(maxWidth: .infinity)
-        .frame(height: 30)
-        .background(.black.opacity(0.12))
+        .frame(height: 36)
+        .background {
+            ZStack {
+                Rectangle().fill(.ultraThinMaterial)
+                VPTheme.rail.opacity(0.72)
+            }
+        }
         .overlay(alignment: .bottom) {
-            VPGradientRule()
-                .frame(height: 1)
+            VPHairline()
         }
         .background(WindowDragArea())
     }
 
+    // MARK: Breadcrumb
+
     private var breadcrumb: some View {
-        HStack(spacing: 7) {
-            VPStatusDot(
-                color: model.connection == .connected ? .green : .orange,
-                pulsing: model.connection == .connecting,
-                size: 5
-            )
-            if let project = model.selectedProject {
+        HStack(spacing: 8) {
+            if model.mode == .project, let project = model.selectedProject {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(VPTheme.projectTint(seed: project.id).opacity(0.18))
+                    .frame(width: 16, height: 16)
+                    .overlay {
+                        Text(String(project.name.prefix(1)).uppercased())
+                            .font(.system(size: 7, weight: .bold, design: .rounded))
+                            .foregroundStyle(VPTheme.projectTint(seed: project.id))
+                    }
+
                 Text(project.name)
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .font(VPTheme.mono(9, weight: .medium))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .lineLimit(1)
+
                 if let session = model.selectedSession {
-                    Text("/")
-                        .foregroundStyle(.quaternary)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 6, weight: .bold))
+                        .foregroundStyle(VPTheme.textTertiary)
                     Text(session.goal)
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .font(VPTheme.font(10, weight: .medium))
+                        .foregroundStyle(VPTheme.textPrimary)
                         .lineLimit(1)
+                    StatusPill(status: session.status)
                 } else {
-                    Text("/")
-                        .foregroundStyle(.quaternary)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 6, weight: .bold))
+                        .foregroundStyle(VPTheme.textTertiary)
                     Text("no session")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(VPTheme.mono(9))
+                        .foregroundStyle(VPTheme.textTertiary)
                 }
             } else {
-                Text(model.mode == .resident ? "Resident · Aviiya bridge" : "No project")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(VPTheme.resident)
+                    Text(model.mode == .resident ? "Resident · Aviiya bridge" : "No project")
+                        .font(VPTheme.mono(9, weight: .medium))
+                        .foregroundStyle(VPTheme.textSecondary)
+                }
             }
         }
         .contentTransition(.opacity)
-        .animation(VPMotion.snap, value: model.selectedProjectID)
-        .animation(VPMotion.snap, value: model.selectedSessionID)
+        .animation(motion(VPMotion.snap), value: model.selectedProjectID)
+        .animation(motion(VPMotion.snap), value: model.selectedSessionID)
         .lineLimit(1)
         .truncationMode(.middle)
-        .frame(maxWidth: 420, alignment: .leading)
+        .frame(maxWidth: 520, alignment: .leading)
+    }
+
+    // MARK: Runtime meters
+
+    private var runtimeState: some View {
+        HStack(spacing: 5) {
+            VPStatusDot(
+                color: model.connection == .connected ? VPTheme.success : VPTheme.warning,
+                pulsing: model.connection == .connecting,
+                size: 4
+            )
+            Text(connectionLabel)
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary)
+        }
+    }
+
+    private var memoryLabel: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "memorychip")
+                .font(.system(size: 7))
+            Text(memory.text)
+                .font(VPTheme.mono(8))
+                .contentTransition(.numericText())
+        }
+        .foregroundStyle(VPTheme.textTertiary)
+        .animation(motion(VPMotion.snap), value: memory.text)
+    }
+
+    private var divider: some View {
+        Rectangle()
+            .fill(VPTheme.hairline)
+            .frame(width: 1, height: 14)
+            .padding(.horizontal, 1)
+    }
+
+    // MARK: Actions
+
+    private var commandButton: some View {
+        Button {
+            showCommandPalette = true
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "command")
+                    .font(.system(size: 8, weight: .semibold))
+                Text("Jump")
+                    .font(VPTheme.mono(8, weight: .medium))
+                VPKeyCap(text: "⌘K")
+            }
+            .foregroundStyle(VPTheme.textSecondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(VPTheme.surface, in: Capsule())
+            .overlay {
+                Capsule().strokeBorder(VPTheme.hairline, lineWidth: 1)
+            }
+        }
+        .buttonStyle(VPPressableButtonStyle(scale: 0.97))
+        .help("Jump to a project, session, or action · ⌘K")
+    }
+
+    private var inspectorButton: some View {
+        Button {
+            withAnimation(motion(VPMotion.smooth)) {
+                inspectorVisible.toggle()
+            }
+        } label: {
+            Image(systemName: "sidebar.right")
+                .symbolVariant(inspectorVisible ? .fill : .none)
+        }
+        .buttonStyle(
+            VPGlassIconButtonStyle(
+                size: 24,
+                tint: inspectorVisible ? VPTheme.accent : VPTheme.textSecondary
+            )
+        )
+        .help(inspectorVisible ? "Hide inspector · ⌥⌘I" : "Show inspector · ⌥⌘I")
+    }
+
+    private var notificationsButton: some View {
+        Button(action: openNotifications) {
+            Image(systemName: model.unreadNoticeCount > 0 ? "bell.badge" : "bell")
+                .symbolEffect(.bounce, value: model.unreadNoticeCount)
+        }
+        .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
+        .overlay(alignment: .topTrailing) {
+            if model.unreadNoticeCount > 0 {
+                Circle()
+                    .fill(VPTheme.accent)
+                    .frame(width: 5, height: 5)
+                    .overlay {
+                        Circle().strokeBorder(VPTheme.rail, lineWidth: 1.5)
+                    }
+                    .offset(x: 2, y: -1)
+            }
+        }
+        .help("Notifications")
+    }
+
+    private var shortcutsButton: some View {
+        Button(action: openShortcuts) {
+            Image(systemName: "questionmark")
+        }
+        .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
+        .help("Keyboard shortcuts · ⌘/")
+    }
+
+    private var focusButton: some View {
+        Button {
+            withAnimation(motion(VPMotion.smooth)) {
+                focusMode.toggle()
+            }
+        } label: {
+            Image(systemName: focusMode
+                ? "arrow.down.right.and.arrow.up.left"
+                : "arrow.up.left.and.arrow.down.right")
+        }
+        .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
+        .help(focusMode ? "Exit focus mode" : "Hide rail and studio · ⇧⌘F")
+    }
+
+    private var connectionLabel: String {
+        switch model.connection {
+        case .connected: "online"
+        case .connecting: "connecting"
+        case .idle: "idle"
+        case .failed: "offline"
+        }
+    }
+
+    private func motion(_ animation: Animation) -> Animation? {
+        VPMotion.resolved(animation, reduceMotion: reduceMotion)
     }
 }

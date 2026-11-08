@@ -8,16 +8,18 @@ struct NotificationCenterView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
+                    Text("INBOX")
+                        .font(VPTheme.mono(8, weight: .semibold))
+                        .tracking(1.2)
+                        .foregroundStyle(VPTheme.accent)
                     Text("Notifications")
-                        .font(.title3.weight(.semibold))
+                        .font(VPTheme.font(20, weight: .semibold, rounded: true))
                     Text("Approvals, failed tasks, integration failures, and stopped sessions.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(VPTheme.mono(8.5))
+                        .foregroundStyle(VPTheme.textSecondary)
                 }
                 Spacer()
-                Text("\(model.unreadNoticeCount) unread")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                VPCountBadge(count: model.unreadNoticeCount, tint: VPTheme.accent, compact: false)
                     .contentTransition(.numericText())
                     .animation(VPMotion.snap, value: model.unreadNoticeCount)
             }
@@ -50,8 +52,8 @@ struct NotificationCenterView: View {
                 VStack(spacing: 6) {
                     VPFloatingSymbol(name: "bell.slash", size: 22, tint: .secondary)
                     Text("No notifications yet.")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .font(VPTheme.mono(9))
+                        .foregroundStyle(VPTheme.textSecondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -75,8 +77,10 @@ struct NotificationCenterView: View {
                 }
             }
         }
-        .padding(20)
-        .frame(width: 650, height: 500)
+        .padding(22)
+        .frame(width: 680, height: 540)
+        .background(VPTheme.canvas)
+        .tint(VPTheme.accent)
         .onAppear {
             Task { await model.refreshSessionDirectory() }
         }
@@ -98,20 +102,21 @@ private struct NotificationRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(notice.title)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(VPTheme.font(11, weight: .medium))
+                        .foregroundStyle(VPTheme.textPrimary)
                     Spacer()
-                    Text(notice.createdAt)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                    Text(VPRelativeTime.label(notice.createdAt))
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
                 }
                 Text(notice.detail)
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
                     .lineLimit(2)
                 if let directory = model.sessionDirectory[notice.sessionId] {
                     Text(directory.goal)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
                         .lineLimit(1)
                 }
             }
@@ -123,9 +128,16 @@ private struct NotificationRow: View {
         .padding(9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            notice.isRead ? Color.white.opacity(0.02) : Color.white.opacity(0.045),
-            in: RoundedRectangle(cornerRadius: 9)
+            notice.isRead ? VPTheme.surface.opacity(0.45) : VPTheme.surface,
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
         )
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(
+                    notice.isRead ? VPTheme.hairline : color.opacity(0.16),
+                    lineWidth: 1
+                )
+        }
         .vpHoverLift(scale: 1.005, lift: 1, glow: notice.isRead ? .white : color)
     }
 
@@ -141,11 +153,11 @@ private struct NotificationRow: View {
 
     private var color: Color {
         switch notice.kind {
-        case "question": .cyan
-        case "approval": .orange
-        case "task": .red
-        case "integration": .purple
-        default: .red
+        case "question": VPTheme.info
+        case "approval": VPTheme.warning
+        case "task": VPTheme.danger
+        case "integration": VPTheme.plan
+        default: VPTheme.danger
         }
     }
 }

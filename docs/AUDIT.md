@@ -22,7 +22,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、其他 forge PR、shell scratch 回收、部分 merge 状态的人工检查、外部 ACP agent 的网络/凭证边界、mid-stream 断点续传。
 
-当前测试：Rust 267（core 217 / protocol 1 / store 41 / providers 8；另有 3 个 ignored live tests），Swift 71。CI 以最新提交为准。
+当前测试：Rust 267（core 217 / protocol 1 / store 41 / providers 8；另有 3 个 ignored live tests），Swift 72。CI 以最新提交为准。
 
 ### 0.1 2026-10-31 跟进
 
@@ -342,6 +342,7 @@
 - `project.fork.forest` / `vp fork-forest` 以 session.created parent metadata 构建 depth 32/nodes 500 forest；`project.fork.audit` 检查 missing parent/link/child/checkpoint commit/ref/stale tombstone ref；`project.fork.repair` 追加 missing fork link、重建/删除 ref；`session.checkpoint.stats` 报告近似 commit/blob bytes；Manage Dash Project fork forest 卡。
 - `dashboard.snapshot` / `vp dashboard` 只读汇总跨 project sessions/status/tasks/leases/approvals/questions/checkpoints/forks 与 severity-sorted alerts（critical→warning→info，≤100 + truncated）；支持 project filter；含 per-project breakdown（running/queued/failed、approvals/questions、tasks、checkpoints、forks，按 activity 排序）；daemon 附加 `agent.info` capacity；Manage Dash Overview metrics/pending/attention/badges 使用该快照，未选 project 时显示 Projects breakdown，显式 refresh，不自动跑 Doctor/audit/provider。
 - UI motion/interaction system：`VPMotion` 统一 tokens/springs/stagger/reduce-motion；`VPSegmentedControl` matched geometry、Rail/Dashboard/Settings 选中动画、Stage chat/composer/streaming、Studio Collab stagger + animated connectors、10-mode Preview chips、Settings sidebar shell、`⌘K` command palette、`⇧⌘F` focus mode、TopChrome、toast stack；见 ADR-0114。
+- Warm graphite atelier UI：`VPTheme` 统一暖石墨表面/hairline/珊瑚强调色/语义色/角色色/项目色；Rail 内联展开 session、活动计数、running pulse、show-more、新 session/inbox/settings；Stage 单 header、880pt transcript、可展开 tool output、focus-ring composer；Inspector 持久化 `⌥⌘I`；Settings/Dashboard/Studio/sheet/command palette/resident surface 统一重做；resident orbital mark；见 ADR-0115。视觉回归仍是手工检查（截图 + Reduce Motion + 1120px 最小窗口），未进入 CI。
 - `update.check` 支持 `.dmg`/`.sha256` assets；`update.download` 校验 GitHub URL/redirect、512MB cap、流式 SHA-256、原子 rename 到 `~/Downloads`，不自动安装。
 - `model.preset.*` 全局 model presets（provider/model/context/prices/notes，不含密钥）；provider 匹配时应用 role 字段，仍需 Save & Connect；Settings Providers 模态。
 - `update.check` / `vp update-check` 查询 GitHub latest release，校验 `owner/repo`，numeric version compare；Settings → About 手动检查并打开 release page，不自动下载/安装。

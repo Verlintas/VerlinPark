@@ -6,18 +6,20 @@ struct ConnectionBadge: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Circle()
-                .fill(color)
-                .frame(width: 6, height: 6)
+            VPStatusDot(
+                color: color,
+                pulsing: state == .connecting,
+                size: 5
+            )
             Text(label)
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                .foregroundStyle(.secondary)
+                .font(VPTheme.mono(8, weight: .medium))
+                .foregroundStyle(VPTheme.textSecondary)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(.ultraThinMaterial, in: Capsule())
+        .background(VPTheme.surface, in: Capsule())
         .overlay {
-            Capsule().strokeBorder(.white.opacity(0.08), lineWidth: 1)
+            Capsule().strokeBorder(VPTheme.hairline, lineWidth: 1)
         }
     }
 
@@ -44,22 +46,24 @@ struct StatusPill: View {
     let status: String
 
     var body: some View {
-        Text(status.uppercased())
-            .font(.system(size: 9, weight: .semibold, design: .monospaced))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(color.opacity(0.16), in: Capsule())
-            .foregroundStyle(color)
-    }
-
-    private var color: Color {
-        switch status.lowercased() {
-        case "done", "completed", "connected": .green
-        case "failed", "cancelled", "offline": .red
-        case "running", "verifying", "merging", "thinking": .orange
-        case "paused", "queued": .yellow
-        case "waiting", "idle": .secondary
-        default: .secondary
+        HStack(spacing: 5) {
+            VPStatusDot(
+                color: VPTheme.statusColor(status),
+                pulsing: ["running", "verifying", "merging", "thinking"].contains(
+                    status.lowercased()
+                ),
+                size: 4
+            )
+            Text(status.uppercased())
+                .font(VPTheme.mono(8, weight: .semibold))
+                .tracking(0.4)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(VPTheme.statusColor(status).opacity(0.09), in: Capsule())
+        .foregroundStyle(VPTheme.statusColor(status))
+        .overlay {
+            Capsule().strokeBorder(VPTheme.statusColor(status).opacity(0.16), lineWidth: 1)
         }
     }
 }
@@ -71,21 +75,31 @@ struct ErrorBanner: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(VPTheme.warning)
             Text(message)
-                .font(.callout)
+                .font(VPTheme.font(11, weight: .medium))
+                .foregroundStyle(VPTheme.textPrimary)
                 .lineLimit(2)
             Spacer()
-            Button("Dismiss", action: dismiss)
-                .buttonStyle(.link)
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .frame(width: 20, height: 20)
+                    .background(VPTheme.surfaceHover, in: Circle())
+            }
+            .buttonStyle(VPPressableButtonStyle(scale: 0.9))
+            .help("Dismiss")
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .background(VPTheme.surfaceRaised, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(.orange.opacity(0.3), lineWidth: 1)
+                .strokeBorder(VPTheme.warning.opacity(0.28), lineWidth: 1)
         }
+        .shadow(color: .black.opacity(0.32), radius: 20, y: 9)
         .padding(.horizontal, 18)
         .padding(.top, 6)
     }
@@ -135,11 +149,11 @@ struct MemoryPill: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "memorychip")
-                .font(.system(size: 10))
+                .font(.system(size: 9))
             Text(memory.text)
-                .font(.system(size: 10, design: .monospaced))
+                .font(VPTheme.mono(8))
         }
-        .foregroundStyle(.tertiary)
+        .foregroundStyle(VPTheme.textTertiary)
     }
 }
 
@@ -152,10 +166,18 @@ struct CompactIconButton: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(VPTheme.textSecondary)
                 .frame(width: 26, height: 26)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(
+                    VPTheme.surface,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(VPPressableButtonStyle(scale: 0.92))
         .help(help)
     }
 }

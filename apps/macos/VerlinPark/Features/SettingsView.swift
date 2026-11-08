@@ -65,27 +65,20 @@ struct SettingsView: View {
     var body: some View {
         HStack(spacing: 0) {
             sidebar
-            VPGradientRule(vertical: true)
-                .frame(width: 1)
+            VPHairline(vertical: true)
             content
                 .id(section)
-                .transition(.vpContent)
+                .transition(.vpStage)
                 .animation(
                     VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
                     value: section
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 840, height: 640)
+        .frame(width: 880, height: 660)
         .preferredColorScheme(.dark)
-        .background {
-            ZStack {
-                VPAuroraBackground()
-                    .opacity(0.45)
-                Rectangle()
-                    .fill(.ultraThinMaterial)
-            }
-        }
+        .tint(VPTheme.accent)
+        .background(VPTheme.canvas)
         .onAppear {
             if let saved = SettingsSection(rawValue: storedSection) {
                 section = saved
@@ -97,63 +90,65 @@ struct SettingsView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                BrandMark(config: brand.config, fontSize: 17)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Settings")
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
-                    Text(brand.config.effectiveName)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
+        VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("PREFERENCES")
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(VPTheme.textTertiary)
+                BrandMark(config: brand.config, fontSize: 19, maxWidth: 174)
+                Text("Settings")
+                    .font(VPTheme.font(10))
+                    .foregroundStyle(VPTheme.textSecondary)
             }
-            .padding(.bottom, 12)
+            .padding(.bottom, 14)
 
             ForEach(Array(SettingsSection.allCases.enumerated()), id: \.element.id) { index, item in
                 Button {
                     section = item
                 } label: {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 9) {
                         Image(systemName: item.icon)
-                            .font(.system(size: 11, weight: .medium))
-                            .frame(width: 16)
+                            .font(.system(size: 11, weight: .semibold))
+                            .frame(width: 17)
+                            .foregroundStyle(
+                                section == item ? VPTheme.accent : VPTheme.textTertiary
+                            )
                         VStack(alignment: .leading, spacing: 1) {
                             Text(item.title)
-                                .font(.system(size: 11, weight: .medium))
+                                .font(VPTheme.font(11, weight: section == item ? .semibold : .medium))
                             Text(item.detail)
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(.tertiary)
+                                .font(VPTheme.mono(7.5))
+                                .foregroundStyle(VPTheme.textTertiary)
                                 .lineLimit(1)
                         }
                         Spacer(minLength: 4)
                     }
-                    .foregroundStyle(section == item ? Color.primary : Color.secondary)
-                    .padding(.horizontal, 8)
+                    .foregroundStyle(
+                        section == item ? VPTheme.textPrimary : VPTheme.textSecondary
+                    )
+                    .padding(.horizontal, 9)
                     .padding(.vertical, 7)
                     .background {
                         if section == item {
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.accentColor.opacity(0.16))
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(VPTheme.accent.opacity(0.10))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                        .strokeBorder(VPTheme.accent.opacity(0.20), lineWidth: 1)
+                                }
                                 .matchedGeometryEffect(
                                     id: "settings-selection",
                                     in: selectionNamespace
                                 )
                         } else if hoveredSection == item {
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(.white.opacity(0.045))
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(VPTheme.surface)
                         }
-                    }
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .strokeBorder(
-                                section == item ? Color.accentColor.opacity(0.18) : .clear,
-                                lineWidth: 1
-                            )
                     }
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(VPPressableButtonStyle(scale: 0.985))
+                .buttonStyle(VPPressableButtonStyle(scale: 0.988))
                 .keyboardShortcut(
                     KeyEquivalent(Character(String(index + 1))),
                     modifiers: .command
@@ -171,25 +166,28 @@ struct SettingsView: View {
             }
 
             Spacer(minLength: 10)
+
+            VPHairline()
+                .padding(.bottom, 8)
+
             HStack(spacing: 6) {
                 VPStatusDot(
-                    color: model.connection == .connected ? .green : .orange,
+                    color: model.connection == .connected ? VPTheme.success : VPTheme.warning,
                     pulsing: model.connection == .connecting,
-                    size: 6
+                    size: 5
                 )
                 Text(model.connection == .connected ? "daemon connected" : "daemon offline")
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
             }
-            .padding(.bottom, 4)
             Text("⌘K command palette · ⌘1–⌘7 sections")
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .padding(.bottom, 4)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textTertiary.opacity(0.8))
+                .padding(.bottom, 2)
         }
-        .padding(14)
-        .frame(width: 205)
-        .background(.black.opacity(0.10))
+        .padding(16)
+        .frame(width: 216)
+        .background(VPTheme.rail)
     }
 
     @ViewBuilder
@@ -457,7 +455,7 @@ struct FlagPickerView: View {
                                     .overlay {
                                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                                             .strokeBorder(
-                                                isSelected(option) ? Color.green : Color.white.opacity(0.08),
+                                                isSelected(option) ? VPTheme.accent : VPTheme.hairline,
                                                 lineWidth: isSelected(option) ? 2 : 1
                                             )
                                     }
@@ -479,7 +477,7 @@ struct FlagPickerView: View {
         }
         .padding(22)
         .frame(width: 720, height: 560)
-        .background(.ultraThinMaterial)
+        .background(VPTheme.canvas)
     }
 
     private func isSelected(_ option: FlagOption) -> Bool {
@@ -499,9 +497,9 @@ struct ResidentSettingsView: View {
             HStack(spacing: 12) {
                 Image(systemName: "sparkles")
                     .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(.green)
+                    .foregroundStyle(VPTheme.resident)
                     .frame(width: 38, height: 38)
-                    .background(.green.opacity(0.12), in: Circle())
+                    .background(VPTheme.resident.opacity(0.12), in: Circle())
                 VStack(alignment: .leading, spacing: 3) {
                     Text(bridge.displayName)
                         .font(.system(size: 18, weight: .semibold))
@@ -777,7 +775,7 @@ private struct ModelPresetsSheet: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Button("New") { model.newModelPresetDraft() }
-                            .buttonStyle(VPPrimaryButtonStyle(tint: .green))
+                            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
                         Button("Refresh") {
                             Task { await model.loadModelPresets() }
                         }
@@ -863,7 +861,7 @@ private struct ModelPresetsSheet: View {
                             Button("Save preset") {
                                 Task { await model.saveModelPreset() }
                             }
-                            .buttonStyle(VPPrimaryButtonStyle(tint: .green))
+                            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
                             .disabled(model.modelPresetsBusy)
                             Button("Delete") { confirmingDelete = true }
                                 .buttonStyle(.bordered)
