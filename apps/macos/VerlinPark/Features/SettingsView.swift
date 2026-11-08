@@ -1031,7 +1031,7 @@ struct ProvidersSettingsView: View {
                     .textFieldStyle(.plain).vpFrostedField()
                     .frame(width: 160)
                 Text(
-                    "Input + output token budget for new sessions. Existing sessions keep their own budget. Concurrent agent batches may overshoot by one turn."
+                    "Input + output token budget for new sessions. Existing sessions keep their own budget. Provider calls reserve before they start and settle from reported usage, so the cap holds across concurrent batches."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

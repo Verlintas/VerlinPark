@@ -76,28 +76,46 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
     }
 
     let backup = backup_database(data_dir)?;
-    let store = Store::open(data_dir)?;
-    for snapshot in &snapshots {
-        store.insert_project_snapshot(&snapshot.project)?;
-        store.set_shell_policy(&snapshot.project.id, &snapshot.shell_policy)?;
-        store.set_integration_policy(&snapshot.project.id, &snapshot.integration_policy)?;
-        store.set_artifact_policy(&snapshot.project.id, &snapshot.artifact_policy)?;
-        store.set_mailbox_policy(&snapshot.project.id, &snapshot.mailbox_policy)?;
-        store.set_worktree_policy(&snapshot.project.id, &snapshot.worktree_policy)?;
-        store.set_checkpoint_policy(&snapshot.project.id, &snapshot.checkpoint_policy)?;
-        store.set_project_budget(&snapshot.project.id, &snapshot.budget)?;
-        store.set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
-    }
-    let engine = Engine::new(store);
-    let mut sessions = 0usize;
-    for (session, _) in prepared {
-        engine.store().insert_session_snapshot(&session)?;
-        match engine.restore_session_log(&session.id).await {
-            Ok(_) => sessions += 1,
-            Err(error) => skipped.push(format!("{}: rebuild failed: {error}", session.id)),
+    let result: Result<(usize, Vec<String>)> = async {
+        let store = Store::open(data_dir)?;
+        for snapshot in &snapshots {
+            store.insert_project_snapshot(&snapshot.project)?;
+            store.set_shell_policy(&snapshot.project.id, &snapshot.shell_policy)?;
+            store.set_integration_policy(&snapshot.project.id, &snapshot.integration_policy)?;
+            store.set_artifact_policy(&snapshot.project.id, &snapshot.artifact_policy)?;
+            store.set_mailbox_policy(&snapshot.project.id, &snapshot.mailbox_policy)?;
+            store.set_worktree_policy(&snapshot.project.id, &snapshot.worktree_policy)?;
+            store.set_checkpoint_policy(&snapshot.project.id, &snapshot.checkpoint_policy)?;
+            store.set_project_budget(&snapshot.project.id, &snapshot.budget)?;
+            store
+                .set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
+            store.set_memory_policy(&snapshot.project.id, &snapshot.memory_policy)?;
         }
+        let engine = Engine::new(store);
+        let mut sessions = 0usize;
+        let mut skipped = skipped.clone();
+        for (session, _) in prepared {
+            engine.store().insert_session_snapshot(&session)?;
+            match engine.restore_session_log(&session.id).await {
+                Ok(_) => sessions += 1,
+                Err(error) => skipped.push(format!("{}: rebuild failed: {error}", session.id)),
+            }
+        }
+        engine.record_project_manifest().await?;
+        Ok((sessions, skipped))
     }
-    engine.record_project_manifest().await?;
+    .await;
+    let (sessions, skipped) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(backup) = &backup
+                && let Err(restore) = restore_backup(data_dir, backup)
+            {
+                tracing::error!(%restore, "failed to restore the pre-rebuild database");
+            }
+            return Err(error.context("database rebuild failed; restored the previous database"));
+        }
+    };
     Ok(RebuildReport {
         sessions,
         skipped,
@@ -209,11 +227,31 @@ fn backup_database(data_dir: &Path) -> Result<Option<PathBuf>> {
         if source.is_file() {
             let target = PathBuf::from(format!("{}{suffix}", backup.display()));
             if let Err(error) = std::fs::rename(&source, &target) {
-                tracing::warn!(%error, path = %source.display(), "failed to move SQLite sidecar");
+                // A database without its WAL/SHM sidecars is not a complete
+                // backup. Roll back whatever was already moved.
+                let _ = restore_backup(data_dir, &backup);
+                return Err(error)
+                    .with_context(|| format!("moving SQLite sidecar {}", source.display()));
             }
         }
     }
     Ok(Some(backup))
+}
+
+fn restore_backup(data_dir: &Path, backup: &Path) -> Result<()> {
+    let database = data_dir.join("verlinpark.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let live = PathBuf::from(format!("{}{suffix}", database.display()));
+        if live.exists() {
+            std::fs::remove_file(&live).with_context(|| format!("removing {}", live.display()))?;
+        }
+        let saved = PathBuf::from(format!("{}{suffix}", backup.display()));
+        if saved.exists() {
+            std::fs::rename(&saved, &live)
+                .with_context(|| format!("restoring {}", live.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -315,6 +353,22 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            engine
+                .record_agent_usage(
+                    &session.id,
+                    "worker-rebuild",
+                    "Worker",
+                    "worker",
+                    Some("T1".into()),
+                    Some("impl".into()),
+                    "test",
+                    100,
+                    50,
+                    false,
+                    0.75,
+                )
+                .await
+                .unwrap();
             engine.record_project_manifest().await.unwrap();
             (project.id, session.id)
         };
@@ -332,6 +386,9 @@ mod tests {
         let session = store.get_session(&session_id).unwrap().unwrap();
         assert_eq!(session.goal, "rebuild me");
         assert_eq!(session.token_budget, Some(1000));
+        assert!((session.cost_spent_usd - 0.75).abs() < 1e-9);
+        assert_eq!(session.tokens_in, 100);
+        assert_eq!(session.tokens_out, 50);
         assert!(
             store
                 .list_messages(&session_id)

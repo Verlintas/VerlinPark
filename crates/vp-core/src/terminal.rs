@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
@@ -27,6 +27,7 @@ const MAX_WRITE_BYTES: usize = 64 * 1024;
 pub struct TerminalManager {
     terminals: Mutex<HashMap<String, Arc<Terminal>>>,
     sessions: Mutex<HashMap<String, String>>,
+    open_lock: Mutex<()>,
 }
 
 struct Terminal {
@@ -173,6 +174,7 @@ impl TerminalManager {
         cols: u16,
         rows: u16,
     ) -> Result<TerminalOpenResult> {
+        let _open_guard = self.open_lock.lock().await;
         let existing = self.sessions.lock().await.get(session_id).cloned();
         if let Some(existing) = existing {
             let _ = self.close(&existing).await;
@@ -332,6 +334,29 @@ impl TerminalManager {
         Ok(TerminalResizeResult { resized: true })
     }
 
+    /// Close terminals that have not been read/written/resized for `idle`.
+    pub async fn sweep_idle(&self, idle: Duration) -> usize {
+        let ids = {
+            let terminals = self.terminals.lock().await;
+            terminals
+                .iter()
+                .filter(|(_, terminal)| {
+                    !terminal.closed.load(Ordering::SeqCst)
+                        && terminal
+                            .last_used
+                            .lock()
+                            .map(|last_used| last_used.elapsed() >= idle)
+                            .unwrap_or(false)
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
+        for id in &ids {
+            let _ = self.close(id).await;
+        }
+        ids.len()
+    }
+
     pub async fn close(&self, terminal_id: &str) -> Result<TerminalCloseResult> {
         let terminal = self.terminals.lock().await.remove(terminal_id);
         let Some(terminal) = terminal else {
@@ -382,6 +407,7 @@ mod tests {
             home: root.join("home"),
             restrict_home: false,
             read_jail: false,
+            git_branch: None,
         }
     }
 

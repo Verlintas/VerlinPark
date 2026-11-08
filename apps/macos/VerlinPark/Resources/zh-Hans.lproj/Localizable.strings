@@ -550,3 +550,8 @@
 "No agents yet" = "还没有智能体";
 "The Leader will build the org from the next team plan." = "Leader 会在下一份团队计划中组建组织。";
 "Waiting for a session" = "等待会话";
+"ACP" = "ACP";
+"MCP" = "MCP";
+"Keyboard Shortcuts" = "键盘快捷键";
+"Reset Window Layout" = "重置窗口布局";
+"Approval could not be resolved." = "无法完成审批。";

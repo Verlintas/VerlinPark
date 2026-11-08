@@ -34,27 +34,33 @@ final class MemoryMonitor {
     }
 
     func refresh() {
-        appBytes = Self.residentBytes(pid: getpid())
-        if let discovery = readDiscovery() {
-            daemonBytes = Self.residentBytes(pid: Int32(discovery.pid))
-        } else {
-            daemonBytes = 0
+        Task.detached(priority: .utility) { [weak self] in
+            let app = Self.residentBytes(pid: getpid())
+            let daemon = Self.readDiscovery().map { Self.residentBytes(pid: Int32($0.pid)) } ?? 0
+            await MainActor.run {
+                self?.appBytes = app
+                self?.daemonBytes = daemon
+            }
         }
     }
 
-    private func readDiscovery() -> Discovery? {
-        let base = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? URL(fileURLWithPath: NSHomeDirectory())
+    private nonisolated static func readDiscovery() -> Discovery? {
+        let base: URL = if let path = ProcessInfo.processInfo.environment["VERLINPARK_DATA_DIR"] {
+            URL(fileURLWithPath: path, isDirectory: true)
+        } else {
+            (FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first ?? URL(fileURLWithPath: NSHomeDirectory()))
+                .appendingPathComponent("VerlinPark", isDirectory: true)
+        }
         let url = base
-            .appendingPathComponent("VerlinPark", isDirectory: true)
             .appendingPathComponent("run/daemon.json")
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(Discovery.self, from: data)
     }
 
-    private static func residentBytes(pid: Int32) -> UInt64 {
+    private nonisolated static func residentBytes(pid: Int32) -> UInt64 {
         guard pid > 0 else { return 0 }
         var info = proc_taskinfo()
         let size = MemoryLayout<proc_taskinfo>.size

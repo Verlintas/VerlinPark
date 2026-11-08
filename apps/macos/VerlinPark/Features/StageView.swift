@@ -499,11 +499,15 @@ private struct ProjectStageView: View {
     private func send() {
         let goal = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !goal.isEmpty else { return }
-        draft = ""
         if model.selectedSession != nil {
+            draft = ""
             Task { await model.sendMessage(goal) }
         } else {
-            Task { await model.createSession(goal: goal) }
+            Task {
+                if await model.createSession(goal: goal) {
+                    draft = ""
+                }
+            }
         }
     }
 }
@@ -779,7 +783,10 @@ struct SessionChatView: View {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     transcriptHeader
 
-                    if entries.isEmpty, model.streamingText.isEmpty {
+                    if entries.isEmpty,
+                       model.streamingText.isEmpty,
+                       session.status != "running"
+                    {
                         emptyState
                     }
                     ForEach(entries) { entry in

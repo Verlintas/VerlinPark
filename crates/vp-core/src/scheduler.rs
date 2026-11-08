@@ -169,12 +169,12 @@ impl TaskScheduler {
         session_id: &str,
         plan_seq: u64,
         task_ids: &[String],
-    ) -> Result<Vec<ScheduledTask>> {
+    ) -> Result<(Vec<ScheduledTask>, Vec<vp_protocol::types::Event>)> {
         let store = self.store.clone();
         let session_id = session_id.to_string();
         let task_ids = task_ids.to_vec();
         tokio::task::spawn_blocking(move || {
-            store.claim_plan_tasks(&session_id, plan_seq, &task_ids)
+            store.claim_plan_tasks_with_events(&session_id, plan_seq, &task_ids)
         })
         .await?
     }
@@ -445,12 +445,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["high", "low"]
         );
-        let claimed = scheduler
+        let (claimed, events) = scheduler
             .claim(&session.id, seq, &["high".into()])
             .await
             .unwrap();
         assert_eq!(claimed[0].status, "running");
         assert_eq!(claimed[0].attempts, 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "plan_task.started");
+        assert_eq!(events[0].payload["task_id"], "high");
         scheduler
             .finish(&session.id, seq, "high", "completed", None)
             .await

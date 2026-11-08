@@ -5,6 +5,7 @@ struct AcpSettingsView: View {
     @State private var name = ""
     @State private var command = ""
     @State private var argsText = ""
+    @State private var envText = ""
     @State private var autoApprove = false
     @State private var timeout = 1800
 
@@ -45,6 +46,21 @@ struct AcpSettingsView: View {
                     )
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                    TextEditor(text: $envText)
+                        .font(.system(size: 10, design: .monospaced))
+                        .scrollContentBackground(.hidden)
+                        .padding(6)
+                        .frame(height: 54)
+                        .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 8))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+                        }
+                    Text(
+                        "Environment, one KEY=VALUE per line. Values are stored in the local database and passed to the agent; prefer a short-lived token."
+                    )
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
                     HStack(spacing: 12) {
                         Toggle("Auto-approve ACP permissions", isOn: $autoApprove)
                             .toggleStyle(.switch)
@@ -60,19 +76,33 @@ struct AcpSettingsView: View {
                                 .split(whereSeparator: \.isNewline)
                                 .map(String.init)
                                 .filter { !$0.isEmpty }
+                            var env: [String: String] = [:]
+                            for line in envText.split(whereSeparator: \.isNewline) {
+                                let parts = line.split(separator: "=", maxSplits: 1)
+                                guard parts.count == 2 else { continue }
+                                let key = parts[0].trimmingCharacters(in: .whitespaces)
+                                let value = parts[1].trimmingCharacters(in: .whitespaces)
+                                if !key.isEmpty {
+                                    env[key] = value
+                                }
+                            }
                             Task {
-                                await model.addAcpAgent(
+                                let added = await model.addAcpAgent(
                                     name: name,
                                     command: command,
                                     args: args,
+                                    env: env,
                                     autoApprove: autoApprove,
                                     timeoutSecs: timeout
                                 )
-                                name = ""
-                                command = ""
-                                argsText = ""
-                                autoApprove = false
-                                timeout = 1800
+                                if added {
+                                    name = ""
+                                    command = ""
+                                    argsText = ""
+                                    envText = ""
+                                    autoApprove = false
+                                    timeout = 1800
+                                }
                             }
                         }
                         .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
@@ -175,6 +205,12 @@ private struct AcpAgentRow: View {
                     .foregroundStyle(.tertiary)
                 if !agent.args.isEmpty {
                     Text(agent.args.joined(separator: " "))
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                }
+                if !agent.env.isEmpty {
+                    Text("env: \(agent.env.keys.sorted().joined(separator: ", "))")
                         .font(.system(size: 8, design: .monospaced))
                         .foregroundStyle(.tertiary)
                         .lineLimit(2)

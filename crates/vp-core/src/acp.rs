@@ -103,6 +103,7 @@ pub struct AcpLaunch {
     pub home: PathBuf,
     pub restrict_home: bool,
     pub read_jail: bool,
+    pub git_branch: Option<String>,
     pub mcp_servers: Vec<McpServer>,
     pub timeout: Duration,
 }
@@ -386,6 +387,7 @@ async fn build_command(launch: &AcpLaunch) -> Result<tokio::process::Command> {
         home: launch.home.clone(),
         restrict_home: launch.restrict_home,
         read_jail: launch.read_jail,
+        git_branch: launch.git_branch.clone(),
     };
     let mut command = crate::tools::sandboxed_command(&context).await?;
     let scratch = launch
@@ -834,6 +836,7 @@ for line in sys.stdin:
                 .unwrap_or_default(),
             restrict_home: false,
             read_jail: false,
+            git_branch: None,
             mcp_servers: Vec::new(),
             timeout: Duration::from_secs(20),
         };
@@ -927,6 +930,7 @@ for line in sys.stdin:
                 .unwrap_or_default(),
             restrict_home: false,
             read_jail: false,
+            git_branch: None,
             mcp_servers: Vec::new(),
             timeout: Duration::from_secs(20),
         };
@@ -969,6 +973,7 @@ for line in sys.stdin:
                 .unwrap_or_default(),
             restrict_home: false,
             read_jail: false,
+            git_branch: None,
             mcp_servers: Vec::new(),
             timeout: Duration::from_secs(20),
         };

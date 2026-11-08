@@ -55,8 +55,8 @@ enum JSONValue: Codable, Hashable, Sendable {
     }
 
     var intValue: Int? {
-        guard case let .number(value) = self else { return nil }
-        return Int(value)
+        guard case let .number(value) = self, value.isFinite else { return nil }
+        return Int(exactly: value)
     }
 
     var doubleValue: Double? {
@@ -81,7 +81,11 @@ enum JSONValue: Codable, Hashable, Sendable {
         case let .bool(value):
             value ? "true" : "false"
         case let .number(value):
-            value.rounded() == value ? String(Int(value)) : String(value)
+            if value.isFinite, value.rounded() == value, let integer = Int(exactly: value) {
+                String(integer)
+            } else {
+                String(value)
+            }
         case let .string(value):
             value
         case let .array(values):

@@ -196,14 +196,22 @@ struct RailView: View {
                 _ = expandedProjects.insert(first)
             }
         }
-        .task {
-            await model.loadAllSessions()
-            guard model.connection == .connected, model.allSessionsComplete else { return }
-            pinnedStore.prune(
-                validSessionIDs: Set(model.allSessions.map(\.id)),
-                validProjectIDs: Set(model.projects.map(\.id))
-            )
+        .task(id: model.connection) {
+            await refreshAllSessions()
         }
+        .onChange(of: model.projects.count) { _, _ in
+            Task { await refreshAllSessions() }
+        }
+    }
+
+    private func refreshAllSessions() async {
+        guard model.connection == .connected else { return }
+        await model.loadAllSessions()
+        guard model.allSessionsComplete, !model.projects.isEmpty else { return }
+        pinnedStore.prune(
+            validSessionIDs: Set(model.allSessions.map(\.id)),
+            validProjectIDs: Set(model.projects.map(\.id))
+        )
     }
 
     private var pinnedSessions: [Session] {

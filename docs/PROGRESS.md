@@ -66,12 +66,12 @@
 | Distribution | ✅ | `just package` 生成 Release app + bundled `verlinpadd` + `vp` + docs 的 DMG 和 SHA-256；默认 ad-hoc，**Developer ID/公证已明确暂缓，不作为近期目标**；ad-hoc DMG 是当前支持的发布路径。可选 `VERLINPARK_SIGN_IDENTITY` / `VERLINPARK_NOTARY_PROFILE` 代码保留但不投入；`just cask` / tag workflow 生成 cask，并可用 `HOMEBREW_TAP_REPO` + `HOMEBREW_TAP_TOKEN` 自动提交到 tap（未配置时只留在 GitHub release）；release workflow 使用 arm64 runner；仍无 Sparkle 自动更新 |
 | Project budget | ✅ | `project.budget.get/set` / `vp project-budget*` / Manage Dash；跨 session 共享 token/USD pool，使用同一 `BudgetRegistry` `project:<id>` 原子 reservation；project 超限终止当前 run |
 | Project usage | ✅ | `project.usage` / `vp project-usage` / Manage Dash：按 session 返回 goal/status/calls/input/output/cost 和项目 totals；与 project budget 使用同一 session 投影 |
-| Worktree cleanup | ✅ | `project.cleanup_worktrees` / `vp cleanup-worktrees` / Manage Dash：仅终端 session、默认 7 天、dry-run、dirty 保护、默认保留 branch、`--delete-branches` 显式删除、`--keep-failed`；项目级 `WorktreeRetentionPolicy`（默认关闭、≤365 天、keep failed、keep branches）+ daemon 定时 sweep（`VERLINPARK_WORKTREE_SWEEP_SECS` 默认 3600，0 关闭）；移除 worktree 时同时清 `sandbox/<session>`，worktree 已缺失时也清孤儿 scratch |
+| Worktree cleanup | ✅ | `project.cleanup_worktrees` / `vp cleanup-worktrees` / Manage Dash：仅终端 session、默认 7 天、dry-run、dirty 保护、默认保留 branch、`--delete-branches` 显式删除、`--drop-failed`（默认保留失败/取消 worktree）；项目级 `WorktreeRetentionPolicy`（默认关闭、≤365 天、keep failed、keep branches）+ daemon 定时 sweep（`VERLINPARK_WORKTREE_SWEEP_SECS` 默认 3600，0 关闭）；移除 worktree 时同时清 `sandbox/<session>`，worktree 已缺失时也清孤儿 scratch |
 
 ## 验证
 
-- `cargo test --workspace`：270 个测试通过（core 218、protocol 1、store 42、providers 9）；另有 3 个 env-gated live provider tests 默认 ignored。
-- `xcodebuild test`：83 个 Swift 测试通过（含协议向后兼容解码、diff parser、Rail session grouping 与 design-system invariants）。
+- `cargo test --workspace`：316 个测试通过（core 256、protocol 2、store 44、providers 14）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `xcodebuild test`：89 个 Swift 测试通过（含协议向后兼容解码、diff parser、transcript/collab、Rail session grouping 与 design-system invariants）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
 - 最近 CI：GitHub hosted macOS runner 持续排队/容量受限；本地 lint、Rust/Swift 测试与打包通过。
@@ -287,3 +287,5 @@ just cli session-new <project-id> "Your goal"
 - WebSocket 断线重连没有单元测试。
 - Anthropic 工具调用没有真实账号 live 验证。
 - `agent.rs` 与 `AppModel.swift` 仍然偏大，需要拆分（见 `docs/AUDIT.md`）。
+
+- **M3 第一百二十五切片**：全量审查修复与优化收口（2,000+ 行审计修复）。新增 `docs/audit/2026-11-09-findings.md`/`.csv`：116 个原始 finding 合并为 65 条，50 Fixed / 10 Partial / 5 Deferred。修复 P0 Git worktree `.git`/common-ref sandbox 逃逸与 TeamPlan task-id 目录碰撞；Integrator 改为 merge 精确 verified commit、clean/base 检查与 Git 锁；retry 重新 Verifier；MCP call 升为 HostState 且 Manager/Verifier 只读；shell classifier 补 keyword/expansion/git -C/php -r/>|；secret roots 覆盖 DB sidecar/artifacts/manifest；recovery 事件可 replay；event mirror 串行排序；db-rebuild 恢复 cost/token、加 daemon lock 与失败回滚；bundle import 校验 path traversal/cross-session；provider EOF/error/JSON/非 SSE/超时/partial usage/tool-id/redaction；shell/read_file/grep/integration output 有界，integration command 进入 Seatbelt；auto-approved Worker 也取 write lease；UI event 分页、selection generation、delta 不进历史、approval live/pending、event disconnect/timeout、自动重连退避、workspace draft 跨视图保留、ACP env 编辑器、ACP/New Session/composer 成功后才清空、Rail 重试、terminal 2MB cap、idle console/terminal sweep、atomic plan_task claim event、item-specific stale guards、numeric validation、Collab skipped 计入完成、org preset 绑定真实配置、auth protocol negotiation。

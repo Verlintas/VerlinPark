@@ -169,7 +169,16 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
                 .unwrap_or_default();
             assess_shell_command(command, worktree)
         }
-        "mcp" => PermissionAssessment::new(RiskLevel::External, "external MCP tool call"),
+        "mcp" => {
+            if input.get("action").and_then(Value::as_str) == Some("call") {
+                PermissionAssessment::new(
+                    RiskLevel::HostState,
+                    "MCP tool execution can change host or remote state",
+                )
+            } else {
+                PermissionAssessment::new(RiskLevel::ReadOnly, "MCP inspection")
+            }
+        }
         // MCP tools are projected into the agent schema under names chosen by
         // the server. Unknown tools therefore use the same conservative
         // external classification instead of being treated as local reads.
@@ -341,6 +350,12 @@ fn assess_shell_from(command: &str, start_cwd: &Path, worktree: &Path) -> Permis
             pipeline_has_download = true;
         }
     }
+    if (trimmed.contains("$(") || trimmed.contains('`')) && best.risk == RiskLevel::WorkspaceWrite {
+        return PermissionAssessment::new(
+            RiskLevel::HostState,
+            "command substitution contains an unmodeled command",
+        );
+    }
     best
 }
 
@@ -462,8 +477,17 @@ fn assess_shell_segment(
             _ => break,
         }
     }
+    while index < words.len() && is_shell_keyword(&words[index]) {
+        index += 1;
+    }
     if index >= words.len() {
         return None;
+    }
+    if words[index].contains('$') || words[index].contains('`') {
+        return Some(PermissionAssessment::new(
+            RiskLevel::HostState,
+            "shell expansion hides the command name",
+        ));
     }
     let cwd = effective_cwd.as_path();
     let name = basename(&words[index]);
@@ -505,7 +529,7 @@ fn assess_shell_segment(
             "AppleScript can drive host applications",
         )),
         "open" => Some(PermissionAssessment::new(
-            RiskLevel::External,
+            RiskLevel::HostState,
             "opens host applications or URLs",
         )),
         "docker" | "podman" | "colima" => Some(assess_container(&name, args)),
@@ -527,10 +551,15 @@ fn assess_shell_segment(
                 "toolchain installation writes outside the worktree",
             ))
         }
-        "git" => Some(assess_git(args)),
-        "curl" | "wget" | "nc" | "netcat" | "ssh" | "scp" | "sftp" | "ftp" | "telnet" => Some(
-            PermissionAssessment::new(RiskLevel::External, "network or remote-system access"),
-        ),
+        "git" => Some(assess_git(args, cwd, worktree)),
+        "curl" | "wget" | "nc" | "netcat" | "ftp" | "telnet" => Some(PermissionAssessment::new(
+            RiskLevel::External,
+            "network access",
+        )),
+        "ssh" | "scp" | "sftp" => Some(PermissionAssessment::new(
+            RiskLevel::HostState,
+            "remote host access can mutate another machine",
+        )),
         "rsync" => Some(assess_rsync(args, cwd, worktree)),
         "gh" | "glab" => Some(assess_forge_cli(&name, args)),
         "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish" => {
@@ -752,6 +781,9 @@ fn redirection_targets(raw: &str) -> Vec<String> {
             if index < chars.len() && chars[index] == '>' {
                 index += 1;
             }
+            if index < chars.len() && chars[index] == '|' {
+                index += 1;
+            }
             while index < chars.len() && chars[index].is_whitespace() {
                 index += 1;
             }
@@ -910,8 +942,38 @@ fn assess_cargo(args: &[String]) -> PermissionAssessment {
     }
 }
 
-fn assess_git(args: &[String]) -> PermissionAssessment {
-    let subcommand = args.first().map(String::as_str).unwrap_or_default();
+fn assess_git(args: &[String], cwd: &Path, worktree: &Path) -> PermissionAssessment {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "-C" || arg == "--git-dir" || arg == "--work-tree" {
+            if let Some(path) = args.get(index + 1) {
+                let assessment = assess_target(path, cwd, worktree, false);
+                if assessment.risk.requires_human() || assessment.blocked {
+                    return assessment;
+                }
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(path) = arg
+            .strip_prefix("--git-dir=")
+            .or_else(|| arg.strip_prefix("--work-tree="))
+        {
+            let assessment = assess_target(path, cwd, worktree, false);
+            if assessment.risk.requires_human() || assessment.blocked {
+                return assessment;
+            }
+            index += 1;
+            continue;
+        }
+        if arg == "-c" {
+            index += 2;
+            continue;
+        }
+        break;
+    }
+    let subcommand = args.get(index).map(String::as_str).unwrap_or_default();
     if args
         .iter()
         .any(|arg| arg == "--global" || arg == "--system")
@@ -923,7 +985,10 @@ fn assess_git(args: &[String]) -> PermissionAssessment {
         "status" | "diff" | "log" | "show" | "rev-parse" | "branch" | "remote" | "tag" => {
             PermissionAssessment::new(RiskLevel::ReadOnly, "Git inspection")
         }
-        "push" | "fetch" | "pull" | "clone" | "ls-remote" => {
+        "push" => {
+            PermissionAssessment::new(RiskLevel::HostState, "pushing updates a remote repository")
+        }
+        "fetch" | "pull" | "clone" | "ls-remote" => {
             PermissionAssessment::new(RiskLevel::External, "Git network operation")
         }
         _ => PermissionAssessment::new(RiskLevel::WorkspaceWrite, "Git workspace operation"),
@@ -932,24 +997,33 @@ fn assess_git(args: &[String]) -> PermissionAssessment {
 
 fn assess_rsync(args: &[String], cwd: &Path, worktree: &Path) -> PermissionAssessment {
     if args.iter().any(|arg| arg.contains(':')) {
-        PermissionAssessment::new(RiskLevel::External, "rsync remote transfer")
+        PermissionAssessment::new(
+            RiskLevel::HostState,
+            "rsync remote transfer can write another host",
+        )
     } else {
         assess_write_command("rsync", args, cwd, worktree)
     }
 }
 
 fn assess_forge_cli(name: &str, args: &[String]) -> PermissionAssessment {
-    if matches!(
-        args.first().map(String::as_str).unwrap_or_default(),
-        "auth" | "config" | "login" | "logout"
-    ) {
-        PermissionAssessment::new(
+    let subcommand = args.first().map(String::as_str).unwrap_or_default();
+    if matches!(subcommand, "auth" | "config" | "login" | "logout") {
+        return PermissionAssessment::new(
             RiskLevel::HostState,
             "host forge credentials or configuration",
-        )
-    } else {
-        PermissionAssessment::new(RiskLevel::External, format!("{name} remote repository API"))
+        );
     }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "delete" | "merge" | "close" | "archive"))
+    {
+        return PermissionAssessment::new(
+            RiskLevel::HostState,
+            format!("{name} can mutate a remote repository"),
+        );
+    }
+    PermissionAssessment::new(RiskLevel::External, format!("{name} remote repository API"))
 }
 
 fn assess_shell_interpreter(
@@ -985,7 +1059,7 @@ fn assess_interpreter(
 ) -> PermissionAssessment {
     if let Some(index) = args
         .iter()
-        .position(|arg| matches!(arg.as_str(), "-c" | "-e" | "--eval"))
+        .position(|arg| matches!(arg.as_str(), "-c" | "-e" | "-r" | "--eval"))
         && let Some(code) = args.get(index + 1)
     {
         let nested = assess_shell_from(code, cwd, worktree);
@@ -1083,7 +1157,11 @@ fn assess_xargs(args: &[String], cwd: &Path, worktree: &Path) -> PermissionAsses
         return PermissionAssessment::new(RiskLevel::WorkspaceWrite, "xargs command");
     };
     let has_explicit_target = command.iter().skip(1).any(|arg| !arg.starts_with('-'));
-    if !has_explicit_target
+    let has_placeholder = command
+        .iter()
+        .skip(1)
+        .any(|arg| arg.contains("{}") || arg == "%");
+    if (has_placeholder || !has_explicit_target)
         && matches!(
             program.as_str(),
             "rm" | "rmdir"
@@ -1159,6 +1237,11 @@ fn split_shell_segments(command: &str) -> Vec<ShellSegment> {
             }
             ';' | '\n' => push_segment(&mut segments, &mut current, &mut next_pipe),
             '|' => {
+                if chars.get(index.wrapping_sub(1)) == Some(&'>') {
+                    current.push('|');
+                    index += 1;
+                    continue;
+                }
                 let is_pipe = chars.get(index + 1) != Some(&'|');
                 push_segment(&mut segments, &mut current, &mut next_pipe);
                 next_pipe = is_pipe;
@@ -1235,6 +1318,30 @@ fn shell_words(input: &str) -> Vec<String> {
         words.push(current);
     }
     words
+}
+
+fn is_shell_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then"
+            | "elif"
+            | "else"
+            | "fi"
+            | "for"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "in"
+            | "function"
+            | "{"
+            | "}"
+            | "!"
+            | "time"
+            | "select"
+    )
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -1477,16 +1584,17 @@ mod tests {
     }
 
     #[test]
-    fn external_actions_are_visible_but_do_not_prompt_in_smart_mode() {
+    fn remote_reads_are_external_but_pushes_ask() {
         let push = shell("git push origin main");
-        assert_eq!(push.risk, RiskLevel::External);
+        assert_eq!(push.risk, RiskLevel::HostState);
         assert!(matches!(
             decide(ApprovalMode::Smart, &push, false),
-            ApprovalDecision::Allow { .. }
-        ));
-        assert!(matches!(
-            decide(ApprovalMode::Strict, &push, false),
             ApprovalDecision::Ask { .. }
+        ));
+        assert_eq!(shell("git fetch origin").risk, RiskLevel::External);
+        assert!(matches!(
+            decide(ApprovalMode::Smart, &shell("git fetch origin"), false),
+            ApprovalDecision::Allow { .. }
         ));
     }
 
@@ -1504,15 +1612,48 @@ mod tests {
     }
 
     #[test]
-    fn mcp_and_unknown_tools_are_external() {
+    fn mcp_calls_ask_but_mcp_inspection_is_read_only() {
         assert_eq!(
             assess("mcp", json!({"action": "call"})).risk,
-            RiskLevel::External
+            RiskLevel::HostState
+        );
+        assert_eq!(
+            assess("mcp", json!({"action": "list"})).risk,
+            RiskLevel::ReadOnly
         );
         assert_eq!(
             assess("mcp_mock_echo", json!({"text": "hi"})).risk,
             RiskLevel::External
         );
+    }
+
+    #[test]
+    fn shell_keywords_and_expansions_are_conservative() {
+        assert_eq!(
+            shell("if true; then docker run -v /:/host alpine; fi").risk,
+            RiskLevel::HostState
+        );
+        assert_eq!(
+            shell("$(echo docker) run -v /:/host alpine").risk,
+            RiskLevel::HostState
+        );
+        assert_eq!(
+            shell("rm${IFS}-rf${IFS}/Users/example/Documents").risk,
+            RiskLevel::HostState
+        );
+        assert_eq!(
+            shell("find . -name '*.log' | xargs -I{} rm {}").risk,
+            RiskLevel::HostState
+        );
+        assert_eq!(
+            shell("git -C /Users/example clean -fdx").risk,
+            RiskLevel::Destructive
+        );
+        assert_eq!(
+            shell("php -r 'system(\"launchctl list\")'").risk,
+            RiskLevel::Destructive
+        );
+        assert!(shell("echo x >|/Users/example/file").risk >= RiskLevel::HostState);
     }
 
     #[test]

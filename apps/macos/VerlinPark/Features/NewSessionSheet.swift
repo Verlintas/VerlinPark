@@ -232,14 +232,16 @@ struct NewSessionSheet: View {
 
             Button {
                 Task {
-                    await model.createSession(
+                    let created = await model.createSession(
                         goal: goal,
                         tokenBudget: budget,
                         costBudgetUSD: Double(costBudget),
                         timeBudgetSecs: Int(timeBudget),
                         priority: priority
                     )
-                    dismiss()
+                    if created {
+                        dismiss()
+                    }
                 }
             } label: {
                 Label("Create session", systemImage: "arrow.right")

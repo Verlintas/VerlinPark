@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -23,6 +23,7 @@ const MAX_WRITE_BYTES: usize = 64 * 1024;
 pub struct ConsoleManager {
     consoles: Mutex<HashMap<String, Arc<Console>>>,
     sessions: Mutex<HashMap<String, String>>,
+    open_lock: Mutex<()>,
 }
 
 struct Console {
@@ -172,6 +173,7 @@ impl ConsoleManager {
     }
 
     pub async fn open(&self, session_id: &str, context: ToolContext) -> Result<ConsoleOpenResult> {
+        let _open_guard = self.open_lock.lock().await;
         let existing = self.sessions.lock().await.get(session_id).cloned();
         if let Some(existing) = existing {
             let _ = self.close(&existing).await;
@@ -281,6 +283,30 @@ impl ConsoleManager {
         Ok(ConsoleSignalResult { signaled })
     }
 
+    /// Close consoles that have not been read/written for `idle`. This bounds
+    /// resource use when the app crashes or a client forgets to close a tab.
+    pub async fn sweep_idle(&self, idle: Duration) -> usize {
+        let ids = {
+            let consoles = self.consoles.lock().await;
+            consoles
+                .iter()
+                .filter(|(_, console)| {
+                    !console.closed.load(Ordering::SeqCst)
+                        && console
+                            .last_used
+                            .lock()
+                            .map(|last_used| last_used.elapsed() >= idle)
+                            .unwrap_or(false)
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
+        for id in &ids {
+            let _ = self.close(id).await;
+        }
+        ids.len()
+    }
+
     pub async fn close(&self, console_id: &str) -> Result<ConsoleCloseResult> {
         let console = self.consoles.lock().await.remove(console_id);
         let Some(console) = console else {
@@ -319,21 +345,56 @@ where
     R: AsyncRead + Unpin,
 {
     let mut buffer = [0u8; 8192];
+    let mut pending = Vec::new();
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
-                let text = String::from_utf8_lossy(&buffer[..read]).to_string();
-                if let Ok(mut output) = output.lock() {
+                let text = decode_utf8_stream(&mut pending, &buffer[..read]);
+                if !text.is_empty()
+                    && let Ok(mut output) = output.lock()
+                {
                     output.append(stream, text);
                 }
             }
             Err(_) => break,
         }
     }
+    if !pending.is_empty()
+        && let Ok(mut output) = output.lock()
+    {
+        output.append(stream, String::from_utf8_lossy(&pending).to_string());
+    }
     if let Ok(mut output) = output.lock() {
         output.reader_done();
     }
+}
+
+fn decode_utf8_stream(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
+    pending.extend_from_slice(bytes);
+    let mut text = String::new();
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(valid) => {
+                text.push_str(valid);
+                pending.clear();
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    text.push_str(&String::from_utf8_lossy(&pending[..valid_up_to]));
+                    pending.drain(..valid_up_to);
+                }
+                let Some(invalid_len) = error.error_len() else {
+                    break;
+                };
+                text.push('\u{FFFD}');
+                pending.drain(..invalid_len.min(pending.len()));
+            }
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -353,6 +414,7 @@ mod tests {
             home: root.join("home"),
             restrict_home: false,
             read_jail: false,
+            git_branch: None,
         }
     }
 
@@ -446,5 +508,18 @@ mod tests {
         }
         assert!(!outside.exists());
         manager.close(&opened.console_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sweeps_idle_consoles() {
+        let dir = git_repo();
+        let manager = ConsoleManager::new();
+        let opened = manager
+            .open("session-1", context(dir.path()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(manager.sweep_idle(Duration::from_millis(1)).await, 1);
+        assert!(manager.read(&opened.console_id, 0).await.is_err());
     }
 }

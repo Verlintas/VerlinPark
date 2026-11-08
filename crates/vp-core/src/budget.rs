@@ -132,12 +132,11 @@ impl BudgetRegistry {
         for request in requests {
             let key = request.pool_key.clone();
             let pool = pools.entry(key.clone()).or_default();
-            if request.limit_tokens.is_some() {
-                pool.limit_tokens = request.limit_tokens;
-            }
-            if request.limit_cost.is_some() {
-                pool.limit_cost = request.limit_cost;
-            }
+            // Limits are part of the current configuration, not sticky
+            // history: removing a project/task/department budget must clear the
+            // old pool limit instead of keeping the previous value alive.
+            pool.limit_tokens = request.limit_tokens;
+            pool.limit_cost = request.limit_cost;
             pool.observed_tokens = pool.observed_tokens.max(request.observed.tokens);
             pool.observed_cost = pool.observed_cost.max(request.observed.cost_usd);
             keys.push((key, request));

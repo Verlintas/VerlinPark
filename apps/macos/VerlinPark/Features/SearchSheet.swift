@@ -119,9 +119,6 @@ struct SearchSheet: View {
         .tint(VPTheme.accent)
         .onAppear {
             queryFocused = true
-            if !model.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Task { await runSearch() }
-            }
         }
         .task(id: debounceKey) {
             guard !model.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

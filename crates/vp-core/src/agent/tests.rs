@@ -95,6 +95,7 @@ fn test_service_with_provider_cap(
         provider_idle_timeout_secs: 300,
         question_timeout_secs: 1800,
         approval_mode: ApprovalMode::default(),
+        approval_timeout_secs: 600,
         compact_after_tokens: 0,
         compact_keep_messages: 8,
         context_window: 0,
@@ -1275,7 +1276,18 @@ async fn records_merge_conflicts_in_the_queue() {
 async fn retries_a_conflicted_merge_after_rebase() {
     let dir = TempDir::new().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
-        responses: Mutex::new(VecDeque::new()),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "retry_verdict".into(),
+                name: "submit_verdict".into(),
+                arguments: serde_json::json!({
+                    "approved": true,
+                    "summary": "rebased worker change matches the task"
+                })
+                .to_string(),
+            }),
+            StreamEvent::Done,
+        ]])),
     });
     let (engine, service, project) = test_service_with_provider(&dir, provider);
     let session = engine
@@ -3536,6 +3548,32 @@ fn token_reservations_bound_concurrent_requests() {
     assert!(budget.reserve_tokens(1).is_none());
 }
 
+#[test]
+fn cost_reservations_bound_concurrent_calls() {
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 5,
+            workers: 10,
+            labour: 20,
+        },
+    )
+    .with_cost(Some(1.0), 0.0);
+    let first = budget
+        .reserve_cost(400_000, 400_000, 1.0, 1.0)
+        .expect("first cost reservation")
+        .expect("cost limit configured");
+    assert!(budget.reserve_cost(200_000, 200_000, 1.0, 1.0).is_err());
+    assert!(!first.settle(0.6));
+    assert!((budget.cost_spent() - 0.6).abs() < 1e-9);
+    let second = budget
+        .reserve_cost(100_000, 100_000, 1.0, 1.0)
+        .expect("remaining cost reservation")
+        .expect("cost limit configured");
+    assert!(second.settle(0.4));
+}
+
 struct PausingProvider {
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -3666,6 +3704,41 @@ async fn mailbox_tools_send_read_and_publish() {
     .await
     .unwrap();
     assert!(artifacts.content.contains("worker-notes.md"));
+}
+
+#[test]
+fn shell_secret_roots_cover_database_sidecars_and_artifacts() {
+    let data = TempDir::new().unwrap();
+    for relative in [
+        "verlinpark.db",
+        "verlinpark.db-wal",
+        "verlinpark.db-shm",
+        "verlinpark.db-journal",
+        "verlinpark.db.pre-rebuild-20261109",
+        "projects.jsonl",
+        "artifacts/blobs/aa/bb",
+    ] {
+        let path = data.path().join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, "secret").unwrap();
+    }
+    let roots = shell_secret_roots(data.path());
+    for relative in [
+        "verlinpark.db",
+        "verlinpark.db-wal",
+        "verlinpark.db-shm",
+        "verlinpark.db-journal",
+        "verlinpark.db.pre-rebuild-20261109",
+        "projects.jsonl",
+        "artifacts",
+    ] {
+        assert!(
+            roots.iter().any(|root| root == &data.path().join(relative)),
+            "missing secret root {relative}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4259,6 +4332,33 @@ for line in sys.stdin:
                 .as_str()
                 .is_some_and(|output| output.contains("notes <file:///notes.md>"))
     }));
+    assert!(events.iter().any(|event| {
+        event.kind == "approval.requested"
+            && event.payload["tool"] == "mcp"
+            && event.payload["approval_risk"] == "host_state"
+    }));
+}
+
+#[tokio::test]
+async fn managers_and_verifiers_cannot_execute_mcp_tools() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, _project) = test_service(&dir);
+    for role in [AgentRole::Manager, AgentRole::Verifier] {
+        let output = run_mcp_tool(
+            &engine,
+            role,
+            serde_json::json!({
+                "action": "call",
+                "server": "missing",
+                "tool": "mutate",
+                "arguments": {}
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("cannot execute MCP tools"));
+    }
 }
 
 #[tokio::test]
@@ -4361,7 +4461,7 @@ for line in sys.stdin:
     assert!(events.iter().any(|event| {
         event.kind == "approval.requested"
             && event.payload["tool"] == "mcp_mock_echo"
-            && event.payload["approval_risk"] == "external"
+            && event.payload["approval_risk"] == "host_state"
     }));
 }
 

@@ -139,9 +139,9 @@
 | 问题 | 默认/倾向 | 何时决定 |
 |---|---|---|
 | Aviiya / NovaBAIC 桥接协议 | 不在 VerlinPark 实现 Aviiya；等 NovaBAIC 协议 | NovaBAIC 稳定后 |
-| 四层扩编默认值 | 已定：1 Leader / 4 Managers / 6 Workers / 12 Labour；runtime caps 5 / 10 / 40；自动扩编仍未实现 | 已定（ADR-0026） |
+| 四层扩编默认值 | 已定：1 Leader / 4 Managers / 6 Workers / 12 Labour；runtime caps 5 / 10 / 40；plan Worker 扩编已 opt-in/budget-gated，Manager/Labour 全面扩编与缩编仍未实现 | 已定（ADR-0026/0084） |
 | 最低 macOS | 15+，Apple Silicon only | M0 |
-| UI 语言 | 英文 UI，中文文档 | M0 |
+| UI 语言 | 运行时 English / 简体中文切换，默认跟随系统 | 已定（ADR-0117） |
 | Hero demo 仓库 | 自建 `fixtures/tiny-webapp` | M1 前 |
 | Apple Developer 账号/公证 | 有则 v0.1 公证；没有则 ad-hoc | M4 |
 | CLI 范围 | `run/status/attach/diff/logs` | M3 |

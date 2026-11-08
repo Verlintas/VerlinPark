@@ -28,6 +28,7 @@ pub struct SessionRepair {
     pub priority: Option<i32>,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    pub cost_spent_usd: f64,
     pub replace_plan: bool,
     pub plan: Option<String>,
     pub todos: Option<Vec<TodoItem>>,
@@ -60,6 +61,8 @@ pub struct ProjectManifestSnapshot {
     pub budget: ProjectBudget,
     #[serde(default)]
     pub task_scheduler_policy: TaskSchedulerPolicy,
+    #[serde(default)]
+    pub memory_policy: MemoryPolicy,
 }
 
 /// Read the latest project snapshot for each project from `projects.jsonl`.
@@ -80,9 +83,14 @@ pub fn read_project_manifest(data_dir: &Path) -> Result<Vec<ProjectManifestSnaps
         if line.trim().is_empty() {
             continue;
         }
-        let snapshot: ProjectManifestSnapshot =
-            serde_json::from_str(&line).context("parsing project manifest snapshot")?;
-        latest.insert(snapshot.project.id.clone(), snapshot);
+        match serde_json::from_str::<ProjectManifestSnapshot>(&line) {
+            Ok(snapshot) => {
+                latest.insert(snapshot.project.id.clone(), snapshot);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "skipping malformed project manifest line");
+            }
+        }
     }
     let mut snapshots = latest.into_values().collect::<Vec<_>>();
     snapshots.sort_by(|left, right| left.project.created_at.cmp(&right.project.created_at));
@@ -97,6 +105,101 @@ pub fn read_project_manifest(data_dir: &Path) -> Result<Vec<ProjectManifestSnaps
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
     data_dir: PathBuf,
+    mirror_lock: Arc<Mutex<()>>,
+    manifest_lock: Arc<Mutex<()>>,
+}
+
+/// Reject IDs that could escape the daemon's per-session storage paths or
+/// inject rows into another session through an imported bundle. IDs are opaque
+/// strings, not just UUIDs, so this is a path-component check rather than a
+/// UUID regex.
+pub fn validate_storage_id(kind: &str, id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 128 || id.trim() != id {
+        return Err(anyhow!("{kind} id must be 1-128 non-padded characters"));
+    }
+    if id == "." || id == ".." || id.contains('/') || id.contains('\\') || id.contains('\0') {
+        return Err(anyhow!("{kind} id is not a safe storage component: {id}"));
+    }
+    Ok(())
+}
+
+fn ensure_bundle_session(kind: &str, actual: &str, expected: &str) -> Result<()> {
+    if actual != expected {
+        return Err(anyhow!(
+            "bundle {kind} belongs to session {actual}, expected {expected}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
+    validate_storage_id("project", &bundle.project.id)?;
+    validate_storage_id("session", &bundle.session.id)?;
+    if bundle.session.project_id != bundle.project.id {
+        return Err(anyhow!("bundle session/project ids do not match"));
+    }
+    for event in &bundle.events {
+        ensure_bundle_session("event", &event.session_id, &bundle.session.id)?;
+    }
+    for agent in &bundle.agents {
+        ensure_bundle_session("agent", &agent.session_id, &bundle.session.id)?;
+    }
+    for message in &bundle.messages {
+        ensure_bundle_session("message", &message.session_id, &bundle.session.id)?;
+    }
+    for approval in &bundle.approvals {
+        ensure_bundle_session("approval", &approval.session_id, &bundle.session.id)?;
+    }
+    for entry in &bundle.merge_queue {
+        ensure_bundle_session("merge queue entry", &entry.session_id, &bundle.session.id)?;
+    }
+    for message in &bundle.agent_messages {
+        ensure_bundle_session("agent message", &message.session_id, &bundle.session.id)?;
+    }
+    for artifact in &bundle.artifacts {
+        ensure_bundle_session("artifact", &artifact.session_id, &bundle.session.id)?;
+    }
+    for entry in &bundle.usage {
+        ensure_bundle_session("usage entry", &entry.session_id, &bundle.session.id)?;
+    }
+    for memory in &bundle.memories {
+        ensure_bundle_session("memory", &memory.session_id, &bundle.session.id)?;
+        if memory.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle memory {} belongs to a different project",
+                memory.id
+            ));
+        }
+    }
+    for question in &bundle.questions {
+        ensure_bundle_session("question", &question.session_id, &bundle.session.id)?;
+    }
+    for task in &bundle.tasks {
+        ensure_bundle_session("task", &task.session_id, &bundle.session.id)?;
+        if task.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle task {} belongs to a different project",
+                task.task_id
+            ));
+        }
+    }
+    for agent in &bundle.agents {
+        validate_storage_id("agent", &agent.id)?;
+    }
+    Ok(())
+}
+
+fn allowed_session_transition(current: &str, next: &str) -> bool {
+    if current == next {
+        return true;
+    }
+    match current {
+        // Landed work is final until the user creates a new session or forks.
+        "landed" => false,
+        // Imported archives may only be rehydrated into an idle working session.
+        "imported" => next == "idle",
+        _ => true,
+    }
 }
 
 impl Store {
@@ -112,6 +215,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS store_meta (
@@ -502,6 +606,7 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_approvals_session
                 ON approvals(session_id, created_at);
 
+
             CREATE TABLE IF NOT EXISTS merge_queue (
                 id          TEXT PRIMARY KEY,
                 session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -600,6 +705,12 @@ impl Store {
                 [],
             )?;
         }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
+             CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status);
+             CREATE INDEX IF NOT EXISTS idx_merge_queue_status ON merge_queue(status);
+             CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);",
+        )?;
         ensure_column(
             &conn,
             "project_task_scheduler_policies",
@@ -697,6 +808,8 @@ impl Store {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             data_dir,
+            mirror_lock: Arc::new(Mutex::new(())),
+            manifest_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -810,11 +923,11 @@ impl Store {
             return Ok(());
         }
         let path = self.data_dir.join("projects.jsonl");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening project manifest {}", path.display()))?;
+        let _guard = self
+            .manifest_lock
+            .lock()
+            .map_err(|_| anyhow!("project manifest mutex poisoned"))?;
+        let mut line_buffer = Vec::new();
         for project in projects {
             let snapshot = ProjectManifestSnapshot {
                 version: 1,
@@ -827,11 +940,18 @@ impl Store {
                 checkpoint_policy: self.get_checkpoint_policy(&project.id)?,
                 budget: self.get_project_budget(&project.id)?,
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
+                memory_policy: self.get_memory_policy(&project.id)?,
                 project,
             };
-            serde_json::to_writer(&mut file, &snapshot)?;
-            file.write_all(b"\n")?;
+            serde_json::to_writer(&mut line_buffer, &snapshot)?;
+            line_buffer.push(b'\n');
         }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening project manifest {}", path.display()))?;
+        file.write_all(&line_buffer)?;
         file.flush()?;
         paths::ensure_private_file(&path)?;
         Ok(())
@@ -3241,17 +3361,24 @@ impl Store {
     }
 
     fn append_event_mirror(&self, event: &Event) -> Result<()> {
+        validate_storage_id("session", &event.session_id)?;
         let dir = self.data_dir.join("sessions").join(&event.session_id);
         paths::ensure_private_dir(&dir)?;
         let path = dir.join("events.jsonl");
+        let mut line = serde_json::to_vec(event)?;
+        line.push(b'\n');
+        let _guard = self
+            .mirror_lock
+            .lock()
+            .map_err(|_| anyhow!("event mirror mutex poisoned"))?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        serde_json::to_writer(&mut file, event)?;
-        file.write_all(b"\n")?;
+        file.write_all(&line)?;
         file.flush()?;
         Ok(())
     }
 
     pub fn read_event_mirror(&self, session_id: &str) -> Result<Option<Vec<Event>>> {
+        validate_storage_id("session", session_id)?;
         let path = self
             .data_dir
             .join("sessions")
@@ -3273,6 +3400,10 @@ impl Store {
             })?;
             events.push(event);
         }
+        // Concurrent writers may commit SQLite in a different order than the
+        // mirror append lock serializes lines. The event sequence is the
+        // canonical order, so normalize on read before log-status/restore.
+        events.sort_by_key(|event| event.seq);
         Ok(Some(events))
     }
 
@@ -3909,6 +4040,19 @@ impl Store {
     ) -> Result<Event> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
+        let current: String = tx
+            .query_row(
+                "SELECT status FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        if !allowed_session_transition(&current, status) {
+            return Err(anyhow!(
+                "invalid session status transition: {current} -> {status}"
+            ));
+        }
         let changed = tx.execute(
             "UPDATE sessions SET status = ?1 WHERE id = ?2",
             params![status, session_id],
@@ -4490,7 +4634,7 @@ impl Store {
              FROM plan_tasks t
              JOIN sessions s ON s.id = t.session_id
              LEFT JOIN project_task_scheduler_policies p ON p.project_id = t.project_id
-             WHERE t.status IN ('pending', 'interrupted', 'failed', 'blocked', 'cancelled')
+             WHERE t.status IN ('pending', 'interrupted', 'failed', 'cancelled')
                AND s.status IN ('idle', 'failed', 'cancelled')
                AND COALESCE(p.enabled, ?1) = 1
              GROUP BY t.session_id, t.project_id, s.priority, p.cooldown_secs
@@ -4522,35 +4666,69 @@ impl Store {
         plan_seq: u64,
         task_ids: &[String],
     ) -> Result<Vec<ScheduledTask>> {
+        let (tasks, _events) = self.claim_plan_tasks_with_events(session_id, plan_seq, task_ids)?;
+        Ok(tasks)
+    }
+
+    /// Claim tasks and append the `plan_task.started` events in the same
+    /// transaction. A claim without its event would leave attempts/status
+    /// ahead of the event log and force a replay repair after a crash.
+    pub fn claim_plan_tasks_with_events(
+        &self,
+        session_id: &str,
+        plan_seq: u64,
+        task_ids: &[String],
+    ) -> Result<(Vec<ScheduledTask>, Vec<Event>)> {
         let now = now_rfc3339();
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        let mut claimed = Vec::new();
-        for task_id in task_ids {
-            let changed = tx.execute(
-                "UPDATE plan_tasks
-                 SET status = 'running', attempts = attempts + 1, started_at = ?1,
-                     finished_at = NULL, last_error = NULL, updated_at = ?1
-                 WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4
-                   AND status IN ('pending', 'interrupted', 'failed', 'blocked', 'cancelled')",
-                params![now, session_id, plan_seq as i64, task_id],
-            )?;
-            if changed == 0 {
-                continue;
+        let (claimed, events) = {
+            let mut conn = self.lock()?;
+            let tx = conn.transaction()?;
+            let mut claimed = Vec::new();
+            let mut events = Vec::new();
+            for task_id in task_ids {
+                let changed = tx.execute(
+                    "UPDATE plan_tasks
+                     SET status = 'running', attempts = attempts + 1, started_at = ?1,
+                         finished_at = NULL, last_error = NULL, updated_at = ?1
+                     WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4
+                       AND status IN ('pending', 'interrupted', 'failed', 'blocked', 'cancelled')",
+                    params![now, session_id, plan_seq as i64, task_id],
+                )?;
+                if changed == 0 {
+                    continue;
+                }
+                let task = tx.query_row(
+                    "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
+                            status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
+                            last_error
+                     FROM plan_tasks
+                     WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
+                    params![session_id, plan_seq as i64, task_id],
+                    map_scheduled_task,
+                )?;
+                events.push(insert_event_tx(
+                    &tx,
+                    session_id,
+                    "plan_task.started",
+                    serde_json::json!({
+                        "task_id": task.task_id,
+                        "task_status": "running",
+                        "department": task.department,
+                        "title": task.title,
+                        "attempts": task.attempts,
+                    }),
+                )?);
+                claimed.push(task);
             }
-            let task = tx.query_row(
-                "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
-                        status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                        last_error
-                 FROM plan_tasks
-                 WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
-                params![session_id, plan_seq as i64, task_id],
-                map_scheduled_task,
-            )?;
-            claimed.push(task);
+            tx.commit()?;
+            (claimed, events)
+        };
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
         }
-        tx.commit()?;
-        Ok(claimed)
+        Ok((claimed, events))
     }
 
     pub fn finish_plan_task(
@@ -5230,8 +5408,10 @@ impl Store {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let sessions = {
-            let mut stmt =
-                tx.prepare("SELECT id FROM sessions WHERE status IN ('running', 'paused')")?;
+            let mut stmt = tx.prepare(
+                "SELECT id FROM sessions
+                 WHERE status IN ('running', 'paused', 'waiting_input')",
+            )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -5242,7 +5422,7 @@ impl Store {
         let agents = {
             let mut stmt = tx.prepare(
                 "SELECT id, session_id FROM agents
-                     WHERE status IN ('running', 'waiting_input')",
+                     WHERE status IN ('running', 'waiting_input', 'queued')",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -5250,7 +5430,8 @@ impl Store {
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
-            "UPDATE agents SET status = 'failed' WHERE status = 'running'",
+            "UPDATE agents SET status = 'failed'
+             WHERE status IN ('running', 'waiting_input', 'queued')",
             [],
         )?;
         let approvals = {
@@ -5333,23 +5514,26 @@ impl Store {
             )?);
         }
         for (question_id, session_id) in &expired_questions {
+            let question = tx.query_row(
+                "SELECT id, session_id, agent_id, agent_name, question, options, status,
+                        answer, created_at, answered_at FROM questions WHERE id = ?1",
+                params![question_id],
+                map_question,
+            )?;
             events.push(insert_event_tx(
                 &tx,
                 session_id,
                 "question.expired",
-                serde_json::json!({
-                    "question_id": question_id,
-                    "status": "expired",
-                    "error": "The daemon restarted before the question was answered."
-                }),
+                serde_json::to_value(&question)?,
             )?);
         }
         for (agent_id, session_id) in &agents {
+            let agent = get_agent_tx(&tx, agent_id)?;
             events.push(insert_event_tx(
                 &tx,
                 session_id,
                 "agent.updated",
-                serde_json::json!({"agent_id": agent_id, "status": "failed"}),
+                serde_json::json!({"agent": agent}),
             )?);
         }
         for (session_id, task_id) in &interrupted_tasks {
@@ -5369,7 +5553,11 @@ impl Store {
                 &tx,
                 session_id,
                 "approval.resolved",
-                serde_json::json!({"approval_id": approval_id, "approved": false}),
+                serde_json::json!({
+                    "approval_id": approval_id,
+                    "approved": false,
+                    "resolved_at": now,
+                }),
             )?);
         }
         for id in &queue_ids {
@@ -5406,13 +5594,14 @@ impl Store {
         let changed = tx.execute(
             "UPDATE sessions
              SET status = ?1, priority = COALESCE(?2, priority),
-                 tokens_in = ?3, tokens_out = ?4
-             WHERE id = ?5",
+                 tokens_in = ?3, tokens_out = ?4, cost_spent_usd = ?5
+             WHERE id = ?6",
             params![
                 repair.status,
                 repair.priority,
                 repair.tokens_in as i64,
                 repair.tokens_out as i64,
+                repair.cost_spent_usd,
                 session_id
             ],
         )?;
@@ -5689,6 +5878,7 @@ impl Store {
     }
 
     pub fn import_session_bundle(&self, bundle: &SessionBundle) -> Result<Event> {
+        validate_session_bundle(bundle)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 

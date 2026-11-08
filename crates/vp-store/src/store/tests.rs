@@ -1486,6 +1486,42 @@ fn persists_task_queue_claims_and_completions() {
 }
 
 #[test]
+fn concurrent_event_appends_keep_the_mirror_ordered() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("events"))
+        .unwrap();
+    let session = store.create_session(&project.id, "mirror").unwrap();
+    let mut handles = Vec::new();
+    for index in 0..24 {
+        let store = store.clone();
+        let session_id = session.id.clone();
+        handles.push(std::thread::spawn(move || {
+            store
+                .append_event(
+                    &session_id,
+                    "test.event",
+                    serde_json::json!({"index": index}),
+                )
+                .unwrap();
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let mirror = store.read_event_mirror(&session.id).unwrap().unwrap();
+    assert_eq!(mirror.len(), 24);
+    assert!(mirror.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    let database = store.list_events(&session.id, 0, 100).unwrap();
+    assert_eq!(mirror.len(), database.len());
+    for (mirror, database) in mirror.iter().zip(database.iter()) {
+        assert_eq!(mirror.seq, database.seq);
+        assert_eq!(mirror.kind, database.kind);
+        assert_eq!(mirror.payload, database.payload);
+    }
+}
+
+#[test]
 fn persistent_write_leases_block_overlapping_projects_and_survive_reopen() {
     let (data, store, repo) = test_store();
     let project = store

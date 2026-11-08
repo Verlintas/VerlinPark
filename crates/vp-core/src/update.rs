@@ -9,6 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 use vp_protocol::APP_VERSION;
 use vp_protocol::types::{UpdateCheckResult, UpdateDownloadResult};
 
@@ -79,7 +80,7 @@ pub async fn download_update(repo: Option<&str>) -> Result<UpdateDownloadResult>
             .unwrap_or("VerlinPark-update.dmg"),
     );
     let final_path = downloads.join(&file_name);
-    let part_path = downloads.join(format!(".{file_name}.part"));
+    let part_path = downloads.join(format!(".{file_name}.{}.part", Uuid::now_v7()));
     let result = download_to_path(&client, &dmg_url, &part_path).await?;
     if let Err(error) = verify_checksum(&checksum.sha256, &result.sha256) {
         let _ = std::fs::remove_file(&part_path);

@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::body::to_bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -137,6 +138,7 @@ async fn main() -> Result<()> {
     spawn_worktree_sweeper(state.engine.clone());
     spawn_checkpoint_sweeper(state.engine.clone());
     spawn_memory_sweeper(state.engine.clone());
+    spawn_terminal_sweeper(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
     let addr = listener.local_addr()?;
@@ -152,7 +154,10 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/rpc", post(rpc_http))
+        .route(
+            "/rpc",
+            post(rpc_http).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .route("/ws", get(ws_handler))
         .with_state(state.clone());
 
@@ -174,7 +179,9 @@ async fn health() -> Json<Value> {
     Json(json!({"ok": true, "version": APP_VERSION, "protocol": PROTOCOL_VERSION}))
 }
 
-async fn rpc_http(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+const MAX_RPC_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+async fn rpc_http(State(state): State<AppState>, headers: HeaderMap, request: Request) -> Response {
     if !authorized(&headers, &state.token) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -183,6 +190,26 @@ async fn rpc_http(State(state): State<AppState>, headers: HeaderMap, body: Strin
             .into_response();
     }
 
+    let body = match to_bytes(request.into_body(), MAX_RPC_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return Json(RpcResponse::error(
+                None,
+                RpcError::new(codes::INVALID_REQUEST, "request body too large"),
+            ))
+            .into_response();
+        }
+    };
+    let body = match String::from_utf8(body.to_vec()) {
+        Ok(body) => body,
+        Err(_) => {
+            return Json(RpcResponse::error(
+                None,
+                RpcError::new(codes::PARSE_ERROR, "request body is not UTF-8"),
+            ))
+            .into_response();
+        }
+    };
     let request: RpcRequest = match serde_json::from_str(&body) {
         Ok(request) => request,
         Err(error) => {
@@ -245,6 +272,28 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             return;
         }
     };
+
+    if params
+        .protocol
+        .is_some_and(|protocol| protocol != PROTOCOL_VERSION)
+    {
+        let _ = send_json(
+            &mut socket,
+            &RpcResponse::error(
+                request.id,
+                RpcError::new(
+                    codes::INVALID_REQUEST,
+                    format!(
+                        "protocol version mismatch: client {} server {}",
+                        params.protocol.unwrap_or_default(),
+                        PROTOCOL_VERSION
+                    ),
+                ),
+            ),
+        )
+        .await;
+        return;
+    }
 
     if !constant_time_eq(&params.token, &state.token) {
         let _ = send_json(
@@ -1839,7 +1888,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .resolve_approval(&params.approval_id, params.approved)
                 .await
             {
-                Ok(()) => RpcResponse::success(id, ResolveApprovalResult { resolved: true }),
+                Ok(resolved) => RpcResponse::success(id, ResolveApprovalResult { resolved }),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
@@ -1859,6 +1908,8 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "project.budget.set"
             | "project.worktree_policy.set"
             | "project.checkpoint_policy.set"
+            | "project.task_scheduler.set"
+            | "memory.policy.set"
             | "mailbox.policy.set"
             | "artifact.policy.set"
             | "session.import"
@@ -1929,6 +1980,35 @@ fn spawn_checkpoint_sweeper(engine: Engine) {
                 Err(error) => {
                     tracing::warn!(%error, "automatic checkpoint retention failed");
                 }
+            }
+        }
+    });
+}
+
+fn spawn_terminal_sweeper(engine: Engine) {
+    let idle_secs = std::env::var("VERLINPARK_TERMINAL_IDLE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3600);
+    if idle_secs == 0 {
+        return;
+    }
+    // Sweep several times per idle window, but keep the check cheap.
+    let interval_secs = (idle_secs / 4).clamp(15, 300);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let (consoles, terminals) = engine
+                .sweep_idle_terminals(Duration::from_secs(idle_secs))
+                .await;
+            if consoles + terminals > 0 {
+                tracing::info!(
+                    consoles,
+                    terminals,
+                    "closed idle console/terminal processes"
+                );
             }
         }
     });

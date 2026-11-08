@@ -10,6 +10,7 @@ pub mod anthropic;
 pub mod openai;
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use futures_util::Stream;
@@ -18,6 +19,15 @@ use serde_json::Value;
 
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiCompatibleProvider;
+
+static TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn fallback_tool_call_id(index: usize) -> String {
+    format!(
+        "call_{index}_{}",
+        TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
@@ -140,6 +150,7 @@ const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(4);
 pub(crate) fn provider_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(300))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -180,7 +191,7 @@ where
             Ok(response) => {
                 let status = response.status().as_u16();
                 if !retryable_status(status) || attempt >= PROVIDER_ATTEMPTS {
-                    let body = response.text().await.unwrap_or_default();
+                    let body = redact_provider_body(&response.text().await.unwrap_or_default());
                     return Err(ProviderError::Api { status, body });
                 }
                 let delay = retry_after(&response)
@@ -225,6 +236,65 @@ pub(crate) fn openai_usage(value: &Value) -> Option<StreamEvent> {
     }
 }
 
+/// Provider error bodies can echo request headers or keys. Keep a short,
+/// redacted diagnostic instead of persisting the full response.
+pub(crate) fn redact_provider_body(body: &str) -> String {
+    let mut redacted = body.to_string();
+    for marker in [
+        "Bearer ",
+        "bearer ",
+        "sk-",
+        "x-api-key",
+        "api_key",
+        "api-key",
+    ] {
+        let mut search = 0;
+        while let Some(relative) = redacted[search..].find(marker) {
+            let index = search + relative;
+            let value_start = index + marker.len();
+            let rest = &redacted[value_start..];
+            let value_len = rest
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}'))
+                .unwrap_or(rest.len());
+            if value_len == 0 {
+                search = value_start;
+                continue;
+            }
+            let value_end = value_start + value_len;
+            redacted.replace_range(value_start..value_end, "[redacted]");
+            search = value_start + "[redacted]".len();
+        }
+    }
+    const MAX: usize = 8_000;
+    if redacted.len() > MAX {
+        let mut end = MAX;
+        while end > 0 && !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        redacted.truncate(end);
+        redacted.push('…');
+    }
+    redacted
+}
+
 pub(crate) fn provider_error_from_stream(error: impl std::fmt::Display) -> ProviderError {
     ProviderError::Stream(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_error_bodies_are_redacted_and_bounded() {
+        let body = format!(
+            "{{\"error\":\"bad key sk-secret123\",\"header\":\"Bearer abc.def\",\"x\":\"{}\"}}",
+            "x".repeat(10_000)
+        );
+        let redacted = redact_provider_body(&body);
+        assert!(!redacted.contains("sk-secret123"));
+        assert!(!redacted.contains("abc.def"));
+        assert!(redacted.contains("[redacted]"));
+        assert!(redacted.len() <= 8_010);
+    }
 }

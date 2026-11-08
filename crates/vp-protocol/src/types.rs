@@ -639,6 +639,10 @@ pub struct SubscribeParams {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthParams {
     pub token: String,
+    /// Optional client protocol major version. Older clients omit it and are
+    /// treated as protocol 1.
+    #[serde(default)]
+    pub protocol: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2747,6 +2751,16 @@ pub struct TeamPlanResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn auth_params_accept_legacy_clients_without_a_protocol() {
+        let legacy: AuthParams = serde_json::from_value(json!({"token": "abc"})).unwrap();
+        assert_eq!(legacy.token, "abc");
+        assert!(legacy.protocol.is_none());
+        let current: AuthParams =
+            serde_json::from_value(json!({"token": "abc", "protocol": 2})).unwrap();
+        assert_eq!(current.protocol, Some(2));
+    }
 
     #[test]
     fn mcp_add_params_preserve_flat_wire_shape() {

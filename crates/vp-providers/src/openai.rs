@@ -115,9 +115,21 @@ impl Provider for OpenAiCompatibleProvider {
             Err(error) => return Err(error),
         };
 
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().contains("json"))
+        {
+            return Err(ProviderError::Unsupported(
+                "provider returned a JSON response; expected a stream".into(),
+            ));
+        }
         let stream = Box::pin(response.bytes_stream().eventsource());
         let mapped = async_stream::stream! {
             let mut tool_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
+            let mut saw_done = false;
+            let mut stream_failed = false;
             let mut stream = stream;
             while let Some(item) = stream.next().await {
                 match item {
@@ -127,6 +139,7 @@ impl Provider for OpenAiCompatibleProvider {
                     }
                     Ok(event) => {
                         if event.data.trim() == "[DONE]" {
+                            saw_done = true;
                             break;
                         }
                         let value: Value = match serde_json::from_str(&event.data) {
@@ -136,6 +149,14 @@ impl Provider for OpenAiCompatibleProvider {
                                 continue;
                             }
                         };
+                        if let Some(error) = value.get("error") {
+                            stream_failed = true;
+                            yield Err(ProviderError::Api {
+                                status: 200,
+                                body: crate::redact_provider_body(&error.to_string()),
+                            });
+                            break;
+                        }
                         if let Some(text) = value
                             .pointer("/choices/0/delta/content")
                             .and_then(Value::as_str)
@@ -181,8 +202,17 @@ impl Provider for OpenAiCompatibleProvider {
                     }
                 }
             }
-            for (_, call) in tool_calls {
+            if !saw_done && !stream_failed {
+                yield Err(ProviderError::Stream(
+                    "provider stream ended before [DONE]".into(),
+                ));
+                return;
+            }
+            for (index, mut call) in tool_calls {
                 if !call.name.is_empty() {
+                    if call.id.is_empty() {
+                        call.id = crate::fallback_tool_call_id(index);
+                    }
                     yield Ok(StreamEvent::ToolCall(call));
                 }
             }
@@ -365,6 +395,129 @@ mod tests {
             arguments: "{\"path\":\"README.md\"}".to_string(),
         })));
         assert_eq!(events.last(), Some(&StreamEvent::Done));
+    }
+
+    #[tokio::test]
+    async fn errors_when_stream_ends_without_done() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "test-model",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+            .unwrap();
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            if let Err(provider_error) = item {
+                error = Some(provider_error);
+            }
+        }
+        assert!(matches!(error, Some(ProviderError::Stream(_))));
+    }
+
+    #[tokio::test]
+    async fn surfaces_provider_error_objects() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {\"error\":{\"message\":\"backend unavailable\"}}\n\n"),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "test-model",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+            .unwrap();
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            if let Err(provider_error) = item {
+                error = Some(provider_error);
+            }
+        }
+        assert!(matches!(
+            error,
+            Some(ProviderError::Api { status: 200, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_sse_success_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}",
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let error = match provider
+            .stream_chat(ChatRequest::new(
+                "test-model",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+        {
+            Ok(_) => panic!("expected non-SSE rejection"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ProviderError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn assigns_an_id_when_the_provider_omits_one() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "test-model",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+            .unwrap();
+        let mut tool_call = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(StreamEvent::ToolCall(call)) = item {
+                tool_call = Some(call);
+            }
+        }
+        let tool_call = tool_call.expect("tool call");
+        assert!(tool_call.id.starts_with("call_0_"));
+        assert_eq!(tool_call.name, "read_file");
     }
 
     #[tokio::test]

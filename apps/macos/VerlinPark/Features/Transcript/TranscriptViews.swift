@@ -138,6 +138,7 @@ struct ApprovalNotice: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var pending = false
     @State private var showingDetails = false
+    @State private var errorMessage: String?
 
     private var title: String {
         if entry.isPending {
@@ -233,14 +234,26 @@ struct ApprovalNotice: View {
                 HStack(spacing: 7) {
                     Button(L10n.t("Deny")) {
                         pending = true
-                        Task { await model.resolveApproval(entry.approval.id, approved: false) }
+                        errorMessage = nil
+                        Task {
+                            if await !(model.resolveApproval(entry.approval.id, approved: false)) {
+                                pending = false
+                                errorMessage = L10n.t("Approval could not be resolved.")
+                            }
+                        }
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
 
                     Button(L10n.t("Approve")) {
                         pending = true
-                        Task { await model.resolveApproval(entry.approval.id, approved: true) }
+                        errorMessage = nil
+                        Task {
+                            if await !(model.resolveApproval(entry.approval.id, approved: true)) {
+                                pending = false
+                                errorMessage = L10n.t("Approval could not be resolved.")
+                            }
+                        }
                     }
                     .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                     .controlSize(.small)
@@ -254,6 +267,13 @@ struct ApprovalNotice: View {
                     Spacer()
                 }
                 .disabled(pending)
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.danger)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.leading, 10)
@@ -271,6 +291,10 @@ struct ApprovalNotice: View {
             VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion),
             value: entry.status
         )
+        .onChange(of: entry.status) { _, _ in
+            pending = false
+            errorMessage = nil
+        }
     }
 
     private var statusIcon: String {

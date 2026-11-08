@@ -22,7 +22,12 @@ pub fn tree(root: &Path) -> Result<WorkspaceTreeResult> {
     let walker = WalkBuilder::new(&root)
         .hidden(false)
         .max_depth(Some(MAX_DEPTH))
-        .filter_entry(|entry| entry.file_name() != ".git")
+        .filter_entry(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".git")
+        })
         .build();
     for entry in walker {
         let entry = match entry {
@@ -177,10 +182,12 @@ fn resolve_for_write(root: &Path, relative: &str) -> Result<PathBuf> {
     {
         bail!("workspace path must be relative and must not contain ..");
     }
-    if relative_path
-        .components()
-        .any(|component| component.as_os_str() == ".git")
-    {
+    if relative_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".git")
+    }) {
         bail!("workspace path must not target .git");
     }
     let candidate = root.join(relative_path);
@@ -195,10 +202,12 @@ fn resolve_for_write(root: &Path, relative: &str) -> Result<PathBuf> {
             bail!("path is a directory: {relative}");
         }
         let canonical_relative = resolved.strip_prefix(root).unwrap_or(&resolved);
-        if canonical_relative
-            .components()
-            .any(|component| component.as_os_str() == ".git")
-        {
+        if canonical_relative.components().any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".git")
+        }) {
             bail!("workspace path must not target .git");
         }
         return Ok(resolved);
@@ -212,10 +221,12 @@ fn resolve_for_write(root: &Path, relative: &str) -> Result<PathBuf> {
         bail!("workspace path escapes the session worktree");
     }
     let parent_relative = parent.strip_prefix(root).unwrap_or(&parent);
-    if parent_relative
-        .components()
-        .any(|component| component.as_os_str() == ".git")
-    {
+    if parent_relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".git")
+    }) {
         bail!("workspace path must not target .git");
     }
     let name = candidate
@@ -244,10 +255,12 @@ fn resolve(root: &Path, relative: &str) -> Result<PathBuf> {
         bail!("workspace path escapes the session worktree");
     }
     let relative = resolved.strip_prefix(root).unwrap_or(&resolved);
-    if relative
-        .components()
-        .any(|component| component.as_os_str() == ".git")
-    {
+    if relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".git")
+    }) {
         bail!("workspace path must not target .git");
     }
     Ok(resolved)

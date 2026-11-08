@@ -869,6 +869,20 @@ async fn session_budgets_round_trip() {
         .find(|candidate| candidate.id == session.id)
         .unwrap();
     assert_eq!(stored.cost_spent_usd, 1.25);
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
+    assert!(
+        engine
+            .create_session_with_limits(
+                project.id.clone(),
+                "bad tokens".into(),
+                Some(0),
+                None,
+                None,
+            )
+            .await
+            .is_err()
+    );
     assert!(
         engine
             .create_session_with_limits(
@@ -1972,12 +1986,26 @@ async fn recovers_interrupted_sessions_and_pending_approvals() {
         .create_session(project.id, "run".into(), None)
         .await
         .unwrap();
-    engine
+    let leader_id = engine
         .create_leader_agent(&session.id, "test")
         .await
         .unwrap();
     engine
-        .update_session_status(&session.id, "running")
+        .update_agent_status(&leader_id, "running")
+        .await
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "waiting_input")
+        .await
+        .unwrap();
+    let (question, _question_receiver) = engine
+        .request_question(
+            &session.id,
+            &leader_id,
+            "Leader",
+            "Which branch should I use?",
+            vec!["main".into(), "release".into()],
+        )
         .await
         .unwrap();
     let (approval, _receiver) = engine
@@ -2035,6 +2063,33 @@ async fn recovers_interrupted_sessions_and_pending_approvals() {
             && event.payload["entry"]["id"] == queue_entry.id
             && event.payload["entry"]["status"] == "interrupted"
     }));
+    let questions = engine
+        .list_questions(Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(questions.questions[0].id, question.id);
+    assert_eq!(questions.questions[0].status, "expired");
+    assert!(events.iter().any(|event| {
+        event.kind == "question.expired"
+            && event.payload["id"] == question.id
+            && event.payload["status"] == "expired"
+    }));
+    let agents = engine.list_agents(&session.id).await.unwrap();
+    assert_eq!(agents[0].status, "failed");
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.updated"
+            && event.payload["agent"]["id"] == leader_id
+            && event.payload["agent"]["status"] == "failed"
+    }));
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
+    assert!(!engine.resolve_approval(&approval.id, true).await.unwrap());
+    assert!(
+        !engine
+            .resolve_approval("missing-approval", true)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -2572,6 +2627,10 @@ async fn replay_checks_critical_projections() {
     assert_eq!(sessions[0].status, "running");
 
     engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
         .store()
         .update_agent_status(&agent.id, "cancelled")
         .unwrap();
@@ -2699,6 +2758,20 @@ async fn replay_checks_critical_projections() {
     let original_branch = session.branch.clone().unwrap();
     let import_data = TempDir::new().unwrap();
     let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
+    let mut traversal = bundle.clone();
+    traversal.session.id = "../escape".into();
+    let error = imported_engine.import_session(traversal).await.unwrap_err();
+    assert!(error.to_string().contains("safe storage"));
+    let mut cross_session = bundle.clone();
+    cross_session.agents[0].session_id = "another-session".into();
+    let error = imported_engine
+        .import_session(cross_session)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("different session")
+            || error.to_string().contains("belongs to session")
+    );
     let imported = imported_engine.import_session(bundle).await.unwrap();
     assert_eq!(imported.session_id, session.id);
     assert_eq!(imported.status, "imported");

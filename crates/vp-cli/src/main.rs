@@ -5,7 +5,9 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
 use serde_json::{Value, json};
+use std::fs::OpenOptions;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::RpcResponse;
 use vp_store::paths;
@@ -186,9 +188,9 @@ enum Command {
         /// Also delete the session branches.
         #[arg(long)]
         delete_branches: bool,
-        /// Keep worktrees for failed/cancelled sessions.
-        #[arg(long)]
-        keep_failed: bool,
+        /// Also remove failed/cancelled worktrees. Off by default.
+        #[arg(long = "drop-failed")]
+        drop_failed: bool,
     },
     /// Show the project's automatic task-resume policy.
     TaskScheduler { project: String },
@@ -643,7 +645,22 @@ async fn main() -> Result<()> {
                 data_dir.join("run/daemon.json").display()
             );
         }
+        std::fs::create_dir_all(data_dir.join("run"))?;
+        let lock_path = data_dir.join("run/daemon.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        if lock_file.try_lock_exclusive().is_err() {
+            bail!(
+                "daemon lock is held at {}; stop the daemon before rebuilding",
+                lock_path.display()
+            );
+        }
         let report = vp_core::rebuild_database(&data_dir, *dry_run).await?;
+        let _ = lock_file.unlock();
         let value = serde_json::to_value(report)?;
         if cli.json {
             print_json(&value)?;
@@ -877,7 +894,7 @@ async fn main() -> Result<()> {
             dry_run,
             force,
             delete_branches,
-            keep_failed,
+            drop_failed,
         } => {
             rpc(
                 &discovery,
@@ -888,7 +905,7 @@ async fn main() -> Result<()> {
                     "dry_run": dry_run,
                     "force": force,
                     "delete_branches": delete_branches,
-                    "keep_failed": keep_failed,
+                    "keep_failed": !drop_failed,
                 }),
             )
             .await?

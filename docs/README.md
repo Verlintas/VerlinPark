@@ -1,6 +1,6 @@
 # VerlinPark 文档索引
 
-> 最后更新：2026-11-08
+> 最后更新：2026-11-09
 > 仓库：<https://github.com/Verlintas/VerlinPark>
 
 文档分成三类，避免把“设计目标”误读成“已经实现”：
@@ -9,6 +9,7 @@
 |---|---|---|
 | **Current** | [PROGRESS.md](PROGRESS.md) | 当前真实可用的能力、限制、测试结果；状态以这里为准 |
 | **Current** | [AUDIT.md](AUDIT.md) | 最近一次项目重审：P0/P1/P2 问题、证据、建议顺序 |
+| **Current** | [audit/2026-11-09-findings.md](audit/2026-11-09-findings.md) | 2026-11-09 全量审查完整台账（[CSV](audit/2026-11-09-findings.csv)）；116 个原始 finding 合并为 65 条并保留全部来源 ID |
 | **Design** | [ARCHITECTURE.md](ARCHITECTURE.md) | 目标架构、协议、数据模型、状态机；实现状态见 PROGRESS/AUDIT |
 | **Design** | [PLAN.md](PLAN.md) | 长期产品计划、范围、里程碑、风险；保留早期设计章节作为背景 |
 | **Reference** | [DECISIONS.md](DECISIONS.md) | Accepted ADR 索引；改架构先加 ADR |
@@ -23,9 +24,10 @@
 1. [README](../README.md) — 产品是什么、怎么跑。
 2. [PROGRESS.md](PROGRESS.md) — 现在到底有什么。
 3. [AUDIT.md](AUDIT.md) — 哪些地方还不可靠，下一步优先修什么。
-4. [ARCHITECTURE.md](ARCHITECTURE.md) — 目标架构与不变量。
-5. [DECISIONS.md](DECISIONS.md) — 已锁定的决策。
-6. [PLAN.md](PLAN.md) — 长期路线与早期设计背景。
+4. [audit/2026-11-09-findings.md](audit/2026-11-09-findings.md) — 完整修复台账与残余风险。
+5. [ARCHITECTURE.md](ARCHITECTURE.md) — 目标架构与不变量。
+6. [DECISIONS.md](DECISIONS.md) — 已锁定的决策。
+7. [PLAN.md](PLAN.md) — 长期路线与早期设计背景。
 
 ## 文档状态规则
 

@@ -30,9 +30,11 @@ actor CoreClient {
     private var urlSession: URLSession?
     private var socket: URLSessionWebSocketTask?
     private var pending: [String: CheckedContinuation<JSONValue, Error>] = [:]
+    private var requestTimeouts: [String: Task<Void, Never>] = [:]
     private var eventContinuation: AsyncStream<Event>.Continuation?
     private var receiveTask: Task<Void, Never>?
     private var isConnected = false
+    private var disconnectHandler: (@Sendable (Error) -> Void)?
 
     func connect(to discovery: Discovery) async throws {
         disconnect()
@@ -55,7 +57,10 @@ actor CoreClient {
 
         let authResult = try await request(
             method: "auth",
-            params: ["token": .string(discovery.token)]
+            params: [
+                "token": .string(discovery.token),
+                "protocol": .number(1),
+            ]
         )
         guard try authResult.decode(AuthResult.self).ok else {
             throw CoreError.rpc(code: -32001, message: "authentication failed")
@@ -83,6 +88,10 @@ actor CoreClient {
                 Task { await self.clearEventContinuation() }
             }
         }
+    }
+
+    func setDisconnectHandler(_ handler: @escaping @Sendable (Error) -> Void) {
+        disconnectHandler = handler
     }
 
     func ping() async throws -> JSONValue {
@@ -834,6 +843,7 @@ actor CoreClient {
         name: String,
         command: String,
         args: [String],
+        env: [String: String],
         autoApprove: Bool,
         timeoutSecs: Int
     ) async throws -> AcpAgent {
@@ -841,6 +851,7 @@ actor CoreClient {
             "name": .string(name),
             "command": .string(command),
             "args": .array(args.map(JSONValue.string)),
+            "env": .object(env.mapValues(JSONValue.string)),
             "enabled": .bool(true),
             "auto_approve": .bool(autoApprove),
             "timeout_secs": .number(Double(timeoutSecs)),
@@ -1380,12 +1391,14 @@ actor CoreClient {
             .cancelled
     }
 
-    func resolveApproval(id: String, approved: Bool) async throws {
+    func resolveApproval(id: String, approved: Bool) async throws -> Bool {
         let params: [String: JSONValue] = [
             "approval_id": .string(id),
             "approved": .bool(approved),
         ]
-        _ = try await request(method: "approval.resolve", params: params)
+        return try await request(method: "approval.resolve", params: params)
+            .decode(ResolveApprovalResult.self)
+            .resolved
     }
 
     func agentInfo() async throws -> AgentInfo {
@@ -1476,6 +1489,10 @@ actor CoreClient {
 
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
+            requestTimeouts[id] = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(30))
+                await self?.timeoutRequest(id)
+            }
             Task {
                 do {
                     try await socket.send(.string(text))
@@ -1502,7 +1519,10 @@ actor CoreClient {
                     break
                 }
             } catch {
+                isConnected = false
+                eventContinuation?.finish()
                 failAll(error)
+                disconnectHandler?(error)
                 break
             }
         }
@@ -1520,6 +1540,7 @@ actor CoreClient {
            let id = idValue.stringValue,
            let continuation = pending.removeValue(forKey: id)
         {
+            requestTimeouts.removeValue(forKey: id)?.cancel()
             if let error = envelope.error {
                 continuation.resume(
                     throwing: CoreError.rpc(code: error.code, message: error.message)
@@ -1539,12 +1560,22 @@ actor CoreClient {
     }
 
     private func failRequest(_ id: String, _ error: Error) {
+        requestTimeouts.removeValue(forKey: id)?.cancel()
         pending.removeValue(forKey: id)?.resume(throwing: error)
+    }
+
+    private func timeoutRequest(_ id: String) {
+        requestTimeouts.removeValue(forKey: id)
+        pending.removeValue(forKey: id)?.resume(throwing: CoreError.timeout)
     }
 
     private func failAll(_ error: Error) {
         let continuations = pending.values
         pending.removeAll()
+        for task in requestTimeouts.values {
+            task.cancel()
+        }
+        requestTimeouts.removeAll()
         for continuation in continuations {
             continuation.resume(throwing: error)
         }

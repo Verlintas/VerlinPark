@@ -128,7 +128,10 @@ struct CollabSnapshot: Equatable {
             + verifiers.count(where: \.isRunning)
             + labour.count(where: \.isRunning)
         let tasks = plan?.tasks ?? []
-        let completedTasks = tasks.count { statuses[$0.id] == "completed" }
+        let completedTasks = tasks.count {
+            let status = statuses[$0.id]
+            return status == "completed" || status == "skipped"
+        }
         let activeTasks = tasks.count {
             let status = statuses[$0.id]
             return status == "running" || status == "queued"

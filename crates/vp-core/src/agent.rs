@@ -148,6 +148,8 @@ pub struct AgentConfig {
     pub question_timeout_secs: u64,
     /// Risk-based approval policy for tool calls.
     pub approval_mode: ApprovalMode,
+    /// Maximum time a tool/ACP approval may wait for a human.
+    pub approval_timeout_secs: u64,
     /// Compact the active conversation after this many estimated tokens.
     /// Zero disables compaction.
     pub compact_after_tokens: u64,
@@ -1017,6 +1019,7 @@ struct BudgetState {
     /// the same pre-flight check and overshoot by a full batch.
     reserved_tokens: u64,
     cost_spent: f64,
+    reserved_cost: f64,
     managers: usize,
     workers: usize,
     verifiers: usize,
@@ -1066,6 +1069,7 @@ impl SessionBudget {
                 spent,
                 reserved_tokens: 0,
                 cost_spent: 0.0,
+                reserved_cost: 0.0,
                 managers: 0,
                 workers: 0,
                 verifiers: 0,
@@ -1108,7 +1112,7 @@ impl SessionBudget {
         if let Ok(state) = self.state.lock()
             && self
                 .cost_limit
-                .is_some_and(|limit| state.cost_spent >= limit)
+                .is_some_and(|limit| state.cost_spent + state.reserved_cost >= limit)
         {
             return Some("cost");
         }
@@ -1131,7 +1135,7 @@ impl SessionBudget {
             return Some("tokens");
         }
         if let Some(limit) = self.cost_limit
-            && state.cost_spent >= limit * 0.8
+            && state.cost_spent + state.reserved_cost >= limit * 0.8
             && !state.warned_cost
         {
             state.warned_cost = true;
@@ -1159,6 +1163,13 @@ impl SessionBudget {
         self.state
             .lock()
             .map(|state| state.cost_spent)
+            .unwrap_or(0.0)
+    }
+
+    fn reserved_cost(&self) -> f64 {
+        self.state
+            .lock()
+            .map(|state| state.reserved_cost)
             .unwrap_or(0.0)
     }
 
@@ -1211,6 +1222,33 @@ impl SessionBudget {
             budget: self,
             amount,
         })
+    }
+
+    fn reserve_cost(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        input_price: f64,
+        output_price: f64,
+    ) -> std::result::Result<Option<CostReservation<'_>>, ()> {
+        let Some(limit) = self.cost_limit else {
+            return Ok(None);
+        };
+        let estimate = usage_cost(input_tokens, output_tokens, input_price, output_price);
+        if !estimate.is_finite() || estimate <= 0.0 {
+            return Ok(None);
+        }
+        let mut state = self.state.lock().map_err(|_| ())?;
+        let committed = state.cost_spent + state.reserved_cost;
+        if committed + estimate > limit {
+            return Err(());
+        }
+        state.reserved_cost += estimate;
+        drop(state);
+        Ok(Some(CostReservation {
+            budget: self,
+            amount: estimate,
+        }))
     }
 
     fn reserve(&self, role: AgentRole) -> Option<usize> {
@@ -1289,6 +1327,37 @@ impl Drop for TokenReservation<'_> {
     }
 }
 
+struct CostReservation<'a> {
+    budget: &'a SessionBudget,
+    amount: f64,
+}
+
+impl CostReservation<'_> {
+    fn settle(mut self, actual: f64) -> bool {
+        let amount = self.amount;
+        self.amount = 0.0;
+        let Ok(mut state) = self.budget.state.lock() else {
+            return true;
+        };
+        state.reserved_cost = (state.reserved_cost - amount).max(0.0);
+        state.cost_spent += actual.max(0.0);
+        self.budget
+            .cost_limit
+            .is_some_and(|limit| state.cost_spent >= limit)
+    }
+}
+
+impl Drop for CostReservation<'_> {
+    fn drop(&mut self) {
+        if self.amount <= 0.0 {
+            return;
+        }
+        if let Ok(mut state) = self.budget.state.lock() {
+            state.reserved_cost = (state.reserved_cost - self.amount).max(0.0);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct VerifierVerdict {
     approved: bool,
@@ -1327,7 +1396,7 @@ impl BudgetStop {
             limit_cost: budget.cost_limit,
             spent_cost: budget.cost_spent(),
             reserved_tokens: 0,
-            reserved_cost: 0.0,
+            reserved_cost: budget.reserved_cost(),
             elapsed_secs: Some(budget.elapsed_secs()),
         }
     }
@@ -1354,6 +1423,13 @@ impl BudgetStop {
     fn session_tokens(budget: &SessionBudget) -> Self {
         Self {
             reason: "tokens".to_string(),
+            ..Self::session(budget)
+        }
+    }
+
+    fn session_cost(budget: &SessionBudget) -> Self {
+        Self {
+            reason: "cost".to_string(),
             ..Self::session(budget)
         }
     }
@@ -1492,6 +1568,11 @@ impl AgentService {
                     .ok()
                     .and_then(|value| ApprovalMode::parse(&value))
                     .unwrap_or_default(),
+                approval_timeout_secs: env::var("VERLINPARK_APPROVAL_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(600)
+                    .clamp(10, 86400),
                 compact_after_tokens: compact_after_tokens(),
                 compact_keep_messages: compact_keep_messages(),
                 context_window: context_window(),
@@ -1597,6 +1678,11 @@ impl AgentService {
                         .and_then(|value| ApprovalMode::parse(&value))
                 })
                 .unwrap_or_default(),
+            approval_timeout_secs: env::var("VERLINPARK_APPROVAL_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(600)
+                .clamp(10, 86400),
             compact_after_tokens: compact_after_tokens(),
             compact_keep_messages: compact_keep_messages(),
             context_window: params
@@ -1721,6 +1807,24 @@ impl AgentService {
             .get_merge_queue_entry(entry_id)
             .await?
             .ok_or_else(|| anyhow!("merge queue entry not found: {entry_id}"))?;
+        let (session, _) =
+            load_session_project(self.engine.store().clone(), &entry.session_id).await?;
+        crate::ensure_session_quiescent(&session, "retry a merge")?;
+        if session.status == "landed" {
+            anyhow::bail!("session is already landed");
+        }
+        self.begin_operation(&entry.session_id)?;
+        let result = self.retry_merge_inner(entry_id).await;
+        self.end_operation(&entry.session_id);
+        result
+    }
+
+    async fn retry_merge_inner(&self, entry_id: &str) -> Result<MergeQueueEntry> {
+        let entry = self
+            .engine
+            .get_merge_queue_entry(entry_id)
+            .await?
+            .ok_or_else(|| anyhow!("merge queue entry not found: {entry_id}"))?;
         if !matches!(entry.status.as_str(), "conflict" | "failed" | "interrupted") {
             return Err(anyhow!(
                 "merge queue entry is {}, only conflict/failed/interrupted can be retried",
@@ -1733,7 +1837,7 @@ impl AgentService {
             .ok()
             .and_then(|config| config.as_ref().cloned())
             .ok_or_else(|| anyhow!("agent provider is not configured"))?;
-        let (session, _) =
+        let (session, project) =
             load_session_project(self.engine.store().clone(), &entry.session_id).await?;
         let agents = self.engine.list_agents(&entry.session_id).await?;
         let agent = agents
@@ -1775,24 +1879,136 @@ impl AgentService {
         let base_worktree = session_worktree.clone();
         let base_commit =
             tokio::task::spawn_blocking(move || worktree::head_commit(&base_worktree)).await??;
-        let Some(entry) = self
-            .engine
-            .retry_merge_queue_entry(
-                &entry.id,
-                &commit,
-                &base_commit,
-                Some("rebased onto the current session branch".to_string()),
-            )
-            .await?
-        else {
-            return Err(anyhow!("merge queue entry can no longer be retried"));
-        };
 
         let profile = agent
             .profile
             .as_deref()
             .and_then(AgentProfile::parse)
             .unwrap_or(AgentProfile::Coding);
+        let plan = self.engine.get_team_plan(&session.id).await.ok().flatten();
+        let task = entry.task_id.as_deref().and_then(|task_id| {
+            plan.as_ref()
+                .and_then(|plan| plan.tasks.iter().find(|task| task.id == task_id))
+        });
+        let objective = task
+            .map(|task| task.title.clone())
+            .unwrap_or_else(|| format!("Retry integration for queue entry {}", entry.id));
+        let acceptance = task.map(|task| task.acceptance.join("; "));
+        let control = Arc::new(RunControl::new_operation());
+        let budget = SessionBudget::new(
+            session.token_budget,
+            session.tokens_in + session.tokens_out,
+            AgentCaps {
+                managers: config.max_managers,
+                workers: config.max_workers,
+                labour: config.max_labour,
+            },
+        )
+        .with_cost(session.cost_budget_usd, session.cost_spent_usd)
+        .with_time(session.time_budget_secs);
+        let manager_spec = AgentSpec {
+            id: agent
+                .parent_id
+                .clone()
+                .unwrap_or_else(|| "integrator".to_string()),
+            role: AgentRole::Manager,
+            name: "Integrator".to_string(),
+            depth: 1,
+            parent_name: None,
+            title: Some("Integration".to_string()),
+            task_id: None,
+            department: None,
+            profile: AgentProfile::Generic,
+            allow_delegation: false,
+            auto_approve: true,
+            worktree: session_worktree.clone(),
+            branch: session_branch.clone(),
+            session_worktree: session_worktree.clone(),
+            session_branch: session_branch.clone(),
+            write_scope: Vec::new(),
+            base_commit: base_commit.clone(),
+        };
+        let worker_spec = AgentSpec {
+            id: agent.id.clone(),
+            role: AgentRole::Worker,
+            name: agent.name.clone(),
+            depth: 2,
+            parent_name: Some("Integrator".to_string()),
+            title: agent.title.clone(),
+            task_id: entry.task_id.clone(),
+            department: None,
+            profile,
+            allow_delegation: false,
+            auto_approve: true,
+            worktree: agent_worktree.clone(),
+            branch: entry.branch.clone(),
+            session_worktree: session_worktree.clone(),
+            session_branch: session_branch.clone(),
+            write_scope: Vec::new(),
+            base_commit: base_commit.clone(),
+        };
+        let verification = verify_worker(
+            &self.engine,
+            &config,
+            &session,
+            &project,
+            &control,
+            &budget,
+            &manager_spec,
+            &worker_spec,
+            &commit,
+            &objective,
+            "Rebased onto the current session branch after a previous integration attempt.",
+            acceptance.as_deref(),
+            true,
+        )
+        .await?;
+        let verifier_summary = match verification {
+            VerificationOutcome::Approved(verdict) => verdict.summary,
+            VerificationOutcome::Rejected(verdict) => {
+                let detail = truncate(&format!("retry rejected by Verifier: {}", verdict.summary));
+                self.engine
+                    .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+            VerificationOutcome::Cancelled => {
+                let detail = "retry verification cancelled".to_string();
+                self.engine
+                    .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+            VerificationOutcome::BudgetExceeded(stop) => {
+                let detail = truncate(&format!("retry verification stopped: {}", stop.summary()));
+                self.engine
+                    .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+            VerificationOutcome::Error(error) => {
+                let detail = truncate(&format!("retry verification failed: {error}"));
+                self.engine
+                    .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+        };
+        let Some(entry) = self
+            .engine
+            .retry_merge_queue_entry(
+                &entry.id,
+                &commit,
+                &base_commit,
+                Some(format!(
+                    "rebased onto the current session branch; verified: {verifier_summary}"
+                )),
+            )
+            .await?
+        else {
+            return Err(anyhow!("merge queue entry can no longer be retried"));
+        };
+
         let spec = AgentSpec {
             id: agent.id.clone(),
             role: AgentRole::Worker,
@@ -2672,6 +2888,9 @@ impl AgentService {
                 "imported sessions are read-only archives; create a new session to continue"
             );
         }
+        if session.status == "landed" {
+            anyhow::bail!("landed sessions are final; create a new session or fork to continue");
+        }
 
         let control = Arc::new(RunControl::new());
         {
@@ -3051,7 +3270,14 @@ impl AgentService {
         let integration = match check {
             Ok(()) => {
                 if let Some(command) = integration_command {
-                    run_integration_command(source_worktree.clone(), command).await
+                    run_integration_command(
+                        &self.engine,
+                        project,
+                        source,
+                        source_worktree.clone(),
+                        command.clone(),
+                    )
+                    .await
                 } else {
                     Ok("diff check passed".to_string())
                 }
@@ -4010,6 +4236,14 @@ fn estimate_text_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(2).max(1)
 }
 
+fn estimate_output_tokens(text: &str, tool_calls: &[ToolCall]) -> u64 {
+    estimate_text_tokens(text).saturating_add(
+        serde_json::to_string(tool_calls)
+            .map(|calls| estimate_text_tokens(&calls))
+            .unwrap_or(0),
+    )
+}
+
 /// Context-window estimates should be closer to the tokenizer than the
 /// conservative budget reservation above. English/code averages ~4 ASCII
 /// characters per token; CJK and other non-ASCII text is roughly 1.5 tokens
@@ -4203,38 +4437,40 @@ async fn commit_worker(spec: &AgentSpec, name: &str) -> Result<Option<String>> {
     .await?
 }
 
-async fn run_integration_command(worktree: PathBuf, command: String) -> Result<String> {
-    let output = timeout(
-        Duration::from_secs(300),
-        tokio::process::Command::new("sh")
-            .arg("-lc")
-            .arg(&command)
-            .current_dir(&worktree)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow!("integration command timed out after 300s"))??;
-
-    let mut text = String::new();
-    if !output.stdout.is_empty() {
-        text.push_str(&String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-    }
+async fn run_integration_command(
+    engine: &Engine,
+    project: &Project,
+    session: &Session,
+    worktree: PathBuf,
+    command: String,
+) -> Result<String> {
+    let policy = engine.get_shell_policy(&project.id).await?;
+    let mut secret_roots = shell_secret_roots(engine.store().data_dir());
+    secret_roots.extend(policy.read_deny.iter().map(PathBuf::from));
+    let context = crate::tools::ToolContext {
+        root: worktree,
+        project_root: PathBuf::from(&project.root),
+        sandbox_root: engine
+            .store()
+            .data_dir()
+            .join("sandbox")
+            .join(&session.id)
+            .join("integration"),
+        secret_roots,
+        network_allowed: policy.network != "deny",
+        home: env::var_os("HOME").map(PathBuf::from).unwrap_or_default(),
+        restrict_home: policy.restrict_home,
+        read_jail: policy.read_jail,
+        git_branch: session.branch.clone(),
+    };
+    let (exit, text) =
+        crate::tools::run_sandboxed_login_shell(&context, &command, Duration::from_secs(300))
+            .await?;
     let text = truncate(&text);
-    if output.status.success() {
+    if exit == 0 {
         Ok(text)
     } else {
-        Err(anyhow!(
-            "integration command exited with {}:\n{}",
-            output.status.code().unwrap_or(-1),
-            text
-        ))
+        Err(anyhow!("integration command exited with {exit}:\n{text}"))
     }
 }
 
@@ -4273,6 +4509,7 @@ async fn process_merge_entry(
     entry: &MergeQueueEntry,
     integration_command: Option<&str>,
 ) -> Result<String> {
+    let (_, project) = load_session_project(engine.store().clone(), &session.id).await?;
     engine
         .update_merge_queue_entry(&entry.id, "merging", None)
         .await?;
@@ -4292,45 +4529,65 @@ async fn process_merge_entry(
     .await?;
 
     let merge_worktree = spec.session_worktree.clone();
-    let branch = entry.branch.clone();
+    let merge_commit = entry.commit.clone();
+    let expected_base = entry.base_commit.clone();
     let message = format!("merge {}", spec.name);
-    let merge_result = tokio::task::spawn_blocking(move || {
-        worktree::merge_branch(&merge_worktree, &branch, &message)
+    let git_lock = engine.git_mutex();
+    let merge_result = tokio::task::spawn_blocking(move || -> Result<String> {
+        let _guard = git_lock.lock().map_err(|_| anyhow!("git mutex poisoned"))?;
+        if !worktree::is_clean(&merge_worktree)? {
+            return Err(anyhow!(
+                "session worktree has uncommitted tracked changes; refusing to integrate"
+            ));
+        }
+        let actual_base = worktree::head_commit(&merge_worktree)?;
+        if actual_base != expected_base {
+            tracing::warn!(
+                expected = %expected_base,
+                actual = %actual_base,
+                "merge queue base moved; integrating against current session HEAD"
+            );
+        }
+        worktree::merge_commit(&merge_worktree, &merge_commit, &message)?;
+        Ok(actual_base)
     })
     .await?;
-    if let Err(error) = merge_result {
-        let message = format!("{error:#}");
-        let conflict = message.to_lowercase().contains("conflict")
-            || message.contains("Automatic merge failed");
-        let status = if conflict { "conflict" } else { "failed" };
-        let detail = truncate(&if conflict {
-            format!("merge conflict: {message}")
-        } else {
-            format!("merge failed: {message}")
-        });
-        engine
-            .update_merge_queue_entry(&entry.id, status, Some(detail.clone()))
+    let actual_base = match merge_result {
+        Ok(base) => base,
+        Err(error) => {
+            let message = format!("{error:#}");
+            let conflict = message.to_lowercase().contains("conflict")
+                || message.contains("Automatic merge failed");
+            let status = if conflict { "conflict" } else { "failed" };
+            let detail = truncate(&if conflict {
+                format!("merge conflict: {message}")
+            } else {
+                format!("merge failed: {message}")
+            });
+            engine
+                .update_merge_queue_entry(&entry.id, status, Some(detail.clone()))
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "integrator.finished",
+                serde_json::json!({
+                    "entry_id": entry.id,
+                    "status": status,
+                    "detail": detail,
+                }),
+            )
             .await?;
-        emit(
-            engine,
-            &session.id,
-            spec,
-            "integrator.finished",
-            serde_json::json!({
-                "entry_id": entry.id,
-                "status": status,
-                "detail": detail,
-            }),
-        )
-        .await?;
-        return Err(anyhow!(detail));
-    }
+            return Err(anyhow!(detail));
+        }
+    };
 
     engine
         .update_merge_queue_entry(&entry.id, "checking", None)
         .await?;
     let check_worktree = spec.session_worktree.clone();
-    let check_base = entry.base_commit.clone();
+    let check_base = actual_base.clone();
     let check_result = tokio::task::spawn_blocking(move || {
         worktree::check_merged_diff(&check_worktree, &check_base)
     })
@@ -4338,7 +4595,14 @@ async fn process_merge_entry(
     let check_result = match check_result {
         Ok(()) => {
             if let Some(command) = integration_command {
-                run_integration_command(spec.session_worktree.clone(), command.to_string()).await
+                run_integration_command(
+                    engine,
+                    &project,
+                    session,
+                    spec.session_worktree.clone(),
+                    command.to_string(),
+                )
+                .await
             } else {
                 Ok("diff check passed".to_string())
             }
@@ -4351,7 +4615,7 @@ async fn process_merge_entry(
         Err(error) => {
             let detail = format!("integration check failed: {error}");
             let reset_worktree = spec.session_worktree.clone();
-            let reset_base = entry.base_commit.clone();
+            let reset_base = actual_base.clone();
             let reset = tokio::task::spawn_blocking(move || {
                 worktree::reset_hard(&reset_worktree, &reset_base)
             })
@@ -4550,6 +4814,43 @@ async fn verify_worker(
     match result {
         Ok(LoopOutcome::Verdict(verdict)) => {
             let verify_root = verifier_spec.worktree.clone();
+            let expected_commit = commit.to_string();
+            let head_root = verify_root.clone();
+            let head =
+                tokio::task::spawn_blocking(move || worktree::head_commit(&head_root)).await??;
+            if head != expected_commit {
+                let reset_root = verify_root.clone();
+                let reset_commit = expected_commit.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    worktree::reset_hard(&reset_root, &reset_commit)
+                })
+                .await?;
+                let summary = format!(
+                    "Verifier changed HEAD from {} to {}",
+                    truncate_to(&expected_commit, 12),
+                    truncate_to(&head, 12)
+                );
+                engine.update_agent_status(&verifier.id, "failed").await?;
+                emit(
+                    engine,
+                    &session.id,
+                    &verifier_spec,
+                    "agent.finished",
+                    serde_json::json!({
+                        "status": "failed",
+                        "approved": false,
+                        "summary": summary,
+                        "verified_worker": worker_spec.name,
+                        "worktree": verifier_spec.worktree,
+                        "branch": verifier_spec.branch,
+                    }),
+                )
+                .await?;
+                return Ok(VerificationOutcome::Rejected(VerifierVerdict {
+                    approved: false,
+                    summary,
+                }));
+            }
             let changed =
                 tokio::task::spawn_blocking(move || worktree::tracked_changes(&verify_root))
                     .await??;
@@ -4698,6 +4999,7 @@ struct AcpWorkerHost {
     acp_name: String,
     auto_approve: bool,
     approval_mode: ApprovalMode,
+    approval_timeout_secs: u64,
     cancel: watch::Receiver<bool>,
     text: Mutex<String>,
     started_tools: Mutex<HashSet<String>>,
@@ -4935,7 +5237,13 @@ impl acp::AcpHost for AcpWorkerHost {
         let Ok((approval, receiver)) = approval else {
             return acp::AcpPermissionDecision::Deny;
         };
-        match wait_for_approval_with(self.cancel.clone(), receiver).await {
+        match wait_for_approval_with(
+            self.cancel.clone(),
+            receiver,
+            Duration::from_secs(self.approval_timeout_secs),
+        )
+        .await
+        {
             ApprovalOutcome::Approved => acp::AcpPermissionDecision::Approve,
             ApprovalOutcome::Denied => acp::AcpPermissionDecision::Deny,
             ApprovalOutcome::TimedOut => {
@@ -5220,6 +5528,7 @@ Additional instructions:
             .unwrap_or_default(),
         restrict_home: shell_policy.restrict_home,
         read_jail: shell_policy.read_jail,
+        git_branch: Some(child_spec.branch.clone()),
         mcp_servers,
         timeout: Duration::from_secs(
             timeout
@@ -5234,6 +5543,7 @@ Additional instructions:
         acp_name: acp_agent.name.clone(),
         auto_approve: acp_agent.auto_approve,
         approval_mode: config.approval_mode,
+        approval_timeout_secs: config.approval_timeout_secs,
         cancel: control.subscribe(),
         text: Mutex::new(String::new()),
         started_tools: Mutex::new(HashSet::new()),
@@ -5636,10 +5946,27 @@ async fn finish_worker(
 pub(crate) fn shell_secret_roots(data_dir: &std::path::Path) -> Vec<PathBuf> {
     let mut roots = vec![
         data_dir.join("verlinpark.db"),
+        data_dir.join("verlinpark.db-wal"),
+        data_dir.join("verlinpark.db-shm"),
+        data_dir.join("verlinpark.db-journal"),
         data_dir.join("run"),
         data_dir.join("sessions"),
         data_dir.join("logs"),
+        data_dir.join("artifacts"),
+        data_dir.join("projects.jsonl"),
+        data_dir.join("projects.jsonl.tmp"),
     ];
+    // Rebuild backups use a timestamped suffix; deny every sidecar/backup
+    // rather than only the live database file.
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("verlinpark.db.pre-rebuild-") {
+                roots.push(entry.path());
+            }
+        }
+    }
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         for relative in [
@@ -6025,12 +6352,30 @@ async fn consume_stream(
     let mut attempt = 0;
     'streams: loop {
         attempt += 1;
-        let mut stream = match provider.stream_chat(request.clone()).await {
-            Ok(stream) => stream,
-            Err(error) => {
+        let mut setup_cancel = control.subscribe();
+        let setup = tokio::select! {
+            changed = setup_cancel.changed() => {
+                if changed.is_err() || *setup_cancel.borrow() {
+                    turn.cancelled = true;
+                    break 'streams;
+                }
+                continue;
+            }
+            result = tokio::time::timeout(idle_timeout, provider.stream_chat(request.clone())) => result,
+        };
+        let mut stream = match setup {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
                 // The provider's own send path already retries transient
                 // startup failures; do not multiply those attempts here.
                 turn.error = Some(anyhow!(error).context("starting provider stream"));
+                break;
+            }
+            Err(_) => {
+                turn.error = Some(anyhow!(
+                    "provider did not start a stream within {}s",
+                    idle_timeout.as_secs()
+                ));
                 break;
             }
         };
@@ -6606,25 +6951,24 @@ async fn run_loop(
         } else {
             None
         };
-    let _scope_guard =
-        if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
-            match config
-                .scope_locks
-                .acquire(
-                    &project.id,
-                    &session.id,
-                    &spec.id,
-                    &spec.write_scope,
-                    control,
-                )
-                .await?
-            {
-                Some(guard) => Some(guard),
-                None => return Ok(LoopOutcome::Cancelled),
-            }
-        } else {
-            None
-        };
+    let _scope_guard = if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) {
+        match config
+            .scope_locks
+            .acquire(
+                &project.id,
+                &session.id,
+                &spec.id,
+                &spec.write_scope,
+                control,
+            )
+            .await?
+        {
+            Some(guard) => Some(guard),
+            None => return Ok(LoopOutcome::Cancelled),
+        }
+    } else {
+        None
+    };
     let shell_policy = engine.get_shell_policy(&project.id).await?;
     let mut secret_roots = shell_secret_roots(engine.store().data_dir());
     secret_roots.extend(shell_policy.read_deny.iter().map(PathBuf::from));
@@ -6644,6 +6988,7 @@ async fn run_loop(
             .unwrap_or_default(),
         restrict_home: shell_policy.restrict_home,
         read_jail: shell_policy.read_jail,
+        git_branch: Some(spec.branch.clone()),
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
     let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;
@@ -6848,6 +7193,15 @@ async fn run_loop(
             };
             token_reservation = Some(reservation);
         }
+        let mut cost_reservation =
+            match budget.reserve_cost(input_estimate, output_budget, input_price, output_price) {
+                Ok(reservation) => reservation,
+                Err(()) => {
+                    return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session_cost(
+                        budget,
+                    )));
+                }
+            };
         if output_budget < configured_output {
             request.max_tokens = Some(output_budget.min(u32::MAX as u64) as u32);
         }
@@ -6892,24 +7246,23 @@ async fn run_loop(
             }
         }
         let has_output = !stream_turn.text.is_empty() || !stream_turn.tool_calls.is_empty();
-        let (input_tokens, output_tokens, estimated, record_usage) = if stream_turn.usage != (0, 0)
-        {
-            (stream_turn.usage.0, stream_turn.usage.1, false, true)
-        } else if has_output {
-            // Some local endpoints omit usage. Persist a conservative estimate
-            // so the budget still survives across turns and daemon restarts;
-            // the event is marked `estimated` so it is not mistaken for
-            // provider-reported usage.
-            let input = estimate_request_tokens(&request);
-            let output = estimate_text_tokens(&stream_turn.text).saturating_add(
-                serde_json::to_string(&stream_turn.tool_calls)
-                    .map(|calls| estimate_text_tokens(&calls))
-                    .unwrap_or(0),
-            );
-            (input, output, true, true)
+        let reported = stream_turn.usage;
+        let input_tokens = if reported.0 > 0 {
+            reported.0
+        } else if has_output || reported.1 > 0 {
+            estimate_request_tokens(&request)
         } else {
-            (0, 0, true, false)
+            0
         };
+        let output_tokens = if reported.1 > 0 {
+            reported.1
+        } else if has_output {
+            estimate_output_tokens(&stream_turn.text, &stream_turn.tool_calls)
+        } else {
+            0
+        };
+        let estimated = reported.0 == 0 || reported.1 == 0;
+        let record_usage = reported != (0, 0) || has_output;
         let mut budget_exceeded = false;
         if record_usage {
             let cost = usage_cost(input_tokens, output_tokens, input_price, output_price);
@@ -6929,10 +7282,15 @@ async fn run_loop(
                 )
                 .await?;
             let actual_usage = input_tokens.saturating_add(output_tokens);
+            let cost_exceeded = if let Some(reservation) = cost_reservation.take() {
+                reservation.settle(cost)
+            } else {
+                budget.add_cost(cost)
+            };
             budget_exceeded = token_reservation
                 .take()
                 .is_some_and(|reservation| reservation.settle(actual_usage))
-                || budget.add_cost(cost);
+                || cost_exceeded;
         }
         if stream_turn.cancelled {
             return Ok(LoopOutcome::Cancelled);
@@ -7094,7 +7452,13 @@ async fn run_loop(
                 .tools
                 .get(&call.name)
                 .filter(|_| spec.role.allows_tool(spec.profile, &call.name));
-            let assessment = assess_tool_call(&call.name, &input, &spec.worktree);
+            let mut assessment = assess_tool_call(&call.name, &input, &spec.worktree);
+            if dynamic_mcp_tool.is_some() {
+                assessment = crate::permissions::PermissionAssessment::new(
+                    RiskLevel::HostState,
+                    "dynamic MCP tool execution can change host or remote state",
+                );
+            }
             let decision = decide(config.approval_mode, &assessment, spec.auto_approve);
             let mut denied_reason: Option<String> = None;
             match decision {
@@ -7129,7 +7493,13 @@ async fn run_loop(
                             Some(&reason),
                         )
                         .await?;
-                    match wait_for_approval(receiver, control).await {
+                    match wait_for_approval(
+                        receiver,
+                        control,
+                        Duration::from_secs(config.approval_timeout_secs),
+                    )
+                    .await
+                    {
                         ApprovalOutcome::Approved => {}
                         ApprovalOutcome::Denied => {
                             denied_reason = Some("The user denied this tool call.".to_string());
@@ -7196,7 +7566,10 @@ async fn run_loop(
                                 return Ok(LoopOutcome::Cancelled);
                             }
                             RoundtableResult::BudgetExceeded(stop) => {
-                                return Ok(LoopOutcome::BudgetExceeded(stop));
+                                if stop.is_abortive() {
+                                    return Ok(LoopOutcome::BudgetExceeded(stop));
+                                }
+                                ToolOutput::error(stop.summary())
                             }
                         }
                     }
@@ -7310,7 +7683,7 @@ async fn run_loop(
                     }),
                 )
                 .await?;
-                match run_mcp_tool(engine, input.clone()).await {
+                match run_mcp_tool(engine, spec.role, input.clone()).await {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("MCP error: {error}")),
                 }
@@ -7623,11 +7996,16 @@ async fn run_loop(
                                             )
                                             .await?
                                             {
-                                                WorkerFinish::Done { report, .. } => {
-                                                    ToolOutput::ok(format!(
+                                                WorkerFinish::Done { report, success } => {
+                                                    let text = format!(
                                                         "Worker {} finished:\n{}",
                                                         child_name, report
-                                                    ))
+                                                    );
+                                                    if success {
+                                                        ToolOutput::ok(text)
+                                                    } else {
+                                                        ToolOutput::error(text)
+                                                    }
                                                 }
                                                 WorkerFinish::Cancelled => {
                                                     return Ok(LoopOutcome::Cancelled);
@@ -7941,11 +8319,25 @@ fn format_mcp_tool_result(result: &serde_json::Value) -> String {
     truncate_to(&text, 16_000)
 }
 
-async fn run_mcp_tool(engine: &Engine, input: serde_json::Value) -> Result<ToolOutput> {
+async fn run_mcp_tool(
+    engine: &Engine,
+    role: AgentRole,
+    input: serde_json::Value,
+) -> Result<ToolOutput> {
     let action = input
         .get("action")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow!("action is required"))?;
+    if action == "call"
+        && !matches!(
+            role,
+            AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+        )
+    {
+        return Ok(ToolOutput::error(
+            "this role may inspect MCP servers but cannot execute MCP tools",
+        ));
+    }
     let servers = engine.list_mcp_servers().await?.servers;
     let server = input
         .get("server")
@@ -8577,15 +8969,33 @@ fn tool_schemas(
             }),
         });
     }
+    let mcp_actions = if matches!(role, AgentRole::Manager | AgentRole::Verifier) {
+        serde_json::json!([
+            "list",
+            "resources",
+            "read_resource",
+            "prompts",
+            "get_prompt"
+        ])
+    } else {
+        serde_json::json!([
+            "list",
+            "call",
+            "resources",
+            "read_resource",
+            "prompts",
+            "get_prompt"
+        ])
+    };
     tools.push(ToolSchema {
         name: "mcp".to_string(),
-        description: "Inspect configured MCP servers and use their tools, resources, or prompts. Tool calls require approval unless the agent is auto-approved.".to_string(),
+        description: "Inspect configured MCP servers and use their tools, resources, or prompts. Tool executions require approval; Managers and Verifiers can only inspect.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "call", "resources", "read_resource", "prompts", "get_prompt"]
+                    "enum": mcp_actions
                 },
                 "server": {"type": "string", "description": "MCP server id or name"},
                 "tool": {"type": "string"},
@@ -9211,6 +9621,7 @@ async fn run_parallel_workers(
     }
 
     let mut reports = Vec::new();
+    let mut all_success = true;
     for (index, result) in results.into_iter().enumerate() {
         let (child_spec, objective, _) = &prepared[index];
         match result {
@@ -9226,7 +9637,8 @@ async fn run_parallel_workers(
                 )
                 .await?
                 {
-                    WorkerFinish::Done { report, .. } => {
+                    WorkerFinish::Done { report, success } => {
+                        all_success &= success;
                         reports.push(format!("{}: {}", child_spec.name, report));
                     }
                     WorkerFinish::Cancelled => {
@@ -9267,13 +9679,17 @@ async fn run_parallel_workers(
                     }
                 }
             }
-            Ok(LoopOutcome::Verdict(_)) | Ok(LoopOutcome::Cancelled) => {}
+            Ok(LoopOutcome::Verdict(_)) | Ok(LoopOutcome::Cancelled) => {
+                all_success = false;
+            }
             Ok(LoopOutcome::BudgetExceeded(stop)) => {
                 if !stop.is_abortive() {
+                    all_success = false;
                     reports.push(format!("{}: {}", child_spec.name, stop.summary()));
                 }
             }
             Err(error) => {
+                all_success = false;
                 engine.update_agent_status(&child_spec.id, "failed").await?;
                 emit(
                     engine,
@@ -9290,7 +9706,12 @@ async fn run_parallel_workers(
             }
         }
     }
-    Ok(ParallelResult::Output(ToolOutput::ok(reports.join("\n\n"))))
+    let text = reports.join("\n\n");
+    Ok(ParallelResult::Output(if all_success {
+        ToolOutput::ok(text)
+    } else {
+        ToolOutput::error(text)
+    }))
 }
 
 fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
@@ -9352,9 +9773,7 @@ fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
     let mut ids = std::collections::HashSet::new();
     for task in &plan.tasks {
         let id = task.id.trim();
-        if id.is_empty() || id.len() > 40 {
-            return Err(anyhow!("task id must be 1-40 chars"));
-        }
+        worktree::validate_task_id(id)?;
         if !ids.insert(id.to_string()) {
             return Err(anyhow!("duplicate task id: {id}"));
         }
@@ -10115,10 +10534,13 @@ async fn execute_team_plan(
         }
         let batch = select_plan_batch(ready, capacity);
         let task_ids = batch.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
-        let claimed = engine
+        let (claimed, claim_events) = engine
             .scheduler()
             .claim(&session.id, plan_seq, &task_ids)
             .await?;
+        for event in claim_events {
+            engine.broadcast_event(event);
+        }
         if claimed.is_empty() {
             break;
         }
@@ -10215,19 +10637,6 @@ async fn execute_team_plan(
                     "objective": task.title,
                     "plan_task_id": task.id,
                     "department": task.department,
-                }),
-            )
-            .await?;
-            emit(
-                engine,
-                &session.id,
-                &worker_spec,
-                "plan_task.started",
-                serde_json::json!({
-                    "task_id": task.id,
-                    "task_status": "running",
-                    "department": task.department,
-                    "title": task.title,
                 }),
             )
             .await?;
@@ -10883,20 +11292,22 @@ async fn wait_for_question(
 async fn wait_for_approval(
     receiver: oneshot::Receiver<bool>,
     control: &RunControl,
+    timeout_duration: Duration,
 ) -> ApprovalOutcome {
-    wait_for_approval_with(control.subscribe(), receiver).await
+    wait_for_approval_with(control.subscribe(), receiver, timeout_duration).await
 }
 
 async fn wait_for_approval_with(
     mut cancel_rx: watch::Receiver<bool>,
     receiver: oneshot::Receiver<bool>,
+    timeout_duration: Duration,
 ) -> ApprovalOutcome {
     if *cancel_rx.borrow() {
         return ApprovalOutcome::Cancelled;
     }
     tokio::select! {
         _ = cancel_rx.changed() => ApprovalOutcome::Cancelled,
-        result = timeout(Duration::from_secs(600), receiver) => match result {
+        result = timeout(timeout_duration, receiver) => match result {
             Ok(Ok(true)) => ApprovalOutcome::Approved,
             Ok(Ok(false)) | Ok(Err(_)) => ApprovalOutcome::Denied,
             Err(_) => ApprovalOutcome::TimedOut,

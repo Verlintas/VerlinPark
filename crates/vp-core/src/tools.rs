@@ -10,11 +10,21 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use vp_providers::ToolSchema;
 
 const MAX_TOOL_OUTPUT: usize = 40_000;
+/// Files above this size are not loaded into memory by read_file. The agent can
+/// use shell tools (head/sed/grep) for targeted reads instead.
+const MAX_READ_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// grep skips very large files rather than allocating their full contents.
+const MAX_GREP_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// Per-stream cap for shell output. The process is not killed when it exceeds
+/// the cap; the remainder is drained and discarded so a chatty build cannot
+/// block on a full pipe or exhaust daemon memory.
+const MAX_SHELL_STREAM_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -35,6 +45,9 @@ pub struct ToolContext {
     /// Deny reads under the home parent (normally `/Users`) and `/Volumes`
     /// outside the worktree/scratch/Git metadata/toolchain allowlist.
     pub read_jail: bool,
+    /// The branch this agent is allowed to advance through Git metadata writes.
+    /// `None` grants no common-ref writes.
+    pub git_branch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,9 +137,18 @@ const SHELL_SANDBOX_PROFILE: &str = r#"(version 1)
   (subpath (param "WORKTREE"))
   (subpath (param "SCRATCH"))
   (subpath (param "GIT_DIR"))
-  (subpath (param "COMMON_DIR"))
+  (subpath (param "COMMON_OBJECTS"))
+  (subpath (param "COMMON_LOGS"))
+  (literal (param "BRANCH_REF"))
+  (literal (param "BRANCH_REF_LOCK"))
   (literal "/dev/null")
 )))
+(deny file-write* (literal (param "WORKTREE_GITFILE")))
+(deny file-write* (literal (param "GIT_HEAD")))
+(deny file-write* (literal (param "GIT_COMMONDIR")))
+(deny file-write* (literal (param "COMMON_PACKED_REFS")))
+(deny file-write* (subpath (param "COMMON_OBJECTS_INFO")))
+(deny file-write* (subpath (param "COMMON_OBJECTS_PACK")))
 (deny file-write* (subpath (param "COMMON_HOOKS")))
 (deny file-write* (literal (param "COMMON_CONFIG")))
 (deny file-write* (literal (param "WORKTREE_CONFIG")))
@@ -138,7 +160,7 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Variables that are safe and useful to pass into a build/test shell. Provider
 /// keys, cloud credentials, tokens, and daemon configuration are deliberately
 /// excluded; a command must set any extra project env explicitly.
-const SHELL_ENV_PASSTHROUGH: &[&str] = &[
+pub(crate) const SHELL_ENV_PASSTHROUGH: &[&str] = &[
     "PATH",
     "HOME",
     "USER",
@@ -150,7 +172,6 @@ const SHELL_ENV_PASSTHROUGH: &[&str] = &[
     "LC_CTYPE",
     "TZ",
     "CI",
-    "SSH_AUTH_SOCK",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "RUSTUP_HOME",
@@ -230,8 +251,12 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
         || ip.is_unicast_link_local()
         || ip.is_multicast()
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x2001 && segments[1] == 0)
+        || segments[0] == 0x2002
         || (segments[0] == 0x0064 && segments[1] == 0xff9b)
         || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[..6].iter().all(|segment| *segment == 0)
+            && segments[6..].iter().any(|segment| *segment != 0))
 }
 
 async fn resolve_public_address(host: &str, port: u16) -> Result<SocketAddr> {
@@ -388,6 +413,14 @@ impl AgentTool for ReadFile {
         let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
         let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(400) as usize;
         let path = safe_existing_path(&context.root, path)?;
+        let metadata = tokio::fs::metadata(&path).await?;
+        if metadata.len() > MAX_READ_FILE_BYTES {
+            return Ok(ToolOutput::error(format!(
+                "file is {} bytes; read_file is limited to {} bytes. Use shell head/sed for a targeted read.",
+                metadata.len(),
+                MAX_READ_FILE_BYTES
+            )));
+        }
         let content = tokio::fs::read_to_string(&path).await?;
         let lines: Vec<&str> = content.lines().skip(offset).take(limit).collect();
         let mut out = format!("{} ({} lines)\n", path.display(), content.lines().count());
@@ -488,6 +521,12 @@ impl AgentTool for Grep {
             if let Some(globset) = &globset
                 && !globset.is_match(path)
             {
+                continue;
+            }
+            let Ok(metadata) = std::fs::metadata(path) else {
+                continue;
+            };
+            if metadata.len() > MAX_GREP_FILE_BYTES {
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(path) else {
@@ -646,7 +685,7 @@ pub(crate) async fn sandboxed_command(context: &ToolContext) -> Result<Command> 
         .project_root
         .canonicalize()
         .unwrap_or_else(|_| root.clone());
-    let (git_dir, common_dir) = git_metadata_dirs(&root, &project_root);
+    let (git_dir, common_dir) = git_metadata_dirs(&root, &project_root)?;
     let mut profile = String::from(SHELL_SANDBOX_PROFILE);
     if !context.network_allowed {
         profile.push_str("(deny network*)\n");
@@ -755,30 +794,37 @@ pub(crate) async fn sandboxed_command(context: &ToolContext) -> Result<Command> 
             process.env(key, value);
         }
     }
-    process
-        .arg("-D")
-        .arg(format!("WORKTREE={}", root.display()))
-        .arg("-D")
-        .arg(format!("SCRATCH={}", scratch.display()))
-        .arg("-D")
-        .arg(format!("GIT_DIR={}", git_dir.display()))
-        .arg("-D")
-        .arg(format!("COMMON_DIR={}", common_dir.display()))
-        .arg("-D")
-        .arg(format!(
-            "COMMON_HOOKS={}",
-            common_dir.join("hooks").display()
-        ))
-        .arg("-D")
-        .arg(format!(
-            "COMMON_CONFIG={}",
-            common_dir.join("config").display()
-        ))
-        .arg("-D")
-        .arg(format!(
-            "WORKTREE_CONFIG={}",
-            git_dir.join("config.worktree").display()
-        ));
+    let branch = context
+        .git_branch
+        .as_deref()
+        .filter(|branch| !branch.trim().is_empty())
+        .unwrap_or("__no_branch__");
+    let branch_ref = common_dir.join("refs").join("heads").join(branch);
+    let branch_ref_lock = PathBuf::from(format!("{}.lock", branch_ref.display()));
+    let common_objects = common_dir.join("objects");
+    let worktree_gitfile = root.join(".git");
+    let params = [
+        ("WORKTREE", root.clone()),
+        ("SCRATCH", scratch.clone()),
+        ("GIT_DIR", git_dir.clone()),
+        ("COMMON_DIR", common_dir.clone()),
+        ("COMMON_OBJECTS", common_objects.clone()),
+        ("COMMON_OBJECTS_INFO", common_objects.join("info")),
+        ("COMMON_OBJECTS_PACK", common_objects.join("pack")),
+        ("COMMON_LOGS", common_dir.join("logs")),
+        ("COMMON_HOOKS", common_dir.join("hooks")),
+        ("COMMON_CONFIG", common_dir.join("config")),
+        ("COMMON_PACKED_REFS", common_dir.join("packed-refs")),
+        ("BRANCH_REF", branch_ref.clone()),
+        ("BRANCH_REF_LOCK", branch_ref_lock),
+        ("WORKTREE_GITFILE", worktree_gitfile),
+        ("GIT_HEAD", git_dir.join("HEAD")),
+        ("GIT_COMMONDIR", git_dir.join("commondir")),
+        ("WORKTREE_CONFIG", git_dir.join("config.worktree")),
+    ];
+    for (name, value) in params {
+        process.arg("-D").arg(format!("{name}={}", value.display()));
+    }
     for (index, secret) in secret_roots.iter().enumerate() {
         process
             .arg("-D")
@@ -864,14 +910,6 @@ impl AgentTool for Shell {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("command is required"))?;
-        let lower = command.to_lowercase();
-        for blocked in ["sudo ", "rm -rf /", "curl | sh", "wget | sh", "> /dev/"] {
-            if lower.contains(blocked) {
-                return Ok(ToolOutput::error(format!(
-                    "blocked command pattern: {blocked}"
-                )));
-            }
-        }
         if !Path::new(SANDBOX_EXEC).is_file() {
             return Ok(ToolOutput::error(
                 "shell sandbox is unavailable on this platform; refusing to run unsandboxed shell",
@@ -882,35 +920,135 @@ impl AgentTool for Shell {
             .and_then(Value::as_u64)
             .unwrap_or(120)
             .min(900);
-        let mut process = sandboxed_command(context).await?;
-        process
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(command)
-            .stdin(Stdio::null());
-        let child = process.spawn().context("spawning sandboxed shell")?;
-        let _group = ProcessGroupGuard::new(child.id());
-        let output = timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-            .await
-            .map_err(|_| anyhow!("command timed out after {timeout_secs}s"))??;
-
-        let mut text = String::new();
-        if !output.stdout.is_empty() {
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-        }
-        if !output.stderr.is_empty() {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
-        let exit = output.status.code().unwrap_or(-1);
+        let (exit, text) =
+            run_sandboxed_shell(context, command, Duration::from_secs(timeout_secs)).await?;
         let result = format!("exit {exit}\n{}", truncate(text));
-        if output.status.success() {
+        if exit == 0 {
             Ok(ToolOutput::ok(result))
         } else {
             Ok(ToolOutput::error(result))
         }
+    }
+}
+
+/// Run a non-interactive shell under the write sandbox and return its exit
+/// code plus bounded combined output. Used by the shell tool and by the
+/// deterministic Integrator command so both share the same Seatbelt policy,
+/// environment allowlist, process-group cleanup, and output caps.
+pub(crate) async fn run_sandboxed_shell(
+    context: &ToolContext,
+    command: &str,
+    timeout_duration: Duration,
+) -> Result<(i32, String)> {
+    run_sandboxed_shell_with(context, "/bin/sh", &["-c"], command, timeout_duration).await
+}
+
+/// Login-shell variant used by the Integrator command for compatibility with
+/// project setup scripts. It still runs under the same Seatbelt profile and
+/// environment allowlist.
+pub(crate) async fn run_sandboxed_login_shell(
+    context: &ToolContext,
+    command: &str,
+    timeout_duration: Duration,
+) -> Result<(i32, String)> {
+    run_sandboxed_shell_with(context, "/bin/sh", &["-lc"], command, timeout_duration).await
+}
+
+async fn run_sandboxed_shell_with(
+    context: &ToolContext,
+    program: &str,
+    args: &[&str],
+    command: &str,
+    timeout_duration: Duration,
+) -> Result<(i32, String)> {
+    let mut process = sandboxed_command(context).await?;
+    process
+        .arg(program)
+        .args(args)
+        .arg(command)
+        .stdin(Stdio::null());
+    let mut child = process.spawn().context("spawning sandboxed shell")?;
+    let _group = ProcessGroupGuard::new(child.id());
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("shell stdout pipe is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("shell stderr pipe is unavailable"))?;
+    let stdout_task = tokio::spawn(read_capped_stream(stdout));
+    let stderr_task = tokio::spawn(read_capped_stream(stderr));
+    let status = match timeout(timeout_duration, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            let _ = child.kill().await;
+            // Do not await the readers: a background process may still hold
+            // the pipe open, and waiting would delay process-group cleanup.
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(anyhow!(
+                "command timed out after {}s",
+                timeout_duration.as_secs()
+            ));
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .map_err(|error| anyhow!("shell stdout reader failed: {error}"))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|error| anyhow!("shell stderr reader failed: {error}"))?;
+    let mut text = stdout.text;
+    if !stderr.text.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&stderr.text);
+    }
+    let mut notes = Vec::new();
+    if stdout.truncated {
+        notes.push("stdout capped at 1 MiB");
+    }
+    if stderr.truncated {
+        notes.push("stderr capped at 1 MiB");
+    }
+    if !notes.is_empty() {
+        text = format!("[{}]\n{}", notes.join("; "), text);
+    }
+    Ok((status.code().unwrap_or(-1), text))
+}
+
+struct CappedStream {
+    text: String,
+    truncated: bool,
+}
+
+async fn read_capped_stream<R>(mut reader: R) -> CappedStream
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = [0u8; 8192];
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let remaining = MAX_SHELL_STREAM_BYTES.saturating_sub(bytes.len());
+                if remaining > 0 {
+                    bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+                if read > remaining {
+                    truncated = true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    CappedStream {
+        text: String::from_utf8_lossy(&bytes).to_string(),
+        truncated,
     }
 }
 
@@ -942,7 +1080,25 @@ impl Drop for ProcessGroupGuard {
 /// Return the worktree-specific Git directory and the shared common directory.
 /// Linked worktrees keep only a `.git` file in the checkout; both paths are
 /// needed so normal Git writes (index, refs, objects, logs) keep working.
-fn git_metadata_dirs(root: &Path, project_root: &Path) -> (PathBuf, PathBuf) {
+fn git_metadata_dirs(root: &Path, project_root: &Path) -> Result<(PathBuf, PathBuf)> {
+    // A checked-out verification clone (or any standalone repository) owns its
+    // own `.git` directory. It must never fall back to the source project's Git
+    // metadata, otherwise a supposedly read-only shell can rewrite source refs.
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        let git_dir = dot_git
+            .canonicalize()
+            .with_context(|| format!("resolving Git directory {}", dot_git.display()))?;
+        let common_dir = resolve_common_dir(&git_dir);
+        return Ok((git_dir, common_dir));
+    }
+    if !dot_git.exists() {
+        // A probe/scratch directory that is not a repository. It gets a
+        // non-existent Git parameter so the sandbox grants no project metadata.
+        let placeholder = root.join(".git");
+        return Ok((placeholder.clone(), placeholder));
+    }
+
     let project_git = resolve_git_dir(project_root).unwrap_or_else(|| project_root.join(".git"));
     let resolved_common = resolve_common_dir(&project_git);
     let project_common = if is_git_dir(&resolved_common) {
@@ -951,19 +1107,26 @@ fn git_metadata_dirs(root: &Path, project_root: &Path) -> (PathBuf, PathBuf) {
         project_root.join(".git")
     };
     let worktrees_root = project_common.join("worktrees");
-    let is_project_root = root == project_root;
-    let git_dir = resolve_git_dir(root)
-        .filter(|path| {
-            (is_project_root && path == &project_git) || path.starts_with(&worktrees_root)
-        })
-        .unwrap_or_else(|| project_git.clone());
-    let common_dir = resolve_common_dir(&git_dir);
-    let common_dir = if common_dir == project_common || common_dir.starts_with(&project_common) {
-        common_dir
-    } else {
-        project_common
+    let Some(git_dir) = resolve_git_dir(root) else {
+        return Err(anyhow!(
+            "refusing to run shell with an invalid Git pointer in {}",
+            root.display()
+        ));
     };
-    (git_dir, common_dir)
+    if !git_dir.starts_with(&worktrees_root) {
+        return Err(anyhow!(
+            "refusing to run shell with Git metadata outside {}",
+            worktrees_root.display()
+        ));
+    }
+    let common_dir = resolve_common_dir(&git_dir);
+    if common_dir != project_common {
+        return Err(anyhow!(
+            "refusing to run shell with unexpected Git common directory {}",
+            common_dir.display()
+        ));
+    }
+    Ok((git_dir, common_dir))
 }
 
 fn is_git_dir(path: &Path) -> bool {
@@ -1040,10 +1203,12 @@ fn safe_write_path(root: &Path, relative: &str) -> Result<PathBuf> {
     if path.file_name().is_none() {
         return Err(anyhow!("file name is required"));
     }
-    if path
-        .components()
-        .any(|component| component.as_os_str() == ".git")
-    {
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".git")
+    }) {
         return Err(anyhow!(
             "refusing to write Git metadata through a file tool"
         ));
@@ -1077,7 +1242,12 @@ fn path_is_git_metadata(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root)
         .ok()
         .and_then(|relative| relative.components().next())
-        .is_some_and(|component| component.as_os_str() == ".git")
+        .is_some_and(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".git")
+        })
 }
 
 fn truncate(mut content: String) -> String {
@@ -1108,6 +1278,7 @@ mod tests {
                 home,
                 restrict_home: false,
                 read_jail: false,
+                git_branch: None,
                 secret_roots: Vec::new(),
                 network_allowed: true,
             },
@@ -1175,6 +1346,10 @@ mod tests {
             .execute(&context, json!({"path": ".git/config", "content": "x"}))
             .await;
         assert!(write.is_err());
+        let case_variant = WriteFile
+            .execute(&context, json!({"path": ".GIT/config", "content": "x"}))
+            .await;
+        assert!(case_variant.is_err());
         let edit = EditFile
             .execute(
                 &context,
@@ -1248,6 +1423,9 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "2001:db8::1",
+            "2001::1",
+            "2002:7f00:1::1",
+            "::192.168.1.1",
             "::ffff:127.0.0.1",
         ] {
             let ip = address.parse().unwrap();
@@ -1296,6 +1474,7 @@ mod tests {
             home: dir.path().join("home"),
             restrict_home: false,
             read_jail: false,
+            git_branch: None,
             secret_roots: Vec::new(),
             network_allowed: true,
         };
@@ -1347,6 +1526,7 @@ mod tests {
             home: home.clone(),
             restrict_home: true,
             read_jail: false,
+            git_branch: None,
         };
         let visible = Shell
             .execute(&context, json!({"command": "cat visible.txt"}))
@@ -1382,6 +1562,7 @@ mod tests {
             home,
             restrict_home: false,
             read_jail: true,
+            git_branch: None,
         };
         let visible = Shell
             .execute(&context, json!({"command": "cat visible.txt"}))
@@ -1417,6 +1598,7 @@ mod tests {
             home: dir.path().join("home"),
             restrict_home: false,
             read_jail: false,
+            git_branch: None,
             secret_roots: Vec::new(),
             network_allowed: false,
         };
@@ -1443,6 +1625,7 @@ mod tests {
             home: dir.path().join("home"),
             restrict_home: false,
             read_jail: false,
+            git_branch: None,
             secret_roots: Vec::new(),
             network_allowed: true,
         };
@@ -1460,6 +1643,34 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(!root.join("marker").exists());
+    }
+
+    #[tokio::test]
+    async fn shell_output_is_bounded() {
+        let (dir, context) = ctx();
+        std::fs::write(dir.path().join("large.txt"), vec![b'x'; 3_000_000]).unwrap();
+        let output = Shell
+            .execute(&context, json!({"command": "cat large.txt"}))
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("stdout capped at 1 MiB"));
+        assert!(output.content.len() < MAX_SHELL_STREAM_BYTES + 4_000);
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_oversized_files() {
+        let (dir, context) = ctx();
+        let path = dir.path().join("large.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_READ_FILE_BYTES + 1).unwrap();
+        let output = ReadFile
+            .execute(&context, json!({"path": "large.bin"}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("read_file is limited"));
     }
 
     #[cfg(target_os = "macos")]
@@ -1493,6 +1704,7 @@ mod tests {
             home: dir.path().join("home"),
             restrict_home: false,
             read_jail: false,
+            git_branch: Some("task".to_string()),
             secret_roots: Vec::new(),
             network_allowed: true,
         };
@@ -1527,6 +1739,35 @@ mod tests {
                 .unwrap();
             assert!(output.is_error, "{} was writable", target.display());
         }
+
+        let pristine_gitfile = std::fs::read_to_string(worktree.join(".git")).unwrap();
+        let output = Shell
+            .execute(&context, json!({"command": "echo hacked > .git"}))
+            .await
+            .unwrap();
+        assert!(output.is_error, "{}", output.content);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(".git")).unwrap(),
+            pristine_gitfile
+        );
+
+        let output = Shell
+            .execute(
+                &context,
+                json!({"command": "git update-ref refs/heads/main HEAD"}),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error, "{}", output.content);
+
+        let output = Shell
+            .execute(
+                &context,
+                json!({"command": "echo hacked > \"$(git rev-parse --git-dir)/HEAD\""}),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error, "{}", output.content);
     }
 
     #[cfg(target_os = "macos")]
@@ -1552,6 +1793,7 @@ mod tests {
             home: dir.path().join("home"),
             restrict_home: false,
             read_jail: false,
+            git_branch: None,
             secret_roots: Vec::new(),
             network_allowed: true,
         };
@@ -1560,9 +1802,8 @@ mod tests {
                 &context,
                 json!({"command": format!("echo pwn > {}/file", target.display())}),
             )
-            .await
-            .unwrap();
-        assert!(output.is_error, "{}", output.content);
+            .await;
+        assert!(output.is_err());
         assert!(!target.join("file").exists());
     }
 

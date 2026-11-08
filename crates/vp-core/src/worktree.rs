@@ -36,6 +36,15 @@ pub fn create(
     let base_commit = git_output(&root, &["rev-parse", "HEAD"])?;
 
     if path.join(".git").is_file() {
+        let current = git_output(&path, &["branch", "--show-current"]).unwrap_or_default();
+        if current.trim() != branch {
+            return Err(anyhow!(
+                "existing worktree {} is on branch '{}', expected '{}'",
+                path.display(),
+                current.trim(),
+                branch
+            ));
+        }
         return Ok(WorktreeInfo {
             path,
             branch,
@@ -289,6 +298,36 @@ fn git_output_with_index(root: &Path, index: &Path, args: &[&str]) -> Result<Str
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Validate a plan task ID before it becomes a worktree directory or branch
+/// suffix. Task IDs are user/model supplied, so they must be a single safe path
+/// component and must not collide with the Leader worktree or reserved names.
+pub fn validate_task_id(task_id: &str) -> Result<()> {
+    let id = task_id.trim();
+    if id.is_empty() || id.len() > 40 {
+        return Err(anyhow!("task id must be 1-40 chars"));
+    }
+    if id != task_id {
+        return Err(anyhow!(
+            "task id must not have leading or trailing whitespace"
+        ));
+    }
+    if matches!(id, "leader" | "console" | "terminal" | "sandbox" | "tasks") {
+        return Err(anyhow!("task id '{id}' is reserved"));
+    }
+    if id == "." || id == ".." || id.starts_with('.') || id.starts_with('-') {
+        return Err(anyhow!("task id '{id}' is not a safe path component"));
+    }
+    if !id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(anyhow!(
+            "task id '{id}' may only contain ASCII letters, digits, '-', '_', and '.'"
+        ));
+    }
+    Ok(())
+}
+
 /// Create a Worker worktree based on the session branch.
 pub fn create_task(
     project_root: &Path,
@@ -298,6 +337,7 @@ pub fn create_task(
     task_id: &str,
     base_branch: &str,
 ) -> Result<WorktreeInfo> {
+    validate_task_id(task_id)?;
     let root = project_root
         .canonicalize()
         .with_context(|| format!("resolving project root {}", project_root.display()))?;
@@ -386,6 +426,30 @@ pub fn commit_all(worktree: &Path, message: &str) -> Result<Option<String>> {
     run_git(worktree, &["add", "-A"])?;
     run_git(worktree, &["commit", "-m", message])?;
     Ok(Some(git_output(worktree, &["rev-parse", "HEAD"])?))
+}
+
+/// Merge an exact commit, not a mutable branch name. Callers should use this
+/// for verified commits so a branch moved after verification cannot change
+/// what the Integrator integrates.
+pub fn is_clean(worktree: &Path) -> Result<bool> {
+    Ok(tracked_changes(worktree)?.is_empty())
+}
+
+pub fn merge_commit(session_worktree: &Path, commit: &str, message: &str) -> Result<()> {
+    let commit = commit.trim();
+    if commit.len() < 7 || commit.len() > 64 || !commit.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(anyhow!("invalid commit id: {commit}"));
+    }
+    match run_git(
+        session_worktree,
+        &["merge", "--no-ff", commit, "-m", message],
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = run_git(session_worktree, &["merge", "--abort"]);
+            Err(error.context("integrating verified commit"))
+        }
+    }
 }
 
 pub fn merge_branch(session_worktree: &Path, branch: &str, message: &str) -> Result<()> {
@@ -804,6 +868,57 @@ mod tests {
             .output()
             .unwrap();
         assert_ne!(String::from_utf8_lossy(&branch.stdout).trim(), info.branch);
+    }
+
+    #[test]
+    fn validates_task_ids_as_safe_components() {
+        for valid in ["T1", "task-1", "task_2", "v1.2"] {
+            validate_task_id(valid).unwrap();
+        }
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../leader",
+            "/tmp/task",
+            "a/b",
+            "leader",
+            "console",
+            "terminal",
+            "sandbox",
+            "tasks",
+            ".hidden",
+            "-flag",
+            "has space",
+            "任务",
+        ] {
+            assert!(
+                validate_task_id(invalid).is_err(),
+                "task id {invalid:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn create_task_rejects_a_leader_worktree_collision() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let session = create(repo.path(), data.path(), "project-1", "session-1").unwrap();
+        let error = create_task(
+            repo.path(),
+            data.path(),
+            "project-1",
+            "session-1",
+            "leader",
+            &session.branch,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
+        assert_eq!(
+            std::fs::read_to_string(session.path.join("worker.txt")).ok(),
+            None
+        );
     }
 
     #[test]

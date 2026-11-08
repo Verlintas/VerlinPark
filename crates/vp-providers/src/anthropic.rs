@@ -124,11 +124,22 @@ impl Provider for AnthropicProvider {
         })
         .await?;
 
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().contains("json"))
+        {
+            return Err(ProviderError::Unsupported(
+                "provider returned a JSON response; expected a stream".into(),
+            ));
+        }
         let stream = Box::pin(response.bytes_stream().eventsource());
         let mapped = async_stream::stream! {
             let mut input_tokens = 0u32;
             let mut output_tokens = 0u32;
             let mut tool_calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
+            let mut saw_done = false;
             let mut stream = stream;
             while let Some(item) = stream.next().await {
                 match item {
@@ -190,9 +201,12 @@ impl Provider for AnthropicProvider {
                             }
                             "content_block_stop" => {
                                 if let Some(index) = value.get("index").and_then(Value::as_u64)
-                                    && let Some(call) = tool_calls.remove(&index)
+                                    && let Some(mut call) = tool_calls.remove(&index)
                                     && !call.name.is_empty()
                                 {
+                                    if call.id.is_empty() {
+                                        call.id = crate::fallback_tool_call_id(index as usize);
+                                    }
                                     yield Ok(StreamEvent::ToolCall(call));
                                 }
                             }
@@ -217,12 +231,13 @@ impl Provider for AnthropicProvider {
                                 });
                             }
                             "message_stop" => {
+                                saw_done = true;
                                 yield Ok(StreamEvent::Done);
                             }
                             "error" => {
                                 yield Err(ProviderError::Api {
                                     status: 200,
-                                    body: value.to_string(),
+                                    body: crate::redact_provider_body(&value.to_string()),
                                 });
                                 break;
                             }
@@ -230,6 +245,11 @@ impl Provider for AnthropicProvider {
                         }
                     }
                 }
+            }
+            if !saw_done {
+                yield Err(ProviderError::Stream(
+                    "provider stream ended before message_stop".into(),
+                ));
             }
         };
 

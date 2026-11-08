@@ -91,21 +91,24 @@ struct StudioView: View {
                 Spacer()
 
                 if model.mode == .project {
+                    let status = model.selectedSession?.status
+                    let active = status == "running" || status == "queued"
+                        || status == "paused" || status == "waiting_input"
                     HStack(spacing: 5) {
                         VPStatusDot(
-                            color: model.selectedSession == nil ? VPTheme.textTertiary : VPTheme.success,
-                            pulsing: model.selectedSession != nil,
+                            color: active ? VPTheme.success : VPTheme.textTertiary,
+                            pulsing: active,
                             size: 4
                         )
-                        Text(model.selectedSession == nil ? "NO SESSION" : "LIVE")
-                            .font(VPTheme.mono(7.5, weight: .semibold))
-                            .tracking(0.6)
-                            .foregroundStyle(
-                                model.selectedSession == nil
-                                    ? VPTheme.textTertiary
-                                    : VPTheme.success
-                            )
-                            .contentTransition(.opacity)
+                        Text(
+                            status == nil
+                                ? "NO SESSION"
+                                : (active ? "LIVE" : "IDLE")
+                        )
+                        .font(VPTheme.mono(7.5, weight: .semibold))
+                        .tracking(0.6)
+                        .foregroundStyle(active ? VPTheme.success : VPTheme.textTertiary)
+                        .contentTransition(.opacity)
                     }
                 }
             }
@@ -314,12 +317,6 @@ struct PreviewPanelView: View {
             }
         }
         .task(id: model.selectedSessionID) {
-            if model.consoleID != nil {
-                await model.closeConsole()
-            }
-            if model.terminalID != nil {
-                await model.closeTerminal()
-            }
             if mode == .files {
                 await model.loadWorkspaceTree()
             }
@@ -1470,11 +1467,14 @@ private struct FilesPanel: View {
     @Environment(AppModel.self) private var model
     @State private var hoveredPath: String?
     @Namespace private var selectionNamespace
-    @State private var draft = ""
-    @State private var dirty = false
     @State private var pendingEntry: WorkspaceEntry?
     @State private var confirmDiscard = false
     @State private var confirmClose = false
+
+    private var dirty: Bool {
+        guard let file = model.workspaceFile, file.editable else { return false }
+        return model.workspaceDraft != file.content
+    }
 
     private var filteredEntries: [WorkspaceEntry] {
         let filter = model.workspaceFilter.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1660,15 +1660,17 @@ private struct FilesPanel: View {
                         .padding(.horizontal, 10)
                         .padding(.top, 5)
                 }
-                TextEditor(text: $draft)
-                    .font(VPTheme.mono(10))
-                    .foregroundStyle(VPTheme.textSecondary)
-                    .scrollContentBackground(.hidden)
-                    .disabled(!file.editable || model.workspaceFileBusy || model.workspaceSaveBusy)
-                    .onChange(of: draft) { _, value in
-                        dirty = file.editable && value != file.content
-                    }
-                    .padding(6)
+                TextEditor(
+                    text: Binding(
+                        get: { model.workspaceDraft },
+                        set: { model.workspaceDraft = $0 }
+                    )
+                )
+                .font(VPTheme.mono(10))
+                .foregroundStyle(VPTheme.textSecondary)
+                .scrollContentBackground(.hidden)
+                .disabled(!file.editable || model.workspaceFileBusy || model.workspaceSaveBusy)
+                .padding(6)
             } else {
                 VStack(spacing: 8) {
                     Image(systemName: "doc.text.magnifyingglass")
@@ -1742,9 +1744,7 @@ private struct FilesPanel: View {
                     .disabled(model.workspaceSaveBusy)
                     Button("Save") {
                         Task {
-                            if await model.saveWorkspaceFile(content: draft) {
-                                dirty = false
-                            }
+                            _ = await model.saveWorkspaceFile(content: model.workspaceDraft)
                         }
                     }
                     .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
@@ -1769,8 +1769,8 @@ private struct FilesPanel: View {
     private func closeFile() {
         model.workspaceSelectedPath = nil
         model.workspaceFile = nil
-        draft = ""
-        dirty = false
+        model.workspaceDraft = ""
+        model.workspaceDraftPath = nil
     }
 
     private var fileKey: String {
@@ -1780,12 +1780,17 @@ private struct FilesPanel: View {
 
     private func syncDraft() {
         guard let file = model.workspaceFile else {
-            draft = ""
-            dirty = false
+            model.workspaceDraft = ""
+            model.workspaceDraftPath = nil
             return
         }
-        draft = file.content
-        dirty = false
+        // Keep a preserved draft when the same file is re-opened after a view
+        // rebuild (language switch, inspector toggle). A different path or a
+        // successful reload resets the draft in AppModel.
+        if model.workspaceDraftPath != file.path {
+            model.workspaceDraft = file.content
+            model.workspaceDraftPath = file.path
+        }
     }
 
     private func select(_ entry: WorkspaceEntry) {
@@ -2025,9 +2030,9 @@ struct StudioEmptyView: View {
     var body: some View {
         VStack(spacing: 9) {
             VPFloatingSymbol(name: icon, size: 26, tint: .secondary)
-            Text(title)
+            Text(L10n.t(title))
                 .font(.system(size: 13, weight: .semibold))
-            Text(detail)
+            Text(L10n.t(detail))
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -2042,19 +2047,14 @@ struct StudioEmptyView: View {
 struct OrgPresetSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(AppModel.self) private var model
-    @AppStorage("verlinpark.org.managers") private var managers = 4
-    @AppStorage("verlinpark.org.workers") private var workers = 6
-    @AppStorage("verlinpark.org.labour") private var labour = 12
-    @AppStorage("verlinpark.org.autoscale") private var autoScale = true
-    @AppStorage("verlinpark.org.budgetGate") private var budgetGate = 80
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        @Bindable var model = model
+        return VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Org Preset")
                     .font(.title2.weight(.semibold))
                 Text(
-                    "Small default team. Managers are created lazily when a plan task needs their department; Workers control batch concurrency. The session budget is the primary cost limit, though concurrent batches can overshoot by one turn."
+                    "Small default team. Managers are created lazily when a plan task needs their department; Workers control batch concurrency. The session budget reserves tokens before each provider call and settles from provider usage."
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -2063,36 +2063,21 @@ struct OrgPresetSheet: View {
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
                 GridRow {
                     Text("Managers").font(.system(size: 12))
-                    Stepper("\(managers) · max 5", value: $managers, in: 1 ... 5)
+                    Stepper("\(model.orgManagers) · max 5", value: $model.orgManagers, in: 1 ... 5)
                 }
                 GridRow {
                     Text("Workers").font(.system(size: 12))
-                    Stepper("\(workers) · max 10", value: $workers, in: 1 ... 10)
+                    Stepper("\(model.orgWorkers) · max 10", value: $model.orgWorkers, in: 1 ... 10)
                 }
                 GridRow {
                     Text("Labour").font(.system(size: 12))
-                    Stepper("\(labour) · max 40", value: $labour, in: 1 ... 40)
+                    Stepper("\(model.orgLabour) · max 40", value: $model.orgLabour, in: 1 ... 40)
                 }
             }
             .font(.system(size: 11))
 
-            Toggle("Auto-scale within budget (planned)", isOn: $autoScale)
-                .disabled(true)
-            HStack {
-                Text("Freeze expansion at")
-                Slider(value: Binding(
-                    get: { Double(budgetGate) },
-                    set: { budgetGate = Int($0) }
-                ), in: 50 ... 95, step: 5)
-                Text("\(budgetGate)%")
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(width: 38, alignment: .trailing)
-            }
-            .font(.system(size: 11))
-            .disabled(true)
-
             Text(
-                "Plan dispatch runs ready tasks in dependency batches, each Worker in its own task worktree; Managers are created lazily. Merge queue and deterministic Integrator are implemented; cross-entry retry, auto-expansion, and per-role budgets are not."
+                "Plan dispatch runs ready tasks in dependency batches, each Worker in its own task worktree; Managers are created lazily. Merge queue, deterministic Integrator, cross-entry retry, per-role budgets, and opt-in plan Worker expansion are implemented; general Manager/Labour expansion and scale-down are not."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.tertiary)

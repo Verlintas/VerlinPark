@@ -121,6 +121,8 @@ final class AppModel {
     var workspaceFilter = ""
     var workspaceSelectedPath: String?
     var workspaceFile: WorkspaceFileResult?
+    var workspaceDraft = ""
+    var workspaceDraftPath: String?
     var workspaceFileBusy = false
     var workspaceFileError: String?
     var workspaceSaveBusy = false
@@ -295,7 +297,11 @@ final class AppModel {
     private let core = CoreClient()
     private let daemon = DaemonController()
     private var eventTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var reconnectAttempt = 0
     private var started = false
+    private var selectionGeneration = 0
+    private var searchGeneration = 0
 
     var unreadNoticeCount: Int {
         notices.count(where: { !$0.isRead })
@@ -334,36 +340,57 @@ final class AppModel {
         sessions.first { $0.id == selectedSessionID }
     }
 
+    private func isCurrent(sessionID: String, generation: Int) -> Bool {
+        selectedSessionID == sessionID && selectionGeneration == generation
+    }
+
     func start() async {
         guard !started else { return }
         started = true
+        loadNotices()
+        loadOrgCaps()
+        SystemNotifier.shared.requestAuthorization()
+        SystemNotifier.shared.onResolveApproval = { [weak self] approvalID, approved in
+            guard let self else { return }
+            Task { @MainActor in
+                await self.resolveGlobalApproval(approvalID, approved: approved)
+            }
+        }
+        SystemNotifier.shared.onOpenSession = { [weak self] sessionID in
+            guard let self else { return }
+            Task { @MainActor in
+                if let projectID = self.sessionDirectory[sessionID]?.projectId {
+                    await self.openSession(sessionID: sessionID, projectID: projectID)
+                } else {
+                    await self.refresh()
+                    if let projectID = self.sessionDirectory[sessionID]?.projectId {
+                        await self.openSession(sessionID: sessionID, projectID: projectID)
+                    }
+                }
+            }
+        }
+        await connectIfNeeded()
+        if connection != .connected {
+            scheduleReconnect()
+        }
+    }
+
+    private func connectIfNeeded() async {
+        guard started, connection != .connected else { return }
         connection = .connecting
         do {
             let discovery = try await daemon.ensureRunning()
             try await core.connect(to: discovery)
+            await core.setDisconnectHandler { [weak self] error in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.connection = .failed(error.localizedDescription)
+                    self.lastError = error.localizedDescription
+                    self.scheduleReconnect()
+                }
+            }
             connection = .connected
-            loadNotices()
-            loadOrgCaps()
-            SystemNotifier.shared.requestAuthorization()
-            SystemNotifier.shared.onResolveApproval = { [weak self] approvalID, approved in
-                guard let self else { return }
-                Task { @MainActor in
-                    await self.resolveGlobalApproval(approvalID, approved: approved)
-                }
-            }
-            SystemNotifier.shared.onOpenSession = { [weak self] sessionID in
-                guard let self else { return }
-                Task { @MainActor in
-                    if let projectID = self.sessionDirectory[sessionID]?.projectId {
-                        await self.openSession(sessionID: sessionID, projectID: projectID)
-                    } else {
-                        await self.refresh()
-                        if let projectID = self.sessionDirectory[sessionID]?.projectId {
-                            await self.openSession(sessionID: sessionID, projectID: projectID)
-                        }
-                    }
-                }
-            }
+            reconnectAttempt = 0
             await configureStoredProvider()
             agentInfo = try? await core.agentInfo()
             if let info = agentInfo {
@@ -373,8 +400,28 @@ final class AppModel {
             consumeEvents()
             await refresh()
         } catch {
+            reconnectAttempt += 1
             connection = .failed(error.localizedDescription)
             lastError = error.localizedDescription
+        }
+    }
+
+    private func scheduleReconnect() {
+        guard started, reconnectTask == nil, connection != .connected else { return }
+        reconnectTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.reconnectTask = nil
+            }
+            while started, connection != .connected, !Task.isCancelled {
+                let delays = [1, 2, 4, 8, 16, 30, 30, 30]
+                let delay = delays[min(reconnectAttempt, delays.count - 1)]
+                try? await Task.sleep(for: .seconds(delay))
+                if Task.isCancelled {
+                    return
+                }
+                await connectIfNeeded()
+            }
         }
     }
 
@@ -406,6 +453,7 @@ final class AppModel {
 
     func selectProject(_ id: String?) {
         guard let id else {
+            selectionGeneration &+= 1
             selectedProjectID = nil
             selectedSessionID = nil
             events = []
@@ -475,9 +523,111 @@ final class AppModel {
         }
         mode = .project
         guard selectedProjectID != id else { return }
+        selectionGeneration &+= 1
         selectedProjectID = id
         selectedSessionID = nil
         events = []
+        contextStatus = nil
+        compactNotice = nil
+        checkpoints = []
+        checkpointNotice = nil
+        checkpointStats = nil
+        checkpointDiff = nil
+        checkpointDiffNotice = nil
+        sessionLineage = nil
+        forkTree = nil
+        forkRepairNotice = nil
+        compareResult = nil
+        compareError = nil
+        forkMergeNotice = nil
+        sessionDiff = nil
+        diffFiles = []
+        todos = []
+        agents = []
+        mergeQueue = []
+        mailbox = []
+        artifacts = []
+        usageLedger = nil
+        usageStatus = nil
+        shellPolicy = .allow
+        shellPolicyNetwork = "allow"
+        shellPolicyRestrictHome = false
+        shellPolicyReadJail = false
+        shellPolicyReadDenyText = ""
+        shellPolicyStatus = nil
+        integrationPolicy = .disabled
+        integrationAutoResolve = false
+        integrationMaxAutoAttempts = 1
+        integrationMaxTokensText = ""
+        integrationPolicyStatus = nil
+        artifactPolicy = .disabled
+        artifactAutoGc = false
+        artifactMaxBytesText = ""
+        artifactMaxAgeText = ""
+        artifactMaxCountText = ""
+        artifactPolicyStatus = nil
+        mailboxPolicy = .disabled
+        mailboxMaxAgeText = ""
+        mailboxMaxCountText = ""
+        mailboxDeleteUnread = false
+        mailboxAutoGc = false
+        mailboxPolicyStatus = nil
+        projectBudget = .empty
+        projectSpentTokens = 0
+        projectSpentCostUsd = 0
+        projectTokenBudgetText = ""
+        projectCostBudgetText = ""
+        projectBudgetStatus = nil
+        projectUsage = nil
+        projectUsageStatus = nil
+        memories = []
+        taskQueue = nil
+        gitCommits = []
+        gitBranch = nil
+        gitBaseCommit = nil
+        gitSelectedCommit = nil
+        gitShow = nil
+        workspaceEntries = []
+        workspaceSelectedPath = nil
+        workspaceFile = nil
+        workspaceFileError = nil
+        Task { await loadShellPolicy() }
+        Task { await loadIntegrationPolicy() }
+        Task { await loadArtifactPolicy() }
+        Task { await loadMailboxPolicy() }
+        Task { await loadProjectBudget() }
+        Task { await loadProjectUsage() }
+        Task { await loadProjectForkForest() }
+        Task { await loadDashboardSnapshot() }
+        Task { await loadMemories() }
+        Task { await loadCheckpointPolicy() }
+        Task { await loadWorktreePolicy() }
+        teamPlan = nil
+        planTaskStatuses = [:]
+        lastCommit = nil
+        lastLanding = nil
+        lastPullRequest = nil
+        Task { await loadSessions() }
+    }
+
+    func selectResident() {
+        selectionGeneration &+= 1
+        mode = .resident
+    }
+
+    func selectSession(_ id: String?) {
+        if selectedSessionID == id {
+            mode = .project
+            return
+        }
+        selectionGeneration &+= 1
+        mode = .project
+        selectedSessionID = id
+        Task {
+            await closeTerminal()
+            await closeConsole()
+        }
+        streamingText = ""
         contextStatus = nil
         compactNotice = nil
         checkpoints = []
@@ -502,54 +652,17 @@ final class AppModel {
         artifacts = []
         usageLedger = nil
         usageStatus = nil
-        Task { await loadShellPolicy() }
-        Task { await loadIntegrationPolicy() }
-        Task { await loadArtifactPolicy() }
-        Task { await loadMailboxPolicy() }
-        Task { await loadProjectBudget() }
-        Task { await loadProjectUsage() }
-        Task { await loadProjectForkForest() }
-        Task { await loadDashboardSnapshot() }
-        Task { await loadMemories() }
-        Task { await loadCheckpointPolicy() }
-        Task { await loadWorktreePolicy() }
-        teamPlan = nil
-        planTaskStatuses = [:]
-        lastCommit = nil
-        lastLanding = nil
-        lastPullRequest = nil
-        Task { await loadSessions() }
-    }
-
-    func selectResident() {
-        mode = .resident
-    }
-
-    func selectSession(_ id: String?) {
-        guard selectedSessionID != id else { return }
-        mode = .project
-        selectedSessionID = id
-        streamingText = ""
-        contextStatus = nil
-        compactNotice = nil
-        checkpoints = []
-        checkpointNotice = nil
-        checkpointStats = nil
-        checkpointDiff = nil
-        checkpointDiffNotice = nil
-        sessionLineage = nil
-        forkTree = nil
-        projectForkForest = nil
-        forkAudit = nil
-        forkRepairNotice = nil
-        compareResult = nil
-        compareError = nil
-        forkMergeNotice = nil
-        sessionDiff = nil
-        diffFiles = []
-        todos = []
-        agents = []
-        mergeQueue = []
+        questions = []
+        pendingQuestions = []
+        gitCommits = []
+        gitBranch = nil
+        gitBaseCommit = nil
+        gitSelectedCommit = nil
+        gitShow = nil
+        workspaceEntries = []
+        workspaceSelectedPath = nil
+        workspaceFile = nil
+        workspaceFileError = nil
         teamPlan = nil
         planTaskStatuses = [:]
         lastCommit = nil
@@ -618,20 +731,31 @@ final class AppModel {
     func runSearch(projectID: String?) async {
         let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
+            searchGeneration &+= 1
             searchHits = []
             searchTruncated = false
+            searchBusy = false
             return
         }
+        searchGeneration &+= 1
+        let generation = searchGeneration
         searchBusy = true
-        defer { searchBusy = false }
+        defer {
+            if generation == searchGeneration {
+                searchBusy = false
+            }
+        }
         do {
             let result = try await core.search(query: trimmed, projectID: projectID)
-            guard trimmed == searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            guard generation == searchGeneration,
+                  trimmed == searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            else {
                 return
             }
             searchHits = result.hits
             searchTruncated = result.truncated
         } catch {
+            guard generation == searchGeneration else { return }
             searchHits = []
             searchTruncated = false
             handle(error)
@@ -648,11 +772,12 @@ final class AppModel {
         }
         do {
             let loaded = try await core.listSessions(projectID: projectID)
-            if selectedProjectID == projectID {
-                sessions = loaded
-            }
+            guard selectedProjectID == projectID else { return }
+            sessions = loaded
         } catch {
-            handle(error)
+            if selectedProjectID == projectID {
+                handle(error)
+            }
             return
         }
         for session in sessions {
@@ -673,7 +798,14 @@ final class AppModel {
 
     func openNotice(_ notice: AppNotice) async {
         markNoticeRead(notice.id)
-        guard let projectID = notice.projectId else { return }
+        guard let projectID = notice.projectId ?? sessionDirectory[notice.sessionId]?.projectId
+        else {
+            await refreshSessionDirectory()
+            if let projectID = sessionDirectory[notice.sessionId]?.projectId {
+                await openSession(sessionID: notice.sessionId, projectID: projectID)
+            }
+            return
+        }
         await openSession(sessionID: notice.sessionId, projectID: projectID)
     }
 
@@ -734,8 +866,15 @@ final class AppModel {
                 ($0.id, SessionDirectoryEntry(projectId: $0.projectId, goal: $0.goal))
             }
         )
+        var patched = false
         for index in notices.indices where notices[index].projectId == nil {
-            notices[index].projectId = sessionDirectory[notices[index].sessionId]?.projectId
+            if let projectID = sessionDirectory[notices[index].sessionId]?.projectId {
+                notices[index].projectId = projectID
+                patched = true
+            }
+        }
+        if patched {
+            saveNotices()
         }
     }
 
@@ -779,13 +918,13 @@ final class AppModel {
         costBudgetUSD: Double? = nil,
         timeBudgetSecs: Int? = nil,
         priority: Int = 0
-    ) async {
+    ) async -> Bool {
         guard let projectID = selectedProjectID else {
             lastError = "Choose a project first."
-            return
+            return false
         }
         let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
         let budget = (tokenBudget ?? defaultTokenBudget).clampedTokenBudget
         UserDefaults.standard.set(budget, forKey: "verlinpark.session.tokenBudget")
 
@@ -800,18 +939,15 @@ final class AppModel {
                 timeBudgetSecs: timeBudgetSecs,
                 priority: priority
             )
-            sessions = try await core.listSessions(projectID: projectID)
-            selectedSessionID = session.id
-            mode = .project
-            events = try await core.listEvents(sessionID: session.id)
-            refreshPlanTaskStatuses()
-            sessionDiff = try? await core.sessionDiff(sessionID: session.id)
-            todos = await (try? core.sessionTodos(sessionID: session.id)) ?? []
-            mergeQueue = await (try? core.listMergeQueue(sessionID: session.id)) ?? []
-            lastCommit = nil
+            let loaded = try await core.listSessions(projectID: projectID)
+            guard selectedProjectID == projectID else { return false }
+            sessions = loaded
+            selectSession(session.id)
             showToast("Session created", detail: session.goal, kind: .success)
+            return true
         } catch {
             handle(error)
+            return false
         }
     }
 
@@ -1040,8 +1176,10 @@ final class AppModel {
         approvalCenterBusy = true
         defer { approvalCenterBusy = false }
         do {
-            try await core.resolveApproval(id: id, approved: approved)
-            pendingApprovals.removeAll { $0.id == id }
+            let resolved = try await core.resolveApproval(id: id, approved: approved)
+            if resolved {
+                pendingApprovals.removeAll { $0.id == id }
+            }
             approvalCenterStatus = pendingApprovals.isEmpty ? "No pending approvals." : nil
         } catch {
             approvalCenterStatus = error.localizedDescription
@@ -1064,9 +1202,10 @@ final class AppModel {
         name: String,
         command: String,
         args: [String],
+        env: [String: String],
         autoApprove: Bool,
         timeoutSecs: Int
-    ) async {
+    ) async -> Bool {
         acpBusy = true
         defer { acpBusy = false }
         do {
@@ -1074,15 +1213,18 @@ final class AppModel {
                 name: name,
                 command: command,
                 args: args,
+                env: env,
                 autoApprove: autoApprove,
                 timeoutSecs: timeoutSecs
             )
             acpStatus = "ACP agent added."
             await loadAcpAgents()
             showToast("ACP agent added", detail: name, kind: .success)
+            return true
         } catch {
             acpStatus = error.localizedDescription
             handle(error)
+            return false
         }
     }
 
@@ -1317,10 +1459,12 @@ final class AppModel {
             questions = []
             return
         }
+        let generation = selectionGeneration
         do {
             let loaded = try await core.listQuestions(sessionID: sessionID)
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 questions = loaded
+                pendingQuestions = loaded.filter(\.isPending)
             }
         } catch {
             // The event stream will retry on question.requested.
@@ -1438,6 +1582,7 @@ final class AppModel {
             gitHistorySessionID = nil
             return
         }
+        let generation = selectionGeneration
         let sessionChanged = gitHistorySessionID != sessionID
         gitHistorySessionID = sessionID
         if sessionChanged {
@@ -1448,7 +1593,9 @@ final class AppModel {
         defer { gitLogBusy = false }
         do {
             let result = try await core.gitLog(sessionID: sessionID)
-            guard sessionID == selectedSessionID else { return }
+            guard sessionID == selectedSessionID,
+                  generation == selectionGeneration
+            else { return }
             gitCommits = result.commits
             gitBranch = result.branch
             gitBaseCommit = result.baseCommit
@@ -1477,9 +1624,10 @@ final class AppModel {
         defer { gitShowBusy = false }
         do {
             let show = try await core.gitShow(sessionID: sessionID, commit: hash)
-            guard sessionID == selectedSessionID else { return }
+            guard sessionID == selectedSessionID, gitSelectedCommit == hash else { return }
             gitShow = show
         } catch {
+            guard sessionID == selectedSessionID, gitSelectedCommit == hash else { return }
             gitShow = nil
             gitShowError = error.localizedDescription
         }
@@ -1490,6 +1638,8 @@ final class AppModel {
             workspaceEntries = []
             workspaceSelectedPath = nil
             workspaceFile = nil
+            workspaceDraft = ""
+            workspaceDraftPath = nil
             workspaceSessionID = nil
             return
         }
@@ -1499,6 +1649,8 @@ final class AppModel {
             workspaceFilter = ""
             workspaceSelectedPath = nil
             workspaceFile = nil
+            workspaceDraft = ""
+            workspaceDraftPath = nil
         }
         workspaceTreeBusy = true
         defer { workspaceTreeBusy = false }
@@ -1512,6 +1664,8 @@ final class AppModel {
             {
                 workspaceSelectedPath = nil
                 workspaceFile = nil
+                workspaceDraft = ""
+                workspaceDraftPath = nil
             }
         } catch {
             workspaceTreeError = error.localizedDescription
@@ -1527,10 +1681,19 @@ final class AppModel {
         defer { workspaceFileBusy = false }
         do {
             let file = try await core.workspaceFile(sessionID: sessionID, path: entry.path)
-            guard sessionID == selectedSessionID else { return }
+            guard sessionID == selectedSessionID,
+                  workspaceSelectedPath == entry.path
+            else { return }
             workspaceFile = file
+            workspaceDraft = file.content
+            workspaceDraftPath = file.path
         } catch {
+            guard sessionID == selectedSessionID,
+                  workspaceSelectedPath == entry.path
+            else { return }
             workspaceFile = nil
+            workspaceDraft = ""
+            workspaceDraftPath = nil
             workspaceFileError = error.localizedDescription
         }
     }
@@ -1543,6 +1706,7 @@ final class AppModel {
             workspaceSaveStatus = "This file is read-only."
             return false
         }
+        let savingPath = file.path
         workspaceSaveBusy = true
         workspaceSaveStatus = nil
         defer { workspaceSaveBusy = false }
@@ -1553,7 +1717,10 @@ final class AppModel {
                 content: content,
                 expectedSha256: file.sha256
             )
-            guard sessionID == selectedSessionID else { return false }
+            guard sessionID == selectedSessionID,
+                  workspaceDraftPath == savingPath,
+                  workspaceFile?.path == savingPath
+            else { return false }
             workspaceFile = WorkspaceFileResult(
                 path: result.path,
                 size: result.size,
@@ -1563,6 +1730,8 @@ final class AppModel {
                 sha256: result.sha256,
                 editable: true
             )
+            workspaceDraft = content
+            workspaceDraftPath = result.path
             workspaceFileError = nil
             workspaceSaveStatus = "Saved \(result.path) (\(result.size) bytes)."
             await loadDiff()
@@ -1629,6 +1798,9 @@ final class AppModel {
                     terminalData.append(data)
                 }
             }
+            if terminalData.count > 2_000_000 {
+                terminalData = terminalData.suffix(1_500_000)
+            }
             terminalSeq = result.nextSeq
             if result.status != terminalStatus {
                 terminalStatus = result.status
@@ -1669,13 +1841,13 @@ final class AppModel {
         do {
             let result = try await core.closeTerminal(terminalID: terminalID)
             terminalExitCode = result.exitCode ?? terminalExitCode
+            self.terminalID = nil
+            terminalWorktree = ""
+            terminalStatus = "closed"
+            terminalSessionID = nil
         } catch {
             terminalError = error.localizedDescription
         }
-        self.terminalID = nil
-        terminalWorktree = ""
-        terminalStatus = "closed"
-        terminalSessionID = nil
     }
 
     func openConsole() async {
@@ -1763,11 +1935,11 @@ final class AppModel {
             let result = try await core.closeConsole(consoleID: consoleID)
             consoleExitCode = result.exitCode ?? consoleExitCode
             consoleStatus = "closed"
+            self.consoleID = nil
+            consoleWorktree = ""
         } catch {
             consoleError = error.localizedDescription
         }
-        self.consoleID = nil
-        consoleWorktree = ""
     }
 
     func clearConsole() {
@@ -2159,11 +2331,16 @@ final class AppModel {
         await saveIntegrationPolicy()
     }
 
-    func resolveApproval(_ id: String, approved: Bool) async {
+    func resolveApproval(_ id: String, approved: Bool) async -> Bool {
         do {
-            try await core.resolveApproval(id: id, approved: approved)
+            let resolved = try await core.resolveApproval(id: id, approved: approved)
+            if resolved {
+                pendingApprovals.removeAll { $0.id == id }
+            }
+            return resolved
         } catch {
             handle(error)
+            return false
         }
     }
 
@@ -2325,9 +2502,10 @@ final class AppModel {
             todos = []
             return
         }
+        let generation = selectionGeneration
         do {
             let items = try await core.sessionTodos(sessionID: sessionID)
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 todos = items
             }
         } catch {
@@ -2340,9 +2518,10 @@ final class AppModel {
             teamPlan = nil
             return
         }
+        let generation = selectionGeneration
         do {
             let plan = try await core.getTeamPlan(sessionID: sessionID)
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 teamPlan = plan
             }
         } catch {
@@ -2387,8 +2566,8 @@ final class AppModel {
             taskSchedulerPolicyStatus = "Select a project first."
             return
         }
-        let cooldown = UInt64(taskSchedulerCooldownText.trimmingCharacters(in: .whitespaces)) ?? 60
-        guard (1 ... 86400).contains(cooldown) else {
+        let cooldownText = taskSchedulerCooldownText.trimmingCharacters(in: .whitespaces)
+        guard let cooldown = UInt64(cooldownText), (1 ... 86400).contains(cooldown) else {
             taskSchedulerPolicyStatus = "Cooldown must be between 1 and 86400 seconds."
             return
         }
@@ -2766,8 +2945,14 @@ final class AppModel {
             checkpointPolicyStatus = "Select a project first."
             return
         }
-        let days = Int(checkpointPolicyOlderDaysText.trimmingCharacters(in: .whitespaces)) ?? 30
-        let keepLatest = Int(checkpointPolicyKeepLatestText.trimmingCharacters(in: .whitespaces)) ?? 5
+        let daysText = checkpointPolicyOlderDaysText.trimmingCharacters(in: .whitespaces)
+        let keepText = checkpointPolicyKeepLatestText.trimmingCharacters(in: .whitespaces)
+        guard let days = Int(daysText), days >= 0,
+              let keepLatest = Int(keepText), keepLatest >= 0
+        else {
+            checkpointPolicyStatus = "Retention must be non-negative whole days and a whole keep count."
+            return
+        }
         let policy = CheckpointRetentionPolicy(
             enabled: checkpointPolicyEnabled,
             olderThanSecs: max(0, days) * 86400,
@@ -2813,7 +2998,11 @@ final class AppModel {
             worktreePolicyStatus = "Select a project first."
             return
         }
-        let days = Int(worktreePolicyOlderDaysText.trimmingCharacters(in: .whitespaces)) ?? 7
+        let daysText = worktreePolicyOlderDaysText.trimmingCharacters(in: .whitespaces)
+        guard let days = Int(daysText), days >= 0 else {
+            worktreePolicyStatus = "Retention must be a non-negative whole number of days."
+            return
+        }
         let policy = WorktreeRetentionPolicy(
             enabled: worktreePolicyEnabled,
             olderThanSecs: max(0, days) * 86400,
@@ -2839,7 +3028,11 @@ final class AppModel {
             cleanupStatus = "Select a project first."
             return
         }
-        let days = Int(cleanupOlderDaysText.trimmingCharacters(in: .whitespaces)) ?? 7
+        let daysText = cleanupOlderDaysText.trimmingCharacters(in: .whitespaces)
+        guard let days = Int(daysText), days >= 0 else {
+            cleanupStatus = "Retention must be a non-negative whole number of days."
+            return
+        }
         cleanupBusy = true
         defer { cleanupBusy = false }
         do {
@@ -2918,9 +3111,10 @@ final class AppModel {
             agents = []
             return
         }
+        let generation = selectionGeneration
         do {
             let records = try await core.listAgents(sessionID: sessionID)
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 agents = records
             }
         } catch {
@@ -2936,10 +3130,11 @@ final class AppModel {
             usageStatus = nil
             return
         }
+        let generation = selectionGeneration
         do {
             let messages = try await core.listMailbox(sessionID: sessionID)
             let published = try await core.listArtifacts(sessionID: sessionID)
-            guard sessionID == selectedSessionID else { return }
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             mailbox = messages
             artifacts = published
         } catch {
@@ -2953,13 +3148,14 @@ final class AppModel {
             usageStatus = nil
             return
         }
+        let generation = selectionGeneration
         do {
             let ledger = try await core.usageLedger(sessionID: sessionID)
-            guard sessionID == selectedSessionID else { return }
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             usageLedger = ledger
             usageStatus = nil
         } catch {
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 usageStatus = error.localizedDescription
             }
         }
@@ -2979,8 +3175,12 @@ final class AppModel {
             mergeQueue = []
             return
         }
+        let generation = selectionGeneration
         do {
-            mergeQueue = try await core.listMergeQueue(sessionID: sessionID)
+            let queue = try await core.listMergeQueue(sessionID: sessionID)
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                mergeQueue = queue
+            }
         } catch {
             // The event stream will retry on the next merge queue event.
         }
@@ -3049,9 +3249,10 @@ final class AppModel {
             contextStatus = nil
             return
         }
+        let generation = selectionGeneration
         do {
             let status = try await core.contextStatus(sessionID: sessionID)
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 contextStatus = status
             }
         } catch {
@@ -3070,7 +3271,9 @@ final class AppModel {
                 goal: goal
             )
             await loadSessions()
-            selectSession(result.session.id)
+            if selectedSessionID == sourceSessionID {
+                selectSession(result.session.id)
+            }
             showToast("Session forked", detail: result.session.goal, kind: .success)
             return true
         } catch {
@@ -3084,13 +3287,16 @@ final class AppModel {
             checkpoints = []
             return
         }
+        let generation = selectionGeneration
         do {
             let loaded = try await core.listCheckpoints(sessionID: sessionID)
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 checkpoints = loaded
             }
         } catch {
-            checkpoints = []
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                checkpoints = []
+            }
         }
     }
 
@@ -3141,6 +3347,7 @@ final class AppModel {
                 sessionID: sessionID,
                 checkpointID: checkpointID
             )
+            guard sessionID == selectedSessionID else { return }
             await loadCheckpoints()
             await loadCheckpointStats()
             await loadEvents()
@@ -3170,6 +3377,7 @@ final class AppModel {
                 sessionID: sessionID,
                 checkpointID: checkpointID
             )
+            guard sessionID == selectedSessionID else { return }
             await loadCheckpoints()
             checkpointNotice = result.removed ? "Checkpoint deleted" : "Checkpoint was already removed"
             if result.removed {
@@ -3204,15 +3412,18 @@ final class AppModel {
             sessionLineage = nil
             return
         }
+        let generation = selectionGeneration
         lineageBusy = true
         defer { lineageBusy = false }
         do {
             let result = try await core.sessionLineage(sessionID: sessionID)
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 sessionLineage = result
             }
         } catch {
-            sessionLineage = nil
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionLineage = nil
+            }
         }
     }
 
@@ -3221,15 +3432,18 @@ final class AppModel {
             forkTree = nil
             return
         }
+        let generation = selectionGeneration
         forkTreeBusy = true
         defer { forkTreeBusy = false }
         do {
             let result = try await core.sessionForkTree(sessionID: sessionID)
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 forkTree = result
             }
         } catch {
-            forkTree = nil
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                forkTree = nil
+            }
         }
     }
 
@@ -3332,6 +3546,7 @@ final class AppModel {
                 sourceSessionID: sourceID,
                 forkSessionID: forkID
             )
+            guard sourceID == selectedSessionID else { return }
             await loadLineage()
             await loadEvents()
             await loadDiff()
@@ -3383,17 +3598,22 @@ final class AppModel {
             sessionDiff = nil
             return
         }
+        let generation = selectionGeneration
         diffLoading = true
-        defer { diffLoading = false }
+        defer {
+            if generation == selectionGeneration {
+                diffLoading = false
+            }
+        }
         do {
             let diff = try await core.sessionDiff(sessionID: sessionID)
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 sessionDiff = diff
                 diffFiles = SessionDiffParser.parse(diff.patch)
                 diffError = nil
             }
         } catch {
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 diffError = error.localizedDescription
             }
         }
@@ -3410,8 +3630,15 @@ final class AppModel {
             events = []
             return
         }
+        let generation = selectionGeneration
         do {
-            sessions = try await core.listSessions(projectID: projectID)
+            let loaded = try await core.listSessions(projectID: projectID)
+            guard selectedProjectID == projectID,
+                  generation == selectionGeneration
+            else {
+                return
+            }
+            sessions = loaded
             if let selectedSessionID,
                !sessions.contains(where: { $0.id == selectedSessionID })
             {
@@ -3427,7 +3654,9 @@ final class AppModel {
             await loadTeamPlan()
             await loadDiff()
         } catch {
-            handle(error)
+            if selectedProjectID == projectID, generation == selectionGeneration {
+                handle(error)
+            }
         }
     }
 
@@ -3436,26 +3665,79 @@ final class AppModel {
             events = []
             return
         }
+        let generation = selectionGeneration
         do {
-            events = try await core.listEvents(sessionID: sessionID)
+            var loaded: [Event] = []
+            var since: UInt64 = 0
+            while true {
+                if Task.isCancelled || !isCurrent(sessionID: sessionID, generation: generation) {
+                    return
+                }
+                let page = try await core.listEvents(
+                    sessionID: sessionID,
+                    since: since,
+                    limit: 500
+                )
+                loaded.append(contentsOf: page)
+                guard page.count == 500, let last = page.last else { break }
+                let next = last.seq &+ 1
+                guard next > since else { break }
+                since = next
+                if loaded.count > 100_000 {
+                    break
+                }
+            }
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            // Keep events that arrived while the history was loading; dedupe by
+            // sequence and restore the canonical order.
+            let live = events.filter { $0.sessionId == sessionID }
+            events = mergeEvents(loaded, live)
             refreshPlanTaskStatuses()
         } catch {
-            handle(error)
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                handle(error)
+            }
         }
+    }
+
+    private func mergeEvents(_ first: [Event], _ second: [Event]) -> [Event] {
+        var bySeq: [UInt64: Event] = [:]
+        for event in first {
+            bySeq[event.seq] = event
+        }
+        for event in second {
+            bySeq[event.seq] = event
+        }
+        return bySeq.values.sorted { $0.seq < $1.seq }
     }
 
     private func refreshPlanTaskStatuses() {
         var statuses: [String: String] = [:]
         for event in events {
-            guard event.type == "plan_task.started" || event.type == "plan_task.finished",
-                  let taskID = event.payload.objectValue?["task_id"]?.stringValue,
-                  let status = event.payload.objectValue?["task_status"]?.stringValue
+            guard let taskID = event.payload.objectValue?["task_id"]?.stringValue,
+                  let status = planTaskStatus(for: event)
             else {
                 continue
             }
             statuses[taskID] = status
         }
         planTaskStatuses = statuses
+    }
+
+    private func planTaskStatus(for event: Event) -> String? {
+        if let status = event.payload.objectValue?["task_status"]?.stringValue {
+            return status
+        }
+        return switch event.type {
+        case "plan_task.started", "plan_task.resumed": "running"
+        case "plan_task.skipped": "skipped"
+        case "plan_task.retried": "pending"
+        case "plan_task.cancelling": "cancelling"
+        case "plan_task.pausing": "pausing"
+        case "plan_task.paused": "paused"
+        case "plan_task.interrupted": "interrupted"
+        default: nil
+        }
     }
 
     private func consumeEvents() {
@@ -3470,7 +3752,9 @@ final class AppModel {
     }
 
     private func apply(_ event: Event) {
+        let transientDelta = event.type == "agent.message_delta" || event.type == "agent.thought_delta"
         if event.sessionId == selectedSessionID,
+           !transientDelta,
            !events.contains(where: { $0.id == event.id })
         {
             events.append(event)
@@ -3483,16 +3767,22 @@ final class AppModel {
         }
 
         if event.sessionId == selectedSessionID {
+            let role = event.payload.objectValue?["agent_role"]?.stringValue
+            let isLeader = role == nil || role == "leader"
             switch event.type {
             case "agent.started":
-                streamingText = ""
+                if isLeader {
+                    streamingText = ""
+                }
             case "agent.message_delta":
-                if let text = event.payload.objectValue?["text"]?.stringValue {
+                if isLeader, let text = event.payload.objectValue?["text"]?.stringValue {
                     streamingText += text
                 }
             case "agent.message", "agent.turn_finished", "agent.failed", "agent.cancelled",
                  "agent.budget_exceeded":
-                streamingText = ""
+                if isLeader {
+                    streamingText = ""
+                }
             default:
                 break
             }
@@ -3637,9 +3927,8 @@ final class AppModel {
                 planTaskStatuses = [:]
                 Task { await self.loadTeamPlan() }
             }
-            if event.type == "plan_task.started" || event.type == "plan_task.finished",
-               let taskID = event.payload.objectValue?["task_id"]?.stringValue,
-               let status = event.payload.objectValue?["task_status"]?.stringValue
+            if let taskID = event.payload.objectValue?["task_id"]?.stringValue,
+               let status = planTaskStatus(for: event)
             {
                 planTaskStatuses[taskID] = status
             }
@@ -3662,6 +3951,18 @@ final class AppModel {
 
         if event.type == "memory.created" {
             Task { await self.loadMemories() }
+        }
+
+        if event.type == "approval.requested",
+           let approval = try? event.payload.decode(Approval.self),
+           !pendingApprovals.contains(where: { $0.id == approval.id })
+        {
+            pendingApprovals.append(approval)
+        }
+        if event.type == "approval.resolved",
+           let approvalID = event.payload.objectValue?["approval_id"]?.stringValue
+        {
+            pendingApprovals.removeAll { $0.id == approvalID }
         }
 
         if ["question.requested", "question.answered", "question.cancelled", "question.expired"]

@@ -305,8 +305,19 @@ impl Engine {
         &self.scheduler
     }
 
+    pub(crate) fn git_mutex(&self) -> Arc<Mutex<()>> {
+        self.git_lock.clone()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    /// Broadcast an event that was inserted atomically by the store together
+    /// with another projection update. Do not call `append_event` here: that
+    /// would create a second event row for the same transition.
+    pub(crate) fn broadcast_event(&self, event: Event) {
+        let _ = self.events.send(event);
     }
 
     pub async fn add_project(&self, root: String, name: Option<String>) -> Result<Project> {
@@ -523,6 +534,9 @@ impl Engine {
     ) -> Result<Session> {
         if !(-100..=100).contains(&priority) {
             anyhow::bail!("session priority must be between -100 and 100");
+        }
+        if token_budget == Some(0) {
+            anyhow::bail!("token budget must be greater than zero");
         }
         if cost_budget_usd.is_some_and(|value| !value.is_finite() || value <= 0.0) {
             anyhow::bail!("cost budget must be a positive finite number");
@@ -2176,12 +2190,17 @@ impl Engine {
     pub async fn discard_session(&self, session_id: &str) -> Result<()> {
         self.reject_imported_session(session_id).await?;
         let session = self.ensure_session_worktree(session_id).await?;
+        ensure_session_quiescent(&session, "discard the session worktree")?;
         let worktree = session
             .worktree
             .clone()
             .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?;
         let worktree = PathBuf::from(worktree);
+        let git_lock = self.git_lock.clone();
         tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
             git_output(&worktree, &["reset", "--hard", "HEAD"])?;
             git_output(&worktree, &["clean", "-fd"])?;
             Ok::<_, anyhow::Error>(())
@@ -2199,6 +2218,7 @@ impl Engine {
             return Err(anyhow::anyhow!("commit message is required"));
         }
         let session = self.ensure_session_worktree(session_id).await?;
+        ensure_session_quiescent(&session, "commit the session worktree")?;
         let worktree = session
             .worktree
             .clone()
@@ -2206,7 +2226,11 @@ impl Engine {
         let session_id = session.id.clone();
         let worktree = PathBuf::from(worktree);
         let message_for_git = message.clone();
+        let git_lock = self.git_lock.clone();
         let (commit, summary) = tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
             git_output(&worktree, &["add", "-A"])?;
             let output = std::process::Command::new("git")
                 .arg("-C")
@@ -2253,6 +2277,10 @@ impl Engine {
     pub async fn land_session(&self, session_id: &str) -> Result<SessionLandResult> {
         self.reject_imported_session(session_id).await?;
         let session = self.ensure_session_worktree(session_id).await?;
+        ensure_session_quiescent(&session, "land the session")?;
+        if session.status == "landed" {
+            anyhow::bail!("session is already landed");
+        }
         let session_branch = session
             .branch
             .clone()
@@ -2941,6 +2969,7 @@ impl Engine {
             store.set_project_budget(&project_id_owned, &for_store)
         })
         .await??;
+        self.budget_registry.clear_project(project_id);
         self.get_project_budget(project_id).await
     }
 
@@ -3762,7 +3791,14 @@ impl Engine {
             match event.kind.as_str() {
                 "plan_task.started" => {
                     if task.status != "completed" {
-                        task.status = "interrupted".to_string();
+                        task.status = if matches!(
+                            data.session.status.as_str(),
+                            "queued" | "running" | "paused" | "waiting_input"
+                        ) {
+                            "running".to_string()
+                        } else {
+                            "interrupted".to_string()
+                        };
                         task.finished_at = None;
                         task.last_error = None;
                     }
@@ -4200,12 +4236,14 @@ impl Engine {
                     output.saturating_add(event.payload["output_tokens"].as_u64().unwrap_or(0)),
                 )
             });
-        let usage_matches =
-            replay_in == data.session.tokens_in && replay_out == data.session.tokens_out;
+        let replay_cost = replay_session_cost(&data.events);
+        let usage_matches = replay_in == data.session.tokens_in
+            && replay_out == data.session.tokens_out
+            && (replay_cost - data.session.cost_spent_usd).abs() < 1e-9;
         if !usage_matches {
             mismatches.push(format!(
-                "usage: projection={}/{}, replay={replay_in}/{replay_out}",
-                data.session.tokens_in, data.session.tokens_out
+                "usage: projection={}/{}/{:.6}, replay={replay_in}/{replay_out}/{replay_cost:.6}",
+                data.session.tokens_in, data.session.tokens_out, data.session.cost_spent_usd
             ));
         }
 
@@ -4778,6 +4816,7 @@ impl Engine {
             );
             None
         };
+        let cost_spent_usd = replay_session_cost(&data.events);
         let priority = data
             .events
             .iter()
@@ -4791,6 +4830,7 @@ impl Engine {
             priority,
             tokens_in,
             tokens_out,
+            cost_spent_usd,
             replace_plan,
             plan,
             todos,
@@ -5070,6 +5110,7 @@ impl Engine {
     }
 
     pub async fn rebuild_session(&self, session_id: &str) -> Result<SessionReplayReport> {
+        ensure_session_not_active(&self.store, session_id, "rebuild a session").await?;
         let data = self.load_replay_data(session_id).await?;
         let repair = Self::build_session_repair(&data)?;
         for warning in &repair.artifact_warnings {
@@ -5253,6 +5294,7 @@ impl Engine {
     }
 
     pub async fn restore_session_log(&self, session_id: &str) -> Result<SessionLogStatus> {
+        ensure_session_not_active(&self.store, session_id, "restore an event log").await?;
         let store = self.store.clone();
         let id = session_id.to_string();
         let mirror = tokio::task::spawn_blocking(move || store.read_event_mirror(&id))
@@ -5291,6 +5333,7 @@ impl Engine {
     }
 
     pub async fn repair_session(&self, session_id: &str) -> Result<SessionReplayReport> {
+        ensure_session_not_active(&self.store, session_id, "repair a session").await?;
         let data = self.load_replay_data(session_id).await?;
         let report = Self::replay_report(&data, false)?;
         if report.consistent {
@@ -5924,6 +5967,7 @@ impl Engine {
                 .unwrap_or_default(),
             restrict_home: policy.restrict_home,
             read_jail: policy.read_jail,
+            git_branch: None,
             mcp_servers,
             timeout: std::time::Duration::from_secs(agent.timeout_secs.min(120)),
         };
@@ -6058,6 +6102,7 @@ impl Engine {
                 .unwrap_or_default(),
             restrict_home: policy.restrict_home,
             read_jail: policy.read_jail,
+            git_branch: session.branch.clone(),
         };
         self.consoles.open(&session.id, context).await
     }
@@ -6211,6 +6256,7 @@ impl Engine {
                 .unwrap_or_default(),
             restrict_home: policy.restrict_home,
             read_jail: policy.read_jail,
+            git_branch: session.branch.clone(),
         };
         self.terminals.open(&session.id, context, cols, rows).await
     }
@@ -6244,6 +6290,14 @@ impl Engine {
         self.terminals.close(terminal_id).await
     }
 
+    /// Sweep consoles and terminals that have been idle for `idle`. Called by
+    /// the daemon so abandoned GUI sessions cannot accumulate child processes.
+    pub async fn sweep_idle_terminals(&self, idle: std::time::Duration) -> (usize, usize) {
+        let consoles = self.consoles.sweep_idle(idle).await;
+        let terminals = self.terminals.sweep_idle(idle).await;
+        (consoles, terminals)
+    }
+
     pub async fn list_questions(&self, session_id: Option<String>) -> Result<QuestionListResult> {
         let store = self.store.clone();
         let questions =
@@ -6252,7 +6306,7 @@ impl Engine {
         Ok(QuestionListResult { questions })
     }
 
-    pub async fn resolve_approval(&self, approval_id: &str, approved: bool) -> Result<()> {
+    pub async fn resolve_approval(&self, approval_id: &str, approved: bool) -> Result<bool> {
         let store = self.store.clone();
         let id = approval_id.to_string();
         let resolved =
@@ -6268,8 +6322,10 @@ impl Engine {
                 let _ = sender.send(approved);
             }
             let _ = self.events.send(event);
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6764,6 +6820,54 @@ fn validate_model_preset(
         anyhow::bail!("model preset notes must be at most 2,000 characters");
     }
     Ok(())
+}
+
+async fn ensure_session_not_active(store: &Store, session_id: &str, action: &str) -> Result<()> {
+    let store = store.clone();
+    let id = session_id.to_string();
+    let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+    if matches!(
+        session.status.as_str(),
+        "queued" | "running" | "paused" | "waiting_input"
+    ) {
+        anyhow::bail!(
+            "session must be idle to {action}; current status is {}",
+            session.status
+        );
+    }
+    Ok(())
+}
+
+/// Cost is recorded twice when a usage entry has a price: `agent.usage`
+/// carries the per-call cost and `agent.cost` carries the running session total.
+/// Prefer the latest total so both `record_agent_usage` and the legacy
+/// `record_cost` path replay identically; fall back to summing older usage
+/// events that predate `agent.cost`.
+fn replay_session_cost(events: &[Event]) -> f64 {
+    if let Some(total) = events.iter().rev().find_map(|event| {
+        if event.kind != "agent.cost" {
+            return None;
+        }
+        event
+            .payload
+            .get("total_usd")
+            .and_then(serde_json::Value::as_f64)
+    }) {
+        return total;
+    }
+    events
+        .iter()
+        .filter(|event| event.kind == "agent.usage")
+        .map(|event| {
+            event
+                .payload
+                .get("cost_usd")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0)
+        })
+        .sum()
 }
 
 pub(crate) fn ensure_session_quiescent(session: &Session, action: &str) -> Result<()> {
