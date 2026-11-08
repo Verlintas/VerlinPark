@@ -223,9 +223,11 @@ struct SettingsView: View {
 
 struct GeneralSettingsView: View {
     @Environment(LanguageStore.self) private var language
+    @Environment(WorkspaceLayoutStore.self) private var layout
 
     var body: some View {
-        ScrollView {
+        @Bindable var layout = layout
+        return ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(L10n.t("General"))
@@ -299,6 +301,42 @@ struct GeneralSettingsView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 9) {
+                    SectionLabel(title: L10n.t("Workspace layout"))
+                    HStack(spacing: 10) {
+                        ForEach(WorkspaceLayoutPreset.allCases) { preset in
+                            layoutCard(preset)
+                        }
+                    }
+                    Text(
+                        L10n.t(
+                            "Presets update the persisted rail and inspector sizes. Drag either divider or double-click it to reset one side."
+                        )
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+
+                    VStack(spacing: 7) {
+                        widthControl(
+                            L10n.t("Rail width"),
+                            value: $layout.railWidth,
+                            range: Double(WorkspaceLayout.railRange.lowerBound)
+                                ... Double(WorkspaceLayout.railRange.upperBound)
+                        )
+                        widthControl(
+                            L10n.t("Inspector width"),
+                            value: $layout.inspectorWidth,
+                            range: Double(WorkspaceLayout.inspectorRange.lowerBound)
+                                ... Double(WorkspaceLayout.inspectorRange.upperBound)
+                        )
+                        Toggle(L10n.t("Show inspector"), isOn: $layout.inspectorVisible)
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .font(VPTheme.font(10, weight: .medium))
+                    }
+                    .padding(.top, 2)
+                }
+
+                VStack(alignment: .leading, spacing: 9) {
                     SectionLabel(title: L10n.t("Workspace"))
                     HStack(spacing: 14) {
                         Label(L10n.t("Isolated worktrees"), systemImage: "arrow.triangle.branch")
@@ -313,6 +351,69 @@ struct GeneralSettingsView: View {
             .frame(maxWidth: 780, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
         }
+    }
+
+    private func widthControl(
+        _ title: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>
+    ) -> some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textSecondary)
+                .frame(width: 100, alignment: .leading)
+            Slider(value: value, in: range)
+                .controlSize(.small)
+            Text("\(Int(value.wrappedValue)) pt")
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary)
+                .frame(width: 48, alignment: .trailing)
+                .contentTransition(.numericText())
+        }
+    }
+
+    private func layoutCard(_ preset: WorkspaceLayoutPreset) -> some View {
+        let selected = layout.currentPreset == preset
+        return Button {
+            withAnimation(VPMotion.smooth) {
+                layout.apply(preset)
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Image(systemName: preset.icon)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(selected ? VPTheme.accent : VPTheme.textTertiary)
+                    Spacer()
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 12))
+                        .foregroundStyle(selected ? VPTheme.accent : VPTheme.textTertiary)
+                }
+                Text(preset.title)
+                    .font(VPTheme.font(11.5, weight: .semibold))
+                    .foregroundStyle(VPTheme.textPrimary)
+                Text(preset.detail)
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(11)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                selected ? VPTheme.accent.opacity(0.09) : VPTheme.surface,
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(
+                        selected ? VPTheme.accent.opacity(0.28) : VPTheme.hairline,
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(VPPressableButtonStyle(scale: 0.99))
     }
 
     private func languageCard(_ option: AppLanguage) -> some View {

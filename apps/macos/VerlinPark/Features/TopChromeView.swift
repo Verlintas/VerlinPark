@@ -29,7 +29,9 @@ struct TopChromeView: View {
 
                 languageMenu
                 commandButton
-                inspectorButton
+                if !focusMode {
+                    inspectorButton
+                }
                 notificationsButton
                 shortcutsButton
                 focusButton
@@ -41,6 +43,7 @@ struct TopChromeView: View {
         .background {
             VPCrystalSurface(
                 tone: VPTheme.rail,
+                solidTone: VPTheme.solidRail,
                 tintOpacity: 0.62,
                 material: .thinMaterial
             )
@@ -246,18 +249,41 @@ struct TopChromeView: View {
         .help("Keyboard shortcuts · ⌘/")
     }
 
+    @ViewBuilder
     private var focusButton: some View {
-        Button {
-            withAnimation(motion(VPMotion.smooth)) {
-                focusMode.toggle()
+        if focusMode {
+            Button {
+                withAnimation(motion(VPMotion.smooth)) {
+                    focusMode = false
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                        .font(.system(size: 8, weight: .semibold))
+                    Text(L10n.t("Exit Focus"))
+                        .font(VPTheme.font(9, weight: .semibold))
+                }
+                .foregroundStyle(VPTheme.textPrimary)
+                .padding(.horizontal, 8)
+                .frame(height: 24)
+                .background(VPTheme.surface, in: Capsule())
+                .overlay {
+                    Capsule().strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
+                }
             }
-        } label: {
-            Image(systemName: focusMode
-                ? "arrow.down.right.and.arrow.up.left"
-                : "arrow.up.left.and.arrow.down.right")
+            .buttonStyle(VPPressableButtonStyle(scale: 0.96))
+            .help(L10n.t("Show the rail and studio · ⇧⌘F"))
+        } else {
+            Button {
+                withAnimation(motion(VPMotion.smooth)) {
+                    focusMode = true
+                }
+            } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+            }
+            .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
+            .help(L10n.t("Hide rail and studio · ⇧⌘F"))
         }
-        .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
-        .help(focusMode ? "Exit focus mode" : "Hide rail and studio · ⇧⌘F")
     }
 
     private var connectionLabel: String {

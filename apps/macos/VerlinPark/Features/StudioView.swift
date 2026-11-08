@@ -76,7 +76,7 @@ struct StudioView: View {
                 .padding(.vertical, 9)
             }
         }
-        .background { VPCrystalSurface(tone: VPTheme.rail, tintOpacity: 0.68) }
+        .background { VPCrystalSurface(tone: VPTheme.rail, solidTone: VPTheme.solidRail, tintOpacity: 0.68) }
         .sheet(isPresented: $showingOrgEditor) {
             OrgPresetSheet()
                 .environment(model)

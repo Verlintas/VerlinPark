@@ -1084,7 +1084,14 @@ animated connectors and a scrollable ten-mode Preview chip row; dashboard
 cards and settings panels use bounded hover elevation. `⌘K` opens a keyboard
 command palette for projects, all sessions, and global actions; `⇧⌘F` toggles
 focus mode; a slim draggable top chrome shows the breadcrumb, memory, command
-palette, and focus control. Settings is an eight-section sidebar shell with
+palette, and focus control. The rail and inspector are resizable, their widths
+and the window frame persist, and Balanced / Reading / Team presets apply
+deterministic layouts. The command palette ranks exact word prefixes, substrings,
+and subsequences with recent-command boosts and scope filters. The rail can pin
+sessions/projects and sort sessions by recency, status, or priority. Session
+search filters messages versus raw events and highlights matches. The
+notification center is a filterable, searchable, project-scoped inbox grouped by
+day with clear-read and per-notice actions. Settings is an eight-section sidebar shell with
 content transitions, persisted selection, and an English / Simplified Chinese
 language switch shared with the top chrome. Static and computed labels resolve
 through the same localization table (ADR-0117). Toasts are transient UI feedback;

@@ -5,7 +5,9 @@ struct RootView: View {
     @Environment(BrandStore.self) private var brand
     @Environment(MemoryMonitor.self) private var memory
     @Environment(LanguageStore.self) private var language
-    @Environment(\.openSettings) private var openSettings
+    @Environment(WindowStateStore.self) private var windowState
+    @Environment(WorkspaceLayoutStore.self) private var layoutStore
+    @Environment(WorkspaceCommandRouter.self) private var commandRouter
 
     @State private var showDashboard = false
     @State private var showNewSession = false
@@ -14,7 +16,6 @@ struct RootView: View {
     @State private var showNotifications = false
     @State private var showCommandPalette = false
     @State private var focusMode = false
-    @AppStorage("verlinpark.inspector.visible") private var inspectorVisible = true
     @State private var studioTab: StudioTab = .collab
 
     var body: some View {
@@ -44,8 +45,9 @@ struct RootView: View {
             }
             .overlay { commandPaletteOverlay }
             .overlay(alignment: .topTrailing) { toastOverlay }
-            .overlay(alignment: .topTrailing) { focusExitOverlay }
-            .background { keyboardShortcuts }
+            .onChange(of: commandRouter.sequence) { _, _ in
+                handle(commandRouter.lastCommand)
+            }
             .animation(VPMotion.snap, value: showCommandPalette)
             .animation(VPMotion.smooth, value: focusMode)
     }
@@ -54,48 +56,88 @@ struct RootView: View {
         ZStack {
             VPAmbientBackground()
 
-            HStack(spacing: 0) {
-                if !focusMode {
-                    RailView(
-                        showDashboard: $showDashboard,
-                        showCommandPalette: $showCommandPalette,
-                        showingNotifications: $showNotifications,
-                        showingNewSession: $showNewSession
-                    )
-                    .frame(width: 272)
-                    .transition(.vpSidebar)
-                    .vpAppear(index: 0, animation: VPMotion.smooth)
-
-                    Rectangle()
-                        .fill(VPTheme.hairline)
-                        .frame(width: 1)
-                        .transition(.opacity)
-                }
-
-                StageView(
-                    showingNewSession: $showNewSession,
-                    showingSearch: $showSearch,
-                    inspectorVisible: $inspectorVisible
+            GeometryReader { proxy in
+                let layout = WorkspaceLayout(
+                    railWidth: CGFloat(layoutStore.railWidth),
+                    inspectorWidth: CGFloat(layoutStore.inspectorWidth),
+                    inspectorVisible: layoutStore.inspectorVisible
                 )
-                .frame(maxWidth: .infinity)
-                .vpAppear(index: 1, animation: VPMotion.smooth)
+                .resolved(windowWidth: proxy.size.width, focusMode: focusMode)
 
-                if !focusMode, inspectorVisible {
-                    Rectangle()
-                        .fill(VPTheme.hairline)
-                        .frame(width: 1)
+                HStack(spacing: 0) {
+                    if layout.railVisible {
+                        RailView(
+                            showDashboard: $showDashboard,
+                            showCommandPalette: $showCommandPalette,
+                            showingNotifications: $showNotifications,
+                            showingNewSession: $showNewSession
+                        )
+                        .frame(width: layout.railWidth)
+                        .transition(.vpSidebar)
+                        .vpAppear(index: 0, animation: VPMotion.smooth)
+
+                        VPSplitHandle(
+                            value: railWidthBinding,
+                            range: WorkspaceLayout.railRange,
+                            direction: .rightIncreases,
+                            onReset: {
+                                layoutStore.railWidth = Double(WorkspaceLayout.defaultRailWidth)
+                            }
+                        )
+                        .transition(.opacity)
+                    }
+
+                    StageView(
+                        showingNewSession: $showNewSession,
+                        showingSearch: $showSearch,
+                        inspectorVisible: inspectorBinding
+                    )
+                    .frame(maxWidth: .infinity)
+                    .vpAppear(index: 1, animation: VPMotion.smooth)
+
+                    if layout.inspectorVisible {
+                        VPSplitHandle(
+                            value: inspectorWidthBinding,
+                            range: WorkspaceLayout.inspectorRange,
+                            direction: .leftIncreases,
+                            onReset: {
+                                layoutStore.inspectorWidth = Double(WorkspaceLayout.defaultInspectorWidth)
+                            }
+                        )
                         .transition(.opacity)
 
-                    StudioView(tab: $studioTab)
-                        .frame(width: 382)
-                        .transition(.vpInspector)
-                        .vpAppear(index: 2, animation: VPMotion.smooth)
+                        StudioView(tab: $studioTab)
+                            .frame(width: layout.inspectorWidth)
+                            .transition(.vpInspector)
+                            .vpAppear(index: 2, animation: VPMotion.smooth)
+                    }
                 }
+                .padding(.top, 36)
+                .animation(VPMotion.smooth, value: focusMode)
+                .animation(VPMotion.smooth, value: layoutStore.inspectorVisible)
             }
-            .padding(.top, 36)
-            .animation(VPMotion.smooth, value: focusMode)
-            .animation(VPMotion.smooth, value: inspectorVisible)
         }
+    }
+
+    private var railWidthBinding: Binding<CGFloat> {
+        Binding(
+            get: { CGFloat(layoutStore.railWidth) },
+            set: { layoutStore.railWidth = Double($0) }
+        )
+    }
+
+    private var inspectorWidthBinding: Binding<CGFloat> {
+        Binding(
+            get: { CGFloat(layoutStore.inspectorWidth) },
+            set: { layoutStore.inspectorWidth = Double($0) }
+        )
+    }
+
+    private var inspectorBinding: Binding<Bool> {
+        Binding(
+            get: { layoutStore.inspectorVisible },
+            set: { layoutStore.inspectorVisible = $0 }
+        )
     }
 
     private var windowConfiguration: some View {
@@ -107,6 +149,7 @@ struct RootView: View {
             window.isOpaque = false
             window.backgroundColor = .clear
             window.isMovableByWindowBackground = true
+            windowState.install(window)
         }
     }
 
@@ -114,7 +157,7 @@ struct RootView: View {
         TopChromeView(
             showCommandPalette: $showCommandPalette,
             focusMode: $focusMode,
-            inspectorVisible: $inspectorVisible,
+            inspectorVisible: inspectorBinding,
             openShortcuts: { showShortcuts = true },
             openNotifications: { showNotifications = true }
         )
@@ -166,8 +209,20 @@ struct RootView: View {
                 openSearch: { showSearch = true },
                 openShortcuts: { showShortcuts = true },
                 openNotifications: { showNotifications = true },
-                toggleInspector: { inspectorVisible.toggle() },
-                toggleFocusMode: { focusMode.toggle() }
+                toggleInspector: { layoutStore.inspectorVisible.toggle() },
+                toggleFocusMode: { focusMode.toggle() },
+                resetLayout: {
+                    windowState.reset()
+                    layoutStore.reset()
+                },
+                applyLayoutPreset: { preset in
+                    layoutStore.apply(preset)
+                },
+                toggleLanguage: {
+                    language.select(
+                        language.language == .english ? .simplifiedChinese : .english
+                    )
+                }
             )
             .environment(model)
             .environment(brand)
@@ -183,45 +238,48 @@ struct RootView: View {
             .zIndex(30)
     }
 
-    @ViewBuilder
-    private var focusExitOverlay: some View {
-        if focusMode {
-            Button {
-                withAnimation(VPMotion.smooth) {
+    private func handle(_ command: WorkspaceCommand?) {
+        guard let command else { return }
+        switch command {
+        case .commandPalette:
+            showCommandPalette = true
+        case .newSession:
+            showNewSession = true
+        case .search:
+            showSearch = true
+        case .dashboard:
+            showDashboard = true
+        case .notifications:
+            showNotifications = true
+        case .shortcuts:
+            showShortcuts = true
+        case .focusMode:
+            withAnimation(VPMotion.smooth) {
+                focusMode.toggle()
+            }
+        case .inspector:
+            withAnimation(VPMotion.smooth) {
+                if focusMode {
                     focusMode = false
-                }
-            } label: {
-                Label("Exit Focus", systemImage: "arrow.down.right.and.arrow.up.left")
-            }
-            .buttonStyle(VPGlassIconButtonStyle(size: 30, tint: .secondary))
-            .padding(.top, 40)
-            .padding(.trailing, 18)
-            .transition(.vpScaleFade)
-            .help("Show the rail and studio")
-        }
-    }
-
-    private var keyboardShortcuts: some View {
-        ZStack {
-            Button("") { showCommandPalette = true }
-                .keyboardShortcut("k", modifiers: .command)
-            Button("") {
-                withAnimation(VPMotion.smooth) {
-                    focusMode.toggle()
+                    layoutStore.inspectorVisible = true
+                } else {
+                    layoutStore.inspectorVisible.toggle()
                 }
             }
-            .keyboardShortcut("f", modifiers: [.command, .shift])
-            Button("") { showNewSession = true }
-                .keyboardShortcut("n", modifiers: .command)
-            Button("") { showDashboard = true }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
-            Button("") { showShortcuts = true }
-                .keyboardShortcut("/", modifiers: .command)
-            Button("") { inspectorVisible.toggle() }
-                .keyboardShortcut("i", modifiers: [.command, .option])
+        case .resetLayout:
+            withAnimation(VPMotion.smooth) {
+                focusMode = false
+            }
+            layoutStore.reset()
+            windowState.reset()
+        case .addProject:
+            Task { await model.addProject() }
+        case .refresh:
+            Task { await model.refresh() }
+        case .toggleLanguage:
+            language.select(
+                language.language == .english ? .simplifiedChinese : .english
+            )
         }
-        .opacity(0)
-        .frame(width: 0, height: 0)
-        .accessibilityHidden(true)
     }
 }

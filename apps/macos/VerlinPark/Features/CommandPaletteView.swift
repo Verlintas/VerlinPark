@@ -8,6 +8,7 @@ struct CommandPaletteView: View {
     @Environment(BrandStore.self) private var brand
     @Environment(\.openSettings) private var openSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Binding var isPresented: Bool
     let openDashboard: () -> Void
     let openNewSession: () -> Void
@@ -16,21 +17,34 @@ struct CommandPaletteView: View {
     let openNotifications: () -> Void
     let toggleInspector: () -> Void
     let toggleFocusMode: () -> Void
+    let resetLayout: () -> Void
+    let applyLayoutPreset: (WorkspaceLayoutPreset) -> Void
+    let toggleLanguage: () -> Void
 
     @State private var query = ""
     @State private var selectedIndex = 0
+    @State private var recents = PaletteRecents.load()
+    @State private var scope: PaletteScope = .all
     @State private var hoveringID: String?
     @FocusState private var queryFocused: Bool
     @Namespace private var selectionNamespace
 
     var body: some View {
         ZStack(alignment: .top) {
-            Rectangle()
-                .fill(VPTheme.canvas.opacity(0.62))
-                .background(.ultraThinMaterial)
-                .ignoresSafeArea()
-                .onTapGesture { close() }
-                .transition(.opacity)
+            Group {
+                if reduceTransparency {
+                    Rectangle()
+                        .fill(VPTheme.solidCanvas)
+                        .ignoresSafeArea()
+                } else {
+                    Rectangle()
+                        .fill(VPTheme.canvas.opacity(0.62))
+                        .background(.ultraThinMaterial)
+                        .ignoresSafeArea()
+                }
+            }
+            .onTapGesture { close() }
+            .transition(.opacity)
 
             palette
                 .padding(.top, 96)
@@ -48,6 +62,9 @@ struct CommandPaletteView: View {
         .onChange(of: query) { _, _ in
             selectedIndex = 0
         }
+        .onChange(of: scope) { _, _ in
+            selectedIndex = 0
+        }
         .task {
             await model.loadAllSessions()
         }
@@ -56,6 +73,7 @@ struct CommandPaletteView: View {
     private var palette: some View {
         VStack(spacing: 0) {
             searchHeader
+            scopeBar
             VPGradientRule()
                 .frame(height: 1)
             results
@@ -135,26 +153,71 @@ struct CommandPaletteView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
-                    ForEach(Array(filteredItems.enumerated()), id: \.element.id) { index, item in
+                    ForEach(Array(rankedItems.enumerated()), id: \.element.id) { index, item in
                         row(item, selected: index == selectedIndex)
                             .id(item.id)
                             .transition(.vpContent)
                     }
-                    if filteredItems.isEmpty {
+                    if rankedItems.isEmpty {
                         emptyState
                     }
                 }
                 .padding(10)
-                .animation(VPMotion.smooth, value: filteredItems.count)
+                .animation(VPMotion.smooth, value: rankedItems.count)
             }
             .onChange(of: selectedIndex) { _, newValue in
-                guard filteredItems.indices.contains(newValue) else { return }
+                guard rankedItems.indices.contains(newValue) else { return }
                 withAnimation(VPMotion.resolved(VPMotion.hover, reduceMotion: reduceMotion)) {
-                    proxy.scrollTo(filteredItems[newValue].id, anchor: .center)
+                    proxy.scrollTo(rankedItems[newValue].id, anchor: .center)
                 }
             }
         }
         .frame(maxHeight: 380)
+    }
+
+    private var scopeBar: some View {
+        HStack(spacing: 4) {
+            ForEach(PaletteScope.allCases) { candidate in
+                let selected = scope == candidate
+                Button {
+                    withAnimation(VPMotion.snap) {
+                        scope = candidate
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        if let icon = candidate.icon {
+                            Image(systemName: icon)
+                                .font(.system(size: 7, weight: .semibold))
+                        }
+                        Text(candidate.title)
+                            .font(VPTheme.mono(8, weight: .medium))
+                        let count = candidate.count(in: items)
+                        if count > 0 {
+                            Text("\(count)")
+                                .font(VPTheme.mono(7))
+                                .foregroundStyle(selected ? VPTheme.accent : VPTheme.textTertiary)
+                        }
+                    }
+                    .foregroundStyle(selected ? VPTheme.textPrimary : VPTheme.textSecondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background {
+                        Capsule()
+                            .fill(selected ? VPTheme.accent.opacity(0.10) : .clear)
+                            .overlay {
+                                Capsule().strokeBorder(
+                                    selected ? VPTheme.accent.opacity(0.22) : .clear,
+                                    lineWidth: 1
+                                )
+                            }
+                    }
+                }
+                .buttonStyle(VPPressableButtonStyle(scale: 0.97))
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
     }
 
     private var emptyState: some View {
@@ -178,7 +241,7 @@ struct CommandPaletteView: View {
             PaletteKeyCap("↵")
             Text("open")
             Spacer()
-            Text("\(filteredItems.count) result\(filteredItems.count == 1 ? "" : "s")")
+            Text("\(rankedItems.count) result\(rankedItems.count == 1 ? "" : "s")")
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .contentTransition(.numericText())
@@ -189,8 +252,9 @@ struct CommandPaletteView: View {
         .padding(.vertical, 9)
     }
 
-    private func row(_ item: PaletteItem, selected: Bool) -> some View {
-        Button {
+    private func row(_ result: RankedPaletteItem, selected: Bool) -> some View {
+        let item = result.item
+        return Button {
             execute(item)
         } label: {
             HStack(spacing: 11) {
@@ -201,16 +265,21 @@ struct CommandPaletteView: View {
                     .background(item.tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(L10n.t(item.title))
+                    VPHighlightedText(text: result.title, ranges: result.titleRanges)
                         .font(.system(size: 12, weight: .medium))
                         .lineLimit(1)
-                    Text(L10n.t(item.subtitle))
+                    VPHighlightedText(text: result.subtitle, ranges: result.subtitleRanges)
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
 
                 Spacer(minLength: 8)
+                if query.isEmpty, recents.contains(item.id) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
                 Text(item.kindLabel)
                     .font(.system(size: 8, weight: .medium, design: .monospaced))
                     .foregroundStyle(item.tint.opacity(0.85))
@@ -255,16 +324,42 @@ struct CommandPaletteView: View {
         .animation(VPMotion.hover, value: hoveringID)
     }
 
-    private var filteredItems: [PaletteItem] {
-        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return items }
-        return items.filter {
-            L10n.t($0.title).localizedCaseInsensitiveContains(query)
-                || $0.title.localizedCaseInsensitiveContains(query)
-                || L10n.t($0.subtitle).localizedCaseInsensitiveContains(query)
-                || $0.subtitle.localizedCaseInsensitiveContains(query)
-                || $0.keywords.localizedCaseInsensitiveContains(query)
+    private struct RankedPaletteItem: Identifiable {
+        let item: PaletteItem
+        let title: String
+        let subtitle: String
+        let titleRanges: [Range<Int>]
+        let subtitleRanges: [Range<Int>]
+
+        var id: String {
+            item.id
         }
+    }
+
+    private var rankedItems: [RankedPaletteItem] {
+        let sourceItems = items.filter { scope.includes($0.kind) }
+        let candidates = sourceItems.map {
+            CommandPaletteCandidate(
+                id: $0.id,
+                title: L10n.t($0.title),
+                subtitle: L10n.t($0.subtitle),
+                keywords: "\($0.keywords) \($0.title) \($0.subtitle)"
+            )
+        }
+        let byID = Dictionary(uniqueKeysWithValues: sourceItems.map { ($0.id, $0) })
+        return CommandPaletteRanker.rank(candidates, query: query, recents: recents)
+            .compactMap { match in
+                guard let item = byID[match.id],
+                      let candidate = candidates.first(where: { $0.id == match.id })
+                else { return nil }
+                return RankedPaletteItem(
+                    item: item,
+                    title: candidate.title,
+                    subtitle: candidate.subtitle,
+                    titleRanges: match.titleRanges,
+                    subtitleRanges: match.subtitleRanges
+                )
+            }
     }
 
     private var items: [PaletteItem] {
@@ -374,6 +469,71 @@ struct CommandPaletteView: View {
                 }
             ),
             PaletteItem(
+                id: "action-reset-layout",
+                title: "Reset Window Layout",
+                subtitle: "Restore the default rail, inspector, and window size",
+                icon: "rectangle.3.group",
+                tint: VPTheme.info,
+                kind: .action,
+                keywords: "layout window size reset rail inspector",
+                action: {
+                    close()
+                    resetLayout()
+                }
+            ),
+            PaletteItem(
+                id: "action-layout-balanced",
+                title: "Balanced Layout",
+                subtitle: "Rail, stage, and inspector in balance",
+                icon: "rectangle.split.3x1",
+                tint: VPTheme.accent,
+                kind: .action,
+                keywords: "layout balanced workspace",
+                action: {
+                    close()
+                    applyLayoutPreset(.balanced)
+                }
+            ),
+            PaletteItem(
+                id: "action-layout-reading",
+                title: "Reading Layout",
+                subtitle: "Hide the inspector and widen the transcript",
+                icon: "rectangle.leadinghalf.inset.filled",
+                tint: VPTheme.info,
+                kind: .action,
+                keywords: "layout reading focus transcript inspector hide",
+                action: {
+                    close()
+                    applyLayoutPreset(.reading)
+                }
+            ),
+            PaletteItem(
+                id: "action-layout-team",
+                title: "Team Layout",
+                subtitle: "Widen the inspector for Collab and Preview",
+                icon: "rectangle.trailinghalf.inset.filled",
+                tint: VPTheme.plan,
+                kind: .action,
+                keywords: "layout team collab preview inspector wide",
+                action: {
+                    close()
+                    applyLayoutPreset(.team)
+                }
+            ),
+            PaletteItem(
+                id: "action-language",
+                title: "Switch Language",
+                subtitle: "Toggle English / 简体中文",
+                icon: "globe",
+                tint: VPTheme.plan,
+                kind: .action,
+                keywords: "language locale english chinese 简体 中文",
+                action: {
+                    close()
+                    toggleLanguage()
+                }
+            ),
+            PaletteItem(
                 id: "action-new-project",
                 title: "Add Project",
                 subtitle: "Choose a local repository",
@@ -434,19 +594,20 @@ struct CommandPaletteView: View {
     }
 
     private func move(_ delta: Int) {
-        guard !filteredItems.isEmpty else { return }
+        guard !rankedItems.isEmpty else { return }
         selectedIndex = min(
             max(0, selectedIndex + delta),
-            filteredItems.count - 1
+            rankedItems.count - 1
         )
     }
 
     private func executeSelected() {
-        guard filteredItems.indices.contains(selectedIndex) else { return }
-        execute(filteredItems[selectedIndex])
+        guard rankedItems.indices.contains(selectedIndex) else { return }
+        execute(rankedItems[selectedIndex].item)
     }
 
     private func execute(_ item: PaletteItem) {
+        recents = PaletteRecents.record(item.id, in: recents)
         item.action()
     }
 
@@ -454,6 +615,48 @@ struct CommandPaletteView: View {
         withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
             isPresented = false
         }
+    }
+}
+
+private enum PaletteScope: String, CaseIterable, Identifiable {
+    case all
+    case actions
+    case projects
+    case sessions
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .all: L10n.t("All")
+        case .actions: L10n.t("Actions")
+        case .projects: L10n.t("Projects")
+        case .sessions: L10n.t("Sessions")
+        }
+    }
+
+    var icon: String? {
+        switch self {
+        case .all: nil
+        case .actions: "command"
+        case .projects: "folder"
+        case .sessions: "bubble.left.and.bubble.right"
+        }
+    }
+
+    func includes(_ kind: PaletteItem.Kind) -> Bool {
+        switch self {
+        case .all: true
+        case .actions: kind == .action
+        case .projects: kind == .project
+        case .sessions: kind == .session
+        }
+    }
+
+    func count(in items: [PaletteItem]) -> Int {
+        items.count(where: { includes($0.kind) })
     }
 }
 

@@ -31,6 +31,7 @@ final class AppModel {
     var projects: [Project] = []
     var sessions: [Session] = []
     var allSessions: [Session] = []
+    var allSessionsComplete = false
     var events: [Event] = []
     var selectedProjectID: String?
     var selectedSessionID: String?
@@ -695,10 +696,23 @@ final class AppModel {
         updateDockBadge()
     }
 
+    func clearReadNotices() {
+        notices.removeAll { $0.isRead }
+        saveNotices()
+        updateDockBadge()
+    }
+
+    func removeNotice(_ id: String) {
+        notices.removeAll { $0.id == id }
+        saveNotices()
+        updateDockBadge()
+    }
+
     func loadAllSessions() async {
         guard connection == .connected else { return }
         do {
             allSessions = try await core.listSessions(projectID: nil)
+            allSessionsComplete = true
             sessionDirectory = Dictionary(
                 uniqueKeysWithValues: allSessions.map {
                     ($0.id, SessionDirectoryEntry(projectId: $0.projectId, goal: $0.goal))
@@ -706,6 +720,7 @@ final class AppModel {
             )
         } catch {
             allSessions = sessions
+            allSessionsComplete = false
         }
     }
 

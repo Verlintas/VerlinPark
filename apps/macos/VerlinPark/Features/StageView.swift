@@ -30,7 +30,9 @@ struct StageView: View {
         .transition(.vpScaleFade)
         .animation(VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion), value: model.mode)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background { VPCrystalSurface(tone: VPTheme.canvas, tintOpacity: 0.56) }
+        .background {
+            VPCrystalSurface(tone: VPTheme.canvas, solidTone: VPTheme.solidCanvas, tintOpacity: 0.56)
+        }
     }
 }
 
@@ -191,7 +193,6 @@ private struct ProjectStageView: View {
                     Image(systemName: "magnifyingglass")
                 }
                 .buttonStyle(VPGlassIconButtonStyle(size: 26))
-                .keyboardShortcut("f", modifiers: .command)
                 .help("Search messages and events · ⌘F")
 
                 Menu {

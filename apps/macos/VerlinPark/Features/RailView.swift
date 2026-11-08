@@ -1,26 +1,25 @@
+import AppKit
 import SwiftUI
 
 /// Pure presentation helpers for the navigation rail. Keeping grouping and
 /// ordering here makes the sidebar behavior testable without a running daemon.
 enum RailSessionList {
-    static func sorted(_ sessions: [Session], projectID: String) -> [Session] {
-        sessions
-            .filter { $0.projectId == projectID }
-            .sorted {
-                if $0.createdAt == $1.createdAt {
-                    return $0.id > $1.id
-                }
-                return $0.createdAt > $1.createdAt
-            }
+    static func sorted(
+        _ sessions: [Session],
+        projectID: String,
+        sort: RailSessionSort = .recent
+    ) -> [Session] {
+        sort.sorted(sessions, projectID: projectID)
     }
 
     static func visible(
         _ sessions: [Session],
         projectID: String,
         expanded: Bool,
+        sort: RailSessionSort = .recent,
         limit: Int = 6
     ) -> [Session] {
-        let sorted = sorted(sessions, projectID: projectID)
+        let sorted = sorted(sessions, projectID: projectID, sort: sort)
         guard !expanded else { return sorted }
         return Array(sorted.prefix(max(0, limit)))
     }
@@ -33,10 +32,87 @@ enum RailSessionList {
     }
 }
 
+enum RailSessionSort: String, CaseIterable, Identifiable, Sendable {
+    case recent
+    case status
+    case priority
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .recent: L10n.t("Recent")
+        case .status: L10n.t("Status")
+        case .priority: L10n.t("Priority")
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .recent: "clock"
+        case .status: "circle.dashed"
+        case .priority: "flag"
+        }
+    }
+
+    func sorted(_ sessions: [Session], projectID: String) -> [Session] {
+        let filtered = sessions.filter { $0.projectId == projectID }
+        switch self {
+        case .recent:
+            return filtered.sorted(by: Self.recentOrder)
+        case .status:
+            return filtered.sorted { lhs, rhs in
+                let left = Self.statusRank(lhs.status)
+                let right = Self.statusRank(rhs.status)
+                if left != right {
+                    return left < right
+                }
+                return Self.recentOrder(lhs, rhs)
+            }
+        case .priority:
+            return filtered.sorted { lhs, rhs in
+                let left = lhs.priority ?? 0
+                let right = rhs.priority ?? 0
+                if left != right {
+                    return left > right
+                }
+                return Self.recentOrder(lhs, rhs)
+            }
+        }
+    }
+
+    private static func recentOrder(_ lhs: Session, _ rhs: Session) -> Bool {
+        if lhs.createdAt == rhs.createdAt {
+            return lhs.id > rhs.id
+        }
+        return lhs.createdAt > rhs.createdAt
+    }
+
+    private static func statusRank(_ status: String) -> Int {
+        switch status.lowercased() {
+        case "running", "verifying", "merging", "queued", "paused", "waiting_input":
+            0
+        case "idle", "draft", "waiting":
+            1
+        case "done", "completed", "landed", "merged":
+            2
+        case "conflict", "changes_requested":
+            3
+        case "failed", "cancelled", "interrupted", "blocked":
+            4
+        default:
+            5
+        }
+    }
+}
+
 struct RailView: View {
     @Environment(AppModel.self) private var model
     @Environment(BrandStore.self) private var brand
     @Environment(MemoryMonitor.self) private var memory
+    @Environment(PinnedItemsStore.self) private var pinnedStore
     @Environment(\.openSettings) private var openSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -51,6 +127,7 @@ struct RailView: View {
     @State private var hoveredAction: String?
     @State private var expandedProjects: Set<String> = []
     @State private var fullyExpandedProjects: Set<String> = []
+    @AppStorage("verlinpark.rail.sort") private var sortRawValue = RailSessionSort.recent.rawValue
     @Namespace private var selectionNamespace
 
     var body: some View {
@@ -100,7 +177,7 @@ struct RailView: View {
             .padding(.top, 9)
             .padding(.bottom, 12)
         }
-        .background { VPCrystalSurface(tone: VPTheme.rail, tintOpacity: 0.70) }
+        .background { VPCrystalSurface(tone: VPTheme.rail, solidTone: VPTheme.solidRail, tintOpacity: 0.70) }
         .onAppear {
             if let id = model.selectedProjectID {
                 expandedProjects.insert(id)
@@ -119,6 +196,37 @@ struct RailView: View {
                 _ = expandedProjects.insert(first)
             }
         }
+        .task {
+            await model.loadAllSessions()
+            guard model.connection == .connected, model.allSessionsComplete else { return }
+            pinnedStore.prune(
+                validSessionIDs: Set(model.allSessions.map(\.id)),
+                validProjectIDs: Set(model.projects.map(\.id))
+            )
+        }
+    }
+
+    private var pinnedSessions: [Session] {
+        let source = model.allSessions.isEmpty ? model.sessions : model.allSessions
+        let byID = Dictionary(uniqueKeysWithValues: source.map { ($0.id, $0) })
+        return pinnedStore.sessionIDs.compactMap { byID[$0] }
+    }
+
+    private var sessionSort: RailSessionSort {
+        RailSessionSort(rawValue: sortRawValue) ?? .recent
+    }
+
+    private var orderedProjects: [Project] {
+        model.projects.enumerated()
+            .sorted { lhs, rhs in
+                let leftPinned = pinnedStore.isPinnedProject(lhs.element.id)
+                let rightPinned = pinnedStore.isPinnedProject(rhs.element.id)
+                if leftPinned != rightPinned {
+                    return leftPinned
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
     }
 
     // MARK: Header
@@ -254,6 +362,31 @@ struct RailView: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     VPKicker(text: "Projects", trailing: "\(model.projects.count)")
+                    Menu {
+                        ForEach(RailSessionSort.allCases) { sort in
+                            Button {
+                                withAnimation(motion(VPMotion.snap)) {
+                                    sortRawValue = sort.rawValue
+                                }
+                            } label: {
+                                Label(
+                                    sort.title,
+                                    systemImage: sessionSort == sort ? "checkmark" : sort.icon
+                                )
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .frame(width: 18, height: 18)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help(L10n.t("Sort sessions"))
+                    .buttonStyle(VPPressableButtonStyle(scale: 0.9))
+
                     Button {
                         Task { await model.addProject() }
                     } label: {
@@ -268,7 +401,24 @@ struct RailView: View {
                 .padding(.horizontal, 10)
                 .padding(.bottom, 5)
 
-                ForEach(Array(model.projects.enumerated()), id: \.element.id) { index, project in
+                if !pinnedSessions.isEmpty {
+                    VPKicker(text: "Pinned", trailing: "\(pinnedSessions.count)")
+                        .padding(.horizontal, 10)
+                        .padding(.top, 2)
+                        .padding(.bottom, 2)
+
+                    ForEach(pinnedSessions) { session in
+                        if let project = model.projects.first(where: { $0.id == session.projectId }) {
+                            sessionRow(session, project: project)
+                        }
+                    }
+
+                    VPHairline()
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
+                }
+
+                ForEach(Array(orderedProjects.enumerated()), id: \.element.id) { index, project in
                     projectGroup(project, index: index)
                 }
 
@@ -289,9 +439,14 @@ struct RailView: View {
         let sessions = RailSessionList.visible(
             model.sessions,
             projectID: project.id,
-            expanded: showAll
+            expanded: showAll,
+            sort: sessionSort
         )
-        let total = RailSessionList.sorted(model.sessions, projectID: project.id).count
+        let total = RailSessionList.sorted(
+            model.sessions,
+            projectID: project.id,
+            sort: sessionSort
+        ).count
         let active = RailSessionList.activeCount(model.sessions, projectID: project.id)
         let tint = VPTheme.projectTint(seed: project.id)
 
@@ -344,6 +499,12 @@ struct RailView: View {
 
                     Spacer(minLength: 4)
 
+                    if pinnedStore.isPinnedProject(project.id) {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 7, weight: .semibold))
+                            .foregroundStyle(tint)
+                    }
+
                     Image(systemName: "chevron.right")
                         .font(.system(size: 7, weight: .bold))
                         .foregroundStyle(VPTheme.textTertiary)
@@ -378,6 +539,35 @@ struct RailView: View {
             .animation(motion(VPMotion.hover), value: hoveredProjectID)
             .animation(motion(VPMotion.snap), value: selected)
             .vpAppear(index: index + 3, animation: VPMotion.smooth)
+            .contextMenu {
+                Button(L10n.t("Open")) {
+                    model.selectProject(project.id)
+                    withAnimation(motion(VPMotion.smooth)) {
+                        _ = expandedProjects.insert(project.id)
+                    }
+                }
+                Button(L10n.t("New Session")) {
+                    model.selectProject(project.id)
+                    showingNewSession = true
+                }
+                Divider()
+                Button(L10n.t("Copy Project Path")) {
+                    copyToPasteboard(project.root)
+                }
+                Button(L10n.t("Reveal Project in Finder")) {
+                    NSWorkspace.shared.activateFileViewerSelecting([
+                        URL(fileURLWithPath: project.root),
+                    ])
+                }
+                Divider()
+                Button(
+                    pinnedStore.isPinnedProject(project.id)
+                        ? L10n.t("Unpin Project")
+                        : L10n.t("Pin Project")
+                ) {
+                    pinnedStore.toggleProject(project.id)
+                }
+            }
 
             if expanded {
                 VStack(spacing: 1) {
@@ -475,6 +665,91 @@ struct RailView: View {
         .animation(motion(VPMotion.hover), value: hoveredSessionID)
         .animation(motion(VPMotion.snap), value: selected)
         .help("\(session.goal) · \(session.status)")
+        .contextMenu {
+            Button(L10n.t("Open")) {
+                openSession(session)
+            }
+            if session.status == "running" {
+                Button(L10n.t("Pause")) {
+                    openSession(session)
+                    Task { await model.pauseSession() }
+                }
+            }
+            if session.status == "paused" {
+                Button(L10n.t("Resume")) {
+                    openSession(session)
+                    Task { await model.resumeSession() }
+                }
+            }
+            if ["running", "paused", "queued"].contains(session.status) {
+                Button(L10n.t("Stop"), role: .destructive) {
+                    openSession(session)
+                    Task { await model.cancelSession() }
+                }
+            }
+            Divider()
+            Menu(L10n.t("Priority")) {
+                Button(L10n.t("Low (-10)")) {
+                    openSession(session)
+                    Task { await model.setSessionPriority(-10) }
+                }
+                Button(L10n.t("Normal (0)")) {
+                    openSession(session)
+                    Task { await model.setSessionPriority(0) }
+                }
+                Button(L10n.t("High (10)")) {
+                    openSession(session)
+                    Task { await model.setSessionPriority(10) }
+                }
+                Button(L10n.t("Urgent (50)")) {
+                    openSession(session)
+                    Task { await model.setSessionPriority(50) }
+                }
+            }
+            Divider()
+            Button(L10n.t("Export Transcript…")) {
+                openSession(session)
+                Task { await model.exportTranscript() }
+            }
+            Button(L10n.t("Copy Session ID")) {
+                copyToPasteboard(session.id)
+            }
+            Button(L10n.t("Copy Goal")) {
+                copyToPasteboard(session.goal)
+            }
+            Button(
+                pinnedStore.isPinnedSession(session.id)
+                    ? L10n.t("Unpin Session")
+                    : L10n.t("Pin Session")
+            ) {
+                pinnedStore.toggleSession(session.id)
+            }
+            if let branch = session.branch {
+                Button(L10n.t("Copy Branch")) {
+                    copyToPasteboard(branch)
+                }
+            }
+            if let worktree = session.worktree {
+                Button(L10n.t("Reveal Worktree")) {
+                    NSWorkspace.shared.activateFileViewerSelecting([
+                        URL(fileURLWithPath: worktree),
+                    ])
+                }
+            }
+        }
+    }
+
+    private func openSession(_ session: Session) {
+        if model.selectedProjectID != session.projectId {
+            model.selectProject(session.projectId)
+        }
+        model.selectSession(session.id)
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(value, forType: .string)
     }
 
     private var emptyProjects: some View {

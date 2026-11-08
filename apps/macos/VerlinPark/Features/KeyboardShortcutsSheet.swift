@@ -33,6 +33,11 @@ enum KeyboardShortcutsCatalog {
                         key: "I",
                         modifiers: [.command, .option]
                     ),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Reset window layout"),
+                        key: "0",
+                        modifiers: [.command, .option]
+                    ),
                     KeyboardShortcutEntry(title: L10n.t("Search messages"), key: "F", modifiers: [.command]),
                     KeyboardShortcutEntry(
                         title: L10n.t("Refresh current panel"),

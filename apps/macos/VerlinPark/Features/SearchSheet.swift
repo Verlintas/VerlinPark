@@ -4,6 +4,7 @@ struct SearchSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var scopeToProject = true
+    @State private var results = SearchResultsModel()
     @FocusState private var queryFocused: Bool
 
     var body: some View {
@@ -51,51 +52,62 @@ struct SearchSheet: View {
             .padding(.vertical, 9)
             .vpFieldSurface(radius: 10, focused: queryFocused)
 
-            if model.searchHits.isEmpty {
-                VStack(spacing: 6) {
+            sourceFilters
+
+            if visibleHits.isEmpty {
+                VStack(spacing: 7) {
                     VPFloatingSymbol(name: "text.magnifyingglass", size: 22, tint: .secondary)
                     Text(
                         model.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            ? "Type a query to search across sessions."
-                            : "No matches yet."
+                            ? L10n.t("Type a query to search across sessions.")
+                            : L10n.t("No matches in this source.")
                     )
                     .font(VPTheme.mono(9))
                     .foregroundStyle(VPTheme.textSecondary)
+                    if !model.searchHits.isEmpty, results.source != .all {
+                        Button(L10n.t("Show all sources")) {
+                            withAnimation(VPMotion.snap) {
+                                results.source = .all
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 6) {
-                        ForEach(Array(model.searchHits.enumerated()), id: \.element.id) { index, hit in
+                        ForEach(Array(visibleHits.enumerated()), id: \.element.id) { index, hit in
                             Button {
                                 Task {
                                     await model.openSearchHit(hit)
                                     dismiss()
                                 }
                             } label: {
-                                SearchHitRow(hit: hit)
+                                SearchHitRow(hit: hit, query: model.searchQuery)
                             }
                             .buttonStyle(VPPressableButtonStyle(scale: 0.99))
                             .transition(.vpRise)
                             .vpAppear(index: index)
                         }
                     }
-                    .animation(VPMotion.smooth, value: model.searchHits.count)
+                    .animation(VPMotion.smooth, value: visibleHits.count)
                 }
             }
 
             HStack {
                 Text(
                     model.searchTruncated
-                        ? "Showing the newest matches. Narrow the query for more precision."
-                        : "\(model.searchHits.count) match\(model.searchHits.count == 1 ? "" : "es")"
+                        ? L10n.t("Showing the newest matches. Narrow the query for more precision.")
+                        : "\(visibleHits.count) / \(model.searchHits.count) match\(model.searchHits.count == 1 ? "" : "es")"
                 )
                 .font(VPTheme.mono(8))
                 .foregroundStyle(VPTheme.textTertiary)
                 .contentTransition(.numericText())
                 .animation(VPMotion.snap, value: model.searchHits.count)
                 Spacer()
-                Button("Close") {
+                Button(L10n.t("Close")) {
                     dismiss()
                 }
                 .keyboardShortcut(.cancelAction)
@@ -123,6 +135,53 @@ struct SearchSheet: View {
         }
     }
 
+    private var visibleHits: [SearchHit] {
+        results.visible(model.searchHits)
+    }
+
+    private var sourceFilters: some View {
+        let counts = results.counts(model.searchHits)
+        return HStack(spacing: 4) {
+            ForEach(SearchSourceFilter.allCases) { filter in
+                let selected = results.source == filter
+                Button {
+                    withAnimation(VPMotion.snap) {
+                        results.source = filter
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        if let icon = filter.icon {
+                            Image(systemName: icon)
+                                .font(.system(size: 7, weight: .semibold))
+                        }
+                        Text(filter.title)
+                            .font(VPTheme.mono(8, weight: .medium))
+                        if let count = counts[filter], count > 0 {
+                            Text("\(count)")
+                                .font(VPTheme.mono(7, weight: .semibold))
+                                .foregroundStyle(selected ? VPTheme.accent : VPTheme.textTertiary)
+                        }
+                    }
+                    .foregroundStyle(selected ? VPTheme.textPrimary : VPTheme.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background {
+                        Capsule()
+                            .fill(selected ? VPTheme.accent.opacity(0.10) : VPTheme.surface.opacity(0.45))
+                            .overlay {
+                                Capsule().strokeBorder(
+                                    selected ? VPTheme.accent.opacity(0.24) : .clear,
+                                    lineWidth: 1
+                                )
+                            }
+                    }
+                }
+                .buttonStyle(VPPressableButtonStyle(scale: 0.97))
+            }
+            Spacer()
+        }
+    }
+
     private var debounceKey: String {
         "\(scopeToProject)-\(model.searchQuery)"
     }
@@ -134,6 +193,7 @@ struct SearchSheet: View {
 
 private struct SearchHitRow: View {
     let hit: SearchHit
+    let query: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -155,15 +215,21 @@ private struct SearchHitRow: View {
                     .font(VPTheme.mono(8))
                     .foregroundStyle(VPTheme.textTertiary)
             }
-            Text(hit.sessionGoal)
-                .font(VPTheme.font(11, weight: .medium))
-                .foregroundStyle(VPTheme.textPrimary)
-                .lineLimit(1)
-            Text(hit.snippet)
-                .font(VPTheme.mono(9))
-                .foregroundStyle(VPTheme.textSecondary)
-                .lineLimit(3)
-                .multilineTextAlignment(.leading)
+            VPHighlightedText(
+                text: hit.sessionGoal,
+                ranges: SearchResultsModel.ranges(of: query, in: hit.sessionGoal)
+            )
+            .font(VPTheme.font(11, weight: .medium))
+            .foregroundStyle(VPTheme.textPrimary)
+            .lineLimit(1)
+            VPHighlightedText(
+                text: hit.snippet,
+                ranges: SearchResultsModel.ranges(of: query, in: hit.snippet)
+            )
+            .font(VPTheme.mono(9))
+            .foregroundStyle(VPTheme.textSecondary)
+            .lineLimit(3)
+            .multilineTextAlignment(.leading)
             Text(hit.sessionId)
                 .font(VPTheme.mono(7.5))
                 .foregroundStyle(VPTheme.textTertiary)

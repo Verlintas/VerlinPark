@@ -127,6 +127,7 @@
 | [0115](adr/0115-warm-graphite-atelier-ui.md) | Warm graphite atelier UI | Accepted; refined by 0116 | UI/Design |
 | [0116](adr/0116-black-crystal-glass-refinement.md) | Black crystal glass refinement | Accepted | UI/Design |
 | [0117](adr/0117-runtime-localization.md) | Runtime English / Simplified Chinese localization | Accepted | UI/Localization |
+| [0118](adr/0118-workspace-shell-and-command-inbox.md) | Workspace shell, command ranking, and notification inbox | Accepted | UI/State |
 
 ---
 

@@ -1425,6 +1425,305 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(segment.icon, "rectangle.on.rectangle")
     }
 
+    @MainActor
+    func testPinnedItemsStoreTogglesPersistsAndPrunes() throws {
+        let suite = "VerlinParkTests.PinnedItemsStore"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = PinnedItemsStore(defaults: defaults)
+        store.toggleSession("s1")
+        store.toggleSession("s2")
+        store.toggleProject("p1")
+        XCTAssertEqual(store.sessionIDs, ["s2", "s1"])
+        XCTAssertTrue(store.isPinnedSession("s1"))
+        XCTAssertTrue(store.isPinnedProject("p1"))
+
+        let reloaded = PinnedItemsStore(defaults: defaults)
+        XCTAssertEqual(reloaded.sessionIDs, ["s2", "s1"])
+        XCTAssertTrue(reloaded.isPinnedProject("p1"))
+
+        reloaded.toggleSession("s2")
+        XCTAssertEqual(reloaded.sessionIDs, ["s1"])
+
+        reloaded.prune(validSessionIDs: ["s1"], validProjectIDs: [])
+        XCTAssertEqual(reloaded.sessionIDs, ["s1"])
+        XCTAssertTrue(reloaded.projectIDs.isEmpty)
+    }
+
+    @MainActor
+    func testWorkspaceLayoutStoreAppliesPresetsAndPersists() throws {
+        let suite = "VerlinParkTests.WorkspaceLayoutStore"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = WorkspaceLayoutStore(defaults: defaults)
+        XCTAssertEqual(store.currentPreset, .balanced)
+
+        store.apply(.reading)
+        XCTAssertEqual(store.currentPreset, .reading)
+        XCTAssertFalse(store.inspectorVisible)
+
+        let reloaded = WorkspaceLayoutStore(defaults: defaults)
+        XCTAssertEqual(reloaded.currentPreset, .reading)
+        XCTAssertFalse(reloaded.inspectorVisible)
+
+        reloaded.reset()
+        XCTAssertEqual(reloaded.currentPreset, .balanced)
+        XCTAssertTrue(reloaded.inspectorVisible)
+    }
+
+    @MainActor
+    func testWorkspaceCommandRouterSequencesAndTitlesAreUnique() {
+        let router = WorkspaceCommandRouter()
+        XCTAssertEqual(router.sequence, 0)
+        XCTAssertNil(router.lastCommand)
+
+        router.send(.search)
+        XCTAssertEqual(router.lastCommand, .search)
+        XCTAssertEqual(router.sequence, 1)
+
+        router.send(.resetLayout)
+        XCTAssertEqual(router.lastCommand, .resetLayout)
+        XCTAssertEqual(router.sequence, 2)
+
+        let titles = WorkspaceCommand.allCases.map(\.title)
+        XCTAssertEqual(Set(titles).count, titles.count)
+        XCTAssertTrue(titles.allSatisfy { !$0.isEmpty })
+    }
+
+    func testWorkspaceLayoutKeepsReadableStageAndClampsInspector() {
+        let defaults = WorkspaceLayout(
+            railWidth: WorkspaceLayout.defaultRailWidth,
+            inspectorWidth: WorkspaceLayout.defaultInspectorWidth,
+            inspectorVisible: true
+        ).resolved(windowWidth: 1320, focusMode: false)
+        XCTAssertEqual(defaults.railWidth, 272, accuracy: 0.001)
+        XCTAssertEqual(defaults.inspectorWidth, 382, accuracy: 0.001)
+        XCTAssertEqual(defaults.stageWidth, 652, accuracy: 0.001)
+        XCTAssertTrue(defaults.railVisible)
+        XCTAssertTrue(defaults.inspectorVisible)
+
+        let narrow = WorkspaceLayout(
+            railWidth: 320,
+            inspectorWidth: 560,
+            inspectorVisible: true
+        ).resolved(windowWidth: 1120, focusMode: false)
+        XCTAssertEqual(narrow.railWidth, 266, accuracy: 0.001)
+        XCTAssertEqual(narrow.inspectorWidth, 320, accuracy: 0.001)
+        XCTAssertEqual(narrow.stageWidth, 520, accuracy: 0.001)
+
+        let hidden = WorkspaceLayout(
+            railWidth: 272,
+            inspectorWidth: 382,
+            inspectorVisible: false
+        ).resolved(windowWidth: 1120, focusMode: false)
+        XCTAssertFalse(hidden.inspectorVisible)
+        XCTAssertEqual(hidden.stageWidth, 841, accuracy: 0.001)
+    }
+
+    func testWorkspaceLayoutFocusModeUsesFullStage() {
+        let focused = WorkspaceLayout(
+            railWidth: 300,
+            inspectorWidth: 500,
+            inspectorVisible: true
+        ).resolved(windowWidth: 1320, focusMode: true)
+        XCTAssertFalse(focused.railVisible)
+        XCTAssertFalse(focused.inspectorVisible)
+        XCTAssertEqual(focused.railWidth, 0, accuracy: 0.001)
+        XCTAssertEqual(focused.inspectorWidth, 0, accuracy: 0.001)
+        XCTAssertEqual(focused.stageWidth, 1320, accuracy: 0.001)
+    }
+
+    func testWindowFramePolicyRestoresOnScreenAndEnforcesMinimumSize() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let offscreen = WindowFramePolicy.sanitized(
+            CGRect(x: 5000, y: 5000, width: 1320, height: 860),
+            screens: [screen]
+        )
+        XCTAssertEqual(offscreen.width, 1320, accuracy: 0.001)
+        XCTAssertEqual(offscreen.height, 860, accuracy: 0.001)
+        XCTAssertEqual(offscreen.midX, screen.midX, accuracy: 0.001)
+        XCTAssertEqual(offscreen.midY, screen.midY, accuracy: 0.001)
+
+        let tiny = WindowFramePolicy.sanitized(
+            CGRect(x: 10, y: 10, width: 800, height: 500),
+            screens: [screen]
+        )
+        XCTAssertEqual(tiny.width, WindowFramePolicy.minimumSize.width, accuracy: 0.001)
+        XCTAssertEqual(tiny.height, WindowFramePolicy.minimumSize.height, accuracy: 0.001)
+
+        let noScreens = WindowFramePolicy.sanitized(
+            CGRect(x: 20, y: 20, width: 400, height: 300),
+            screens: []
+        )
+        XCTAssertEqual(noScreens.width, WindowFramePolicy.minimumSize.width, accuracy: 0.001)
+        XCTAssertEqual(noScreens.height, WindowFramePolicy.minimumSize.height, accuracy: 0.001)
+    }
+
+    func testCommandPaletteRankerRewardsTitleAndRecency() {
+        let candidates = [
+            CommandPaletteCandidate(
+                id: "action-dashboard",
+                title: "Manage Dash",
+                subtitle: "Agents, cost, queue",
+                keywords: "dashboard manage agents"
+            ),
+            CommandPaletteCandidate(
+                id: "session-dashboard",
+                title: "Build dashboard",
+                subtitle: "Project session",
+                keywords: "session dashboard"
+            ),
+            CommandPaletteCandidate(
+                id: "action-search",
+                title: "Search",
+                subtitle: "Find messages",
+                keywords: "find query"
+            ),
+        ]
+
+        let ranked = CommandPaletteRanker.rank(candidates, query: "dash", recents: [])
+        XCTAssertEqual(ranked.first?.id, "action-dashboard")
+        XCTAssertTrue(ranked.contains { $0.id == "session-dashboard" })
+
+        let recent = CommandPaletteRanker.rank(candidates, query: "", recents: ["session-dashboard"])
+        XCTAssertEqual(recent.first?.id, "session-dashboard")
+
+        XCTAssertEqual(
+            CommandPaletteRanker.highlightRanges("dash", in: "Manage Dash"),
+            [7 ..< 11]
+        )
+        XCTAssertNil(CommandPaletteRanker.score("zzz", candidate: "Manage Dash"))
+        XCTAssertNotNil(CommandPaletteRanker.score("ms", candidate: "Manage Dash"))
+    }
+
+    func testSearchResultsModelFiltersSourcesCountsAndHighlights() {
+        let hits = [
+            testSearchHit(id: "a", source: "message", goal: "Build Dashboard", snippet: "dashboard summary"),
+            testSearchHit(id: "b", source: "event", goal: "Build event", snippet: "dashboard event"),
+            testSearchHit(id: "c", source: "event", goal: "Unrelated", snippet: "no match"),
+        ]
+        var model = SearchResultsModel()
+        XCTAssertEqual(model.visible(hits).map(\.id), ["a", "b", "c"])
+        XCTAssertEqual(model.counts(hits)[.all], 3)
+        XCTAssertEqual(model.counts(hits)[.messages], 1)
+        XCTAssertEqual(model.counts(hits)[.events], 2)
+
+        model.source = .messages
+        XCTAssertEqual(model.visible(hits).map(\.id), ["a"])
+        model.source = .events
+        XCTAssertEqual(model.visible(hits).map(\.id), ["b", "c"])
+
+        XCTAssertEqual(
+            SearchResultsModel.ranges(of: "dashboard", in: "Build Dashboard here"),
+            [6 ..< 15]
+        )
+        XCTAssertEqual(SearchResultsModel.ranges(of: "", in: "Build Dashboard"), [])
+    }
+
+    private func testSearchHit(id: String, source: String, goal: String, snippet: String) -> SearchHit {
+        SearchHit(
+            id: id,
+            sessionId: "s-\(id)",
+            projectId: "p1",
+            sessionGoal: goal,
+            source: source,
+            role: nil,
+            kind: nil,
+            seq: nil,
+            snippet: snippet,
+            createdAt: "2026-11-08T10:00:00Z"
+        )
+    }
+
+    func testNotificationInboxFiltersSearchesCountsAndGroups() throws {
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-11-08T12:00:00Z"))
+        let today = "2026-11-08T10:00:00Z"
+        let yesterday = "2026-11-07T10:00:00Z"
+        let earlier = "2026-10-01T10:00:00Z"
+        let notices = [
+            testNotice(
+                id: "a",
+                project: "p1",
+                kind: "approval",
+                title: "Approve write",
+                createdAt: today,
+                read: false
+            ),
+            testNotice(
+                id: "b",
+                project: "p1",
+                kind: "task",
+                title: "Task failed",
+                createdAt: yesterday,
+                read: true
+            ),
+            testNotice(
+                id: "c",
+                project: "p2",
+                kind: "integration",
+                title: "Merge conflict",
+                createdAt: earlier,
+                read: false
+            ),
+        ]
+        let directory: [String: SessionDirectoryEntry] = [
+            "s-a": SessionDirectoryEntry(projectId: "p1", goal: "Ship the dashboard"),
+            "s-b": SessionDirectoryEntry(projectId: "p1", goal: "Fix the queue"),
+            "s-c": SessionDirectoryEntry(projectId: "p2", goal: "Merge the branch"),
+        ]
+
+        var inbox = NotificationInboxModel()
+        XCTAssertEqual(inbox.visible(in: notices, directory: directory).map(\.id), ["a", "b", "c"])
+        inbox.filter = .unread
+        XCTAssertEqual(inbox.visible(in: notices, directory: directory).map(\.id), ["a", "c"])
+        inbox.query = "dashboard"
+        XCTAssertEqual(inbox.visible(in: notices, directory: directory).map(\.id), ["a"])
+        inbox.query = ""
+        inbox.filter = .all
+        inbox.projectID = "p2"
+        XCTAssertEqual(inbox.visible(in: notices, directory: directory).map(\.id), ["c"])
+
+        inbox.projectID = nil
+        let counts = inbox.counts(in: notices, directory: directory)
+        XCTAssertEqual(counts[.all], 3)
+        XCTAssertEqual(counts[.unread], 2)
+        XCTAssertEqual(counts[.approvals], 1)
+        XCTAssertEqual(counts[.tasks], 1)
+        XCTAssertEqual(counts[.integration], 1)
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let groups = inbox.groups(from: notices, calendar: calendar, now: now)
+        XCTAssertEqual(groups.map(\.id), ["today", "yesterday", "earlier"])
+        XCTAssertEqual(groups[0].notices.map(\.id), ["a"])
+        XCTAssertEqual(groups[1].notices.map(\.id), ["b"])
+        XCTAssertEqual(groups[2].notices.map(\.id), ["c"])
+    }
+
+    private func testNotice(
+        id: String,
+        project: String,
+        kind: String,
+        title: String,
+        createdAt: String,
+        read: Bool
+    ) -> AppNotice {
+        AppNotice(
+            id: id,
+            sessionId: "s-\(id)",
+            projectId: project,
+            kind: kind,
+            title: title,
+            detail: title,
+            createdAt: createdAt,
+            isRead: read
+        )
+    }
+
     func testRailSessionListFiltersSortsLimitsAndCountsActive() {
         let sessions = [
             testSession(id: "a", project: "p1", status: "idle", createdAt: "2026-11-01T10:00:00Z"),
@@ -1453,14 +1752,15 @@ final class ProtocolCompatibilityTests: XCTestCase {
         id: String,
         project: String,
         status: String,
-        createdAt: String
+        createdAt: String,
+        priority: Int = 0
     ) -> Session {
         Session(
             id: id,
             projectId: project,
             goal: "Session \(id)",
             status: status,
-            priority: 0,
+            priority: priority,
             worktree: nil,
             branch: nil,
             tokenBudget: nil,
@@ -1471,6 +1771,45 @@ final class ProtocolCompatibilityTests: XCTestCase {
             tokensIn: 0,
             tokensOut: 0,
             createdAt: createdAt
+        )
+    }
+
+    func testRailSessionSortsByStatusAndPriority() {
+        let sessions = [
+            testSession(id: "a", project: "p1", status: "idle", createdAt: "2026-11-01T10:00:00Z"),
+            testSession(
+                id: "c",
+                project: "p1",
+                status: "running",
+                createdAt: "2026-11-04T10:00:00Z",
+                priority: 50
+            ),
+            testSession(
+                id: "d",
+                project: "p1",
+                status: "paused",
+                createdAt: "2026-11-02T10:00:00Z",
+                priority: -10
+            ),
+            testSession(
+                id: "e",
+                project: "p1",
+                status: "failed",
+                createdAt: "2026-11-05T10:00:00Z",
+                priority: 5
+            ),
+        ]
+        XCTAssertEqual(
+            RailSessionSort.status.sorted(sessions, projectID: "p1").map(\.id),
+            ["c", "d", "a", "e"]
+        )
+        XCTAssertEqual(
+            RailSessionSort.priority.sorted(sessions, projectID: "p1").map(\.id),
+            ["c", "e", "a", "d"]
+        )
+        XCTAssertEqual(
+            RailSessionSort.recent.sorted(sessions, projectID: "p1").map(\.id),
+            ["e", "c", "d", "a"]
         )
     }
 
@@ -1499,8 +1838,8 @@ final class ProtocolCompatibilityTests: XCTestCase {
             Set(KeyboardShortcutsCatalog.groups.map(\.title)).count,
             KeyboardShortcutsCatalog.groups.count
         )
-        XCTAssertEqual(KeyboardShortcutsCatalog.groups.first?.title, "Global")
-        XCTAssertEqual(KeyboardShortcutsCatalog.groups.last?.title, "Project")
+        XCTAssertEqual(KeyboardShortcutsCatalog.groups.first?.title, L10n.t("Global"))
+        XCTAssertEqual(KeyboardShortcutsCatalog.groups.last?.title, L10n.t("Project"))
         XCTAssertEqual(
             KeyboardShortcutsCatalog.groups.map(\.entries.count).reduce(0, +),
             entries.count

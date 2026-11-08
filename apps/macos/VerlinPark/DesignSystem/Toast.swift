@@ -61,6 +61,7 @@ private struct VPToastCard: View {
     let toast: VPToast
     let dismiss: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var progress: CGFloat = 1
 
     var body: some View {
@@ -107,7 +108,12 @@ private struct VPToastCard: View {
             .frame(height: 2)
         }
         .frame(width: 340, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(
+            reduceTransparency
+                ? AnyShapeStyle(VPTheme.surfaceRaised)
+                : AnyShapeStyle(.regularMaterial),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(toast.kind.tint.opacity(0.22), lineWidth: 1)

@@ -12,7 +12,9 @@ enum VPTheme {
     // MARK: Canvas and surfaces
 
     static let canvas = Color(hex: "030407")
+    static let solidCanvas = Color(hex: "030407")
     static let rail = Color(hex: "070B10F5")
+    static let solidRail = Color(hex: "070B10")
     static let surface = Color(hex: "0F1720CC")
     static let surfaceRaised = Color(hex: "16212BDD")
     static let surfaceHover = Color(hex: "1D2A36EE")
@@ -353,29 +355,36 @@ struct VPKeyCap: View {
 /// Static ambient wash. It replaces the previous drifting aurora so the canvas
 /// stays calm while the content carries the motion.
 struct VPCrystalSurface: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
     var tone: Color = VPTheme.canvas
+    var solidTone: Color = VPTheme.solidCanvas
     var tintOpacity: Double = 0.52
     var material: Material = .ultraThinMaterial
 
     var body: some View {
         ZStack {
-            Rectangle().fill(material)
-            tone.opacity(tintOpacity)
-            RadialGradient(
-                colors: [.white.opacity(0.032), .clear],
-                center: .topLeading,
-                startRadius: 0,
-                endRadius: 520
-            )
-            LinearGradient(
-                colors: [
-                    .white.opacity(0.032),
-                    .clear,
-                    .white.opacity(0.012),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+            if reduceTransparency {
+                solidTone
+            } else {
+                Rectangle().fill(material)
+                tone.opacity(tintOpacity)
+                RadialGradient(
+                    colors: [.white.opacity(0.032), .clear],
+                    center: .topLeading,
+                    startRadius: 0,
+                    endRadius: 520
+                )
+                LinearGradient(
+                    colors: [
+                        .white.opacity(0.032),
+                        .clear,
+                        .white.opacity(0.012),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
         }
         .ignoresSafeArea()
     }
