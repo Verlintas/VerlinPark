@@ -1381,6 +1381,25 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertFalse(result.promptsSupported)
     }
 
+    func testSimplifiedChineseResourcesResolve() {
+        let previous = UserDefaults.standard.string(forKey: LanguageStore.storageKey)
+        defer {
+            if let previous {
+                UserDefaults.standard.set(previous, forKey: LanguageStore.storageKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: LanguageStore.storageKey)
+            }
+        }
+
+        UserDefaults.standard.set("zh-Hans", forKey: LanguageStore.storageKey)
+        XCTAssertEqual(L10n.t("Settings"), "设置")
+        XCTAssertEqual(L10n.t("General"), "通用")
+        XCTAssertEqual(L10n.t("History"), "历史")
+        XCTAssertEqual(L10n.format("%lld active", 3), "3 个活跃")
+        XCTAssertEqual(AppLanguage.simplifiedChinese.locale.identifier, "zh-Hans")
+        XCTAssertEqual(AppLanguage.allCases.count, 2)
+    }
+
     func testMotionTokensAreOrderedAndStaggerIsCapped() {
         XCTAssertLessThan(VPMotion.instant, VPMotion.quick)
         XCTAssertLessThan(VPMotion.quick, VPMotion.standard)
@@ -1457,8 +1476,8 @@ final class ProtocolCompatibilityTests: XCTestCase {
 
     func testSettingsSectionsAreUniqueAndComplete() {
         let sections = SettingsSection.allCases
-        XCTAssertEqual(sections.count, 7)
-        XCTAssertEqual(sections.first, .brand)
+        XCTAssertEqual(sections.count, 8)
+        XCTAssertEqual(sections.first, .general)
         XCTAssertEqual(sections.last, .about)
         XCTAssertEqual(Set(sections.map(\.title)).count, sections.count)
         XCTAssertTrue(sections.allSatisfy { !$0.detail.isEmpty && !$0.icon.isEmpty })

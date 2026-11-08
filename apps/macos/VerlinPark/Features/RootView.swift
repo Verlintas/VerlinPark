@@ -4,6 +4,7 @@ struct RootView: View {
     @Environment(AppModel.self) private var model
     @Environment(BrandStore.self) private var brand
     @Environment(MemoryMonitor.self) private var memory
+    @Environment(LanguageStore.self) private var language
     @Environment(\.openSettings) private var openSettings
 
     @State private var showDashboard = false
@@ -18,6 +19,8 @@ struct RootView: View {
 
     var body: some View {
         workspace
+            .environment(\.locale, language.locale)
+            .id(language.language.rawValue)
             .frame(minWidth: 1120, minHeight: 720)
             .preferredColorScheme(.dark)
             .tint(VPTheme.accent)

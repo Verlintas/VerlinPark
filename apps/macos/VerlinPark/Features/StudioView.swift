@@ -11,8 +11,8 @@ enum StudioTab: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .collab: "Collab"
-        case .preview: "Preview"
+        case .collab: L10n.t("Collab")
+        case .preview: L10n.t("Preview")
         }
     }
 }
@@ -559,7 +559,7 @@ struct OrgNodeCard: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(role)
+                    Text(L10n.t(role))
                         .font(VPTheme.mono(8, weight: .semibold))
                         .tracking(0.7)
                         .foregroundStyle(accent)
@@ -644,7 +644,7 @@ struct AgentTierCard: View {
                     Image(systemName: icon)
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(tint)
-                    Text(title.uppercased())
+                    Text(L10n.t(title).uppercased())
                         .font(VPTheme.mono(9, weight: .semibold))
                         .tracking(0.7)
                         .foregroundStyle(VPTheme.textSecondary)
@@ -736,7 +736,7 @@ struct TierPlaceholder: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(title)
+                    Text(L10n.t(title))
                         .font(VPTheme.font(12, weight: .semibold))
                         .foregroundStyle(VPTheme.textSecondary)
                     Text("× \(range)")
@@ -747,7 +747,7 @@ struct TierPlaceholder: View {
                         .font(VPTheme.mono(7.5, weight: .medium))
                         .foregroundStyle(tint)
                 }
-                Text(detail)
+                Text(L10n.t(detail))
                     .font(VPTheme.font(9.5))
                     .foregroundStyle(VPTheme.textTertiary)
                     .lineLimit(2)
@@ -918,10 +918,10 @@ struct ExternalResidentPanel: View {
                 .frame(width: 17)
                 .padding(.top, 1)
             VStack(alignment: .leading, spacing: 1) {
-                Text(title)
+                Text(L10n.t(title))
                     .font(VPTheme.font(10, weight: .medium))
                     .foregroundStyle(VPTheme.textPrimary)
-                Text(detail)
+                Text(L10n.t(detail))
                     .font(VPTheme.mono(8))
                     .foregroundStyle(VPTheme.textTertiary)
             }
@@ -1887,16 +1887,16 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .changes: "Changes"
-        case .plan: "Plan"
-        case .files: "Files"
-        case .history: "History"
-        case .queue: "Queue"
-        case .mailbox: "Mailbox"
-        case .cost: "Cost"
-        case .console: "Console"
-        case .terminal: "Terminal"
-        case .trace: "Trace"
+        case .changes: L10n.t("Changes")
+        case .plan: L10n.t("Plan")
+        case .files: L10n.t("Files")
+        case .history: L10n.t("History")
+        case .queue: L10n.t("Queue")
+        case .mailbox: L10n.t("Mailbox")
+        case .cost: L10n.t("Cost")
+        case .console: L10n.t("Console")
+        case .terminal: L10n.t("Terminal")
+        case .trace: L10n.t("Trace")
         }
     }
 
@@ -1922,149 +1922,218 @@ private struct HistoryPanel: View {
     @Namespace private var selectionNamespace
 
     var body: some View {
-        HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 8) {
-                    Text(model.gitBranch ?? "session branch")
-                        .font(.system(size: 9, design: .monospaced))
-                        .lineLimit(1)
-                    Spacer()
-                    if model.gitLogBusy {
-                        ProgressView().controlSize(.small)
-                    }
-                    Text("\(model.gitCommits.count)")
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+        GeometryReader { proxy in
+            let compact = proxy.size.width < 560
+            if compact {
+                if model.gitSelectedCommit != nil {
+                    detailPane(compact: true)
+                } else {
+                    listPane
                 }
-                .padding(8)
-                if let base = model.gitBaseCommit, !base.isEmpty {
-                    Text("base \(String(base.prefix(12)))")
-                        .font(.system(size: 7, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 8)
-                        .padding(.bottom, 6)
-                }
-                Divider().opacity(0.3)
-                if let error = model.gitLogError {
-                    Text(error)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.orange)
-                        .padding(8)
-                }
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(model.gitCommits) { commit in
-                            Button {
-                                Task { await model.loadGitCommit(commit.hash) }
-                            } label: {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    HStack(spacing: 6) {
-                                        Text(commit.shortHash)
-                                            .font(.system(size: 9, weight: .medium, design: .monospaced))
-                                            .foregroundStyle(.cyan)
-                                        Text(commit.subject)
-                                            .font(.system(size: 10, weight: .medium))
-                                            .lineLimit(1)
-                                        Spacer()
-                                    }
-                                    HStack(spacing: 8) {
-                                        Text(commit.author)
-                                        Text(commit.authorDate)
-                                        if !commit.refs.isEmpty {
-                                            Text(commit.refs)
-                                                .foregroundStyle(.cyan)
-                                                .lineLimit(1)
-                                        }
-                                    }
-                                    .font(.system(size: 7, design: .monospaced))
-                                    .foregroundStyle(.tertiary)
-                                }
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 6)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background {
-                                    if model.gitSelectedCommit == commit.hash {
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .fill(Color.accentColor.opacity(0.16))
-                                            .matchedGeometryEffect(
-                                                id: "history-selection",
-                                                in: selectionNamespace
-                                            )
-                                    } else if hoveredCommit == commit.hash {
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .fill(.white.opacity(0.04))
-                                    }
-                                }
-                            }
-                            .buttonStyle(VPPressableButtonStyle(scale: 0.99))
-                            .onHover { hovering in
-                                if hovering {
-                                    hoveredCommit = commit.hash
-                                } else if hoveredCommit == commit.hash {
-                                    hoveredCommit = nil
-                                }
-                            }
-                            .animation(VPMotion.hover, value: hoveredCommit)
-                            .animation(VPMotion.snap, value: model.gitSelectedCommit)
-                        }
-                    }
-                }
-                if model.gitCommits.isEmpty, !model.gitLogBusy {
-                    Text("No commits on this session branch yet.")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .padding(10)
+            } else {
+                HStack(spacing: 0) {
+                    listPane
+                        .frame(width: min(320, max(240, proxy.size.width * 0.38)))
+                    VPHairline(vertical: true)
+                    detailPane(compact: false)
                 }
             }
-            .frame(width: 330)
-            Divider().opacity(0.3)
-            VStack(alignment: .leading, spacing: 0) {
-                if let show = model.gitShow {
-                    HStack(spacing: 8) {
-                        Image(systemName: "clock.arrow.circlepath")
-                            .font(.system(size: 10))
-                        Text(String(show.commit.prefix(12)))
-                            .font(.system(size: 10, design: .monospaced))
-                        if show.truncated {
-                            Text("truncated")
-                                .font(.system(size: 7, weight: .medium, design: .monospaced))
-                                .foregroundStyle(.yellow)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .background(.yellow.opacity(0.12), in: Capsule())
-                        }
-                        Spacer()
-                        if model.gitShowBusy {
-                            ProgressView().controlSize(.small)
-                        }
-                    }
-                    .padding(10)
-                    Divider().opacity(0.3)
-                    if let error = model.gitShowError {
-                        Text(error)
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.orange)
-                            .padding(10)
-                    }
-                    TextEditor(text: .constant(show.output))
-                        .font(.system(size: 9, design: .monospaced))
-                        .scrollContentBackground(.hidden)
-                        .disabled(true)
-                        .padding(6)
-                } else {
-                    VStack(spacing: 8) {
-                        Image(systemName: "clock.arrow.circlepath")
-                            .font(.system(size: 24))
-                            .foregroundStyle(.secondary)
-                        Text(model.gitLogBusy ? "Loading commits…" : "Select a commit to inspect its diff.")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                        if model.gitShowBusy {
-                            ProgressView().controlSize(.small)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var listPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text(model.gitBranch ?? "session branch")
+                    .font(VPTheme.mono(9))
+                    .lineLimit(1)
+                Spacer()
+                if model.gitLogBusy {
+                    ProgressView().controlSize(.small)
                 }
+                Text("\(model.gitCommits.count)")
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            .padding(10)
+
+            if let base = model.gitBaseCommit, !base.isEmpty {
+                Text("base \(String(base.prefix(12)))")
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 7)
+            }
+
+            VPHairline()
+
+            if let error = model.gitLogError {
+                Text(error)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.warning)
+                    .padding(10)
+            }
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(model.gitCommits) { commit in
+                        Button {
+                            Task { await model.loadGitCommit(commit.hash) }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(commit.shortHash)
+                                        .font(VPTheme.mono(9, weight: .medium))
+                                        .foregroundStyle(VPTheme.accent)
+                                    Text(commit.subject)
+                                        .font(VPTheme.font(10, weight: .medium))
+                                        .foregroundStyle(VPTheme.textPrimary)
+                                        .lineLimit(1)
+                                    Spacer(minLength: 0)
+                                }
+                                HStack(spacing: 7) {
+                                    Text(commit.author)
+                                    Text(commit.authorDate)
+                                    if !commit.refs.isEmpty {
+                                        Text(commit.refs)
+                                            .foregroundStyle(VPTheme.accent)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                .font(VPTheme.mono(7))
+                                .foregroundStyle(VPTheme.textTertiary)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background {
+                                if model.gitSelectedCommit == commit.hash {
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .fill(VPTheme.accent.opacity(0.10))
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                                .strokeBorder(VPTheme.accent.opacity(0.16), lineWidth: 1)
+                                        }
+                                        .matchedGeometryEffect(
+                                            id: "history-selection",
+                                            in: selectionNamespace
+                                        )
+                                } else if hoveredCommit == commit.hash {
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .fill(VPTheme.surface)
+                                }
+                            }
+                        }
+                        .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+                        .onHover { hovering in
+                            if hovering {
+                                hoveredCommit = commit.hash
+                            } else if hoveredCommit == commit.hash {
+                                hoveredCommit = nil
+                            }
+                        }
+                        .animation(VPMotion.hover, value: hoveredCommit)
+                        .animation(VPMotion.snap, value: model.gitSelectedCommit)
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+            }
+
+            if model.gitCommits.isEmpty, !model.gitLogBusy {
+                Text("No commits on this session branch yet.")
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .padding(12)
+            }
+        }
+    }
+
+    private func detailPane(compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                if compact {
+                    Button {
+                        model.gitSelectedCommit = nil
+                        model.gitShow = nil
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .buttonStyle(VPGlassIconButtonStyle(size: 22, tint: VPTheme.textSecondary))
+                    .help("Back to commits")
+                } else {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 10))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+
+                if let show = model.gitShow {
+                    Text(String(show.commit.prefix(12)))
+                        .font(VPTheme.mono(9))
+                        .foregroundStyle(VPTheme.textSecondary)
+                    if show.truncated {
+                        Text("truncated")
+                            .font(VPTheme.mono(7, weight: .medium))
+                            .foregroundStyle(VPTheme.warning)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(VPTheme.warning.opacity(0.10), in: Capsule())
+                    }
+                } else if let selected = model.gitSelectedCommit {
+                    Text(String(selected.prefix(12)))
+                        .font(VPTheme.mono(9))
+                        .foregroundStyle(VPTheme.textSecondary)
+                } else {
+                    Text("Commit")
+                        .font(VPTheme.mono(9))
+                        .foregroundStyle(VPTheme.textSecondary)
+                }
+
+                Spacer()
+
+                if model.gitShowBusy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+
+            VPHairline()
+
+            if let error = model.gitShowError {
+                Text(error)
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.warning)
+                    .padding(10)
+            }
+
+            if let show = model.gitShow {
+                ScrollView([.vertical, .horizontal]) {
+                    Text(show.output)
+                        .font(VPTheme.mono(9))
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .padding(10)
+                }
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 24))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text(
+                        model.gitLogBusy
+                            ? "Loading commits…"
+                            : "Select a commit to inspect its diff."
+                    )
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    if model.gitShowBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
@@ -2078,6 +2147,7 @@ private struct FilesPanel: View {
     @State private var dirty = false
     @State private var pendingEntry: WorkspaceEntry?
     @State private var confirmDiscard = false
+    @State private var confirmClose = false
 
     private var filteredEntries: [WorkspaceEntry] {
         let filter = model.workspaceFilter.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2091,186 +2161,20 @@ private struct FilesPanel: View {
 
     var body: some View {
         @Bindable var model = model
-        HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 6) {
-                    TextField("Filter files", text: $model.workspaceFilter)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 9, design: .monospaced))
-                    if model.workspaceTreeBusy {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-                .padding(8)
-                Divider().opacity(0.3)
-                if let error = model.workspaceTreeError {
-                    Text(error)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.orange)
-                        .padding(8)
-                }
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(filteredEntries) { entry in
-                            Button {
-                                select(entry)
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "doc.text")
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(.secondary)
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(entry.name)
-                                            .font(.system(size: 10, weight: .medium))
-                                            .lineLimit(1)
-                                        Text(entry.path)
-                                            .font(.system(size: 7, design: .monospaced))
-                                            .foregroundStyle(.tertiary)
-                                            .lineLimit(1)
-                                    }
-                                    Spacer()
-                                    Text(formatSize(entry.size))
-                                        .font(.system(size: 7, design: .monospaced))
-                                        .foregroundStyle(.tertiary)
-                                }
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 5)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background {
-                                    if model.workspaceSelectedPath == entry.path {
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .fill(Color.accentColor.opacity(0.16))
-                                            .matchedGeometryEffect(
-                                                id: "file-selection",
-                                                in: selectionNamespace
-                                            )
-                                    } else if hoveredPath == entry.path {
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .fill(.white.opacity(0.04))
-                                    }
-                                }
-                            }
-                            .buttonStyle(VPPressableButtonStyle(scale: 0.99))
-                            .onHover { hovering in
-                                if hovering {
-                                    hoveredPath = entry.path
-                                } else if hoveredPath == entry.path {
-                                    hoveredPath = nil
-                                }
-                            }
-                            .animation(VPMotion.hover, value: hoveredPath)
-                            .animation(VPMotion.snap, value: model.workspaceSelectedPath)
-                        }
-                    }
-                }
-                if filteredEntries.isEmpty {
-                    Text(
-                        model.workspaceTreeBusy
-                            ? "Loading files…"
-                            : "No files match the filter."
-                    )
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .padding(10)
-                }
-            }
-            .frame(width: 280)
-            Divider().opacity(0.3)
-            VStack(alignment: .leading, spacing: 0) {
-                if let file = model.workspaceFile {
-                    HStack(spacing: 8) {
-                        Image(systemName: file.binary ? "doc.zipper" : "doc.text")
-                            .font(.system(size: 10))
-                        Text(file.path)
-                            .font(.system(size: 10, design: .monospaced))
-                            .lineLimit(1)
-                        if file.binary {
-                            Text("binary")
-                                .font(.system(size: 7, weight: .medium, design: .monospaced))
-                                .foregroundStyle(.orange)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .background(.orange.opacity(0.12), in: Capsule())
-                        }
-                        if file.truncated {
-                            Text("truncated")
-                                .font(.system(size: 7, weight: .medium, design: .monospaced))
-                                .foregroundStyle(.yellow)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .background(.yellow.opacity(0.12), in: Capsule())
-                        }
-                        if dirty {
-                            Text("modified")
-                                .font(.system(size: 7, weight: .medium, design: .monospaced))
-                                .foregroundStyle(.cyan)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .background(.cyan.opacity(0.12), in: Capsule())
-                        }
-                        Spacer()
-                        Text(formatSize(file.size))
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                        if file.editable {
-                            Button("Reload") {
-                                reload()
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(model.workspaceSaveBusy)
-                            Button("Save") {
-                                Task {
-                                    if await model.saveWorkspaceFile(content: draft) {
-                                        dirty = false
-                                    }
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            .disabled(!dirty || model.workspaceSaveBusy)
-                        }
-                    }
-                    .padding(10)
-                    Divider().opacity(0.3)
-                    if let error = model.workspaceFileError {
-                        Text(error)
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.orange)
-                            .padding(10)
-                    }
-                    if let status = model.workspaceSaveStatus {
-                        Text(status)
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundStyle(status.hasPrefix("Saved") ? .green : .orange)
-                            .padding(.horizontal, 10)
-                            .padding(.top, 4)
-                    }
-                    TextEditor(text: $draft)
-                        .font(.system(size: 10, design: .monospaced))
-                        .scrollContentBackground(.hidden)
-                        .disabled(!file.editable || model.workspaceFileBusy || model.workspaceSaveBusy)
-                        .onChange(of: draft) { _, value in
-                            dirty = file.editable && value != file.content
-                        }
-                        .padding(6)
+        GeometryReader { proxy in
+            let compact = proxy.size.width < 560
+            if compact {
+                if model.workspaceFile != nil {
+                    detailPane(compact: true)
                 } else {
-                    VStack(spacing: 8) {
-                        Image(systemName: "doc.text.magnifyingglass")
-                            .font(.system(size: 24))
-                            .foregroundStyle(.secondary)
-                        Text(
-                            model.workspaceTreeBusy
-                                ? "Loading session files…"
-                                : "Select a file to inspect the session worktree."
-                        )
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        if model.workspaceFileBusy {
-                            ProgressView().controlSize(.small)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    listPane(filter: $model.workspaceFilter)
+                }
+            } else {
+                HStack(spacing: 0) {
+                    listPane(filter: $model.workspaceFilter)
+                        .frame(width: min(300, max(230, proxy.size.width * 0.40)))
+                    VPHairline(vertical: true)
+                    detailPane(compact: false)
                 }
             }
         }
@@ -2297,6 +2201,249 @@ private struct FilesPanel: View {
         } message: {
             Text("The current draft has not been saved.")
         }
+        .confirmationDialog(
+            "Discard unsaved changes?",
+            isPresented: $confirmClose,
+            titleVisibility: .visible
+        ) {
+            Button("Discard", role: .destructive) {
+                closeFile()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The current draft has not been saved.")
+        }
+    }
+
+    private func listPane(filter: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                TextField("Filter files", text: filter)
+                    .textFieldStyle(.plain)
+                    .font(VPTheme.mono(9))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 5)
+                    .vpFieldSurface(radius: 7)
+                if model.workspaceTreeBusy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .padding(8)
+
+            VPHairline()
+
+            if let error = model.workspaceTreeError {
+                Text(error)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.warning)
+                    .padding(8)
+            }
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(filteredEntries) { entry in
+                        Button {
+                            select(entry)
+                        } label: {
+                            HStack(spacing: 7) {
+                                Image(systemName: "doc.text")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(entry.name)
+                                        .font(VPTheme.font(10, weight: .medium))
+                                        .foregroundStyle(VPTheme.textPrimary)
+                                        .lineLimit(1)
+                                    Text(entry.path)
+                                        .font(VPTheme.mono(7))
+                                        .foregroundStyle(VPTheme.textTertiary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                Spacer(minLength: 4)
+                                Text(formatSize(entry.size))
+                                    .font(VPTheme.mono(7))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background {
+                                if model.workspaceSelectedPath == entry.path {
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .fill(VPTheme.accent.opacity(0.10))
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                                .strokeBorder(VPTheme.accent.opacity(0.16), lineWidth: 1)
+                                        }
+                                        .matchedGeometryEffect(
+                                            id: "file-selection",
+                                            in: selectionNamespace
+                                        )
+                                } else if hoveredPath == entry.path {
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .fill(VPTheme.surface)
+                                }
+                            }
+                        }
+                        .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+                        .onHover { hovering in
+                            if hovering {
+                                hoveredPath = entry.path
+                            } else if hoveredPath == entry.path {
+                                hoveredPath = nil
+                            }
+                        }
+                        .animation(VPMotion.hover, value: hoveredPath)
+                        .animation(VPMotion.snap, value: model.workspaceSelectedPath)
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+            }
+
+            if filteredEntries.isEmpty {
+                Text(
+                    model.workspaceTreeBusy
+                        ? "Loading files…"
+                        : "No files match the filter."
+                )
+                .font(VPTheme.mono(9))
+                .foregroundStyle(VPTheme.textSecondary)
+                .padding(12)
+            }
+        }
+    }
+
+    private func detailPane(compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let file = model.workspaceFile {
+                detailHeader(file: file, compact: compact)
+                VPHairline()
+                if let error = model.workspaceFileError {
+                    Text(error)
+                        .font(VPTheme.mono(9))
+                        .foregroundStyle(VPTheme.warning)
+                        .padding(10)
+                }
+                if let status = model.workspaceSaveStatus {
+                    Text(status)
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(status.hasPrefix("Saved") ? VPTheme.success : VPTheme.warning)
+                        .padding(.horizontal, 10)
+                        .padding(.top, 5)
+                }
+                TextEditor(text: $draft)
+                    .font(VPTheme.mono(10))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .scrollContentBackground(.hidden)
+                    .disabled(!file.editable || model.workspaceFileBusy || model.workspaceSaveBusy)
+                    .onChange(of: draft) { _, value in
+                        dirty = file.editable && value != file.content
+                    }
+                    .padding(6)
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 24))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text(
+                        model.workspaceTreeBusy
+                            ? "Loading session files…"
+                            : "Select a file to inspect the session worktree."
+                    )
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    if model.workspaceFileBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    private func detailHeader(file: WorkspaceFileResult, compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                if compact {
+                    Button {
+                        if dirty {
+                            confirmClose = true
+                        } else {
+                            closeFile()
+                        }
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .buttonStyle(VPGlassIconButtonStyle(size: 22, tint: VPTheme.textSecondary))
+                    .help("Back to files")
+                }
+
+                Image(systemName: file.binary ? "doc.zipper" : "doc.text")
+                    .font(.system(size: 10))
+                    .foregroundStyle(VPTheme.textTertiary)
+                Text(file.path)
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text(formatSize(file.size))
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+
+            HStack(spacing: 5) {
+                if file.binary {
+                    fileBadge("binary", tint: VPTheme.warning)
+                }
+                if file.truncated {
+                    fileBadge("truncated", tint: VPTheme.warning)
+                }
+                if dirty {
+                    fileBadge("modified", tint: VPTheme.accent)
+                }
+                Spacer(minLength: 0)
+                if file.editable {
+                    Button("Reload") {
+                        reload()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.workspaceSaveBusy)
+                    Button("Save") {
+                        Task {
+                            if await model.saveWorkspaceFile(content: draft) {
+                                dirty = false
+                            }
+                        }
+                    }
+                    .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
+                    .controlSize(.small)
+                    .disabled(!dirty || model.workspaceSaveBusy)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+    }
+
+    private func fileBadge(_ text: String, tint: Color) -> some View {
+        Text(L10n.t(text))
+            .font(VPTheme.mono(7, weight: .medium))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(tint.opacity(0.10), in: Capsule())
+    }
+
+    private func closeFile() {
+        model.workspaceSelectedPath = nil
+        model.workspaceFile = nil
+        draft = ""
+        dirty = false
     }
 
     private var fileKey: String {
@@ -2492,29 +2639,29 @@ private struct DiffLines: View {
 
     private func color(for line: String) -> Color {
         if line.hasPrefix("+++") || line.hasPrefix("---") {
-            return .secondary
+            return VPTheme.textTertiary
         }
         if line.hasPrefix("+") {
-            return .green
+            return VPTheme.success
         }
         if line.hasPrefix("-") {
-            return .red
+            return VPTheme.danger
         }
         if line.hasPrefix("@@") || line.hasPrefix("diff --git") {
-            return .cyan
+            return VPTheme.info
         }
-        return .secondary
+        return VPTheme.textSecondary
     }
 
     private func background(for line: String) -> Color {
         if line.hasPrefix("+"), !line.hasPrefix("+++") {
-            return .green.opacity(0.07)
+            return VPTheme.success.opacity(0.10)
         }
         if line.hasPrefix("-"), !line.hasPrefix("---") {
-            return .red.opacity(0.06)
+            return VPTheme.danger.opacity(0.09)
         }
         if line.hasPrefix("@@") {
-            return .blue.opacity(0.06)
+            return VPTheme.info.opacity(0.09)
         }
         return .clear
     }

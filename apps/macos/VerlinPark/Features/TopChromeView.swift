@@ -6,6 +6,7 @@ import SwiftUI
 struct TopChromeView: View {
     @Environment(AppModel.self) private var model
     @Environment(MemoryMonitor.self) private var memory
+    @Environment(LanguageStore.self) private var language
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var showCommandPalette: Bool
     @Binding var focusMode: Bool
@@ -26,6 +27,7 @@ struct TopChromeView: View {
 
                 divider
 
+                languageMenu
                 commandButton
                 inspectorButton
                 notificationsButton
@@ -81,7 +83,7 @@ struct TopChromeView: View {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 6, weight: .bold))
                         .foregroundStyle(VPTheme.textTertiary)
-                    Text("no session")
+                    Text(L10n.t("no session"))
                         .font(VPTheme.mono(9))
                         .foregroundStyle(VPTheme.textTertiary)
                 }
@@ -90,7 +92,7 @@ struct TopChromeView: View {
                     Image(systemName: "cube.transparent")
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(VPTheme.resident)
-                    Text(model.mode == .resident ? "Resident · Aviiya bridge" : "No project")
+                    Text(model.mode == .resident ? L10n.t("Resident · Aviiya bridge") : L10n.t("No project"))
                         .font(VPTheme.mono(9, weight: .medium))
                         .foregroundStyle(VPTheme.textSecondary)
                 }
@@ -139,6 +141,41 @@ struct TopChromeView: View {
     }
 
     // MARK: Actions
+
+    private var languageMenu: some View {
+        Menu {
+            ForEach(AppLanguage.allCases) { option in
+                Button {
+                    language.select(option)
+                } label: {
+                    if language.language == option {
+                        Label(option.endonym, systemImage: "checkmark")
+                    } else {
+                        Text(option.endonym)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "globe")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(language.language.shortLabel)
+                    .font(VPTheme.mono(8, weight: .semibold))
+            }
+            .foregroundStyle(VPTheme.textSecondary)
+            .padding(.horizontal, 7)
+            .frame(height: 24)
+            .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(L10n.t("Language"))
+    }
 
     private var commandButton: some View {
         Button {
@@ -225,10 +262,10 @@ struct TopChromeView: View {
 
     private var connectionLabel: String {
         switch model.connection {
-        case .connected: "online"
-        case .connecting: "connecting"
-        case .idle: "idle"
-        case .failed: "offline"
+        case .connected: L10n.t("online")
+        case .connecting: L10n.t("connecting")
+        case .idle: L10n.t("idle")
+        case .failed: L10n.t("offline")
         }
     }
 

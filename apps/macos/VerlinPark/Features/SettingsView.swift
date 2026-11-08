@@ -3,6 +3,7 @@ import SwiftUI
 import UserNotifications
 
 enum SettingsSection: String, CaseIterable, Identifiable {
+    case general
     case brand
     case resident
     case providers
@@ -17,30 +18,33 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .brand: "Brand"
-        case .resident: "Resident"
-        case .providers: "Providers"
-        case .acp: "ACP"
-        case .mcp: "MCP"
-        case .notifications: "Notifications"
-        case .about: "About"
+        case .general: L10n.t("General")
+        case .brand: L10n.t("Brand")
+        case .resident: L10n.t("Resident")
+        case .providers: L10n.t("Providers")
+        case .acp: L10n.t("ACP")
+        case .mcp: L10n.t("MCP")
+        case .notifications: L10n.t("Notifications")
+        case .about: L10n.t("About")
         }
     }
 
     var detail: String {
         switch self {
-        case .brand: "Wordmark, flags, and live preview"
-        case .resident: "External Aviiya bridge"
-        case .providers: "Models, prices, and team capacity"
-        case .acp: "External stdio agents"
-        case .mcp: "Local and remote tool servers"
-        case .notifications: "Permission and background alerts"
-        case .about: "Version, updates, and license"
+        case .general: L10n.t("Language and appearance")
+        case .brand: L10n.t("Wordmark, flags, and live preview")
+        case .resident: L10n.t("External Aviiya bridge")
+        case .providers: L10n.t("Models, prices, and team capacity")
+        case .acp: L10n.t("External stdio agents")
+        case .mcp: L10n.t("Local and remote tool servers")
+        case .notifications: L10n.t("Permission and background alerts")
+        case .about: L10n.t("Version, updates, and license")
         }
     }
 
     var icon: String {
         switch self {
+        case .general: "globe"
         case .brand: "paintpalette"
         case .resident: "cube.transparent"
         case .providers: "network"
@@ -55,6 +59,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 struct SettingsView: View {
     @Environment(BrandStore.self) private var brand
     @Environment(AppModel.self) private var model
+    @Environment(LanguageStore.self) private var language
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var section: SettingsSection = .brand
     @State private var hoveredSection: SettingsSection?
@@ -75,9 +80,11 @@ struct SettingsView: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 880, height: 660)
+        .frame(width: 900, height: 680)
         .preferredColorScheme(.dark)
         .tint(VPTheme.accent)
+        .environment(\.locale, language.locale)
+        .id(language.language.rawValue)
         .background { VPCrystalBackdrop() }
         .onAppear {
             if let saved = SettingsSection(rawValue: storedSection) {
@@ -118,9 +125,10 @@ struct SettingsView: View {
                             Text(item.title)
                                 .font(VPTheme.font(11, weight: section == item ? .semibold : .medium))
                             Text(item.detail)
-                                .font(VPTheme.mono(7.5))
+                                .font(VPTheme.mono(7.3))
                                 .foregroundStyle(VPTheme.textTertiary)
                                 .lineLimit(1)
+                                .minimumScaleFactor(0.82)
                         }
                         Spacer(minLength: 4)
                     }
@@ -176,23 +184,25 @@ struct SettingsView: View {
                     pulsing: model.connection == .connecting,
                     size: 5
                 )
-                Text(model.connection == .connected ? "daemon connected" : "daemon offline")
+                Text(L10n.t(model.connection == .connected ? "daemon connected" : "daemon offline"))
                     .font(VPTheme.mono(8))
                     .foregroundStyle(VPTheme.textTertiary)
             }
-            Text("⌘K command palette · ⌘1–⌘7 sections")
+            Text(L10n.t("⌘K command palette · ⌘1–⌘8 sections"))
                 .font(VPTheme.mono(7.5))
                 .foregroundStyle(VPTheme.textTertiary.opacity(0.8))
                 .padding(.bottom, 2)
         }
         .padding(16)
-        .frame(width: 216)
+        .frame(width: 248)
         .background(VPTheme.rail)
     }
 
     @ViewBuilder
     private var content: some View {
         switch section {
+        case .general:
+            GeneralSettingsView()
         case .brand:
             BrandSettingsView()
         case .resident:
@@ -208,6 +218,137 @@ struct SettingsView: View {
         case .about:
             AboutSettingsView()
         }
+    }
+}
+
+struct GeneralSettingsView: View {
+    @Environment(LanguageStore.self) private var language
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(L10n.t("General"))
+                        .font(VPTheme.font(22, weight: .semibold, rounded: true))
+                        .foregroundStyle(VPTheme.textPrimary)
+                    Text(L10n.t("Interface language and the workspace appearance."))
+                        .font(VPTheme.font(10.5))
+                        .foregroundStyle(VPTheme.textSecondary)
+                }
+
+                VStack(alignment: .leading, spacing: 9) {
+                    SectionLabel(title: L10n.t("Interface language"))
+                    HStack(spacing: 10) {
+                        ForEach(AppLanguage.allCases) { option in
+                            languageCard(option)
+                        }
+                    }
+                    Text(
+                        L10n.t(
+                            "Language changes apply immediately. Daemon output and long technical provider messages may remain in English."
+                        )
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+                }
+
+                VStack(alignment: .leading, spacing: 9) {
+                    SectionLabel(title: L10n.t("Appearance"))
+                    HStack(spacing: 10) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(
+                                    LinearGradient(
+                                        colors: [VPTheme.surfaceRaised, VPTheme.canvas],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                )
+                                .frame(width: 54, height: 38)
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
+                                }
+                            Image(systemName: "cube.transparent")
+                                .font(.system(size: 14, weight: .light))
+                                .foregroundStyle(VPTheme.accent)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(L10n.t("Black crystal"))
+                                .font(VPTheme.font(11.5, weight: .semibold))
+                                .foregroundStyle(VPTheme.textPrimary)
+                            Text(L10n.t("Obsidian glass, ice accent, specular edges."))
+                                .font(VPTheme.mono(8))
+                                .foregroundStyle(VPTheme.textTertiary)
+                        }
+                        Spacer()
+                        Text(L10n.t("DARK ONLY"))
+                            .font(VPTheme.mono(7, weight: .semibold))
+                            .tracking(0.6)
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(VPTheme.surfaceRaised, in: Capsule())
+                    }
+                    .padding(11)
+                    .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 9) {
+                    SectionLabel(title: L10n.t("Workspace"))
+                    HStack(spacing: 14) {
+                        Label(L10n.t("Isolated worktrees"), systemImage: "arrow.triangle.branch")
+                        Label(L10n.t("Verifier gate"), systemImage: "checkmark.shield")
+                        Label(L10n.t("Deterministic merge"), systemImage: "arrow.triangle.merge")
+                    }
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: 780, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
+    }
+
+    private func languageCard(_ option: AppLanguage) -> some View {
+        let selected = language.language == option
+        return Button {
+            language.select(option)
+        } label: {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(option.endonym)
+                        .font(VPTheme.font(13, weight: .semibold))
+                        .foregroundStyle(selected ? VPTheme.textPrimary : VPTheme.textSecondary)
+                    Text(option == .english ? "English" : "Simplified Chinese")
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 13))
+                    .foregroundStyle(selected ? VPTheme.accent : VPTheme.textTertiary)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                selected ? VPTheme.accent.opacity(0.09) : VPTheme.surface,
+                in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .strokeBorder(
+                        selected ? VPTheme.accent.opacity(0.30) : VPTheme.hairline,
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(VPPressableButtonStyle(scale: 0.99))
     }
 }
 
@@ -237,7 +378,7 @@ struct BrandSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     SectionLabel(title: "Display name")
                     TextField("VerlinPark", text: $brand.config.displayName)
-                        .textFieldStyle(.roundedBorder)
+                        .textFieldStyle(.plain).vpFrostedField()
                         .font(.system(size: 13))
                     HStack(spacing: 6) {
                         ForEach(BrandConfig.presets, id: \.self) { preset in
@@ -430,7 +571,7 @@ struct FlagPickerView: View {
                 .frame(width: 220)
 
                 TextField("Search", text: $search)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain).vpFrostedField()
                     .font(.system(size: 11))
             }
 
@@ -565,12 +706,12 @@ struct ProvidersSettingsView: View {
                     }
                 }
                 TextField("Base URL", text: $model.providerBaseURL)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain).vpFrostedField()
                 TextField("Model", text: $model.providerModel)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain).vpFrostedField()
                 HStack(spacing: 8) {
                     TextField("Context window (tokens)", text: $model.providerContextWindowText)
-                        .textFieldStyle(.roundedBorder)
+                        .textFieldStyle(.plain).vpFrostedField()
                     Menu("Presets") {
                         Button("Off") { model.providerContextWindowText = "0" }
                         Button("8k") { model.providerContextWindowText = "8000" }
@@ -592,7 +733,7 @@ struct ProvidersSettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 SecureField("API key", text: $model.providerAPIKey)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain).vpFrostedField()
                 Text(
                     "The key is stored in Keychain and sent only to the local daemon. It is never written to SQLite or logs."
                 )
@@ -614,7 +755,8 @@ struct ProvidersSettingsView: View {
                     }
                     Spacer()
                     if let info = model.agentInfo {
-                        Text(info.configured ? (info.model ?? "configured") : "not configured")
+                        Text(info.configured ? (info.model ?? L10n.t("configured")) : L10n
+                            .t("not configured"))
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(info.configured ? Color.green : Color.orange)
                     }
@@ -715,7 +857,7 @@ struct ProvidersSettingsView: View {
 
             Section("Session defaults") {
                 TextField("Token budget", value: $tokenBudget, format: .number)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain).vpFrostedField()
                     .frame(width: 160)
                 Text(
                     "Input + output token budget for new sessions. Existing sessions keep their own budget. Concurrent agent batches may overshoot by one turn."
@@ -733,7 +875,10 @@ struct ProvidersSettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
         .padding(24)
+        .frame(maxWidth: 920)
+        .frame(maxWidth: .infinity)
         .sheet(isPresented: $showingModelPresets) {
             ModelPresetsSheet()
                 .environment(model)
@@ -800,7 +945,7 @@ private struct ModelPresetsSheet: View {
                                     .background {
                                         if model.selectedModelPresetID == preset.id {
                                             RoundedRectangle(cornerRadius: 7)
-                                                .fill(Color.accentColor.opacity(0.18))
+                                                .fill(VPTheme.accent.opacity(0.18))
                                                 .matchedGeometryEffect(
                                                     id: "preset-selection",
                                                     in: presetNamespace
@@ -839,23 +984,23 @@ private struct ModelPresetsSheet: View {
                             .font(.system(size: 9, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.tertiary)
                         TextField("Name", text: $model.modelPresetName)
-                            .textFieldStyle(.roundedBorder)
+                            .textFieldStyle(.plain).vpFrostedField()
                         Picker("Provider", selection: $model.modelPresetProvider) {
                             Text("OpenAI-compatible").tag("openai-compatible")
                             Text("Anthropic").tag("anthropic")
                         }
                         TextField("Model", text: $model.modelPresetModel)
-                            .textFieldStyle(.roundedBorder)
+                            .textFieldStyle(.plain).vpFrostedField()
                         HStack(spacing: 8) {
                             TextField("Context window", text: $model.modelPresetContextText)
-                                .textFieldStyle(.roundedBorder)
+                                .textFieldStyle(.plain).vpFrostedField()
                             TextField("Input $/1M", text: $model.modelPresetInputPriceText)
-                                .textFieldStyle(.roundedBorder)
+                                .textFieldStyle(.plain).vpFrostedField()
                             TextField("Output $/1M", text: $model.modelPresetOutputPriceText)
-                                .textFieldStyle(.roundedBorder)
+                                .textFieldStyle(.plain).vpFrostedField()
                         }
                         TextField("Notes", text: $model.modelPresetNotes, axis: .vertical)
-                            .textFieldStyle(.roundedBorder)
+                            .textFieldStyle(.plain).vpFrostedField()
                             .lineLimit(2 ... 3)
                         HStack {
                             Button("Save preset") {
@@ -932,26 +1077,71 @@ private struct RoleModelRow: View {
     @Binding var config: RoleModelConfig
 
     var body: some View {
-        HStack(spacing: 8) {
-            Text(title)
-                .font(.system(size: 11, weight: .medium))
-                .frame(width: 64, alignment: .leading)
-            TextField("base model", text: modelBinding)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 11, design: .monospaced))
-            TextField("in $/1M", text: priceBinding(\.inputUsdPerMillion))
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 11, design: .monospaced))
-                .frame(width: 80)
-            TextField("out $/1M", text: priceBinding(\.outputUsdPerMillion))
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 11, design: .monospaced))
-                .frame(width: 80)
-            TextField("ctx", text: contextBinding)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 11, design: .monospaced))
-                .frame(width: 72)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 9) {
+                Text(L10n.t(title))
+                    .font(VPTheme.font(11, weight: .semibold))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .frame(width: 66, alignment: .leading)
+
+                TextField("Override base model", text: modelBinding)
+                    .textFieldStyle(.plain)
+                    .font(VPTheme.mono(10))
+                    .foregroundStyle(VPTheme.textPrimary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .vpFieldSurface(radius: 7)
+            }
+
+            HStack(alignment: .top, spacing: 8) {
+                metricField(
+                    "Input $ / 1M",
+                    placeholder: "0",
+                    text: priceBinding(\.inputUsdPerMillion)
+                )
+                metricField(
+                    "Output $ / 1M",
+                    placeholder: "0",
+                    text: priceBinding(\.outputUsdPerMillion)
+                )
+                metricField(
+                    "Context window",
+                    placeholder: "base",
+                    text: contextBinding
+                )
+            }
+            .padding(.leading, 75)
         }
+        .padding(9)
+        .background(
+            VPTheme.surfaceSunken.opacity(0.55),
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
+        }
+    }
+
+    private func metricField(
+        _ label: String,
+        placeholder: String,
+        text: Binding<String>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(L10n.t(label).uppercased())
+                .font(VPTheme.mono(7, weight: .medium))
+                .tracking(0.5)
+                .foregroundStyle(VPTheme.textTertiary)
+            TextField(placeholder, text: text)
+                .textFieldStyle(.plain)
+                .font(VPTheme.mono(10))
+                .foregroundStyle(VPTheme.textPrimary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
+                .vpFieldSurface(radius: 6)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var contextBinding: Binding<String> {

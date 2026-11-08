@@ -11,12 +11,12 @@ import SwiftUI
 enum VPTheme {
     // MARK: Canvas and surfaces
 
-    static let canvas = Color(hex: "06080B")
-    static let rail = Color(hex: "0A0F14F2")
-    static let surface = Color(hex: "101820B8")
-    static let surfaceRaised = Color(hex: "18232ED9")
-    static let surfaceHover = Color(hex: "1F2C38EA")
-    static let surfaceSunken = Color(hex: "080C10CC")
+    static let canvas = Color(hex: "030407")
+    static let rail = Color(hex: "070B10F5")
+    static let surface = Color(hex: "0F1720CC")
+    static let surfaceRaised = Color(hex: "16212BDD")
+    static let surfaceHover = Color(hex: "1D2A36EE")
+    static let surfaceSunken = Color(hex: "070A0ECC")
     static let hairline = Color.white.opacity(0.075)
     static let hairlineStrong = Color.white.opacity(0.15)
     static let hairlineAccent = Color(hex: "A9C9D6").opacity(0.26)
@@ -29,15 +29,15 @@ enum VPTheme {
 
     // MARK: Identity and state
 
-    static let accent = Color(hex: "A9C9D6")
-    static let accentSoft = Color(hex: "D9ECF2")
-    static let accentDeep = Color(hex: "4C7285")
-    static let success = Color(hex: "8DBBA7")
-    static let warning = Color(hex: "D6B06B")
-    static let info = Color(hex: "97AFE8")
-    static let danger = Color(hex: "D97B7B")
-    static let plan = Color(hex: "B1A8DA")
-    static let resident = Color(hex: "8FC8D1")
+    static let accent = Color(hex: "B4DCEB")
+    static let accentSoft = Color(hex: "E2F4FA")
+    static let accentDeep = Color(hex: "3F6B7F")
+    static let success = Color(hex: "74D3A4")
+    static let warning = Color(hex: "F2C66D")
+    static let info = Color(hex: "9CB5FF")
+    static let danger = Color(hex: "FF8585")
+    static let plan = Color(hex: "C2A6FF")
+    static let resident = Color(hex: "6FE0E6")
 
     static let accentGradient = LinearGradient(
         colors: [accentSoft, accent],
@@ -59,21 +59,21 @@ enum VPTheme {
 
     static let edgeGradient = LinearGradient(
         colors: [
-            Color.white.opacity(0.19),
-            Color.white.opacity(0.035),
-            Color.white.opacity(0.095),
+            Color.white.opacity(0.24),
+            Color.white.opacity(0.045),
+            Color.white.opacity(0.12),
         ],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
 
     static let avatarPalettes: [(Color, Color)] = [
-        (Color(hex: "6F8D9B"), Color(hex: "A9C9D6")),
-        (Color(hex: "738F87"), Color(hex: "A8C4BB")),
-        (Color(hex: "7D82A6"), Color(hex: "AFB4D8")),
-        (Color(hex: "9B7F8C"), Color(hex: "CBAAB7")),
-        (Color(hex: "6D879E"), Color(hex: "A6BFD1")),
-        (Color(hex: "8A877E"), Color(hex: "C0BDB2")),
+        (Color(hex: "4E8FA8"), Color(hex: "8FD6E8")),
+        (Color(hex: "4F8F7B"), Color(hex: "86D8B8")),
+        (Color(hex: "6B6FB0"), Color(hex: "B5A6FF")),
+        (Color(hex: "A05F77"), Color(hex: "E8A6C2")),
+        (Color(hex: "4D7CA8"), Color(hex: "8FC4F0")),
+        (Color(hex: "8B7B57"), Color(hex: "D8C08A")),
     ]
 
     // MARK: Typography
@@ -201,11 +201,23 @@ extension View {
         }
     }
 
+    func vpFrostedField(radius: CGFloat = 8) -> some View {
+        font(VPTheme.mono(10))
+            .foregroundStyle(VPTheme.textPrimary)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .vpFieldSurface(radius: radius)
+    }
+
     func vpFieldSurface(radius: CGFloat = 10, focused: Bool = false) -> some View {
-        background(
-            VPTheme.surfaceSunken,
-            in: RoundedRectangle(cornerRadius: radius, style: .continuous)
-        )
+        background {
+            ZStack {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .fill(VPTheme.surfaceSunken.opacity(0.52))
+            }
+        }
         .overlay {
             RoundedRectangle(cornerRadius: radius, style: .continuous)
                 .strokeBorder(
@@ -245,13 +257,13 @@ struct VPKicker: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(text.uppercased())
+            Text(L10n.t(text).uppercased())
                 .font(VPTheme.mono(9, weight: .semibold))
                 .tracking(0.9)
                 .foregroundStyle(color)
             Spacer(minLength: 0)
             if let trailing {
-                Text(trailing)
+                Text(L10n.t(trailing))
                     .font(VPTheme.mono(8))
                     .foregroundStyle(VPTheme.textTertiary)
             }
@@ -263,7 +275,7 @@ struct VPLabel: View {
     let text: String
 
     var body: some View {
-        Text(text)
+        Text(L10n.t(text))
             .font(VPTheme.mono(9, weight: .medium))
             .foregroundStyle(VPTheme.textTertiary)
     }
@@ -562,7 +574,7 @@ struct VPStatusChip: View {
             Circle()
                 .fill(VPTheme.statusColor(status))
                 .frame(width: 5, height: 5)
-            Text((label ?? status).uppercased())
+            Text(L10n.t(label ?? status).uppercased())
                 .font(VPTheme.mono(8, weight: .semibold))
                 .tracking(0.5)
                 .foregroundStyle(VPTheme.statusColor(status))
@@ -570,11 +582,11 @@ struct VPStatusChip: View {
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
         .background(
-            VPTheme.statusColor(status).opacity(0.10),
+            VPTheme.statusColor(status).opacity(0.15),
             in: Capsule()
         )
         .overlay {
-            Capsule().strokeBorder(VPTheme.statusColor(status).opacity(0.18), lineWidth: 1)
+            Capsule().strokeBorder(VPTheme.statusColor(status).opacity(0.28), lineWidth: 1)
         }
         .accessibilityLabel("Status \(status)")
     }

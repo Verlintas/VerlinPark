@@ -201,10 +201,10 @@ struct CommandPaletteView: View {
                     .background(item.tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(item.title)
+                    Text(L10n.t(item.title))
                         .font(.system(size: 12, weight: .medium))
                         .lineLimit(1)
-                    Text(item.subtitle)
+                    Text(L10n.t(item.subtitle))
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -259,7 +259,9 @@ struct CommandPaletteView: View {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return items }
         return items.filter {
-            $0.title.localizedCaseInsensitiveContains(query)
+            L10n.t($0.title).localizedCaseInsensitiveContains(query)
+                || $0.title.localizedCaseInsensitiveContains(query)
+                || L10n.t($0.subtitle).localizedCaseInsensitiveContains(query)
                 || $0.subtitle.localizedCaseInsensitiveContains(query)
                 || $0.keywords.localizedCaseInsensitiveContains(query)
         }
@@ -473,9 +475,9 @@ private struct PaletteItem: Identifiable {
 
     var kindLabel: String {
         switch kind {
-        case .action: "ACTION"
-        case .project: "PROJECT"
-        case .session: "SESSION"
+        case .action: L10n.t("ACTION")
+        case .project: L10n.t("PROJECT")
+        case .session: L10n.t("SESSION")
         }
     }
 }

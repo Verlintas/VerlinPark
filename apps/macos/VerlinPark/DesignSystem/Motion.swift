@@ -457,7 +457,7 @@ struct VPSegmentedControl<Value: Hashable>: View {
                             Image(systemName: icon)
                                 .font(.system(size: compact ? 8 : 9, weight: .semibold))
                         }
-                        Text(segment.title)
+                        Text(L10n.t(segment.title))
                             .font(.system(size: compact ? 9 : 10, weight: .medium, design: .rounded))
                             .lineLimit(1)
                     }
@@ -585,7 +585,7 @@ struct VPStreamingCaret: View {
 
 struct VPGradientProgress: View {
     let value: Double
-    var tint: Color = .accentColor
+    var tint: Color = VPTheme.accent
     var height: CGFloat = 6
 
     var body: some View {

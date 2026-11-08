@@ -187,7 +187,7 @@ struct NewSessionSheet: View {
                 Image(systemName: icon)
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(VPTheme.textTertiary)
-                Text(title.uppercased())
+                Text(L10n.t(title).uppercased())
                     .font(VPTheme.mono(8, weight: .semibold))
                     .tracking(0.7)
                     .foregroundStyle(VPTheme.textSecondary)
@@ -197,7 +197,7 @@ struct NewSessionSheet: View {
                 .padding(.horizontal, 9)
                 .padding(.vertical, 7)
                 .vpFieldSurface(radius: 8)
-            Text(hint)
+            Text(L10n.t(hint))
                 .font(VPTheme.mono(7.5))
                 .foregroundStyle(VPTheme.textTertiary)
         }
@@ -259,7 +259,7 @@ struct NewSessionSheet: View {
                 .font(VPTheme.mono(8.5, weight: .semibold))
                 .tracking(1.0)
                 .foregroundStyle(VPTheme.textSecondary)
-            Text(detail)
+            Text(L10n.t(detail))
                 .font(VPTheme.mono(7.5))
                 .foregroundStyle(VPTheme.textTertiary)
         }

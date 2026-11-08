@@ -25,10 +25,10 @@ struct AcpSettingsView: View {
                     SectionLabel(title: "Add agent")
                     HStack(spacing: 8) {
                         TextField("name", text: $name)
-                            .textFieldStyle(.roundedBorder)
+                            .textFieldStyle(.plain).vpFrostedField()
                             .frame(width: 150)
                         TextField("command (for example npx)", text: $command)
-                            .textFieldStyle(.roundedBorder)
+                            .textFieldStyle(.plain).vpFrostedField()
                     }
                     TextEditor(text: $argsText)
                         .font(.system(size: 10, design: .monospaced))

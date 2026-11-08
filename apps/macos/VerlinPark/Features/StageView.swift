@@ -113,7 +113,7 @@ private struct ProjectStageView: View {
                         .frame(width: 1, height: 9)
 
                     if let info = model.agentInfo {
-                        Text(info.configured ? (info.model ?? "MODEL") : "NO MODEL")
+                        Text(info.configured ? (info.model ?? "MODEL") : L10n.t("NO MODEL"))
                             .font(VPTheme.mono(8, weight: .medium))
                             .foregroundStyle(info.configured ? VPTheme.textTertiary : VPTheme.warning)
                     }
@@ -549,7 +549,7 @@ private struct ContextPopoverView: View {
                     value: contextProgress(usage),
                     tint: usage.estimatedTokens >= usage.hardLimitTokens
                         ? .red
-                        : usage.estimatedTokens >= usage.thresholdTokens ? .orange : .accentColor,
+                        : usage.estimatedTokens >= usage.thresholdTokens ? VPTheme.warning : VPTheme.accent,
                     height: 6
                 )
 
@@ -910,7 +910,7 @@ struct SessionChatView: View {
                             .id("streaming")
                             .transition(.vpRise)
                     } else if session.status == "running" {
-                        VPThinkingIndicator(label: "Leader is thinking…", tint: VPTheme.accent)
+                        VPThinkingIndicator(label: L10n.t("Leader is thinking…"), tint: VPTheme.accent)
                             .padding(.vertical, 4)
                             .transition(.vpContent)
                     } else if session.status == "queued" {
@@ -1112,7 +1112,7 @@ struct SessionChatView: View {
 
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
-                    Text(agent ?? "Leader")
+                    Text(L10n.t(agent ?? "Leader"))
                         .font(VPTheme.mono(8, weight: .semibold))
                         .foregroundStyle(VPTheme.roleColor(role))
                     if streaming {

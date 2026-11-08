@@ -331,7 +331,7 @@ struct RailView: View {
                         HStack(spacing: 4) {
                             if active > 0 {
                                 VPStatusDot(color: VPTheme.accent, pulsing: true, size: 4)
-                                Text("\(active) active")
+                                Text(L10n.format("%lld active", active))
                                     .foregroundStyle(VPTheme.accent)
                             } else {
                                 Text(project.defaultBranch)
@@ -392,7 +392,7 @@ struct RailView: View {
                             }
                         } label: {
                             HStack(spacing: 5) {
-                                Text("Show \(total - sessions.count) more")
+                                Text(L10n.format("Show %lld more", total - sessions.count))
                                 Image(systemName: "chevron.down")
                                     .font(.system(size: 7, weight: .bold))
                             }
@@ -573,7 +573,7 @@ struct RailView: View {
                             .offset(x: 5, y: -2)
                     }
                 }
-                Text(title)
+                Text(L10n.t(title))
                     .font(VPTheme.mono(7.5, weight: .medium))
             }
             .foregroundStyle(hovering ? VPTheme.textPrimary : VPTheme.textSecondary)

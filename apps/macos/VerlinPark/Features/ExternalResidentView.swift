@@ -62,7 +62,7 @@ struct ExternalResidentView: View {
                     .tracking(1.4)
                     .foregroundStyle(VPTheme.resident)
 
-                Text("Aviiya lives in\nNovaBAIC.")
+                Text("Aviiya lives in NovaBAIC.")
                     .font(VPTheme.editorial(38))
                     .foregroundStyle(VPTheme.textPrimary)
                     .lineSpacing(1)
@@ -186,7 +186,7 @@ struct ExternalResidentView: View {
     // MARK: Components
 
     private func residentChip(_ title: String, icon: String) -> some View {
-        Label(title, systemImage: icon)
+        Label(L10n.t(title), systemImage: icon)
             .font(VPTheme.mono(8))
             .foregroundStyle(VPTheme.textTertiary)
             .padding(.horizontal, 7)
@@ -215,7 +215,7 @@ struct ExternalResidentView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(title)
+                    Text(L10n.t(title))
                         .font(VPTheme.font(11.5, weight: .semibold))
                         .foregroundStyle(VPTheme.textPrimary)
                     Text("FUTURE")
@@ -226,7 +226,7 @@ struct ExternalResidentView: View {
                         .padding(.vertical, 1)
                         .background(VPTheme.surfaceRaised, in: Capsule())
                 }
-                Text(detail)
+                Text(L10n.t(detail))
                     .font(VPTheme.font(9.5))
                     .foregroundStyle(VPTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)

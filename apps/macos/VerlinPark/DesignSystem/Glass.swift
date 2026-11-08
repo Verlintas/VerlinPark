@@ -163,7 +163,7 @@ struct SectionLabel: View {
     let title: String
 
     var body: some View {
-        Text(title.uppercased())
+        Text(L10n.t(title).uppercased())
             .font(VPTheme.mono(9, weight: .semibold))
             .foregroundStyle(VPTheme.textTertiary)
             .tracking(0.9)

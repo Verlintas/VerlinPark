@@ -11,7 +11,7 @@ struct ConnectionBadge: View {
                 pulsing: state == .connecting,
                 size: 5
             )
-            Text(label)
+            Text(L10n.t(label))
                 .font(VPTheme.mono(8, weight: .medium))
                 .foregroundStyle(VPTheme.textSecondary)
         }
@@ -54,16 +54,16 @@ struct StatusPill: View {
                 ),
                 size: 4
             )
-            Text(status.uppercased())
+            Text(L10n.t(status).uppercased())
                 .font(VPTheme.mono(8, weight: .semibold))
                 .tracking(0.4)
         }
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
-        .background(VPTheme.statusColor(status).opacity(0.09), in: Capsule())
+        .background(VPTheme.statusColor(status).opacity(0.13), in: Capsule())
         .foregroundStyle(VPTheme.statusColor(status))
         .overlay {
-            Capsule().strokeBorder(VPTheme.statusColor(status).opacity(0.16), lineWidth: 1)
+            Capsule().strokeBorder(VPTheme.statusColor(status).opacity(0.24), lineWidth: 1)
         }
     }
 }

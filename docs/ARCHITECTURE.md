@@ -1084,8 +1084,10 @@ animated connectors and a scrollable ten-mode Preview chip row; dashboard
 cards and settings panels use bounded hover elevation. `⌘K` opens a keyboard
 command palette for projects, all sessions, and global actions; `⇧⌘F` toggles
 focus mode; a slim draggable top chrome shows the breadcrumb, memory, command
-palette, and focus control. Settings is a seven-section sidebar shell with
-content transitions and persisted selection. Toasts are transient UI feedback;
+palette, and focus control. Settings is an eight-section sidebar shell with
+content transitions, persisted selection, and an English / Simplified Chinese
+language switch shared with the top chrome. Static and computed labels resolve
+through the same localization table (ADR-0117). Toasts are transient UI feedback;
 the Rail notification center remains the durable inbox. All custom continuous
 effects stop under Reduce Motion.
 

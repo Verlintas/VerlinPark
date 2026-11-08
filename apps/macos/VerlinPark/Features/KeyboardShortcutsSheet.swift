@@ -17,48 +17,90 @@ struct KeyboardShortcutGroup: Identifiable {
 }
 
 enum KeyboardShortcutsCatalog {
-    static let groups: [KeyboardShortcutGroup] = [
-        KeyboardShortcutGroup(
-            title: "Global",
-            entries: [
-                KeyboardShortcutEntry(title: "Command palette", key: "K", modifiers: [.command]),
-                KeyboardShortcutEntry(title: "Focus mode", key: "F", modifiers: [.command, .shift]),
-                KeyboardShortcutEntry(title: "Toggle inspector", key: "I", modifiers: [.command, .option]),
-                KeyboardShortcutEntry(title: "Search messages", key: "F", modifiers: [.command]),
-                KeyboardShortcutEntry(title: "Refresh current panel", key: "R", modifiers: [.command]),
-                KeyboardShortcutEntry(title: "Manage Dash", key: "D", modifiers: [.command, .shift]),
-                KeyboardShortcutEntry(title: "New session", key: "N", modifiers: [.command]),
-                KeyboardShortcutEntry(title: "Chat with Aviiya", key: "1", modifiers: [.command]),
-                KeyboardShortcutEntry(title: "Add project", key: "O", modifiers: [.command, .shift]),
-                KeyboardShortcutEntry(title: "Keyboard shortcuts", key: "/", modifiers: [.command]),
-            ]
-        ),
-        KeyboardShortcutGroup(
-            title: "Navigation",
-            entries: [
-                KeyboardShortcutEntry(title: "Move through palette", key: "↑ / ↓", modifiers: []),
-                KeyboardShortcutEntry(title: "Open highlighted result", key: "↵", modifiers: []),
-                KeyboardShortcutEntry(title: "Dismiss overlay", key: "esc", modifiers: []),
-                KeyboardShortcutEntry(title: "Switch dashboard section", key: "1–9", modifiers: [.command]),
-                KeyboardShortcutEntry(title: "Switch settings section", key: "1–7", modifiers: [.command]),
-            ]
-        ),
-        KeyboardShortcutGroup(
-            title: "Session",
-            entries: [
-                KeyboardShortcutEntry(title: "New session", key: "N", modifiers: [.command]),
-                KeyboardShortcutEntry(title: "Focus message composer", key: "L", modifiers: [.command]),
-                KeyboardShortcutEntry(title: "Send message", key: "↵", modifiers: []),
-                KeyboardShortcutEntry(title: "New line in composer", key: "⇧↵", modifiers: []),
-            ]
-        ),
-        KeyboardShortcutGroup(
-            title: "Project",
-            entries: [
-                KeyboardShortcutEntry(title: "Add project", key: "O", modifiers: [.command, .shift]),
-            ]
-        ),
-    ]
+    static var groups: [KeyboardShortcutGroup] {
+        [
+            KeyboardShortcutGroup(
+                title: L10n.t("Global"),
+                entries: [
+                    KeyboardShortcutEntry(title: L10n.t("Command palette"), key: "K", modifiers: [.command]),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Focus mode"),
+                        key: "F",
+                        modifiers: [.command, .shift]
+                    ),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Toggle inspector"),
+                        key: "I",
+                        modifiers: [.command, .option]
+                    ),
+                    KeyboardShortcutEntry(title: L10n.t("Search messages"), key: "F", modifiers: [.command]),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Refresh current panel"),
+                        key: "R",
+                        modifiers: [.command]
+                    ),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Manage Dash"),
+                        key: "D",
+                        modifiers: [.command, .shift]
+                    ),
+                    KeyboardShortcutEntry(title: L10n.t("New session"), key: "N", modifiers: [.command]),
+                    KeyboardShortcutEntry(title: L10n.t("Chat with Aviiya"), key: "1", modifiers: [.command]),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Add project"),
+                        key: "O",
+                        modifiers: [.command, .shift]
+                    ),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Keyboard shortcuts"),
+                        key: "/",
+                        modifiers: [.command]
+                    ),
+                ]
+            ),
+            KeyboardShortcutGroup(
+                title: L10n.t("Navigation"),
+                entries: [
+                    KeyboardShortcutEntry(title: L10n.t("Move through palette"), key: "↑ / ↓", modifiers: []),
+                    KeyboardShortcutEntry(title: L10n.t("Open highlighted result"), key: "↵", modifiers: []),
+                    KeyboardShortcutEntry(title: L10n.t("Dismiss overlay"), key: "esc", modifiers: []),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Switch dashboard section"),
+                        key: "1–9",
+                        modifiers: [.command]
+                    ),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Switch settings section"),
+                        key: "1–8",
+                        modifiers: [.command]
+                    ),
+                ]
+            ),
+            KeyboardShortcutGroup(
+                title: L10n.t("Session"),
+                entries: [
+                    KeyboardShortcutEntry(title: L10n.t("New session"), key: "N", modifiers: [.command]),
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Focus message composer"),
+                        key: "L",
+                        modifiers: [.command]
+                    ),
+                    KeyboardShortcutEntry(title: L10n.t("Send message"), key: "↵", modifiers: []),
+                    KeyboardShortcutEntry(title: L10n.t("New line in composer"), key: "⇧↵", modifiers: []),
+                ]
+            ),
+            KeyboardShortcutGroup(
+                title: L10n.t("Project"),
+                entries: [
+                    KeyboardShortcutEntry(
+                        title: L10n.t("Add project"),
+                        key: "O",
+                        modifiers: [.command, .shift]
+                    ),
+                ]
+            ),
+        ]
+    }
 }
 
 struct KeyboardShortcutsSheet: View {

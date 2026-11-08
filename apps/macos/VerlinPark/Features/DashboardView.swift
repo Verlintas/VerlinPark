@@ -17,29 +17,29 @@ enum DashboardSection: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .overview: "Overview"
-        case .inbox: "Inbox"
-        case .team: "Team & Tasks"
-        case .usage: "Usage & Budget"
-        case .git: "Git & Forks"
-        case .checkpoints: "Checkpoints"
-        case .storage: "Storage & Memory"
-        case .policies: "Policies"
-        case .diagnostics: "Diagnostics"
+        case .overview: L10n.t("Overview")
+        case .inbox: L10n.t("Inbox")
+        case .team: L10n.t("Team & Tasks")
+        case .usage: L10n.t("Usage & Budget")
+        case .git: L10n.t("Git & Forks")
+        case .checkpoints: L10n.t("Checkpoints")
+        case .storage: L10n.t("Storage & Memory")
+        case .policies: L10n.t("Policies")
+        case .diagnostics: L10n.t("Diagnostics")
         }
     }
 
     var detail: String {
         switch self {
-        case .overview: "Workspace, capacity, and pending actions"
-        case .inbox: "Approvals and blocking questions"
-        case .team: "Agents, scheduler, and task queue"
-        case .usage: "Project spend, budget, and per-session usage"
-        case .git: "Fork lineage, project forest, and merge-back"
-        case .checkpoints: "Snapshots, retention, and approximate storage"
-        case .storage: "Artifacts, mailbox, memory, and worktree retention"
-        case .policies: "Shell, integration, and safety policy"
-        case .diagnostics: "Doctor report and runtime checks"
+        case .overview: L10n.t("Workspace, capacity, and pending actions")
+        case .inbox: L10n.t("Approvals and blocking questions")
+        case .team: L10n.t("Agents, scheduler, and task queue")
+        case .usage: L10n.t("Project spend, budget, and per-session usage")
+        case .git: L10n.t("Fork lineage, project forest, and merge-back")
+        case .checkpoints: L10n.t("Snapshots, retention, and approximate storage")
+        case .storage: L10n.t("Artifacts, mailbox, memory, and worktree retention")
+        case .policies: L10n.t("Shell, integration, and safety policy")
+        case .diagnostics: L10n.t("Doctor report and runtime checks")
         }
     }
 
@@ -144,8 +144,7 @@ struct DashboardView: View {
             }
             .padding(.horizontal, 7)
             .padding(.vertical, 5)
-            .background(VPTheme.surfaceSunken, in: RoundedRectangle(cornerRadius: 7))
-            .vpFocusRing(filterFocused, color: VPTheme.accent, radius: 7)
+            .vpFieldSurface(radius: 7, focused: filterFocused)
             .padding(.bottom, 2)
             .help("Filter sections by title or description")
 
@@ -287,7 +286,7 @@ struct DashboardView: View {
                 pulsing: model.connection == .connecting,
                 size: 6
             )
-            Text(model.connection == .connected ? "daemon connected" : "daemon offline")
+            Text(L10n.t(model.connection == .connected ? "daemon connected" : "daemon offline"))
                 .font(VPTheme.mono(8))
                 .foregroundStyle(VPTheme.textTertiary)
             Spacer()

@@ -37,7 +37,7 @@ struct McpSettingsView: View {
                     SectionLabel(title: "Add server")
                     HStack(spacing: 8) {
                         TextField("name", text: $name)
-                            .textFieldStyle(.roundedBorder)
+                            .textFieldStyle(.plain).vpFrostedField()
                             .frame(width: 150)
                         Picker("Transport", selection: $transport) {
                             Text("Stdio").tag("stdio")
@@ -160,7 +160,7 @@ private struct McpConfigEditor: View {
         Group {
             if transport == "stdio" {
                 TextField("command (for example npx)", text: $command)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain).vpFrostedField()
                 pairEditor(
                     title: "Arguments, one per line.",
                     placeholder: "--root\n/tmp",
@@ -173,7 +173,7 @@ private struct McpConfigEditor: View {
                 )
             } else {
                 TextField("URL (https://host/acp or http://127.0.0.1:3000/sse)", text: $url)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain).vpFrostedField()
                 pairEditor(
                     title: "Headers, KEY=VALUE per line. Use ${ENV_VAR} for secrets.",
                     placeholder: "Authorization=Bearer ${MCP_TOKEN}\nX-Client=VerlinPark",
@@ -421,7 +421,7 @@ private struct McpEditSheet: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 8) {
                         TextField("name", text: $name)
-                            .textFieldStyle(.roundedBorder)
+                            .textFieldStyle(.plain).vpFrostedField()
                         Picker("Transport", selection: $transport) {
                             Text("Stdio").tag("stdio")
                             Text("HTTP").tag("http")
