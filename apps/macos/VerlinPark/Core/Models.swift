@@ -1153,6 +1153,12 @@ struct Approval: Codable, Identifiable, Hashable, Sendable {
     let agentName: String?
     let agentRole: String?
     let agentTitle: String?
+    let approvalRisk: String?
+    let approvalReason: String?
+
+    var isDenied: Bool {
+        status == "denied"
+    }
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -1166,6 +1172,8 @@ struct Approval: Codable, Identifiable, Hashable, Sendable {
         case agentName = "agent_name"
         case agentRole = "agent_role"
         case agentTitle = "agent_title"
+        case approvalRisk = "approval_risk"
+        case approvalReason = "approval_reason"
     }
 }
 
@@ -1225,6 +1233,7 @@ struct AgentInfo: Codable, Sendable {
     let roleModels: RoleModels
     let capacity: CapacityInfo?
     let contextWindow: Int?
+    let approvalMode: String?
 
     enum CodingKeys: String, CodingKey {
         case configured
@@ -1234,6 +1243,7 @@ struct AgentInfo: Codable, Sendable {
         case roleModels = "role_models"
         case capacity
         case contextWindow = "context_window"
+        case approvalMode = "approval_mode"
     }
 }
 

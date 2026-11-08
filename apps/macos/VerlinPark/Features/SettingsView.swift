@@ -224,6 +224,7 @@ struct SettingsView: View {
 struct GeneralSettingsView: View {
     @Environment(LanguageStore.self) private var language
     @Environment(WorkspaceLayoutStore.self) private var layout
+    @Environment(AppModel.self) private var model
 
     var body: some View {
         @Bindable var layout = layout
@@ -252,6 +253,23 @@ struct GeneralSettingsView: View {
                     )
                     .font(VPTheme.mono(8))
                     .foregroundStyle(VPTheme.textTertiary)
+                }
+
+                VStack(alignment: .leading, spacing: 9) {
+                    SectionLabel(title: L10n.t("Agent permissions"))
+                    HStack(spacing: 10) {
+                        ForEach(AgentApprovalMode.allCases) { mode in
+                            permissionCard(mode)
+                        }
+                    }
+                    Text(
+                        L10n.t(
+                            "Smart keeps routine edits, builds, and tests moving. It asks only before operations that can change host state. Unattended never waits for a person and denies those operations."
+                        )
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
 
                 VStack(alignment: .leading, spacing: 9) {
@@ -370,6 +388,58 @@ struct GeneralSettingsView: View {
                 .foregroundStyle(VPTheme.textTertiary)
                 .frame(width: 48, alignment: .trailing)
                 .contentTransition(.numericText())
+        }
+    }
+
+    private func permissionCard(_ mode: AgentApprovalMode) -> some View {
+        let selected = model.approvalMode == mode
+        return Button {
+            withAnimation(VPMotion.smooth) {
+                model.approvalMode = mode
+            }
+            Task { await model.applyApprovalMode() }
+        } label: {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Image(systemName: mode.icon)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(selected ? permissionTint(mode) : VPTheme.textTertiary)
+                    Spacer()
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 12))
+                        .foregroundStyle(selected ? permissionTint(mode) : VPTheme.textTertiary)
+                }
+                Text(mode.title)
+                    .font(VPTheme.font(11.5, weight: .semibold))
+                    .foregroundStyle(VPTheme.textPrimary)
+                Text(mode.detail)
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(11)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                selected ? permissionTint(mode).opacity(0.08) : VPTheme.surface,
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(
+                        selected ? permissionTint(mode).opacity(0.30) : VPTheme.hairline,
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+    }
+
+    private func permissionTint(_ mode: AgentApprovalMode) -> Color {
+        switch mode {
+        case .smart: VPTheme.success
+        case .strict: VPTheme.warning
+        case .unattended: VPTheme.info
         }
     }
 

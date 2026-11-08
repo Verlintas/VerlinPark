@@ -64,7 +64,6 @@ pub trait AgentTool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn schema(&self) -> Value;
-    fn requires_approval(&self) -> bool;
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput>;
 }
 
@@ -276,10 +275,6 @@ impl AgentTool for FetchUrl {
         })
     }
 
-    fn requires_approval(&self) -> bool {
-        false
-    }
-
     async fn execute(&self, _context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let raw_url = input
             .get("url")
@@ -385,10 +380,6 @@ impl AgentTool for ReadFile {
         })
     }
 
-    fn requires_approval(&self) -> bool {
-        false
-    }
-
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let path = input
             .get("path")
@@ -424,10 +415,6 @@ impl AgentTool for ListDir {
                 "path": {"type": "string", "description": "Path relative to the project root; default ."}
             }
         })
-    }
-
-    fn requires_approval(&self) -> bool {
-        false
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
@@ -470,10 +457,6 @@ impl AgentTool for Grep {
             },
             "required": ["pattern"]
         })
-    }
-
-    fn requires_approval(&self) -> bool {
-        false
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
@@ -539,7 +522,7 @@ impl AgentTool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Replace an exact string in an existing UTF-8 file. Requires approval."
+        "Replace an exact string in an existing UTF-8 file."
     }
 
     fn schema(&self) -> Value {
@@ -553,10 +536,6 @@ impl AgentTool for EditFile {
             },
             "required": ["path", "old_string", "new_string"]
         })
-    }
-
-    fn requires_approval(&self) -> bool {
-        true
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
@@ -580,6 +559,11 @@ impl AgentTool for EditFile {
             return Ok(ToolOutput::error("old_string must not be empty"));
         }
         let path = safe_existing_path(&context.root, path)?;
+        if path_is_git_metadata(&context.root, &path) {
+            return Ok(ToolOutput::error(
+                "refusing to edit Git metadata through a file tool",
+            ));
+        }
         let content = tokio::fs::read_to_string(&path).await?;
         let matches = content.matches(old_string).count();
         if matches == 0 {
@@ -610,7 +594,7 @@ impl AgentTool for WriteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Create or overwrite a UTF-8 file in the project. Requires approval."
+        "Create or overwrite a UTF-8 file in the session worktree."
     }
 
     fn schema(&self) -> Value {
@@ -622,10 +606,6 @@ impl AgentTool for WriteFile {
             },
             "required": ["path", "content"]
         })
-    }
-
-    fn requires_approval(&self) -> bool {
-        true
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
@@ -865,7 +845,7 @@ impl AgentTool for Shell {
     }
 
     fn description(&self) -> &'static str {
-        "Run a non-interactive shell command in the agent worktree. Writes are confined to the worktree, its Git metadata, and runtime scratch. Requires approval."
+        "Run a non-interactive shell command in the agent worktree. Writes are confined to the worktree, its Git metadata, and runtime scratch; host-level commands may require permission."
     }
 
     fn schema(&self) -> Value {
@@ -877,10 +857,6 @@ impl AgentTool for Shell {
             },
             "required": ["command"]
         })
-    }
-
-    fn requires_approval(&self) -> bool {
-        true
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
@@ -1064,6 +1040,14 @@ fn safe_write_path(root: &Path, relative: &str) -> Result<PathBuf> {
     if path.file_name().is_none() {
         return Err(anyhow!("file name is required"));
     }
+    if path
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        return Err(anyhow!(
+            "refusing to write Git metadata through a file tool"
+        ));
+    }
     let target = root.join(path);
     let mut ancestor = target
         .parent()
@@ -1086,6 +1070,14 @@ fn safe_write_path(root: &Path, relative: &str) -> Result<PathBuf> {
         return Err(anyhow!("refusing to write through a symlink"));
     }
     Ok(target)
+}
+
+fn path_is_git_metadata(root: &Path, path: &Path) -> bool {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| component.as_os_str() == ".git")
 }
 
 fn truncate(mut content: String) -> String {
@@ -1172,6 +1164,29 @@ mod tests {
             .execute(&context, json!({"path": "../outside.txt", "content": "x"}))
             .await;
         assert!(escape.is_err());
+    }
+
+    #[tokio::test]
+    async fn refuses_to_write_git_metadata_through_file_tools() {
+        let (_dir, context) = ctx();
+        std::fs::create_dir_all(context.root.join(".git")).unwrap();
+        std::fs::write(context.root.join(".git/config"), "[core]\n").unwrap();
+        let write = WriteFile
+            .execute(&context, json!({"path": ".git/config", "content": "x"}))
+            .await;
+        assert!(write.is_err());
+        let edit = EditFile
+            .execute(
+                &context,
+                json!({"path": ".git/config", "old_string": "[core]", "new_string": "x"}),
+            )
+            .await
+            .unwrap();
+        assert!(edit.is_error);
+        assert_eq!(
+            std::fs::read_to_string(context.root.join(".git/config")).unwrap(),
+            "[core]\n"
+        );
     }
 
     #[tokio::test]
@@ -1565,13 +1580,5 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    #[test]
-    fn write_and_shell_require_approval() {
-        assert!(EditFile.requires_approval());
-        assert!(WriteFile.requires_approval());
-        assert!(Shell.requires_approval());
-        assert!(!ReadFile.requires_approval());
     }
 }

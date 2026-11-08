@@ -925,10 +925,17 @@ fn writes_approval_projections_and_events_atomically() {
             "shell",
             &serde_json::json!({"command": "true"}),
             Some(&serde_json::json!({"agent_id": "agent-1"})),
+            Some("workspace_write"),
+            Some("shell command inside the sandbox"),
         )
         .unwrap();
     assert_eq!(requested.kind, "approval.requested");
     assert_eq!(requested.payload["agent_id"], "agent-1");
+    assert_eq!(requested.payload["approval_risk"], "workspace_write");
+    assert_eq!(
+        requested.payload["approval_reason"],
+        "shell command inside the sandbox"
+    );
     let (resolved, event) = store
         .resolve_approval_with_event(&approval.id, true)
         .unwrap()
@@ -1067,6 +1074,62 @@ fn migrates_legacy_agents_without_losing_rows() {
 }
 
 #[test]
+fn migrates_legacy_approvals_with_risk_columns() {
+    let data = TempDir::new().unwrap();
+    let db_path = data.path().join("verlinpark.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            root TEXT NOT NULL UNIQUE,
+            default_branch TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            goal TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE approvals (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            tool TEXT NOT NULL,
+            input TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT
+        );
+        INSERT INTO projects VALUES ('p1','demo','/tmp/demo','main','2026-01-01T00:00:00Z');
+        INSERT INTO sessions VALUES ('s1','p1','legacy','idle','2026-01-01T00:00:00Z');
+        INSERT INTO approvals VALUES ('a1','s1','call-1','shell','{"command":"true"}','approved','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z');"#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(data.path()).unwrap();
+    let approvals = store.list_approvals(Some("s1")).unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].approval_risk, None);
+    assert_eq!(approvals[0].status, "approved");
+
+    let created = store
+        .create_approval(
+            "s1",
+            "call-2",
+            "shell",
+            &serde_json::json!({"command": "shutdown"}),
+            Some("destructive"),
+            Some("system power control"),
+        )
+        .unwrap();
+    assert_eq!(created.approval_risk.as_deref(), Some("destructive"));
+}
+
+#[test]
 fn fresh_schema_keeps_artifact_and_mailbox_policy_columns_distinct() {
     let (_data, store, _repo) = test_store();
     let conn = store.lock().unwrap();
@@ -1180,8 +1243,15 @@ fn persists_approvals_and_resolves_once() {
             "call_1",
             "write_file",
             &serde_json::json!({"path": "README.md"}),
+            Some("workspace_write"),
+            Some("workspace file write"),
         )
         .unwrap();
+    assert_eq!(approval.approval_risk.as_deref(), Some("workspace_write"));
+    assert_eq!(
+        approval.approval_reason.as_deref(),
+        Some("workspace file write")
+    );
     assert_eq!(store.list_approvals(Some(&session.id)).unwrap().len(), 1);
 
     let resolved = store.resolve_approval(&approval.id, true).unwrap().unwrap();

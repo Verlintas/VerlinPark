@@ -22,7 +22,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、其他 forge PR、shell scratch 回收、部分 merge 状态的人工检查、外部 ACP agent 的网络/凭证边界、mid-stream 断点续传。
 
-当前测试：Rust 270（core 218 / protocol 1 / store 42 / providers 9；另有 3 个 ignored live tests），Swift 83。CI 以最新提交为准。
+当前测试：Rust 300（core 247 / protocol 1 / store 43 / providers 9；另有 3 个 ignored live tests），Swift 89。CI 以最新提交为准。
 
 ### 0.1 2026-10-31 跟进
 
@@ -68,6 +68,17 @@
 - 新增可选 Developer ID 签名/notarization、cask tap 发布和 arm64 release runner；见 ADR-0090。
 - 新增 opt-in user/volume read jail：`ShellPolicy.read_jail`、HOME parent + `/Volumes` deny、toolchain/worktree allowlist、Manage Dash/CLI，Agent/Console/PTY 统一；见 ADR-0089。
 - 新增持久 task-DAG 队列与全局 write leases：`plan_tasks`/`write_leases`、plan lifecycle rebuild、priority+aging ready order、`task.queue`/`vp tasks`/Manage Dash、recovery 将 in-flight task 标为 interrupted 并清 lease；task 行已进入 replay/repair/bundle/db-rebuild；非 active session 可通过 `task.skip` / `task.retry` 和 Manage Dash 按钮跳过/重试 task，事件为 `plan_task.skipped` / `plan_task.retried`；opt-in `VERLINPARK_TASK_SCHEDULER` 可按 effective priority/round-robin resume 待办 session plan；见 ADR-0088。
+
+### 0.2 2026-11-08 权限策略、转录面与 Collab 收敛
+
+- **审批从“每次写/Shell 都问”改为风险分级**：`ApprovalMode` 三档 `smart` / `strict` / `unattended`，默认 `smart`。`smart` 放行工作区文件写入、常规构建/测试和外部只读/网络动作，只在 host-state/destructive 操作前询问；`strict` 恢复旧行为；`unattended` 不等待人工并拒绝 host-state/destructive。Settings → General 与 `VERLINPARK_APPROVAL_MODE` 可配置，daemon 仍是唯一决策者。
+- **确定性分类器**：`crates/vp-core/src/permissions.rs` 不调用模型。它拆 Shell 段、跟踪 `cd`、扫描 `sh -c`/`eval`/解释器 `-c`/`find -exec`/`xargs`、双引号内命令替换和重定向；区分 workspace write、external、host-state、destructive；永久拒绝 `sudo`/`su`/`doas`、根目录删除、裸设备写入、`chroot` 和 fork bomb。`xargs` 无显式目标时按 stdin 目标处理为 host-state。ACP permission 走同一分类器；未知 ACP 请求为 host-state。
+- **审批记录可审计**：`Approval` 增加可选 `approval_risk`/`approval_reason`，`approvals` 表增量迁移、bundle/replay/repair 保留；`permission.allowed` / `permission.denied` 事件记录自动放行和拒绝，不再只靠 tool 输出猜原因。Stage 与 Manage Dash 展示 risk/reason。
+- **工具调用不再是卡片**：`TranscriptProjection` 把事件流投影为稳定行；tool call 是单行工具名 + 参数摘要 + agent + 耗时/状态，点击才展开平铺的输入/输出；running tool 立即出现，`tool.finished` 原地完成。审批行也改为扁平、少见的决策条，显示 risk/reason 后才给 Approve/Deny。
+- **Collab 只保留编排状态**：`CollabSnapshot` 按真实 `parent_id` 将 Worker 归到 Manager 下，只渲染 Leader、Manager/Worker 组、未归属 Worker、Verifier、Labour 和一条计划进度；任务列表、roundtable 文本、Leader todo 明细、computer-lease 设计说明全部移出 Collab。
+- **审计修复**：`write_file`/`edit_file` 拒绝 `.git` 元数据写入；approval schema 增量迁移保留旧行；移除已不再使用的 `AgentTool::requires_approval` 静态标志，避免与真实策略产生第二套事实；修复 `eval`/`sh -c` 递归时把当前目录误当 worktree root 的问题；`xargs` 无显式目标时不再自动放行。
+- **仍未解决**：分类器不是形式化证明。任意解释器、Makefile、构建脚本仍可在 sandbox 内执行未枚举动作；shell 写入之外的任意读取、network allow 下的外发、daemon 介导写入仍未完全隔离。外部 ACP agent 仍是受信任二进制，不提供网络/凭证沙箱。`smart` 只覆盖已识别的 host-state 模式，新增工具必须显式分类；未知工具默认 `external`，在 `strict` 会询问。
+- **测试**：权限分类矩阵、Shell 递归/重定向/`cd`/`xargs`、审批持久化与迁移、smart/strict/unattended 决策、smart 模式下写入不询问、blocked Shell 不询问、MCP/ACP risk 断言；Swift transcript running/finished/approval、tool summary、Collab 分组/计数、approval mode 兼容。见 ADR-0119。
 
 ---
 

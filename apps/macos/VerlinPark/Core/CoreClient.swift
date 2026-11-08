@@ -1403,7 +1403,8 @@ actor CoreClient {
         maxWorkers: Int,
         maxLabour: Int,
         autoExpandWorkers: Bool = false,
-        contextWindow: Int? = nil
+        contextWindow: Int? = nil,
+        approvalMode: String = AgentApprovalMode.smart.rawValue
     ) async throws -> AgentInfo {
         var params: [String: JSONValue] = [
             "provider": .string(kind),
@@ -1413,6 +1414,7 @@ actor CoreClient {
             "max_workers": .number(Double(maxWorkers)),
             "max_labour": .number(Double(maxLabour)),
             "auto_expand_workers": .bool(autoExpandWorkers),
+            "approval_mode": .string(approvalMode),
         ]
         if let roleModels {
             params["role_models"] = Self.roleModelsValue(roleModels)

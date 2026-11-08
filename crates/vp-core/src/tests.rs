@@ -2524,6 +2524,8 @@ async fn replay_checks_critical_projections() {
             "orphan-approval",
             "shell",
             &serde_json::json!({"command": "true"}),
+            None,
+            None,
         )
         .unwrap();
     let report = engine.replay_session(&session.id).await.unwrap();

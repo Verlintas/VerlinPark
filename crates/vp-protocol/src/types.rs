@@ -42,6 +42,40 @@ fn default_shell_network() -> String {
     "allow".to_string()
 }
 
+/// How the runtime decides whether an elevated tool call needs a human.
+///
+/// `Smart` is the default: routine workspace writes and ordinary shell
+/// commands run immediately, while commands that can change host state ask
+/// first. `Strict` restores the older ask-before-every-write behavior.
+/// `Unattended` never blocks on a human; host-level operations are denied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    #[default]
+    Smart,
+    Strict,
+    Unattended,
+}
+
+impl ApprovalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Smart => "smart",
+            Self::Strict => "strict",
+            Self::Unattended => "unattended",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "smart" => Some(Self::Smart),
+            "strict" => Some(Self::Strict),
+            "unattended" => Some(Self::Unattended),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskSchedulerPolicy {
     #[serde(default)]
@@ -1296,6 +1330,12 @@ pub struct Approval {
     pub created_at: String,
     #[serde(default)]
     pub resolved_at: Option<String>,
+    /// Risk classification captured when the approval was requested.
+    #[serde(default)]
+    pub approval_risk: Option<String>,
+    /// Human-readable explanation of why the approval was requested.
+    #[serde(default)]
+    pub approval_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1462,6 +1502,8 @@ pub struct AgentInfo {
     pub capacity: CapacityInfo,
     #[serde(default)]
     pub context_window: Option<u64>,
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
 }
 
 fn default_context_calibration() -> f64 {
@@ -2157,6 +2199,9 @@ pub struct ConfigureAgentParams {
     /// context management.
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// Risk-based approval policy. Omitted preserves `smart`.
+    #[serde(default)]
+    pub approval_mode: Option<ApprovalMode>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

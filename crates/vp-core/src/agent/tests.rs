@@ -94,12 +94,25 @@ fn test_service_with_provider_cap(
         )),
         provider_idle_timeout_secs: 300,
         question_timeout_secs: 1800,
+        approval_mode: ApprovalMode::default(),
         compact_after_tokens: 0,
         compact_keep_messages: 8,
         context_window: 0,
     };
     let service = AgentService::configured(engine.clone(), config);
     (engine, service, project)
+}
+
+fn set_approval_mode(service: &AgentService, mode: ApprovalMode) {
+    let mut config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service is configured")
+        .clone();
+    config.approval_mode = mode;
+    *service.config.write().unwrap() = Some(config);
 }
 
 fn set_worker_cap(service: &AgentService, max_workers: usize) {
@@ -252,6 +265,7 @@ fn configures_provider_without_persisting_secrets() {
             max_labour: None,
             auto_expand_workers: None,
             context_window: None,
+            approval_mode: None,
         })
         .unwrap();
     assert!(info.configured);
@@ -272,6 +286,7 @@ fn configures_provider_without_persisting_secrets() {
             max_labour: None,
             auto_expand_workers: None,
             context_window: None,
+            approval_mode: None,
         })
         .unwrap_err();
     assert!(error.to_string().contains("model is required"));
@@ -748,6 +763,115 @@ async fn runs_tool_call_and_final_message() {
     let messages = engine.list_messages(&session.id).await.unwrap();
     assert!(messages.iter().any(|message| message.role == "assistant"));
 }
+#[tokio::test]
+async fn smart_policy_auto_approves_workspace_writes() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_write".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "notes/smart.txt",
+                        "content": "smart policy\n"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("wrote the file".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "write without a prompt".into(), None)
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "write without a prompt")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let worktree = session.worktree.clone().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&worktree).join("notes/smart.txt")).unwrap(),
+        "smart policy\n"
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "approval.requested")
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.finished"
+            && event.payload["name"] == "write_file"
+            && event.payload["is_error"] == false
+    }));
+}
+
+#[tokio::test]
+async fn smart_policy_denies_blocked_shell_without_asking() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_sudo".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "sudo true"}).to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("the host command was refused".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "refuse privilege escalation".into(), None)
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "refuse privilege escalation")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "approval.requested")
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "permission.denied"
+            && event.payload["tool"] == "shell"
+            && event.payload["risk"] == "destructive"
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.finished"
+            && event.payload["name"] == "shell"
+            && event.payload["is_error"] == true
+            && event.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("Blocked by the local permission policy"))
+    }));
+}
+
 #[tokio::test]
 async fn writes_a_persisted_plan() {
     let dir = TempDir::new().unwrap();
@@ -4218,6 +4342,7 @@ for line in sys.stdin:
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     });
+    set_approval_mode(&service, ApprovalMode::Strict);
     service.start(&session.id, "use dynamic mcp").await.unwrap();
     let sessions = wait_until_idle(&engine, &session).await;
     approver.abort();
@@ -4234,7 +4359,9 @@ for line in sys.stdin:
                 .is_some_and(|output| output.contains("dynamic mcp"))
     }));
     assert!(events.iter().any(|event| {
-        event.kind == "approval.requested" && event.payload["tool"] == "mcp_mock_echo"
+        event.kind == "approval.requested"
+            && event.payload["tool"] == "mcp_mock_echo"
+            && event.payload["approval_risk"] == "external"
     }));
 }
 
@@ -5357,6 +5484,7 @@ async fn delegates_to_an_external_acp_agent_and_integrates_it() {
         }
     });
 
+    set_approval_mode(&service, ApprovalMode::Strict);
     let worktree = session.worktree.clone().unwrap();
     service.start(&session.id, "external").await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -5405,6 +5533,7 @@ async fn delegates_to_an_external_acp_agent_and_integrates_it() {
             && event.payload["tool"]
                 .as_str()
                 .is_some_and(|tool| tool.starts_with("acp."))
+            && event.payload["approval_risk"] == "workspace_write"
     }));
     assert!(events.iter().any(|event| {
         event.kind == "agent.finished"

@@ -476,14 +476,16 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS approvals (
-                id           TEXT PRIMARY KEY,
-                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                tool_call_id TEXT NOT NULL,
-                tool         TEXT NOT NULL,
-                input        TEXT NOT NULL,
-                status       TEXT NOT NULL,
-                created_at   TEXT NOT NULL,
-                resolved_at  TEXT
+                id              TEXT PRIMARY KEY,
+                session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                tool_call_id    TEXT NOT NULL,
+                tool            TEXT NOT NULL,
+                input           TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                resolved_at     TEXT,
+                approval_risk   TEXT,
+                approval_reason TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_session
@@ -669,6 +671,8 @@ impl Store {
         ensure_column(&conn, "agents", "parent_id", "TEXT")?;
         ensure_column(&conn, "agents", "worktree", "TEXT")?;
         ensure_column(&conn, "agents", "branch", "TEXT")?;
+        ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
+        ensure_column(&conn, "approvals", "approval_reason", "TEXT")?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(
             &conn,
@@ -4034,6 +4038,8 @@ impl Store {
         tool_call_id: &str,
         tool: &str,
         input: &serde_json::Value,
+        approval_risk: Option<&str>,
+        approval_reason: Option<&str>,
     ) -> Result<Approval> {
         let approval = Approval {
             id: Uuid::now_v7().to_string(),
@@ -4044,24 +4050,29 @@ impl Store {
             status: "pending".to_string(),
             created_at: now_rfc3339(),
             resolved_at: None,
+            approval_risk: approval_risk.map(str::to_string),
+            approval_reason: approval_reason.map(str::to_string),
         };
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO approvals
-             (id, session_id, tool_call_id, tool, input, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+             (id, session_id, tool_call_id, tool, input, status, created_at, approval_risk, approval_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8)",
             params![
                 approval.id,
                 approval.session_id,
                 approval.tool_call_id,
                 approval.tool,
                 serde_json::to_string(&approval.input)?,
-                approval.created_at
+                approval.created_at,
+                approval.approval_risk,
+                approval.approval_reason
             ],
         )?;
         Ok(approval)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_approval_with_event(
         &self,
         session_id: &str,
@@ -4069,6 +4080,8 @@ impl Store {
         tool: &str,
         input: &serde_json::Value,
         agent: Option<&serde_json::Value>,
+        approval_risk: Option<&str>,
+        approval_reason: Option<&str>,
     ) -> Result<(Approval, Event)> {
         let approval = Approval {
             id: Uuid::now_v7().to_string(),
@@ -4079,20 +4092,24 @@ impl Store {
             status: "pending".to_string(),
             created_at: now_rfc3339(),
             resolved_at: None,
+            approval_risk: approval_risk.map(str::to_string),
+            approval_reason: approval_reason.map(str::to_string),
         };
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO approvals
-             (id, session_id, tool_call_id, tool, input, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+             (id, session_id, tool_call_id, tool, input, status, created_at, approval_risk, approval_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8)",
             params![
                 approval.id,
                 approval.session_id,
                 approval.tool_call_id,
                 approval.tool,
                 serde_json::to_string(&approval.input)?,
-                approval.created_at
+                approval.created_at,
+                approval.approval_risk,
+                approval.approval_reason
             ],
         )?;
         let mut payload = serde_json::to_value(&approval)?;
@@ -4130,7 +4147,8 @@ impl Store {
             return Ok(None);
         }
         let approval = tx.query_row(
-            "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at
+            "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at,
+                    approval_risk, approval_reason
              FROM approvals WHERE id = ?1",
             params![approval_id],
             |row| {
@@ -4144,6 +4162,8 @@ impl Store {
                     status: row.get(5)?,
                     created_at: row.get(6)?,
                     resolved_at: row.get(7)?,
+                    approval_risk: row.get(8)?,
+                    approval_reason: row.get(9)?,
                 })
             },
         )?;
@@ -4177,7 +4197,8 @@ impl Store {
             return Ok(None);
         }
         conn.query_row(
-            "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at
+            "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at,
+                    approval_risk, approval_reason
              FROM approvals WHERE id = ?1",
             params![approval_id],
             |row| {
@@ -4191,6 +4212,8 @@ impl Store {
                     status: row.get(5)?,
                     created_at: row.get(6)?,
                     resolved_at: row.get(7)?,
+                    approval_risk: row.get(8)?,
+                    approval_reason: row.get(9)?,
                 })
             },
         )
@@ -5643,8 +5666,9 @@ impl Store {
             for approval in approvals {
                 tx.execute(
                     "INSERT INTO approvals
-                     (id, session_id, tool_call_id, tool, input, status, created_at, resolved_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (id, session_id, tool_call_id, tool, input, status, created_at, resolved_at,
+                      approval_risk, approval_reason)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         approval.id,
                         approval.session_id,
@@ -5653,7 +5677,9 @@ impl Store {
                         serde_json::to_string(&approval.input)?,
                         approval.status,
                         approval.created_at,
-                        approval.resolved_at
+                        approval.resolved_at,
+                        approval.approval_risk,
+                        approval.approval_reason
                     ],
                 )?;
             }
@@ -5828,8 +5854,9 @@ impl Store {
         for approval in &bundle.approvals {
             tx.execute(
                 "INSERT INTO approvals
-                 (id, session_id, tool_call_id, tool, input, status, created_at, resolved_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (id, session_id, tool_call_id, tool, input, status, created_at, resolved_at,
+                  approval_risk, approval_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     approval.id,
                     approval.session_id,
@@ -5838,7 +5865,9 @@ impl Store {
                     serde_json::to_string(&approval.input)?,
                     approval.status,
                     approval.created_at,
-                    approval.resolved_at
+                    approval.resolved_at,
+                    approval.approval_risk,
+                    approval.approval_reason
                 ],
             )?;
         }
@@ -6391,10 +6420,10 @@ impl Store {
         let conn = self.lock()?;
         let sql = match session_id {
             Some(_) => {
-                "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at FROM approvals WHERE session_id = ?1 ORDER BY created_at ASC"
+                "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at, approval_risk, approval_reason FROM approvals WHERE session_id = ?1 ORDER BY created_at ASC"
             }
             None => {
-                "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at FROM approvals ORDER BY created_at ASC"
+                "SELECT id, session_id, tool_call_id, tool, input, status, created_at, resolved_at, approval_risk, approval_reason FROM approvals ORDER BY created_at ASC"
             }
         };
         let mut stmt = conn.prepare(sql)?;
@@ -6414,6 +6443,8 @@ impl Store {
                 status: row.get(5)?,
                 created_at: row.get(6)?,
                 resolved_at: row.get(7)?,
+                approval_risk: row.get(8)?,
+                approval_reason: row.get(9)?,
             });
         }
         Ok(approvals)

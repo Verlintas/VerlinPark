@@ -13,11 +13,11 @@ use futures_util::StreamExt;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
-    AgentInfo, AgentProbeResult, CapacityInfo, ConfigureAgentParams, ContextCompactionSummary,
-    ContextMeasurement, MergeQueueEntry, PlanDepartment, PlanTask, Project, RoleModels, Session,
-    SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
-    SessionCompactResult, SessionForkResult, SessionMergeForkResult, StoredMessage, TeamPlan,
-    TodoItem,
+    AgentInfo, AgentProbeResult, ApprovalMode, CapacityInfo, ConfigureAgentParams,
+    ContextCompactionSummary, ContextMeasurement, MergeQueueEntry, PlanDepartment, PlanTask,
+    Project, RoleModels, Session, SessionCheckpoint, SessionCheckpointDiffResult,
+    SessionCheckpointRestoreResult, SessionCompactResult, SessionForkResult,
+    SessionMergeForkResult, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -28,6 +28,9 @@ use vp_store::Store;
 use crate::Engine;
 use crate::acp;
 use crate::budget::{BudgetReason, Rejection, ScopeRequest, Spend};
+use crate::permissions::{
+    ApprovalDecision, RiskLevel, assess_acp_permission, assess_tool_call, decide,
+};
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::worktree;
 
@@ -143,6 +146,8 @@ pub struct AgentConfig {
     pub provider_idle_timeout_secs: u64,
     /// Maximum time a blocking user question may wait for an answer.
     pub question_timeout_secs: u64,
+    /// Risk-based approval policy for tool calls.
+    pub approval_mode: ApprovalMode,
     /// Compact the active conversation after this many estimated tokens.
     /// Zero disables compaction.
     pub compact_after_tokens: u64,
@@ -965,8 +970,8 @@ struct AgentSpec {
     department: Option<String>,
     profile: AgentProfile,
     allow_delegation: bool,
-    /// Skip per-tool approvals for an explicitly authorized internal run.
-    /// The shell sandbox still applies.
+    /// Skip routine tool prompts for an explicitly authorized internal run.
+    /// Host-level operations are still denied, and the shell sandbox applies.
     auto_approve: bool,
     worktree: PathBuf,
     branch: String,
@@ -1483,6 +1488,10 @@ impl AgentService {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(1800)
                     .clamp(60, 86400),
+                approval_mode: env::var("VERLINPARK_APPROVAL_MODE")
+                    .ok()
+                    .and_then(|value| ApprovalMode::parse(&value))
+                    .unwrap_or_default(),
                 compact_after_tokens: compact_after_tokens(),
                 compact_keep_messages: compact_keep_messages(),
                 context_window: context_window(),
@@ -1580,6 +1589,14 @@ impl AgentService {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1800)
                 .clamp(60, 86400),
+            approval_mode: params
+                .approval_mode
+                .or_else(|| {
+                    env::var("VERLINPARK_APPROVAL_MODE")
+                        .ok()
+                        .and_then(|value| ApprovalMode::parse(&value))
+                })
+                .unwrap_or_default(),
             compact_after_tokens: compact_after_tokens(),
             compact_keep_messages: compact_keep_messages(),
             context_window: params
@@ -1609,6 +1626,7 @@ impl AgentService {
                 role_models: config.role_models.clone(),
                 capacity: self.capacity.snapshot(),
                 context_window: Some(config.context_window),
+                approval_mode: config.approval_mode,
             },
             None => AgentInfo {
                 configured: false,
@@ -1618,6 +1636,7 @@ impl AgentService {
                 role_models: RoleModels::default(),
                 capacity: self.capacity.snapshot(),
                 context_window: None,
+                approval_mode: ApprovalMode::default(),
             },
         }
     }
@@ -1809,8 +1828,9 @@ impl AgentService {
 
     /// Resolve a merge conflict with an internal coding agent, re-verify the
     /// rebased branch, then integrate it. This is an explicit user action: it
-    /// bypasses per-tool approval for the resolver and verifier because the user
-    /// already chose auto-resolution, but the shell sandbox still applies.
+    /// skips routine prompts for the resolver and verifier because the user
+    /// already chose auto-resolution, but host-level operations are still
+    /// denied and the shell sandbox still applies.
     pub async fn resolve_merge(&self, entry_id: &str) -> Result<MergeQueueEntry> {
         self.resolve_merge_with_limit(entry_id, None).await
     }
@@ -4677,6 +4697,7 @@ struct AcpWorkerHost {
     spec: AgentSpec,
     acp_name: String,
     auto_approve: bool,
+    approval_mode: ApprovalMode,
     cancel: watch::Receiver<bool>,
     text: Mutex<String>,
     started_tools: Mutex<HashSet<String>>,
@@ -4838,10 +4859,46 @@ impl acp::AcpHost for AcpWorkerHost {
     }
 
     async fn permission(&self, request: acp::AcpPermissionRequest) -> acp::AcpPermissionDecision {
-        if self.auto_approve {
-            return acp::AcpPermissionDecision::Approve;
-        }
+        let assessment = assess_acp_permission(&request, &self.spec.worktree);
+        let decision = decide(self.approval_mode, &assessment, self.auto_approve);
         let tool_call_id = format!("acp:{}:{}", self.spec.id, request.tool_call_id);
+        let (risk, reason) = match decision {
+            ApprovalDecision::Allow { risk, reason } => {
+                if risk >= RiskLevel::External {
+                    let _ = emit(
+                        &self.engine,
+                        &self.session.id,
+                        &self.spec,
+                        "permission.allowed",
+                        serde_json::json!({
+                            "tool": format!("acp.{}", self.acp_name),
+                            "tool_call_id": tool_call_id,
+                            "risk": risk.as_str(),
+                            "reason": reason,
+                        }),
+                    )
+                    .await;
+                }
+                return acp::AcpPermissionDecision::Approve;
+            }
+            ApprovalDecision::Deny { risk, reason } => {
+                let _ = emit(
+                    &self.engine,
+                    &self.session.id,
+                    &self.spec,
+                    "permission.denied",
+                    serde_json::json!({
+                        "tool": format!("acp.{}", self.acp_name),
+                        "tool_call_id": tool_call_id,
+                        "risk": risk.as_str(),
+                        "reason": reason,
+                    }),
+                )
+                .await;
+                return acp::AcpPermissionDecision::Deny;
+            }
+            ApprovalDecision::Ask { risk, reason } => (risk, reason),
+        };
         let options = request
             .options
             .iter()
@@ -4865,12 +4922,14 @@ impl acp::AcpHost for AcpWorkerHost {
         context["acp_agent"] = serde_json::json!(self.acp_name);
         let approval = self
             .engine
-            .request_approval(
+            .request_approval_with_risk(
                 &self.session.id,
                 &tool_call_id,
                 &format!("acp.{}", self.acp_name),
                 input,
                 Some(context),
+                Some(risk.as_str()),
+                Some(&reason),
             )
             .await;
         let Ok((approval, receiver)) = approval else {
@@ -5174,6 +5233,7 @@ Additional instructions:
         spec: child_spec.clone(),
         acp_name: acp_agent.name.clone(),
         auto_approve: acp_agent.auto_approve,
+        approval_mode: config.approval_mode,
         cancel: control.subscribe(),
         text: Mutex::new(String::new()),
         started_tools: Mutex::new(HashSet::new()),
@@ -7034,60 +7094,77 @@ async fn run_loop(
                 .tools
                 .get(&call.name)
                 .filter(|_| spec.role.allows_tool(spec.profile, &call.name));
-            let requires_approval = !spec.auto_approve
-                && if is_delegate
-                    || is_acp_delegate
-                    || is_delegate_many
-                    || is_verdict
-                    || is_team_plan
-                    || is_run_plan
-                    || is_todo
-                    || is_mailbox_tool
-                    || is_memory_tool
-                    || is_question_tool
-                {
-                    false
-                } else if (is_mcp_tool
-                    && input.get("action").and_then(serde_json::Value::as_str) == Some("call"))
-                    || dynamic_mcp_tool.is_some()
-                {
-                    true
-                } else {
-                    registry_tool
-                        .as_ref()
-                        .map(|tool| tool.requires_approval())
-                        .unwrap_or(false)
-                };
-
-            let mut approved = true;
-            if requires_approval {
-                let mut context = serde_json::json!({});
-                agent_fields(&mut context, spec);
-                let (approval, receiver) = engine
-                    .request_approval(
+            let assessment = assess_tool_call(&call.name, &input, &spec.worktree);
+            let decision = decide(config.approval_mode, &assessment, spec.auto_approve);
+            let mut denied_reason: Option<String> = None;
+            match decision {
+                ApprovalDecision::Allow { risk, reason } => {
+                    if risk >= RiskLevel::External {
+                        emit(
+                            engine,
+                            &session.id,
+                            spec,
+                            "permission.allowed",
+                            serde_json::json!({
+                                "tool": call.name,
+                                "tool_call_id": call_id,
+                                "risk": risk.as_str(),
+                                "reason": reason,
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+                ApprovalDecision::Ask { risk, reason } => {
+                    let mut context = serde_json::json!({});
+                    agent_fields(&mut context, spec);
+                    let (approval, receiver) = engine
+                        .request_approval_with_risk(
+                            &session.id,
+                            &call_id,
+                            &call.name,
+                            input.clone(),
+                            Some(context),
+                            Some(risk.as_str()),
+                            Some(&reason),
+                        )
+                        .await?;
+                    match wait_for_approval(receiver, control).await {
+                        ApprovalOutcome::Approved => {}
+                        ApprovalOutcome::Denied => {
+                            denied_reason = Some("The user denied this tool call.".to_string());
+                        }
+                        ApprovalOutcome::TimedOut => {
+                            denied_reason = Some("The approval request timed out.".to_string());
+                            let _ = engine.resolve_approval(&approval.id, false).await;
+                        }
+                        ApprovalOutcome::Cancelled => {
+                            let _ = engine.resolve_approval(&approval.id, false).await;
+                            return Ok(LoopOutcome::Cancelled);
+                        }
+                    }
+                }
+                ApprovalDecision::Deny { risk, reason } => {
+                    emit(
+                        engine,
                         &session.id,
-                        &call_id,
-                        &call.name,
-                        input.clone(),
-                        Some(context),
+                        spec,
+                        "permission.denied",
+                        serde_json::json!({
+                            "tool": call.name,
+                            "tool_call_id": call_id,
+                            "risk": risk.as_str(),
+                            "reason": reason,
+                        }),
                     )
                     .await?;
-                match wait_for_approval(receiver, control).await {
-                    ApprovalOutcome::Approved => {}
-                    ApprovalOutcome::Denied => approved = false,
-                    ApprovalOutcome::TimedOut => {
-                        approved = false;
-                        let _ = engine.resolve_approval(&approval.id, false).await;
-                    }
-                    ApprovalOutcome::Cancelled => {
-                        let _ = engine.resolve_approval(&approval.id, false).await;
-                        return Ok(LoopOutcome::Cancelled);
-                    }
+                    denied_reason =
+                        Some(format!("Blocked by the local permission policy: {reason}"));
                 }
             }
 
-            let output = if !approved {
-                ToolOutput::error("The user denied this tool call.")
+            let output = if let Some(reason) = denied_reason {
+                ToolOutput::error(reason)
             } else if is_deliberate {
                 emit(
                     engine,
@@ -8591,7 +8668,7 @@ fn tool_schemas(
     if matches!(role, AgentRole::Leader | AgentRole::Manager) && allow_delegation {
         tools.push(ToolSchema {
             name: "delegate_acp".to_string(),
-            description: "Delegate a focused task to a configured external Agent Client Protocol (ACP) agent. It runs in an isolated task worktree, its permission requests use the approval center, and its committed changes are verified and merged like a Worker.".to_string(),
+            description: "Delegate a focused task to a configured external Agent Client Protocol (ACP) agent. It runs in an isolated task worktree, its permission requests use the risk-based approval policy, and its committed changes are verified and merged like a Worker.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

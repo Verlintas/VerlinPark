@@ -259,6 +259,7 @@
 - **M3 第一百二十一切片**：runtime localization + responsive Studio + frosted fields（`AppLanguage`/`LanguageStore`、`L10n.t/format`、zh-Hans.lproj 约 450 键；Settings General 语言卡 + TopChrome globe 菜单，切换即时生效并持久化；Settings/Providers 角色行改为两层响应式卡片、输入框 frosted crystal；Studio Preview Files/History 在 <560pt inspector 宽度切换单栏 + 返回；Diff 色、状态色、role/project 色提高对比；更深 canvas；见 ADR-0117）。
 - **M3 第一百二十二切片**：workspace shell + command/inbox 模块（`WorkspaceLayout` 自适应三栏与 stage minimum、可拖拽 `VPSplitHandle` + 持久化宽度 + `WorkspaceLayoutStore` Balanced/Reading/Team presets + ⌥⌘0 重置、`WindowStateStore` 屏幕内窗口 frame 恢复/屏幕变化重定位/防抖保存、焦点模式退出胶囊与 chrome 状态收敛、native Workspace command menu + `WorkspaceCommandRouter`、`CommandPaletteRanker` fuzzy/word-prefix/subsequence + recents + scope filters + `VPHighlightedText`、`NotificationInboxModel` filter/search/project/group/count + clear-read/remove + day groups、`PinnedItemsStore` pinned sessions/projects + rail sort、`SearchResultsModel` message/event source filters + match highlights、Reduce Transparency fallback；Swift tests 83；见 ADR-0118）。
 - **M3 第一百二十三切片**：LM Studio / reasoning-model 实机修复（旧 `agents` 表缺 name/title/profile/parent_id/worktree/branch 的增量迁移；`agent.probe` 对 reasoning model 使用 1024–2048 token 预算与 60s 超时；`session.create` 统一走 `create_session_with_options`，priority 同时保留 token/USD/time budgets；OpenAI-compatible stream 请求 `stream_options.include_usage` 并在 400 时回退；`send_message` 说明不得发给 user 并给出清晰错误）。实机用 `empty3` 验证 provider probe、README 读取、write_file 审批、文件内容 `LMSTUDIO_OK`、真实 usage（33/220 probe，session 15088/488，非估算）与 600s time budget；Rust 270 / Swift 83）。
+- **M3 第一百二十四切片**：风险审批 + 紧凑转录 + Collab 收敛（`ApprovalMode` smart/strict/unattended，默认 smart；`permissions.rs` 确定性分类 workspace/external/host-state/destructive/blocked，扫描 Shell 分段、`cd`、`sh -c`/`eval`/解释器 `-c`/`find -exec`/`xargs`/重定向/命令替换；`Approval` 持久化 `approval_risk`/`approval_reason` 并进入 replay/repair/bundle；`permission.allowed`/`permission.denied` 审计事件；Settings General 三档选择 + `VERLINPARK_APPROVAL_MODE`；`TranscriptProjection` + `ToolTraceRow` 单行工具调用、原地 running/finished、扁平审批条；`CollabSnapshot` 按 parent_id 分组 Worker，Collab 仅 Leader/Manager/Worker/Verifier/Labour + 计划进度；审计修复 `.git` 文件工具写保护、旧 approvals schema 迁移、移除静态 `requires_approval`、修正 `eval`/`sh -c` 递归 root 与 `xargs` 无显式目标；见 ADR-0119；Rust 300 / Swift 89）。
 
 ## 如何运行
 
@@ -285,4 +286,4 @@ just cli session-new <project-id> "Your goal"
 - App 首次启动 daemon 失败时只在 Welcome/ErrorBanner 显示；日志在 `~/Library/Application Support/VerlinPark/logs/daemon.log`。
 - WebSocket 断线重连没有单元测试。
 - Anthropic 工具调用没有真实账号 live 验证。
-- `agent.rs`、`StudioView.swift` 已经偏大，需要拆分（见 `docs/AUDIT.md`）。
+- `agent.rs` 与 `AppModel.swift` 仍然偏大，需要拆分（见 `docs/AUDIT.md`）。

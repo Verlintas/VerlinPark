@@ -241,6 +241,7 @@ final class AppModel {
     var orgLabour = 12
     var autoExpandWorkers = false
     var providerAPIKey = Keychain.read(account: "provider.apiKey") ?? ""
+    var approvalMode = AgentApprovalMode.stored
     var providerStatus: String?
     var providerBusy = false
     var providerProbeBusy = false
@@ -367,6 +368,7 @@ final class AppModel {
             agentInfo = try? await core.agentInfo()
             if let info = agentInfo {
                 roleModels = info.roleModels
+                adoptApprovalMode(from: info)
             }
             consumeEvents()
             await refresh()
@@ -2221,7 +2223,8 @@ final class AppModel {
                 maxWorkers: caps.workers,
                 maxLabour: caps.labour,
                 autoExpandWorkers: autoExpandWorkers,
-                contextWindow: parsedContextWindow
+                contextWindow: parsedContextWindow,
+                approvalMode: approvalMode.rawValue
             )
             agentInfo = info
             roleModels = info.roleModels
@@ -2265,7 +2268,8 @@ final class AppModel {
                 maxWorkers: caps.workers,
                 maxLabour: caps.labour,
                 autoExpandWorkers: autoExpandWorkers,
-                contextWindow: parsedContextWindow
+                contextWindow: parsedContextWindow,
+                approvalMode: approvalMode.rawValue
             )
         } catch {
             providerStatus = error.localizedDescription
@@ -2274,6 +2278,16 @@ final class AppModel {
 
     func applyOrgSettings() async {
         await configureStoredProvider()
+    }
+
+    func applyApprovalMode() async {
+        approvalMode.store()
+        await configureStoredProvider()
+        showToast(
+            "Permission policy updated",
+            detail: approvalMode.title,
+            kind: .success
+        )
     }
 
     func commitSession(message: String) async {
@@ -2880,12 +2894,23 @@ final class AppModel {
         do {
             let info = try await core.agentInfo()
             agentInfo = info
+            adoptApprovalMode(from: info)
             if let contextWindow = info.contextWindow, contextWindow > 0 {
                 providerContextWindowText = String(contextWindow)
             }
         } catch {
             handle(error)
         }
+    }
+
+    private func adoptApprovalMode(from info: AgentInfo) {
+        guard let raw = info.approvalMode,
+              let mode = AgentApprovalMode(rawValue: raw)
+        else {
+            return
+        }
+        approvalMode = mode
+        mode.store()
     }
 
     func loadAgents() async {

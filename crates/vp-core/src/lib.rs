@@ -50,6 +50,7 @@ pub mod console;
 mod dashboard;
 pub mod history;
 pub mod mcp;
+pub mod permissions;
 pub mod rebuild;
 pub mod scheduler;
 mod session_graph;
@@ -5611,10 +5612,27 @@ impl Engine {
         input: serde_json::Value,
         agent: Option<serde_json::Value>,
     ) -> Result<(Approval, oneshot::Receiver<bool>)> {
+        self.request_approval_with_risk(session_id, tool_call_id, tool, input, agent, None, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_approval_with_risk(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        tool: &str,
+        input: serde_json::Value,
+        agent: Option<serde_json::Value>,
+        approval_risk: Option<&str>,
+        approval_reason: Option<&str>,
+    ) -> Result<(Approval, oneshot::Receiver<bool>)> {
         let store = self.store.clone();
         let session_id_owned = session_id.to_string();
         let tool_call_id = tool_call_id.to_string();
         let tool = tool.to_string();
+        let approval_risk = approval_risk.map(str::to_string);
+        let approval_reason = approval_reason.map(str::to_string);
         let (approval, event) = tokio::task::spawn_blocking(move || {
             store.create_approval_with_event(
                 &session_id_owned,
@@ -5622,6 +5640,8 @@ impl Engine {
                 &tool,
                 &input,
                 agent.as_ref(),
+                approval_risk.as_deref(),
+                approval_reason.as_deref(),
             )
         })
         .await??;

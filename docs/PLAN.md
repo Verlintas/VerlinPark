@@ -814,9 +814,14 @@ loop {
         Assistant { text, tool_calls } => {
             store.assistant_message(text);
             for call in tool_calls {
-                let decision = permissions.check(&agent, &call)?;
-                if decision.requires_approval() {
-                    approvals.request(call).await?;
+                let assessment = permissions::assess_tool_call(&call, &agent.worktree)?;
+                match permissions::decide(mode, &assessment, agent.auto_approve) {
+                    Allow => {}
+                    Ask { .. } => approvals.request(call).await?,
+                    Deny { .. } => {
+                        store.tool_result(denied_result);
+                        continue;
+                    }
                 }
                 let output = tools.execute(call).await?;
                 store.tool_result(output);

@@ -244,7 +244,7 @@ struct IntegrationPolicyCard: View {
             }
 
             Text(
-                "When enabled, a conflict re-enters an internal resolver + Verifier without per-tool approvals. The shell sandbox still applies. Attempts and tokens are capped; manual Auto-resolve remains available."
+                "When enabled, a conflict re-enters an internal resolver + Verifier without routine tool prompts. Host-level operations are still refused, and the shell sandbox applies. Attempts and tokens are capped; manual Auto-resolve remains available."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)

@@ -147,6 +147,14 @@ struct ApprovalCenterCard: View {
                                 .padding(.horizontal, 5)
                                 .padding(.vertical, 2)
                                 .background(.orange.opacity(0.1), in: Capsule())
+                            if let risk = approval.approvalRisk, !risk.isEmpty {
+                                Text(risk.uppercased())
+                                    .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(riskColor(risk))
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 2)
+                                    .background(riskColor(risk).opacity(0.09), in: Capsule())
+                            }
                             Text(approval.agentName ?? approval.agentRole ?? "agent")
                                 .font(.system(size: 9, weight: .medium))
                             if let title = approval.agentTitle {
@@ -168,6 +176,12 @@ struct ApprovalCenterCard: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(3)
                             .textSelection(.enabled)
+                        if let reason = approval.approvalReason, !reason.isEmpty {
+                            Text(reason)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(riskColor(approval.approvalRisk ?? ""))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         HStack(spacing: 6) {
                             Button("Approve") {
                                 Task {
@@ -203,6 +217,15 @@ struct ApprovalCenterCard: View {
         .vpAppear(index: 0)
         .task {
             await model.loadPendingApprovals()
+        }
+    }
+
+    private func riskColor(_ risk: String) -> Color {
+        switch risk {
+        case "destructive": .red
+        case "host_state": .orange
+        case "external": .blue
+        default: .secondary
         }
     }
 

@@ -15,7 +15,7 @@ struct AcpSettingsView: View {
                     Text("External ACP agents")
                         .font(.system(size: 22, weight: .semibold, design: .rounded))
                     Text(
-                        "Agents that speak the Agent Client Protocol over stdio (for example Gemini CLI or Claude Code ACP). A delegated task runs in an isolated worktree under the Seatbelt write sandbox with a scratch HOME; its permission requests use the approval center, and its commit is verified and merged like a Worker. Only install trusted agents."
+                        "Agents that speak the Agent Client Protocol over stdio (for example Gemini CLI or Claude Code ACP). A delegated task runs in an isolated worktree under the Seatbelt write sandbox with a scratch HOME; its permission requests use the risk-based approval policy, and its commit is verified and merged like a Worker. Only install trusted agents."
                     )
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
