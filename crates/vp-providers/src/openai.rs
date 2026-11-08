@@ -40,6 +40,17 @@ impl OpenAiCompatibleProvider {
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url)
     }
+
+    async fn send_body(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
+        send_with_retry(|| {
+            let mut builder = self.client.post(self.endpoint()).json(body);
+            if let Some(api_key) = &self.api_key {
+                builder = builder.bearer_auth(api_key);
+            }
+            builder
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -59,6 +70,7 @@ impl Provider for OpenAiCompatibleProvider {
             "model": request.model,
             "messages": messages,
             "stream": true,
+            "stream_options": {"include_usage": true},
         });
         if let Some(max_tokens) = request.max_tokens {
             body["max_tokens"] = json!(max_tokens);
@@ -84,14 +96,24 @@ impl Provider for OpenAiCompatibleProvider {
             body["tool_choice"] = json!("auto");
         }
 
-        let response = send_with_retry(|| {
-            let mut builder = self.client.post(self.endpoint()).json(&body);
-            if let Some(api_key) = &self.api_key {
-                builder = builder.bearer_auth(api_key);
+        let response = match self.send_body(&body).await {
+            Ok(response) => response,
+            Err(ProviderError::Api {
+                status: 400,
+                body: _,
+            }) if body.get("stream_options").is_some() => {
+                // Some OpenAI-compatible servers reject optional stream
+                // metadata; fall back once so older local servers still work.
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("stream_options");
+                }
+                match self.send_body(&body).await {
+                    Ok(response) => response,
+                    Err(error) => return Err(error),
+                }
             }
-            builder
-        })
-        .await?;
+            Err(error) => return Err(error),
+        };
 
         let stream = Box::pin(response.bytes_stream().eventsource());
         let mapped = async_stream::stream! {
@@ -274,6 +296,35 @@ mod tests {
                 StreamEvent::Done,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn requests_stream_usage_metadata() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let _ = provider
+            .stream_chat(ChatRequest::new(
+                "test-model",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
     #[tokio::test]

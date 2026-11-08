@@ -663,6 +663,12 @@ impl Store {
             "auto_gc",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "agents", "name", "TEXT NOT NULL DEFAULT 'Agent'")?;
+        ensure_column(&conn, "agents", "title", "TEXT")?;
+        ensure_column(&conn, "agents", "profile", "TEXT")?;
+        ensure_column(&conn, "agents", "parent_id", "TEXT")?;
+        ensure_column(&conn, "agents", "worktree", "TEXT")?;
+        ensure_column(&conn, "agents", "branch", "TEXT")?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(
             &conn,

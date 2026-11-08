@@ -519,28 +519,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         }
         "session.create" => match parse_params::<CreateSessionParams>(request.params) {
             Ok(params) => {
-                let created = if let Some(priority) = params.priority {
-                    state
-                        .engine
-                        .create_session_with_priority(
-                            params.project_id,
-                            params.goal.clone(),
-                            params.token_budget,
-                            priority,
-                        )
-                        .await
-                } else {
-                    state
-                        .engine
-                        .create_session_with_limits(
-                            params.project_id,
-                            params.goal.clone(),
-                            params.token_budget,
-                            params.cost_budget_usd,
-                            params.time_budget_secs,
-                        )
-                        .await
-                };
+                let created = state
+                    .engine
+                    .create_session_with_options(
+                        params.project_id,
+                        params.goal.clone(),
+                        params.token_budget,
+                        params.cost_budget_usd,
+                        params.time_budget_secs,
+                        params.priority.unwrap_or(0),
+                    )
+                    .await;
                 match created {
                     Ok(session) => {
                         let info = state.agent.info();

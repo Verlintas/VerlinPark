@@ -1023,6 +1023,50 @@ fn migrates_legacy_sessions_table_with_worktree_columns() {
 }
 
 #[test]
+fn migrates_legacy_agents_without_losing_rows() {
+    let data = TempDir::new().unwrap();
+    let db_path = data.path().join("verlinpark.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            root TEXT NOT NULL UNIQUE,
+            default_branch TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            goal TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE agents (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            status TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO projects VALUES ('p1','demo','/tmp/demo','main','2026-01-01T00:00:00Z');
+        INSERT INTO sessions VALUES ('s1','p1','legacy','idle','2026-01-01T00:00:00Z');
+        INSERT INTO agents VALUES ('a1','s1','leader','idle','legacy-model','2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(data.path()).unwrap();
+    let agents = store.list_agents("s1").unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].name, "Agent");
+    assert_eq!(agents[0].model, "legacy-model");
+    assert_eq!(agents[0].title, None);
+    assert_eq!(agents[0].branch, None);
+}
+
+#[test]
 fn fresh_schema_keeps_artifact_and_mailbox_policy_columns_distinct() {
     let (_data, store, _repo) = test_store();
     let conn = store.lock().unwrap();

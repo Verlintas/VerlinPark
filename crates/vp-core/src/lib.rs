@@ -488,6 +488,29 @@ impl Engine {
             .await
     }
 
+    /// Create a session with every admission and budget option. This is the
+    /// full option path used by the RPC layer; the narrower helpers above are
+    /// convenience wrappers for tests and older call sites.
+    pub async fn create_session_with_options(
+        &self,
+        project_id: String,
+        goal: String,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+        priority: i32,
+    ) -> Result<Session> {
+        self.create_session_full(
+            project_id,
+            goal,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            priority,
+        )
+        .await
+    }
+
     async fn create_session_full(
         &self,
         project_id: String,

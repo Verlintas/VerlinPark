@@ -1630,16 +1630,20 @@ impl AgentService {
             .and_then(|config| config.as_ref().cloned())
             .ok_or_else(|| anyhow!("agent provider is not configured"))?;
         let started = std::time::Instant::now();
+        // Reasoning models can spend hundreds of tokens before emitting their
+        // first visible content token. Keep the probe small but large enough to
+        // distinguish a healthy reasoning endpoint from a dead one.
+        let probe_tokens = config.max_tokens.unwrap_or(1024).clamp(1024, 2048);
         let request = ChatRequest {
             model: config.model.clone(),
             messages: vec![ChatMessage::user("Reply with the single word: OK")],
             system: Some("You are a connection probe. Reply concisely.".to_string()),
-            max_tokens: Some(16),
+            max_tokens: Some(probe_tokens),
             temperature: Some(0.0),
             tools: Vec::new(),
         };
         let mut stream = timeout(
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             config.provider.stream_chat(request),
         )
         .await
@@ -1650,7 +1654,7 @@ impl AgentService {
         let mut chunks = 0u32;
         let mut first_token_ms = 0u64;
         let mut done = false;
-        while let Some(item) = timeout(Duration::from_secs(30), stream.next())
+        while let Some(item) = timeout(Duration::from_secs(60), stream.next())
             .await
             .map_err(|_| anyhow!("provider probe stream timed out"))?
         {
@@ -8175,7 +8179,11 @@ async fn run_mailbox_tool(
                 .find(|agent| {
                     agent.id == to || agent.name == to || agent.name.eq_ignore_ascii_case(to)
                 })
-                .ok_or_else(|| anyhow!("agent not found in this session: {to}"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "agent not found in this session: {to}. Address another agent by id/name; answer the human directly instead of sending to 'user'."
+                    )
+                })?;
             let message = engine
                 .send_agent_message(
                     &session.id,
@@ -8390,7 +8398,7 @@ fn tool_schemas(
         .collect::<Vec<_>>();
     tools.push(ToolSchema {
         name: "send_message".to_string(),
-        description: "Send a typed message to another agent in this session.".to_string(),
+        description: "Send a typed message to another agent in this session. Do not address the human user; put the final answer in the normal assistant response.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {

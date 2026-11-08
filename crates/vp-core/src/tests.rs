@@ -795,6 +795,36 @@ async fn shell_policy_round_trips_and_validates() {
 }
 
 #[tokio::test]
+async fn session_options_keep_priority_and_budgets_together() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("options".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session_with_options(
+            project.id,
+            "priority and budgets".into(),
+            Some(4_000),
+            Some(1.5),
+            Some(300),
+            25,
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.priority, 25);
+    assert_eq!(session.token_budget, Some(4_000));
+    assert_eq!(session.cost_budget_usd, Some(1.5));
+    assert_eq!(session.time_budget_secs, Some(300));
+}
+
+#[tokio::test]
 async fn session_budgets_round_trip() {
     let data = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();
