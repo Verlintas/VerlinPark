@@ -155,6 +155,8 @@ struct CheckpointsCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .confirmationDialog(
             "Delete checkpoint?",
             isPresented: Binding(
@@ -421,6 +423,8 @@ struct ForksCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .sheet(isPresented: $showingCompare) {
             CompareSessionsSheet()
                 .environment(model)
@@ -576,6 +580,8 @@ struct ProjectForkForestCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .sheet(isPresented: $showingForest) {
             ProjectForkForestSheet()
                 .environment(model)

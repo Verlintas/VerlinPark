@@ -83,6 +83,8 @@ struct ProjectUsageCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
     }
 
     private func usageMetric(_ title: String, _ value: String) -> some View {
@@ -197,6 +199,8 @@ struct ApprovalCenterCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .task {
             await model.loadPendingApprovals()
         }
@@ -325,6 +329,8 @@ struct MemoryCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .confirmationDialog(
             "Prune project memory?",
             isPresented: $confirmPrune,
@@ -381,6 +387,8 @@ struct QuestionCenterCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .task {
             await model.loadPendingQuestions()
         }
@@ -666,6 +674,8 @@ struct TaskSchedulerCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .task(id: model.selectedProjectID) {
             await model.loadTaskQueue()
             await model.loadTaskSchedulerPolicy()
@@ -783,6 +793,8 @@ struct AgentsCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
     }
 
     private func icon(for role: String) -> String {

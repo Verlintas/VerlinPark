@@ -30,12 +30,14 @@ final class AppModel {
     var mode: WorkspaceMode = .resident
     var projects: [Project] = []
     var sessions: [Session] = []
+    var allSessions: [Session] = []
     var events: [Event] = []
     var selectedProjectID: String?
     var selectedSessionID: String?
     var isBusy = false
     var lastError: String?
     var agentInfo: AgentInfo?
+    var toasts: [VPToast] = []
     var streamingText = ""
     var diffFiles: [SessionDiffFile] = []
     var searchQuery = ""
@@ -693,6 +695,20 @@ final class AppModel {
         updateDockBadge()
     }
 
+    func loadAllSessions() async {
+        guard connection == .connected else { return }
+        do {
+            allSessions = try await core.listSessions(projectID: nil)
+            sessionDirectory = Dictionary(
+                uniqueKeysWithValues: allSessions.map {
+                    ($0.id, SessionDirectoryEntry(projectId: $0.projectId, goal: $0.goal))
+                }
+            )
+        } catch {
+            allSessions = sessions
+        }
+    }
+
     func refreshSessionDirectory() async {
         guard connection == .connected,
               let allSessions = try? await core.listSessions(projectID: nil) else { return }
@@ -776,6 +792,7 @@ final class AppModel {
             todos = await (try? core.sessionTodos(sessionID: session.id)) ?? []
             mergeQueue = await (try? core.listMergeQueue(sessionID: session.id)) ?? []
             lastCommit = nil
+            showToast("Session created", detail: session.goal, kind: .success)
         } catch {
             handle(error)
         }
@@ -1045,6 +1062,7 @@ final class AppModel {
             )
             acpStatus = "ACP agent added."
             await loadAcpAgents()
+            showToast("ACP agent added", detail: name, kind: .success)
         } catch {
             acpStatus = error.localizedDescription
             handle(error)
@@ -1158,6 +1176,7 @@ final class AppModel {
             )
             mcpStatus = "MCP server added."
             await loadMcpServers()
+            showToast("MCP server added", detail: name, kind: .success)
             return true
         } catch {
             mcpStatus = error.localizedDescription
@@ -1210,6 +1229,7 @@ final class AppModel {
                 enabled: enabled
             )
             mcpStatus = "MCP server updated."
+            showToast("MCP server updated", detail: name, kind: .success)
             mcpProbeStatus[id] = nil
             mcpTools[id] = nil
             mcpResources[id] = nil
@@ -2208,6 +2228,7 @@ final class AppModel {
                 try Keychain.save(providerAPIKey, account: "provider.apiKey")
             }
             providerStatus = "Connected · \(model)"
+            showToast("Provider connected", detail: model, kind: .success)
         } catch {
             providerStatus = error.localizedDescription
         }
@@ -2950,10 +2971,16 @@ final class AppModel {
         landingBusy = true
         defer { landingBusy = false }
         do {
-            lastLanding = try await core.landSession(sessionID: sessionID)
+            let landing = try await core.landSession(sessionID: sessionID)
+            lastLanding = landing
             await loadSessions()
             await loadDiff()
             await loadMergeQueue()
+            showToast(
+                "Session landed",
+                detail: "\(landing.commit) → \(landing.targetBranch)",
+                kind: .success
+            )
         } catch {
             handle(error)
         }
@@ -2964,8 +2991,14 @@ final class AppModel {
         pullRequestBusy = true
         defer { pullRequestBusy = false }
         do {
-            lastPullRequest = try await core.openPullRequest(sessionID: sessionID)
+            let pullRequest = try await core.openPullRequest(sessionID: sessionID)
+            lastPullRequest = pullRequest
             await loadSessions()
+            showToast(
+                "Pull request opened",
+                detail: pullRequest.url ?? pullRequest.branch,
+                kind: .success
+            )
         } catch {
             handle(error)
         }
@@ -2998,6 +3031,7 @@ final class AppModel {
             )
             await loadSessions()
             selectSession(result.session.id)
+            showToast("Session forked", detail: result.session.goal, kind: .success)
             return true
         } catch {
             handle(error)
@@ -3075,6 +3109,11 @@ final class AppModel {
             checkpointDiffNotice = nil
             checkpointNotice =
                 "Restored \(String(result.restoredCommit.prefix(8))) from \(String(result.previousCommit.prefix(8)))"
+            showToast(
+                "Checkpoint restored",
+                detail: String(result.restoredCommit.prefix(8)),
+                kind: .success
+            )
         } catch {
             checkpointNotice = error.localizedDescription
             handle(error)
@@ -3093,6 +3132,9 @@ final class AppModel {
             )
             await loadCheckpoints()
             checkpointNotice = result.removed ? "Checkpoint deleted" : "Checkpoint was already removed"
+            if result.removed {
+                showToast("Checkpoint deleted", detail: "Snapshot ref released", kind: .success)
+            }
         } catch {
             handle(error)
         }
@@ -3727,6 +3769,33 @@ final class AppModel {
 
     private func updateDockBadge() {
         NSApp.dockTile.badgeLabel = unreadNoticeCount > 0 ? "\(unreadNoticeCount)" : nil
+    }
+
+    func showToast(
+        _ title: String,
+        detail: String,
+        kind: VPToastKind = .info,
+        duration: TimeInterval = 3.4
+    ) {
+        let toast = VPToast(
+            id: UUID().uuidString,
+            title: title,
+            detail: detail,
+            kind: kind,
+            duration: duration
+        )
+        toasts.append(toast)
+        if toasts.count > 4 {
+            toasts.removeFirst(toasts.count - 4)
+        }
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(duration))
+            self?.toasts.removeAll { $0.id == toast.id }
+        }
+    }
+
+    func dismissToast(_ id: String) {
+        toasts.removeAll { $0.id == id }
     }
 
     private func handle(_ error: Error) {

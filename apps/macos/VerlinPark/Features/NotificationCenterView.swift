@@ -18,17 +18,23 @@ struct NotificationCenterView: View {
                 Text("\(model.unreadNoticeCount) unread")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                    .contentTransition(.numericText())
+                    .animation(VPMotion.snap, value: model.unreadNoticeCount)
             }
 
             HStack {
                 Button("Mark all read") {
-                    model.markAllNoticesRead()
+                    withAnimation(VPMotion.snap) {
+                        model.markAllNoticesRead()
+                    }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(model.unreadNoticeCount == 0)
                 Button("Clear") {
-                    model.clearNotices()
+                    withAnimation(VPMotion.snap) {
+                        model.clearNotices()
+                    }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -42,9 +48,7 @@ struct NotificationCenterView: View {
 
             if model.notices.isEmpty {
                 VStack(spacing: 6) {
-                    Image(systemName: "bell.slash")
-                        .font(.system(size: 22, weight: .light))
-                        .foregroundStyle(.tertiary)
+                    VPFloatingSymbol(name: "bell.slash", size: 22, tint: .secondary)
                     Text("No notifications yet.")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
@@ -53,7 +57,7 @@ struct NotificationCenterView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 6) {
-                        ForEach(model.notices) { notice in
+                        ForEach(Array(model.notices.enumerated()), id: \.element.id) { index, notice in
                             Button {
                                 Task {
                                     await model.openNotice(notice)
@@ -62,9 +66,12 @@ struct NotificationCenterView: View {
                             } label: {
                                 NotificationRow(notice: notice)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+                            .transition(.vpRise)
+                            .vpAppear(index: index)
                         }
                     }
+                    .animation(VPMotion.smooth, value: model.notices.count)
                 }
             }
         }
@@ -82,10 +89,12 @@ private struct NotificationRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 9) {
-            Circle()
-                .fill(notice.isRead ? Color.secondary.opacity(0.25) : color)
-                .frame(width: 7, height: 7)
-                .padding(.top, 5)
+            VPStatusDot(
+                color: notice.isRead ? .secondary.opacity(0.35) : color,
+                pulsing: !notice.isRead,
+                size: 7
+            )
+            .padding(.top, 5)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(notice.title)
@@ -117,6 +126,7 @@ private struct NotificationRow: View {
             notice.isRead ? Color.white.opacity(0.02) : Color.white.opacity(0.045),
             in: RoundedRectangle(cornerRadius: 9)
         )
+        .vpHoverLift(scale: 1.005, lift: 1, glow: notice.isRead ? .white : color)
     }
 
     private var icon: String {

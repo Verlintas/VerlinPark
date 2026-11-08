@@ -29,42 +29,50 @@ struct DashboardOverviewView: View {
             metric(
                 "Workspace",
                 value: "\(summary?.projects ?? model.projects.count)",
-                detail: workspaceDetail
+                detail: workspaceDetail,
+                index: 0
             )
             metric(
                 "Inbox",
                 value: "\(inboxCount)",
-                detail: "\(approvalCount) approvals · \(questionCount) questions"
+                detail: "\(approvalCount) approvals · \(questionCount) questions",
+                index: 1
             )
             metric(
                 "Scheduler",
                 value: "\(taskCount)",
-                detail: "\(runningTasks) running · \(leaseCount) leases"
+                detail: "\(runningTasks) running · \(leaseCount) leases",
+                index: 2
             )
             metric(
                 "Checkpoints",
                 value: "\(checkpointCount)",
-                detail: "\(dirtyCheckpointCount) dirty · \(model.checkpoints.count) current session"
+                detail: "\(dirtyCheckpointCount) dirty · \(model.checkpoints.count) current session",
+                index: 3
             )
             metric(
                 "Fork roots",
                 value: "\(forkRootCount)",
-                detail: "\(forkSessionCount) forked sessions"
+                detail: "\(forkSessionCount) forked sessions",
+                index: 4
             )
             metric(
                 "Capacity",
                 value: capacityLabel,
-                detail: "global workers / labour availability"
+                detail: "global workers / labour availability",
+                index: 5
             )
             metric(
                 "Memory",
                 value: memory.text,
-                detail: "app + daemon resident"
+                detail: "app + daemon resident",
+                index: 6
             )
             metric(
                 "Brand",
                 value: brand.config.effectiveName,
-                detail: "\(brand.config.style.title) mark"
+                detail: "\(brand.config.style.title) mark",
+                index: 7
             )
         }
 
@@ -129,11 +137,15 @@ struct DashboardOverviewView: View {
         return "\(capacity.workerAvailable) / \(capacity.labourAvailable)"
     }
 
-    private func metric(_ title: String, value: String, detail: String) -> some View {
+    private func metric(
+        _ title: String,
+        value: String,
+        detail: String,
+        index: Int
+    ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             SectionLabel(title: title)
-            Text(value)
-                .font(.system(size: 22, weight: .semibold, design: .rounded))
+            VPAnimatedNumberText(value: value, size: 22)
                 .lineLimit(1)
             Text(detail)
                 .font(.system(size: 9, design: .monospaced))
@@ -147,6 +159,8 @@ struct DashboardOverviewView: View {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.006, lift: 1)
+        .vpAppear(index: index)
     }
 }
 
@@ -212,6 +226,8 @@ private struct DashboardPendingActions: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 8)
     }
 
     private func action(
@@ -229,8 +245,7 @@ private struct DashboardPendingActions: View {
                     Image(systemName: icon)
                         .foregroundStyle(color)
                     Spacer()
-                    Text("\(count)")
-                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    VPAnimatedNumberText(value: "\(count)", size: 16)
                 }
                 Text(title)
                     .font(.system(size: 9, design: .monospaced))
@@ -240,7 +255,7 @@ private struct DashboardPendingActions: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(VPPressableButtonStyle(scale: 0.97))
     }
 }
 
@@ -296,6 +311,8 @@ private struct DashboardAttentionCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 9)
     }
 
     private func row(_ alert: DashboardAlert) -> some View {
@@ -327,6 +344,7 @@ private struct DashboardAttentionCard: View {
         }
         .padding(8)
         .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+        .vpHoverHighlight(radius: 8)
     }
 
     private func open(_ alert: DashboardAlert) {
@@ -429,6 +447,8 @@ private struct DashboardProjectBreakdownCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 10)
     }
 
     private func row(_ summary: DashboardProjectSummary) -> some View {
@@ -467,6 +487,7 @@ private struct DashboardProjectBreakdownCard: View {
         }
         .padding(8)
         .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+        .vpHoverHighlight(radius: 8)
     }
 
     private func stat(_ symbol: String, _ value: Int, color: Color) -> some View {
@@ -474,7 +495,7 @@ private struct DashboardProjectBreakdownCard: View {
             Image(systemName: symbol)
                 .font(.system(size: 8))
                 .foregroundStyle(color)
-            Text("\(value)")
+            VPAnimatedNumberText(value: "\(value)", size: 8, weight: .medium, design: .monospaced)
                 .foregroundStyle(.secondary)
         }
         .font(.system(size: 8, weight: .medium, design: .monospaced))
@@ -490,8 +511,16 @@ private struct DashboardRuntimeCard: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     SectionLabel(title: "Runtime")
-                    Text(model.connection == .connected ? "Daemon connected" : "Daemon offline")
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    HStack(spacing: 6) {
+                        VPStatusDot(
+                            color: model.connection == .connected ? .green : .orange,
+                            pulsing: model.connection == .connecting,
+                            size: 6
+                        )
+                        Text(model.connection == .connected ? "Daemon connected" : "Daemon offline")
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .contentTransition(.opacity)
+                    }
                 }
                 Spacer()
                 if let info = model.agentInfo {
@@ -523,6 +552,8 @@ private struct DashboardRuntimeCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 11)
     }
 
     private func capacity(_ kind: String) -> String {
@@ -551,6 +582,7 @@ struct DashboardNoProjectCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpAppear(index: 12)
     }
 }
 
@@ -593,6 +625,8 @@ private struct DashboardRecentActivityCard: View {
                                 .lineLimit(1)
                             Spacer(minLength: 0)
                         }
+                        .padding(.vertical, 2)
+                        .vpHoverHighlight(radius: 6)
                     }
                 }
             }
@@ -603,6 +637,8 @@ private struct DashboardRecentActivityCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 13)
     }
 
     private func summary(_ event: Event) -> String {

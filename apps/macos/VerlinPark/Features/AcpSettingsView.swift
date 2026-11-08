@@ -75,8 +75,7 @@ struct AcpSettingsView: View {
                                 timeout = 1800
                             }
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+                        .buttonStyle(VPPrimaryButtonStyle(tint: .green))
                         .disabled(
                             model.acpBusy
                                 || name.trimmingCharacters(in: .whitespaces).isEmpty
@@ -90,6 +89,8 @@ struct AcpSettingsView: View {
                     RoundedRectangle(cornerRadius: 14)
                         .strokeBorder(.white.opacity(0.06), lineWidth: 1)
                 }
+                .vpHoverLift(scale: 1.002, lift: 1)
+                .vpAppear(index: 0)
 
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
@@ -183,9 +184,13 @@ private struct AcpAgentRow: View {
                 Text(status)
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.secondary)
+                    .contentTransition(.opacity)
+                    .animation(VPMotion.snap, value: status)
             }
         }
         .padding(10)
         .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 10))
+        .vpHoverLift(scale: 1.004, lift: 1, glow: agent.enabled ? .green : .white)
+        .vpAppear(index: 0)
     }
 }

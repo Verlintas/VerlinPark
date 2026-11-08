@@ -8,9 +8,11 @@ struct TerminalPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 7, height: 7)
+                VPStatusDot(
+                    color: statusColor,
+                    pulsing: model.terminalStatus == "running",
+                    size: 7
+                )
                 Text(model.terminalStatus)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
@@ -34,13 +36,13 @@ struct TerminalPanel: View {
                     Button("Open terminal") {
                         Task { await model.openTerminal() }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    .buttonStyle(VPPrimaryButtonStyle(tint: .green))
                     .disabled(model.selectedSessionID == nil || model.terminalBusy)
                 }
             }
             .padding(10)
-            Divider().opacity(0.3)
+            VPGradientRule()
+                .frame(height: 1)
             if let terminalID = model.terminalID {
                 TerminalSurface(
                     terminalID: terminalID,
@@ -57,12 +59,11 @@ struct TerminalPanel: View {
                     }
                 )
                 .id(terminalID)
+                .transition(.vpContent)
                 .background(SwiftUI.Color.black.opacity(0.18))
             } else {
                 VStack(spacing: 10) {
-                    Image(systemName: "terminal")
-                        .font(.system(size: 28))
-                        .foregroundStyle(.secondary)
+                    VPFloatingSymbol(name: "terminal", size: 28, tint: .secondary)
                     Text("A full PTY terminal in the session worktree.")
                         .font(.system(size: 11, design: .monospaced))
                     Text(
@@ -79,8 +80,10 @@ struct TerminalPanel: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .transition(.vpContent)
             }
         }
+        .animation(VPMotion.smooth, value: model.terminalID)
         .task(id: model.terminalID) {
             guard model.terminalID != nil else { return }
             while !Task.isCancelled, model.terminalStatus == "running" {

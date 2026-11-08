@@ -2,30 +2,214 @@ import AppKit
 import SwiftUI
 import UserNotifications
 
+enum SettingsSection: String, CaseIterable, Identifiable {
+    case brand
+    case resident
+    case providers
+    case acp
+    case mcp
+    case notifications
+    case about
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .brand: "Brand"
+        case .resident: "Resident"
+        case .providers: "Providers"
+        case .acp: "ACP"
+        case .mcp: "MCP"
+        case .notifications: "Notifications"
+        case .about: "About"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .brand: "Wordmark, flags, and live preview"
+        case .resident: "External Aviiya bridge"
+        case .providers: "Models, prices, and team capacity"
+        case .acp: "External stdio agents"
+        case .mcp: "Local and remote tool servers"
+        case .notifications: "Permission and background alerts"
+        case .about: "Version, updates, and license"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .brand: "paintpalette"
+        case .resident: "sparkles"
+        case .providers: "network"
+        case .acp: "person.crop.rectangle.stack"
+        case .mcp: "puzzlepiece.extension"
+        case .notifications: "bell"
+        case .about: "info.circle"
+        }
+    }
+}
+
 struct SettingsView: View {
     @Environment(BrandStore.self) private var brand
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var section: SettingsSection = .brand
+    @State private var hoveredSection: SettingsSection?
+    @Namespace private var selectionNamespace
+    @AppStorage("verlinpark.settings.section") private var storedSection =
+        SettingsSection.brand.rawValue
 
     var body: some View {
-        TabView {
-            BrandSettingsView()
-                .tabItem { Label("Brand", systemImage: "paintpalette") }
-            ResidentSettingsView()
-                .tabItem { Label("Resident", systemImage: "sparkles") }
-            ProvidersSettingsView()
-                .tabItem { Label("Providers", systemImage: "network") }
-            AcpSettingsView()
-                .tabItem { Label("ACP", systemImage: "person.crop.rectangle.stack") }
-            McpSettingsView()
-                .tabItem { Label("MCP", systemImage: "puzzlepiece.extension") }
-            NotificationsSettingsView()
-                .tabItem { Label("Notifications", systemImage: "bell") }
-            AboutSettingsView()
-                .tabItem { Label("About", systemImage: "info.circle") }
+        HStack(spacing: 0) {
+            sidebar
+            VPGradientRule(vertical: true)
+                .frame(width: 1)
+            content
+                .id(section)
+                .transition(.vpContent)
+                .animation(
+                    VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
+                    value: section
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 680, height: 600)
+        .frame(width: 840, height: 640)
         .preferredColorScheme(.dark)
-        .background(.ultraThinMaterial)
+        .background {
+            ZStack {
+                VPAuroraBackground()
+                    .opacity(0.45)
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+            }
+        }
+        .onAppear {
+            if let saved = SettingsSection(rawValue: storedSection) {
+                section = saved
+            }
+        }
+        .onChange(of: section) { _, newValue in
+            storedSection = newValue.rawValue
+        }
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                BrandMark(config: brand.config, fontSize: 17)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Settings")
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    Text(brand.config.effectiveName)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.bottom, 12)
+
+            ForEach(Array(SettingsSection.allCases.enumerated()), id: \.element.id) { index, item in
+                Button {
+                    section = item
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: item.icon)
+                            .font(.system(size: 11, weight: .medium))
+                            .frame(width: 16)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(item.title)
+                                .font(.system(size: 11, weight: .medium))
+                            Text(item.detail)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 4)
+                    }
+                    .foregroundStyle(section == item ? Color.primary : Color.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 7)
+                    .background {
+                        if section == item {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.16))
+                                .matchedGeometryEffect(
+                                    id: "settings-selection",
+                                    in: selectionNamespace
+                                )
+                        } else if hoveredSection == item {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(.white.opacity(0.045))
+                        }
+                    }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(
+                                section == item ? Color.accentColor.opacity(0.18) : .clear,
+                                lineWidth: 1
+                            )
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(VPPressableButtonStyle(scale: 0.985))
+                .keyboardShortcut(
+                    KeyEquivalent(Character(String(index + 1))),
+                    modifiers: .command
+                )
+                .onHover { hovering in
+                    if hovering {
+                        hoveredSection = item
+                    } else if hoveredSection == item {
+                        hoveredSection = nil
+                    }
+                }
+                .animation(VPMotion.hover, value: hoveredSection)
+                .animation(VPMotion.snap, value: section)
+                .help("\(item.detail) · ⌘\(index + 1)")
+            }
+
+            Spacer(minLength: 10)
+            HStack(spacing: 6) {
+                VPStatusDot(
+                    color: model.connection == .connected ? .green : .orange,
+                    pulsing: model.connection == .connecting,
+                    size: 6
+                )
+                Text(model.connection == .connected ? "daemon connected" : "daemon offline")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.bottom, 4)
+            Text("⌘K command palette · ⌘1–⌘7 sections")
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .padding(.bottom, 4)
+        }
+        .padding(14)
+        .frame(width: 205)
+        .background(.black.opacity(0.10))
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch section {
+        case .brand:
+            BrandSettingsView()
+        case .resident:
+            ResidentSettingsView()
+        case .providers:
+            ProvidersSettingsView()
+        case .acp:
+            AcpSettingsView()
+        case .mcp:
+            McpSettingsView()
+        case .notifications:
+            NotificationsSettingsView()
+        case .about:
+            AboutSettingsView()
+        }
     }
 }
 
@@ -62,7 +246,7 @@ struct BrandSettingsView: View {
                             Button(preset) {
                                 brand.config.displayName = preset
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(VPPressableButtonStyle(scale: 0.95))
                             .font(.system(size: 10))
                             .padding(.horizontal, 8)
                             .padding(.vertical, 5)
@@ -76,13 +260,16 @@ struct BrandSettingsView: View {
 
                 VStack(alignment: .leading, spacing: 9) {
                     SectionLabel(title: "Mark background")
-                    Picker("", selection: $brand.config.style) {
-                        ForEach(BrandStyle.allCases) { style in
-                            Label(style.title, systemImage: style.icon).tag(style)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
+                    VPSegmentedControl(
+                        segments: BrandStyle.allCases.map {
+                            VPSegment($0.rawValue, title: $0.title, icon: $0.icon)
+                        },
+                        selection: Binding(
+                            get: { brand.config.style.rawValue },
+                            set: { brand.config.style = BrandStyle(rawValue: $0) ?? .solid }
+                        ),
+                        compact: true
+                    )
 
                     switch brand.config.style {
                     case .solid:
@@ -161,6 +348,7 @@ struct BrandSettingsView: View {
                 BrandMark(config: brand.config, fontSize: 26)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 12)
+                    .vpAppear(index: 3, animation: VPMotion.emphasizedSpring)
             }
             .padding(24)
         }
@@ -437,11 +625,15 @@ struct ProvidersSettingsView: View {
                     Text(status)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
+                        .contentTransition(.opacity)
+                        .animation(VPMotion.snap, value: status)
                 }
                 if let status = model.providerProbeStatus {
                     Text(status)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
+                        .contentTransition(.opacity)
+                        .animation(VPMotion.snap, value: status)
                 }
             }
 
@@ -555,6 +747,8 @@ private struct ModelPresetsSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var confirmingDelete = false
+    @State private var hoveredPresetID: String?
+    @Namespace private var presetNamespace
 
     private let roles = ["leader", "manager", "worker", "verifier", "labour"]
 
@@ -577,13 +771,13 @@ private struct ModelPresetsSheet: View {
                     .keyboardShortcut(.defaultAction)
             }
             .padding(18)
-            Divider().opacity(0.35)
+            VPGradientRule()
+                .frame(height: 1)
             HSplitView {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Button("New") { model.newModelPresetDraft() }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
+                            .buttonStyle(VPPrimaryButtonStyle(tint: .green))
                         Button("Refresh") {
                             Task { await model.loadModelPresets() }
                         }
@@ -605,14 +799,31 @@ private struct ModelPresetsSheet: View {
                                     }
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(7)
-                                    .background(
-                                        model.selectedModelPresetID == preset.id
-                                            ? Color.accentColor.opacity(0.18)
-                                            : Color.white.opacity(0.03),
-                                        in: RoundedRectangle(cornerRadius: 7)
-                                    )
+                                    .background {
+                                        if model.selectedModelPresetID == preset.id {
+                                            RoundedRectangle(cornerRadius: 7)
+                                                .fill(Color.accentColor.opacity(0.18))
+                                                .matchedGeometryEffect(
+                                                    id: "preset-selection",
+                                                    in: presetNamespace
+                                                )
+                                        } else if hoveredPresetID == preset.id {
+                                            RoundedRectangle(cornerRadius: 7)
+                                                .fill(.white.opacity(0.05))
+                                        }
+                                    }
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(VPPressableButtonStyle(scale: 0.98))
+                                .onHover { hovering in
+                                    if hovering {
+                                        hoveredPresetID = preset.id
+                                    } else if hoveredPresetID == preset.id {
+                                        hoveredPresetID = nil
+                                    }
+                                }
+                                .animation(VPMotion.hover, value: hoveredPresetID)
+                                .animation(VPMotion.snap, value: model.selectedModelPresetID)
+                                .vpAppear(index: 0)
                             }
                             if model.modelPresets.isEmpty {
                                 Text("No presets yet.")
@@ -652,7 +863,7 @@ private struct ModelPresetsSheet: View {
                             Button("Save preset") {
                                 Task { await model.saveModelPreset() }
                             }
-                            .buttonStyle(.borderedProminent)
+                            .buttonStyle(VPPrimaryButtonStyle(tint: .green))
                             .disabled(model.modelPresetsBusy)
                             Button("Delete") { confirmingDelete = true }
                                 .buttonStyle(.bordered)
@@ -686,6 +897,8 @@ private struct ModelPresetsSheet: View {
                             Text(status)
                                 .font(.system(size: 9, design: .monospaced))
                                 .foregroundStyle(.secondary)
+                                .contentTransition(.opacity)
+                                .animation(VPMotion.snap, value: status)
                         }
                     }
                     .padding(18)
@@ -859,6 +1072,7 @@ struct AboutSettingsView: View {
     var body: some View {
         VStack(spacing: 16) {
             BrandMark(config: brand.config, fontSize: 28)
+                .vpAppear(index: 0, animation: VPMotion.emphasizedSpring)
             Text("VerlinPark")
                 .font(.title2.weight(.semibold))
             Text("A native macOS workbench for agent teams.")
@@ -899,6 +1113,8 @@ struct AboutSettingsView: View {
                         Text("Update available: \(update.latestVersion)")
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.orange)
+                            .contentTransition(.numericText())
+                            .animation(VPMotion.snap, value: update.latestVersion)
                         if let url = update.releaseUrl,
                            let parsed = URL(string: url)
                         {
@@ -913,8 +1129,7 @@ struct AboutSettingsView: View {
                                 Button(model.updateDownloadBusy ? "Downloading…" : "Download DMG") {
                                     Task { await model.downloadUpdate() }
                                 }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
+                                .buttonStyle(VPPrimaryButtonStyle(tint: .orange))
                                 .disabled(model.updateDownloadBusy)
                                 if model.updateDownloadBusy {
                                     ProgressView().controlSize(.small)

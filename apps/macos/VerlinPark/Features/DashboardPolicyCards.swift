@@ -116,6 +116,8 @@ struct MemoryPolicyCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .task {
             await model.loadMemoryPolicy()
         }
@@ -211,6 +213,8 @@ struct ShellPolicyCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .task(id: project.id) {
             await model.loadShellPolicy()
         }
@@ -293,6 +297,8 @@ struct IntegrationPolicyCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .task(id: project.id) {
             await model.loadIntegrationPolicy()
         }
@@ -364,6 +370,8 @@ struct ArtifactPolicyCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .task(id: project.id) {
             await model.loadArtifactPolicy()
         }
@@ -449,6 +457,8 @@ struct MailboxPolicyCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .task(id: project.id) {
             await model.loadMailboxPolicy()
         }
@@ -540,6 +550,8 @@ struct ProjectBudgetCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
         .task(id: project.id) {
             await model.loadProjectBudget()
         }
@@ -605,6 +617,8 @@ struct DoctorCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
     }
 
     private func color(for status: String) -> Color {
@@ -748,5 +762,7 @@ struct WorktreeCleanupCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
     }
 }

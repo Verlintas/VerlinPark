@@ -8,7 +8,8 @@ struct ExternalResidentView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().opacity(0.35)
+            VPGradientRule()
+                .frame(height: 1)
 
             VStack(spacing: 16) {
                 ZStack {
@@ -21,10 +22,13 @@ struct ExternalResidentView: View {
                             )
                         )
                         .frame(width: 64, height: 64)
+                        .shadow(color: .green.opacity(0.24), radius: 24)
                     Image(systemName: "sparkles")
                         .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(.white.opacity(0.9))
+                        .symbolEffect(.pulse, options: .repeating)
                 }
+                .vpAppear(index: 0, animation: VPMotion.emphasizedSpring)
 
                 Text("Aviiya lives in NovaBAIC")
                     .font(.system(size: 20, weight: .semibold, design: .rounded))
@@ -35,6 +39,7 @@ struct ExternalResidentView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 420)
+                .vpAppear(index: 1)
 
                 HStack(spacing: 8) {
                     Label("external", systemImage: "link")
@@ -43,13 +48,15 @@ struct ExternalResidentView: View {
                 }
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundStyle(.tertiary)
+                .vpAppear(index: 2)
 
                 Link(destination: URL(string: "https://github.com/Verlintas/NovaBAIC")!) {
                     Label("NovaBAIC", systemImage: "arrow.up.right.square")
                 }
                 .font(.system(size: 11))
-                .buttonStyle(.plain)
+                .buttonStyle(VPPressableButtonStyle(scale: 0.96))
                 .padding(.top, 4)
+                .vpAppear(index: 3)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(32)
@@ -95,5 +102,6 @@ struct ExternalResidentView: View {
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 14)
+        .vpAppear(index: 0)
     }
 }

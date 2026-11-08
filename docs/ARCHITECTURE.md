@@ -1069,6 +1069,26 @@ severity-sorted alerts, shows a "Needs attention" card, and falls back to local
 card state when a scoped refresh has not completed. It is not the chat
 workspace; Stage remains the conversation surface.
 
+### 13.1 UI motion and interaction
+
+The SwiftUI client uses a shared `VPMotion` vocabulary: short hover/press
+curves, restrained springs for navigation, staggered entrances, matched
+geometry for selected rows/tabs, and a single Reduce Motion resolution point.
+Reusable primitives cover pressable/primary/glass buttons, hover lift, row
+highlight, focus rings, glow borders, status pulses, thinking indicators,
+streaming carets, numeric transitions, gradient progress, skeletons/shimmer,
+floating empty-state symbols, and toast feedback. The rail, dashboard, and
+Settings sidebar animate selection; Stage animates chat entries, the composer,
+and streamed text; Studio uses custom Collab/Preview segmented controls with
+animated connectors and a scrollable ten-mode Preview chip row; dashboard
+cards and settings panels use bounded hover elevation. `⌘K` opens a keyboard
+command palette for projects, all sessions, and global actions; `⇧⌘F` toggles
+focus mode; a slim draggable top chrome shows the breadcrumb, memory, command
+palette, and focus control. Settings is a seven-section sidebar shell with
+content transitions and persisted selection. Toasts are transient UI feedback;
+the Rail notification center remains the durable inbox. All custom continuous
+effects stop under Reduce Motion.
+
 ## 13. 存储与事件溯源
 
 ### 13.1 事件日志

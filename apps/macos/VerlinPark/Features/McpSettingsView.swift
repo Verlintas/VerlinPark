@@ -94,8 +94,7 @@ struct McpSettingsView: View {
                                 }
                             }
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+                        .buttonStyle(VPPrimaryButtonStyle(tint: .green))
                         .disabled(model.mcpBusy || !canAdd)
                     }
                 }
@@ -105,6 +104,8 @@ struct McpSettingsView: View {
                     RoundedRectangle(cornerRadius: 14)
                         .strokeBorder(.white.opacity(0.06), lineWidth: 1)
                 }
+                .vpHoverLift(scale: 1.002, lift: 1)
+                .vpAppear(index: 0)
 
                 if let status = model.mcpStatus, !model.mcpServers.isEmpty {
                     Text(status)
@@ -156,28 +157,31 @@ private struct McpConfigEditor: View {
     @Binding var headersText: String
 
     var body: some View {
-        if transport == "stdio" {
-            TextField("command (for example npx)", text: $command)
-                .textFieldStyle(.roundedBorder)
-            pairEditor(
-                title: "Arguments, one per line.",
-                placeholder: "--root\n/tmp",
-                text: $argsText
-            )
-            pairEditor(
-                title: "Environment, KEY=VALUE per line. Values are stored in the local daemon DB.",
-                placeholder: "LOG_LEVEL=info",
-                text: $envText
-            )
-        } else {
-            TextField("URL (https://host/acp or http://127.0.0.1:3000/sse)", text: $url)
-                .textFieldStyle(.roundedBorder)
-            pairEditor(
-                title: "Headers, KEY=VALUE per line. Use ${ENV_VAR} for secrets.",
-                placeholder: "Authorization=Bearer ${MCP_TOKEN}\nX-Client=VerlinPark",
-                text: $headersText
-            )
+        Group {
+            if transport == "stdio" {
+                TextField("command (for example npx)", text: $command)
+                    .textFieldStyle(.roundedBorder)
+                pairEditor(
+                    title: "Arguments, one per line.",
+                    placeholder: "--root\n/tmp",
+                    text: $argsText
+                )
+                pairEditor(
+                    title: "Environment, KEY=VALUE per line. Values are stored in the local daemon DB.",
+                    placeholder: "LOG_LEVEL=info",
+                    text: $envText
+                )
+            } else {
+                TextField("URL (https://host/acp or http://127.0.0.1:3000/sse)", text: $url)
+                    .textFieldStyle(.roundedBorder)
+                pairEditor(
+                    title: "Headers, KEY=VALUE per line. Use ${ENV_VAR} for secrets.",
+                    placeholder: "Authorization=Bearer ${MCP_TOKEN}\nX-Client=VerlinPark",
+                    text: $headersText
+                )
+            }
         }
+        .animation(VPMotion.snap, value: transport)
     }
 
     private func pairEditor(
@@ -298,6 +302,8 @@ private struct McpServerRow: View {
                 Text(status)
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.secondary)
+                    .contentTransition(.opacity)
+                    .animation(VPMotion.snap, value: status)
             }
             if let status = model.mcpToolStatus[server.id] {
                 Text(status)
@@ -346,6 +352,8 @@ private struct McpServerRow: View {
         }
         .padding(10)
         .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 10))
+        .vpHoverLift(scale: 1.004, lift: 1, glow: server.enabled ? .green : .white)
+        .vpAppear(index: 0)
     }
 }
 
@@ -469,8 +477,7 @@ private struct McpEditSheet: View {
                         }
                     }
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+                .buttonStyle(VPPrimaryButtonStyle(tint: .green))
                 .disabled(model.mcpBusy || !canSave)
             }
             .padding(20)

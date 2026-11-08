@@ -3,7 +3,9 @@ import SwiftUI
 struct StageView: View {
     @Environment(AppModel.self) private var model
     @Environment(BrandStore.self) private var brand
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var showingNewSession: Bool
+    @Binding var showingSearch: Bool
 
     var body: some View {
         Group {
@@ -12,12 +14,19 @@ struct StageView: View {
                 ExternalResidentView()
             case .project:
                 if let project = model.selectedProject {
-                    ProjectStageView(project: project, showingNewSession: $showingNewSession)
+                    ProjectStageView(
+                        project: project,
+                        showingNewSession: $showingNewSession,
+                        showingSearch: $showingSearch
+                    )
                 } else {
                     WelcomeStageView()
                 }
             }
         }
+        .id(model.mode)
+        .transition(.vpScaleFade)
+        .animation(VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion), value: model.mode)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
             ZStack {
@@ -33,32 +42,40 @@ private struct ProjectStageView: View {
     @Environment(BrandStore.self) private var brand
     let project: Project
     @Binding var showingNewSession: Bool
+    @Binding var showingSearch: Bool
     @State private var draft = ""
-    @State private var showingSearch = false
     @State private var showingContext = false
     @State private var showingFork = false
     @FocusState private var composerFocused: Bool
+    @State private var composerHovering = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().opacity(0.35)
+            VPGradientRule()
+                .frame(height: 1)
             if let session = model.selectedSession {
                 SessionChatView(session: session)
+                    .id(session.id)
+                    .transition(.vpContent)
             } else {
                 emptyState
+                    .transition(.vpContent)
             }
             composer
-        }
-        .sheet(isPresented: $showingSearch) {
-            SearchSheet()
-                .environment(model)
         }
         .sheet(isPresented: $showingFork) {
             if let session = model.selectedSession {
                 ForkSessionSheet(session: session)
                     .environment(model)
             }
+        }
+        .background {
+            Button("") { composerFocused = true }
+                .keyboardShortcut("l", modifiers: .command)
+                .opacity(0)
+                .frame(width: 0, height: 0)
+                .accessibilityHidden(true)
         }
     }
 
@@ -127,11 +144,8 @@ private struct ProjectStageView: View {
                 showingSearch = true
             } label: {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 11, weight: .semibold))
-                    .frame(width: 26, height: 26)
-                    .background(.ultraThinMaterial, in: Circle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(VPGlassIconButtonStyle(size: 26))
             .keyboardShortcut("f", modifiers: .command)
             .help("Search messages and events")
 
@@ -176,17 +190,15 @@ private struct ProjectStageView: View {
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
+                .vpHoverLift(scale: 1.01, lift: 0, glow: .green)
             }
 
             Button {
                 showingNewSession = true
             } label: {
                 Image(systemName: "plus")
-                    .font(.system(size: 11, weight: .semibold))
-                    .frame(width: 26, height: 26)
-                    .background(.ultraThinMaterial, in: Circle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(VPGlassIconButtonStyle(size: 26, tint: .green))
             .help("New session")
         }
         .padding(.horizontal, 22)
@@ -195,19 +207,18 @@ private struct ProjectStageView: View {
 
     private var emptyState: some View {
         VStack(spacing: 14) {
-            Image(systemName: "rectangle.stack.badge.plus")
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(.secondary)
+            VPFloatingSymbol(name: "rectangle.stack.badge.plus", size: 34, tint: .green)
             Text("Start a session")
-                .font(.system(size: 20, weight: .semibold))
+                .font(.system(size: 20, weight: .semibold, design: .rounded))
             Text("Give the Leader one concrete goal. The team will appear in Collab as it is recruited.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
             Button("New Session", action: { showingNewSession = true })
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(VPPrimaryButtonStyle(tint: .green))
         }
+        .vpAppear(index: 1, animation: VPMotion.emphasizedSpring)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
     }
@@ -218,10 +229,8 @@ private struct ProjectStageView: View {
                 showingNewSession = true
             } label: {
                 Image(systemName: "plus")
-                    .font(.system(size: 12, weight: .semibold))
-                    .frame(width: 26, height: 26)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(VPGlassIconButtonStyle(size: 26, tint: .secondary))
             .help("New session")
 
             TextField(
@@ -241,8 +250,10 @@ private struct ProjectStageView: View {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 22))
                     .foregroundStyle(draft.isEmpty ? Color.secondary : Color.green)
+                    .contentTransition(.symbolEffect(.replace))
+                    .symbolEffect(.bounce, value: draft.isEmpty)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(VPPressableButtonStyle(scale: 0.90))
             .disabled(sendDisabled)
         }
         .padding(.horizontal, 14)
@@ -250,8 +261,21 @@ private struct ProjectStageView: View {
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+                .strokeBorder(
+                    composerFocused
+                        ? Color.green.opacity(0.45)
+                        : (composerHovering ? Color.white.opacity(0.15) : Color.white.opacity(0.08)),
+                    lineWidth: composerFocused ? 1.3 : 1
+                )
         }
+        .shadow(
+            color: composerFocused ? Color.green.opacity(0.12) : .clear,
+            radius: composerFocused ? 18 : 0,
+            y: 4
+        )
+        .onHover { composerHovering = $0 }
+        .animation(VPMotion.snap, value: composerFocused)
+        .animation(VPMotion.hover, value: composerHovering)
         .padding(.horizontal, 18)
         .padding(.bottom, 16)
         .padding(.top, 8)
@@ -314,12 +338,13 @@ private struct ContextPopoverView: View {
                         )
                 }
 
-                ProgressView(value: contextProgress(usage))
-                    .tint(
-                        usage.estimatedTokens >= usage.hardLimitTokens
-                            ? .red
-                            : usage.estimatedTokens >= usage.thresholdTokens ? .orange : .accentColor
-                    )
+                VPGradientProgress(
+                    value: contextProgress(usage),
+                    tint: usage.estimatedTokens >= usage.hardLimitTokens
+                        ? .red
+                        : usage.estimatedTokens >= usage.thresholdTokens ? .orange : .accentColor,
+                    height: 6
+                )
 
                 HStack(spacing: 18) {
                     metric("Window", contextTokenLabel(usage.contextWindow))
@@ -504,6 +529,7 @@ private struct ForkSessionSheet: View {
 
 struct SessionChatView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let session: Session
 
     private var entries: [ChatEntry] {
@@ -728,50 +754,56 @@ struct SessionChatView: View {
                         ForEach(entries) { entry in
                             entryView(entry)
                                 .id(entry.id)
+                                .transition(.vpRise)
                         }
                         if !model.streamingText.isEmpty {
-                            assistantBubble(model.streamingText + "▍")
+                            assistantBubble(model.streamingText, streaming: true)
                                 .id("streaming")
+                                .transition(.vpRise)
                         } else if session.status == "running" {
-                            HStack(spacing: 8) {
-                                ProgressView().controlSize(.small)
-                                Text("Leader is thinking…")
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.vertical, 4)
+                            VPThinkingIndicator(label: "Leader is thinking…", tint: .green)
+                                .padding(.vertical, 4)
+                                .transition(.vpContent)
                         } else if session.status == "queued" {
                             HStack(spacing: 8) {
-                                Image(systemName: "clock")
-                                    .foregroundStyle(.yellow)
+                                VPStatusDot(color: .yellow, pulsing: true, size: 6)
                                 Text("Queued for a global session slot")
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundStyle(.secondary)
                             }
                             .padding(.vertical, 4)
+                            .transition(.vpContent)
                         } else if session.status == "paused" {
                             HStack(spacing: 8) {
-                                Image(systemName: "pause.circle")
-                                    .foregroundStyle(.yellow)
+                                VPStatusDot(color: .yellow, size: 6)
                                 Text("Leader is paused")
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundStyle(.secondary)
                             }
                             .padding(.vertical, 4)
+                            .transition(.vpContent)
                         }
                     }
                     .padding(.horizontal, 18)
                     .padding(.bottom, 16)
+                    .animation(
+                        VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
+                        value: entries.count
+                    )
+                    .animation(
+                        VPMotion.resolved(VPMotion.hover, reduceMotion: reduceMotion),
+                        value: model.streamingText.isEmpty
+                    )
                 }
                 .onChange(of: entries.count) { _, _ in
                     if let last = entries.last {
-                        withAnimation(.easeOut(duration: 0.2)) {
+                        withAnimation(VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion)) {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
                 }
                 .onChange(of: model.streamingText) { _, _ in
-                    withAnimation(.easeOut(duration: 0.1)) {
+                    withAnimation(VPMotion.resolved(VPMotion.hover, reduceMotion: reduceMotion)) {
                         proxy.scrollTo("streaming", anchor: .bottom)
                     }
                 }
@@ -825,9 +857,7 @@ struct SessionChatView: View {
 
     private var emptyState: some View {
         VStack(spacing: 10) {
-            Image(systemName: "bubble.left.and.text.bubble.right")
-                .font(.system(size: 30, weight: .light))
-                .foregroundStyle(.secondary)
+            VPFloatingSymbol(name: "bubble.left.and.text.bubble.right", size: 30, tint: .green)
             Text("Talk to the Leader")
                 .font(.headline)
             Text(
@@ -838,6 +868,7 @@ struct SessionChatView: View {
             .multilineTextAlignment(.center)
             .frame(maxWidth: 380)
         }
+        .vpAppear(index: 1, animation: VPMotion.emphasizedSpring)
         .frame(maxWidth: .infinity)
         .padding(.vertical, 40)
     }
@@ -901,7 +932,11 @@ struct SessionChatView: View {
         }
     }
 
-    private func assistantBubble(_ text: String, agent: String? = nil) -> some View {
+    private func assistantBubble(
+        _ text: String,
+        agent: String? = nil,
+        streaming: Bool = false
+    ) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Circle()
                 .fill(.green.opacity(0.2))
@@ -918,19 +953,25 @@ struct SessionChatView: View {
                         .foregroundStyle(.tertiary)
                         .padding(.leading, 2)
                 }
-                Text(text)
-                    .font(.system(size: 13))
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(
-                        .ultraThinMaterial,
-                        in: RoundedRectangle(cornerRadius: 13, style: .continuous)
-                    )
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 13, style: .continuous)
-                            .strokeBorder(.white.opacity(0.07), lineWidth: 1)
+                HStack(alignment: .bottom, spacing: 3) {
+                    Text(text)
+                        .font(.system(size: 13))
+                        .textSelection(.enabled)
+                    if streaming {
+                        VPStreamingCaret()
                     }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(
+                    .ultraThinMaterial,
+                    in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .strokeBorder(.white.opacity(streaming ? 0.14 : 0.07), lineWidth: 1)
+                }
+                .animation(VPMotion.hover, value: streaming)
             }
             Spacer(minLength: 30)
         }
@@ -1032,10 +1073,8 @@ private struct QuestionCard: View {
             }
             .padding(10)
             .background(.cyan.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(.cyan.opacity(0.14), lineWidth: 1)
-            }
+            .vpGlowBorder(.cyan, radius: 10, active: question.isPending)
+            .vpHoverLift(scale: 1.004, lift: 1, glow: .cyan)
         }
     }
 
@@ -1099,6 +1138,7 @@ struct ToolCallCard: View {
             RoundedRectangle(cornerRadius: 10)
                 .strokeBorder(isError ? .red.opacity(0.2) : .white.opacity(0.05), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.005, lift: 1, glow: isError ? .red : .white)
     }
 }
 
@@ -1176,10 +1216,12 @@ struct ApprovalCard: View {
         }
         .padding(11)
         .background(.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(.orange.opacity(0.2), lineWidth: 1)
-        }
+        .vpGlowBorder(
+            .orange,
+            radius: 12,
+            active: !resolved && approval.status == "pending"
+        )
+        .vpHoverLift(scale: 1.004, lift: 1, glow: .orange)
     }
 }
 
@@ -1190,8 +1232,10 @@ private struct WelcomeStageView: View {
     var body: some View {
         VStack(spacing: 20) {
             BrandMark(config: brand.config, fontSize: 34)
+                .vpAppear(index: 0, animation: VPMotion.emphasizedSpring)
             Text("Agent teams, not chat tabs.")
                 .font(.system(size: 22, weight: .semibold, design: .rounded))
+                .vpAppear(index: 1)
             Text(
                 "Open a repository to start. VerlinPark will isolate every task in a worktree and make the whole run inspectable."
             )
@@ -1199,17 +1243,74 @@ private struct WelcomeStageView: View {
             .foregroundStyle(.secondary)
             .multilineTextAlignment(.center)
             .frame(maxWidth: 420)
+            .vpAppear(index: 2)
+
+            HStack(spacing: 10) {
+                welcomeFeature(
+                    "Isolated worktrees",
+                    "Every task gets its own branch and write scope.",
+                    icon: "arrow.triangle.branch",
+                    tint: .green
+                )
+                welcomeFeature(
+                    "Verifier gate",
+                    "Approval is required before a Worker branch merges.",
+                    icon: "checkmark.shield",
+                    tint: .orange
+                )
+                welcomeFeature(
+                    "Deterministic merge",
+                    "A serial integrator checks and rolls back on failure.",
+                    icon: "arrow.triangle.merge",
+                    tint: .cyan
+                )
+            }
+            .frame(maxWidth: 680)
+            .vpAppear(index: 3)
+
             Button {
                 Task { await model.addProject() }
             } label: {
                 Label("Add Project…", systemImage: "folder.badge.plus")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(VPPrimaryButtonStyle(tint: .green))
             .controlSize(.large)
             .disabled(model.connection != .connected)
+            .vpAppear(index: 4)
             ConnectionBadge(state: model.connection)
+                .vpAppear(index: 5)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
+    }
+
+    private func welcomeFeature(
+        _ title: String,
+        _ detail: String,
+        icon: String,
+        tint: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 28, height: 28)
+                .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+            Text(detail)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(11)
+        .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .strokeBorder(tint.opacity(0.12), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.015, lift: 2, glow: tint)
     }
 }

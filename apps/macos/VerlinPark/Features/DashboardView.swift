@@ -63,24 +63,37 @@ struct DashboardView: View {
     @Environment(BrandStore.self) private var brand
     @Environment(MemoryMonitor.self) private var memory
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var section: DashboardSection = .overview
     @State private var filter = ""
+    @State private var hoveredSection: DashboardSection?
+    @State private var refreshing = false
+    @FocusState private var filterFocused: Bool
+    @Namespace private var sectionNamespace
     @AppStorage("verlinpark.dashboard.section") private var storedSection =
         DashboardSection.overview.rawValue
 
     var body: some View {
         HStack(spacing: 0) {
             sidebar
-            Divider().opacity(0.35)
+            VPGradientRule(vertical: true)
+                .frame(width: 1)
             VStack(alignment: .leading, spacing: 0) {
                 contentHeader
-                Divider().opacity(0.25)
+                VPGradientRule()
+                    .frame(height: 1)
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
                         sectionContent
+                            .id(section)
+                            .transition(.vpContent)
                     }
                     .padding(20)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .animation(
+                        VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
+                        value: section
+                    )
                 }
             }
         }
@@ -128,10 +141,12 @@ struct DashboardView: View {
                 TextField("Filter sections", text: $filter)
                     .textFieldStyle(.plain)
                     .font(.system(size: 9, design: .monospaced))
+                    .focused($filterFocused)
             }
             .padding(.horizontal, 7)
             .padding(.vertical, 5)
             .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 7))
+            .vpFocusRing(filterFocused, color: .accentColor, radius: 7)
             .padding(.bottom, 2)
             .help("Filter sections by title or description")
 
@@ -154,26 +169,48 @@ struct DashboardView: View {
                             .font(.system(size: 11, weight: .medium))
                         Spacer(minLength: 4)
                         if let badge = badge(for: item), badge > 0 {
-                            Text("\(badge)")
-                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .background(
-                                    (item == .inbox ? Color.orange : Color.accentColor).opacity(0.2),
-                                    in: Capsule()
-                                )
-                                .foregroundStyle(item == .inbox ? Color.orange : Color.secondary)
+                            VPCountBadge(
+                                count: badge,
+                                tint: item == .inbox ? .orange : .accentColor,
+                                compact: true
+                            )
                         }
                     }
                     .foregroundStyle(section == item ? Color.primary : Color.secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 6)
-                    .background(
-                        section == item ? Color.accentColor.opacity(0.16) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 8)
-                    )
+                    .background {
+                        if section == item {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.accentColor.opacity(0.16))
+                                .matchedGeometryEffect(
+                                    id: "dashboard-section",
+                                    in: sectionNamespace
+                                )
+                        } else if hoveredSection == item {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(.white.opacity(0.045))
+                        }
+                    }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(
+                                section == item ? Color.accentColor.opacity(0.18) : .clear,
+                                lineWidth: 1
+                            )
+                    }
+                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(VPPressableButtonStyle(scale: 0.985))
+                .onHover { hovering in
+                    if hovering {
+                        hoveredSection = item
+                    } else if hoveredSection == item {
+                        hoveredSection = nil
+                    }
+                }
+                .animation(VPMotion.hover, value: hoveredSection)
+                .animation(VPMotion.snap, value: section)
                 .keyboardShortcut(
                     KeyEquivalent(Character(String(index + 1))),
                     modifiers: .command
@@ -188,8 +225,7 @@ struct DashboardView: View {
                 .padding(.bottom, 2)
             connectionFooter
             Button("Done") { dismiss() }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+                .buttonStyle(VPPrimaryButtonStyle(tint: .accentColor))
                 .keyboardShortcut(.cancelAction)
         }
         .padding(14)
@@ -245,9 +281,11 @@ struct DashboardView: View {
 
     private var connectionFooter: some View {
         HStack(spacing: 6) {
-            Circle()
-                .fill(model.connection == .connected ? Color.green : Color.orange)
-                .frame(width: 6, height: 6)
+            VPStatusDot(
+                color: model.connection == .connected ? .green : .orange,
+                pulsing: model.connection == .connecting,
+                size: 6
+            )
             Text(model.connection == .connected ? "daemon connected" : "daemon offline")
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(.secondary)
@@ -266,9 +304,12 @@ struct DashboardView: View {
                     Image(systemName: section.icon)
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.secondary)
+                        .contentTransition(.symbolEffect(.replace))
                     Text(section.title)
                         .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        .contentTransition(.opacity)
                 }
+                .animation(VPMotion.snap, value: section)
                 Text(section.detail)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
@@ -294,13 +335,30 @@ struct DashboardView: View {
             }
             Spacer()
             Button {
-                Task { await refreshSection(section) }
+                Task {
+                    refreshing = true
+                    await refreshSection(section)
+                    refreshing = false
+                }
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
+                    .font(.system(size: 10, weight: .medium))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(.white.opacity(0.05), in: Capsule())
+                    .overlay {
+                        Capsule().strokeBorder(.white.opacity(0.07), lineWidth: 1)
+                    }
+                    .rotationEffect(.degrees(refreshing && !reduceMotion ? 360 : 0))
+                    .animation(
+                        refreshing && !reduceMotion ? VPMotion.spin : VPMotion.snap,
+                        value: refreshing
+                    )
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(VPPressableButtonStyle(scale: 0.96))
             .controlSize(.small)
             .keyboardShortcut("r", modifiers: .command)
+            .disabled(refreshing)
             .help("Refresh the visible section · ⌘R")
         }
         .padding(.horizontal, 20)

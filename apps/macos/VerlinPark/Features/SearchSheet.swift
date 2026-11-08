@@ -46,16 +46,11 @@ struct SearchSheet: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(.white.opacity(0.08), lineWidth: 1)
-            }
+            .vpFocusRing(queryFocused, color: .cyan, radius: 9)
 
             if model.searchHits.isEmpty {
                 VStack(spacing: 6) {
-                    Image(systemName: "text.magnifyingglass")
-                        .font(.system(size: 22, weight: .light))
-                        .foregroundStyle(.tertiary)
+                    VPFloatingSymbol(name: "text.magnifyingglass", size: 22, tint: .secondary)
                     Text(
                         model.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             ? "Type a query to search across sessions."
@@ -68,7 +63,7 @@ struct SearchSheet: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 6) {
-                        ForEach(model.searchHits) { hit in
+                        ForEach(Array(model.searchHits.enumerated()), id: \.element.id) { index, hit in
                             Button {
                                 Task {
                                     await model.openSearchHit(hit)
@@ -77,9 +72,12 @@ struct SearchSheet: View {
                             } label: {
                                 SearchHitRow(hit: hit)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+                            .transition(.vpRise)
+                            .vpAppear(index: index)
                         }
                     }
+                    .animation(VPMotion.smooth, value: model.searchHits.count)
                 }
             }
 
@@ -91,6 +89,8 @@ struct SearchSheet: View {
                 )
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundStyle(.tertiary)
+                .contentTransition(.numericText())
+                .animation(VPMotion.snap, value: model.searchHits.count)
                 Spacer()
                 Button("Close") {
                     dismiss()
@@ -166,5 +166,6 @@ private struct SearchHitRow: View {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .strokeBorder(.white.opacity(0.05), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.005, lift: 1, glow: .cyan)
     }
 }

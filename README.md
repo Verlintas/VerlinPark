@@ -69,6 +69,18 @@ The UI can inspect a session and show exactly why a change was proposed. `vp rep
 > [NovaBAIC](https://github.com/Verlintas/NovaBAIC) bridge. VerlinPark does not implement a
 > local Aviiya persona or memory.
 
+### Keyboard and command palette
+
+- `⌘K` — command palette: projects, all sessions, actions, settings, focus mode.
+- `⇧⌘F` — focus mode (hide rail and studio); `⌘K` can toggle it too.
+- `⌘F` — search messages and events; `⌘R` — refresh the active surface.
+- `⇧⌘O` — add project; `⌘N` — new session; `⇧⌘D` — Manage Dash.
+- `⌘1` — chat with the external Aviiya bridge; `⌘L` — focus the message composer.
+- `⌘/` — keyboard shortcut reference; `esc` dismisses overlays.
+- In Manage Dash, `⌘1–⌘9` switch sections; in Settings, `⌘1–⌘7` switch sections.
+- The top chrome exposes connection state, breadcrumb, memory, notifications, command palette, shortcuts, and focus mode.
+- Session/provider/MCP/ACP/landing/PR/checkpoint actions surface transient toasts; the Rail notification center remains the durable inbox.
+
 ## Architecture at a glance
 
 ```mermaid

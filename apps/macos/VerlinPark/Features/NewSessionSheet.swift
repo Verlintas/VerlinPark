@@ -20,6 +20,7 @@ struct NewSessionSheet: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             }
+            .vpAppear(index: 0)
 
             TextField(
                 "e.g. Add team invitations across API, UI, and tests",
@@ -28,19 +29,22 @@ struct NewSessionSheet: View {
             )
             .textFieldStyle(.roundedBorder)
             .lineLimit(3 ... 6)
+            .vpAppear(index: 1)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Priority")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Picker("Priority", selection: $priority) {
-                    Text("Low").tag(-10)
-                    Text("Normal").tag(0)
-                    Text("High").tag(10)
-                    Text("Urgent").tag(50)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+                VPSegmentedControl(
+                    segments: [
+                        VPSegment(-10, title: "Low"),
+                        VPSegment(0, title: "Normal"),
+                        VPSegment(10, title: "High"),
+                        VPSegment(50, title: "Urgent"),
+                    ],
+                    selection: $priority,
+                    compact: true
+                )
                 .frame(width: 360)
                 Text(
                     "Higher priority sessions are admitted before lower priority runs when the global session cap is full."
@@ -48,6 +52,7 @@ struct NewSessionSheet: View {
                 .font(.caption)
                 .foregroundStyle(.tertiary)
             }
+            .vpAppear(index: 2)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Token budget")
@@ -62,6 +67,7 @@ struct NewSessionSheet: View {
                 .font(.caption)
                 .foregroundStyle(.tertiary)
             }
+            .vpAppear(index: 3)
 
             HStack(alignment: .top, spacing: 18) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -87,6 +93,7 @@ struct NewSessionSheet: View {
                         .foregroundStyle(.tertiary)
                 }
             }
+            .vpAppear(index: 4)
 
             HStack {
                 if let project = model.selectedProject {
@@ -98,6 +105,7 @@ struct NewSessionSheet: View {
                 Button("Cancel", role: .cancel) {
                     dismiss()
                 }
+                .buttonStyle(VPPressableButtonStyle(scale: 0.96))
                 .keyboardShortcut(.cancelAction)
 
                 Button("Create") {
@@ -112,7 +120,7 @@ struct NewSessionSheet: View {
                         dismiss()
                     }
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(VPPrimaryButtonStyle(tint: .green))
                 .keyboardShortcut(.defaultAction)
                 .disabled(isCreateDisabled)
             }

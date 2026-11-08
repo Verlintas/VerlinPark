@@ -1380,4 +1380,63 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertTrue(result.resourcesSupported)
         XCTAssertFalse(result.promptsSupported)
     }
+
+    func testMotionTokensAreOrderedAndStaggerIsCapped() {
+        XCTAssertLessThan(VPMotion.instant, VPMotion.quick)
+        XCTAssertLessThan(VPMotion.quick, VPMotion.standard)
+        XCTAssertLessThan(VPMotion.standard, VPMotion.emphasized)
+        XCTAssertLessThan(VPMotion.emphasized, VPMotion.slow)
+        XCTAssertEqual(VPMotion.stagger(-1), 0)
+        XCTAssertEqual(VPMotion.stagger(0), 0)
+        XCTAssertEqual(VPMotion.stagger(2), 0.09, accuracy: 0.0001)
+        XCTAssertEqual(VPMotion.stagger(100), 0.36, accuracy: 0.0001)
+    }
+
+    func testMotionRespectsReduceMotion() {
+        XCTAssertNil(VPMotion.resolved(VPMotion.snap, reduceMotion: true))
+        XCTAssertNotNil(VPMotion.resolved(VPMotion.snap, reduceMotion: false))
+        XCTAssertNil(VPMotion.delayed(VPMotion.smooth, index: 2, reduceMotion: true))
+        XCTAssertNotNil(VPMotion.delayed(VPMotion.smooth, index: 2, reduceMotion: false))
+    }
+
+    func testSegmentIdentityAndMetadata() {
+        let segment = VPSegment("preview", title: "Preview", icon: "rectangle.on.rectangle")
+        XCTAssertEqual(segment.id, "preview")
+        XCTAssertEqual(segment.title, "Preview")
+        XCTAssertEqual(segment.icon, "rectangle.on.rectangle")
+    }
+
+    func testSettingsSectionsAreUniqueAndComplete() {
+        let sections = SettingsSection.allCases
+        XCTAssertEqual(sections.count, 7)
+        XCTAssertEqual(sections.first, .brand)
+        XCTAssertEqual(sections.last, .about)
+        XCTAssertEqual(Set(sections.map(\.title)).count, sections.count)
+        XCTAssertTrue(sections.allSatisfy { !$0.detail.isEmpty && !$0.icon.isEmpty })
+    }
+
+    func testToastKindsHaveDistinctIconography() {
+        XCTAssertEqual(VPToastKind.allCases.count, 4)
+        XCTAssertEqual(Set(VPToastKind.allCases.map(\.icon)).count, 4)
+        XCTAssertEqual(VPToastKind.success.icon, "checkmark.circle.fill")
+        XCTAssertEqual(VPToastKind.error.icon, "xmark.octagon.fill")
+    }
+
+    func testKeyboardShortcutCatalogIsNonEmptyAndUnambiguous() {
+        XCTAssertFalse(KeyboardShortcutsCatalog.groups.isEmpty)
+        let entries = KeyboardShortcutsCatalog.groups.flatMap(\.entries)
+        XCTAssertGreaterThan(entries.count, 10)
+        XCTAssertTrue(entries.allSatisfy { !$0.title.isEmpty && !$0.key.isEmpty })
+        XCTAssertEqual(
+            Set(KeyboardShortcutsCatalog.groups.map(\.title)).count,
+            KeyboardShortcutsCatalog.groups.count
+        )
+        XCTAssertEqual(KeyboardShortcutsCatalog.groups.first?.title, "Global")
+        XCTAssertEqual(KeyboardShortcutsCatalog.groups.last?.title, "Project")
+        XCTAssertEqual(
+            KeyboardShortcutsCatalog.groups.map(\.entries.count).reduce(0, +),
+            entries.count
+        )
+        XCTAssertTrue(KeyboardShortcutsCatalog.groups.allSatisfy { !$0.entries.isEmpty })
+    }
 }

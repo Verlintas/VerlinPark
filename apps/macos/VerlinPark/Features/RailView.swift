@@ -7,15 +7,53 @@ struct RailView: View {
     @Environment(\.openSettings) private var openSettings
 
     @Binding var showDashboard: Bool
-    @State private var showingNotifications = false
+    @Binding var showCommandPalette: Bool
+    @Binding var showingNotifications: Bool
+    @State private var residentHovering = false
+    @State private var hoveredProjectID: String?
+    @State private var hoveredAction: String?
+    @Namespace private var selectionNamespace
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             BrandMark(config: brand.config, fontSize: 28)
+                .vpAppear(index: 0, animation: VPMotion.emphasizedSpring)
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
-                .padding(.bottom, 18)
+                .padding(.bottom, 12)
                 .help("Customize this name in Settings → Brand")
+
+            Button {
+                showCommandPalette = true
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "command")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Text("Jump to…")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("⌘K")
+                        .font(.system(size: 8, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 4))
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+                .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+            .padding(.horizontal, 10)
+            .padding(.bottom, 10)
+            .help("Jump to a project, session, or action · ⌘K")
 
             Button {
                 model.selectResident()
@@ -46,10 +84,16 @@ struct RailView: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 9)
-                .background(
-                    model.mode == .resident ? Color.white.opacity(0.12) : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 11, style: .continuous)
-                )
+                .background {
+                    if model.mode == .resident {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(.white.opacity(0.12))
+                            .matchedGeometryEffect(id: "rail-selection", in: selectionNamespace)
+                    } else if residentHovering {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(.white.opacity(0.045))
+                    }
+                }
                 .overlay {
                     RoundedRectangle(cornerRadius: 11, style: .continuous)
                         .strokeBorder(
@@ -57,12 +101,16 @@ struct RailView: View {
                             lineWidth: 1
                         )
                 }
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(VPPressableButtonStyle(scale: 0.985))
+            .onHover { residentHovering = $0 }
+            .animation(VPMotion.hover, value: residentHovering)
+            .animation(VPMotion.snap, value: model.mode)
             .padding(.horizontal, 10)
 
-            Divider()
-                .opacity(0.45)
+            VPGradientRule()
+                .frame(height: 1)
                 .padding(.vertical, 14)
                 .padding(.horizontal, 16)
 
@@ -122,9 +170,9 @@ struct RailView: View {
                 railAction(
                     icon: model.unreadNoticeCount > 0 ? "bell.badge" : "bell",
                     title: "Notifications",
-                    subtitle: model.unreadNoticeCount > 0
-                        ? "\(model.unreadNoticeCount) unread · approvals & failures"
-                        : "approvals & failures"
+                    subtitle: "approvals & failures",
+                    badge: model.unreadNoticeCount,
+                    bounceValue: model.unreadNoticeCount
                 ) {
                     showingNotifications = true
                 }
@@ -138,8 +186,8 @@ struct RailView: View {
             }
             .padding(.horizontal, 8)
 
-            Divider()
-                .opacity(0.45)
+            VPGradientRule()
+                .frame(height: 1)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
 
@@ -154,10 +202,6 @@ struct RailView: View {
             .padding(.bottom, 10)
         }
         .background(.ultraThinMaterial.opacity(0.55))
-        .sheet(isPresented: $showingNotifications) {
-            NotificationCenterView()
-                .environment(model)
-        }
     }
 
     private func projectRow(_ project: Project) -> some View {
@@ -182,12 +226,32 @@ struct RailView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .background(
-                selected ? Color.white.opacity(0.11) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-            )
+            .background {
+                if selected {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(.white.opacity(0.11))
+                        .matchedGeometryEffect(id: "rail-selection", in: selectionNamespace)
+                } else if hoveredProjectID == project.id {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(.white.opacity(0.045))
+                }
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(selected ? .white.opacity(0.12) : .clear, lineWidth: 1)
+            }
+            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+        .onHover { hovering in
+            if hovering {
+                hoveredProjectID = project.id
+            } else if hoveredProjectID == project.id {
+                hoveredProjectID = nil
+            }
+        }
+        .animation(VPMotion.hover, value: hoveredProjectID)
+        .animation(VPMotion.snap, value: selected)
     }
 
     private var projectStatusColor: Color {
@@ -203,14 +267,18 @@ struct RailView: View {
         icon: String,
         title: String,
         subtitle: String,
+        badge: Int? = nil,
+        bounceValue: Int = 0,
         action: @escaping () -> Void
     ) -> some View {
-        Button(action: action) {
+        let hovering = hoveredAction == title
+        return Button(action: action) {
             HStack(spacing: 10) {
                 Image(systemName: icon)
                     .font(.system(size: 12, weight: .medium))
                     .frame(width: 18)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(hovering ? Color.primary : Color.secondary)
+                    .symbolEffect(.bounce, value: bounceValue)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(title)
                         .font(.system(size: 12, weight: .medium))
@@ -219,11 +287,29 @@ struct RailView: View {
                         .foregroundStyle(.tertiary)
                 }
                 Spacer()
+                if let badge, badge > 0 {
+                    VPCountBadge(count: badge, tint: .orange, compact: true)
+                        .transition(.vpScaleFade)
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
+            .offset(x: hovering ? 1 : 0)
+            .background(
+                hovering ? Color.white.opacity(0.05) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+            )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+        .onHover { isHovering in
+            if isHovering {
+                hoveredAction = title
+            } else if hoveredAction == title {
+                hoveredAction = nil
+            }
+        }
+        .animation(VPMotion.hover, value: hovering)
+        .animation(VPMotion.badge, value: badge ?? 0)
     }
 }

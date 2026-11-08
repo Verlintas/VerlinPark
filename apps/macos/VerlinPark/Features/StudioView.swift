@@ -20,13 +20,15 @@ enum StudioTab: String, CaseIterable, Identifiable {
 struct StudioView: View {
     @Environment(AppModel.self) private var model
     @Environment(BrandStore.self) private var brand
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var tab: StudioTab
     @State private var showingOrgEditor = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().opacity(0.35)
+            VPGradientRule()
+                .frame(height: 1)
 
             Group {
                 if model.mode == .resident {
@@ -48,10 +50,14 @@ struct StudioView: View {
                     }
                 }
             }
+            .id(tab)
+            .transition(.vpContent)
+            .animation(VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion), value: tab)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if model.mode == .project, tab == .collab {
-                Divider().opacity(0.35)
+                VPGradientRule()
+                    .frame(height: 1)
                 HStack {
                     Text("Org preset")
                         .font(.system(size: 9, design: .monospaced))
@@ -63,7 +69,7 @@ struct StudioView: View {
                         Label("Edit", systemImage: "slider.horizontal.3")
                             .font(.system(size: 10))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(VPPressableButtonStyle(scale: 0.95))
                     .foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 14)
@@ -79,18 +85,27 @@ struct StudioView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Picker("", selection: $tab) {
-                ForEach(StudioTab.allCases) { tab in
-                    Text(tab.title).tag(tab)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            VPSegmentedControl(
+                segments: [
+                    VPSegment(.collab, title: "Collab", icon: "person.3"),
+                    VPSegment(.preview, title: "Preview", icon: "rectangle.on.rectangle"),
+                ],
+                selection: $tab,
+                compact: true
+            )
 
             if model.mode == .project {
-                Text(model.selectedSession == nil ? "no session" : "live")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                HStack(spacing: 4) {
+                    VPStatusDot(
+                        color: model.selectedSession == nil ? .secondary : .green,
+                        pulsing: model.selectedSession != nil,
+                        size: 5
+                    )
+                    Text(model.selectedSession == nil ? "no session" : "live")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .contentTransition(.opacity)
+                }
             }
         }
         .padding(.horizontal, 12)
@@ -115,23 +130,31 @@ struct CollabGraphView: View {
                     accent: .green,
                     isPlaceholder: false
                 )
+                .vpAppear(index: 0, animation: VPMotion.emphasizedSpring)
 
                 if let plan = model.teamPlan {
                     OrgConnector()
+                        .vpAppear(index: 1)
                     TeamPlanCard(plan: plan)
+                        .vpAppear(index: 2)
                 }
 
                 if !model.roundtableRounds.isEmpty {
                     OrgConnector()
+                        .vpAppear(index: 3)
                     RoundtableCard(rounds: model.roundtableRounds)
+                        .vpAppear(index: 4)
                 }
 
                 if !model.todos.isEmpty {
                     OrgConnector()
+                        .vpAppear(index: 5)
                     LeaderPlanCard(todos: model.todos)
+                        .vpAppear(index: 6)
                 }
 
                 OrgConnector()
+                    .vpAppear(index: 7)
 
                 AgentTierCard(
                     title: "Managers",
@@ -141,8 +164,10 @@ struct CollabGraphView: View {
                     icon: "person.2",
                     agents: model.agents.filter { $0.role == "manager" }
                 )
+                .vpAppear(index: 8)
 
                 OrgConnector()
+                    .vpAppear(index: 9)
 
                 AgentTierCard(
                     title: "Workers",
@@ -152,8 +177,10 @@ struct CollabGraphView: View {
                     icon: "person.3",
                     agents: model.agents.filter { $0.role == "worker" }
                 )
+                .vpAppear(index: 10)
 
                 OrgConnector()
+                    .vpAppear(index: 11)
 
                 AgentTierCard(
                     title: "Verifiers",
@@ -163,8 +190,10 @@ struct CollabGraphView: View {
                     icon: "checkmark.shield",
                     agents: model.agents.filter { $0.role == "verifier" }
                 )
+                .vpAppear(index: 12)
 
                 OrgConnector()
+                    .vpAppear(index: 13)
 
                 AgentTierCard(
                     title: "Labour",
@@ -174,12 +203,14 @@ struct CollabGraphView: View {
                     icon: "hammer",
                     agents: model.agents.filter { $0.role == "labour" }
                 )
+                .vpAppear(index: 14)
 
                 Divider()
                     .opacity(0.3)
                     .padding(.vertical, 14)
 
                 computerLeaseCard
+                    .vpAppear(index: 15)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 12)
@@ -246,6 +277,8 @@ private struct PlanTaskRow: View {
                 .foregroundStyle(color)
                 .frame(width: 12)
                 .padding(.top, 1)
+                .contentTransition(.symbolEffect(.replace))
+                .animation(VPMotion.snap, value: status)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Text(task.id)
@@ -284,6 +317,7 @@ private struct PlanTaskRow: View {
         }
         .padding(7)
         .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 8))
+        .vpHoverHighlight(radius: 8)
     }
 
     private var icon: String {
@@ -350,6 +384,7 @@ struct TeamPlanCard: View {
             RoundedRectangle(cornerRadius: 10)
                 .strokeBorder(.cyan.opacity(0.15), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.005, lift: 1, glow: .cyan)
     }
 }
 
@@ -411,6 +446,7 @@ private struct RoundtableCard: View {
             RoundedRectangle(cornerRadius: 10)
                 .strokeBorder(.purple.opacity(0.14), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.005, lift: 1, glow: .purple)
     }
 
     private func binding(for round: Int) -> Binding<Bool> {
@@ -466,6 +502,7 @@ struct LeaderPlanCard: View {
             RoundedRectangle(cornerRadius: 10)
                 .strokeBorder(.white.opacity(0.06), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.005, lift: 1)
     }
 
     private func icon(for status: String) -> String {
@@ -542,6 +579,7 @@ struct OrgNodeCard: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(accent.opacity(isPlaceholder ? 0.08 : 0.16), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.006, lift: 1, glow: accent)
     }
 
     private var icon: String {
@@ -587,10 +625,12 @@ struct AgentTierCard: View {
                 }
                 ForEach(agents) { agent in
                     HStack(alignment: .top, spacing: 7) {
-                        Circle()
-                            .fill(color(for: agent.status))
-                            .frame(width: 6, height: 6)
-                            .padding(.top, 3)
+                        VPStatusDot(
+                            color: color(for: agent.status),
+                            pulsing: agent.status == "running",
+                            size: 6
+                        )
+                        .padding(.top, 3)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(agent.name)
                                 .font(.system(size: 10.5, weight: .medium))
@@ -625,6 +665,7 @@ struct AgentTierCard: View {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(.white.opacity(0.07), lineWidth: 1)
             }
+            .vpHoverLift(scale: 1.005, lift: 1)
         }
     }
 
@@ -686,10 +727,14 @@ struct TierPlaceholder: View {
                     style: StrokeStyle(lineWidth: 1, dash: [4, 4])
                 )
         }
+        .vpHoverLift(scale: 1.005, lift: 1)
     }
 }
 
 struct OrgConnector: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var drawn = false
+
     var body: some View {
         VStack(spacing: 0) {
             Rectangle()
@@ -702,6 +747,13 @@ struct OrgConnector: View {
                 .fill(.white.opacity(0.12))
                 .frame(width: 1, height: 10)
         }
+        .scaleEffect(y: drawn || reduceMotion ? 1 : 0.01, anchor: .top)
+        .opacity(drawn || reduceMotion ? 1 : 0)
+        .animation(
+            VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
+            value: drawn
+        )
+        .onAppear { drawn = true }
         .frame(maxWidth: .infinity)
     }
 }
@@ -800,6 +852,7 @@ struct ExternalResidentPanel: View {
 
 struct PreviewPanelView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var mode: PreviewMode = .changes
     @State private var showingCommit = false
     @State private var showingDiscard = false
@@ -813,28 +866,36 @@ struct PreviewPanelView: View {
             if let session = model.selectedSession {
                 header(session)
                 Divider().opacity(0.3)
-                switch mode {
-                case .changes:
-                    changes
-                case .plan:
-                    plan
-                case .files:
-                    FilesPanel()
-                case .history:
-                    HistoryPanel()
-                case .queue:
-                    queue
-                case .mailbox:
-                    mailbox
-                case .cost:
-                    cost
-                case .console:
-                    ConsolePanel()
-                case .terminal:
-                    TerminalPanel()
-                case .trace:
-                    trace
+                Group {
+                    switch mode {
+                    case .changes:
+                        changes
+                    case .plan:
+                        plan
+                    case .files:
+                        FilesPanel()
+                    case .history:
+                        HistoryPanel()
+                    case .queue:
+                        queue
+                    case .mailbox:
+                        mailbox
+                    case .cost:
+                        cost
+                    case .console:
+                        ConsolePanel()
+                    case .terminal:
+                        TerminalPanel()
+                    case .trace:
+                        trace
+                    }
                 }
+                .id(mode)
+                .transition(.vpContent)
+                .animation(
+                    VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
+                    value: mode
+                )
             } else {
                 StudioEmptyView(
                     icon: "rectangle.stack",
@@ -1003,9 +1064,8 @@ struct PreviewPanelView: View {
                     }
                 } label: {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 10, weight: .semibold))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: .secondary))
                 .help(
                     mode == .files ? "Refresh files" :
                         mode == .history ? "Refresh history" :
@@ -1016,14 +1076,14 @@ struct PreviewPanelView: View {
                 )
                 .disabled(model.diffLoading)
             }
-            Picker("", selection: $mode) {
-                ForEach(PreviewMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .controlSize(.small)
+            VPSegmentedControl(
+                segments: PreviewMode.allCases.map {
+                    VPSegment($0, title: $0.title, icon: $0.icon)
+                },
+                selection: $mode,
+                scrollable: true,
+                compact: true
+            )
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -1032,9 +1092,7 @@ struct PreviewPanelView: View {
     @ViewBuilder
     private var changes: some View {
         if model.diffLoading, model.sessionDiff == nil {
-            ProgressView()
-                .controlSize(.small)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VPSkeletonRows(rows: 4, height: 12)
         } else if let error = model.diffError, model.sessionDiff == nil {
             StudioEmptyView(
                 icon: "exclamationmark.triangle",
@@ -1345,9 +1403,7 @@ struct PreviewPanelView: View {
                 detail: status
             )
         } else {
-            ProgressView()
-                .controlSize(.small)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VPSkeletonRows(rows: 4, height: 14)
         }
     }
 
@@ -1403,6 +1459,8 @@ private struct MergeQueueRow: View {
             HStack(spacing: 7) {
                 Image(systemName: icon)
                     .foregroundStyle(color)
+                    .contentTransition(.symbolEffect(.replace))
+                    .animation(VPMotion.snap, value: entry.status)
                 Text(entry.status.uppercased())
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
                     .foregroundStyle(color)
@@ -1474,6 +1532,7 @@ private struct MergeQueueRow: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(color.opacity(0.16), lineWidth: 1)
         }
+        .vpHoverLift(scale: 1.005, lift: 1, glow: color)
     }
 
     private var color: Color {
@@ -1528,6 +1587,7 @@ private struct MailboxMessageRow: View {
         }
         .padding(9)
         .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
+        .vpHoverLift(scale: 1.005, lift: 1, glow: message.status == "unread" ? .orange : .white)
     }
 }
 
@@ -1625,6 +1685,7 @@ private struct ArtifactRow: View {
         }
         .padding(9)
         .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
+        .vpHoverLift(scale: 1.005, lift: 1)
         .task(id: artifact.id) {
             preview = await model.artifactPreviewData(artifact)
         }
@@ -1640,13 +1701,13 @@ private struct UsageMetric: View {
             Text(title)
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(.tertiary)
-            Text(value)
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
+            VPAnimatedNumberText(value: value, size: 15)
                 .monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(9)
         .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
+        .vpHoverLift(scale: 1.006, lift: 1)
     }
 }
 
@@ -1756,10 +1817,27 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .trace: "Trace"
         }
     }
+
+    var icon: String {
+        switch self {
+        case .changes: "plus.forwardslash.minus"
+        case .plan: "list.bullet.clipboard"
+        case .files: "folder"
+        case .history: "clock.arrow.circlepath"
+        case .queue: "arrow.triangle.merge"
+        case .mailbox: "tray"
+        case .cost: "dollarsign.circle"
+        case .console: "terminal"
+        case .terminal: "apple.terminal"
+        case .trace: "list.bullet.rectangle"
+        }
+    }
 }
 
 private struct HistoryPanel: View {
     @Environment(AppModel.self) private var model
+    @State private var hoveredCommit: String?
+    @Namespace private var selectionNamespace
 
     var body: some View {
         HStack(spacing: 0) {
@@ -1822,12 +1900,30 @@ private struct HistoryPanel: View {
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 6)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(
-                                    model.gitSelectedCommit == commit.hash
-                                        ? Color.accentColor.opacity(0.16) : Color.clear
-                                )
+                                .background {
+                                    if model.gitSelectedCommit == commit.hash {
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(Color.accentColor.opacity(0.16))
+                                            .matchedGeometryEffect(
+                                                id: "history-selection",
+                                                in: selectionNamespace
+                                            )
+                                    } else if hoveredCommit == commit.hash {
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(.white.opacity(0.04))
+                                    }
+                                }
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+                            .onHover { hovering in
+                                if hovering {
+                                    hoveredCommit = commit.hash
+                                } else if hoveredCommit == commit.hash {
+                                    hoveredCommit = nil
+                                }
+                            }
+                            .animation(VPMotion.hover, value: hoveredCommit)
+                            .animation(VPMotion.snap, value: model.gitSelectedCommit)
                         }
                     }
                 }
@@ -1894,6 +1990,8 @@ private struct HistoryPanel: View {
 
 private struct FilesPanel: View {
     @Environment(AppModel.self) private var model
+    @State private var hoveredPath: String?
+    @Namespace private var selectionNamespace
     @State private var draft = ""
     @State private var dirty = false
     @State private var pendingEntry: WorkspaceEntry?
@@ -1956,12 +2054,30 @@ private struct FilesPanel: View {
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 5)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(
-                                    model.workspaceSelectedPath == entry.path
-                                        ? Color.accentColor.opacity(0.16) : Color.clear
-                                )
+                                .background {
+                                    if model.workspaceSelectedPath == entry.path {
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(Color.accentColor.opacity(0.16))
+                                            .matchedGeometryEffect(
+                                                id: "file-selection",
+                                                in: selectionNamespace
+                                            )
+                                    } else if hoveredPath == entry.path {
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(.white.opacity(0.04))
+                                    }
+                                }
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+                            .onHover { hovering in
+                                if hovering {
+                                    hoveredPath = entry.path
+                                } else if hoveredPath == entry.path {
+                                    hoveredPath = nil
+                                }
+                            }
+                            .animation(VPMotion.hover, value: hoveredPath)
+                            .animation(VPMotion.snap, value: model.workspaceSelectedPath)
                         }
                     }
                 }
@@ -2155,9 +2271,11 @@ private struct ConsolePanel: View {
         @Bindable var model = model
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 7, height: 7)
+                VPStatusDot(
+                    color: statusColor,
+                    pulsing: model.consoleStatus == "running",
+                    size: 7
+                )
                 Text(model.consoleStatus)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
@@ -2192,13 +2310,13 @@ private struct ConsolePanel: View {
                     Button("Open console") {
                         Task { await model.openConsole() }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    .buttonStyle(VPPrimaryButtonStyle(tint: .green))
                     .disabled(model.selectedSessionID == nil || model.consoleBusy)
                 }
             }
             .padding(10)
-            Divider().opacity(0.3)
+            VPGradientRule()
+                .frame(height: 1)
             ScrollViewReader { proxy in
                 ScrollView {
                     Text(
@@ -2217,7 +2335,8 @@ private struct ConsolePanel: View {
                     proxy.scrollTo("console-bottom", anchor: .bottom)
                 }
             }
-            Divider().opacity(0.3)
+            VPGradientRule()
+                .frame(height: 1)
             if let error = model.consoleError {
                 Text(error)
                     .font(.system(size: 8, design: .monospaced))
@@ -2239,8 +2358,7 @@ private struct ConsolePanel: View {
                 Button("Send") {
                     Task { await model.sendConsole() }
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+                .buttonStyle(VPPrimaryButtonStyle(tint: .green))
                 .disabled(
                     model.consoleID == nil
                         || model.consoleStatus != "running"
@@ -2350,9 +2468,7 @@ struct StudioEmptyView: View {
 
     var body: some View {
         VStack(spacing: 9) {
-            Image(systemName: icon)
-                .font(.system(size: 26, weight: .light))
-                .foregroundStyle(.secondary)
+            VPFloatingSymbol(name: icon, size: 26, tint: .secondary)
             Text(title)
                 .font(.system(size: 13, weight: .semibold))
             Text(detail)
@@ -2361,6 +2477,7 @@ struct StudioEmptyView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 240)
         }
+        .vpAppear(index: 1, animation: VPMotion.emphasizedSpring)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
     }
