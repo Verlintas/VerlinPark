@@ -97,7 +97,7 @@ struct DashboardView: View {
         }
         .frame(width: 1120, height: 760)
         .tint(VPTheme.accent)
-        .background(VPTheme.canvas)
+        .background { VPCrystalBackdrop() }
         .onAppear {
             if let saved = DashboardSection(rawValue: storedSection) {
                 section = saved
@@ -226,7 +226,7 @@ struct DashboardView: View {
                 .padding(.bottom, 2)
             connectionFooter
             Button("Done") { dismiss() }
-                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                 .keyboardShortcut(.cancelAction)
         }
         .padding(15)

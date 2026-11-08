@@ -96,7 +96,7 @@ struct KeyboardShortcutsSheet: View {
             }
         }
         .frame(width: 640, height: 620)
-        .background(VPTheme.canvas)
+        .background { VPCrystalBackdrop() }
         .tint(VPTheme.accent)
     }
 

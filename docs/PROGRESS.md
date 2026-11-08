@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-08
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Warm Graphite Atelier UI 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
 
@@ -255,6 +255,7 @@
 - **M3 第一百一十七切片**：MCP HTTP/SSE transports（`McpTransport` Stdio/Http/Sse、Streamable HTTP JSON/SSE + session id + protocol header + DELETE、legacy SSE endpoint/same-origin POST、same-origin redirect、header env indirection、8MiB caps、server-initiated -32601、transport-aware manager close/retry、ACP capability-filtered propagation、`mcp.server.probe` + CLI/Settings add/edit/probe、store migration；Rust/Swift tests）；见 ADR-0113。
 - **M3 第一百一十八切片**：UI motion/interaction system（VPMotion tokens/primitives、Rail/Dashboard/Settings matched geometry、Stage chat/composer/streaming、Studio tabs/Preview chips/Collab stagger、Settings sidebar shell、⌘K command palette、⇧⌘F focus mode、TopChrome、toast stack、Reduce Motion；Swift tests）；见 ADR-0114。
 - **M3 第一百一十九切片**：warm graphite atelier UI 重构（`VPTheme` 暖石墨表面/珊瑚强调色/语义色/角色色/项目色、Editorial+mono 排版、静态 ambient wash；Rail 内联展开项目 session、活动计数、running pulse、show-more、⌘K/new-session/inbox/settings；Stage 单 header、去重 transcript、880pt 阅读宽度、用户/助手/tool/approval/question 卡片、可展开 tool output、focus-ring composer；Inspector 持久化开关 `⌥⌘I`；Studio/Dashboard/Settings/所有 sheet/command palette/resident 面板统一重做；resident orbital mark、New Session brief+priority+budget grid；`vpStage`/`vpInspector` transitions；Swift tests）；见 ADR-0115。
+- **M3 第一百二十切片**：black crystal glass refinement（`VPCrystalBackdrop` 静态多面体暗色背景、`VPCrystalSurface` in-window material + 深色 tint 的 Rail/Stage/Studio/TopChrome、半透明 surface token、specular `edgeGradient` 边框、圆角方形玻璃 icon button；冷冰蓝 accent + 深钢色 primary fill；移除 serif/coral/sparkles/orbit，改成 `cube.transparent` + 静态 crystal slab；New Session/Settings/Dashboard/Search/Notifications/Shortcuts/Fork 使用 crystal backdrop；见 ADR-0116）。
 
 ## 如何运行
 

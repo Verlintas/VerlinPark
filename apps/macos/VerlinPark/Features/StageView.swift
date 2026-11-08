@@ -30,7 +30,7 @@ struct StageView: View {
         .transition(.vpScaleFade)
         .animation(VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion), value: model.mode)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(VPTheme.surfaceSunken)
+        .background { VPCrystalSurface(tone: VPTheme.canvas, tintOpacity: 0.56) }
     }
 }
 
@@ -353,7 +353,7 @@ private struct ProjectStageView: View {
             } label: {
                 Label("Start a session", systemImage: "plus")
             }
-            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
             .controlSize(.large)
             .vpAppear(index: 2, animation: VPMotion.smooth)
 
@@ -408,7 +408,7 @@ private struct ProjectStageView: View {
                             .fill(
                                 sendDisabled
                                     ? VPTheme.surfaceHover
-                                    : VPTheme.accent
+                                    : VPTheme.accentDeep
                             )
                             .frame(width: 28, height: 28)
                         Image(systemName: "arrow.up")
@@ -419,7 +419,7 @@ private struct ProjectStageView: View {
                             .contentTransition(.symbolEffect(.replace))
                     }
                     .shadow(
-                        color: sendDisabled ? .clear : VPTheme.accent.opacity(0.24),
+                        color: sendDisabled ? .clear : VPTheme.accentDeep.opacity(0.28),
                         radius: 8,
                         y: 2
                     )
@@ -639,7 +639,7 @@ private struct ContextPopoverView: View {
         }
         .padding(16)
         .frame(width: 370)
-        .background(VPTheme.canvas)
+        .background { VPCrystalBackdrop() }
         .tint(VPTheme.accent)
     }
 
@@ -728,7 +728,7 @@ private struct ForkSessionSheet: View {
                 Button(busy ? "Forking…" : "Fork Session") {
                     Task { await fork() }
                 }
-                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                 .keyboardShortcut(.defaultAction)
                 .disabled(busy || model.forkBusy || goal.trimmingCharacters(in: .whitespacesAndNewlines)
                     .isEmpty)
@@ -736,7 +736,7 @@ private struct ForkSessionSheet: View {
         }
         .padding(22)
         .frame(width: 540)
-        .background(VPTheme.canvas)
+        .background { VPCrystalBackdrop() }
         .tint(VPTheme.accent)
         .onAppear {
             goal = "\(session.goal) (fork)"
@@ -1283,7 +1283,7 @@ private struct QuestionCard: View {
                         Button("Send") {
                             submit(question)
                         }
-                        .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.info))
+                        .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                         .disabled(
                             draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         )
@@ -1537,7 +1537,7 @@ struct ApprovalCard: View {
                         pending = true
                         Task { await model.resolveApproval(approval.id, approved: true) }
                     }
-                    .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+                    .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                     .controlSize(.small)
 
                     if pending {
@@ -1607,7 +1607,7 @@ private struct WelcomeStageView: View {
                     .vpAppear(index: 0)
 
                 Text("Agent teams,\nnot chat tabs.")
-                    .font(.system(size: 44, weight: .semibold, design: .serif))
+                    .font(VPTheme.editorial(44))
                     .foregroundStyle(VPTheme.textPrimary)
                     .lineSpacing(1)
                     .padding(.bottom, 16)
@@ -1653,7 +1653,7 @@ private struct WelcomeStageView: View {
                     } label: {
                         Label("Add Project", systemImage: "folder.badge.plus")
                     }
-                    .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+                    .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                     .controlSize(.large)
                     .disabled(model.connection != .connected)
                     .vpAppear(index: 4)

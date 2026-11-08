@@ -124,7 +124,8 @@
 | [0112](adr/0112-cross-project-dashboard-snapshot.md) | Cross-project Manage Dash snapshot | Accepted | UI/API |
 | [0113](adr/0113-mcp-http-and-sse-transports.md) | MCP HTTP and SSE transports | Accepted | MCP/Transport |
 | [0114](adr/0114-motion-and-interaction-system.md) | Motion and interaction system | Accepted | UI/Design |
-| [0115](adr/0115-warm-graphite-atelier-ui.md) | Warm graphite atelier UI | Accepted | UI/Design |
+| [0115](adr/0115-warm-graphite-atelier-ui.md) | Warm graphite atelier UI | Accepted; refined by 0116 | UI/Design |
+| [0116](adr/0116-black-crystal-glass-refinement.md) | Black crystal glass refinement | Accepted | UI/Design |
 
 ---
 

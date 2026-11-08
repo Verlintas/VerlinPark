@@ -382,15 +382,13 @@ struct VPGlassIconButtonStyle: ButtonStyle {
             .frame(width: size, height: size)
             .background(
                 hovering ? VPTheme.surfaceHover : VPTheme.surface,
-                in: Circle()
+                in: RoundedRectangle(cornerRadius: size * 0.30, style: .continuous)
             )
             .overlay {
-                Circle().strokeBorder(
-                    hovering ? VPTheme.hairlineStrong : VPTheme.hairline,
-                    lineWidth: 1
-                )
+                RoundedRectangle(cornerRadius: size * 0.30, style: .continuous)
+                    .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
             }
-            .shadow(color: .black.opacity(hovering ? 0.22 : 0.06), radius: hovering ? 8 : 2, y: 2)
+            .shadow(color: .black.opacity(hovering ? 0.24 : 0.08), radius: hovering ? 8 : 2, y: 2)
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.92 : 1)
             .animation(VPMotion.resolved(VPMotion.hover, reduceMotion: reduceMotion), value: hovering)
             .animation(
@@ -443,7 +441,7 @@ struct VPSegmentedControl<Value: Hashable>: View {
         .background(VPTheme.surfaceSunken, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
         }
         .animation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion), value: selection)
     }

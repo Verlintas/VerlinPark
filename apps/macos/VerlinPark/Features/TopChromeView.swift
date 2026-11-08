@@ -37,10 +37,11 @@ struct TopChromeView: View {
         .frame(maxWidth: .infinity)
         .frame(height: 36)
         .background {
-            ZStack {
-                Rectangle().fill(.ultraThinMaterial)
-                VPTheme.rail.opacity(0.72)
-            }
+            VPCrystalSurface(
+                tone: VPTheme.rail,
+                tintOpacity: 0.62,
+                material: .thinMaterial
+            )
         }
         .overlay(alignment: .bottom) {
             VPHairline()
@@ -86,7 +87,7 @@ struct TopChromeView: View {
                 }
             } else {
                 HStack(spacing: 6) {
-                    Image(systemName: "sparkles")
+                    Image(systemName: "cube.transparent")
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(VPTheme.resident)
                     Text(model.mode == .resident ? "Resident · Aviiya bridge" : "No project")

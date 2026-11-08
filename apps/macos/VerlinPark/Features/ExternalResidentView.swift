@@ -54,7 +54,7 @@ struct ExternalResidentView: View {
 
     private var hero: some View {
         HStack(alignment: .center, spacing: 28) {
-            ResidentOrbit()
+            ResidentCrystal()
 
             VStack(alignment: .leading, spacing: 10) {
                 Text("RESIDENT SURFACE")
@@ -63,7 +63,7 @@ struct ExternalResidentView: View {
                     .foregroundStyle(VPTheme.resident)
 
                 Text("Aviiya lives in\nNovaBAIC.")
-                    .font(.system(size: 38, weight: .semibold, design: .serif))
+                    .font(VPTheme.editorial(38))
                     .foregroundStyle(VPTheme.textPrimary)
                     .lineSpacing(1)
 
@@ -246,81 +246,70 @@ struct ExternalResidentView: View {
     }
 }
 
-/// A restrained orbital mark for the external resident. The ring and satellite
-/// pause under Reduce Motion; the mark itself remains readable.
-private struct ResidentOrbit: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var rotating = false
-    @State private var breathing = false
-
+/// A static black-crystal slab for the external resident. Two translucent
+/// planes and a single specular sweep keep the mark glassy without the orbiting
+/// “magic” of the previous version.
+private struct ResidentCrystal: View {
     var body: some View {
         ZStack {
-            Circle()
-                .strokeBorder(VPTheme.hairline, lineWidth: 1)
-                .frame(width: 116, height: 116)
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(VPTheme.surface.opacity(0.55))
+                .frame(width: 120, height: 120)
+                .rotationEffect(.degrees(-8))
+                .offset(x: -5, y: 5)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
+                        .rotationEffect(.degrees(-8))
+                        .offset(x: -5, y: 5)
+                }
 
-            Circle()
-                .trim(from: 0.04, to: 0.32)
-                .stroke(
-                    AngularGradient(
-                        colors: [
-                            VPTheme.resident.opacity(0.0),
-                            VPTheme.resident.opacity(0.75),
-                            VPTheme.resident.opacity(0.1),
-                        ],
-                        center: .center
-                    ),
-                    style: StrokeStyle(lineWidth: 1.6, lineCap: .round)
-                )
-                .frame(width: 116, height: 116)
-                .rotationEffect(.degrees(rotating ? 360 : 0))
-                .animation(
-                    reduceMotion
-                        ? nil
-                        : .linear(duration: 9).repeatForever(autoreverses: false),
-                    value: rotating
-                )
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .frame(width: 108, height: 108)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(
+                            RadialGradient(
+                                colors: [VPTheme.accent.opacity(0.18), .clear],
+                                center: .topLeading,
+                                startRadius: 0,
+                                endRadius: 120
+                            )
+                        )
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    .white.opacity(0.10),
+                                    .clear,
+                                    .white.opacity(0.035),
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
+                }
 
-            Circle()
-                .fill(VPTheme.resident)
-                .frame(width: 4, height: 4)
-                .offset(y: -58)
-                .rotationEffect(.degrees(rotating ? 360 : 0))
-                .animation(
-                    reduceMotion
-                        ? nil
-                        : .linear(duration: 9).repeatForever(autoreverses: false),
-                    value: rotating
-                )
-
-            Circle()
-                .fill(VPTheme.resident.opacity(0.08))
-                .frame(width: 82, height: 82)
-                .scaleEffect(breathing || reduceMotion ? 1 : 0.94)
-                .animation(
-                    reduceMotion
-                        ? nil
-                        : VPMotion.float,
-                    value: breathing
-                )
-
-            Image(systemName: "sparkles")
-                .font(.system(size: 27, weight: .light))
+            Image(systemName: "cube.transparent")
+                .font(.system(size: 42, weight: .ultraLight))
                 .foregroundStyle(
                     LinearGradient(
-                        colors: [VPTheme.resident, VPTheme.resident.opacity(0.55)],
+                        colors: [VPTheme.accentSoft, VPTheme.accentDeep],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
                 )
                 .symbolRenderingMode(.hierarchical)
         }
-        .frame(width: 120, height: 120)
-        .onAppear {
-            guard !reduceMotion else { return }
-            rotating = true
-            breathing = true
-        }
+        .frame(width: 150, height: 150)
+        .shadow(color: VPTheme.accent.opacity(0.10), radius: 28, y: 8)
         .accessibilityHidden(true)
     }
 }

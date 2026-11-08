@@ -42,7 +42,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .brand: "paintpalette"
-        case .resident: "sparkles"
+        case .resident: "cube.transparent"
         case .providers: "network"
         case .acp: "person.crop.rectangle.stack"
         case .mcp: "puzzlepiece.extension"
@@ -78,7 +78,7 @@ struct SettingsView: View {
         .frame(width: 880, height: 660)
         .preferredColorScheme(.dark)
         .tint(VPTheme.accent)
-        .background(VPTheme.canvas)
+        .background { VPCrystalBackdrop() }
         .onAppear {
             if let saved = SettingsSection(rawValue: storedSection) {
                 section = saved
@@ -477,7 +477,7 @@ struct FlagPickerView: View {
         }
         .padding(22)
         .frame(width: 720, height: 560)
-        .background(VPTheme.canvas)
+        .background { VPCrystalBackdrop() }
     }
 
     private func isSelected(_ option: FlagOption) -> Bool {
@@ -495,7 +495,7 @@ struct ResidentSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
-                Image(systemName: "sparkles")
+                Image(systemName: "cube.transparent")
                     .font(.system(size: 18, weight: .bold))
                     .foregroundStyle(VPTheme.resident)
                     .frame(width: 38, height: 38)
@@ -775,7 +775,7 @@ private struct ModelPresetsSheet: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Button("New") { model.newModelPresetDraft() }
-                            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+                            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                         Button("Refresh") {
                             Task { await model.loadModelPresets() }
                         }
@@ -861,7 +861,7 @@ private struct ModelPresetsSheet: View {
                             Button("Save preset") {
                                 Task { await model.saveModelPreset() }
                             }
-                            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+                            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                             .disabled(model.modelPresetsBusy)
                             Button("Delete") { confirmingDelete = true }
                                 .buttonStyle(.bordered)

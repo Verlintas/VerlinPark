@@ -79,7 +79,7 @@ struct NotificationCenterView: View {
         }
         .padding(22)
         .frame(width: 680, height: 540)
-        .background(VPTheme.canvas)
+        .background { VPCrystalBackdrop() }
         .tint(VPTheme.accent)
         .onAppear {
             Task { await model.refreshSessionDirectory() }

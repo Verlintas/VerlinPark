@@ -100,7 +100,7 @@ struct RailView: View {
             .padding(.top, 9)
             .padding(.bottom, 12)
         }
-        .background(VPTheme.rail)
+        .background { VPCrystalSurface(tone: VPTheme.rail, tintOpacity: 0.70) }
         .onAppear {
             if let id = model.selectedProjectID {
                 expandedProjects.insert(id)
@@ -109,14 +109,14 @@ struct RailView: View {
         .onChange(of: model.selectedProjectID) { _, newValue in
             if let newValue {
                 withAnimation(motion(VPMotion.smooth)) {
-                    expandedProjects.insert(newValue)
+                    _ = expandedProjects.insert(newValue)
                 }
             }
         }
         .onChange(of: model.projects.map(\.id)) { _, ids in
             guard expandedProjects.isEmpty, let first = ids.first else { return }
             withAnimation(motion(VPMotion.smooth)) {
-                expandedProjects.insert(first)
+                _ = expandedProjects.insert(first)
             }
         }
     }
@@ -202,7 +202,7 @@ struct RailView: View {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(VPTheme.resident.opacity(0.14))
                         .frame(width: 28, height: 28)
-                    Image(systemName: "sparkles")
+                    Image(systemName: "cube.transparent")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(VPTheme.resident)
                 }
@@ -301,7 +301,7 @@ struct RailView: View {
                 if !alreadyHere {
                     model.selectProject(project.id)
                     withAnimation(motion(VPMotion.smooth)) {
-                        expandedProjects.insert(project.id)
+                        _ = expandedProjects.insert(project.id)
                     }
                 } else {
                     withAnimation(motion(VPMotion.smooth)) {
@@ -388,7 +388,7 @@ struct RailView: View {
                     if total > sessions.count {
                         Button {
                             withAnimation(motion(VPMotion.smooth)) {
-                                fullyExpandedProjects.insert(project.id)
+                                _ = fullyExpandedProjects.insert(project.id)
                             }
                         } label: {
                             HStack(spacing: 5) {
@@ -492,7 +492,7 @@ struct RailView: View {
                 Label("Add project", systemImage: "folder.badge.plus")
                     .font(VPTheme.font(10, weight: .medium))
             }
-            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
         }
         .padding(10)
     }
@@ -517,11 +517,7 @@ struct RailView: View {
             .padding(.horizontal, 11)
             .padding(.vertical, 8)
             .background(
-                LinearGradient(
-                    colors: [VPTheme.accent, VPTheme.accentDeep],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                ),
+                VPTheme.primaryGradient,
                 in: RoundedRectangle(cornerRadius: 9, style: .continuous)
             )
             .overlay(alignment: .top) {

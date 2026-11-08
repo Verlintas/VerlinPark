@@ -36,7 +36,7 @@ struct TerminalPanel: View {
                     Button("Open terminal") {
                         Task { await model.openTerminal() }
                     }
-                    .buttonStyle(VPPrimaryButtonStyle(tint: .green))
+                    .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                     .disabled(model.selectedSessionID == nil || model.terminalBusy)
                 }
             }

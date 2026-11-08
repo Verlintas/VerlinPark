@@ -1,64 +1,82 @@
 import AppKit
 import SwiftUI
 
-/// VerlinPark's visual language: a warm graphite atelier.
+/// VerlinPark's visual language: black crystal glass.
 ///
-/// The workspace is treated like a quiet workbench rather than a neon
-/// dashboard. Surfaces are flat and layered with hairlines; saturated color is
-/// reserved for identity, state, and the primary action. Typography mixes a
-/// rounded UI face, an editorial serif for large moments, and monospaced
-/// micro-labels for operational metadata.
+/// The workspace is treated like a quiet obsidian workbench: translucent
+/// graphite planes, specular edges, and a cold ice accent. Color is reserved
+/// for identity, state, and the primary action. Typography stays technical:
+/// a UI sans for labels and large moments, monospaced micro-labels for
+/// operational metadata.
 enum VPTheme {
     // MARK: Canvas and surfaces
 
-    static let canvas = Color(hex: "0B0C0E")
-    static let rail = Color(hex: "101114")
-    static let surface = Color(hex: "15161A")
-    static let surfaceRaised = Color(hex: "1C1D22")
-    static let surfaceHover = Color(hex: "23242A")
-    static let surfaceSunken = Color(hex: "0D0E11")
-    static let hairline = Color.white.opacity(0.068)
-    static let hairlineStrong = Color.white.opacity(0.12)
-    static let hairlineAccent = Color(hex: "E4785B").opacity(0.28)
+    static let canvas = Color(hex: "06080B")
+    static let rail = Color(hex: "0A0F14F2")
+    static let surface = Color(hex: "101820B8")
+    static let surfaceRaised = Color(hex: "18232ED9")
+    static let surfaceHover = Color(hex: "1F2C38EA")
+    static let surfaceSunken = Color(hex: "080C10CC")
+    static let hairline = Color.white.opacity(0.075)
+    static let hairlineStrong = Color.white.opacity(0.15)
+    static let hairlineAccent = Color(hex: "A9C9D6").opacity(0.26)
 
     // MARK: Text
 
-    static let textPrimary = Color(hex: "F2EFE8")
-    static let textSecondary = Color(hex: "A8A59C")
-    static let textTertiary = Color(hex: "706E67")
+    static let textPrimary = Color(hex: "EEF2F5")
+    static let textSecondary = Color(hex: "A5B0B8")
+    static let textTertiary = Color(hex: "6D7982")
 
     // MARK: Identity and state
 
-    static let accent = Color(hex: "E4785B")
-    static let accentSoft = Color(hex: "F2A58E")
-    static let accentDeep = Color(hex: "C25B3F")
-    static let success = Color(hex: "8FBF9F")
-    static let warning = Color(hex: "E5B25E")
-    static let info = Color(hex: "8EA2F0")
-    static let danger = Color(hex: "E06666")
-    static let plan = Color(hex: "B8A0E8")
-    static let resident = Color(hex: "7FC3A8")
+    static let accent = Color(hex: "A9C9D6")
+    static let accentSoft = Color(hex: "D9ECF2")
+    static let accentDeep = Color(hex: "4C7285")
+    static let success = Color(hex: "8DBBA7")
+    static let warning = Color(hex: "D6B06B")
+    static let info = Color(hex: "97AFE8")
+    static let danger = Color(hex: "D97B7B")
+    static let plan = Color(hex: "B1A8DA")
+    static let resident = Color(hex: "8FC8D1")
 
     static let accentGradient = LinearGradient(
-        colors: [accent, accentSoft],
+        colors: [accentSoft, accent],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
 
+    static let primaryGradient = LinearGradient(
+        colors: [Color(hex: "4C7285"), Color(hex: "2E4957")],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+
     static let accentWash = LinearGradient(
-        colors: [accent.opacity(0.14), accent.opacity(0.03)],
+        colors: [accent.opacity(0.13), accent.opacity(0.025)],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+
+    static let edgeGradient = LinearGradient(
+        colors: [
+            Color.white.opacity(0.19),
+            Color.white.opacity(0.035),
+            Color.white.opacity(0.095),
+        ],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
 
     static let avatarPalettes: [(Color, Color)] = [
-        (Color(hex: "D97A5F"), Color(hex: "E8B15B")),
-        (Color(hex: "7FA58C"), Color(hex: "A9C7B2")),
-        (Color(hex: "8686D8"), Color(hex: "B69BE8")),
-        (Color(hex: "C98A9B"), Color(hex: "E6B7C2")),
-        (Color(hex: "6F9CB8"), Color(hex: "9CC4D8")),
-        (Color(hex: "B49B6A"), Color(hex: "D8C39A")),
+        (Color(hex: "6F8D9B"), Color(hex: "A9C9D6")),
+        (Color(hex: "738F87"), Color(hex: "A8C4BB")),
+        (Color(hex: "7D82A6"), Color(hex: "AFB4D8")),
+        (Color(hex: "9B7F8C"), Color(hex: "CBAAB7")),
+        (Color(hex: "6D879E"), Color(hex: "A6BFD1")),
+        (Color(hex: "8A877E"), Color(hex: "C0BDB2")),
     ]
+
+    // MARK: Typography
 
     // MARK: Typography
 
@@ -71,7 +89,7 @@ enum VPTheme {
     }
 
     static func editorial(_ size: CGFloat, weight: Font.Weight = .semibold) -> Font {
-        .system(size: size, weight: weight, design: .serif)
+        .system(size: size, weight: weight)
     }
 
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
@@ -158,7 +176,7 @@ extension View {
         .overlay {
             if border {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                    .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
             }
         }
     }
@@ -179,7 +197,7 @@ extension View {
         )
         .overlay {
             RoundedRectangle(cornerRadius: radius, style: .continuous)
-                .strokeBorder(tint.opacity(0.18), lineWidth: 1)
+                .strokeBorder(tint.opacity(0.22), lineWidth: 1)
         }
     }
 
@@ -191,14 +209,22 @@ extension View {
         .overlay {
             RoundedRectangle(cornerRadius: radius, style: .continuous)
                 .strokeBorder(
-                    focused ? VPTheme.accent.opacity(0.55) : VPTheme.hairline,
+                    focused
+                        ? AnyShapeStyle(VPTheme.accent.opacity(0.55))
+                        : AnyShapeStyle(VPTheme.edgeGradient),
                     lineWidth: focused ? 1.2 : 1
                 )
         }
         .shadow(
-            color: focused ? VPTheme.accent.opacity(0.14) : .clear,
-            radius: focused ? 12 : 0
+            color: focused ? VPTheme.accent.opacity(0.12) : .black.opacity(0.12),
+            radius: focused ? 12 : 0,
+            y: focused ? 0 : 1
         )
+        .overlay {
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .strokeBorder(.white.opacity(focused ? 0.02 : 0.045), lineWidth: 1)
+                .padding(1)
+        }
     }
 }
 
@@ -314,31 +340,117 @@ struct VPKeyCap: View {
 
 /// Static ambient wash. It replaces the previous drifting aurora so the canvas
 /// stays calm while the content carries the motion.
-struct VPAmbientBackground: View {
+struct VPCrystalSurface: View {
+    var tone: Color = VPTheme.canvas
+    var tintOpacity: Double = 0.52
+    var material: Material = .ultraThinMaterial
+
     var body: some View {
         ZStack {
-            VPTheme.canvas
+            Rectangle().fill(material)
+            tone.opacity(tintOpacity)
             RadialGradient(
-                colors: [VPTheme.accent.opacity(0.075), .clear],
+                colors: [.white.opacity(0.032), .clear],
                 center: .topLeading,
-                startRadius: 20,
-                endRadius: 680
-            )
-            RadialGradient(
-                colors: [VPTheme.resident.opacity(0.035), .clear],
-                center: .bottomTrailing,
-                startRadius: 40,
-                endRadius: 720
+                startRadius: 0,
+                endRadius: 520
             )
             LinearGradient(
-                colors: [.clear, VPTheme.canvas.opacity(0.35), VPTheme.canvas],
-                startPoint: .top,
-                endPoint: .bottom
+                colors: [
+                    .white.opacity(0.032),
+                    .clear,
+                    .white.opacity(0.012),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
             )
+        }
+        .ignoresSafeArea()
+    }
+}
+
+/// Static black-crystal backdrop. Angular, very low-contrast facets and a
+/// single specular sweep replace the earlier aurora; nothing animates, so the
+/// effect stays calm and cheap.
+struct VPCrystalBackdrop: View {
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                VPTheme.canvas
+
+                CrystalFacet()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(hex: "35515F").opacity(0.20),
+                                Color(hex: "1A2530").opacity(0.06),
+                                .clear,
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: proxy.size.width * 0.78, height: proxy.size.height * 1.05)
+                    .rotationEffect(.degrees(-17))
+                    .offset(x: -proxy.size.width * 0.24, y: -proxy.size.height * 0.22)
+                    .blur(radius: 42)
+
+                CrystalFacet()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(hex: "3A354C").opacity(0.14),
+                                Color(hex: "18202A").opacity(0.05),
+                                .clear,
+                            ],
+                            startPoint: .bottomTrailing,
+                            endPoint: .topLeading
+                        )
+                    )
+                    .frame(width: proxy.size.width * 0.62, height: proxy.size.height * 0.88)
+                    .rotationEffect(.degrees(24))
+                    .offset(x: proxy.size.width * 0.30, y: proxy.size.height * 0.26)
+                    .blur(radius: 50)
+
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(0.035),
+                        .clear,
+                        Color.black.opacity(0.18),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+
+                LinearGradient(
+                    colors: [.clear, VPTheme.canvas.opacity(0.30), VPTheme.canvas.opacity(0.78)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+    }
+}
+
+struct VPAmbientBackground: View {
+    var body: some View {
+        VPCrystalBackdrop()
+    }
+}
+
+private struct CrystalFacet: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.midX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.92, y: rect.minY + rect.height * 0.30))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.71, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.29, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.08, y: rect.minY + rect.height * 0.30))
+        path.closeSubpath()
+        return path
     }
 }
 
@@ -352,7 +464,7 @@ struct VPLogoMark: View {
                 RoundedRectangle(cornerRadius: compact ? 8 : 10, style: .continuous)
                     .fill(VPTheme.accentGradient)
                     .frame(width: compact ? 26 : 30, height: compact ? 26 : 30)
-                Image(systemName: "sparkles")
+                Image(systemName: "cube.transparent")
                     .font(.system(size: compact ? 11 : 13, weight: .bold))
                     .foregroundStyle(.white)
             }

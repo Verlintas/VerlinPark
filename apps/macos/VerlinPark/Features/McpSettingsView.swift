@@ -94,7 +94,7 @@ struct McpSettingsView: View {
                                 }
                             }
                         }
-                        .buttonStyle(VPPrimaryButtonStyle(tint: .green))
+                        .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                         .disabled(model.mcpBusy || !canAdd)
                     }
                 }
@@ -477,7 +477,7 @@ private struct McpEditSheet: View {
                         }
                     }
                 }
-                .buttonStyle(VPPrimaryButtonStyle(tint: .green))
+                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                 .disabled(model.mcpBusy || !canSave)
             }
             .padding(20)

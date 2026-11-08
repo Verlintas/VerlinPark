@@ -44,7 +44,7 @@ struct SearchSheet: View {
                 Button("Search") {
                     Task { await runSearch() }
                 }
-                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                 .disabled(model.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding(.horizontal, 11)
@@ -103,7 +103,7 @@ struct SearchSheet: View {
         }
         .padding(22)
         .frame(width: 760, height: 560)
-        .background(VPTheme.canvas)
+        .background { VPCrystalBackdrop() }
         .tint(VPTheme.accent)
         .onAppear {
             queryFocused = true

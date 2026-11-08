@@ -30,7 +30,7 @@ struct NewSessionSheet: View {
         }
         .frame(width: 660)
         .frame(maxHeight: 700)
-        .background(VPTheme.canvas)
+        .background { VPCrystalBackdrop() }
         .tint(VPTheme.accent)
         .onAppear {
             budget = model.defaultTokenBudget
@@ -244,7 +244,7 @@ struct NewSessionSheet: View {
             } label: {
                 Label("Create session", systemImage: "arrow.right")
             }
-            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
             .keyboardShortcut(.defaultAction)
             .disabled(isCreateDisabled)
         }

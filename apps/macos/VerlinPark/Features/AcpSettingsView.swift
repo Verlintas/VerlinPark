@@ -75,7 +75,7 @@ struct AcpSettingsView: View {
                                 timeout = 1800
                             }
                         }
-                        .buttonStyle(VPPrimaryButtonStyle(tint: .green))
+                        .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                         .disabled(
                             model.acpBusy
                                 || name.trimmingCharacters(in: .whitespaces).isEmpty

@@ -76,7 +76,7 @@ struct StudioView: View {
                 .padding(.vertical, 9)
             }
         }
-        .background(VPTheme.rail)
+        .background { VPCrystalSurface(tone: VPTheme.rail, tintOpacity: 0.68) }
         .sheet(isPresented: $showingOrgEditor) {
             OrgPresetSheet()
                 .environment(model)
@@ -810,7 +810,7 @@ struct ExternalResidentPanel: View {
                             RoundedRectangle(cornerRadius: 9, style: .continuous)
                                 .fill(VPTheme.resident.opacity(0.12))
                                 .frame(width: 36, height: 36)
-                            Image(systemName: "sparkles")
+                            Image(systemName: "cube.transparent")
                                 .font(.system(size: 14, weight: .semibold))
                                 .foregroundStyle(VPTheme.resident)
                         }
@@ -2392,7 +2392,7 @@ private struct ConsolePanel: View {
                     Button("Open console") {
                         Task { await model.openConsole() }
                     }
-                    .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+                    .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                     .disabled(model.selectedSessionID == nil || model.consoleBusy)
                 }
             }
@@ -2440,7 +2440,7 @@ private struct ConsolePanel: View {
                 Button("Send") {
                     Task { await model.sendConsole() }
                 }
-                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accent))
+                .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                 .disabled(
                     model.consoleID == nil
                         || model.consoleStatus != "running"

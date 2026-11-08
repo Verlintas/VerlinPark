@@ -1,6 +1,6 @@
 # ADR-0115: Warm graphite atelier UI
 
-- **Status:** Accepted
+- **Status:** Accepted; palette, typography, and glass treatment refined by ADR-0116
 - **Date:** 2026-11-08
 
 ## Context
