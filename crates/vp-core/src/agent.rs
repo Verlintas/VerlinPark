@@ -4655,8 +4655,8 @@ async fn integrate_worker(
     process_merge_entry(engine, session, spec, &entry, integration_command).await
 }
 
-/// Merge and integration-check an existing queue entry. The entry must already
-/// have a valid `base_commit` (the session HEAD before this merge).
+/// Serialize integration across processes with a runtime lease, then run the
+/// deterministic merge/check path.
 async fn process_merge_entry(
     engine: &Engine,
     session: &Session,
@@ -4664,9 +4664,68 @@ async fn process_merge_entry(
     entry: &MergeQueueEntry,
     integration_command: Option<&str>,
 ) -> Result<String> {
+    let lease = engine
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(900),
+        )
+        .await?;
+    let result = process_merge_entry_inner(engine, session, spec, entry, integration_command).await;
+    lease.release().await;
+    result
+}
+
+/// Merge and integration-check an existing queue entry. The entry must already
+/// have a valid `base_commit` (the session HEAD before this merge).
+async fn process_merge_entry_inner(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    entry: &MergeQueueEntry,
+    integration_command: Option<&str>,
+) -> Result<String> {
     let (_, project) = load_session_project(engine.store().clone(), &session.id).await?;
+    let preflight_worktree = spec.session_worktree.clone();
+    let git_lock = engine.git_mutex();
+    let preflight = {
+        let git_lock = git_lock.clone();
+        let preflight_worktree = preflight_worktree.clone();
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let _guard = git_lock.lock().map_err(|_| anyhow!("git mutex poisoned"))?;
+            if !worktree::is_clean(&preflight_worktree)? {
+                return Err(anyhow!(
+                    "session worktree has uncommitted tracked changes; refusing to integrate"
+                ));
+            }
+            worktree::head_commit(&preflight_worktree)
+        })
+        .await?
+    };
+    let preflight = match preflight {
+        Ok(commit) => commit,
+        Err(error) => {
+            let detail = truncate(&format!("merge preflight failed: {error}"));
+            engine
+                .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "integrator.finished",
+                serde_json::json!({
+                    "entry_id": entry.id,
+                    "status": "failed",
+                    "detail": detail,
+                }),
+            )
+            .await?;
+            return Err(anyhow!(detail));
+        }
+    };
     engine
-        .update_merge_queue_entry(&entry.id, "merging", None)
+        .begin_merge_queue_entry(&entry.id, &preflight)
         .await?;
     emit(
         engine,
@@ -4677,6 +4736,7 @@ async fn process_merge_entry(
             "entry_id": entry.id,
             "branch": entry.branch,
             "base_commit": entry.base_commit,
+            "pre_merge_commit": preflight,
             "attempt": entry.attempt,
             "has_command": integration_command.is_some(),
         }),
@@ -4685,16 +4745,10 @@ async fn process_merge_entry(
 
     let merge_worktree = spec.session_worktree.clone();
     let merge_commit = entry.commit.clone();
-    let expected_base = entry.base_commit.clone();
+    let expected_base = preflight.clone();
     let message = format!("merge {}", spec.name);
-    let git_lock = engine.git_mutex();
     let merge_result = tokio::task::spawn_blocking(move || -> Result<String> {
         let _guard = git_lock.lock().map_err(|_| anyhow!("git mutex poisoned"))?;
-        if !worktree::is_clean(&merge_worktree)? {
-            return Err(anyhow!(
-                "session worktree has uncommitted tracked changes; refusing to integrate"
-            ));
-        }
         let actual_base = worktree::head_commit(&merge_worktree)?;
         if actual_base != expected_base {
             tracing::warn!(

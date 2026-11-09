@@ -696,6 +696,7 @@ impl Store {
                 branch       TEXT NOT NULL,
                 commit_hash  TEXT NOT NULL,
                 base_commit  TEXT NOT NULL,
+                pre_merge_commit TEXT,
                 status      TEXT NOT NULL,
                 attempt     INTEGER NOT NULL DEFAULT 1,
                 detail      TEXT,
@@ -880,6 +881,7 @@ impl Store {
         ensure_column(&conn, "agents", "branch", "TEXT")?;
         ensure_column(&conn, "agents", "task_id", "TEXT")?;
         ensure_column(&conn, "agents", "department", "TEXT")?;
+        ensure_column(&conn, "merge_queue", "pre_merge_commit", "TEXT")?;
         ensure_column(&conn, "plan_tasks", "next_attempt_at", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_reason", "TEXT")?;
@@ -6620,7 +6622,7 @@ impl Store {
         }
         for id in &queue_ids {
             let entry = tx.query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -6773,8 +6775,8 @@ impl Store {
             for entry in queue {
                 tx.execute(
                     "INSERT INTO merge_queue
-                     (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         entry.id,
                         entry.session_id,
@@ -7167,8 +7169,8 @@ impl Store {
         for entry in &bundle.merge_queue {
             tx.execute(
                 "INSERT INTO merge_queue
-                 (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     entry.id,
                     entry.session_id,
@@ -7414,8 +7416,8 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO merge_queue
-             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 1, ?9, ?10, ?10)",
+             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'queued', 1, ?9, ?10, ?10)",
             params![
                 id,
                 session_id,
@@ -7430,7 +7432,7 @@ impl Store {
             ],
         )?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -7452,7 +7454,30 @@ impl Store {
             params![status, detail, now_rfc3339(), id],
         )?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+             FROM merge_queue WHERE id = ?1",
+            params![id],
+            map_merge_queue_entry,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Mark a queue entry as merging and persist the exact pre-merge HEAD.
+    pub fn begin_merge_queue_entry(
+        &self,
+        id: &str,
+        pre_merge_commit: &str,
+    ) -> Result<Option<MergeQueueEntry>> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE merge_queue
+             SET status = 'merging', pre_merge_commit = ?1, updated_at = ?2
+             WHERE id = ?3",
+            params![pre_merge_commit, now_rfc3339(), id],
+        )?;
+        conn.query_row(
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -7479,8 +7504,8 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO merge_queue
-             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 1, ?9, ?10, ?10)",
+             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'queued', 1, ?9, ?10, ?10)",
             params![
                 id,
                 session_id,
@@ -7495,7 +7520,7 @@ impl Store {
             ],
         )?;
         let entry = tx.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -7532,7 +7557,7 @@ impl Store {
         }
         let entry = tx
             .query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -7575,7 +7600,7 @@ impl Store {
         }
         let entry = tx
             .query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -7597,10 +7622,26 @@ impl Store {
         Ok(Some((entry, event)))
     }
 
+    /// Interrupted integration entries that still have a recorded pre-merge
+    /// HEAD. The engine uses this to restore a clean session worktree after a
+    /// crash before the merge status was finalized.
+    pub fn interrupted_merge_recoveries(&self) -> Result<Vec<MergeQueueEntry>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash,
+                    base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+             FROM merge_queue
+             WHERE status = 'interrupted' AND pre_merge_commit IS NOT NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_merge_queue_entry)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn list_merge_queue(&self, session_id: &str) -> Result<Vec<MergeQueueEntry>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
              FROM merge_queue WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], map_merge_queue_entry)?;
@@ -7610,7 +7651,7 @@ impl Store {
     pub fn get_merge_queue_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -7661,7 +7702,7 @@ impl Store {
         let mut entries = Vec::with_capacity(ids.len());
         for id in ids {
             entries.push(conn.query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, status, attempt, detail, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -7831,11 +7872,12 @@ fn map_merge_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueue
         branch: row.get(5)?,
         commit: row.get(6)?,
         base_commit: row.get(7)?,
-        status: row.get(8)?,
-        attempt: row.get::<_, i64>(9)? as u32,
-        detail: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        pre_merge_commit: row.get(8)?,
+        status: row.get(9)?,
+        attempt: row.get::<_, i64>(10)? as u32,
+        detail: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 

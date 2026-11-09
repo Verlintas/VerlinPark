@@ -30,14 +30,24 @@ two gaps:
 3. **Expired leases are swept.** The orchestration tick calls
    `clear_expired_runtime_leases`. `runtime.leases` / `runtime.leases.sweep`
    expose state and manual cleanup to the CLI and Manage Dash.
-4. **The existing instance lock remains.** Leases do not replace per-data-dir
+4. **Integration work is leased too.** `process_merge_entry` acquires an
+   `integration:{session}` runtime lease around the deterministic merge/check
+   path, so a session run and an explicit retry/resolver cannot integrate the
+   same worktree concurrently. The same heartbeat/TTL rules apply.
+5. **Merge recovery is crash-safe.** Before `git merge`, the queue entry
+   records `pre_merge_commit` (the exact session HEAD). On daemon restart,
+   interrupted entries with a recorded pre-merge HEAD are reset only when the
+   session worktree is clean; dirty worktrees are left untouched and receive a
+   `merge_queue.recovery_skipped` event, while successful resets emit
+   `merge_queue.recovered`. The entry remains retryable either way.
+6. **The existing instance lock remains.** Leases do not replace per-data-dir
    exclusivity; they make ownership explicit if the daemon topology changes.
    They are not a distributed lock service and do not provide fencing tokens.
-5. **Overview is a read projection.** `orchestration.overview` scans recent
+7. **Overview is a read projection.** `orchestration.overview` scans recent
    TeamPlan sessions, derives the same snapshot used by Collab, and ranks by
    attention, running status, then priority. It returns totals plus top
    blockers and the last controller decision per session.
-6. **Overview never mutates.** Mission Control is a monitor; task actions and
+8. **Overview never mutates.** Mission Control is a monitor; task actions and
    plan revisions stay in Collab Ops, the task queue, or the CLI.
 
 ## Consequences

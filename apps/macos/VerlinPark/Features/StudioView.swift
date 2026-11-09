@@ -918,6 +918,11 @@ private struct MergeQueueRow: View {
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if let preMerge = entry.preMergeCommit {
+                Text("pre-merge \(String(preMerge.prefix(7)))")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
             if let detail = entry.detail, !detail.isEmpty {
                 Text(detail)
                     .font(.system(size: 9, design: .monospaced))

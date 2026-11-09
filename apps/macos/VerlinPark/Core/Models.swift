@@ -2290,6 +2290,7 @@ struct MergeQueueEntry: Codable, Identifiable, Hashable, Sendable {
     let branch: String
     let commit: String
     let baseCommit: String
+    let preMergeCommit: String?
     let status: String
     let attempt: Int
     let detail: String?
@@ -2305,6 +2306,7 @@ struct MergeQueueEntry: Codable, Identifiable, Hashable, Sendable {
         case branch
         case commit
         case baseCommit = "base_commit"
+        case preMergeCommit = "pre_merge_commit"
         case status
         case attempt
         case detail

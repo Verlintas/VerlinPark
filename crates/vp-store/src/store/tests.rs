@@ -1288,6 +1288,14 @@ fn persists_and_updates_merge_queue_entries() {
     assert_eq!(entry.status, "queued");
     assert_eq!(entry.attempt, 1);
     assert_eq!(entry.task_id.as_deref(), Some("T1"));
+    assert_eq!(entry.pre_merge_commit, None);
+
+    let merging = store
+        .begin_merge_queue_entry(&entry.id, "def456")
+        .unwrap()
+        .unwrap();
+    assert_eq!(merging.status, "merging");
+    assert_eq!(merging.pre_merge_commit.as_deref(), Some("def456"));
 
     let updated = store
         .update_merge_queue_entry(&entry.id, "merged", Some("ok"))
@@ -1319,12 +1327,14 @@ fn interrupts_in_flight_merge_queue_entries() {
             None,
         )
         .unwrap();
-    store
-        .update_merge_queue_entry(&entry.id, "merging", None)
-        .unwrap();
+    store.begin_merge_queue_entry(&entry.id, "def456").unwrap();
     let interrupted = store.interrupt_merge_queue().unwrap();
     assert_eq!(interrupted.len(), 1);
     assert_eq!(interrupted[0].status, "interrupted");
+    assert_eq!(interrupted[0].pre_merge_commit.as_deref(), Some("def456"));
+    let recoveries = store.interrupted_merge_recoveries().unwrap();
+    assert_eq!(recoveries.len(), 1);
+    assert_eq!(recoveries[0].id, entry.id);
     assert!(store.interrupt_merge_queue().unwrap().is_empty());
 }
 
@@ -2230,4 +2240,28 @@ fn approval_grants_are_scoped_and_deletable() {
     assert_eq!(snapshot.approval_grants.len(), 1);
     assert!(store.delete_approval_grant(&grant.id).unwrap());
     assert!(store.list_approval_grants(&project.id).unwrap().is_empty());
+}
+
+#[test]
+fn enqueue_merge_with_event_persists_pre_merge_column() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "merge event").unwrap();
+    let (entry, event) = store
+        .enqueue_merge_with_event(
+            &session.id,
+            "agent_1",
+            "Worker 1",
+            Some("T1"),
+            "verlinpark/task",
+            "abc123",
+            "def456",
+            Some("approved"),
+        )
+        .unwrap();
+    assert_eq!(entry.status, "queued");
+    assert_eq!(entry.pre_merge_commit, None);
+    assert_eq!(event.kind, "merge_queue.enqueued");
 }

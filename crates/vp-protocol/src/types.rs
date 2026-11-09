@@ -2358,6 +2358,10 @@ pub struct MergeQueueEntry {
     pub branch: String,
     pub commit: String,
     pub base_commit: String,
+    /// Session HEAD recorded immediately before the Integrator starts. This is
+    /// the exact rollback target if the process crashes mid-merge.
+    #[serde(default)]
+    pub pre_merge_commit: Option<String>,
     pub status: String,
     pub attempt: u32,
     #[serde(default)]

@@ -5121,3 +5121,59 @@ async fn approval_grants_match_paths_and_subfolders() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn integration_runtime_leases_serialize_merge_work() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let first = Engine::new(store.clone());
+    let second = Engine::new(store);
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("leases".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "integration lease".into(), None)
+        .await
+        .unwrap();
+    let lease = first
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease.kind, "integration");
+    let blocked = second
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+    let error = match blocked {
+        Ok(_) => panic!("second engine acquired the same integration lease"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("busy"));
+    let leases = first.list_runtime_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].kind, "integration");
+    assert_eq!(leases[0].session_id.as_deref(), Some(session.id.as_str()));
+    lease.release().await;
+    let second_lease = second
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    second_lease.release().await;
+}

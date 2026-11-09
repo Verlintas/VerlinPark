@@ -150,6 +150,38 @@ impl Drop for SessionLease {
     }
 }
 
+/// A generic daemon-wide lease used for integration and other serialized
+/// operations. Unlike a session lease it has no session event stream; it still
+/// uses the same SQLite ownership, heartbeat, and expiry rules.
+pub struct RuntimeLeaseGuard {
+    store: Store,
+    pub lease_key: String,
+    pub kind: String,
+    pub owner_id: String,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RuntimeLeaseGuard {
+    pub async fn release(mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+        let store = self.store.clone();
+        let key = self.lease_key.clone();
+        let owner = self.owner_id.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || store.release_runtime_lease(&key, &owner)).await;
+    }
+}
+
+impl Drop for RuntimeLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+    }
+}
+
 fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
     serde_json::json!({
         "artifact_id": artifact.id,
@@ -402,6 +434,75 @@ impl Engine {
 
     pub fn runtime_id(&self) -> &str {
         &self.runtime_id
+    }
+
+    /// Acquire a named runtime lease (for example `integration:{session}`).
+    pub async fn acquire_runtime_lease(
+        &self,
+        kind: &str,
+        resource: &str,
+        ttl: std::time::Duration,
+    ) -> Result<RuntimeLeaseGuard> {
+        let ttl_secs = ttl.as_secs().clamp(10, 86_400);
+        let lease_key = format!("{kind}:{resource}");
+        let owner_id = self.runtime_id.clone();
+        let store = self.store.clone();
+        let key = lease_key.clone();
+        let owner = owner_id.clone();
+        let kind_owned = kind.to_string();
+        let resource_owned = resource.to_string();
+        let acquired = tokio::task::spawn_blocking(move || {
+            store.try_acquire_runtime_lease(
+                &key,
+                &owner,
+                &kind_owned,
+                Some(&resource_owned),
+                ttl_secs,
+            )
+        })
+        .await??;
+        if !acquired {
+            let store = self.store.clone();
+            let key = lease_key.clone();
+            let holder =
+                tokio::task::spawn_blocking(move || store.runtime_lease_owner(&key)).await??;
+            let detail = holder
+                .map(|lease| format!("held by {} until {}", lease.owner_id, lease.expires_at))
+                .unwrap_or_else(|| "held by another process".to_string());
+            anyhow::bail!("{kind} lease for {resource} is busy ({detail})");
+        }
+        let heartbeat_store = self.store.clone();
+        let heartbeat_key = lease_key.clone();
+        let heartbeat_owner = owner_id.clone();
+        let heartbeat_secs = (ttl_secs / 3).max(5);
+        let heartbeat = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let store = heartbeat_store.clone();
+                let key = heartbeat_key.clone();
+                let owner = heartbeat_owner.clone();
+                let renewed = tokio::task::spawn_blocking(move || {
+                    store.renew_runtime_lease(&key, &owner, ttl_secs)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+                if !renewed {
+                    break;
+                }
+            }
+        });
+        Ok(RuntimeLeaseGuard {
+            store: self.store.clone(),
+            lease_key,
+            kind: kind.to_string(),
+            owner_id,
+            heartbeat: Some(heartbeat),
+        })
     }
 
     /// Acquire the cross-process lease for a session run. The database row is
@@ -3244,6 +3345,67 @@ impl Engine {
             tokio::task::spawn_blocking(move || store.recover_state()).await??;
         for event in events {
             let _ = self.events.send(event);
+        }
+        // A crash may land after `git merge` but before the queue status is
+        // finalized. If the session worktree is clean, reset it to the
+        // recorded pre-merge HEAD so retry starts from a known state.
+        let recovery_store = self.store.clone();
+        let recoveries =
+            tokio::task::spawn_blocking(move || recovery_store.interrupted_merge_recoveries())
+                .await??;
+        let git_lock = self.git_lock.clone();
+        for entry in recoveries {
+            let Some(pre_merge) = entry.pre_merge_commit.clone() else {
+                continue;
+            };
+            let session_store = self.store.clone();
+            let session_id = entry.session_id.clone();
+            let session =
+                tokio::task::spawn_blocking(move || session_store.get_session(&session_id))
+                    .await??;
+            let Some(session) = session else {
+                continue;
+            };
+            let Some(worktree_path) = session.worktree.clone() else {
+                continue;
+            };
+            let path = PathBuf::from(worktree_path);
+            let reset = {
+                let git_lock = git_lock.clone();
+                let path = path.clone();
+                let pre_merge = pre_merge.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let _guard = git_lock
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+                    if !worktree::is_clean(&path)? {
+                        anyhow::bail!("session worktree is not clean");
+                    }
+                    worktree::reset_hard(&path, &pre_merge)
+                })
+                .await?
+            };
+            let (kind, payload) = match reset {
+                Ok(()) => (
+                    "merge_queue.recovered",
+                    serde_json::json!({
+                        "entry_id": entry.id,
+                        "pre_merge_commit": pre_merge,
+                        "detail": "reset clean session worktree to the pre-merge HEAD",
+                    }),
+                ),
+                Err(error) => (
+                    "merge_queue.recovery_skipped",
+                    serde_json::json!({
+                        "entry_id": entry.id,
+                        "pre_merge_commit": pre_merge,
+                        "detail": format!("{error:#}"),
+                    }),
+                ),
+            };
+            if let Err(error) = self.append_event(&session.id, kind, payload).await {
+                tracing::warn!(%error, entry_id = %entry.id, "failed to record merge recovery");
+            }
         }
         Ok(sessions.len())
     }
@@ -6778,6 +6940,18 @@ impl Engine {
         .await??;
         let _ = self.events.send(event);
         Ok(entry)
+    }
+
+    pub async fn begin_merge_queue_entry(
+        &self,
+        id: &str,
+        pre_merge_commit: &str,
+    ) -> Result<Option<MergeQueueEntry>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let pre_merge_commit = pre_merge_commit.to_string();
+        tokio::task::spawn_blocking(move || store.begin_merge_queue_entry(&id, &pre_merge_commit))
+            .await?
     }
 
     pub async fn update_merge_queue_entry(

@@ -40,11 +40,12 @@
 - `runtime_leases`（lease_key/owner/kind/session/heartbeat/expiry）跨进程 SQLite 租约。
 - Leader prompt run 和 plan-run（scheduler/resume）都获取 `session:{id}` 租约（TTL 180s，TTL/3 心跳）；释放写 `session.lease.released`，崩溃后 TTL 过期可接管。
 - `runtime.leases` / `runtime.leases.sweep` / `vp leases` / `vp leases-sweep` / Manage Dash Runtime leases 卡片。
+- 集成阶段额外持有 `integration:{session}` 租约；`process_merge_entry` 在 merge 前记录 `pre_merge_commit`，daemon 重启时对 clean worktree 自动 reset 到该 commit（`merge_queue.recovered`），dirty worktree 只记录 `recovery_skipped`，不覆盖用户改动。Live E2E 已确认 merge queue 返回非空 `pre_merge_commit`，merge 后 `runtime.leases` 清空。
 - 现有 data-dir 实例锁仍保留；租约不冒充分布式 fencing。
 
 ### 测试与验证
 
-- Rust：新增 orchestration 纯函数/控制器测试、store 投影测试、Engine 控制循环/preview/overview/lease/revision/replay-repair 测试；总计 356 active（core 285，protocol 2，store 55，providers 14；3 ignored live）。
+- Rust：新增 orchestration 纯函数/控制器测试、store 投影测试、Engine 控制循环/preview/overview/lease/revision/replay-repair 测试；总计 358 active（core 286，protocol 2，store 56，providers 14；3 ignored live）。
 - Swift：新增 snapshot/preview/lease/overview/revision 解码、graph orchestration 状态、policy、task filter 测试；总计 104。
 - Live DeepSeek E2E（2026-11-09）：provider probe 成功；单 Leader 写文件成功；真 TeamPlan（1 Manager + 2 Workers + 2 Verifiers）并行完成 T1/T2，两个 commit 经 Verifier 后进入 merge queue 并以 `--diff-check` 合并到 session branch；`orchestration.preview` 对完成 session 返回空动作；对 completed task 的 `task_edit` 被安全拒绝；`coordination.note` blocker/unblock、mailbox、`team_plan.restore`、`replay`/`repair` 均实测通过。
 
@@ -157,7 +158,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：356 个测试通过（core 285、protocol 2、store 55、providers 14）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `cargo test --workspace`：358 个测试通过（core 286、protocol 2、store 56、providers 14）；另有 3 个 env-gated live provider tests 默认 ignored。
 - `xcodebuild test`：94 个 Swift 测试通过（含协议向后兼容解码、diff parser、transcript/collab、Rail session grouping 与 design-system invariants）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
