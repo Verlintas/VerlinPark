@@ -172,6 +172,10 @@ final class AppModel {
     var taskQueue: TaskQueueResult?
     var taskQueueBusy = false
     var taskQueueStatus: String?
+    /// Task rows for the selected session. Collab uses these for authoritative
+    /// status, attempts, dependencies, and failure reasons.
+    var scheduledSessionTasks: [SchedulerTask] = []
+    var scheduledSessionTasksSessionID: String?
     var taskActionBusyID: String?
     var taskActionStatus: String?
     var taskSchedulerPolicy = TaskSchedulerPolicy.disabled
@@ -242,7 +246,11 @@ final class AppModel {
     var orgWorkers = 6
     var orgLabour = 12
     var autoExpandWorkers = false
-    var providerAPIKey = Keychain.read(account: "provider.apiKey") ?? ""
+    /// Newly typed secret. Stored secrets are read lazily so launching the app
+    /// with a local provider never opens a Keychain password dialog.
+    var providerAPIKey = ""
+    var providerHasStoredKey =
+        UserDefaults.standard.bool(forKey: "provider.hasAPIKey")
     var approvalMode = AgentApprovalMode.stored
     var providerStatus: String?
     var providerBusy = false
@@ -545,6 +553,8 @@ final class AppModel {
         todos = []
         agents = []
         mergeQueue = []
+        scheduledSessionTasks = []
+        scheduledSessionTasksSessionID = nil
         mailbox = []
         artifacts = []
         usageLedger = nil
@@ -582,6 +592,8 @@ final class AppModel {
         projectUsageStatus = nil
         memories = []
         taskQueue = nil
+        scheduledSessionTasks = []
+        scheduledSessionTasksSessionID = nil
         gitCommits = []
         gitBranch = nil
         gitBaseCommit = nil
@@ -676,6 +688,7 @@ final class AppModel {
             await loadTodos()
             await loadAgents()
             await loadMergeQueue()
+            await loadScheduledSessionTasks()
             await loadMailbox()
             await loadTeamPlan()
             await loadQuestions()
@@ -2390,12 +2403,13 @@ final class AppModel {
         defer { providerBusy = false }
         do {
             let caps = orgCaps
+            let apiKey = resolvedProviderAPIKey()
             let info = try await core.configureAgent(
                 kind: providerKind,
                 baseURL: baseURL,
                 model: model,
                 roleModels: roleModels,
-                apiKey: providerAPIKey,
+                apiKey: apiKey,
                 maxManagers: caps.managers,
                 maxWorkers: caps.workers,
                 maxLabour: caps.labour,
@@ -2417,16 +2431,42 @@ final class AppModel {
             if let data = try? JSONEncoder().encode(roleModels) {
                 UserDefaults.standard.set(data, forKey: "provider.roleModels")
             }
-            if providerAPIKey.isEmpty {
-                Keychain.delete(account: "provider.apiKey")
-            } else {
+            if !providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 try Keychain.save(providerAPIKey, account: "provider.apiKey")
+                providerHasStoredKey = true
+                UserDefaults.standard.set(true, forKey: "provider.hasAPIKey")
+                providerAPIKey = ""
             }
             providerStatus = "Connected · \(model)"
             showToast("Provider connected", detail: model, kind: .success)
         } catch {
             providerStatus = error.localizedDescription
         }
+    }
+
+    private var providerNeedsAPIKey: Bool {
+        let lower = providerBaseURL.lowercased()
+        return !(lower.contains("127.0.0.1")
+            || lower.contains("localhost")
+            || lower.contains("[::1]")
+            || lower.contains("0.0.0.0"))
+    }
+
+    private func resolvedProviderAPIKey() -> String {
+        let typed = providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !typed.isEmpty {
+            return typed
+        }
+        guard providerHasStoredKey, providerNeedsAPIKey else { return "" }
+        return Keychain.read(account: "provider.apiKey") ?? ""
+    }
+
+    func clearStoredProviderKey() {
+        Keychain.delete(account: "provider.apiKey")
+        providerAPIKey = ""
+        providerHasStoredKey = false
+        UserDefaults.standard.set(false, forKey: "provider.hasAPIKey")
+        providerStatus = "Stored API key removed."
     }
 
     private func configureStoredProvider() async {
@@ -2440,7 +2480,7 @@ final class AppModel {
                 baseURL: baseURL,
                 model: model,
                 roleModels: roleModels,
-                apiKey: providerAPIKey,
+                apiKey: resolvedProviderAPIKey(),
                 maxManagers: caps.managers,
                 maxWorkers: caps.workers,
                 maxLabour: caps.labour,
@@ -2526,6 +2566,24 @@ final class AppModel {
             }
         } catch {
             // The event stream will retry on team_plan.submitted.
+        }
+    }
+
+    func loadScheduledSessionTasks() async {
+        guard let sessionID = selectedSessionID else {
+            scheduledSessionTasks = []
+            scheduledSessionTasksSessionID = nil
+            return
+        }
+        let generation = selectionGeneration
+        do {
+            let result = try await core.taskQueue(projectID: nil, sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            scheduledSessionTasks = result.tasks
+            scheduledSessionTasksSessionID = sessionID
+        } catch {
+            // Event-driven plan updates still keep the tree usable; the next
+            // plan or task event retries this snapshot.
         }
     }
 
@@ -3925,7 +3983,13 @@ final class AppModel {
         if event.sessionId == selectedSessionID {
             if event.type == "team_plan.submitted" {
                 planTaskStatuses = [:]
-                Task { await self.loadTeamPlan() }
+                Task {
+                    await self.loadTeamPlan()
+                    await self.loadScheduledSessionTasks()
+                }
+            }
+            if event.type.hasPrefix("plan_task.") {
+                Task { await self.loadScheduledSessionTasks() }
             }
             if let taskID = event.payload.objectValue?["task_id"]?.stringValue,
                let status = planTaskStatus(for: event)

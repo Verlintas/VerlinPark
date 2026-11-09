@@ -2249,6 +2249,8 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
     let title: String?
     let profile: String?
     let parentId: String?
+    let taskId: String?
+    let department: String?
     let worktree: String?
     let branch: String?
     let status: String
@@ -2263,6 +2265,8 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
         case title
         case profile
         case parentId = "parent_id"
+        case taskId = "task_id"
+        case department
         case worktree
         case branch
         case status

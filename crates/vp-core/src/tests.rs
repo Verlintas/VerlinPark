@@ -2640,6 +2640,15 @@ async fn replay_checks_critical_projections() {
     assert!(repaired.consistent, "{:?}", repaired.mismatches);
     let agents = engine.list_agents(&session.id).await.unwrap();
     assert_eq!(agents[0].status, "running");
+    engine
+        .set_agent_task(&agent.id, Some("T1".into()), Some("impl".into()))
+        .await
+        .unwrap();
+    let agents = engine.list_agents(&session.id).await.unwrap();
+    assert_eq!(agents[0].task_id.as_deref(), Some("T1"));
+    assert_eq!(agents[0].department.as_deref(), Some("impl"));
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
 
     engine
         .send_agent_message(
@@ -2806,6 +2815,8 @@ async fn replay_checks_critical_projections() {
     assert!(imported_sessions[0].worktree.is_none());
     let imported_agents = imported_engine.list_agents(&session.id).await.unwrap();
     assert_eq!(imported_agents.len(), 1);
+    assert_eq!(imported_agents[0].task_id.as_deref(), Some("T1"));
+    assert_eq!(imported_agents[0].department.as_deref(), Some("impl"));
     let imported_messages = imported_engine.list_messages(&session.id).await.unwrap();
     assert_eq!(imported_messages.len(), 1);
     let imported_tasks = imported_engine

@@ -129,6 +129,7 @@
 | [0117](adr/0117-runtime-localization.md) | Runtime English / Simplified Chinese localization | Accepted | UI/Localization |
 | [0118](adr/0118-workspace-shell-and-command-inbox.md) | Workspace shell, command ranking, and notification inbox | Accepted | UI/State |
 | [0119](adr/0119-risk-based-approval-and-transcript.md) | Risk-based approval, compact transcript, orchestration-only Collab | Accepted | Security/UI |
+| [0120](adr/0120-dynamic-team-graph.md) | Dynamic team graph, task ownership, and coordination notes for Collab | Accepted | UI/Orchestration |
 
 ---
 

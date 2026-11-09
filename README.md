@@ -57,7 +57,7 @@ The UI can inspect a session and show exactly why a change was proposed. `vp rep
 ### 3. Open Bench — native, local-first, and extensible
 
 - Native SwiftUI/AppKit UI, not a web app in a shell.
-- Glass Park shell: project rail, chat stage, Collab/Preview studio, Manage Dash.
+- Glass Park shell: project rail, chat stage, live team graph (Collab), Preview studio, Manage Dash.
 - Knockout wordmark: solid, gradient, or a region/pride flag showing through the letters; 248 regions and 20 pride flags.
 - A Rust core daemon that can run headless and be driven by a CLI.
 - Cloud APIs first; any OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp) works as a local provider.

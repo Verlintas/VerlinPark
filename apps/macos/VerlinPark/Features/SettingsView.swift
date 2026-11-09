@@ -903,13 +903,29 @@ struct ProvidersSettingsView: View {
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                SecureField("API key", text: $model.providerAPIKey)
-                    .textFieldStyle(.plain).vpFrostedField()
+                SecureField(
+                    model.providerHasStoredKey
+                        ? "Replace stored API key"
+                        : "API key",
+                    text: $model.providerAPIKey
+                )
+                .textFieldStyle(.plain).vpFrostedField()
                 Text(
-                    "The key is stored in Keychain and sent only to the local daemon. It is never written to SQLite or logs."
+                    L10n.t(
+                        model.providerHasStoredKey
+                            ? "A key is stored in Keychain. It is read only for remote providers; local endpoints never trigger a Keychain prompt. Leave this empty to keep the stored key."
+                            : "The key is stored in Keychain and sent only to the local daemon. It is never written to SQLite or logs."
+                    )
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                if model.providerHasStoredKey {
+                    Button(L10n.t("Remove stored key")) {
+                        model.clearStoredProviderKey()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
                 HStack {
                     Button("Save & Connect") {
                         Task { await model.saveProviderSettings() }

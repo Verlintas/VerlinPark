@@ -3706,6 +3706,105 @@ async fn mailbox_tools_send_read_and_publish() {
     assert!(artifacts.content.contains("worker-notes.md"));
 }
 
+#[tokio::test]
+async fn coordination_tool_records_blockers_and_team_status_reads_the_board() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "coordinate".into(), None)
+        .await
+        .unwrap();
+    let leader = engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().unwrap_or_default());
+    let branch = session.branch.clone().unwrap_or_default();
+    let spec = AgentSpec {
+        id: leader.clone(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: worktree.clone(),
+        branch: branch.clone(),
+        session_worktree: worktree,
+        session_branch: branch,
+        write_scope: Vec::new(),
+        base_commit: session.base_commit.clone().unwrap_or_default(),
+    };
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "coordinate",
+        "departments": [{
+            "name": "Platform",
+            "manager_title": "Platform",
+            "profile": "coding",
+            "objective": "build"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "department": "Platform",
+            "title": "Build the bridge",
+            "kind": "coding",
+            "deps": [],
+            "acceptance": ["done"]
+        }]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+
+    let output = run_coordination_tool(
+        &engine,
+        &session,
+        &spec,
+        serde_json::json!({
+            "action": "blocker",
+            "task_id": "T1",
+            "message": "waiting for the API schema",
+            "severity": "warning"
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!output.is_error, "{}", output.content);
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "coordination.note"
+            && event.payload["action"] == "blocker"
+            && event.payload["task_id"] == "T1"
+            && event.payload["agent_id"] == leader
+    }));
+
+    let listed = run_coordination_tool(
+        &engine,
+        &session,
+        &spec,
+        serde_json::json!({"action": "list"}),
+    )
+    .await
+    .unwrap();
+    assert!(listed.content.contains("waiting for the API schema"));
+
+    let status = run_team_status(&engine, &session, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(!status.is_error, "{}", status.content);
+    assert!(status.content.contains("Tasks: 0/1 complete"));
+    assert!(status.content.contains("Ready: T1"));
+    assert!(status.content.contains("Recent coordination"));
+    assert!(status.content.contains("waiting for the API schema"));
+}
+
 #[test]
 fn shell_secret_roots_cover_database_sidecars_and_artifacts() {
     let data = TempDir::new().unwrap();

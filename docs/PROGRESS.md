@@ -70,8 +70,8 @@
 
 ## 验证
 
-- `cargo test --workspace`：316 个测试通过（core 256、protocol 2、store 44、providers 14）；另有 3 个 env-gated live provider tests 默认 ignored。
-- `xcodebuild test`：89 个 Swift 测试通过（含协议向后兼容解码、diff parser、transcript/collab、Rail session grouping 与 design-system invariants）。
+- `cargo test --workspace`：318 个测试通过（core 257、protocol 2、store 45、providers 14）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `xcodebuild test`：94 个 Swift 测试通过（含协议向后兼容解码、diff parser、transcript/collab、Rail session grouping 与 design-system invariants）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。
 - 最近 CI：GitHub hosted macOS runner 持续排队/容量受限；本地 lint、Rust/Swift 测试与打包通过。
@@ -289,3 +289,5 @@ just cli session-new <project-id> "Your goal"
 - `agent.rs` 与 `AppModel.swift` 仍然偏大，需要拆分（见 `docs/AUDIT.md`）。
 
 - **M3 第一百二十五切片**：全量审查修复与优化收口（2,000+ 行审计修复）。新增 `docs/audit/2026-11-09-findings.md`/`.csv`：116 个原始 finding 合并为 65 条，50 Fixed / 10 Partial / 5 Deferred。修复 P0 Git worktree `.git`/common-ref sandbox 逃逸与 TeamPlan task-id 目录碰撞；Integrator 改为 merge 精确 verified commit、clean/base 检查与 Git 锁；retry 重新 Verifier；MCP call 升为 HostState 且 Manager/Verifier 只读；shell classifier 补 keyword/expansion/git -C/php -r/>|；secret roots 覆盖 DB sidecar/artifacts/manifest；recovery 事件可 replay；event mirror 串行排序；db-rebuild 恢复 cost/token、加 daemon lock 与失败回滚；bundle import 校验 path traversal/cross-session；provider EOF/error/JSON/非 SSE/超时/partial usage/tool-id/redaction；shell/read_file/grep/integration output 有界，integration command 进入 Seatbelt；auto-approved Worker 也取 write lease；UI event 分页、selection generation、delta 不进历史、approval live/pending、event disconnect/timeout、自动重连退避、workspace draft 跨视图保留、ACP env 编辑器、ACP/New Session/composer 成功后才清空、Rail 重试、terminal 2MB cap、idle console/terminal sweep、atomic plan_task claim event、item-specific stale guards、numeric validation、Collab skipped 计入完成、org preset 绑定真实配置、auth protocol negotiation。
+
+- **M3 第一百二十六切片**：Collab 动态团队树 + 协调工具。新增 `CollabGraphModel`/`CollabGraphView`：基于 `AgentRecord.parent_id`、TeamPlan、task.queue、事件窗口和 merge queue 的纯投影，左到右 Leader→Manager→Worker→Verifier/Labour 树，递归布局、Bezier 连线、运行状态高亮、实时 tool/任务活动、计划中的 Manager/Task 虚线节点、完成 ghost 隐藏、多 Leader 崩溃容错、55% 可读缩放 + pan/zoom/fit + 宽屏 sheet、节点详情 inspector；`AgentRecord` 增加可选 `task_id`/`department`（additive schema、agent.updated、replay/bundle 兼容），plan Worker/Manager/Verifier/Labour/resolver 自动写入；新增 `coordinate`（note/blocker/unblock/handoff/escalate/decision/list）与只读 `team_status` 工具，coordination.note 进入节点活动和团队状态；plan Worker objective 注入上游 handoff 结果与最近协调记录，失败依赖的 blocked reason 精确到具体 task/status；Keychain API key 改为按需读取，本地 provider 启动不再触发钥匙串提示；Rust 318 / Swift 94。

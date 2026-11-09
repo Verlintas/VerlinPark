@@ -1486,6 +1486,34 @@ fn persists_task_queue_claims_and_completions() {
 }
 
 #[test]
+fn agent_task_assignment_is_persisted_in_the_projection_and_event() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("agents"))
+        .unwrap();
+    let session = store.create_session(&project.id, "task mapping").unwrap();
+    let agent = store
+        .create_agent(
+            &session.id,
+            "worker",
+            "Layout worker",
+            None,
+            None,
+            "test-model",
+        )
+        .unwrap();
+    let event = store
+        .set_agent_task_with_event(&agent.id, Some("T3"), Some("Platform"))
+        .unwrap();
+    assert_eq!(event.kind, "agent.updated");
+    assert_eq!(event.payload["agent"]["task_id"], "T3");
+    assert_eq!(event.payload["agent"]["department"], "Platform");
+    let stored = store.list_agents(&session.id).unwrap();
+    assert_eq!(stored[0].task_id.as_deref(), Some("T3"));
+    assert_eq!(stored[0].department.as_deref(), Some("Platform"));
+}
+
+#[test]
 fn concurrent_event_appends_keep_the_mirror_ordered() {
     let (_data, store, repo) = test_store();
     let project = store

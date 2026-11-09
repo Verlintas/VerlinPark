@@ -25,7 +25,7 @@ Current totals: 50 Fixed, 10 Partial, 5 Deferred.
 
 ## Verification at close
 
-- `cargo test --workspace`: 316 active Rust tests, 3 ignored live provider tests.
-- `xcodebuild test`: 89 Swift tests.
+- `cargo test --workspace`: 318 active Rust tests, 3 ignored live provider tests.
+- `xcodebuild test`: 94 Swift tests.
 - `just lint`: `cargo fmt`, `clippy -D warnings`, `swiftformat --lint`.
 - Live daemon checks used during the audit: JSON-RPC auth/health, oversized request body, imported path traversal, and missing-approval resolution. Each defect found this way has a regression test.

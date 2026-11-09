@@ -2598,6 +2598,12 @@ pub struct AgentRecord {
     #[serde(default)]
     pub title: Option<String>,
     pub parent_id: Option<String>,
+    /// Plan task this agent is currently responsible for, when applicable.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Plan department this agent belongs to, when applicable.
+    #[serde(default)]
+    pub department: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]

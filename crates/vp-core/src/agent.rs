@@ -2234,6 +2234,13 @@ impl AgentService {
             )
             .await?;
         self.engine
+            .set_agent_task(
+                &resolver.id,
+                worker.task_id.clone(),
+                worker.department.clone(),
+            )
+            .await?;
+        self.engine
             .set_agent_worktree(
                 &resolver.id,
                 &worker_worktree.to_string_lossy(),
@@ -4740,6 +4747,13 @@ async fn verify_worker(
         .await?;
     engine
         .set_agent_profile(&verifier.id, AgentProfile::Verification.as_str())
+        .await?;
+    engine
+        .set_agent_task(
+            &verifier.id,
+            worker_spec.task_id.clone(),
+            worker_spec.department.clone(),
+        )
         .await?;
     let verifier_spec = AgentSpec {
         id: verifier.id.clone(),
@@ -7445,6 +7459,8 @@ async fn run_loop(
             let is_memory_tool = matches!(call.name.as_str(), "remember" | "recall");
             let is_question_tool = call.name == "ask_user" && spec.role != AgentRole::Verifier;
             let is_mcp_tool = call.name == "mcp";
+            let is_coordination_tool = call.name == "coordinate";
+            let is_team_status = call.name == "team_status";
             let dynamic_mcp_tool = dynamic_mcp_tools
                 .iter()
                 .find(|binding| binding.exposed_name == call.name);
@@ -7632,6 +7648,40 @@ async fn run_loop(
                         ToolOutput::ok(summary)
                     }
                     Err(error) => ToolOutput::error(error.to_string()),
+                }
+            } else if is_coordination_tool {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_coordination_tool(engine, session, spec, input.clone()).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("coordination error: {error}")),
+                }
+            } else if is_team_status {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_team_status(engine, session, input.clone()).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("team status error: {error}")),
                 }
             } else if is_mailbox_tool {
                 emit(
@@ -7917,6 +7967,15 @@ async fn run_loop(
                                         &child.id,
                                         &child_worktree.to_string_lossy(),
                                         &child_branch,
+                                    )
+                                    .await?;
+                                engine
+                                    .set_agent_task(
+                                        &child.id,
+                                        (role == AgentRole::Labour)
+                                            .then(|| spec.task_id.clone())
+                                            .flatten(),
+                                        spec.department.clone(),
                                     )
                                     .await?;
                                 let child_spec = AgentSpec {
@@ -8317,6 +8376,364 @@ fn format_mcp_tool_result(result: &serde_json::Value) -> String {
         text = serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string());
     }
     truncate_to(&text, 16_000)
+}
+
+async fn run_coordination_tool(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    input: serde_json::Value,
+) -> Result<ToolOutput> {
+    if spec.role == AgentRole::Verifier {
+        return Ok(ToolOutput::error(
+            "the Verifier records evidence through submit_verdict, not coordination notes",
+        ));
+    }
+    let action = input
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("action is required"))?;
+    if !matches!(
+        action,
+        "note" | "blocker" | "unblock" | "handoff" | "escalate" | "decision" | "list"
+    ) {
+        return Ok(ToolOutput::error(format!(
+            "unsupported coordination action: {action}"
+        )));
+    }
+    if action == "list" {
+        let limit = input
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 50) as usize;
+        let notes = recent_coordination_notes(engine, &session.id, limit).await?;
+        if notes.is_empty() {
+            return Ok(ToolOutput::ok("No coordination notes yet."));
+        }
+        return Ok(ToolOutput::ok(
+            notes
+                .iter()
+                .map(format_coordination_event)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+    if matches!(action, "unblock" | "decision")
+        && !matches!(spec.role, AgentRole::Leader | AgentRole::Manager)
+    {
+        return Ok(ToolOutput::error(format!(
+            "only a Leader or Manager may record a coordination {action}"
+        )));
+    }
+    let message = input
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .ok_or_else(|| anyhow!("message is required"))?;
+    if message.chars().count() > 2_000 {
+        return Ok(ToolOutput::error(
+            "coordination message is limited to 2000 chars",
+        ));
+    }
+    let task_id = input
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|task_id| !task_id.is_empty())
+        .map(str::to_string);
+    if let Some(task_id) = &task_id {
+        worktree::validate_task_id(task_id)?;
+    }
+    let target_agent_id = input
+        .get("target_agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(str::to_string);
+    if let Some(target) = &target_agent_id {
+        let agents = engine.list_agents(&session.id).await?;
+        if !agents.iter().any(|agent| &agent.id == target) {
+            return Ok(ToolOutput::error(format!(
+                "target agent is not in this session: {target}"
+            )));
+        }
+    }
+    let severity = input
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(if matches!(action, "blocker" | "escalate") {
+            "warning"
+        } else {
+            "info"
+        });
+    if !matches!(severity, "info" | "warning" | "critical") {
+        return Ok(ToolOutput::error(
+            "severity must be info, warning, or critical",
+        ));
+    }
+    let note_id = uuid::Uuid::now_v7().to_string();
+    let payload = serde_json::json!({
+        "note_id": note_id,
+        "action": action,
+        "task_id": task_id,
+        "target_agent_id": target_agent_id,
+        "message": message,
+        "severity": severity,
+    });
+    emit(engine, &session.id, spec, "coordination.note", payload).await?;
+    let scope = task_id
+        .as_deref()
+        .map(|task_id| format!(" for {task_id}"))
+        .unwrap_or_default();
+    Ok(ToolOutput::ok(format!(
+        "recorded {} coordination{scope}: {}",
+        action,
+        truncate_to(message, 240)
+    )))
+}
+
+/// Recent coordination events in ascending order, optionally bounded.
+async fn recent_coordination_notes(
+    engine: &Engine,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<vp_protocol::types::Event>> {
+    let events = engine.recent_events(session_id, 1_000).await?;
+    let mut notes = events
+        .into_iter()
+        .filter(|event| event.kind == "coordination.note")
+        .collect::<Vec<_>>();
+    if notes.len() > limit {
+        notes = notes.split_off(notes.len() - limit);
+    }
+    Ok(notes)
+}
+
+fn format_coordination_event(event: &vp_protocol::types::Event) -> String {
+    let action = event
+        .payload
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("note");
+    let severity = event
+        .payload
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info");
+    let agent = event
+        .payload
+        .get("agent_name")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            event
+                .payload
+                .get("agent_role")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("agent");
+    let task = event
+        .payload
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .map(|task| format!(" · {task}"))
+        .unwrap_or_default();
+    let message = event
+        .payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    format!(
+        "[{severity}] {action} · {agent}{task} · {}",
+        truncate_to(message, 300)
+    )
+}
+
+async fn run_team_status(
+    engine: &Engine,
+    session: &Session,
+    input: serde_json::Value,
+) -> Result<ToolOutput> {
+    let note_limit = input
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(8)
+        .clamp(1, 50) as usize;
+    let plan = engine.get_team_plan(&session.id).await?;
+    let agents = engine.list_agents(&session.id).await?;
+    let queue = engine.task_queue(None, Some(session.id.clone())).await?;
+    let merge = engine.list_merge_queue(&session.id).await?;
+    let questions = engine
+        .list_questions(Some(session.id.clone()))
+        .await?
+        .questions;
+    let recent = engine.recent_events(&session.id, 1_000).await?;
+
+    let plan_tasks = plan
+        .as_ref()
+        .map(|plan| plan.tasks.as_slice())
+        .unwrap_or(&[]);
+    let scheduled = queue
+        .tasks
+        .iter()
+        .map(|task| (task.task_id.clone(), task))
+        .collect::<HashMap<_, _>>();
+    let mut statuses = HashMap::<String, String>::new();
+    for task in plan_tasks {
+        statuses.insert(
+            task.id.clone(),
+            scheduled
+                .get(&task.id)
+                .map(|task| task.status.clone())
+                .unwrap_or_else(|| "pending".to_string()),
+        );
+    }
+    for event in &recent {
+        if let Some(task_id) = event
+            .payload
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            && event.kind.starts_with("plan_task.")
+            && let Some(status) = event
+                .payload
+                .get("task_status")
+                .and_then(serde_json::Value::as_str)
+        {
+            statuses.insert(task_id.to_string(), status.to_string());
+        }
+    }
+    let completed = plan_tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                statuses.get(&task.id).map(String::as_str),
+                Some("completed" | "skipped")
+            )
+        })
+        .count();
+    let active = plan_tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                statuses.get(&task.id).map(String::as_str),
+                Some("running" | "queued" | "paused" | "pausing" | "cancelling")
+            )
+        })
+        .count();
+    let ready = plan_tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                statuses.get(&task.id).map(String::as_str),
+                Some("pending" | "interrupted" | "failed" | "cancelled")
+            ) && task.deps.iter().all(|dep| {
+                matches!(
+                    statuses.get(dep).map(String::as_str),
+                    Some("completed" | "skipped")
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let failed_tasks = plan_tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                statuses.get(&task.id).map(String::as_str),
+                Some("failed" | "blocked")
+            )
+        })
+        .collect::<Vec<_>>();
+    let role_count = |role: &str| agents.iter().filter(|agent| agent.role == role).count();
+    let running = agents
+        .iter()
+        .filter(|agent| agent.status == "running")
+        .count();
+    let conflicts = merge
+        .iter()
+        .filter(|entry| entry.status == "conflict")
+        .count();
+    let pending_questions = questions
+        .iter()
+        .filter(|question| question.status == "pending")
+        .count();
+    let notes = recent
+        .iter()
+        .rev()
+        .filter(|event| event.kind == "coordination.note")
+        .take(note_limit)
+        .collect::<Vec<_>>();
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Team status · session {} · {}",
+        session.status, session.goal
+    ));
+    lines.push(format!(
+        "Agents: {} leader · {} managers · {} workers ({} running) · {} verifiers · {} labour",
+        role_count("leader"),
+        role_count("manager"),
+        role_count("worker"),
+        running,
+        role_count("verifier"),
+        role_count("labour")
+    ));
+    if plan.is_some() {
+        lines.push(format!(
+            "Tasks: {completed}/{} complete · {active} active · {} failed/blocked · {} ready",
+            plan_tasks.len(),
+            failed_tasks.len(),
+            ready.len()
+        ));
+        if !ready.is_empty() {
+            lines.push(format!(
+                "Ready: {}",
+                ready
+                    .iter()
+                    .take(8)
+                    .map(|task| format!("{} ({})", task.id, task.department))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !failed_tasks.is_empty() {
+            lines.push("Blocked/failed tasks:".to_string());
+            for task in failed_tasks.iter().take(8) {
+                let detail = scheduled
+                    .get(&task.id)
+                    .and_then(|task| task.last_error.as_deref())
+                    .unwrap_or("no detail");
+                lines.push(format!(
+                    "- {} [{}] {}",
+                    task.id,
+                    statuses
+                        .get(&task.id)
+                        .map(String::as_str)
+                        .unwrap_or("unknown"),
+                    truncate_to(detail, 180)
+                ));
+            }
+        }
+    } else {
+        lines.push("No TeamPlan submitted.".to_string());
+    }
+    if !merge.is_empty() {
+        lines.push(format!(
+            "Merge queue: {} entries · {} conflicts",
+            merge.len(),
+            conflicts
+        ));
+    }
+    if pending_questions > 0 {
+        lines.push(format!("User questions waiting: {pending_questions}"));
+    }
+    if !notes.is_empty() {
+        lines.push("Recent coordination:".to_string());
+        for note in notes.into_iter().rev() {
+            lines.push(format!("- {}", format_coordination_event(note)));
+        }
+    }
+    Ok(ToolOutput::ok(lines.join("\n")))
 }
 
 async fn run_mcp_tool(
@@ -8969,6 +9386,40 @@ fn tool_schemas(
             }),
         });
     }
+    if role != AgentRole::Verifier {
+        tools.push(ToolSchema {
+            name: "coordinate".to_string(),
+            description: "Collaborate with the team: record a note, raise or clear a blocker, announce a handoff, escalate to the Leader, record a Manager decision, or list recent coordination notes.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["note", "blocker", "unblock", "handoff", "escalate", "decision", "list"]
+                    },
+                    "task_id": {"type": "string", "maxLength": 40},
+                    "target_agent_id": {"type": "string"},
+                    "message": {"type": "string", "maxLength": 2000},
+                    "severity": {
+                        "type": "string",
+                        "enum": ["info", "warning", "critical"]
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+                },
+                "required": ["action"]
+            }),
+        });
+    }
+    tools.push(ToolSchema {
+        name: "team_status".to_string(),
+        description: "Read the current team board: agents by role, task progress, ready/blocked tasks, merge queue, and recent coordination notes. Read-only.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+            }
+        }),
+    });
     let mcp_actions = if matches!(role, AgentRole::Manager | AgentRole::Verifier) {
         serde_json::json!([
             "list",
@@ -10161,6 +10612,80 @@ async fn emit_plan_task_finished(
     emit(engine, session_id, spec, "plan_task.finished", payload).await
 }
 
+async fn latest_plan_results(engine: &Engine, session_id: &str) -> Result<HashMap<String, String>> {
+    let events = engine.recent_events(session_id, 1_000).await?;
+    let mut results = HashMap::new();
+    for event in events {
+        if event.kind != "plan_task.finished" {
+            continue;
+        }
+        let Some(task_id) = event
+            .payload
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let status = event
+            .payload
+            .get("task_status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let detail = event
+            .payload
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("");
+        results.insert(
+            task_id.to_string(),
+            if detail.is_empty() {
+                status.to_string()
+            } else {
+                format!("{status} · {}", truncate_to(detail, 500))
+            },
+        );
+    }
+    Ok(results)
+}
+
+async fn coordination_brief(engine: &Engine, session_id: &str, limit: usize) -> Result<String> {
+    let notes = recent_coordination_notes(engine, session_id, limit).await?;
+    Ok(notes
+        .iter()
+        .map(format_coordination_event)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn task_dependency_brief(
+    task: &PlanTask,
+    statuses: &HashMap<String, String>,
+    results: &HashMap<String, String>,
+) -> String {
+    if task.deps.is_empty() {
+        return "No upstream dependencies.".to_string();
+    }
+    task.deps
+        .iter()
+        .take(8)
+        .map(|dep| {
+            let status = statuses.get(dep).map(String::as_str).unwrap_or("pending");
+            let result = results
+                .get(dep)
+                .map(String::as_str)
+                .unwrap_or("no completed result yet");
+            format!("- {dep} [{status}] {result}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn record_scheduled_task_finish(
     engine: &Engine,
     session_id: &str,
@@ -10216,6 +10741,9 @@ async fn ensure_plan_manager(
             engine
                 .set_agent_profile(&agent.id, profile.as_str())
                 .await?;
+            engine
+                .set_agent_task(&agent.id, None, Some(department.name.clone()))
+                .await?;
             engine.update_agent_status(&agent.id, "idle").await?;
             agent
         }
@@ -10235,6 +10763,9 @@ async fn ensure_plan_manager(
                 .await?;
             engine
                 .set_agent_profile(&agent.id, profile.as_str())
+                .await?;
+            engine
+                .set_agent_task(&agent.id, None, Some(department.name.clone()))
                 .await?;
             engine.update_agent_status(&agent.id, "idle").await?;
             agent
@@ -10458,6 +10989,28 @@ async fn execute_team_plan(
         if ready.is_empty() {
             for task in &remaining {
                 statuses.insert(task.id.clone(), "blocked".to_string());
+                let unmet = task
+                    .deps
+                    .iter()
+                    .filter(|dep| {
+                        !matches!(
+                            statuses.get(*dep).map(String::as_str),
+                            Some("completed" | "skipped")
+                        )
+                    })
+                    .map(|dep| {
+                        format!(
+                            "{} ({})",
+                            dep,
+                            statuses.get(dep).map(String::as_str).unwrap_or("pending")
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let reason = if unmet.is_empty() {
+                    "dependency not completed".to_string()
+                } else {
+                    format!("waiting on {}", unmet.join(", "))
+                };
                 emit(
                     engine,
                     &session.id,
@@ -10466,7 +11019,7 @@ async fn execute_team_plan(
                     serde_json::json!({
                         "task_id": task.id,
                         "task_status": "blocked",
-                        "reason": "dependency not completed",
+                        "reason": reason,
                     }),
                 )
                 .await?;
@@ -10476,7 +11029,7 @@ async fn execute_team_plan(
                     plan_seq,
                     &task.id,
                     "blocked",
-                    Some("dependency not completed"),
+                    Some(&reason),
                 )
                 .await?;
             }
@@ -10555,6 +11108,8 @@ async fn execute_team_plan(
 
         let mut prepared = Vec::new();
         let mut worker_slots = Vec::new();
+        let plan_results = latest_plan_results(engine, &session.id).await?;
+        let coordination = coordination_brief(engine, &session.id, 5).await?;
         for task in &batch {
             let manager_spec = if let Some(spec) = manager_specs.get(&task.department) {
                 spec.clone()
@@ -10594,6 +11149,13 @@ async fn execute_team_plan(
                 .await?;
             engine
                 .set_agent_profile(&worker.id, profile.as_str())
+                .await?;
+            engine
+                .set_agent_task(
+                    &worker.id,
+                    Some(task.id.clone()),
+                    Some(task.department.clone()),
+                )
                 .await?;
             let info = engine
                 .create_task_worktree(
@@ -10641,14 +11203,23 @@ async fn execute_team_plan(
             )
             .await?;
             statuses.insert(task.id.clone(), "running".to_string());
+            let dependency_brief = task_dependency_brief(task, &statuses, &plan_results);
+            let coordination_note = if coordination.is_empty() {
+                String::new()
+            } else {
+                format!("\nRecent team coordination:\n{coordination}")
+            };
             let objective = format!(
                 "Execute plan task {}: {}. Department: {} ({}). Acceptance: {}. \
+                 Upstream handoffs:\n{}\n{}\
                  Work only in your task worktree and return a concise summary.",
                 task.id,
                 task.title,
                 task.department,
                 manager_spec.title.as_deref().unwrap_or(&manager_spec.name),
-                acceptance
+                acceptance,
+                dependency_brief,
+                coordination_note
             );
             prepared.push((
                 task.clone(),
@@ -11096,7 +11667,9 @@ fn role_system_prompt(
              For a multi-department plan, call deliberate_team_plan first so Managers can \
              review peer positions and agree on handoffs; then call run_team_plan to execute. \
              Do not manually delegate the planned Managers unless you intentionally override \
-             the plan. \
+             the plan. Call team_status to inspect ready/blocked tasks and recent coordination. \
+             Use coordinate action=decision for cross-department choices, action=escalate when \
+             the user must decide, and action=unblock after resolving a reported blocker. \
              You can still inspect and edit files yourself for small tasks. \
              Review summaries, verify the final diff, and report the result.",
             spec.name
@@ -11105,11 +11678,14 @@ fn role_system_prompt(
             "{base}\n\
              You are the {} Manager, reporting to {}. Objective: {objective}. \
              You may read and search, but you must not edit files or run shell commands. \
-             Split the objective into focused Worker tasks. For independent tasks, use \
+             Call team_status before splitting work and after a Worker returns. Split the \
+             objective into focused Worker tasks. For independent tasks, use \
              delegate_many(tasks=[...]) with non-overlapping write_scope values so Workers \
-             run in parallel; otherwise use delegate(role=\"worker\"). Review the returned \
-             summaries, resolve gaps, then return a concise consolidated result. \
-             Do not delegate to Managers or Labour.",
+             run in parallel; otherwise use delegate(role=\"worker\"). Tell Workers to report \
+             blockers with coordinate action=blocker. Record handoffs and decisions with \
+             coordinate, and call coordinate action=unblock after resolving a blocker. \
+             Review the returned summaries, resolve gaps, then return a concise consolidated \
+             result. Do not delegate to Managers or Labour.",
             spec.title.as_deref().unwrap_or(spec.name.as_str()),
             spec.parent_name.as_deref().unwrap_or("the Leader")
         ),
@@ -11117,24 +11693,28 @@ fn role_system_prompt(
             "{base}\n\
              You are Worker {}, reporting to a Manager. Task: {objective}. \
              You own implementation in the worktree. Inspect first, make focused edits, \
-             and run tests. Delegate small research or verification subtasks to Labour with \
-             delegate(role=\"labour\") when useful. Return a concise summary with evidence. \
-             Do not delegate to Managers or Workers.",
+             and run tests. Use team_status to see upstream/blocked tasks before you start. \
+             Delegate small research or verification subtasks to Labour with \
+             delegate(role=\"labour\") when useful. If you cannot proceed, call coordinate \
+             action=blocker with the task id and a concrete reason; never silently stall. \
+             Record a final summary with coordinate action=note before returning. Include \
+             evidence in your result. Do not delegate to Managers or Workers.",
             spec.name
         ),
         AgentRole::Verifier => format!(
             "{base}\n\
              You are Verifier {}, reporting to a Manager. Task under review: {objective}. \
-             You are read-only: do not edit files. Inspect the task branch/diff and run \
-             relevant tests or checks with shell. Approve only when the changes meet the \
-             objective and evidence is sufficient. Then call submit_verdict with \
+             You are read-only: do not edit files. Use team_status for upstream context. \
+             Inspect the task branch/diff and run relevant tests or checks with shell. \
+             Approve only when the changes meet the objective and evidence is sufficient. Then call submit_verdict with \
              approved and summary. You cannot delegate.",
             spec.name
         ),
         AgentRole::Labour => format!(
             "{base}\n\
              You are Labour {}, reporting to a Worker. Subtask: {objective}. \
-             Execute it directly in the worktree and return a concise report. \
+             Execute it directly in the worktree and return a concise report. If you are \
+             blocked, use coordinate action=blocker with the task id and a concrete reason. \
              You cannot delegate to other agents.",
             spec.name
         ),

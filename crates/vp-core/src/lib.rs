@@ -1986,6 +1986,12 @@ impl Engine {
         Ok(())
     }
 
+    pub async fn recent_events(&self, session_id: &str, limit: u32) -> Result<Vec<Event>> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.recent_events(&id, limit)).await?
+    }
+
     pub async fn task_queue(
         &self,
         project_id: Option<String>,
@@ -5498,6 +5504,22 @@ impl Engine {
         let event =
             tokio::task::spawn_blocking(move || store.update_agent_status_with_event(&id, &status))
                 .await??;
+        let _ = self.events.send(event);
+        Ok(())
+    }
+
+    pub async fn set_agent_task(
+        &self,
+        agent_id: &str,
+        task_id: Option<String>,
+        department: Option<String>,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let id = agent_id.to_string();
+        let event = tokio::task::spawn_blocking(move || {
+            store.set_agent_task_with_event(&id, task_id.as_deref(), department.as_deref())
+        })
+        .await??;
         let _ = self.events.send(event);
         Ok(())
     }

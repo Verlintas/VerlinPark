@@ -782,6 +782,8 @@ impl Store {
         ensure_column(&conn, "agents", "parent_id", "TEXT")?;
         ensure_column(&conn, "agents", "worktree", "TEXT")?;
         ensure_column(&conn, "agents", "branch", "TEXT")?;
+        ensure_column(&conn, "agents", "task_id", "TEXT")?;
+        ensure_column(&conn, "agents", "department", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_reason", "TEXT")?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
@@ -3446,6 +3448,30 @@ impl Store {
         Ok(seq.max(0) as u64)
     }
 
+    /// Latest events for a session in ascending order. Used by coordination
+    /// views/tools that need the recent board without loading full history.
+    pub fn recent_events(&self, session_id: &str, limit: u32) -> Result<Vec<Event>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, seq, type, payload, created_at
+             FROM events WHERE session_id = ?1
+             ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![session_id, limit.clamp(1, 2_000)], |row| {
+            let payload: String = row.get(3)?;
+            Ok(Event {
+                session_id: row.get(0)?,
+                seq: row.get::<_, i64>(1)? as u64,
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                created_at: row.get(4)?,
+            })
+        })?;
+        let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
     pub fn list_events_by_kind(
         &self,
         session_id: &str,
@@ -3753,6 +3779,8 @@ impl Store {
             title: title.map(ToOwned::to_owned),
             profile: None,
             parent_id: parent_id.map(ToOwned::to_owned),
+            task_id: None,
+            department: None,
             worktree: None,
             branch: None,
             status: "running".to_string(),
@@ -3762,8 +3790,9 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO agents
-             (id, session_id, role, name, title, parent_id, worktree, branch, status, model, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             (id, session_id, role, name, title, parent_id, worktree, branch, status, model, created_at,
+              task_id, department)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 agent.id,
                 agent.session_id,
@@ -3775,7 +3804,9 @@ impl Store {
                 agent.branch,
                 agent.status,
                 agent.model,
-                agent.created_at
+                agent.created_at,
+                agent.task_id,
+                agent.department
             ],
         )?;
         Ok(agent)
@@ -3798,6 +3829,8 @@ impl Store {
             title: title.map(ToOwned::to_owned),
             profile: None,
             parent_id: parent_id.map(ToOwned::to_owned),
+            task_id: None,
+            department: None,
             worktree: None,
             branch: None,
             status: "running".to_string(),
@@ -3808,8 +3841,9 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO agents
-             (id, session_id, role, name, title, parent_id, worktree, branch, status, model, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             (id, session_id, role, name, title, parent_id, worktree, branch, status, model, created_at,
+              task_id, department)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 agent.id,
                 agent.session_id,
@@ -3821,7 +3855,9 @@ impl Store {
                 agent.branch,
                 agent.status,
                 agent.model,
-                agent.created_at
+                agent.created_at,
+                agent.task_id,
+                agent.department
             ],
         )?;
         let event = insert_event_tx(
@@ -3958,10 +3994,45 @@ impl Store {
         Ok(event)
     }
 
+    pub fn set_agent_task_with_event(
+        &self,
+        id: &str,
+        task_id: Option<&str>,
+        department: Option<&str>,
+    ) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let session_id: String = tx
+            .query_row(
+                "SELECT session_id FROM agents WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("agent not found: {id}"))?;
+        tx.execute(
+            "UPDATE agents SET task_id = ?1, department = ?2 WHERE id = ?3",
+            params![task_id, department, id],
+        )?;
+        let agent = get_agent_tx(&tx, id)?;
+        let event = insert_event_tx(
+            &tx,
+            &session_id,
+            "agent.updated",
+            serde_json::json!({"agent_id": id, "agent": agent}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
     pub fn list_agents(&self, session_id: &str) -> Result<Vec<AgentRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at
+            "SELECT id, session_id, role, name, title, profile, parent_id, task_id, department,
+                    worktree, branch, status, model, created_at
              FROM agents WHERE session_id = ?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -3973,11 +4044,13 @@ impl Store {
                 title: row.get(4)?,
                 profile: row.get(5)?,
                 parent_id: row.get(6)?,
-                worktree: row.get(7)?,
-                branch: row.get(8)?,
-                status: row.get(9)?,
-                model: row.get(10)?,
-                created_at: row.get(11)?,
+                task_id: row.get(7)?,
+                department: row.get(8)?,
+                worktree: row.get(9)?,
+                branch: row.get(10)?,
+                status: row.get(11)?,
+                model: row.get(12)?,
+                created_at: row.get(13)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -5685,8 +5758,9 @@ impl Store {
             for agent in agents {
                 tx.execute(
                     "INSERT INTO agents
-                     (id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     (id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at,
+                      task_id, department)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         agent.id,
                         agent.session_id,
@@ -5699,7 +5773,9 @@ impl Store {
                         agent.branch,
                         agent.status,
                         agent.model,
-                        agent.created_at
+                        agent.created_at,
+                        agent.task_id,
+                        agent.department
                     ],
                 )?;
             }
@@ -5955,8 +6031,9 @@ impl Store {
         for agent in &bundle.agents {
             tx.execute(
                 "INSERT INTO agents
-                 (id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at,
+                  task_id, department)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     agent.id,
                     agent.session_id,
@@ -5969,7 +6046,9 @@ impl Store {
                     agent.branch,
                     agent.status,
                     agent.model,
-                    agent.created_at
+                    agent.created_at,
+                    agent.task_id,
+                    agent.department
                 ],
             )?;
         }
@@ -6643,7 +6722,8 @@ impl Store {
 
 fn get_agent_tx(tx: &Transaction<'_>, id: &str) -> Result<AgentRecord> {
     tx.query_row(
-        "SELECT id, session_id, role, name, title, profile, parent_id, worktree, branch, status, model, created_at
+        "SELECT id, session_id, role, name, title, profile, parent_id, task_id, department,
+                worktree, branch, status, model, created_at
          FROM agents WHERE id = ?1",
         params![id],
         map_agent_record,
@@ -6661,11 +6741,13 @@ fn map_agent_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         title: row.get(4)?,
         profile: row.get(5)?,
         parent_id: row.get(6)?,
-        worktree: row.get(7)?,
-        branch: row.get(8)?,
-        status: row.get(9)?,
-        model: row.get(10)?,
-        created_at: row.get(11)?,
+        task_id: row.get(7)?,
+        department: row.get(8)?,
+        worktree: row.get(9)?,
+        branch: row.get(10)?,
+        status: row.get(11)?,
+        model: row.get(12)?,
+        created_at: row.get(13)?,
     })
 }
 
