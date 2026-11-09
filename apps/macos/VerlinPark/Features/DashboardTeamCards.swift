@@ -813,6 +813,484 @@ struct OrchestrationPolicyCard: View {
     }
 }
 
+struct IntakeTasksCard: View {
+    @Environment(AppModel.self) private var model
+    @State private var showComposer = false
+    @State private var pendingDelete: IntakeTask?
+
+    private var activeCount: Int {
+        model.intakeTasks.count(where: \.isActive)
+    }
+
+    private var queuedCount: Int {
+        model.intakeTasks.count(where: { $0.status == "queued" })
+    }
+
+    private var completedCount: Int {
+        model.intakeTasks.count(where: { $0.status == "completed" })
+    }
+
+    private var failedCount: Int {
+        model.intakeTasks.count(where: {
+            ["failed", "interrupted", "blocked"].contains($0.status)
+        })
+    }
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Task inbox")
+                    Text("Standalone work without a stored TeamPlan")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.intakeBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button(showComposer ? "Hide composer" : "New task") {
+                    withAnimation(VPMotion.smooth) {
+                        showComposer.toggle()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Button("Refresh") {
+                    Task { await model.loadIntakeTasks() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.intakeBusy)
+            }
+
+            HStack(spacing: 14) {
+                intakeMetric("queued", queuedCount)
+                intakeMetric("active", activeCount)
+                intakeMetric(
+                    "parallel cap",
+                    Int(model.taskSchedulerMaxIntakeParallelText) ?? 0
+                )
+                intakeMetric("completed", completedCount)
+                intakeMetric("failed/blocked", failedCount)
+                Spacer()
+                Text(
+                    model.taskSchedulerPolicy.enabled
+                        ? (model.taskSchedulerIncludeIntake
+                            ? "auto-dispatch on"
+                            : "auto-dispatch off")
+                        : "scheduler off"
+                )
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+                Button(model.taskSchedulerIncludeIntake ? "Pause intake" : "Enable intake") {
+                    let enabling = !model.taskSchedulerIncludeIntake
+                    model.taskSchedulerIncludeIntake = enabling
+                    if enabling {
+                        model.taskSchedulerEnabled = true
+                    }
+                    Task { await model.saveTaskSchedulerPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.taskSchedulerPolicyBusy)
+            }
+
+            Text(
+                "Each intake item becomes a deterministic one-task TeamPlan in a fresh session worktree. It uses the selected profile, the normal Worker → Verifier → Integrator path, and the project's global write leases. Auto-dispatch is default-on and bounded by the project intake parallelism; Run now always overrides the toggle."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            if let status = model.intakeStatus {
+                Text(status)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            if showComposer {
+                composer
+                    .transition(.vpContent)
+            }
+
+            if model.intakeTasks.isEmpty {
+                Text("No standalone tasks yet. New task starts from a title and a clear instruction.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(model.intakeTasks.prefix(12)) { task in
+                    taskRow(task)
+                }
+                if model.intakeTasks.count > 12 {
+                    Text("+\(model.intakeTasks.count - 12) more intake tasks")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .confirmationDialog(
+            "Delete this intake task?",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: {
+                    if !$0 {
+                        pendingDelete = nil
+                    }
+                }
+            )
+        ) {
+            Button("Delete", role: .destructive) {
+                if let task = pendingDelete {
+                    Task { await model.deleteIntakeTask(task) }
+                }
+                pendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+        } message: {
+            Text(pendingDelete?.title ?? "")
+        }
+        .task(id: model.selectedProjectID) {
+            await model.loadTaskSchedulerPolicy()
+            var silent = false
+            while !Task.isCancelled {
+                await model.loadIntakeTasks(silent: silent)
+                await model.loadSchedulerStatus(silent: silent)
+                silent = true
+                try? await Task.sleep(for: .seconds(6))
+            }
+        }
+    }
+
+    private var composer: some View {
+        @Bindable var model = model
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text(model.intakeEditingID == nil ? "Queue a standalone task" : "Edit intake task")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if model.intakeEditingID != nil {
+                    Button("Cancel edit") {
+                        model.cancelIntakeEdit()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 8) {
+                TextField("Task title", text: $model.intakeDraftTitle)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, weight: .medium))
+                Picker("Profile", selection: $model.intakeDraftProfile) {
+                    ForEach(["coding", "research", "verification", "generic"], id: \.self) {
+                        Text($0).tag($0)
+                    }
+                }
+                .pickerStyle(.menu)
+                .controlSize(.small)
+                .frame(width: 110)
+                TextField("kind (optional)", text: $model.intakeDraftKind)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 130)
+                TextField("p", text: $model.intakeDraftPriorityText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 44)
+                    .help("Priority -100…100")
+            }
+            TextEditor(text: $model.intakeDraftInstructions)
+                .font(.system(size: 10, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .frame(minHeight: 58, maxHeight: 90)
+                .padding(4)
+                .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 6))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+                }
+                .overlay(alignment: .topLeading) {
+                    if model.intakeDraftInstructions.isEmpty {
+                        Text("What should the team do? Include constraints and verification.")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 8)
+                            .allowsHitTesting(false)
+                    }
+                }
+            HStack(spacing: 8) {
+                TextField("write scope: src/a, docs", text: $model.intakeDraftScope)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                TextField("acceptance: tests pass, diff reviewed", text: $model.intakeDraftAcceptance)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text("Dependencies")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text("must complete first")
+                        .font(.system(size: 7, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    if !model.intakeDraftDeps.isEmpty {
+                        Text("\(model.intakeDraftDeps.count) selected")
+                            .font(.system(size: 7, design: .monospaced))
+                            .foregroundStyle(.cyan)
+                    }
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        let candidates = model.intakeTasks
+                            .filter { $0.id != model.intakeEditingID }
+                            .prefix(24)
+                        if candidates.isEmpty {
+                            Text("No other intake tasks to depend on.")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                        ForEach(Array(candidates)) { candidate in
+                            let selected = model.intakeDraftDeps.contains(candidate.id)
+                            Button {
+                                model.toggleIntakeDependency(candidate.id)
+                            } label: {
+                                HStack(spacing: 3) {
+                                    Image(systemName: selected
+                                        ? "checkmark.circle.fill"
+                                        : "circle")
+                                        .font(.system(size: 8))
+                                    Text(candidate.title)
+                                        .font(.system(size: 7.5, design: .monospaced))
+                                        .lineLimit(1)
+                                    Text(candidate.status)
+                                        .font(.system(size: 6.5, design: .monospaced))
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .foregroundStyle(selected ? .cyan : .secondary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .background(
+                                    selected ? Color.cyan.opacity(0.10) : Color.white.opacity(0.03),
+                                    in: Capsule()
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            HStack(spacing: 8) {
+                TextField("labels", text: $model.intakeDraftLabels)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 150)
+                TextField("attempts", text: $model.intakeDraftMaxAttemptsText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 64)
+                TextField("token budget", text: $model.intakeDraftTokenBudget)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 100)
+                TextField("USD", text: $model.intakeDraftCostBudget)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 70)
+                TextField("secs", text: $model.intakeDraftTimeBudget)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 70)
+                Spacer()
+                Button(model.intakeEditingID == nil ? "Queue task" : "Save changes") {
+                    Task { await model.createIntakeTask() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.intakeBusy)
+            }
+        }
+        .padding(10)
+        .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func taskRow(_ task: IntakeTask) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Circle()
+                .fill(intakeStatusColor(task.status))
+                .frame(width: 6, height: 6)
+                .padding(.top, 4)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(task.title)
+                        .font(.system(size: 10, weight: .medium))
+                        .lineLimit(1)
+                    Text(task.profile)
+                        .font(.system(size: 7, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text("p\(task.priority)")
+                        .font(.system(size: 7, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    Text("\(task.attempts)/\(task.maxAttempts)")
+                        .font(.system(size: 7, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Text(task.instructions)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                if let error = task.lastError {
+                    Text(error)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                } else if let summary = task.resultSummary {
+                    Text(summary)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                }
+                if !task.writeScope.isEmpty {
+                    Text("scope: \(task.writeScope.joined(separator: ", "))")
+                        .font(.system(size: 7, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                if !task.deps.isEmpty {
+                    Text("waiting on: \(dependencySummary(task))")
+                        .font(.system(size: 7, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+            Text(task.status.uppercased())
+                .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                .foregroundStyle(intakeStatusColor(task.status))
+            if let sessionID = task.sessionID {
+                Button {
+                    model.selectSession(sessionID)
+                } label: {
+                    Image(systemName: "arrow.up.forward.app")
+                        .font(.system(size: 9))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.cyan)
+                .help("Open the task session")
+            }
+            if model.intakeActionBusyID == task.id {
+                ProgressView().controlSize(.mini).frame(width: 18)
+            } else {
+                if canRun(task) {
+                    actionButton("play.circle.fill", tint: .green, help: "Run now") {
+                        Task { await model.dispatchIntakeTask(task) }
+                    }
+                }
+                if canCancel(task) {
+                    actionButton("stop.circle.fill", tint: .red, help: "Cancel") {
+                        Task { await model.cancelIntakeTask(task) }
+                    }
+                }
+                if canRetry(task) {
+                    actionButton("arrow.clockwise", tint: .cyan, help: "Retry") {
+                        Task { await model.retryIntakeTask(task) }
+                    }
+                }
+                if canEdit(task) {
+                    actionButton("pencil", tint: .yellow, help: "Edit and re-queue") {
+                        model.beginIntakeEdit(task)
+                        withAnimation(VPMotion.smooth) {
+                            showComposer = true
+                        }
+                    }
+                }
+                if task.isTerminal {
+                    actionButton("trash", tint: .secondary, help: "Delete") {
+                        pendingDelete = task
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .background(.white.opacity(0.02), in: RoundedRectangle(cornerRadius: 7))
+    }
+
+    private func actionButton(
+        _ icon: String,
+        tint: Color,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private func intakeMetric(_ title: String, _ value: Int) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("\(value)")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func canEdit(_ task: IntakeTask) -> Bool {
+        ["queued", "failed", "interrupted", "cancelled"].contains(task.status)
+    }
+
+    private func dependencySummary(_ task: IntakeTask) -> String {
+        task.deps
+            .map { dep in
+                if let match = model.intakeTasks.first(where: { $0.id == dep }) {
+                    return "\(match.title) (\(match.status))"
+                }
+                return String(dep.prefix(8))
+            }
+            .joined(separator: ", ")
+    }
+
+    private func canRun(_ task: IntakeTask) -> Bool {
+        ["queued", "failed", "interrupted", "cancelled"].contains(task.status)
+    }
+
+    private func canCancel(_ task: IntakeTask) -> Bool {
+        ["queued", "failed", "interrupted", "running", "dispatching"].contains(task.status)
+    }
+
+    private func canRetry(_ task: IntakeTask) -> Bool {
+        ["failed", "interrupted", "cancelled"].contains(task.status)
+    }
+
+    private func intakeStatusColor(_ status: String) -> Color {
+        switch status {
+        case "running", "dispatching": .green
+        case "completed": .cyan
+        case "failed", "interrupted", "blocked": .orange
+        case "cancelled": .secondary
+        default: .yellow
+        }
+    }
+}
+
 struct TaskSchedulerCard: View {
     @Environment(AppModel.self) private var model
 
@@ -847,6 +1325,14 @@ struct TaskSchedulerCard: View {
                     .help(
                         "Dispatch one ready task per daemon tick instead of resuming the entire stored plan"
                     )
+                Toggle("Include intake", isOn: $model.taskSchedulerIncludeIntake)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help("Let the daemon dispatch standalone task-inbox items")
+                TextField("intake max", text: $model.taskSchedulerMaxIntakeParallelText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    .frame(width: 58)
                 TextField("cooldown secs", text: $model.taskSchedulerCooldownText)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 9, design: .monospaced))
@@ -879,10 +1365,46 @@ struct TaskSchedulerCard: View {
             }
 
             Text(
-                "Ready tasks are ordered by task priority plus session priority, with aging so low-priority work cannot starve. When auto-resume is enabled, the daemon can resume idle/failed plans after the cooldown. With one-task-per-tick enabled it claims and runs a single ready task, then releases the session so other sessions can make progress; the project cooldown still applies between dispatches, so use a small value such as 5s for continuous progress. Otherwise it resumes the whole stored plan. Write leases are stored by the daemon and enforce overlapping path scopes across sessions; the same session may share its worktree."
+                "The autonomous dispatcher is default-on for new projects. Ready plan tasks are ordered by task priority plus session priority with aging; intake items use the same ordering, project round-robin, dependency gates, and global write leases. Auto-resume can continue idle/failed plans after the cooldown. One-task-per-tick claims a single ready task, then releases the session; otherwise the whole stored plan resumes. The scheduler never bypasses configured budgets or model choices."
             )
             .font(.system(size: 10, design: .monospaced))
             .foregroundStyle(.secondary)
+
+            if let status = model.schedulerStatus {
+                HStack(spacing: 14) {
+                    schedulerMetric("active", status.activeSessions)
+                    schedulerMetric("queued", status.queuedSessions)
+                    schedulerMetric("paused", status.pausedSessions)
+                    schedulerMetric(
+                        "session cap",
+                        status.globalSessionCap
+                    )
+                    schedulerMetric("workers", status.globalWorkerCap)
+                    schedulerMetric("labour", status.globalLabourCap)
+                    schedulerMetric("plan pending", status.pendingPlanTasks)
+                    schedulerMetric("intake active", status.activeIntake)
+                    Spacer()
+                    Button("Refresh status") {
+                        Task { await model.loadSchedulerStatus() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.schedulerStatusBusy)
+                }
+                if let project = status.projects.first {
+                    Text(
+                        "Project: enabled=\(project.enabled ? "yes" : "no") · intake=\(project.includeIntake ? "yes" : "no") · parallel cap \(project.maxIntakeParallel) · cooldown \(project.cooldownSecs)s · pending sessions \(project.pendingSessions)"
+                    )
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                }
+            } else if let error = model.schedulerStatusError {
+                Text(error)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.orange)
+            } else {
+                ProgressView().controlSize(.small)
+            }
 
             if let queue = model.taskQueue {
                 HStack(spacing: 14) {
@@ -1037,6 +1559,18 @@ struct TaskSchedulerCard: View {
         .task(id: model.selectedProjectID) {
             await model.loadTaskQueue()
             await model.loadTaskSchedulerPolicy()
+            await model.loadSchedulerStatus()
+        }
+    }
+
+    private func schedulerMetric(_ title: String, _ value: Int) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("\(value)")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text(title)
+                .font(.system(size: 7, design: .monospaced))
+                .foregroundStyle(.secondary)
         }
     }
 

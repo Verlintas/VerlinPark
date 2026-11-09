@@ -7256,3 +7256,470 @@ fn blocked_worker_reports_are_not_successful_task_completions() {
         "No changes were required; the existing implementation already satisfies the task."
     ));
 }
+
+#[tokio::test]
+async fn dispatches_an_intake_task_through_worker_and_verifier() {
+    use vp_protocol::types::IntakeCreateParams;
+
+    fn write_task(path: &str, content: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "write_intake".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": path, "content": content}).to_string(),
+            }),
+            StreamEvent::Done,
+        ]
+    }
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            write_task("src/intake.txt", "standalone work\n"),
+            vec![
+                StreamEvent::TextDelta("standalone work done".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "verdict_intake".into(),
+                    name: "submit_verdict".into(),
+                    arguments: serde_json::json!({
+                        "approved": true,
+                        "summary": "the intake task is complete"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .set_task_scheduler_policy(
+            &project.id,
+            vp_protocol::types::TaskSchedulerPolicy {
+                enabled: false,
+                cooldown_secs: 60,
+                dispatch_tasks: false,
+                include_intake: false,
+                max_intake_parallel: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let task = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Standalone change".into(),
+            instructions: "Create src/intake.txt and verify it.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: Some(15),
+            write_scope: vec!["src/intake.txt".into()],
+            acceptance: vec!["the file contains standalone work".into()],
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(2),
+            labels: vec!["test".into()],
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let dispatched = service.dispatch_intake_task(&task.id).await.unwrap();
+    assert!(dispatched.started);
+    let session_id = dispatched.session_id.clone().unwrap();
+    let sessions = engine
+        .list_sessions(Some(project.id.clone()))
+        .await
+        .unwrap();
+    let session = sessions
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .unwrap();
+    assert!(matches!(session.status.as_str(), "queued" | "running"));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let finished = loop {
+        let task = engine
+            .get_intake_task(task.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        if task.status == "running" {
+            let _ = service.reconcile_intake_tasks().await;
+            let current = engine
+                .get_intake_task(task.id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            if current.status != "running" {
+                break current;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "intake task did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(finished.status, "completed");
+    assert_eq!(finished.session_id.as_deref(), Some(session_id.as_str()));
+    assert_eq!(finished.task_id.as_deref(), Some("T1"));
+    assert_eq!(finished.attempts, 1);
+    assert_eq!(finished.profile, "coding");
+    let plan = engine.get_team_plan(&session_id).await.unwrap().unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].write_scope, vec!["src/intake.txt"]);
+    let events = engine
+        .list_events(session_id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "intake.dispatched"));
+    assert!(events.iter().any(|event| event.kind == "intake.completed"));
+    let files = engine
+        .workspace_file(&session_id, "src/intake.txt")
+        .await
+        .unwrap();
+    assert_eq!(files.content, "standalone work\n");
+}
+
+#[tokio::test]
+async fn cancels_retries_and_deletes_an_intake_task() {
+    use vp_protocol::types::IntakeCreateParams;
+
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(SlowProvider);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let task = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Slow research".into(),
+            instructions: "Take a long time.".into(),
+            profile: Some("research".into()),
+            kind: Some("research".into()),
+            priority: None,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(2),
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let dispatched = service.dispatch_intake_task(&task.id).await.unwrap();
+    assert!(dispatched.started);
+    let session_id = dispatched.session_id.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let sessions = engine
+            .list_sessions(Some(project.id.clone()))
+            .await
+            .unwrap();
+        let session = sessions
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .unwrap();
+        if session.status == "running" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session did not start: {}",
+            session.status
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let cancelled = service.cancel_intake_task(&task.id).await.unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    let retried = service.retry_intake_task(&task.id).await.unwrap();
+    assert_eq!(retried.status, "queued");
+    assert_eq!(retried.attempts, 0);
+    assert!(retried.last_error.is_none());
+    service.delete_intake_task(&task.id).await.unwrap();
+    assert!(engine.get_intake_task(task.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn scheduler_status_reports_plan_and_intake_occupancy() {
+    use vp_protocol::types::IntakeCreateParams;
+
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "status".into(), None)
+        .await
+        .unwrap();
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "status",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "build"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "department": "impl",
+            "title": "One",
+            "kind": "coding",
+            "deps": [],
+            "write_scope": ["src/t1"],
+            "acceptance": ["done"]
+        }]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Intake".into(),
+            instructions: "Queue one.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: Some(3),
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: None,
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+
+    let status = service
+        .scheduler_status(Some(project.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(status.pending_plan_tasks, 1);
+    assert_eq!(status.running_plan_tasks, 0);
+    assert_eq!(status.queued_intake, 1);
+    assert_eq!(status.active_intake, 0);
+    assert_eq!(status.projects.len(), 1);
+    let row = &status.projects[0];
+    assert_eq!(row.project_id, project.id);
+    assert_eq!(row.pending_sessions, 1);
+    assert!(row.enabled);
+    assert!(row.include_intake);
+    assert_eq!(row.max_intake_parallel, 2);
+}
+
+#[tokio::test]
+async fn cancelling_a_dependency_blocks_dependents_until_retried() {
+    use vp_protocol::types::IntakeCreateParams;
+
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let parent = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Parent".into(),
+            instructions: "Parent work.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: None,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(2),
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let child = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Child".into(),
+            instructions: "Child work.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: None,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: vec![parent.id.clone()],
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(2),
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    service.cancel_intake_task(&parent.id).await.unwrap();
+    let child_after = engine
+        .get_intake_task(child.id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_after.status, "blocked");
+    assert!(
+        child_after
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cancelled")
+    );
+    assert!(service.delete_intake_task(&parent.id).await.is_err());
+    let retried = service.retry_intake_task(&child.id).await.unwrap();
+    assert_eq!(retried.status, "queued");
+    service.cancel_intake_task(&child.id).await.unwrap();
+    assert!(service.delete_intake_task(&parent.id).await.is_ok());
+}
+
+#[tokio::test]
+async fn dependency_reconciler_blocks_after_permanent_failure() {
+    use vp_protocol::types::IntakeCreateParams;
+
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let parent = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Permanent failure".into(),
+            instructions: "Fail.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: None,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(1),
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let child = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Dependent".into(),
+            instructions: "Wait.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: None,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: vec![parent.id.clone()],
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(2),
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    engine
+        .claim_intake_task(parent.id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .settle_intake_task(
+            parent.id.clone(),
+            "failed".to_string(),
+            None,
+            Some("boom".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+    let settled = service.reconcile_intake_tasks().await.unwrap();
+    assert!(settled >= 1);
+    let child = engine.get_intake_task(child.id).await.unwrap().unwrap();
+    assert_eq!(child.status, "blocked");
+    assert!(
+        child
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("failed")
+    );
+}
+
+#[tokio::test]
+async fn dependency_reconciler_waits_for_available_automatic_retry() {
+    use vp_protocol::types::IntakeCreateParams;
+
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let parent = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Retryable".into(),
+            instructions: "Try twice.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: None,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(2),
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let child = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Waits".into(),
+            instructions: "Wait for retry.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: None,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: vec![parent.id.clone()],
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(2),
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    engine
+        .claim_intake_task(parent.id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .settle_intake_task(
+            parent.id.clone(),
+            "failed".to_string(),
+            None,
+            Some("will retry".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+    service.reconcile_intake_tasks().await.unwrap();
+    let child = engine.get_intake_task(child.id).await.unwrap().unwrap();
+    assert_eq!(child.status, "queued");
+}

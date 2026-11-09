@@ -1973,31 +1973,160 @@ struct TaskSchedulerPolicy: Codable, Hashable, Sendable {
     var enabled: Bool
     var cooldownSecs: UInt64
     var dispatchTasks: Bool
+    var includeIntake: Bool
+    var maxIntakeParallel: Int
 
     static let disabled = TaskSchedulerPolicy(
         enabled: false,
         cooldownSecs: 60,
-        dispatchTasks: false
+        dispatchTasks: false,
+        includeIntake: false,
+        maxIntakeParallel: 1
     )
 
-    init(enabled: Bool, cooldownSecs: UInt64, dispatchTasks: Bool) {
+    init(
+        enabled: Bool,
+        cooldownSecs: UInt64,
+        dispatchTasks: Bool,
+        includeIntake: Bool = true,
+        maxIntakeParallel: Int = 2
+    ) {
         self.enabled = enabled
         self.cooldownSecs = cooldownSecs
         self.dispatchTasks = dispatchTasks
+        self.includeIntake = includeIntake
+        self.maxIntakeParallel = maxIntakeParallel
     }
 
     enum CodingKeys: String, CodingKey {
         case enabled
         case cooldownSecs = "cooldown_secs"
         case dispatchTasks = "dispatch_tasks"
+        case includeIntake = "include_intake"
+        case maxIntakeParallel = "max_intake_parallel"
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        enabled = try container.decode(Bool.self, forKey: .enabled)
-        cooldownSecs = try container.decode(UInt64.self, forKey: .cooldownSecs)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        cooldownSecs = try container.decodeIfPresent(UInt64.self, forKey: .cooldownSecs) ?? 60
         dispatchTasks = try container.decodeIfPresent(Bool.self, forKey: .dispatchTasks) ?? false
+        includeIntake = try container.decodeIfPresent(Bool.self, forKey: .includeIntake) ?? true
+        maxIntakeParallel = try container.decodeIfPresent(Int.self, forKey: .maxIntakeParallel) ?? 2
     }
+}
+
+struct IntakeTask: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectID: String
+    let title: String
+    let instructions: String
+    let profile: String
+    let kind: String
+    let priority: Int
+    let writeScope: [String]
+    let acceptance: [String]
+    let deps: [String]
+    let tokenBudget: UInt64?
+    let costBudgetUsd: Double?
+    let timeBudgetSecs: UInt64?
+    let status: String
+    let attempts: UInt32
+    let maxAttempts: UInt32
+    let nextAttemptAt: String?
+    let sessionID: String?
+    let taskID: String?
+    let lastError: String?
+    let resultSummary: String?
+    let origin: String
+    let labels: [String]
+    let createdAt: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectID = "project_id"
+        case title
+        case instructions
+        case profile
+        case kind
+        case priority
+        case writeScope = "write_scope"
+        case acceptance
+        case deps
+        case tokenBudget = "token_budget"
+        case costBudgetUsd = "cost_budget_usd"
+        case timeBudgetSecs = "time_budget_secs"
+        case status
+        case attempts
+        case maxAttempts = "max_attempts"
+        case nextAttemptAt = "next_attempt_at"
+        case sessionID = "session_id"
+        case taskID = "task_id"
+        case lastError = "last_error"
+        case resultSummary = "result_summary"
+        case origin
+        case labels
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        title = try container.decode(String.self, forKey: .title)
+        instructions = try container.decode(String.self, forKey: .instructions)
+        profile = try container.decode(String.self, forKey: .profile)
+        kind = try container.decode(String.self, forKey: .kind)
+        priority = try container.decode(Int.self, forKey: .priority)
+        writeScope = try container.decodeIfPresent([String].self, forKey: .writeScope) ?? []
+        acceptance = try container.decodeIfPresent([String].self, forKey: .acceptance) ?? []
+        deps = try container.decodeIfPresent([String].self, forKey: .deps) ?? []
+        tokenBudget = try container.decodeIfPresent(UInt64.self, forKey: .tokenBudget)
+        costBudgetUsd = try container.decodeIfPresent(Double.self, forKey: .costBudgetUsd)
+        timeBudgetSecs = try container.decodeIfPresent(UInt64.self, forKey: .timeBudgetSecs)
+        status = try container.decode(String.self, forKey: .status)
+        attempts = try container.decode(UInt32.self, forKey: .attempts)
+        maxAttempts = try container.decode(UInt32.self, forKey: .maxAttempts)
+        nextAttemptAt = try container.decodeIfPresent(String.self, forKey: .nextAttemptAt)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
+        taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        resultSummary = try container.decodeIfPresent(String.self, forKey: .resultSummary)
+        origin = try container.decodeIfPresent(String.self, forKey: .origin) ?? "unknown"
+        labels = try container.decodeIfPresent([String].self, forKey: .labels) ?? []
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+        updatedAt = try container.decode(String.self, forKey: .updatedAt)
+    }
+
+    var isActive: Bool {
+        status == "running" || status == "dispatching"
+    }
+
+    var isTerminal: Bool {
+        ["completed", "failed", "cancelled"].contains(status)
+    }
+}
+
+struct IntakeListResult: Codable, Sendable {
+    let tasks: [IntakeTask]
+}
+
+struct IntakeDispatchResult: Codable, Sendable {
+    let started: Bool
+    let task: IntakeTask
+    let sessionID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case started
+        case task
+        case sessionID = "session_id"
+    }
+}
+
+struct IntakeDeleteResult: Codable, Sendable {
+    let deleted: Bool
 }
 
 struct TaskSchedulerPolicyResult: Codable, Sendable {
@@ -2007,6 +2136,72 @@ struct TaskSchedulerPolicyResult: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case projectID = "project_id"
         case policy
+    }
+}
+
+struct SchedulerProjectStatus: Codable, Hashable, Sendable, Identifiable {
+    let projectID: String
+    let projectName: String
+    let enabled: Bool
+    let cooldownSecs: UInt64
+    let dispatchTasks: Bool
+    let includeIntake: Bool
+    let maxIntakeParallel: Int
+    let pendingSessions: Int
+    let pendingPlanTasks: Int
+    let runningPlanTasks: Int
+    let queuedIntake: Int
+    let activeIntake: Int
+    let failedIntake: Int
+
+    var id: String {
+        projectID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case projectName = "project_name"
+        case enabled
+        case cooldownSecs = "cooldown_secs"
+        case dispatchTasks = "dispatch_tasks"
+        case includeIntake = "include_intake"
+        case maxIntakeParallel = "max_intake_parallel"
+        case pendingSessions = "pending_sessions"
+        case pendingPlanTasks = "pending_plan_tasks"
+        case runningPlanTasks = "running_plan_tasks"
+        case queuedIntake = "queued_intake"
+        case activeIntake = "active_intake"
+        case failedIntake = "failed_intake"
+    }
+}
+
+struct SchedulerStatusResult: Codable, Sendable {
+    let activeSessions: Int
+    let queuedSessions: Int
+    let pausedSessions: Int
+    let pendingPlanTasks: Int
+    let runningPlanTasks: Int
+    let queuedIntake: Int
+    let activeIntake: Int
+    let failedIntake: Int
+    let globalSessionCap: Int
+    let globalWorkerCap: Int
+    let globalLabourCap: Int
+    let projects: [SchedulerProjectStatus]
+
+    enum CodingKeys: String, CodingKey {
+        case activeSessions = "active_sessions"
+        case queuedSessions = "queued_sessions"
+        case pausedSessions = "paused_sessions"
+        case pendingPlanTasks = "pending_plan_tasks"
+        case runningPlanTasks = "running_plan_tasks"
+        case queuedIntake = "queued_intake"
+        case activeIntake = "active_intake"
+        case failedIntake = "failed_intake"
+        case globalSessionCap = "global_session_cap"
+        case globalWorkerCap = "global_worker_cap"
+        case globalLabourCap = "global_labour_cap"
+        case projects
     }
 }
 
@@ -2467,4 +2662,68 @@ struct ApprovalGrantCreateResult: Codable, Sendable {
 
 struct ApprovalGrantDeleteResult: Codable, Sendable {
     let deleted: Bool
+}
+
+struct WorkspaceListResult: Codable, Sendable {
+    let root: String
+    let path: String
+    let entries: [WorkspaceEntry]
+    let total: Int
+    let hasMore: Bool
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case root
+        case path
+        case entries
+        case total
+        case hasMore = "has_more"
+        case truncated
+    }
+}
+
+struct WorkspaceSearchResult: Codable, Sendable {
+    let entries: [WorkspaceEntry]
+    let truncated: Bool
+}
+
+enum WorkspaceSearchMode: String, CaseIterable, Identifiable, Sendable {
+    case names
+    case contents
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .names: L10n.t("Names")
+        case .contents: L10n.t("Contents")
+        }
+    }
+}
+
+struct WorkspaceGrepMatch: Codable, Identifiable, Hashable, Sendable {
+    let path: String
+    let line: UInt32
+    let column: UInt32
+    let preview: String
+
+    var id: String {
+        "\(path):\(line):\(column)"
+    }
+}
+
+struct WorkspaceGrepResult: Codable, Sendable {
+    let query: String
+    let matches: [WorkspaceGrepMatch]
+    let filesScanned: Int
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case query
+        case matches
+        case filesScanned = "files_scanned"
+        case truncated
+    }
 }

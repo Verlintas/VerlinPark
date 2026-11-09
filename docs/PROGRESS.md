@@ -1,9 +1,78 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-09
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 已跑通
+> 最后更新：2026-11-10
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-10 Standalone task inbox + autonomous dispatch + workspace search
+
+这一轮补齐了“没有 TeamPlan 的 orphan task”路径，并把 Preview 文件面从
+“打开时遍历整个 worktree”改成按目录懒加载、带内容搜索和行号跳转的可靠浏览器。
+所有新增调度都是确定性的，不引入隐藏模型路由。
+
+### Task inbox / autopilot
+
+- 新增项目级 `intake_tasks`：title、instructions、profile、kind、priority、
+  write scope、acceptance、intake 依赖、token/USD/time budgets、labels、
+  origin、attempts/max attempts、next_attempt_at、linked session/task、
+  last_error、result summary。SQLite schema 带增量迁移，并进入 project
+  manifest / `vp db-rebuild` 恢复路径。
+- 新增 `intake.list/create/update/dispatch/cancel/retry/delete` RPC 与
+  `vp intake*` CLI；`intake.update` 只允许非 active task，保存后重新排队并把
+  attempts 归零。
+- 每个 intake item 派发时合成并复用正式校验的 one-department/one-task
+  TeamPlan（任务 id `T1`），然后走正常 session/worktree、Worker、Verifier、
+  merge queue、write lease 与预算路径。不是第二套执行引擎。
+- `TaskSchedulerPolicy` 改为 default-on：计划 resume、intake include、
+  `max_intake_parallel`（1–10，默认 2）、cooldown；显式 DB policy 可关闭，
+  `VERLINPARK_TASK_SCHEDULER=0` 是全局 opt-out。手动 Run now 可越过开关和
+  并发 cap，但仍受依赖、预算、容量、write lease、Verifier 约束。
+- Intake 依赖是项目级 DAG：只允许同项目已有 task，最多 20 个；校验缺失、
+  自依赖和 edit 形成的环；只有依赖全部 completed/skipped 才可自动或手动派发；
+  依赖被 cancel 或 final failure 时 queued dependents 进入 blocked，retry 后
+  重新排队，仍有非终态 dependent 时拒绝删除依赖。
+- 调度顺序：task priority + age + orchestration retry boost，再按 enqueue
+  time/id，平局优先不同 project 的 round-robin。`scheduler.status` /
+  `vp scheduler` / Manage Dash 展示 session cap、plan/intake occupancy 与
+  每项目有效 policy，只读、不产生事件。
+- `reconcile_intake_tasks` 每个 tick 和启动时把 session/plan task 终态映射回
+  intake；失败按 orchestration backoff 写 `next_attempt_at`，绝不越过
+  `max_attempts`。daemon restart 把 dispatching/running intake 标为 failed，
+  `db-rebuild` 也做同样降级，避免悬挂 running。
+- Manage Dash → Team & Tasks 新增 Task Inbox 卡片：创建/编辑、依赖选择、
+  run/cancel/retry/delete、打开 session、轮询活动状态；Task Scheduler 卡片
+  显示实时 occupancy 与 intake 并发控制。
+
+### Workspace browser / content search
+
+- `workspace.list` 单目录分页（默认 500 / 上限 2,000；20,000 entry 安全
+  cap），只返回 dirs-first 的一层；拒绝 absolute/`..`/symlink/`.git`。
+  Swift `WorkspaceDirectoryState` 只在展开目录时加载，折叠保留缓存，Refresh
+  清空；根目录按 session 加载一次。
+- `workspace.grep` 是 bounded literal search：1–200 字符、可选相对目录、
+  默认 case-insensitive、跳过 `.git`/symlink/>2 MiB/NUL/非 UTF-8、默认
+  200/hard cap 1,000，返回 `files_scanned`/`truncated`。不编译 regex。
+- Files panel 增加 Names/Contents 切换、按文件分组的结果、行号/preview；
+  点击匹配打开文件并跳到对应行。两个模式都 220ms debounce、取消感知。
+- 新增 `WorkspaceCodeEditor`（NSTextView + NSScrollView + 行号 ruler），
+  保持 SwiftUI binding、editable/read-only、find、按 reveal token 滚动/选中；
+  ruler 只画可见行片段，wrapped line 不重复编号。
+- 新增 `VPCloseButton`（粗体 X、可见圆形表面、24–28pt hit target、hover
+  放大、accessibility label），替换 Files tab 和 Collab inspector 的小关闭
+  按钮；tab strip 仍保留未保存改动确认。
+
+### 验证
+
+- Rust：新增 scheduler/intake/store/agent/grep 测试，覆盖 atomic claim、
+  attempts 上限、cancel/delete/reconcile、依赖 gate/cycle、默认 policy、
+  manual dispatch、end-to-end Worker+Verifier、scheduler.status 与 grep
+  的路径/大小写/二进制/cap 行为。
+- Swift：新增 intake/scheduler/grep decode 兼容测试；`xcodebuild test` 通过（107 tests）。
+- 当前总量：Rust 381（core 304 / protocol 2 / store 61 / providers 14；另有 3 ignored live），Swift 107。
+- 文档：ADR-0127（task inbox/autopilot）与 ADR-0128（lazy browser/search）。
 
 ---
 

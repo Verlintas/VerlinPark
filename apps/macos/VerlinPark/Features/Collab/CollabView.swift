@@ -1340,11 +1340,12 @@ private struct CollabNodeInspector: View {
                     .tracking(0.5)
                     .foregroundStyle(tint)
                 StatusPill(status: node.statusColorKey)
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .bold))
+                VPCloseButton(
+                    size: 24,
+                    help: L10n.t("Close inspector")
+                ) {
+                    onClose()
                 }
-                .buttonStyle(VPGlassIconButtonStyle(size: 20, tint: VPTheme.textSecondary))
             }
 
             if let task {

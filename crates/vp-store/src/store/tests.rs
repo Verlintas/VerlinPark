@@ -1719,9 +1719,11 @@ fn round_trips_task_scheduler_policy_and_manifest() {
         .add_project(repo.path().to_str().unwrap(), Some("scheduler policy"))
         .unwrap();
     let default = store.get_task_scheduler_policy(&project.id).unwrap();
-    assert!(!default.enabled);
+    assert!(default.enabled);
     assert_eq!(default.cooldown_secs, 60);
     assert!(!default.dispatch_tasks);
+    assert!(default.include_intake);
+    assert_eq!(default.max_intake_parallel, 2);
 
     store
         .set_task_scheduler_policy(
@@ -1730,6 +1732,8 @@ fn round_trips_task_scheduler_policy_and_manifest() {
                 enabled: true,
                 cooldown_secs: 15,
                 dispatch_tasks: true,
+                include_intake: true,
+                max_intake_parallel: 2,
             },
         )
         .unwrap();
@@ -2264,4 +2268,242 @@ fn enqueue_merge_with_event_persists_pre_merge_column() {
     assert_eq!(entry.status, "queued");
     assert_eq!(entry.pre_merge_commit, None);
     assert_eq!(event.kind, "merge_queue.enqueued");
+}
+
+fn intake_draft(project_id: &str, title: &str) -> NewIntakeTask {
+    NewIntakeTask {
+        project_id: project_id.to_string(),
+        title: title.to_string(),
+        instructions: format!("Implement {title} and verify it."),
+        profile: "coding".to_string(),
+        kind: "coding".to_string(),
+        priority: 5,
+        write_scope: vec!["src".to_string()],
+        acceptance: vec!["tests pass".to_string()],
+        deps: Vec::new(),
+        token_budget: Some(20_000),
+        cost_budget_usd: Some(1.5),
+        time_budget_secs: Some(600),
+        max_attempts: 2,
+        origin: "test".to_string(),
+        labels: vec!["nightly".to_string()],
+    }
+}
+
+#[test]
+fn creates_lists_and_reports_intake_tasks() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("intake"))
+        .unwrap();
+    let task = store
+        .create_intake_task(&intake_draft(&project.id, "Fix login"))
+        .unwrap();
+    assert_eq!(task.status, "queued");
+    assert_eq!(task.attempts, 0);
+    assert_eq!(task.max_attempts, 2);
+    assert_eq!(task.write_scope, vec!["src"]);
+    assert_eq!(task.acceptance, vec!["tests pass"]);
+    assert_eq!(task.labels, vec!["nightly"]);
+    assert_eq!(store.count_active_intake_tasks(&project.id).unwrap(), 0);
+
+    let listed = store
+        .list_intake_tasks(Some(&project.id), None, None)
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, task.id);
+    assert_eq!(
+        store
+            .list_intake_tasks(Some(&project.id), Some("completed"), None)
+            .unwrap()
+            .len(),
+        0
+    );
+
+    store.record_project_manifest().unwrap();
+    let snapshots = read_project_manifest(data.path()).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].intake_tasks.len(), 1);
+    assert_eq!(snapshots[0].intake_tasks[0].title, "Fix login");
+}
+
+#[test]
+fn intake_claim_is_atomic_and_attempts_are_bounded() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("claim"))
+        .unwrap();
+    let task = store
+        .create_intake_task(&intake_draft(&project.id, "One"))
+        .unwrap();
+
+    let claimed = store.claim_intake_task(&task.id).unwrap().unwrap();
+    assert_eq!(claimed.status, "dispatching");
+    assert_eq!(claimed.attempts, 1);
+    assert_eq!(store.count_active_intake_tasks(&project.id).unwrap(), 1);
+    assert!(store.claim_intake_task(&task.id).unwrap().is_none());
+    assert!(
+        store
+            .runnable_intake_tasks(&now_rfc3339())
+            .unwrap()
+            .is_empty()
+    );
+
+    let started = store
+        .start_intake_task(&task.id, "session-1", "T1")
+        .unwrap();
+    assert_eq!(started.status, "running");
+    assert_eq!(started.session_id.as_deref(), Some("session-1"));
+
+    let failed = store
+        .settle_intake_task(
+            &task.id,
+            "failed",
+            None,
+            Some("provider failed"),
+            Some("9999-01-01T00:00:00Z"),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.last_error.as_deref(), Some("provider failed"));
+    assert_eq!(
+        failed.next_attempt_at.as_deref(),
+        Some("9999-01-01T00:00:00Z")
+    );
+    assert!(
+        store
+            .runnable_intake_tasks(&now_rfc3339())
+            .unwrap()
+            .is_empty()
+    );
+
+    let retried = store
+        .settle_intake_task(&task.id, "failed", None, Some("again"), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried.attempts, 1);
+    let claimed = store.claim_intake_task(&task.id).unwrap().unwrap();
+    assert_eq!(claimed.attempts, 2);
+    assert_eq!(claimed.status, "dispatching");
+    store
+        .settle_intake_task(&task.id, "failed", None, Some("last"), None)
+        .unwrap();
+    assert!(store.claim_intake_task(&task.id).unwrap().is_none());
+    assert!(store.retry_intake_task(&task.id).unwrap().is_some());
+    assert_eq!(
+        store.get_intake_task(&task.id).unwrap().unwrap().attempts,
+        0
+    );
+}
+
+#[test]
+fn intake_cancel_delete_and_recovery_guard_active_rows() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("lifecycle"))
+        .unwrap();
+    let queued = store
+        .create_intake_task(&intake_draft(&project.id, "Queued"))
+        .unwrap();
+    assert!(store.cancel_intake_task(&queued.id).unwrap().is_some());
+    assert!(store.delete_intake_task(&queued.id).unwrap());
+
+    let dispatching = store
+        .create_intake_task(&intake_draft(&project.id, "Dispatching"))
+        .unwrap();
+    store.claim_intake_task(&dispatching.id).unwrap();
+    assert!(!store.delete_intake_task(&dispatching.id).unwrap());
+    assert!(store.cancel_intake_task(&dispatching.id).unwrap().is_none());
+
+    let running = store
+        .create_intake_task(&intake_draft(&project.id, "Running"))
+        .unwrap();
+    store.claim_intake_task(&running.id).unwrap();
+    store
+        .start_intake_task(&running.id, "session-recover", "T1")
+        .unwrap();
+    assert!(!store.delete_intake_task(&running.id).unwrap());
+    assert!(store.cancel_intake_task(&running.id).unwrap().is_none());
+
+    let (sessions, _events) = store.recover_state().unwrap();
+    assert!(sessions.is_empty());
+    let recovered = store.get_intake_task(&running.id).unwrap().unwrap();
+    assert_eq!(recovered.status, "failed");
+    assert!(
+        recovered
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("daemon restarted")
+    );
+}
+
+#[test]
+fn intake_dependencies_round_trip_and_edits_requeue() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("deps"))
+        .unwrap();
+    let first = store
+        .create_intake_task(&intake_draft(&project.id, "First"))
+        .unwrap();
+    let mut draft = intake_draft(&project.id, "Second");
+    draft.deps = vec![first.id.clone()];
+    let second = store.create_intake_task(&draft).unwrap();
+    assert_eq!(second.deps, vec![first.id.clone()]);
+    assert_eq!(
+        store.get_intake_task(&second.id).unwrap().unwrap().deps,
+        vec![first.id.clone()]
+    );
+
+    let mut edited = intake_draft(&project.id, "Second edited");
+    edited.deps = Vec::new();
+    edited.priority = 30;
+    let updated = store
+        .update_intake_task(&second.id, &edited)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.title, "Second edited");
+    assert_eq!(updated.priority, 30);
+    assert!(updated.deps.is_empty());
+    assert_eq!(updated.status, "queued");
+
+    store.claim_intake_task(&second.id).unwrap();
+    assert!(
+        store
+            .update_intake_task(&second.id, &edited)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn task_scheduler_policy_defaults_to_autonomous_intake() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("policy"))
+        .unwrap();
+    let policy = store.get_task_scheduler_policy(&project.id).unwrap();
+    assert!(policy.enabled);
+    assert!(policy.include_intake);
+    assert_eq!(policy.max_intake_parallel, 2);
+    assert!(!store.has_task_scheduler_policy(&project.id).unwrap());
+
+    store
+        .set_task_scheduler_policy(
+            &project.id,
+            &TaskSchedulerPolicy {
+                enabled: true,
+                cooldown_secs: 5,
+                dispatch_tasks: true,
+                include_intake: false,
+                max_intake_parallel: 7,
+            },
+        )
+        .unwrap();
+    assert!(store.has_task_scheduler_policy(&project.id).unwrap());
+    let policy = store.get_task_scheduler_policy(&project.id).unwrap();
+    assert!(!policy.include_intake);
+    assert_eq!(policy.max_intake_parallel, 7);
 }

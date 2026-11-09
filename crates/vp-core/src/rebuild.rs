@@ -92,6 +92,17 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             store.set_memory_policy(&snapshot.project.id, &snapshot.memory_policy)?;
             store.set_orchestration_policy(&snapshot.project.id, &snapshot.orchestration_policy)?;
             store.restore_approval_grants(&snapshot.project.id, &snapshot.approval_grants)?;
+            for task in &snapshot.intake_tasks {
+                let mut task = task.clone();
+                if matches!(task.status.as_str(), "dispatching" | "running") {
+                    task.status = "failed".to_string();
+                    task.last_error = Some(
+                        "rebuilt from the project manifest after a daemon restart".to_string(),
+                    );
+                    task.next_attempt_at = None;
+                }
+                store.insert_intake_task_snapshot(&task)?;
+            }
         }
         let engine = Engine::new(store);
         let mut sessions = 0usize;
@@ -335,8 +346,30 @@ mod tests {
                         enabled: true,
                         cooldown_secs: 30,
                         dispatch_tasks: false,
+                        include_intake: true,
+                        max_intake_parallel: 2,
                     },
                 )
+                .await
+                .unwrap();
+            engine
+                .create_intake_task(vp_protocol::types::IntakeCreateParams {
+                    project_id: project.id.clone(),
+                    title: "Rebuild intake".into(),
+                    instructions: "Survive a manifest rebuild.".into(),
+                    profile: Some("coding".into()),
+                    kind: Some("coding".into()),
+                    priority: Some(7),
+                    write_scope: vec!["src/rebuild".into()],
+                    acceptance: vec!["restored".into()],
+                    deps: Vec::new(),
+                    token_budget: None,
+                    cost_budget_usd: None,
+                    time_budget_secs: None,
+                    max_attempts: Some(2),
+                    labels: vec!["rebuild".into()],
+                    origin: Some("test".into()),
+                })
                 .await
                 .unwrap();
             engine
@@ -413,6 +446,14 @@ mod tests {
         let policy = store.get_task_scheduler_policy(&project_id).unwrap();
         assert!(policy.enabled);
         assert_eq!(policy.cooldown_secs, 30);
+        let intake = store
+            .list_intake_tasks(Some(&project_id), None, None)
+            .unwrap();
+        assert_eq!(intake.len(), 1);
+        assert_eq!(intake[0].title, "Rebuild intake");
+        assert_eq!(intake[0].priority, 7);
+        assert_eq!(intake[0].labels, vec!["rebuild"]);
+        assert_eq!(intake[0].status, "queued");
     }
 
     #[tokio::test]

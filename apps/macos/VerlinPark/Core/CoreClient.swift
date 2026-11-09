@@ -128,11 +128,127 @@ actor CoreClient {
                 "policy": .object([
                     "enabled": .bool(policy.enabled),
                     "cooldown_secs": .number(Double(policy.cooldownSecs)),
+                    "dispatch_tasks": .bool(policy.dispatchTasks),
+                    "include_intake": .bool(policy.includeIntake),
+                    "max_intake_parallel": .number(Double(policy.maxIntakeParallel)),
                 ]),
             ]
         )
         .decode(TaskSchedulerPolicyResult.self)
         .policy
+    }
+
+    func intakeTasks(
+        projectID: String?,
+        status: String? = nil,
+        limit: Int = 100
+    ) async throws -> IntakeListResult {
+        try await request(
+            method: "intake.list",
+            params: [
+                "project_id": projectID.map(JSONValue.string) ?? .null,
+                "status": status.map(JSONValue.string) ?? .null,
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(IntakeListResult.self)
+    }
+
+    func createIntakeTask(
+        projectID: String,
+        title: String,
+        instructions: String,
+        profile: String,
+        kind: String?,
+        priority: Int,
+        writeScope: [String],
+        acceptance: [String],
+        deps: [String],
+        tokenBudget: UInt64?,
+        costBudgetUsd: Double?,
+        timeBudgetSecs: UInt64?,
+        maxAttempts: UInt32,
+        labels: [String]
+    ) async throws -> IntakeTask {
+        try await request(
+            method: "intake.create",
+            params: [
+                "project_id": .string(projectID),
+                "title": .string(title),
+                "instructions": .string(instructions),
+                "profile": .string(profile),
+                "kind": kind.map(JSONValue.string) ?? .null,
+                "priority": .number(Double(priority)),
+                "write_scope": .array(writeScope.map(JSONValue.string)),
+                "acceptance": .array(acceptance.map(JSONValue.string)),
+                "deps": .array(deps.map(JSONValue.string)),
+                "token_budget": tokenBudget.map { .number(Double($0)) } ?? .null,
+                "cost_budget_usd": costBudgetUsd.map { .number($0) } ?? .null,
+                "time_budget_secs": timeBudgetSecs.map { .number(Double($0)) } ?? .null,
+                "max_attempts": .number(Double(maxAttempts)),
+                "labels": .array(labels.map(JSONValue.string)),
+                "origin": .string("app"),
+            ]
+        )
+        .decode(IntakeTask.self)
+    }
+
+    func updateIntakeTask(
+        id: String,
+        title: String,
+        instructions: String,
+        profile: String,
+        kind: String?,
+        priority: Int,
+        writeScope: [String],
+        acceptance: [String],
+        deps: [String],
+        tokenBudget: UInt64?,
+        costBudgetUsd: Double?,
+        timeBudgetSecs: UInt64?,
+        maxAttempts: UInt32,
+        labels: [String]
+    ) async throws -> IntakeTask {
+        try await request(
+            method: "intake.update",
+            params: [
+                "id": .string(id),
+                "title": .string(title),
+                "instructions": .string(instructions),
+                "profile": .string(profile),
+                "kind": kind.map(JSONValue.string) ?? .null,
+                "priority": .number(Double(priority)),
+                "write_scope": .array(writeScope.map(JSONValue.string)),
+                "acceptance": .array(acceptance.map(JSONValue.string)),
+                "deps": .array(deps.map(JSONValue.string)),
+                "token_budget": tokenBudget.map { .number(Double($0)) } ?? .null,
+                "cost_budget_usd": costBudgetUsd.map { .number($0) } ?? .null,
+                "time_budget_secs": timeBudgetSecs.map { .number(Double($0)) } ?? .null,
+                "max_attempts": .number(Double(maxAttempts)),
+                "labels": .array(labels.map(JSONValue.string)),
+            ]
+        )
+        .decode(IntakeTask.self)
+    }
+
+    func dispatchIntakeTask(id: String) async throws -> IntakeDispatchResult {
+        try await request(method: "intake.dispatch", params: ["id": .string(id)])
+            .decode(IntakeDispatchResult.self)
+    }
+
+    func cancelIntakeTask(id: String) async throws -> IntakeTask {
+        try await request(method: "intake.cancel", params: ["id": .string(id)])
+            .decode(IntakeTask.self)
+    }
+
+    func retryIntakeTask(id: String) async throws -> IntakeTask {
+        try await request(method: "intake.retry", params: ["id": .string(id)])
+            .decode(IntakeTask.self)
+    }
+
+    func deleteIntakeTask(id: String) async throws -> IntakeDeleteResult {
+        try await request(method: "intake.delete", params: ["id": .string(id)])
+            .decode(IntakeDeleteResult.self)
     }
 
     func shellPolicy(projectID: String) async throws -> ShellPolicy {
@@ -1039,6 +1155,60 @@ actor CoreClient {
         .decode(WorkspaceTreeResult.self)
     }
 
+    func workspaceList(
+        sessionID: String,
+        path: String,
+        offset: Int = 0,
+        limit: Int = 500
+    ) async throws -> WorkspaceListResult {
+        try await request(
+            method: "workspace.list",
+            params: [
+                "session_id": .string(sessionID),
+                "path": .string(path),
+                "offset": .number(Double(offset)),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(WorkspaceListResult.self)
+    }
+
+    func workspaceSearch(
+        sessionID: String,
+        query: String,
+        limit: Int = 300
+    ) async throws -> WorkspaceSearchResult {
+        try await request(
+            method: "workspace.search",
+            params: [
+                "session_id": .string(sessionID),
+                "query": .string(query),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(WorkspaceSearchResult.self)
+    }
+
+    func workspaceGrep(
+        sessionID: String,
+        query: String,
+        path: String? = nil,
+        caseSensitive: Bool = false,
+        maxResults: Int = 200
+    ) async throws -> WorkspaceGrepResult {
+        try await request(
+            method: "workspace.grep",
+            params: [
+                "session_id": .string(sessionID),
+                "query": .string(query),
+                "path": path.map(JSONValue.string) ?? .null,
+                "case_sensitive": .bool(caseSensitive),
+                "max_results": .number(Double(maxResults)),
+            ]
+        )
+        .decode(WorkspaceGrepResult.self)
+    }
+
     func workspaceFile(sessionID: String, path: String) async throws -> WorkspaceFileResult {
         try await request(
             method: "workspace.file",
@@ -1061,6 +1231,14 @@ actor CoreClient {
         ]
         return try await request(method: "workspace.write", params: params)
             .decode(WorkspaceWriteResult.self)
+    }
+
+    func schedulerStatus(projectID: String?) async throws -> SchedulerStatusResult {
+        try await request(
+            method: "scheduler.status",
+            params: ["project_id": projectID.map(JSONValue.string) ?? .null]
+        )
+        .decode(SchedulerStatusResult.self)
     }
 
     func taskQueue(projectID: String?, sessionID: String?) async throws -> TaskQueueResult {

@@ -197,13 +197,21 @@ enum Command {
     /// Update the project's automatic task-resume policy.
     TaskSchedulerSet {
         project: String,
+        /// Enable or disable the autonomous scheduler.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        enabled: Option<bool>,
+        /// Minimum seconds between scheduler selections (1–86400).
         #[arg(long)]
-        enabled: bool,
-        #[arg(long, default_value_t = 60)]
-        cooldown_secs: u64,
+        cooldown_secs: Option<u64>,
         /// Dispatch one ready task per tick instead of resuming the whole plan.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        dispatch_tasks: Option<bool>,
+        /// Include standalone task-inbox items.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        include_intake: Option<bool>,
+        /// Maximum dispatching/running intake items per project (1–10).
         #[arg(long)]
-        dispatch_tasks: bool,
+        max_intake_parallel: Option<u32>,
     },
     /// Show the project's deterministic orchestration policy.
     OrchestrationPolicy { project: String },
@@ -417,6 +425,11 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Show scheduler occupancy, caps, and per-project policy.
+    Scheduler {
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// List the persistent global task-DAG queue and write leases.
     Tasks {
         #[arg(long)]
@@ -424,6 +437,84 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// List standalone intake tasks (project task inbox).
+    Intake {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Queue a standalone task that runs through a synthesized one-task plan.
+    IntakeAdd {
+        project: String,
+        title: String,
+        /// Task instructions; use '-' to read from stdin.
+        instructions: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        /// Writable path scope (repeatable).
+        #[arg(long = "scope")]
+        scope: Vec<String>,
+        /// Acceptance criterion (repeatable).
+        #[arg(long = "accept")]
+        acceptance: Vec<String>,
+        /// Intake task id that must complete first (repeatable).
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+        #[arg(long)]
+        token_budget: Option<u64>,
+        #[arg(long)]
+        cost_budget_usd: Option<f64>,
+        #[arg(long)]
+        time_budget_secs: Option<u64>,
+        #[arg(long, default_value_t = 2)]
+        max_attempts: u32,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    /// Edit a queued/failed intake task and re-queue it.
+    IntakeEdit {
+        id: String,
+        title: String,
+        /// Task instructions; use '-' to read from stdin.
+        instructions: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        #[arg(long = "scope")]
+        scope: Vec<String>,
+        #[arg(long = "accept")]
+        acceptance: Vec<String>,
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+        #[arg(long)]
+        token_budget: Option<u64>,
+        #[arg(long)]
+        cost_budget_usd: Option<f64>,
+        #[arg(long)]
+        time_budget_secs: Option<u64>,
+        #[arg(long, default_value_t = 2)]
+        max_attempts: u32,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    /// Dispatch one intake task now, bypassing the schedule toggle.
+    IntakeRun { id: String },
+    /// Cancel a queued or running intake task.
+    IntakeCancel { id: String },
+    /// Reset a failed/cancelled intake task and queue it again.
+    IntakeRetry { id: String },
+    /// Delete a terminal intake task.
+    IntakeDelete { id: String },
     /// Dispatch one ready task from a session's stored TeamPlan.
     TaskDispatch { session: String },
     /// Retry a failed, blocked, interrupted, cancelled, or skipped plan task.
@@ -456,6 +547,17 @@ enum Command {
     Files { session: String },
     /// Show one session worktree file.
     File { session: String, path: String },
+    /// Search file contents in a session worktree.
+    Grep {
+        session: String,
+        query: String,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        case_sensitive: bool,
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+    },
     /// Run one command in a sandboxed PTY terminal.
     Terminal { session: String, command: String },
     /// Show recent commits on the session branch.
@@ -1020,16 +1122,36 @@ async fn main() -> Result<()> {
             enabled,
             cooldown_secs,
             dispatch_tasks,
+            include_intake,
+            max_intake_parallel,
         } => {
+            // Merge with the stored policy so a one-field CLI edit does not
+            // silently reset intake or per-task behavior to defaults.
+            let current = rpc(
+                &discovery,
+                "project.task_scheduler.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
             rpc(
                 &discovery,
                 "project.task_scheduler.set",
                 json!({
                     "project_id": project,
                     "policy": {
-                        "enabled": enabled,
-                        "cooldown_secs": cooldown_secs,
-                        "dispatch_tasks": dispatch_tasks,
+                        "enabled": enabled
+                            .unwrap_or_else(|| policy["enabled"].as_bool().unwrap_or(true)),
+                        "cooldown_secs": cooldown_secs
+                            .unwrap_or_else(|| policy["cooldown_secs"].as_u64().unwrap_or(60)),
+                        "dispatch_tasks": dispatch_tasks
+                            .unwrap_or_else(|| policy["dispatch_tasks"].as_bool().unwrap_or(false)),
+                        "include_intake": include_intake
+                            .unwrap_or_else(|| policy["include_intake"].as_bool().unwrap_or(true)),
+                        "max_intake_parallel": max_intake_parallel
+                            .unwrap_or_else(|| {
+                                policy["max_intake_parallel"].as_u64().unwrap_or(2) as u32
+                            }),
                     }
                 }),
             )
@@ -1415,6 +1537,14 @@ async fn main() -> Result<()> {
         Command::Sessions { project } => {
             rpc(&discovery, "session.list", json!({"project_id": project})).await?
         }
+        Command::Scheduler { project } => {
+            rpc(
+                &discovery,
+                "scheduler.status",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
         Command::Tasks { project, session } => {
             rpc(
                 &discovery,
@@ -1423,6 +1553,117 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::Intake {
+            project,
+            status,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "intake.list",
+                json!({"project_id": project, "status": status, "limit": limit}),
+            )
+            .await?
+        }
+        Command::IntakeAdd {
+            project,
+            title,
+            instructions,
+            profile,
+            kind,
+            priority,
+            scope,
+            acceptance,
+            depends_on,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            max_attempts,
+            labels,
+        } => {
+            let instructions = if instructions == "-" {
+                let mut buffer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buffer)
+                    .context("reading intake instructions from stdin")?;
+                buffer
+            } else {
+                instructions
+            };
+            rpc(
+                &discovery,
+                "intake.create",
+                json!({
+                    "project_id": project,
+                    "title": title,
+                    "instructions": instructions,
+                    "profile": profile,
+                    "kind": kind,
+                    "priority": priority,
+                    "write_scope": scope,
+                    "acceptance": acceptance,
+                    "deps": depends_on,
+                    "token_budget": token_budget,
+                    "cost_budget_usd": cost_budget_usd,
+                    "time_budget_secs": time_budget_secs,
+                    "max_attempts": max_attempts,
+                    "labels": labels,
+                    "origin": "cli",
+                }),
+            )
+            .await?
+        }
+        Command::IntakeEdit {
+            id,
+            title,
+            instructions,
+            profile,
+            kind,
+            priority,
+            scope,
+            acceptance,
+            depends_on,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            max_attempts,
+            labels,
+        } => {
+            let instructions = if instructions == "-" {
+                let mut buffer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buffer)
+                    .context("reading intake instructions from stdin")?;
+                buffer
+            } else {
+                instructions
+            };
+            rpc(
+                &discovery,
+                "intake.update",
+                json!({
+                    "id": id,
+                    "title": title,
+                    "instructions": instructions,
+                    "profile": profile,
+                    "kind": kind,
+                    "priority": priority,
+                    "write_scope": scope,
+                    "acceptance": acceptance,
+                    "deps": depends_on,
+                    "token_budget": token_budget,
+                    "cost_budget_usd": cost_budget_usd,
+                    "time_budget_secs": time_budget_secs,
+                    "max_attempts": max_attempts,
+                    "labels": labels,
+                }),
+            )
+            .await?
+        }
+        Command::IntakeRun { id } => rpc(&discovery, "intake.dispatch", json!({"id": id})).await?,
+        Command::IntakeCancel { id } => rpc(&discovery, "intake.cancel", json!({"id": id})).await?,
+        Command::IntakeRetry { id } => rpc(&discovery, "intake.retry", json!({"id": id})).await?,
+        Command::IntakeDelete { id } => rpc(&discovery, "intake.delete", json!({"id": id})).await?,
         Command::TaskDispatch { session } => {
             rpc(&discovery, "task.dispatch", json!({"session_id": session})).await?
         }
@@ -1560,6 +1801,26 @@ async fn main() -> Result<()> {
                 &discovery,
                 "workspace.file",
                 json!({"session_id": session, "path": path}),
+            )
+            .await?
+        }
+        Command::Grep {
+            session,
+            query,
+            path,
+            case_sensitive,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "workspace.grep",
+                json!({
+                    "session_id": session,
+                    "query": query,
+                    "path": path,
+                    "case_sensitive": case_sensitive,
+                    "max_results": limit,
+                }),
             )
             .await?
         }
@@ -2608,6 +2869,107 @@ fn print_human(value: &Value) {
         }
         return;
     }
+    if let Some(tasks) = value.get("tasks").and_then(Value::as_array)
+        && tasks
+            .first()
+            .is_none_or(|task| task.get("attempts").is_some() && task.get("instructions").is_some())
+        && value.get("leases").is_none()
+        && tasks
+            .iter()
+            .all(|task| task.get("attempts").is_some() && task.get("instructions").is_some())
+    {
+        if tasks.is_empty() {
+            println!("No intake tasks.");
+            return;
+        }
+        for task in tasks {
+            println!(
+                "{:<12} p{:<4} {:<10} {:<9} {}/{}  {}",
+                task["status"].as_str().unwrap_or("?"),
+                task["priority"].as_i64().unwrap_or(0),
+                task["profile"].as_str().unwrap_or("?"),
+                task["kind"].as_str().unwrap_or("?"),
+                task["attempts"].as_u64().unwrap_or(0),
+                task["max_attempts"].as_u64().unwrap_or(0),
+                task["title"].as_str().unwrap_or("")
+            );
+            println!("  id={}", task["id"].as_str().unwrap_or("?"));
+            if let Some(session) = task["session_id"].as_str() {
+                println!("  session={session}");
+            }
+            if let Some(deps) = task["deps"].as_array()
+                && !deps.is_empty()
+            {
+                println!(
+                    "  depends on: {}",
+                    deps.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if let Some(error) = task["last_error"].as_str() {
+                println!("  last error: {error}");
+            } else if let Some(summary) = task["result_summary"].as_str() {
+                println!("  result: {summary}");
+            }
+        }
+        return;
+    }
+    if let Some(task) = value.get("task")
+        && task.get("attempts").is_some()
+        && task.get("instructions").is_some()
+    {
+        println!(
+            "{}  p{}  {}  {}/{}  {}",
+            task["status"].as_str().unwrap_or("?"),
+            task["priority"].as_i64().unwrap_or(0),
+            task["profile"].as_str().unwrap_or("?"),
+            task["attempts"].as_u64().unwrap_or(0),
+            task["max_attempts"].as_u64().unwrap_or(0),
+            task["title"].as_str().unwrap_or("")
+        );
+        println!("id={}", task["id"].as_str().unwrap_or("?"));
+        if let Some(session) = task["session_id"].as_str() {
+            println!("session={session}");
+        }
+        if let Some(error) = task["last_error"].as_str() {
+            println!("last error: {error}");
+        }
+        return;
+    }
+    if let Some(matches) = value.get("matches").and_then(Value::as_array)
+        && value.get("files_scanned").is_some()
+    {
+        if matches.is_empty() {
+            println!("No matches.");
+            return;
+        }
+        for item in matches {
+            println!(
+                "{}:{}:{}  {}",
+                item["path"].as_str().unwrap_or("?"),
+                item["line"].as_u64().unwrap_or(0),
+                item["column"].as_u64().unwrap_or(0),
+                item["preview"].as_str().unwrap_or("")
+            );
+        }
+        println!(
+            "{} matches across {} files{}",
+            matches.len(),
+            value["files_scanned"].as_u64().unwrap_or(0),
+            if value["truncated"].as_bool() == Some(true) {
+                " (truncated)"
+            } else {
+                ""
+            }
+        );
+        return;
+    }
+    if let Some(deleted) = value.get("deleted").and_then(Value::as_bool) {
+        println!("{}", if deleted { "deleted." } else { "not deleted." });
+        return;
+    }
     if let Some(task) = value.get("task")
         && task.get("session_id").is_some()
         && task.get("task_id").is_some()
@@ -2618,6 +2980,47 @@ fn print_human(value: &Value) {
             task["task_id"].as_str().unwrap_or("?"),
             task["status"].as_str().unwrap_or("?")
         );
+        return;
+    }
+    if let Some(projects) = value.get("projects").and_then(Value::as_array)
+        && value.get("global_session_cap").is_some()
+    {
+        println!(
+            "sessions: active={} queued={} paused={} cap={}",
+            value["active_sessions"].as_u64().unwrap_or(0),
+            value["queued_sessions"].as_u64().unwrap_or(0),
+            value["paused_sessions"].as_u64().unwrap_or(0),
+            value["global_session_cap"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "workers: {}  labour: {}  plan tasks: pending={} running={}",
+            value["global_worker_cap"].as_u64().unwrap_or(0),
+            value["global_labour_cap"].as_u64().unwrap_or(0),
+            value["pending_plan_tasks"].as_u64().unwrap_or(0),
+            value["running_plan_tasks"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "intake: queued={} active={} failed={}",
+            value["queued_intake"].as_u64().unwrap_or(0),
+            value["active_intake"].as_u64().unwrap_or(0),
+            value["failed_intake"].as_u64().unwrap_or(0)
+        );
+        for project in projects {
+            println!(
+                "{}  enabled={} intake={} cap={} cooldown={}s  sessions={} plan={}/{}  intake={}/{}/{}",
+                project["project_name"].as_str().unwrap_or("?"),
+                project["enabled"].as_bool().unwrap_or(false),
+                project["include_intake"].as_bool().unwrap_or(false),
+                project["max_intake_parallel"].as_u64().unwrap_or(0),
+                project["cooldown_secs"].as_u64().unwrap_or(0),
+                project["pending_sessions"].as_u64().unwrap_or(0),
+                project["running_plan_tasks"].as_u64().unwrap_or(0),
+                project["pending_plan_tasks"].as_u64().unwrap_or(0),
+                project["active_intake"].as_u64().unwrap_or(0),
+                project["queued_intake"].as_u64().unwrap_or(0),
+                project["failed_intake"].as_u64().unwrap_or(0)
+            );
+        }
         return;
     }
     if let Some(tasks) = value.get("tasks").and_then(Value::as_array)
@@ -3008,6 +3411,25 @@ fn print_human(value: &Value) {
             value["size"].as_u64().unwrap_or(0),
             &sha256[..sha256.len().min(12)]
         );
+        return;
+    }
+    if value.get("attempts").is_some() && value.get("instructions").is_some() {
+        println!(
+            "{}  p{}  {}  {}/{}  {}",
+            value["status"].as_str().unwrap_or("?"),
+            value["priority"].as_i64().unwrap_or(0),
+            value["profile"].as_str().unwrap_or("?"),
+            value["attempts"].as_u64().unwrap_or(0),
+            value["max_attempts"].as_u64().unwrap_or(0),
+            value["title"].as_str().unwrap_or("")
+        );
+        println!("id={}", value["id"].as_str().unwrap_or("?"));
+        if let Some(session) = value["session_id"].as_str() {
+            println!("session={session}");
+        }
+        if let Some(error) = value["last_error"].as_str() {
+            println!("last error: {error}");
+        }
         return;
     }
     if let Some(priority) = value.get("priority").and_then(Value::as_i64)

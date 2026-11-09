@@ -9,6 +9,16 @@ struct ArtifactPreviewData {
     let truncated: Bool
 }
 
+struct WorkspaceDirectoryState: Equatable {
+    var entries: [WorkspaceEntry] = []
+    var total = 0
+    var hasMore = false
+    var truncated = false
+    var loading = false
+    var loadingMore = false
+    var error: String?
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -118,6 +128,19 @@ final class AppModel {
     var workspaceEntries: [WorkspaceEntry] = []
     var workspaceTreeBusy = false
     var workspaceTreeError: String?
+    var workspaceDirectories: [String: WorkspaceDirectoryState] = [:]
+    var workspaceSearchResults: [WorkspaceEntry] = []
+    var workspaceSearchBusy = false
+    var workspaceSearchError: String?
+    var workspaceSearchTruncated = false
+    var workspaceSearchQuery = ""
+    var workspaceSearchMode: WorkspaceSearchMode = .names
+    var workspaceContentMatches: [WorkspaceGrepMatch] = []
+    var workspaceContentSearchBusy = false
+    var workspaceContentSearchError: String?
+    var workspaceContentSearchTruncated = false
+    var workspaceContentFilesScanned = 0
+    var workspaceContentSearchQuery = ""
     var workspaceFilter = ""
     var workspaceSelectedPath: String?
     var workspaceFile: WorkspaceFileResult?
@@ -205,9 +228,32 @@ final class AppModel {
     var taskSchedulerPolicy = TaskSchedulerPolicy.disabled
     var taskSchedulerEnabled = false
     var taskSchedulerDispatchTasks = false
+    var taskSchedulerIncludeIntake = true
+    var taskSchedulerMaxIntakeParallelText = "2"
     var taskSchedulerCooldownText = "60"
     var taskSchedulerPolicyBusy = false
     var taskSchedulerPolicyStatus: String?
+    var schedulerStatus: SchedulerStatusResult?
+    var schedulerStatusBusy = false
+    var schedulerStatusError: String?
+    var intakeTasks: [IntakeTask] = []
+    var intakeBusy = false
+    var intakeStatus: String?
+    var intakeActionBusyID: String?
+    var intakeDraftTitle = ""
+    var intakeDraftInstructions = ""
+    var intakeDraftProfile = "coding"
+    var intakeDraftKind = ""
+    var intakeDraftPriorityText = "0"
+    var intakeDraftScope = ""
+    var intakeDraftAcceptance = ""
+    var intakeDraftMaxAttemptsText = "2"
+    var intakeDraftTokenBudget = ""
+    var intakeDraftCostBudget = ""
+    var intakeDraftTimeBudget = ""
+    var intakeDraftLabels = ""
+    var intakeDraftDeps: Set<String> = []
+    var intakeEditingID: String?
     var contextStatus: SessionContextStatus?
     var compactBusy = false
     var compactNotice: String?
@@ -629,6 +675,12 @@ final class AppModel {
         projectUsageStatus = nil
         memories = []
         taskQueue = nil
+        schedulerStatus = nil
+        schedulerStatusError = nil
+        intakeTasks = []
+        intakeStatus = nil
+        intakeEditingID = nil
+        intakeDraftDeps = []
         scheduledSessionTasks = []
         scheduledSessionTasksSessionID = nil
         orchestrationSnapshot = nil
@@ -641,6 +693,7 @@ final class AppModel {
         gitSelectedCommit = nil
         gitShow = nil
         workspaceEntries = []
+        resetWorkspaceBrowser()
         workspaceSelectedPath = nil
         workspaceFile = nil
         workspaceFileError = nil
@@ -713,6 +766,7 @@ final class AppModel {
         gitSelectedCommit = nil
         gitShow = nil
         workspaceEntries = []
+        resetWorkspaceBrowser()
         workspaceSelectedPath = nil
         workspaceFile = nil
         workspaceFileError = nil
@@ -1691,6 +1745,7 @@ final class AppModel {
     func loadWorkspaceTree() async {
         guard let sessionID = selectedSessionID else {
             workspaceEntries = []
+            resetWorkspaceBrowser()
             workspaceSelectedPath = nil
             workspaceFile = nil
             workspaceDraft = ""
@@ -1724,6 +1779,181 @@ final class AppModel {
             }
         } catch {
             workspaceTreeError = error.localizedDescription
+        }
+    }
+
+    func resetWorkspaceBrowser() {
+        workspaceDirectories = [:]
+        workspaceSearchResults = []
+        workspaceSearchBusy = false
+        workspaceSearchError = nil
+        workspaceSearchTruncated = false
+        workspaceSearchQuery = ""
+        workspaceSearchMode = .names
+        workspaceContentMatches = []
+        workspaceContentSearchBusy = false
+        workspaceContentSearchError = nil
+        workspaceContentSearchTruncated = false
+        workspaceContentFilesScanned = 0
+        workspaceContentSearchQuery = ""
+    }
+
+    func loadWorkspaceRoot() async {
+        if workspaceDirectories[""] == nil {
+            await loadWorkspaceDirectory("", reset: true)
+        }
+    }
+
+    func loadWorkspaceDirectory(_ path: String, reset: Bool = false) async {
+        guard let sessionID = selectedSessionID else { return }
+        let generation = selectionGeneration
+        if !reset, workspaceDirectories[path]?.loading == true {
+            return
+        }
+        var state = workspaceDirectories[path] ?? WorkspaceDirectoryState()
+        state.loading = true
+        state.error = nil
+        workspaceDirectories[path] = state
+        do {
+            let result = try await core.workspaceList(
+                sessionID: sessionID,
+                path: path,
+                offset: 0,
+                limit: 500
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            workspaceDirectories[path] = WorkspaceDirectoryState(
+                entries: result.entries,
+                total: result.total,
+                hasMore: result.hasMore,
+                truncated: result.truncated
+            )
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            var failed = workspaceDirectories[path] ?? WorkspaceDirectoryState()
+            failed.loading = false
+            failed.error = error.localizedDescription
+            workspaceDirectories[path] = failed
+        }
+    }
+
+    func loadMoreWorkspaceDirectory(_ path: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        var state = workspaceDirectories[path] ?? WorkspaceDirectoryState()
+        guard state.hasMore, !state.loading, !state.loadingMore else { return }
+        state.loadingMore = true
+        workspaceDirectories[path] = state
+        let generation = selectionGeneration
+        do {
+            let result = try await core.workspaceList(
+                sessionID: sessionID,
+                path: path,
+                offset: state.entries.count,
+                limit: 500
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            var updated = workspaceDirectories[path] ?? state
+            updated.entries.append(contentsOf: result.entries)
+            updated.total = result.total
+            updated.hasMore = result.hasMore
+            updated.truncated = result.truncated
+            updated.loadingMore = false
+            workspaceDirectories[path] = updated
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            var failed = workspaceDirectories[path] ?? state
+            failed.loadingMore = false
+            failed.error = error.localizedDescription
+            workspaceDirectories[path] = failed
+        }
+    }
+
+    func refreshWorkspaceBrowser() async {
+        guard let sessionID = selectedSessionID else {
+            resetWorkspaceBrowser()
+            return
+        }
+        let generation = selectionGeneration
+        workspaceDirectories = [:]
+        workspaceSearchResults = []
+        workspaceSearchError = nil
+        workspaceSearchTruncated = false
+        workspaceSearchQuery = ""
+        workspaceContentMatches = []
+        workspaceContentSearchError = nil
+        workspaceContentSearchTruncated = false
+        workspaceContentFilesScanned = 0
+        workspaceContentSearchQuery = ""
+        await loadWorkspaceDirectory("", reset: true)
+        guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+    }
+
+    func searchWorkspace(_ rawQuery: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        workspaceSearchQuery = query
+        workspaceSearchError = nil
+        if query.isEmpty {
+            workspaceSearchResults = []
+            workspaceSearchTruncated = false
+            workspaceSearchBusy = false
+            return
+        }
+        workspaceSearchBusy = true
+        let generation = selectionGeneration
+        do {
+            let result = try await core.workspaceSearch(sessionID: sessionID, query: query)
+            guard isCurrent(sessionID: sessionID, generation: generation),
+                  workspaceSearchQuery == query
+            else { return }
+            workspaceSearchResults = result.entries
+            workspaceSearchTruncated = result.truncated
+            workspaceSearchBusy = false
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation),
+                  workspaceSearchQuery == query
+            else { return }
+            workspaceSearchError = error.localizedDescription
+            workspaceSearchBusy = false
+        }
+    }
+
+    func searchWorkspaceContents(_ rawQuery: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        workspaceContentSearchQuery = query
+        workspaceContentSearchError = nil
+        if query.isEmpty {
+            workspaceContentMatches = []
+            workspaceContentSearchTruncated = false
+            workspaceContentFilesScanned = 0
+            workspaceContentSearchBusy = false
+            return
+        }
+        workspaceContentSearchBusy = true
+        let generation = selectionGeneration
+        do {
+            let result = try await core.workspaceGrep(sessionID: sessionID, query: query)
+            guard selectionGeneration == generation,
+                  workspaceContentSearchQuery == query
+            else { return }
+            workspaceContentMatches = result.matches
+            workspaceContentFilesScanned = result.filesScanned
+            workspaceContentSearchTruncated = result.truncated
+            workspaceContentSearchBusy = false
+        } catch {
+            guard selectionGeneration == generation,
+                  workspaceContentSearchQuery == query
+            else { return }
+            workspaceContentSearchError = error.localizedDescription
+            workspaceContentSearchBusy = false
+        }
+    }
+
+    func setWorkspaceSearchMode(_ mode: WorkspaceSearchMode) {
+        if workspaceSearchMode != mode {
+            workspaceSearchMode = mode
+            workspaceContentSearchError = nil
         }
     }
 
@@ -3062,6 +3292,8 @@ final class AppModel {
             taskSchedulerPolicy = .disabled
             taskSchedulerEnabled = false
             taskSchedulerDispatchTasks = false
+            taskSchedulerIncludeIntake = true
+            taskSchedulerMaxIntakeParallelText = "2"
             taskSchedulerCooldownText = "60"
             return
         }
@@ -3071,6 +3303,8 @@ final class AppModel {
             taskSchedulerPolicy = policy
             taskSchedulerEnabled = policy.enabled
             taskSchedulerDispatchTasks = policy.dispatchTasks
+            taskSchedulerIncludeIntake = policy.includeIntake
+            taskSchedulerMaxIntakeParallelText = String(policy.maxIntakeParallel)
             taskSchedulerCooldownText = String(policy.cooldownSecs)
             taskSchedulerPolicyStatus = nil
         } catch {
@@ -3088,6 +3322,12 @@ final class AppModel {
             taskSchedulerPolicyStatus = "Cooldown must be between 1 and 86400 seconds."
             return
         }
+        let parallelText = taskSchedulerMaxIntakeParallelText
+            .trimmingCharacters(in: .whitespaces)
+        guard let parallel = Int(parallelText), (1 ... 10).contains(parallel) else {
+            taskSchedulerPolicyStatus = "Intake parallelism must be between 1 and 10."
+            return
+        }
         taskSchedulerPolicyBusy = true
         defer { taskSchedulerPolicyBusy = false }
         do {
@@ -3096,25 +3336,309 @@ final class AppModel {
                 policy: TaskSchedulerPolicy(
                     enabled: taskSchedulerEnabled,
                     cooldownSecs: cooldown,
-                    dispatchTasks: taskSchedulerDispatchTasks
+                    dispatchTasks: taskSchedulerDispatchTasks,
+                    includeIntake: taskSchedulerIncludeIntake,
+                    maxIntakeParallel: parallel
                 )
             )
             guard projectID == selectedProjectID else { return }
             taskSchedulerPolicy = policy
             taskSchedulerEnabled = policy.enabled
             taskSchedulerDispatchTasks = policy.dispatchTasks
+            taskSchedulerIncludeIntake = policy.includeIntake
+            taskSchedulerMaxIntakeParallelText = String(policy.maxIntakeParallel)
             taskSchedulerCooldownText = String(policy.cooldownSecs)
             if policy.enabled {
                 let mode = policy.dispatchTasks ? "per-task dispatch" : "full plan resume"
+                let intake = policy.includeIntake ? "intake on" : "intake off"
                 taskSchedulerPolicyStatus =
-                    "Scheduler enabled · \(mode) · cooldown \(policy.cooldownSecs)s"
+                    "Scheduler enabled · \(mode) · \(intake) · cooldown \(policy.cooldownSecs)s"
             } else {
-                taskSchedulerPolicyStatus = "Auto-resume disabled"
+                taskSchedulerPolicyStatus = "Autonomous dispatch disabled"
             }
             await loadTaskQueue()
+            await loadIntakeTasks()
+            await loadSchedulerStatus()
         } catch {
             taskSchedulerPolicyStatus = error.localizedDescription
         }
+    }
+
+    func loadSchedulerStatus(silent: Bool = false) async {
+        let projectID = selectedProjectID
+        let generation = selectionGeneration
+        if !silent {
+            schedulerStatusBusy = true
+        }
+        defer {
+            if !silent {
+                schedulerStatusBusy = false
+            }
+        }
+        do {
+            let status = try await core.schedulerStatus(projectID: projectID)
+            guard generation == selectionGeneration, projectID == selectedProjectID else {
+                return
+            }
+            schedulerStatus = status
+            schedulerStatusError = nil
+        } catch {
+            guard generation == selectionGeneration, projectID == selectedProjectID else {
+                return
+            }
+            if !silent {
+                schedulerStatusError = error.localizedDescription
+            }
+        }
+    }
+
+    func loadIntakeTasks(silent: Bool = false) async {
+        guard let projectID = selectedProjectID else {
+            intakeTasks = []
+            return
+        }
+        let generation = selectionGeneration
+        if !silent {
+            intakeBusy = true
+        }
+        defer {
+            if !silent {
+                intakeBusy = false
+            }
+        }
+        do {
+            let result = try await core.intakeTasks(projectID: projectID, limit: 200)
+            guard selectionGeneration == generation, projectID == selectedProjectID else {
+                return
+            }
+            intakeTasks = result.tasks
+            if !silent {
+                intakeStatus = nil
+            }
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            if !silent {
+                intakeStatus = error.localizedDescription
+            }
+        }
+    }
+
+    func createIntakeTask() async {
+        guard let projectID = selectedProjectID else {
+            intakeStatus = "Select a project first."
+            return
+        }
+        let title = intakeDraftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let instructions = intakeDraftInstructions
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            intakeStatus = "Give the task a title."
+            return
+        }
+        guard !instructions.isEmpty else {
+            intakeStatus = "Describe what the task should accomplish."
+            return
+        }
+        let priorityText = intakeDraftPriorityText.trimmingCharacters(in: .whitespaces)
+        guard let priority = Int(priorityText), (-100 ... 100).contains(priority) else {
+            intakeStatus = "Priority must be a whole number between -100 and 100."
+            return
+        }
+        let attemptsText = intakeDraftMaxAttemptsText.trimmingCharacters(in: .whitespaces)
+        guard let maxAttempts = UInt32(attemptsText), (1 ... 10).contains(maxAttempts) else {
+            intakeStatus = "Max attempts must be a whole number between 1 and 10."
+            return
+        }
+        let tokenText = intakeDraftTokenBudget.trimmingCharacters(in: .whitespaces)
+        let tokenBudget = tokenText.isEmpty ? nil : UInt64(tokenText)
+        if !tokenText.isEmpty, tokenBudget == nil || tokenBudget == 0 {
+            intakeStatus = "Token budget must be a positive whole number."
+            return
+        }
+        let timeText = intakeDraftTimeBudget.trimmingCharacters(in: .whitespaces)
+        let timeBudget = timeText.isEmpty ? nil : UInt64(timeText)
+        if !timeText.isEmpty, timeBudget == nil || timeBudget == 0 {
+            intakeStatus = "Time budget must be a positive number of seconds."
+            return
+        }
+        let costText = intakeDraftCostBudget.trimmingCharacters(in: .whitespaces)
+        let costBudget = costText.isEmpty ? nil : Double(costText)
+        if !costText.isEmpty, costBudget == nil || costBudget! <= 0 {
+            intakeStatus = "Cost budget must be a positive number."
+            return
+        }
+        let scope = parseIntakeItems(intakeDraftScope)
+        let acceptance = parseIntakeItems(intakeDraftAcceptance)
+        let labels = parseIntakeItems(intakeDraftLabels)
+        let deps = intakeDraftDeps.sorted()
+        intakeBusy = true
+        defer { intakeBusy = false }
+        do {
+            if let editingID = intakeEditingID {
+                _ = try await core.updateIntakeTask(
+                    id: editingID,
+                    title: title,
+                    instructions: instructions,
+                    profile: intakeDraftProfile,
+                    kind: intakeDraftKind.isEmpty ? nil : intakeDraftKind,
+                    priority: priority,
+                    writeScope: scope,
+                    acceptance: acceptance,
+                    deps: deps,
+                    tokenBudget: tokenBudget,
+                    costBudgetUsd: costBudget,
+                    timeBudgetSecs: timeBudget,
+                    maxAttempts: maxAttempts,
+                    labels: labels
+                )
+                intakeStatus = "Task updated and re-queued."
+            } else {
+                _ = try await core.createIntakeTask(
+                    projectID: projectID,
+                    title: title,
+                    instructions: instructions,
+                    profile: intakeDraftProfile,
+                    kind: intakeDraftKind.isEmpty ? nil : intakeDraftKind,
+                    priority: priority,
+                    writeScope: scope,
+                    acceptance: acceptance,
+                    deps: deps,
+                    tokenBudget: tokenBudget,
+                    costBudgetUsd: costBudget,
+                    timeBudgetSecs: timeBudget,
+                    maxAttempts: maxAttempts,
+                    labels: labels
+                )
+                intakeStatus = "Task queued. The autonomous dispatcher will pick it up."
+            }
+            clearIntakeDraft()
+            await loadIntakeTasks()
+        } catch {
+            intakeStatus = error.localizedDescription
+        }
+    }
+
+    func beginIntakeEdit(_ task: IntakeTask) {
+        intakeEditingID = task.id
+        intakeDraftTitle = task.title
+        intakeDraftInstructions = task.instructions
+        intakeDraftProfile = task.profile
+        intakeDraftKind = task.kind
+        intakeDraftPriorityText = String(task.priority)
+        intakeDraftScope = task.writeScope.joined(separator: ", ")
+        intakeDraftAcceptance = task.acceptance.joined(separator: ", ")
+        intakeDraftMaxAttemptsText = String(task.maxAttempts)
+        intakeDraftTokenBudget = task.tokenBudget.map(String.init) ?? ""
+        intakeDraftCostBudget = task.costBudgetUsd.map { String(format: "%.4f", $0) } ?? ""
+        intakeDraftTimeBudget = task.timeBudgetSecs.map(String.init) ?? ""
+        intakeDraftLabels = task.labels.joined(separator: ", ")
+        intakeDraftDeps = Set(task.deps)
+        intakeStatus = "Editing \(task.title). Saving re-queues the task."
+    }
+
+    func cancelIntakeEdit() {
+        clearIntakeDraft()
+        intakeStatus = nil
+    }
+
+    private func clearIntakeDraft() {
+        intakeEditingID = nil
+        intakeDraftTitle = ""
+        intakeDraftInstructions = ""
+        intakeDraftKind = ""
+        intakeDraftPriorityText = "0"
+        intakeDraftScope = ""
+        intakeDraftAcceptance = ""
+        intakeDraftMaxAttemptsText = "2"
+        intakeDraftTokenBudget = ""
+        intakeDraftCostBudget = ""
+        intakeDraftTimeBudget = ""
+        intakeDraftLabels = ""
+        intakeDraftDeps = []
+    }
+
+    func toggleIntakeDependency(_ id: String) {
+        if intakeDraftDeps.contains(id) {
+            intakeDraftDeps.remove(id)
+        } else {
+            intakeDraftDeps.insert(id)
+        }
+    }
+
+    func dispatchIntakeTask(_ task: IntakeTask) async {
+        intakeActionBusyID = task.id
+        defer { intakeActionBusyID = nil }
+        do {
+            let result = try await core.dispatchIntakeTask(id: task.id)
+            if result.started {
+                if let sessionID = result.sessionID {
+                    intakeStatus = "Task dispatched in session \(sessionID.prefix(8))."
+                } else {
+                    intakeStatus = "Task dispatched."
+                }
+            } else {
+                intakeStatus = result.task.lastError ?? "The task could not start."
+            }
+            await loadIntakeTasks()
+            await loadSessions()
+        } catch {
+            intakeStatus = error.localizedDescription
+        }
+    }
+
+    func cancelIntakeTask(_ task: IntakeTask) async {
+        intakeActionBusyID = task.id
+        defer { intakeActionBusyID = nil }
+        do {
+            _ = try await core.cancelIntakeTask(id: task.id)
+            intakeStatus = "Task cancelled."
+            await loadIntakeTasks()
+            if task.sessionID == selectedSessionID {
+                await loadSessions()
+            }
+        } catch {
+            intakeStatus = error.localizedDescription
+        }
+    }
+
+    func retryIntakeTask(_ task: IntakeTask) async {
+        intakeActionBusyID = task.id
+        defer { intakeActionBusyID = nil }
+        do {
+            _ = try await core.retryIntakeTask(id: task.id)
+            intakeStatus = "Task queued for another attempt."
+            await loadIntakeTasks()
+        } catch {
+            intakeStatus = error.localizedDescription
+        }
+    }
+
+    func deleteIntakeTask(_ task: IntakeTask) async {
+        intakeActionBusyID = task.id
+        defer { intakeActionBusyID = nil }
+        do {
+            _ = try await core.deleteIntakeTask(id: task.id)
+            intakeStatus = "Task removed."
+            await loadIntakeTasks()
+        } catch {
+            intakeStatus = error.localizedDescription
+        }
+    }
+
+    func openIntakeSession(_ task: IntakeTask) {
+        guard let sessionID = task.sessionID else { return }
+        selectSession(sessionID)
+    }
+
+    private func parseIntakeItems(_ text: String) -> [String] {
+        var items: [String] = []
+        for raw in text.split(whereSeparator: { $0 == "," || $0 == "\n" }) {
+            let item = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !item.isEmpty, !items.contains(item) {
+                items.append(item)
+            }
+        }
+        return items
     }
 
     func dispatchScheduledTaskNow() async {
@@ -4410,6 +4934,13 @@ final class AppModel {
            ["agent.spawned", "agent.finished", "agent.updated"].contains(event.type)
         {
             Task { await self.loadAgents() }
+        }
+
+        if event.type.hasPrefix("intake.") {
+            Task {
+                await self.loadIntakeTasks(silent: true)
+                await self.loadSchedulerStatus(silent: true)
+            }
         }
 
         if event.sessionId == selectedSessionID,

@@ -257,9 +257,11 @@ async fn task_scheduler_policy_round_trips_and_validates() {
         .await
         .unwrap();
     let default = engine.get_task_scheduler_policy(&project.id).await.unwrap();
-    assert!(!default.policy.enabled);
+    assert!(default.policy.enabled);
     assert_eq!(default.policy.cooldown_secs, 60);
     assert!(!default.policy.dispatch_tasks);
+    assert!(default.policy.include_intake);
+    assert_eq!(default.policy.max_intake_parallel, 2);
 
     let saved = engine
         .set_task_scheduler_policy(
@@ -268,6 +270,8 @@ async fn task_scheduler_policy_round_trips_and_validates() {
                 enabled: true,
                 cooldown_secs: 12,
                 dispatch_tasks: true,
+                include_intake: true,
+                max_intake_parallel: 2,
             },
         )
         .await
@@ -287,6 +291,8 @@ async fn task_scheduler_policy_round_trips_and_validates() {
                     enabled: true,
                     cooldown_secs: 0,
                     dispatch_tasks: false,
+                    include_intake: true,
+                    max_intake_parallel: 2,
                 },
             )
             .await
@@ -300,6 +306,8 @@ async fn task_scheduler_policy_round_trips_and_validates() {
                     enabled: true,
                     cooldown_secs: 60,
                     dispatch_tasks: false,
+                    include_intake: true,
+                    max_intake_parallel: 2,
                 },
             )
             .await
@@ -5176,4 +5184,203 @@ async fn integration_runtime_leases_serialize_merge_work() {
         .await
         .unwrap();
     second_lease.release().await;
+}
+
+#[tokio::test]
+async fn intake_validation_and_one_task_plan_are_deterministic() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("intake".into()),
+        )
+        .await
+        .unwrap();
+
+    let bad_scope = IntakeCreateParams {
+        project_id: project.id.clone(),
+        title: "Escape".into(),
+        instructions: "write outside".into(),
+        profile: Some("coding".into()),
+        kind: Some("coding".into()),
+        priority: None,
+        write_scope: vec!["../etc".into()],
+        acceptance: Vec::new(),
+        deps: Vec::new(),
+        token_budget: None,
+        cost_budget_usd: None,
+        time_budget_secs: None,
+        max_attempts: None,
+        labels: Vec::new(),
+        origin: Some("test".into()),
+    };
+    assert!(engine.create_intake_task(bad_scope).await.is_err());
+
+    let bad_profile = IntakeCreateParams {
+        project_id: project.id.clone(),
+        title: "Read only coding".into(),
+        instructions: "do it".into(),
+        profile: Some("verification".into()),
+        kind: Some("coding".into()),
+        priority: None,
+        write_scope: Vec::new(),
+        acceptance: Vec::new(),
+        deps: Vec::new(),
+        token_budget: None,
+        cost_budget_usd: None,
+        time_budget_secs: None,
+        max_attempts: None,
+        labels: Vec::new(),
+        origin: None,
+    };
+    assert!(engine.create_intake_task(bad_profile).await.is_err());
+
+    let task = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Review the release notes".into(),
+            instructions: "Read the docs and return a concise review.".into(),
+            profile: Some("research".into()),
+            kind: Some("research".into()),
+            priority: Some(9),
+            write_scope: Vec::new(),
+            acceptance: vec!["the review cites concrete sections".into()],
+            deps: Vec::new(),
+            token_budget: Some(30_000),
+            cost_budget_usd: Some(2.0),
+            time_budget_secs: Some(900),
+            max_attempts: Some(3),
+            labels: vec!["docs".into()],
+            origin: Some("api".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(task.status, "queued");
+    assert_eq!(task.priority, 9);
+    assert_eq!(task.profile, "research");
+    let plan = engine.intake_plan(&task);
+    crate::agent::validate_team_plan(&plan, 5).unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].id, "T1");
+    assert_eq!(plan.tasks[0].department, plan.departments[0].name);
+    assert_eq!(plan.tasks[0].token_budget, Some(30_000));
+
+    let snapshots = vp_store::store::read_project_manifest(data.path()).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].intake_tasks.len(), 1);
+    assert_eq!(snapshots[0].intake_tasks[0].id, task.id);
+
+    let parent = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Parent".into(),
+            instructions: "Do the parent work.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: Some(1),
+            write_scope: vec!["src/parent".into()],
+            acceptance: Vec::new(),
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: None,
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let missing_dep = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Missing dependency".into(),
+            instructions: "Wait for a task that does not exist.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: None,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: vec!["does-not-exist".into()],
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: None,
+            labels: Vec::new(),
+            origin: None,
+        })
+        .await;
+    assert!(missing_dep.is_err());
+    let self_dep = IntakeUpdateParams {
+        id: parent.id.clone(),
+        title: parent.title.clone(),
+        instructions: parent.instructions.clone(),
+        profile: Some(parent.profile.clone()),
+        kind: Some(parent.kind.clone()),
+        priority: Some(parent.priority),
+        write_scope: parent.write_scope.clone(),
+        acceptance: parent.acceptance.clone(),
+        deps: vec![parent.id.clone()],
+        token_budget: None,
+        cost_budget_usd: None,
+        time_budget_secs: None,
+        max_attempts: None,
+        labels: Vec::new(),
+    };
+    assert!(engine.update_intake_task(self_dep).await.is_err());
+    let child = engine
+        .create_intake_task(IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Child".into(),
+            instructions: "Depends on the parent.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: None,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: vec![parent.id.clone()],
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: None,
+            labels: Vec::new(),
+            origin: None,
+        })
+        .await
+        .unwrap();
+    let cycle = IntakeUpdateParams {
+        id: parent.id.clone(),
+        title: parent.title.clone(),
+        instructions: parent.instructions.clone(),
+        profile: Some(parent.profile.clone()),
+        kind: Some(parent.kind.clone()),
+        priority: Some(parent.priority),
+        write_scope: parent.write_scope.clone(),
+        acceptance: parent.acceptance.clone(),
+        deps: vec![child.id.clone()],
+        token_budget: None,
+        cost_budget_usd: None,
+        time_budget_secs: None,
+        max_attempts: None,
+        labels: Vec::new(),
+    };
+    let error = engine.update_intake_task(cycle).await.unwrap_err();
+    assert!(error.to_string().contains("cycle"));
+
+    let error = engine
+        .set_task_scheduler_policy(
+            &project.id,
+            TaskSchedulerPolicy {
+                enabled: true,
+                cooldown_secs: 5,
+                dispatch_tasks: false,
+                include_intake: true,
+                max_intake_parallel: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("intake"));
 }

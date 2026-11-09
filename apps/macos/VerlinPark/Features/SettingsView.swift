@@ -307,15 +307,12 @@ struct GeneralSettingsView: View {
                                             .foregroundStyle(VPTheme.textTertiary)
                                     }
                                     Spacer()
-                                    Button {
+                                    VPCloseButton(
+                                        size: 22,
+                                        help: L10n.t("Remove grant")
+                                    ) {
                                         Task { await model.deleteApprovalGrant(grant) }
-                                    } label: {
-                                        Image(systemName: "xmark")
-                                            .font(.system(size: 7, weight: .semibold))
-                                            .foregroundStyle(VPTheme.textTertiary)
                                     }
-                                    .buttonStyle(.plain)
-                                    .help(L10n.t("Remove grant"))
                                 }
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 4)

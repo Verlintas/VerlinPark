@@ -78,7 +78,9 @@ impl ApprovalMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskSchedulerPolicy {
-    #[serde(default)]
+    /// Default-on. New projects begin with the autonomous dispatcher enabled;
+    /// an explicit false row (or `VERLINPARK_TASK_SCHEDULER=0`) opts out.
+    #[serde(default = "default_task_scheduler_enabled")]
     pub enabled: bool,
     #[serde(default = "default_task_scheduler_cooldown")]
     pub cooldown_secs: u64,
@@ -86,20 +88,41 @@ pub struct TaskSchedulerPolicy {
     /// of resuming the whole stored plan.
     #[serde(default)]
     pub dispatch_tasks: bool,
+    /// Dispatch standalone task-inbox items that are not attached to a stored
+    /// TeamPlan. Intake tasks always run through a synthesized one-task plan.
+    #[serde(default = "default_intake_enabled")]
+    pub include_intake: bool,
+    /// Maximum intake sessions that may be dispatching/running per project.
+    #[serde(default = "default_intake_parallel")]
+    pub max_intake_parallel: u32,
 }
 
 impl Default for TaskSchedulerPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             cooldown_secs: default_task_scheduler_cooldown(),
             dispatch_tasks: false,
+            include_intake: true,
+            max_intake_parallel: default_intake_parallel(),
         }
     }
 }
 
+fn default_task_scheduler_enabled() -> bool {
+    true
+}
+
 fn default_task_scheduler_cooldown() -> u64 {
     60
+}
+
+fn default_intake_enabled() -> bool {
+    true
+}
+
+fn default_intake_parallel() -> u32 {
+    2
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,6 +140,45 @@ pub struct SetTaskSchedulerPolicyParams {
 pub struct TaskSchedulerPolicyResult {
     pub project_id: String,
     pub policy: TaskSchedulerPolicy,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SchedulerStatusParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerProjectStatus {
+    pub project_id: String,
+    pub project_name: String,
+    pub enabled: bool,
+    pub cooldown_secs: u64,
+    pub dispatch_tasks: bool,
+    pub include_intake: bool,
+    pub max_intake_parallel: u32,
+    pub pending_sessions: usize,
+    pub pending_plan_tasks: usize,
+    pub running_plan_tasks: usize,
+    pub queued_intake: usize,
+    pub active_intake: usize,
+    pub failed_intake: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerStatusResult {
+    pub active_sessions: usize,
+    pub queued_sessions: usize,
+    pub paused_sessions: usize,
+    pub pending_plan_tasks: usize,
+    pub running_plan_tasks: usize,
+    pub queued_intake: usize,
+    pub active_intake: usize,
+    pub failed_intake: usize,
+    pub global_session_cap: usize,
+    pub global_worker_cap: usize,
+    pub global_labour_cap: usize,
+    pub projects: Vec<SchedulerProjectStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,6 +434,71 @@ pub struct WorkspaceEntry {
 pub struct WorkspaceTreeResult {
     pub root: String,
     pub entries: Vec<WorkspaceEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceListParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceListResult {
+    pub root: String,
+    pub path: String,
+    pub entries: Vec<WorkspaceEntry>,
+    pub total: usize,
+    pub has_more: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceSearchParams {
+    pub session_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceSearchResult {
+    pub entries: Vec<WorkspaceEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceGrepParams {
+    pub session_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+    #[serde(default)]
+    pub max_results: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceGrepMatch {
+    pub path: String,
+    /// 1-based line number.
+    pub line: u32,
+    /// 1-based character column.
+    pub column: u32,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceGrepResult {
+    pub query: String,
+    pub matches: Vec<WorkspaceGrepMatch>,
+    pub files_scanned: usize,
     pub truncated: bool,
 }
 
@@ -2781,6 +2908,146 @@ pub struct TaskQueueResult {
 pub struct TaskActionParams {
     pub session_id: String,
     pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntakeTask {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub instructions: String,
+    pub profile: String,
+    pub kind: String,
+    pub priority: i32,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    /// Other intake task ids that must complete before this task is runnable.
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    pub status: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub result_summary: Option<String>,
+    pub origin: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IntakeListParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IntakeListResult {
+    pub tasks: Vec<IntakeTask>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IntakeCreateParams {
+    pub project_id: String,
+    pub title: String,
+    pub instructions: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IntakeUpdateParams {
+    pub id: String,
+    pub title: String,
+    pub instructions: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IntakeTaskParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IntakeActionResult {
+    pub task: IntakeTask,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IntakeDispatchResult {
+    pub started: bool,
+    pub task: IntakeTask,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IntakeDeleteResult {
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

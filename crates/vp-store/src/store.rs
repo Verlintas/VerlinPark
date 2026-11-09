@@ -10,11 +10,12 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AgentMessage, AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactPolicy,
-    CheckpointRetentionPolicy, Event, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig,
-    McpTransport, MemoryItem, MemoryPolicy, MergeQueueEntry, ModelPreset, OrchestrationDecision,
-    OrchestrationNote, OrchestrationPolicy, Project, ProjectBudget, ProjectUsageSession, Question,
-    ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage,
-    TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
+    CheckpointRetentionPolicy, Event, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer,
+    McpServerConfig, McpTransport, MemoryItem, MemoryPolicy, MergeQueueEntry, ModelPreset,
+    OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, Project, ProjectBudget,
+    ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy,
+    StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy,
+    WriteLease,
 };
 
 use crate::paths;
@@ -39,6 +40,65 @@ fn map_runtime_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeLease> 
         acquired_at: row.get(4)?,
         heartbeat_at: row.get(5)?,
         expires_at: row.get(6)?,
+    })
+}
+
+/// Input for creating a standalone intake task. Kept in the store layer so
+/// the engine and tests construct the same shape without a 15-argument call.
+#[derive(Debug, Clone)]
+pub struct NewIntakeTask {
+    pub project_id: String,
+    pub title: String,
+    pub instructions: String,
+    pub profile: String,
+    pub kind: String,
+    pub priority: i32,
+    pub write_scope: Vec<String>,
+    pub acceptance: Vec<String>,
+    pub deps: Vec<String>,
+    pub token_budget: Option<u64>,
+    pub cost_budget_usd: Option<f64>,
+    pub time_budget_secs: Option<u64>,
+    pub max_attempts: u32,
+    pub origin: String,
+    pub labels: Vec<String>,
+}
+
+fn map_intake_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntakeTask> {
+    let write_scope: String = row.get(7)?;
+    let acceptance: String = row.get(8)?;
+    let labels: String = row.get(21)?;
+    let deps: String = row.get(24).unwrap_or_else(|_| "[]".to_string());
+    Ok(IntakeTask {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        title: row.get(2)?,
+        instructions: row.get(3)?,
+        profile: row.get(4)?,
+        kind: row.get(5)?,
+        priority: row.get(6)?,
+        write_scope: serde_json::from_str(&write_scope).unwrap_or_default(),
+        acceptance: serde_json::from_str(&acceptance).unwrap_or_default(),
+        deps: serde_json::from_str(&deps).unwrap_or_default(),
+        token_budget: row
+            .get::<_, Option<i64>>(9)?
+            .map(|value| value.max(0) as u64),
+        cost_budget_usd: row.get(10)?,
+        time_budget_secs: row
+            .get::<_, Option<i64>>(11)?
+            .map(|value| value.max(0) as u64),
+        status: row.get(12)?,
+        attempts: row.get::<_, i64>(13)?.max(0) as u32,
+        max_attempts: row.get::<_, i64>(14)?.max(1) as u32,
+        next_attempt_at: row.get(15)?,
+        session_id: row.get(16)?,
+        task_id: row.get(17)?,
+        last_error: row.get(18)?,
+        result_summary: row.get(19)?,
+        origin: row.get(20)?,
+        labels: serde_json::from_str(&labels).unwrap_or_default(),
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
     })
 }
 
@@ -90,6 +150,10 @@ pub struct ProjectManifestSnapshot {
     pub orchestration_policy: OrchestrationPolicy,
     #[serde(default)]
     pub approval_grants: Vec<ApprovalGrant>,
+    /// Standalone task-inbox items. They are project-scoped rather than
+    /// session-scoped, so the project manifest is their rebuild snapshot.
+    #[serde(default)]
+    pub intake_tasks: Vec<IntakeTask>,
 }
 
 /// Read the latest project snapshot for each project from `projects.jsonl`.
@@ -637,12 +701,47 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS project_task_scheduler_policies (
-                project_id     TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-                enabled        INTEGER NOT NULL DEFAULT 0,
-                cooldown_secs  INTEGER NOT NULL DEFAULT 60,
-                dispatch_tasks INTEGER NOT NULL DEFAULT 0,
-                updated_at     TEXT NOT NULL
+                project_id          TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled             INTEGER NOT NULL DEFAULT 1,
+                cooldown_secs       INTEGER NOT NULL DEFAULT 60,
+                dispatch_tasks      INTEGER NOT NULL DEFAULT 0,
+                include_intake      INTEGER NOT NULL DEFAULT 1,
+                max_intake_parallel INTEGER NOT NULL DEFAULT 2,
+                updated_at          TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS intake_tasks (
+                id              TEXT PRIMARY KEY,
+                project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                title           TEXT NOT NULL,
+                instructions    TEXT NOT NULL,
+                profile         TEXT NOT NULL,
+                kind            TEXT NOT NULL,
+                priority        INTEGER NOT NULL DEFAULT 0,
+                write_scope     TEXT NOT NULL DEFAULT '[]',
+                acceptance      TEXT NOT NULL DEFAULT '[]',
+                deps            TEXT NOT NULL DEFAULT '[]',
+                token_budget    INTEGER,
+                cost_budget_usd REAL,
+                time_budget_secs INTEGER,
+                status          TEXT NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                max_attempts    INTEGER NOT NULL DEFAULT 2,
+                next_attempt_at TEXT,
+                session_id      TEXT,
+                task_id         TEXT,
+                last_error      TEXT,
+                result_summary  TEXT,
+                origin          TEXT NOT NULL DEFAULT 'user',
+                labels          TEXT NOT NULL DEFAULT '[]',
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_intake_tasks_project_status
+                ON intake_tasks(project_id, status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_intake_tasks_runnable
+                ON intake_tasks(status, next_attempt_at);
 
             CREATE TABLE IF NOT EXISTS project_orchestration_policies (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -813,6 +912,19 @@ impl Store {
             "project_task_scheduler_policies",
             "dispatch_tasks",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "project_task_scheduler_policies",
+            "include_intake",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        ensure_column(&conn, "intake_tasks", "deps", "TEXT NOT NULL DEFAULT '[]'")?;
+        ensure_column(
+            &conn,
+            "project_task_scheduler_policies",
+            "max_intake_parallel",
+            "INTEGER NOT NULL DEFAULT 2",
         )?;
         ensure_column(&conn, "sessions", "priority", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "sessions", "worktree", "TEXT")?;
@@ -1044,6 +1156,7 @@ impl Store {
                 memory_policy: self.get_memory_policy(&project.id)?,
                 orchestration_policy: self.get_orchestration_policy(&project.id)?,
                 approval_grants: self.list_approval_grants(&project.id)?,
+                intake_tasks: self.list_intake_tasks(Some(&project.id), None, None)?,
                 project,
             };
             serde_json::to_writer(&mut line_buffer, &snapshot)?;
@@ -1164,7 +1277,7 @@ impl Store {
         let conn = self.lock()?;
         let stored = conn
             .query_row(
-                "SELECT enabled, cooldown_secs, dispatch_tasks
+                "SELECT enabled, cooldown_secs, dispatch_tasks, include_intake, max_intake_parallel
                  FROM project_task_scheduler_policies WHERE project_id = ?1",
                 params![project_id],
                 |row| {
@@ -1172,11 +1285,23 @@ impl Store {
                         enabled: row.get::<_, i64>(0)? != 0,
                         cooldown_secs: row.get::<_, i64>(1)?.max(1) as u64,
                         dispatch_tasks: row.get::<_, i64>(2).unwrap_or(0) != 0,
+                        include_intake: row.get::<_, i64>(3).unwrap_or(1) != 0,
+                        max_intake_parallel: row.get::<_, i64>(4).unwrap_or(2).clamp(1, 10) as u32,
                     })
                 },
             )
             .optional()?;
         Ok(stored.unwrap_or_default())
+    }
+
+    pub fn has_task_scheduler_policy(&self, project_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM project_task_scheduler_policies WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn set_task_scheduler_policy(
@@ -1187,19 +1312,394 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO project_task_scheduler_policies
-             (project_id, enabled, cooldown_secs, dispatch_tasks, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             (project_id, enabled, cooldown_secs, dispatch_tasks, include_intake,
+              max_intake_parallel, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(project_id) DO UPDATE SET
                 enabled = excluded.enabled,
                 cooldown_secs = excluded.cooldown_secs,
                 dispatch_tasks = excluded.dispatch_tasks,
+                include_intake = excluded.include_intake,
+                max_intake_parallel = excluded.max_intake_parallel,
                 updated_at = excluded.updated_at",
             params![
                 project_id,
                 if policy.enabled { 1 } else { 0 },
                 policy.cooldown_secs as i64,
                 if policy.dispatch_tasks { 1 } else { 0 },
+                if policy.include_intake { 1 } else { 0 },
+                policy.max_intake_parallel.clamp(1, 10) as i64,
                 now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Project-scoped standalone task intake. Intake items are not attached
+    /// to a TeamPlan until the dispatcher synthesizes a one-task plan for them.
+    pub fn list_intake_tasks(
+        &self,
+        project_id: Option<&str>,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<IntakeTask>> {
+        let conn = self.lock()?;
+        let limit = limit.unwrap_or(500).clamp(1, 2_000) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, title, instructions, profile, kind, priority,
+                    write_scope, acceptance, token_budget, cost_budget_usd,
+                    time_budget_secs, status, attempts, max_attempts, next_attempt_at,
+                    session_id, task_id, last_error, result_summary, origin, labels,
+                    created_at, updated_at, deps
+             FROM intake_tasks
+             WHERE (?1 IS NULL OR project_id = ?1)
+               AND (?2 IS NULL OR status = ?2)
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![project_id, status, limit], map_intake_task)?;
+        let mut tasks = rows.collect::<Result<Vec<_>, _>>()?;
+        tasks.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(tasks)
+    }
+
+    pub fn get_intake_task(&self, id: &str) -> Result<Option<IntakeTask>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, project_id, title, instructions, profile, kind, priority,
+                    write_scope, acceptance, token_budget, cost_budget_usd,
+                    time_budget_secs, status, attempts, max_attempts, next_attempt_at,
+                    session_id, task_id, last_error, result_summary, origin, labels,
+                    created_at, updated_at, deps
+             FROM intake_tasks WHERE id = ?1",
+            params![id],
+            map_intake_task,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Insert a new queued intake item. The engine validates the title,
+    /// profile, scopes, and budgets before calling this store method.
+    pub fn create_intake_task(&self, task: &NewIntakeTask) -> Result<IntakeTask> {
+        let id = Uuid::now_v7().to_string();
+        let now = now_rfc3339();
+        let write_scope = serde_json::to_string(&task.write_scope)?;
+        let acceptance = serde_json::to_string(&task.acceptance)?;
+        let labels = serde_json::to_string(&task.labels)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO intake_tasks
+             (id, project_id, title, instructions, profile, kind, priority, write_scope,
+              acceptance, deps, token_budget, cost_budget_usd, time_budget_secs, status, attempts,
+              max_attempts, next_attempt_at, session_id, task_id, last_error, result_summary,
+              origin, labels, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     'queued', 0, ?14, NULL, NULL, NULL, NULL, NULL, ?15, ?16, ?17, ?17)",
+            params![
+                id,
+                task.project_id,
+                task.title,
+                task.instructions,
+                task.profile,
+                task.kind,
+                task.priority,
+                write_scope,
+                acceptance,
+                serde_json::to_string(&task.deps)?,
+                task.token_budget.map(|value| value as i64),
+                task.cost_budget_usd,
+                task.time_budget_secs.map(|value| value as i64),
+                task.max_attempts as i64,
+                task.origin,
+                labels,
+                now,
+            ],
+        )?;
+        drop(conn);
+        self.get_intake_task(&id)?
+            .ok_or_else(|| anyhow!("created intake task disappeared"))
+    }
+
+    /// Replace the editable fields of a non-active intake item. Editing a
+    /// failed/cancelled item re-queues it with a fresh manual attempt budget,
+    /// matching the "edit then run" workflow in the task inbox.
+    pub fn update_intake_task(&self, id: &str, task: &NewIntakeTask) -> Result<Option<IntakeTask>> {
+        let conn = self.lock()?;
+        let now = now_rfc3339();
+        let changed = conn.execute(
+            "UPDATE intake_tasks
+             SET title = ?2, instructions = ?3, profile = ?4, kind = ?5, priority = ?6,
+                 write_scope = ?7, acceptance = ?8, deps = ?9, token_budget = ?10,
+                 cost_budget_usd = ?11, time_budget_secs = ?12, max_attempts = ?13,
+                 labels = ?14, status = 'queued', attempts = 0, next_attempt_at = NULL,
+                 last_error = NULL, result_summary = NULL, updated_at = ?15
+             WHERE id = ?1 AND status NOT IN ('dispatching', 'running', 'completed')",
+            params![
+                id,
+                task.title,
+                task.instructions,
+                task.profile,
+                task.kind,
+                task.priority,
+                serde_json::to_string(&task.write_scope)?,
+                serde_json::to_string(&task.acceptance)?,
+                serde_json::to_string(&task.deps)?,
+                task.token_budget.map(|value| value as i64),
+                task.cost_budget_usd,
+                task.time_budget_secs.map(|value| value as i64),
+                task.max_attempts as i64,
+                serde_json::to_string(&task.labels)?,
+                now,
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_intake_task(id)
+    }
+
+    /// Atomically take a runnable intake item. This is the only path that
+    /// increments `attempts`, so two scheduler ticks or a manual dispatch
+    /// cannot claim the same item.
+    pub fn claim_intake_task(&self, id: &str) -> Result<Option<IntakeTask>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let current = tx
+            .query_row(
+                "SELECT status, attempts, max_attempts FROM intake_tasks WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as u32,
+                        row.get::<_, i64>(2)? as u32,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, attempts, max_attempts)) = current else {
+            return Ok(None);
+        };
+        if !matches!(status.as_str(), "queued" | "failed" | "interrupted")
+            || attempts >= max_attempts
+        {
+            return Ok(None);
+        }
+        let changed = tx.execute(
+            "UPDATE intake_tasks
+             SET status = 'dispatching', attempts = attempts + 1,
+                 next_attempt_at = NULL, last_error = NULL, updated_at = ?2
+             WHERE id = ?1 AND status = ?3 AND attempts = ?4",
+            params![id, now, status, attempts as i64],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        tx.commit()?;
+        drop(conn);
+        self.get_intake_task(id)
+    }
+
+    pub fn start_intake_task(
+        &self,
+        id: &str,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<IntakeTask> {
+        let conn = self.lock()?;
+        let now = now_rfc3339();
+        let changed = conn.execute(
+            "UPDATE intake_tasks
+             SET status = 'running', session_id = ?2, task_id = ?3,
+                 result_summary = NULL, updated_at = ?4
+             WHERE id = ?1 AND status = 'dispatching'",
+            params![id, session_id, task_id, now],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("intake task {id} is not dispatching");
+        }
+        drop(conn);
+        self.get_intake_task(id)?
+            .ok_or_else(|| anyhow!("intake task {id} disappeared"))
+    }
+
+    /// Settle a dispatch or run. `next_attempt_at` is supplied by the caller
+    /// when the project orchestration policy wants an automatic retry.
+    pub fn settle_intake_task(
+        &self,
+        id: &str,
+        status: &str,
+        result_summary: Option<&str>,
+        last_error: Option<&str>,
+        next_attempt_at: Option<&str>,
+    ) -> Result<Option<IntakeTask>> {
+        if !matches!(
+            status,
+            "queued" | "failed" | "cancelled" | "completed" | "interrupted" | "blocked"
+        ) {
+            anyhow::bail!("invalid intake status: {status}");
+        }
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE intake_tasks
+             SET status = ?2, result_summary = COALESCE(?3, result_summary),
+                 last_error = ?4, next_attempt_at = ?5, updated_at = ?6
+             WHERE id = ?1",
+            params![
+                id,
+                status,
+                result_summary,
+                last_error,
+                next_attempt_at,
+                now_rfc3339()
+            ],
+        )?;
+        drop(conn);
+        self.get_intake_task(id)
+    }
+
+    /// Manual retry resets the attempt budget; automatic retries never do.
+    pub fn retry_intake_task(&self, id: &str) -> Result<Option<IntakeTask>> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE intake_tasks
+             SET status = 'queued', attempts = 0, next_attempt_at = NULL,
+                 last_error = NULL, result_summary = NULL, updated_at = ?2
+             WHERE id = ?1 AND status IN ('failed', 'interrupted', 'cancelled', 'blocked')",
+            params![id, now_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_intake_task(id)
+    }
+
+    pub fn cancel_intake_task(&self, id: &str) -> Result<Option<IntakeTask>> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE intake_tasks
+             SET status = 'cancelled', next_attempt_at = NULL, updated_at = ?2
+             WHERE id = ?1 AND status NOT IN ('running', 'dispatching', 'completed', 'cancelled')",
+            params![id, now_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_intake_task(id)
+    }
+
+    pub fn delete_intake_task(&self, id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "DELETE FROM intake_tasks
+             WHERE id = ?1 AND status NOT IN ('running', 'dispatching')",
+            params![id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn count_active_intake_tasks(&self, project_id: &str) -> Result<u32> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM intake_tasks
+             WHERE project_id = ?1 AND status IN ('dispatching', 'running')",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
+    /// Runnable intake rows, oldest first. The scheduler applies priority,
+    /// aging, project policy, and round-robin ordering in memory.
+    pub fn runnable_intake_tasks(&self, now: &str) -> Result<Vec<IntakeTask>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, title, instructions, profile, kind, priority,
+                    write_scope, acceptance, token_budget, cost_budget_usd,
+                    time_budget_secs, status, attempts, max_attempts, next_attempt_at,
+                    session_id, task_id, last_error, result_summary, origin, labels,
+                    created_at, updated_at, deps
+             FROM intake_tasks
+             WHERE status IN ('queued', 'failed', 'interrupted')
+               AND attempts < max_attempts
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)
+             ORDER BY created_at ASC, id ASC
+             LIMIT 1000",
+        )?;
+        let rows = stmt.query_map(params![now], map_intake_task)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn insert_intake_task_snapshot(&self, task: &IntakeTask) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO intake_tasks
+             (id, project_id, title, instructions, profile, kind, priority, write_scope,
+              acceptance, deps, token_budget, cost_budget_usd, time_budget_secs, status,
+              attempts, max_attempts, next_attempt_at, session_id, task_id, last_error,
+              result_summary, origin, labels, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+             ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                instructions = excluded.instructions,
+                profile = excluded.profile,
+                kind = excluded.kind,
+                priority = excluded.priority,
+                write_scope = excluded.write_scope,
+                acceptance = excluded.acceptance,
+                deps = excluded.deps,
+                token_budget = excluded.token_budget,
+                cost_budget_usd = excluded.cost_budget_usd,
+                time_budget_secs = excluded.time_budget_secs,
+                status = excluded.status,
+                attempts = excluded.attempts,
+                max_attempts = excluded.max_attempts,
+                next_attempt_at = excluded.next_attempt_at,
+                session_id = excluded.session_id,
+                task_id = excluded.task_id,
+                last_error = excluded.last_error,
+                result_summary = excluded.result_summary,
+                origin = excluded.origin,
+                labels = excluded.labels,
+                updated_at = excluded.updated_at",
+            params![
+                task.id,
+                task.project_id,
+                task.title,
+                task.instructions,
+                task.profile,
+                task.kind,
+                task.priority,
+                serde_json::to_string(&task.write_scope)?,
+                serde_json::to_string(&task.acceptance)?,
+                serde_json::to_string(&task.deps)?,
+                task.token_budget.map(|value| value as i64),
+                task.cost_budget_usd,
+                task.time_budget_secs.map(|value| value as i64),
+                task.status,
+                task.attempts as i64,
+                task.max_attempts as i64,
+                task.next_attempt_at,
+                task.session_id,
+                task.task_id,
+                task.last_error,
+                task.result_summary,
+                task.origin,
+                serde_json::to_string(&task.labels)?,
+                task.created_at,
+                task.updated_at,
             ],
         )?;
         Ok(())
@@ -6551,6 +7051,14 @@ impl Store {
                  last_error = 'daemon restarted while the task was active',
                  finished_at = ?1, updated_at = ?1
              WHERE status IN ('running', 'claimed', 'cancelling', 'pausing', 'paused')",
+            params![now],
+        )?;
+        tx.execute(
+            "UPDATE intake_tasks
+             SET status = 'failed',
+                 last_error = 'daemon restarted while the intake task was active',
+                 next_attempt_at = NULL, updated_at = ?1
+             WHERE status IN ('dispatching', 'running')",
             params![now],
         )?;
         tx.execute("DELETE FROM write_leases", [])?;

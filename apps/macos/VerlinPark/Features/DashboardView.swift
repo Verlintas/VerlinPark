@@ -402,6 +402,7 @@ struct DashboardView: View {
             QuestionCenterCard()
         case .team:
             AgentsCard()
+            IntakeTasksCard()
             OrchestrationOverviewCard()
             TaskSchedulerCard()
             OrchestrationPolicyCard()
@@ -449,9 +450,9 @@ struct DashboardView: View {
                 model.pendingApprovals.count + model.pendingQuestions.count
             }
         case .team:
-            model.dashboardSnapshot?.summary.runningTasks
+            (model.dashboardSnapshot?.summary.runningTasks
                 ?? model.taskQueue?.tasks.count(where: { $0.status == "running" })
-                ?? 0
+                ?? 0) + model.intakeTasks.count(where: \.isActive)
         case .git:
             model.dashboardSnapshot?.summary.forkRoots
                 ?? model.projectForkForest?.roots.count
@@ -479,6 +480,7 @@ struct DashboardView: View {
         case .team:
             await model.loadAgents()
             await model.loadTaskQueue()
+            await model.loadIntakeTasks()
             await model.loadDashboardSnapshot()
             await model.refreshAgentInfo()
         case .usage:

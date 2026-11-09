@@ -83,13 +83,9 @@ private struct VPToastCard: View {
                 }
 
                 Spacer(minLength: 6)
-                Button(action: dismiss) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.tertiary)
+                VPCloseButton(size: 22, help: L10n.t("Dismiss")) {
+                    dismiss()
                 }
-                .buttonStyle(VPPressableButtonStyle(scale: 0.88))
-                .help("Dismiss")
             }
             .padding(.horizontal, 11)
             .padding(.vertical, 9)

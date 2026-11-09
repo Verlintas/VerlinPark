@@ -320,7 +320,7 @@ struct PreviewPanelView: View {
         }
         .task(id: model.selectedSessionID) {
             if mode == .files {
-                await model.loadWorkspaceTree()
+                await model.loadWorkspaceRoot()
             }
             if mode == .history {
                 await model.loadGitHistory()
@@ -333,7 +333,7 @@ struct PreviewPanelView: View {
         }
         .task(id: mode) {
             if mode == .files {
-                await model.loadWorkspaceTree()
+                await model.loadWorkspaceRoot()
             }
             if mode == .history {
                 await model.loadGitHistory()
@@ -452,8 +452,7 @@ struct PreviewPanelView: View {
                     Task {
                         switch mode {
                         case .files:
-                            await model.loadWorkspaceTree()
-                            await model.reloadWorkspaceFile()
+                            await model.refreshWorkspaceBrowser()
                         case .history:
                             await model.loadGitHistory()
                         case .queue:
@@ -1585,6 +1584,8 @@ private struct WorkspaceFileTab: Identifiable {
     var error: String?
     var status: String?
     var saving = false
+    var revealLine: Int?
+    var revealToken = 0
 
     var id: String {
         path
@@ -1593,26 +1594,6 @@ private struct WorkspaceFileTab: Identifiable {
     var dirty: Bool {
         guard let file, file.editable else { return false }
         return draft != file.content
-    }
-}
-
-private final class WorkspaceTreeNode: Identifiable {
-    let name: String
-    let path: String
-    let isDirectory: Bool
-    let size: UInt64
-    var children: [WorkspaceTreeNode]
-
-    var id: String {
-        path
-    }
-
-    init(name: String, path: String, isDirectory: Bool, size: UInt64, children: [WorkspaceTreeNode]) {
-        self.name = name
-        self.path = path
-        self.isDirectory = isDirectory
-        self.size = size
-        self.children = children
     }
 }
 
@@ -1628,8 +1609,12 @@ private struct FilesPanel: View {
         tabs.first { $0.path == activePath }
     }
 
-    private var tree: [WorkspaceTreeNode] {
-        Self.buildTree(model.workspaceEntries, filter: model.workspaceFilter)
+    private var rootState: WorkspaceDirectoryState {
+        model.workspaceDirectories[""] ?? WorkspaceDirectoryState()
+    }
+
+    private var query: String {
+        model.workspaceFilter.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     var body: some View {
@@ -1655,9 +1640,8 @@ private struct FilesPanel: View {
             tabs = []
             activePath = nil
             expandedPaths = []
-            if model.workspaceEntries.isEmpty {
-                await model.loadWorkspaceTree()
-            }
+            model.resetWorkspaceBrowser()
+            await model.loadWorkspaceRoot()
         }
         .confirmationDialog(
             L10n.t("Discard unsaved changes?"),
@@ -1683,27 +1667,36 @@ private struct FilesPanel: View {
     }
 
     private func listPane(filter: Binding<String>) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        @Bindable var model = model
+        return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 7) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 9))
                     .foregroundStyle(VPTheme.textTertiary)
-                TextField(L10n.t("Filter files"), text: filter)
-                    .textFieldStyle(.plain)
-                    .font(VPTheme.mono(9))
-                if model.workspaceTreeBusy {
+                TextField(
+                    model.workspaceSearchMode == .names
+                        ? L10n.t("Filter files")
+                        : L10n.t("Search file contents"),
+                    text: filter
+                )
+                .textFieldStyle(.plain)
+                .font(VPTheme.mono(9))
+                Picker("", selection: $model.workspaceSearchMode) {
+                    ForEach(WorkspaceSearchMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.mini)
+                .frame(width: 126)
+                if model.workspaceSearchBusy
+                    || model.workspaceContentSearchBusy
+                    || rootState.loading
+                {
                     ProgressView().controlSize(.small)
                 }
-                if !tree.isEmpty {
-                    Button {
-                        expandedPaths = Set(allDirectoryPaths(in: tree))
-                    } label: {
-                        Image(systemName: "chevron.down.circle")
-                            .font(.system(size: 9, weight: .medium))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(VPTheme.textTertiary)
-                    .help(L10n.t("Expand all folders"))
+                if !expandedPaths.isEmpty {
                     Button {
                         expandedPaths = []
                     } label: {
@@ -1714,46 +1707,280 @@ private struct FilesPanel: View {
                     .foregroundStyle(VPTheme.textTertiary)
                     .help(L10n.t("Collapse all folders"))
                 }
+                Button {
+                    expandedPaths = []
+                    Task { await model.refreshWorkspaceBrowser() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 9, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(VPTheme.textTertiary)
+                .help(L10n.t("Refresh workspace"))
             }
             .padding(8)
 
             VPHairline()
 
-            if let error = model.workspaceTreeError {
+            if query.isEmpty {
+                directoryList
+            } else if model.workspaceSearchMode == .names {
+                searchList
+            } else {
+                contentSearchList
+            }
+        }
+        .task(id: "\(query)|\(model.workspaceSearchMode.rawValue)") {
+            if query.isEmpty {
+                await model.searchWorkspace("")
+                await model.searchWorkspaceContents("")
+            } else {
+                try? await Task.sleep(for: .milliseconds(220))
+                guard !Task.isCancelled else { return }
+                if model.workspaceSearchMode == .names {
+                    await model.searchWorkspace(query)
+                } else {
+                    await model.searchWorkspaceContents(query)
+                }
+            }
+        }
+    }
+
+    private var directoryList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(rootState.entries) { entry in
+                    WorkspaceBrowserRow(
+                        entry: entry,
+                        depth: 0,
+                        activePath: activePath,
+                        hoveredPath: $hoveredPath,
+                        expandedPaths: expandedPaths,
+                        onToggle: toggleFolder,
+                        onOpen: open
+                    )
+                }
+                if rootState.hasMore {
+                    loadMoreRow(path: "", state: rootState)
+                }
+                if rootState.truncated {
+                    Text(L10n.t("Directory listing truncated for safety."))
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+        }
+        .overlay {
+            if rootState.loading, rootState.entries.isEmpty {
+                ProgressView().controlSize(.small)
+            } else if let error = rootState.error, rootState.entries.isEmpty {
                 Text(error)
                     .font(VPTheme.mono(8))
                     .foregroundStyle(VPTheme.warning)
-                    .padding(8)
-            }
-
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(tree) { node in
-                        WorkspaceTreeNodeView(
-                            node: node,
-                            depth: 0,
-                            activePath: activePath,
-                            hoveredPath: $hoveredPath,
-                            expandedPaths: expandedPaths,
-                            forceExpanded: !model.workspaceFilter
-                                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                            onToggle: toggleFolder,
-                            onOpen: open
-                        )
-                    }
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-            }
-
-            if tree.isEmpty {
-                Text(model.workspaceTreeBusy ? L10n.t("Loading files…") : L10n
-                    .t("No files match the filter."))
+                    .padding(12)
+            } else if rootState.entries.isEmpty {
+                Text(L10n.t("No files in this worktree."))
                     .font(VPTheme.mono(9))
                     .foregroundStyle(VPTheme.textSecondary)
                     .padding(12)
             }
         }
+    }
+
+    private var searchList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(model.workspaceSearchResults) { entry in
+                    Button {
+                        open(entry)
+                    } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: "doc.text")
+                                .font(.system(size: 9))
+                                .foregroundStyle(VPTheme.textTertiary)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(entry.name)
+                                    .font(VPTheme.font(9.8, weight: .medium))
+                                    .foregroundStyle(VPTheme.textPrimary)
+                                    .lineLimit(1)
+                                Text(entry.path)
+                                    .font(VPTheme.mono(6.8))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer(minLength: 4)
+                            Text(formatSize(entry.size))
+                                .font(VPTheme.mono(6.8))
+                                .foregroundStyle(VPTheme.textTertiary)
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 5)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+                }
+                if model.workspaceSearchTruncated {
+                    Text(L10n.t("Showing the first 300 matches. Narrow the filter to see more."))
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                }
+                if model.workspaceSearchResults.isEmpty, !model.workspaceSearchBusy {
+                    Text(model.workspaceSearchError ?? L10n.t("No files match the filter."))
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(
+                            model.workspaceSearchError == nil
+                                ? VPTheme.textSecondary
+                                : VPTheme.warning
+                        )
+                        .padding(12)
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+        }
+    }
+
+    private var contentSearchList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 2) {
+                if model.workspaceContentSearchBusy,
+                   model.workspaceContentMatches.isEmpty
+                {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(L10n.t("Scanning file contents…"))
+                            .font(VPTheme.mono(8))
+                            .foregroundStyle(VPTheme.textSecondary)
+                    }
+                    .padding(12)
+                }
+                ForEach(contentGroups) { group in
+                    HStack(spacing: 5) {
+                        Image(systemName: "doc.text")
+                            .font(.system(size: 8.5))
+                            .foregroundStyle(VPTheme.textTertiary)
+                        Text(group.path)
+                            .font(VPTheme.mono(8, weight: .semibold))
+                            .foregroundStyle(VPTheme.textPrimary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text("\(group.matches.count)")
+                            .font(VPTheme.mono(6.5))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.top, 6)
+                    .padding(.bottom, 2)
+
+                    ForEach(group.matches) { match in
+                        Button {
+                            openMatch(match)
+                        } label: {
+                            HStack(alignment: .top, spacing: 6) {
+                                Text("\(match.line)")
+                                    .font(VPTheme.mono(7))
+                                    .foregroundStyle(VPTheme.accent.opacity(0.85))
+                                    .frame(width: 30, alignment: .trailing)
+                                Text(match.preview)
+                                    .font(VPTheme.mono(8))
+                                    .foregroundStyle(VPTheme.textSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+                        .help("\(match.path):\(match.line)")
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    Text(
+                        model.workspaceContentSearchBusy
+                            ? L10n.t("Scanning…")
+                            : String(
+                                format: L10n.t("%d matches in %d files"),
+                                model.workspaceContentMatches.count,
+                                model.workspaceContentFilesScanned
+                            )
+                    )
+                    .font(VPTheme.mono(6.8))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    Spacer()
+                    if model.workspaceContentSearchTruncated {
+                        Text(L10n.t("Result cap reached"))
+                            .font(VPTheme.mono(6.8))
+                            .foregroundStyle(VPTheme.warning)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 7)
+
+                if model.workspaceContentMatches.isEmpty,
+                   !model.workspaceContentSearchBusy
+                {
+                    Text(
+                        model.workspaceContentSearchError
+                            ?? L10n.t("No file contents match the query.")
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(
+                        model.workspaceContentSearchError == nil
+                            ? VPTheme.textSecondary
+                            : VPTheme.warning
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+            }
+            .padding(.vertical, 3)
+        }
+    }
+
+    private var contentGroups: [WorkspaceContentGroup] {
+        var order: [String] = []
+        var groups: [String: [WorkspaceGrepMatch]] = [:]
+        for match in model.workspaceContentMatches {
+            if groups[match.path] == nil {
+                order.append(match.path)
+            }
+            groups[match.path, default: []].append(match)
+        }
+        return order.map { path in
+            WorkspaceContentGroup(path: path, matches: groups[path] ?? [])
+        }
+    }
+
+    private func loadMoreRow(path: String, state: WorkspaceDirectoryState) -> some View {
+        Button {
+            Task { await model.loadMoreWorkspaceDirectory(path) }
+        } label: {
+            HStack(spacing: 4) {
+                if state.loadingMore {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 8))
+                }
+                Text(L10n.t("Load more files"))
+                    .font(VPTheme.mono(7.2))
+            }
+            .foregroundStyle(VPTheme.accent)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+        }
+        .buttonStyle(.plain)
+        .disabled(state.loadingMore)
     }
 
     private func detailPane(compact: Bool) -> some View {
@@ -1776,16 +2003,15 @@ private struct FilesPanel: View {
                         .padding(.horizontal, 10)
                         .padding(.top, 5)
                 }
-                TextEditor(
+                WorkspaceCodeEditor(
                     text: Binding(
                         get: { tab.draft },
                         set: { updateDraft($0, path: tab.path) }
-                    )
+                    ),
+                    isEditable: (tab.file?.editable ?? false) && !tab.saving,
+                    revealLine: tab.revealLine,
+                    revealToken: tab.revealToken
                 )
-                .font(VPTheme.mono(10))
-                .foregroundStyle(VPTheme.textSecondary)
-                .scrollContentBackground(.hidden)
-                .disabled(!(tab.file?.editable ?? false) || tab.saving)
                 .padding(6)
             } else {
                 VStack(spacing: 8) {
@@ -1815,7 +2041,7 @@ private struct FilesPanel: View {
                     .help(L10n.t("Back to files"))
                 }
                 ForEach(tabs) { tab in
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3) {
                         Button {
                             activePath = tab.path
                         } label: {
@@ -1834,17 +2060,17 @@ private struct FilesPanel: View {
                             }
                         }
                         .buttonStyle(.plain)
-                        Button {
+
+                        VPCloseButton(
+                            size: 24,
+                            help: L10n.t("Close tab")
+                        ) {
                             requestClose(tab)
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 6, weight: .bold))
-                                .foregroundStyle(VPTheme.textTertiary)
                         }
-                        .buttonStyle(.plain)
                     }
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 5)
+                    .padding(.leading, 7)
+                    .padding(.trailing, 3)
+                    .padding(.vertical, 4)
                     .background(
                         activePath == tab.path ? VPTheme.accent.opacity(0.10) : VPTheme.surface,
                         in: RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -1853,7 +2079,7 @@ private struct FilesPanel: View {
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .padding(.vertical, 4)
         }
         .background(VPTheme.surface.opacity(0.35))
     }
@@ -1928,6 +2154,16 @@ private struct FilesPanel: View {
         Task { await load(entry.path) }
     }
 
+    private func openMatch(_ match: WorkspaceGrepMatch) {
+        let name = (match.path as NSString).lastPathComponent
+        open(WorkspaceEntry(path: match.path, name: name, kind: "file", size: 0))
+        guard let index = tabs.firstIndex(where: { $0.path == match.path }) else {
+            return
+        }
+        tabs[index].revealLine = Int(match.line)
+        tabs[index].revealToken &+= 1
+    }
+
     private func load(_ path: String) async {
         guard let file = await model.fetchWorkspaceFile(path: path) else {
             updateTab(path) {
@@ -1941,6 +2177,12 @@ private struct FilesPanel: View {
             $0.draft = file.content
             $0.error = nil
             $0.status = nil
+            if $0.revealLine != nil {
+                // The first reveal may have happened on an empty draft while
+                // the file request was still in flight. Bump the token again
+                // now that the real text is available.
+                $0.revealToken &+= 1
+            }
         }
     }
 
@@ -1985,6 +2227,14 @@ private struct FilesPanel: View {
         mutate(&tabs[index])
     }
 
+    private func toggleFolder(_ path: String) {
+        if expandedPaths.contains(path) {
+            expandedPaths.remove(path)
+        } else {
+            expandedPaths.insert(path)
+        }
+    }
+
     private func requestClose(_ tab: WorkspaceFileTab) {
         if tab.dirty {
             pendingClosePath = tab.path
@@ -2000,166 +2250,147 @@ private struct FilesPanel: View {
             activePath = tabs.indices.contains(index) ? tabs[index].path : tabs.last?.path
         }
     }
+}
 
-    private func toggleFolder(_ path: String) {
-        if expandedPaths.contains(path) {
-            expandedPaths.remove(path)
-        } else {
-            expandedPaths.insert(path)
-        }
-    }
+private struct WorkspaceContentGroup: Identifiable {
+    let path: String
+    let matches: [WorkspaceGrepMatch]
 
-    private func allDirectoryPaths(in nodes: [WorkspaceTreeNode]) -> [String] {
-        nodes.flatMap { node -> [String] in
-            guard node.isDirectory else { return [] }
-            return [node.path] + allDirectoryPaths(in: node.children)
-        }
-    }
-
-    private static func buildTree(_ entries: [WorkspaceEntry], filter: String) -> [WorkspaceTreeNode] {
-        let query = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let grouped = Dictionary(grouping: entries) { entry -> String in
-            let components = entry.path.split(separator: "/").map(String.init)
-            return components.dropLast().joined(separator: "/")
-        }
-        func nodes(parent: String) -> [WorkspaceTreeNode] {
-            (grouped[parent] ?? [])
-                .sorted { lhs, rhs in
-                    if lhs.isDirectory != rhs.isDirectory {
-                        return lhs.isDirectory
-                    }
-                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-                }
-                .compactMap { entry in
-                    if entry.isDirectory {
-                        let children = nodes(parent: entry.path)
-                        if !query.isEmpty, children.isEmpty {
-                            return nil
-                        }
-                        return WorkspaceTreeNode(
-                            name: entry.name,
-                            path: entry.path,
-                            isDirectory: true,
-                            size: entry.size,
-                            children: children
-                        )
-                    }
-                    if !query.isEmpty,
-                       !entry.path.lowercased().contains(query),
-                       !entry.name.lowercased().contains(query)
-                    {
-                        return nil
-                    }
-                    return WorkspaceTreeNode(
-                        name: entry.name,
-                        path: entry.path,
-                        isDirectory: false,
-                        size: entry.size,
-                        children: []
-                    )
-                }
-        }
-        return nodes(parent: "")
+    var id: String {
+        path
     }
 }
 
-private struct WorkspaceTreeNodeView: View {
-    let node: WorkspaceTreeNode
+private struct WorkspaceBrowserRow: View {
+    @Environment(AppModel.self) private var model
+    let entry: WorkspaceEntry
     let depth: Int
     let activePath: String?
     @Binding var hoveredPath: String?
     let expandedPaths: Set<String>
-    let forceExpanded: Bool
     let onToggle: (String) -> Void
     let onOpen: (WorkspaceEntry) -> Void
 
-    private var isExpanded: Bool {
-        forceExpanded || expandedPaths.contains(node.path)
+    private var expanded: Bool {
+        expandedPaths.contains(entry.path)
+    }
+
+    private var directoryState: WorkspaceDirectoryState? {
+        model.workspaceDirectories[entry.path]
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if node.isDirectory {
-                Button {
-                    onToggle(node.path)
-                } label: {
-                    row(
-                        icon: isExpanded ? "folder.fill" : "folder",
-                        tint: VPTheme.plan,
-                        isActive: false,
-                        expanded: isExpanded
-                    )
+            Button {
+                if entry.isDirectory {
+                    onToggle(entry.path)
+                } else {
+                    onOpen(entry)
                 }
-                .buttonStyle(.plain)
-                if isExpanded {
-                    ForEach(node.children) { child in
-                        WorkspaceTreeNodeView(
-                            node: child,
-                            depth: depth + 1,
-                            activePath: activePath,
-                            hoveredPath: $hoveredPath,
-                            expandedPaths: expandedPaths,
-                            forceExpanded: forceExpanded,
-                            onToggle: onToggle,
-                            onOpen: onOpen
-                        )
+            } label: {
+                row
+            }
+            .buttonStyle(VPPressableButtonStyle(scale: entry.isDirectory ? 1 : 0.99))
+            .onHover { hovering in
+                hoveredPath = hovering ? entry.path : nil
+            }
+            .task(id: expanded) {
+                guard expanded, entry.isDirectory, directoryState == nil else { return }
+                await model.loadWorkspaceDirectory(entry.path)
+            }
+
+            if entry.isDirectory, expanded {
+                if let state = directoryState {
+                    if state.loading, state.entries.isEmpty {
+                        loadingRow
+                    } else if let error = state.error, state.entries.isEmpty {
+                        Text(error)
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.warning)
+                            .padding(.leading, CGFloat(depth + 1) * 12 + 20)
+                            .padding(.vertical, 4)
+                    } else {
+                        ForEach(state.entries) { child in
+                            WorkspaceBrowserRow(
+                                entry: child,
+                                depth: depth + 1,
+                                activePath: activePath,
+                                hoveredPath: $hoveredPath,
+                                expandedPaths: expandedPaths,
+                                onToggle: onToggle,
+                                onOpen: onOpen
+                            )
+                        }
+                        if state.hasMore {
+                            Button {
+                                Task { await model.loadMoreWorkspaceDirectory(entry.path) }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    if state.loadingMore {
+                                        ProgressView().controlSize(.mini)
+                                    } else {
+                                        Image(systemName: "ellipsis.circle")
+                                            .font(.system(size: 8))
+                                    }
+                                    Text(L10n.t("Load more files"))
+                                        .font(VPTheme.mono(7))
+                                }
+                                .foregroundStyle(VPTheme.accent)
+                                .padding(.leading, CGFloat(depth + 1) * 12 + 20)
+                                .padding(.vertical, 4)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(state.loadingMore)
+                        }
+                        if state.truncated {
+                            Text(L10n.t("Directory listing truncated for safety."))
+                                .font(VPTheme.mono(6.8))
+                                .foregroundStyle(VPTheme.textTertiary)
+                                .padding(.leading, CGFloat(depth + 1) * 12 + 20)
+                                .padding(.vertical, 3)
+                        }
                     }
-                }
-            } else {
-                Button {
-                    onOpen(
-                        WorkspaceEntry(
-                            path: node.path,
-                            name: node.name,
-                            kind: "file",
-                            size: node.size
-                        )
-                    )
-                } label: {
-                    row(
-                        icon: "doc.text",
-                        tint: VPTheme.textTertiary,
-                        isActive: activePath == node.path,
-                        expanded: false
-                    )
-                }
-                .buttonStyle(VPPressableButtonStyle(scale: 0.99))
-                .onHover { hovering in
-                    hoveredPath = hovering ? node.path : nil
+                } else {
+                    loadingRow
                 }
             }
         }
     }
 
-    private func row(icon: String, tint: Color, isActive: Bool, expanded: Bool) -> some View {
+    private var row: some View {
         HStack(spacing: 4) {
-            Spacer()
-                .frame(width: CGFloat(depth) * 10)
-            Image(systemName: node.isDirectory
+            Spacer().frame(width: CGFloat(depth) * 12)
+            Image(systemName: entry.isDirectory
                 ? (expanded ? "chevron.down" : "chevron.right")
                 : "circle.fill")
-                .font(.system(size: node.isDirectory ? 6 : 2.5, weight: .bold))
-                .foregroundStyle(VPTheme.textTertiary.opacity(node.isDirectory ? 1 : 0.35))
+                .font(.system(size: entry.isDirectory ? 6 : 2.5, weight: .bold))
+                .foregroundStyle(VPTheme.textTertiary.opacity(entry.isDirectory ? 1 : 0.35))
                 .frame(width: 7)
-            Image(systemName: icon)
+            Image(systemName: entry.isDirectory
+                ? (expanded ? "folder.fill" : "folder")
+                : "doc.text")
                 .font(.system(size: 8.5))
-                .foregroundStyle(isActive ? VPTheme.accent : tint)
+                .foregroundStyle(
+                    activePath == entry.path
+                        ? VPTheme.accent
+                        : (entry.isDirectory ? VPTheme.plan : VPTheme.textTertiary)
+                )
                 .frame(width: 11)
-            Text(node.name)
+            Text(entry.name)
                 .font(VPTheme.font(
-                    node.isDirectory ? 9.5 : 10,
-                    weight: node.isDirectory ? .medium : .regular
+                    entry.isDirectory ? 9.5 : 10,
+                    weight: entry.isDirectory ? .medium : .regular
                 ))
-                .foregroundStyle(isActive ? VPTheme.textPrimary : VPTheme.textSecondary)
+                .foregroundStyle(activePath == entry.path ? VPTheme.textPrimary : VPTheme.textSecondary)
                 .lineLimit(1)
-            if node.isDirectory {
-                Text("\(node.children.count)")
+            if entry.isDirectory, let total = directoryState?.total, total > 0 {
+                Text("\(total)")
                     .font(VPTheme.mono(6.2))
                     .foregroundStyle(VPTheme.textTertiary)
             }
             Spacer(minLength: 3)
-            if !node.isDirectory {
-                Text(formatSize(node.size))
+            if !entry.isDirectory {
+                Text(formatSize(entry.size))
                     .font(VPTheme.mono(6.8))
                     .foregroundStyle(VPTheme.textTertiary)
             }
@@ -2168,15 +2399,26 @@ private struct WorkspaceTreeNodeView: View {
         .padding(.horizontal, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
-            if isActive {
+            if activePath == entry.path {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(VPTheme.accent.opacity(0.10))
-            } else if hoveredPath == node.path, !node.isDirectory {
+            } else if hoveredPath == entry.path {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(VPTheme.surface)
             }
         }
         .contentShape(Rectangle())
+    }
+
+    private var loadingRow: some View {
+        HStack(spacing: 5) {
+            Spacer().frame(width: CGFloat(depth + 1) * 12 + 12)
+            ProgressView().controlSize(.mini)
+            Text(L10n.t("Loading…"))
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textTertiary)
+        }
+        .padding(.vertical, 4)
     }
 }
 

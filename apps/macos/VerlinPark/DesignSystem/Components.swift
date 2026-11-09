@@ -68,6 +68,46 @@ struct StatusPill: View {
     }
 }
 
+/// A deliberately generous close affordance. Small 8pt glyphs with an 18pt
+/// hit target are hard to click, especially in tab strips that sit on dense
+/// glass surfaces. This keeps a bold glyph, a visible circular surface, and a
+/// full 24-28pt target without adding visual noise when idle.
+struct VPCloseButton: View {
+    var size: CGFloat = 24
+    var help: String = L10n.t("Close")
+    var tint: Color = VPTheme.textSecondary
+    let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.system(size: max(9, size * 0.44), weight: .bold))
+                .foregroundStyle(hovering ? VPTheme.textPrimary : tint)
+                .frame(width: size, height: size)
+                .background(
+                    hovering ? VPTheme.surfaceHover : VPTheme.surface.opacity(0.72),
+                    in: Circle()
+                )
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            hovering ? VPTheme.accent.opacity(0.30) : VPTheme.hairline,
+                            lineWidth: 1
+                        )
+                }
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
+        .onHover { hovering = $0 }
+        .scaleEffect(hovering && !reduceMotion ? 1.06 : 1)
+        .animation(VPMotion.resolved(VPMotion.hover, reduceMotion: reduceMotion), value: hovering)
+    }
+}
+
 struct ErrorBanner: View {
     let message: String
     let dismiss: () -> Void
@@ -82,15 +122,9 @@ struct ErrorBanner: View {
                 .foregroundStyle(VPTheme.textPrimary)
                 .lineLimit(2)
             Spacer()
-            Button(action: dismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(VPTheme.textSecondary)
-                    .frame(width: 20, height: 20)
-                    .background(VPTheme.surfaceHover, in: Circle())
+            VPCloseButton(size: 24, help: L10n.t("Dismiss")) {
+                dismiss()
             }
-            .buttonStyle(VPPressableButtonStyle(scale: 0.9))
-            .help("Dismiss")
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 10)

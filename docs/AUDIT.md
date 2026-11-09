@@ -86,6 +86,13 @@
 - 完整表：[docs/audit/2026-11-09-findings.md](audit/2026-11-09-findings.md) 与 [CSV](audit/2026-11-09-findings.csv)。本切片修复了 P0 Git sandbox/任务 ID 碰撞，以及 merge queue、MCP、recovery、rebuild cost、bundle import、provider EOF/redaction、bounded tool output、sandboxed integration command、protocol auth negotiation、UI event pagination/selection/approval、write-lease resolver 等主要 P1/P2 问题；未完成项在表中标为 Partial/Deferred。
 - 当前测试：Rust 358（core 286 / protocol 2 / store 56 / providers 14；3 ignored live），Swift 104；`just lint`、`cargo test --workspace`、`xcodebuild test` 通过。另有 2026-11-09 live DeepSeek E2E：真 TeamPlan + Workers + Verifier + Integrator 完整跑通；验证了 no-approval workspace shell、task_result 长期记忆、coordination/replay/repair/revision、Lease 与 preview。
 
+### 0.4 2026-11-10 Standalone intake / default-on dispatch
+
+- **P1-9 的 orphan task 缺口已关闭（本地单 daemon）**：`intake_tasks` 项目级 inbox、`intake.*` RPC/CLI、atomic claim、合成 one-task TeamPlan、默认开启的 scheduler policy、intake 依赖 gate、attempts/backoff reconcile、daemon restart/`db-rebuild` 降级、`scheduler.status` 与 Manage Dash Task Inbox。
+- **默认开启范围**：新项目默认 resume 待办计划并 dispatch intake；显式 project policy 或 `VERLINPARK_TASK_SCHEDULER=0` 可关闭。手动 Run now 可越过开关/并发 cap，但仍受依赖、预算、容量、write lease、Verifier 约束。
+- **边界不变**：跨 daemon 的 fencing/merge ownership 仍未实现；intake retry 会新建 session；依赖失败不会自动级联；intake 是项目级 SQLite 状态，派发后才把审计事件写入链接 session。
+- **Preview 文件面**：`workspace.list` 单目录懒加载、`workspace.grep` bounded literal search、行号编辑器与更大关闭按钮；见 ADR-0128。内容搜索不是索引/正则，仍有 2 MiB/file 与 1,000 match 上限。
+
 ---
 
 ## 1. 总体判断
@@ -324,12 +331,13 @@
 
 - dispatch 模式下同一 session 同时只跑一个 plan task，牺牲 intra-plan 并行换取跨 session 公平；用户按项目选择模式。
 - task claim 是原子行状态更新；Leader/plan-run 现在持有 `runtime_leases` session 租约（owner/heartbeat/TTL），但 daemon 仍用 data-dir instance lock 保证单实例，且租约没有 fencing token。两个 daemon 共享数据库的完整竞争语义仍未设计。
-- 调度仍要求已存储的 TeamPlan；没有 plan 的 orphan task 不会被自动创建或调度。
+- **2026-11-10 已补齐 orphan task 路径：** 项目级 task inbox（`intake_tasks`）+ atomic claim + 合成 one-task TeamPlan；`TaskSchedulerPolicy` 默认开启，带 intake include、每项目并发 cap、依赖 gate、attempts/backoff reconcile、manifest/db-rebuild 恢复、`scheduler.status` 与 Manage Dash/CLI UI。调度不再要求事先存在 TeamPlan。
+- 仍需注意：intake retry 会创建新 session，旧失败 session 保留供检查；依赖失败不会自动级联取消，由用户 retry/delete；默认开启意味着新项目会自动消费已排队计划/任务，预算与显式队列是花费边界。
 
 **后续**
 
 - 已增加 durable session lease（owner + expiry + renewal），并把 Leader/plan-run 归属持久化；下一步是把租约接入 server-mode 调度和 merge ownership。
-- 评估 default-on dispatcher 策略和 orphan task 的安全入口。
+- 已实现 default-on dispatcher 和 orphan task 安全入口；后续评估跨 daemon fencing、intake 依赖失败的自动策略，以及 UI 的自动重试可视化。
 - 为 per-task 模式增加 UI 的按 session 队列和 next-task 预览。
 
 ---

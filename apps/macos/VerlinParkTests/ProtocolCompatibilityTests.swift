@@ -787,6 +787,30 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(written.sha256, "def456")
     }
 
+    func testWorkspaceGrepResultsDecode() throws {
+        let json = """
+        {
+          "query": "token",
+          "matches": [{
+            "path": "src/main.rs",
+            "line": 2,
+            "column": 9,
+            "preview": "let token = find_token();"
+          }],
+          "files_scanned": 4,
+          "truncated": true
+        }
+        """
+        let result = try JSONDecoder().decode(WorkspaceGrepResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.query, "token")
+        XCTAssertEqual(result.filesScanned, 4)
+        XCTAssertTrue(result.truncated)
+        XCTAssertEqual(result.matches.first?.path, "src/main.rs")
+        XCTAssertEqual(result.matches.first?.line, 2)
+        XCTAssertEqual(result.matches.first?.column, 9)
+        XCTAssertEqual(result.matches.first?.id, "src/main.rs:2:9")
+    }
+
     func testTaskSchedulerPolicyDecodes() throws {
         let result = try JSONDecoder().decode(
             TaskSchedulerPolicyResult.self,
@@ -799,15 +823,19 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertTrue(result.policy.enabled)
         XCTAssertEqual(result.policy.cooldownSecs, 15)
         XCTAssertFalse(result.policy.dispatchTasks)
+        XCTAssertTrue(result.policy.includeIntake)
+        XCTAssertEqual(result.policy.maxIntakeParallel, 2)
 
         let perTask = try JSONDecoder().decode(
             TaskSchedulerPolicyResult.self,
             from: Data(
-                #"{"project_id":"project-1","policy":{"enabled":true,"cooldown_secs":15,"dispatch_tasks":true}}"#
+                #"{"project_id":"project-1","policy":{"enabled":true,"cooldown_secs":15,"dispatch_tasks":true,"include_intake":false,"max_intake_parallel":4}}"#
                     .utf8
             )
         )
         XCTAssertTrue(perTask.policy.dispatchTasks)
+        XCTAssertFalse(perTask.policy.includeIntake)
+        XCTAssertEqual(perTask.policy.maxIntakeParallel, 4)
     }
 
     func testShellPolicyReadsOptionalReadJail() throws {
@@ -855,6 +883,130 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(result.task.taskID, "T1")
         XCTAssertEqual(result.task.status, "skipped")
         XCTAssertEqual(result.task.lastError, "skipped by user")
+    }
+
+    func testSchedulerStatusDecodes() throws {
+        let json = """
+        {
+          "active_sessions": 2,
+          "queued_sessions": 1,
+          "paused_sessions": 0,
+          "pending_plan_tasks": 3,
+          "running_plan_tasks": 1,
+          "queued_intake": 4,
+          "active_intake": 2,
+          "failed_intake": 1,
+          "global_session_cap": 4,
+          "global_worker_cap": 12,
+          "global_labour_cap": 24,
+          "projects": [{
+            "project_id": "project-1",
+            "project_name": "Demo",
+            "enabled": true,
+            "cooldown_secs": 30,
+            "dispatch_tasks": false,
+            "include_intake": true,
+            "max_intake_parallel": 2,
+            "pending_sessions": 1,
+            "pending_plan_tasks": 3,
+            "running_plan_tasks": 1,
+            "queued_intake": 4,
+            "active_intake": 2,
+            "failed_intake": 1
+          }]
+        }
+        """
+        let status = try JSONDecoder().decode(SchedulerStatusResult.self, from: Data(json.utf8))
+        XCTAssertEqual(status.activeSessions, 2)
+        XCTAssertEqual(status.globalSessionCap, 4)
+        XCTAssertEqual(status.globalLabourCap, 24)
+        XCTAssertEqual(status.queuedIntake, 4)
+        XCTAssertEqual(status.projects.count, 1)
+        XCTAssertEqual(status.projects[0].projectName, "Demo")
+        XCTAssertEqual(status.projects[0].maxIntakeParallel, 2)
+        XCTAssertTrue(status.projects[0].includeIntake)
+    }
+
+    func testIntakeResultsDecode() throws {
+        let json = """
+        {
+          "tasks": [{
+            "id": "intake-1",
+            "project_id": "project-1",
+            "title": "Fix the intake queue",
+            "instructions": "Implement and verify the queue.",
+            "profile": "coding",
+            "kind": "coding",
+            "priority": 12,
+            "write_scope": ["src/intake"],
+            "acceptance": ["tests pass"],
+            "deps": ["intake-0"],
+            "token_budget": 20000,
+            "cost_budget_usd": 1.5,
+            "time_budget_secs": 600,
+            "status": "failed",
+            "attempts": 1,
+            "max_attempts": 2,
+            "next_attempt_at": "2026-11-10T00:00:00Z",
+            "session_id": "session-1",
+            "task_id": "T1",
+            "last_error": "worker failed",
+            "result_summary": null,
+            "origin": "app",
+            "labels": ["nightly"],
+            "created_at": "2026-11-09T23:00:00Z",
+            "updated_at": "2026-11-10T00:00:00Z"
+          }]
+        }
+        """
+        let result = try JSONDecoder().decode(IntakeListResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.tasks.count, 1)
+        let task = result.tasks[0]
+        XCTAssertEqual(task.id, "intake-1")
+        XCTAssertEqual(task.profile, "coding")
+        XCTAssertEqual(task.writeScope, ["src/intake"])
+        XCTAssertEqual(task.deps, ["intake-0"])
+        XCTAssertEqual(task.attempts, 1)
+        XCTAssertEqual(task.maxAttempts, 2)
+        XCTAssertEqual(task.sessionID, "session-1")
+        XCTAssertEqual(task.taskID, "T1")
+        XCTAssertFalse(task.isActive)
+        XCTAssertTrue(task.isTerminal)
+        XCTAssertTrue(task.labels.contains("nightly"))
+
+        let dispatchedJSON = """
+        {
+          "started": true,
+          "session_id": "session-1",
+          "task": {
+            "id": "intake-1",
+            "project_id": "project-1",
+            "title": "Fix the intake queue",
+            "instructions": "Implement and verify the queue.",
+            "profile": "coding",
+            "kind": "coding",
+            "priority": 12,
+            "write_scope": ["src/intake"],
+            "acceptance": ["tests pass"],
+            "status": "running",
+            "attempts": 1,
+            "max_attempts": 2,
+            "origin": "app",
+            "labels": [],
+            "created_at": "2026-11-09T23:00:00Z",
+            "updated_at": "2026-11-10T00:00:00Z"
+          }
+        }
+        """
+        let dispatched = try JSONDecoder().decode(
+            IntakeDispatchResult.self,
+            from: Data(dispatchedJSON.utf8)
+        )
+        XCTAssertTrue(dispatched.started)
+        XCTAssertEqual(dispatched.sessionID, "session-1")
+        XCTAssertTrue(dispatched.task.isActive)
+        let action = try JSONDecoder().decode(IntakeDeleteResult.self, from: Data(#"{"deleted":true}"#.utf8))
+        XCTAssertTrue(action.deleted)
     }
 
     func testTaskQueueResultsDecode() throws {

@@ -136,6 +136,8 @@
 | [0124](adr/0124-role-aware-context-and-memory.md) | Role-aware context strategies and automatic persistent team memory | Accepted | Runtime/Orchestration |
 | [0125](adr/0125-approval-grants-and-routine-activity.md) | Path-scoped approval grants, substitution classification, quiet routine tools | Accepted | Permissions/UI |
 | [0126](adr/0126-preview-tabs-showcase-and-setup.md) | Preview result board, file tabs/tree, essential Manage Dash, preset-first setup | Accepted | UI/Onboarding |
+| [0127](adr/0127-task-inbox-autopilot.md) | Standalone task inbox, one-task plan bridge, default-on autonomous dispatch, dependency gates, retry reconciliation | Accepted | Runtime/Scheduling |
+| [0128](adr/0128-lazy-workspace-browser-and-content-search.md) | Lazy directory listing, bounded literal content search, line-number editor, generous close targets | Accepted | UI/Workspace |
 
 ---
 

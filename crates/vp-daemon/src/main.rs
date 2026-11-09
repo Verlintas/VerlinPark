@@ -35,7 +35,8 @@ use vp_protocol::types::{
     ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, CreateModelPresetParams,
     CreateSessionParams, DashboardParams, DeleteModelPresetParams, DiscardSessionParams,
     DoctorCheck, DoctorReport, EventListResult, ForkAuditParams, ForkRepairParams, GitLogParams,
-    GitShowParams, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
+    GitShowParams, IntakeCreateParams, IntakeDeleteResult, IntakeListParams, IntakeTaskParams,
+    IntakeUpdateParams, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
     ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams,
     MailboxListResult, MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams,
     McpCallParams, McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
@@ -44,24 +45,25 @@ use vp_protocol::types::{
     OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectForkForestParams,
     ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
     RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
-    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult, SearchParams,
-    ServerInfo, SessionCheckpointDeleteParams, SessionCheckpointDiffParams,
-    SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
-    SessionCheckpointRestoreParams, SessionCheckpointStatsParams, SessionCompactParams,
-    SessionCompareParams, SessionContextParams, SessionDiffParams, SessionExportParams,
-    SessionForkParams, SessionForkTreeParams, SessionImportParams, SessionLineageParams,
-    SessionListResult, SessionLogParams, SessionMergeForkParams, SessionPauseParams,
-    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams,
-    SessionResumeResult, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
-    SetArtifactPolicyParams, SetCheckpointPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
-    SetSessionPriorityParams, SetShellPolicyParams, SetTaskSchedulerPolicyParams,
-    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SubscribeParams,
-    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
-    UpdateModelPresetParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceTreeParams,
+    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult,
+    SchedulerStatusParams, SearchParams, ServerInfo, SessionCheckpointDeleteParams,
+    SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
+    SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
+    SessionCompactParams, SessionCompareParams, SessionContextParams, SessionDiffParams,
+    SessionExportParams, SessionForkParams, SessionForkTreeParams, SessionImportParams,
+    SessionLineageParams, SessionListResult, SessionLogParams, SessionMergeForkParams,
+    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
+    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
+    SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
+    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
+    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams, UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams,
+    UpdateMcpServerParams, UpdateModelPresetParams, UsageLedgerParams, WorkspaceFileParams,
+    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
     WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
@@ -811,6 +813,66 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             }
             Err(response) => response_with_id(id, response),
         },
+        "scheduler.status" => match parse_params::<SchedulerStatusParams>(request.params) {
+            Ok(params) => match state.agent.scheduler_status(params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "intake.list" => match parse_params::<IntakeListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .list_intake_tasks(params.project_id, params.status, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "intake.create" => match parse_params::<IntakeCreateParams>(request.params) {
+            Ok(params) => match state.engine.create_intake_task(params).await {
+                Ok(task) => RpcResponse::success(id, task),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "intake.update" => match parse_params::<IntakeUpdateParams>(request.params) {
+            Ok(params) => match state.engine.update_intake_task(params).await {
+                Ok(task) => RpcResponse::success(id, task),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "intake.dispatch" => match parse_params::<IntakeTaskParams>(request.params) {
+            Ok(params) => match state.agent.dispatch_intake_task(&params.id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "intake.cancel" => match parse_params::<IntakeTaskParams>(request.params) {
+            Ok(params) => match state.agent.cancel_intake_task(&params.id).await {
+                Ok(task) => RpcResponse::success(id, task),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "intake.retry" => match parse_params::<IntakeTaskParams>(request.params) {
+            Ok(params) => match state.agent.retry_intake_task(&params.id).await {
+                Ok(task) => RpcResponse::success(id, task),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "intake.delete" => match parse_params::<IntakeTaskParams>(request.params) {
+            Ok(params) => match state.agent.delete_intake_task(&params.id).await {
+                Ok(()) => RpcResponse::success(id, IntakeDeleteResult { deleted: true }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "task.queue" => match parse_params::<TaskQueueParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -1010,6 +1072,50 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "workspace.tree" => match parse_params::<WorkspaceTreeParams>(request.params) {
             Ok(params) => match state.engine.workspace_tree(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "workspace.list" => match parse_params::<WorkspaceListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .workspace_list(
+                    &params.session_id,
+                    &params.path,
+                    params.offset,
+                    params.limit,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "workspace.search" => match parse_params::<WorkspaceSearchParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .workspace_search(&params.session_id, &params.query, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "workspace.grep" => match parse_params::<WorkspaceGrepParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .workspace_grep(
+                    &params.session_id,
+                    &params.query,
+                    params.path,
+                    params.case_sensitive,
+                    params.max_results,
+                )
+                .await
+            {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },

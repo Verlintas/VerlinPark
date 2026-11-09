@@ -6,7 +6,9 @@ use anyhow::Result;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::watch;
-use vp_protocol::types::{PlanTask, ScheduledTask, Session, TaskQueueResult, TeamPlan, WriteLease};
+use vp_protocol::types::{
+    IntakeTask, PlanTask, ScheduledTask, Session, TaskQueueResult, TeamPlan, WriteLease,
+};
 use vp_store::Store;
 
 /// Persistent task-DAG queue. Task definitions come from the submitted
@@ -19,6 +21,12 @@ pub struct TaskScheduler {
     state: watch::Sender<u64>,
     global_enabled: bool,
     default_cooldown_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingIntake {
+    pub task: IntakeTask,
+    pub effective_priority: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +308,110 @@ impl TaskScheduler {
         .await?
     }
 
+    /// Pick a standalone intake item for the autonomous dispatcher. The
+    /// project policy may opt out, cap concurrency, or be disabled entirely.
+    /// Candidates are ordered by task priority plus age, with a project
+    /// round-robin tie-break, and retries receive the orchestration policy's
+    /// priority boost without resetting their attempt budget.
+    pub async fn next_pending_intake(
+        &self,
+        last_project: Option<&str>,
+        excluded: &[String],
+    ) -> Result<Option<PendingIntake>> {
+        let store = self.store.clone();
+        let aging = self.aging;
+        let global_enabled = self.global_enabled;
+        let last_project = last_project.map(ToOwned::to_owned);
+        let excluded = excluded.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let now = OffsetDateTime::now_utc();
+            let now_text = now.format(&Rfc3339)?;
+            let tasks = store.runnable_intake_tasks(&now_text)?;
+            let mut candidates = Vec::new();
+            let mut status_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
+            for task in tasks {
+                if excluded.contains(&task.id) {
+                    continue;
+                }
+                if !status_cache.contains_key(&task.project_id) {
+                    let statuses = store
+                        .list_intake_tasks(Some(&task.project_id), None, None)?
+                        .into_iter()
+                        .map(|row| (row.id, row.status))
+                        .collect::<HashMap<_, _>>();
+                    status_cache.insert(task.project_id.clone(), statuses);
+                }
+                let dependencies_ready = status_cache
+                    .get(&task.project_id)
+                    .map(|statuses| {
+                        task.deps.iter().all(|dep| {
+                            matches!(
+                                statuses.get(dep).map(String::as_str),
+                                Some("completed") | Some("skipped")
+                            )
+                        })
+                    })
+                    .unwrap_or(false);
+                if !dependencies_ready {
+                    continue;
+                }
+                let policy = store.get_task_scheduler_policy(&task.project_id)?;
+                if !global_enabled && !store.has_task_scheduler_policy(&task.project_id)? {
+                    continue;
+                }
+                if !policy.enabled || !policy.include_intake {
+                    continue;
+                }
+                let active = store.count_active_intake_tasks(&task.project_id)?;
+                if active >= policy.max_intake_parallel {
+                    continue;
+                }
+                let orchestration = store.get_orchestration_policy(&task.project_id)?;
+                if matches!(task.status.as_str(), "failed" | "interrupted")
+                    && (!orchestration.auto_retry_failed || task.attempts >= task.max_attempts)
+                {
+                    continue;
+                }
+                let retry_boost = if task.attempts > 0
+                    && matches!(task.status.as_str(), "failed" | "interrupted")
+                {
+                    i64::from(orchestration.retry_priority_boost)
+                } else {
+                    0
+                };
+                let effective_priority = intake_effective_priority(&task, now, aging) + retry_boost;
+                candidates.push(PendingIntake {
+                    task,
+                    effective_priority,
+                });
+            }
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            candidates.sort_by(|left, right| {
+                right
+                    .effective_priority
+                    .cmp(&left.effective_priority)
+                    .then_with(|| left.task.created_at.cmp(&right.task.created_at))
+                    .then_with(|| left.task.id.cmp(&right.task.id))
+            });
+            let highest = candidates[0].effective_priority;
+            let tied = candidates
+                .iter()
+                .filter(|candidate| candidate.effective_priority == highest)
+                .collect::<Vec<_>>();
+            let picked = tied
+                .iter()
+                .find(|candidate| {
+                    Some(candidate.task.project_id.as_str()) != last_project.as_deref()
+                })
+                .copied()
+                .unwrap_or(tied[0]);
+            Ok(Some(picked.clone()))
+        })
+        .await?
+    }
+
     pub async fn queue(
         &self,
         project_id: Option<String>,
@@ -328,14 +440,17 @@ impl TaskScheduler {
 }
 
 fn task_scheduler_global_default() -> bool {
+    // The dispatcher is default-on; `0`/`false`/`no` is the explicit opt-out
+    // for operators who want a strictly manual workspace.
     env::var("VERLINPARK_TASK_SCHEDULER")
         .ok()
-        .is_some_and(|value| {
-            matches!(
+        .map(|value| {
+            !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes"
+                "0" | "false" | "no" | "off"
             )
         })
+        .unwrap_or(true)
 }
 
 fn task_scheduler_cooldown_default() -> u64 {
@@ -379,6 +494,17 @@ fn session_effective_priority(
         .map(|enqueued| (now - enqueued).whole_seconds().max(0))
         .unwrap_or(0);
     i64::from(priority) + (age / aging.as_secs().max(1) as i64).min(100)
+}
+
+fn intake_effective_priority(task: &IntakeTask, now: OffsetDateTime, aging: Duration) -> i64 {
+    let base = i64::from(task.priority.clamp(-100, 100));
+    if aging.is_zero() {
+        return base;
+    }
+    let age = OffsetDateTime::parse(&task.created_at, &Rfc3339)
+        .map(|created| (now - created).whole_seconds().max(0))
+        .unwrap_or(0);
+    base + (age / aging.as_secs().max(1) as i64).min(100)
 }
 
 fn task_effective_priority(
@@ -521,6 +647,8 @@ mod tests {
                     enabled: true,
                     cooldown_secs: 20,
                     dispatch_tasks: false,
+                    include_intake: true,
+                    max_intake_parallel: 2,
                 },
             )
             .unwrap();
@@ -550,6 +678,8 @@ mod tests {
                     enabled: true,
                     cooldown_secs: 60,
                     dispatch_tasks: false,
+                    include_intake: true,
+                    max_intake_parallel: 2,
                 },
             )
             .unwrap();
@@ -588,6 +718,8 @@ mod tests {
                     enabled: true,
                     cooldown_secs: 60,
                     dispatch_tasks: false,
+                    include_intake: true,
+                    max_intake_parallel: 2,
                 },
             )
             .unwrap();
@@ -638,5 +770,266 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queue.tasks[0].last_error.as_deref(), Some("tests failed"));
+    }
+}
+
+#[cfg(test)]
+mod intake_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use vp_store::store::NewIntakeTask;
+
+    fn store() -> (TempDir, Store, vp_protocol::types::Project) {
+        let dir = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("intake"))
+            .unwrap();
+        (dir, store, project)
+    }
+
+    fn draft(project_id: &str, title: &str, priority: i32) -> NewIntakeTask {
+        NewIntakeTask {
+            project_id: project_id.to_string(),
+            title: title.to_string(),
+            instructions: format!("Do {title}."),
+            profile: "coding".to_string(),
+            kind: "coding".to_string(),
+            priority,
+            write_scope: vec!["src".to_string()],
+            acceptance: vec!["done".to_string()],
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: 2,
+            origin: "test".to_string(),
+            labels: Vec::new(),
+        }
+    }
+
+    fn scheduler(store: Store) -> TaskScheduler {
+        TaskScheduler::new_with_aging_and_policy(store, Duration::ZERO, true, 60)
+    }
+
+    #[tokio::test]
+    async fn selects_intake_by_priority_and_round_robins_projects() {
+        let (_dir, store, project) = store();
+        let repo = TempDir::new().unwrap();
+        let second_project = store
+            .add_project(repo.path().to_str().unwrap(), Some("second"))
+            .unwrap();
+        let low = store
+            .create_intake_task(&draft(&project.id, "low", -5))
+            .unwrap();
+        let high = store
+            .create_intake_task(&draft(&project.id, "high", 20))
+            .unwrap();
+        let peer = store
+            .create_intake_task(&draft(&second_project.id, "peer", 20))
+            .unwrap();
+        let scheduler = scheduler(store);
+        let picked = scheduler
+            .next_pending_intake(None, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(picked.task.id == high.id || picked.task.id == peer.id);
+        assert_eq!(picked.effective_priority, 20);
+        let picked = scheduler
+            .next_pending_intake(Some(&project.id), &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.task.id, peer.id);
+        let picked = scheduler
+            .next_pending_intake(Some(&second_project.id), std::slice::from_ref(&low.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(picked.task.id, low.id);
+    }
+
+    #[tokio::test]
+    async fn intake_policy_can_exclude_and_limit_parallelism() {
+        let (_dir, store, project) = store();
+        let first = store
+            .create_intake_task(&draft(&project.id, "first", 10))
+            .unwrap();
+        store
+            .create_intake_task(&draft(&project.id, "second", 5))
+            .unwrap();
+        let scheduler = scheduler(store.clone());
+        store
+            .set_task_scheduler_policy(
+                &project.id,
+                &vp_protocol::types::TaskSchedulerPolicy {
+                    enabled: true,
+                    cooldown_secs: 60,
+                    dispatch_tasks: false,
+                    include_intake: false,
+                    max_intake_parallel: 1,
+                },
+            )
+            .unwrap();
+        assert!(
+            scheduler
+                .next_pending_intake(None, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .set_task_scheduler_policy(
+                &project.id,
+                &vp_protocol::types::TaskSchedulerPolicy {
+                    enabled: true,
+                    cooldown_secs: 60,
+                    dispatch_tasks: false,
+                    include_intake: true,
+                    max_intake_parallel: 1,
+                },
+            )
+            .unwrap();
+        let claimed = store.claim_intake_task(&first.id).unwrap().unwrap();
+        assert_eq!(claimed.status, "dispatching");
+        let started = store
+            .start_intake_task(&first.id, "session-1", "T1")
+            .unwrap();
+        assert_eq!(started.status, "running");
+        assert!(
+            scheduler
+                .next_pending_intake(None, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .settle_intake_task(&first.id, "completed", None, None, None)
+            .unwrap();
+        let picked = scheduler
+            .next_pending_intake(None, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.task.title, "second");
+    }
+
+    #[tokio::test]
+    async fn intake_dependencies_gate_selection() {
+        let (_dir, store, project) = store();
+        let first = store
+            .create_intake_task(&draft(&project.id, "first", 0))
+            .unwrap();
+        let mut child = draft(&project.id, "child", 100);
+        child.deps = vec![first.id.clone()];
+        let child = store.create_intake_task(&child).unwrap();
+        let scheduler = scheduler(store.clone());
+        let picked = scheduler
+            .next_pending_intake(None, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.task.id, first.id);
+        store.claim_intake_task(&first.id).unwrap();
+        store
+            .start_intake_task(&first.id, "session-1", "T1")
+            .unwrap();
+        store
+            .settle_intake_task(&first.id, "completed", None, None, None)
+            .unwrap();
+        let picked = scheduler
+            .next_pending_intake(None, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.task.id, child.id);
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_respects_the_orchestration_policy() {
+        let (_dir, store, project) = store();
+        let task = store
+            .create_intake_task(&draft(&project.id, "no auto retry", 0))
+            .unwrap();
+        store.claim_intake_task(&task.id).unwrap();
+        store
+            .settle_intake_task(&task.id, "failed", None, Some("boom"), None)
+            .unwrap();
+        store
+            .set_orchestration_policy(
+                &project.id,
+                &vp_protocol::types::OrchestrationPolicy {
+                    auto_retry_failed: false,
+                    max_attempts: 3,
+                    retry_backoff_secs: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let scheduler = scheduler(store.clone());
+        assert!(
+            scheduler
+                .next_pending_intake(None, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.retry_intake_task(&task.id).unwrap();
+        assert!(
+            scheduler
+                .next_pending_intake(None, &[])
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_and_priority_boost_are_honored() {
+        let (_dir, store, project) = store();
+        let task = store
+            .create_intake_task(&draft(&project.id, "retry me", 0))
+            .unwrap();
+        store.claim_intake_task(&task.id).unwrap();
+        store
+            .settle_intake_task(&task.id, "failed", None, Some("boom"), None)
+            .unwrap();
+        store
+            .set_orchestration_policy(
+                &project.id,
+                &vp_protocol::types::OrchestrationPolicy {
+                    auto_retry_failed: true,
+                    max_attempts: 3,
+                    retry_backoff_secs: 30,
+                    retry_priority_boost: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let scheduler = scheduler(store.clone());
+        let picked = scheduler
+            .next_pending_intake(None, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.effective_priority, 10);
+        store
+            .settle_intake_task(
+                &task.id,
+                "failed",
+                None,
+                Some("wait"),
+                Some("2999-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        assert!(
+            scheduler
+                .next_pending_intake(None, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
