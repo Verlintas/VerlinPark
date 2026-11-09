@@ -66,7 +66,7 @@
 - Ops 改为 Overview / Board / Inbox / History 四个页签；主命令只保留 Run next、Preview、Coordinate 和 More 菜单，减少首屏卡片与按钮。
 - 缩放默认 100%，每次 5%，按 5% 吸附；点击百分比立即回到 100%。宽屏 sheet 同样处理。
 - Preview 默认 Showcase（Agent 成果白板），展示 published artifacts；Changes/Files/Plan 为主分类，History/Queue/Mailbox/Cost/Console/Terminal/Trace 收进 More。
-- Files 面板改为递归文件夹树 + 浏览器式文件标签页；每个标签独立 draft、dirty、save/reload、关闭确认。
+- Files 面板改为递归文件夹树 + 浏览器式文件标签页；每个标签独立 draft、dirty、save/reload、关闭确认。文件夹默认折叠（chevron 可展开/收起，支持 Expand all / Collapse all），只渲染当前展开分支，避免一次渲染整个 worktree；筛选时自动展开匹配路径。
 - Manage Dash 默认只显示 Overview / Inbox / Team & Tasks / Usage；其余高级段通过 “Advanced sections” 开关显示。
 
 ### Provider / 首次使用

@@ -22,8 +22,10 @@ role overrides, team capacity, and model presets before the first useful run.
    primary. History, Queue, Mailbox, Cost, Console, Terminal, and Trace live in
    a More menu. This reduces horizontal crowding.
 3. **Files are a recursive tree with tabs.** The flat file list becomes a
-   folder tree. Opening files creates browser-like tabs with independent
-   drafts, dirty indicators, save/reload, and close confirmation.
+   folder tree. Folders start collapsed and render children only when expanded;
+   the panel also offers Expand all / Collapse all. Opening files creates
+   browser-like tabs with independent drafts, dirty indicators, save/reload,
+   and close confirmation.
 4. **Manage Dash starts essential.** Overview, Inbox, Team & Tasks, and Usage
    are visible by default; Git, Checkpoints, Storage, Policies, and Diagnostics
    are behind an “Advanced sections” switch.

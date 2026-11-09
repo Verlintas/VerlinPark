@@ -1617,6 +1617,7 @@ private struct FilesPanel: View {
     @State private var tabs: [WorkspaceFileTab] = []
     @State private var activePath: String?
     @State private var pendingClosePath: String?
+    @State private var expandedPaths: Set<String> = []
 
     private var activeTab: WorkspaceFileTab? {
         tabs.first { $0.path == activePath }
@@ -1648,6 +1649,7 @@ private struct FilesPanel: View {
         .task(id: model.selectedSessionID) {
             tabs = []
             activePath = nil
+            expandedPaths = []
             if model.workspaceEntries.isEmpty {
                 await model.loadWorkspaceTree()
             }
@@ -1687,6 +1689,26 @@ private struct FilesPanel: View {
                 if model.workspaceTreeBusy {
                     ProgressView().controlSize(.small)
                 }
+                if !tree.isEmpty {
+                    Button {
+                        expandedPaths = Set(allDirectoryPaths(in: tree))
+                    } label: {
+                        Image(systemName: "chevron.down.circle")
+                            .font(.system(size: 9, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .help(L10n.t("Expand all folders"))
+                    Button {
+                        expandedPaths = []
+                    } label: {
+                        Image(systemName: "chevron.right.circle")
+                            .font(.system(size: 9, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .help(L10n.t("Collapse all folders"))
+                }
             }
             .padding(8)
 
@@ -1707,6 +1729,10 @@ private struct FilesPanel: View {
                             depth: 0,
                             activePath: activePath,
                             hoveredPath: $hoveredPath,
+                            expandedPaths: expandedPaths,
+                            forceExpanded: !model.workspaceFilter
+                                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                            onToggle: toggleFolder,
                             onOpen: open
                         )
                     }
@@ -1970,6 +1996,21 @@ private struct FilesPanel: View {
         }
     }
 
+    private func toggleFolder(_ path: String) {
+        if expandedPaths.contains(path) {
+            expandedPaths.remove(path)
+        } else {
+            expandedPaths.insert(path)
+        }
+    }
+
+    private func allDirectoryPaths(in nodes: [WorkspaceTreeNode]) -> [String] {
+        nodes.flatMap { node -> [String] in
+            guard node.isDirectory else { return [] }
+            return [node.path] + allDirectoryPaths(in: node.children)
+        }
+    }
+
     private static func buildTree(_ entries: [WorkspaceEntry], filter: String) -> [WorkspaceTreeNode] {
         let query = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let grouped = Dictionary(grouping: entries) { entry -> String in
@@ -2022,26 +2063,39 @@ private struct WorkspaceTreeNodeView: View {
     let depth: Int
     let activePath: String?
     @Binding var hoveredPath: String?
+    let expandedPaths: Set<String>
+    let forceExpanded: Bool
+    let onToggle: (String) -> Void
     let onOpen: (WorkspaceEntry) -> Void
 
-    @State private var expanded = true
+    private var isExpanded: Bool {
+        forceExpanded || expandedPaths.contains(node.path)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if node.isDirectory {
                 Button {
-                    expanded.toggle()
+                    onToggle(node.path)
                 } label: {
-                    row(icon: expanded ? "folder.fill" : "folder", tint: VPTheme.plan, isActive: false)
+                    row(
+                        icon: isExpanded ? "folder.fill" : "folder",
+                        tint: VPTheme.plan,
+                        isActive: false,
+                        expanded: isExpanded
+                    )
                 }
                 .buttonStyle(.plain)
-                if expanded {
+                if isExpanded {
                     ForEach(node.children) { child in
                         WorkspaceTreeNodeView(
                             node: child,
                             depth: depth + 1,
                             activePath: activePath,
                             hoveredPath: $hoveredPath,
+                            expandedPaths: expandedPaths,
+                            forceExpanded: forceExpanded,
+                            onToggle: onToggle,
                             onOpen: onOpen
                         )
                     }
@@ -2060,7 +2114,8 @@ private struct WorkspaceTreeNodeView: View {
                     row(
                         icon: "doc.text",
                         tint: VPTheme.textTertiary,
-                        isActive: activePath == node.path
+                        isActive: activePath == node.path,
+                        expanded: false
                     )
                 }
                 .buttonStyle(VPPressableButtonStyle(scale: 0.99))
@@ -2071,13 +2126,16 @@ private struct WorkspaceTreeNodeView: View {
         }
     }
 
-    private func row(icon: String, tint: Color, isActive: Bool) -> some View {
-        HStack(spacing: 5) {
-            if !node.isDirectory {
-                Spacer().frame(width: CGFloat(depth) * 10)
-            } else {
-                Spacer().frame(width: CGFloat(depth) * 10)
-            }
+    private func row(icon: String, tint: Color, isActive: Bool, expanded: Bool) -> some View {
+        HStack(spacing: 4) {
+            Spacer()
+                .frame(width: CGFloat(depth) * 10)
+            Image(systemName: node.isDirectory
+                ? (expanded ? "chevron.down" : "chevron.right")
+                : "circle.fill")
+                .font(.system(size: node.isDirectory ? 6 : 2.5, weight: .bold))
+                .foregroundStyle(VPTheme.textTertiary.opacity(node.isDirectory ? 1 : 0.35))
+                .frame(width: 7)
             Image(systemName: icon)
                 .font(.system(size: 8.5))
                 .foregroundStyle(isActive ? VPTheme.accent : tint)
@@ -2089,6 +2147,11 @@ private struct WorkspaceTreeNodeView: View {
                 ))
                 .foregroundStyle(isActive ? VPTheme.textPrimary : VPTheme.textSecondary)
                 .lineLimit(1)
+            if node.isDirectory {
+                Text("\(node.children.count)")
+                    .font(VPTheme.mono(6.2))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
             Spacer(minLength: 3)
             if !node.isDirectory {
                 Text(formatSize(node.size))
