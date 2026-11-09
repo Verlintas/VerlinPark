@@ -7,6 +7,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case brand
     case resident
     case providers
+    case skills
     case acp
     case mcp
     case notifications
@@ -22,6 +23,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .brand: L10n.t("Brand")
         case .resident: L10n.t("Resident")
         case .providers: L10n.t("Providers")
+        case .skills: L10n.t("Skills")
         case .acp: L10n.t("ACP")
         case .mcp: L10n.t("MCP")
         case .notifications: L10n.t("Notifications")
@@ -35,6 +37,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .brand: L10n.t("Wordmark, flags, and live preview")
         case .resident: L10n.t("External Aviiya bridge")
         case .providers: L10n.t("Connect a model; advanced overrides")
+        case .skills: L10n.t("Reusable project instructions and tools")
         case .acp: L10n.t("External stdio agents")
         case .mcp: L10n.t("Local and remote tool servers")
         case .notifications: L10n.t("Permission and background alerts")
@@ -48,6 +51,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .brand: "paintpalette"
         case .resident: "cube.transparent"
         case .providers: "network"
+        case .skills: "wand.and.stars"
         case .acp: "person.crop.rectangle.stack"
         case .mcp: "puzzlepiece.extension"
         case .notifications: "bell"
@@ -209,6 +213,8 @@ struct SettingsView: View {
             ResidentSettingsView()
         case .providers:
             ProvidersSettingsView()
+        case .skills:
+            SkillsSettingsView()
         case .acp:
             AcpSettingsView()
         case .mcp:

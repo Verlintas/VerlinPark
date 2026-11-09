@@ -885,6 +885,176 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(result.task.lastError, "skipped by user")
     }
 
+    func testSourceAndSkillModelsDecode() throws {
+        let sourceJSON = """
+        {
+          "id": "source-1",
+          "project_id": "project-1",
+          "kind": "note",
+          "title": "Architecture",
+          "uri": null,
+          "mime_type": "text/markdown",
+          "status": "indexed",
+          "size_bytes": 42,
+          "sha256": "abc",
+          "revision": 1,
+          "chunk_count": 2,
+          "char_count": 42,
+          "token_count": 10,
+          "error": null,
+          "labels": ["docs"],
+          "created_at": "2026-11-10T00:00:00Z",
+          "updated_at": "2026-11-10T00:00:00Z",
+          "indexed_at": "2026-11-10T00:00:00Z"
+        }
+        """
+        let source = try JSONDecoder().decode(ProjectSource.self, from: Data(sourceJSON.utf8))
+        XCTAssertEqual(source.title, "Architecture")
+        XCTAssertEqual(source.chunkCount, 2)
+        XCTAssertEqual(source.labels, ["docs"])
+
+        let skillJSON = """
+        {
+          "id": "skill-1",
+          "project_id": "project-1",
+          "name": "Review",
+          "slug": "review",
+          "description": "Review a change",
+          "when_to_use": "Before merging",
+          "version": "1.1.0",
+          "instructions": "Read the diff.",
+          "tool_allow": ["read_file"],
+          "tool_deny": ["shell"],
+          "profiles": ["coding"],
+          "roles": ["worker"],
+          "enabled": true,
+          "source": "user",
+          "sha256": "def",
+          "created_at": "2026-11-10T00:00:00Z",
+          "updated_at": "2026-11-10T00:00:00Z"
+        }
+        """
+        let skill = try JSONDecoder().decode(ProjectSkill.self, from: Data(skillJSON.utf8))
+        XCTAssertEqual(skill.name, "Review")
+        XCTAssertEqual(skill.toolAllow, ["read_file"])
+        XCTAssertEqual(skill.toolDeny, ["shell"])
+
+        let hitJSON = """
+        {
+          "source_id": "source-1",
+          "source_title": "Architecture",
+          "chunk_id": "chunk-1",
+          "chunk_no": 1,
+          "heading": "Leases",
+          "content": "deterministic leases",
+          "score": 1.5
+        }
+        """
+        let hit = try JSONDecoder().decode(SourceSearchHit.self, from: Data(hitJSON.utf8))
+        XCTAssertEqual(hit.chunkNo, 1)
+        XCTAssertEqual(hit.score, 1.5, accuracy: 0.001)
+    }
+
+    func testKnowledgeCollectionActivationDiffAndAuditDecode() throws {
+        let collectionJSON = """
+        {
+          "collections": [
+            {"name": "engineering", "sources": 2, "chunks": 9, "bytes": 1200,
+             "tokens": 340, "labels": ["runtime", "verified"]},
+            {"name": null, "sources": 1, "chunks": 2, "bytes": 100,
+             "tokens": 20, "labels": []}
+          ],
+          "total_sources": 3
+        }
+        """
+        let collections = try JSONDecoder().decode(
+            SourceCollectionsResult.self,
+            from: Data(collectionJSON.utf8)
+        )
+        XCTAssertEqual(collections.totalSources, 3)
+        XCTAssertEqual(collections.collections.count, 2)
+        XCTAssertEqual(collections.collections[0].displayName, "engineering")
+        XCTAssertEqual(collections.collections[1].id, "")
+        XCTAssertTrue(collections.collections[1].name == nil)
+
+        let activationJSON = """
+        {
+          "activations": [
+            {"name": "Release Review", "slug": "release-review", "version": "1.2.0",
+             "role": "worker", "profile": "coding", "tool_allow": ["read_file"],
+             "tool_deny": ["shell"], "agent_id": "agent-1", "agent_name": "Worker",
+             "task_id": "T1", "activated_at": "2026-11-10T00:00:00Z"}
+          ]
+        }
+        """
+        let activations = try JSONDecoder().decode(
+            SkillActivationsResult.self,
+            from: Data(activationJSON.utf8)
+        )
+        XCTAssertEqual(activations.activations.count, 1)
+        XCTAssertEqual(activations.activations[0].toolAllow, ["read_file"])
+        XCTAssertEqual(activations.activations[0].toolDeny, ["shell"])
+        XCTAssertEqual(activations.activations[0].role, "worker")
+
+        let diffJSON = """
+        {
+          "artifact_id": "artifact-1",
+          "name": "Report",
+          "from_version": 1,
+          "to_version": 2,
+          "diff": {
+            "hunks": [
+              {"old_start": 1, "old_lines": 1, "new_start": 1, "new_lines": 2,
+               "lines": [
+                 {"kind": "delete", "old_line": 1, "new_line": null, "text": "alpha"},
+                 {"kind": "add", "old_line": null, "new_line": 1, "text": "beta"},
+                 {"kind": "add", "old_line": null, "new_line": 2, "text": "gamma"}
+               ]}
+            ],
+            "additions": 2, "deletions": 1, "unchanged": 0,
+            "identical": false, "truncated": false
+          }
+        }
+        """
+        let diff = try JSONDecoder().decode(
+            ArtifactDiffResult.self,
+            from: Data(diffJSON.utf8)
+        )
+        XCTAssertEqual(diff.fromVersion, 1)
+        XCTAssertEqual(diff.toVersion, 2)
+        XCTAssertEqual(diff.diff.additions, 2)
+        XCTAssertEqual(diff.diff.deletions, 1)
+        XCTAssertEqual(diff.diff.hunks[0].lines[1].kind, "add")
+        XCTAssertEqual(diff.diff.hunks[0].lines[1].newLine, 1)
+        XCTAssertNil(diff.diff.hunks[0].lines[1].oldLine)
+
+        let auditJSON = """
+        {
+          "audit": {
+            "messages": [
+              {"message_id": "m1", "agent_name": "Worker",
+               "excerpt": "Claim [c1].", "citation_count": 1,
+               "referenced_keys": ["c1"], "dangling_keys": [],
+               "unused_keys": [], "created_at": "2026-11-10T00:00:00Z"}
+            ],
+            "messages_with_citations": 1,
+            "messages_without_citations": 0,
+            "total_citations": 1,
+            "unique_sources": 1,
+            "dangling_key_count": 0,
+            "unused_citation_count": 0
+          }
+        }
+        """
+        let audit = try JSONDecoder().decode(
+            SessionCitationAuditResult.self,
+            from: Data(auditJSON.utf8)
+        )
+        XCTAssertEqual(audit.audit.messagesWithCitations, 1)
+        XCTAssertEqual(audit.audit.messages[0].referencedKeys, ["c1"])
+        XCTAssertEqual(audit.audit.danglingKeyCount, 0)
+    }
+
     func testSchedulerStatusDecodes() throws {
         let json = """
         {
@@ -1967,7 +2137,8 @@ final class ProtocolCompatibilityTests: XCTestCase {
 
     func testSettingsSectionsAreUniqueAndComplete() {
         let sections = SettingsSection.allCases
-        XCTAssertEqual(sections.count, 8)
+        XCTAssertEqual(sections.count, 9)
+        XCTAssertTrue(sections.contains(.skills))
         XCTAssertEqual(sections.first, .general)
         XCTAssertEqual(sections.last, .about)
         XCTAssertEqual(Set(sections.map(\.title)).count, sections.count)

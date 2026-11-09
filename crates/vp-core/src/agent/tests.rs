@@ -6568,18 +6568,18 @@ fn derives_context_limits_from_the_configured_model_window() {
     let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
 
     config.context_window = 128_000;
-    let (threshold_128k, hard_128k) = context_limits(&config, AgentRole::Leader, 2_000, 2_000);
+    let (threshold_128k, hard_128k) = context_limits(&config, AgentRole::Leader);
     assert!(threshold_128k > 80_000, "128k model threshold too low");
     assert!(hard_128k > threshold_128k);
 
     config.context_window = 1_000_000;
-    let (threshold_1m, hard_1m) = context_limits(&config, AgentRole::Leader, 2_000, 2_000);
+    let (threshold_1m, hard_1m) = context_limits(&config, AgentRole::Leader);
     assert!(threshold_1m > 700_000, "1M model threshold too low");
     assert!(hard_1m > threshold_1m);
 
     config.context_window = 8_000;
     config.max_tokens = Some(2_048);
-    let (threshold_8k, hard_8k) = context_limits(&config, AgentRole::Leader, 1_000, 1_000);
+    let (threshold_8k, hard_8k) = context_limits(&config, AgentRole::Leader);
     assert!(threshold_8k < 4_000, "8k model threshold too high");
     assert!(hard_8k < 5_000);
 
@@ -6591,7 +6591,7 @@ fn derives_context_limits_from_the_configured_model_window() {
     );
 
     config.context_window = 0;
-    let (threshold_off, hard_off) = context_limits(&config, AgentRole::Leader, 0, 0);
+    let (threshold_off, hard_off) = context_limits(&config, AgentRole::Leader);
     assert_eq!(threshold_off, 0);
     assert_eq!(hard_off, u64::MAX);
 }
@@ -7722,4 +7722,215 @@ async fn dependency_reconciler_waits_for_available_automatic_retry() {
     service.reconcile_intake_tasks().await.unwrap();
     let child = engine.get_intake_task(child.id).await.unwrap().unwrap();
     assert_eq!(child.status, "queued");
+}
+
+#[tokio::test]
+async fn source_search_attaches_citation_evidence_to_agent_messages() {
+    use vp_protocol::types::SourceCreateNoteParams;
+
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "search_sources_1".into(),
+                    name: "search_sources".into(),
+                    arguments: serde_json::json!({
+                        "query": "deterministic leases",
+                        "limit": 4
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("The scheduler uses deterministic leases [c1].".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Scheduler notes".into(),
+            content: "The scheduler uses deterministic leases for integration.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(source.status, "indexed");
+    let session = engine
+        .create_session(project.id.clone(), "answer from sources".into(), None)
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "answer from sources")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    let message = events
+        .iter()
+        .find(|event| {
+            event.kind == "agent.message"
+                && event.payload["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("[c1]"))
+        })
+        .expect("final assistant message");
+    assert!(message.payload["message_id"].as_str().is_some());
+    let citations = message.payload["citations"]
+        .as_array()
+        .expect("citations array");
+    assert_eq!(citations.len(), 1);
+    assert_eq!(citations[0]["key"], "c1");
+    assert_eq!(citations[0]["source_id"], source.id);
+    assert_eq!(citations[0]["origin"], "search");
+    assert!(
+        citations[0]["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("deterministic leases")
+    );
+    let persisted = engine.session_citations(&session.id, None).await.unwrap();
+    assert_eq!(persisted.citations.len(), 1);
+    assert_eq!(persisted.citations[0].citation.key, "c1");
+    assert_eq!(persisted.citations[0].citation.source_id, source.id);
+    let audit = engine
+        .session_citation_audit(&session.id)
+        .await
+        .unwrap()
+        .audit;
+    assert_eq!(audit.messages_with_citations, 1);
+    assert_eq!(audit.messages_without_citations, 0);
+    assert_eq!(audit.total_citations, 1);
+    assert_eq!(audit.unique_sources, 1);
+    assert_eq!(audit.dangling_key_count, 0);
+    assert_eq!(audit.unused_citation_count, 0);
+}
+
+#[test]
+fn skill_tool_wildcards_narrow_without_granting() {
+    let mut skill = Skill {
+        id: "skill-wildcard".into(),
+        project_id: "project".into(),
+        name: "Wildcard".into(),
+        slug: "wildcard".into(),
+        description: "Test wildcard policy".into(),
+        when_to_use: String::new(),
+        version: "1.0.0".into(),
+        instructions: "Test".into(),
+        tool_allow: Vec::new(),
+        tool_deny: vec!["*".into()],
+        profiles: Vec::new(),
+        roles: Vec::new(),
+        enabled: true,
+        source: "test".into(),
+        sha256: String::new(),
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    assert!(!skill_allows_tool(&skill, "read_file"));
+    assert!(!skill_allows_tool(&skill, "shell"));
+    assert!(skill_allows_tool(&skill, "use_skill"));
+    skill.tool_deny.clear();
+    skill.tool_allow = vec!["*".into()];
+    assert!(skill_allows_tool(&skill, "read_file"));
+    skill.tool_allow = vec!["read_file".into()];
+    assert!(skill_allows_tool(&skill, "read_file"));
+    assert!(!skill_allows_tool(&skill, "shell"));
+}
+
+#[tokio::test]
+async fn active_skill_narrows_tools_at_execution_time() {
+    use vp_protocol::types::SkillCreateParams;
+
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "use_skill_1".into(),
+                    name: "use_skill".into(),
+                    arguments: serde_json::json!({"name": "Read Only"}).to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "write_blocked".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "blocked.txt",
+                        "content": "should not be written"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("The skill blocked the write.".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .create_skill(SkillCreateParams {
+            project_id: project.id.clone(),
+            name: "Read Only".into(),
+            description: "Only inspect files.".into(),
+            when_to_use: "When editing is forbidden.".into(),
+            version: None,
+            instructions: "Do not write files.".into(),
+            tool_allow: vec!["read_file".into()],
+            tool_deny: Vec::new(),
+            profiles: Vec::new(),
+            roles: vec!["leader".into()],
+        })
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "skill policy".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "skill policy").await.unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let blocked = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished" && event.payload["tool_call_id"] == "write_blocked"
+        })
+        .expect("blocked tool event");
+    assert!(
+        blocked.payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("not allowed by active skill")
+    );
+    assert!(
+        engine
+            .workspace_file(&session.id, "blocked.txt")
+            .await
+            .is_err()
+    );
+    let activations = engine.session_skill_activations(&session.id).await.unwrap();
+    assert_eq!(activations.activations.len(), 1);
+    assert_eq!(activations.activations[0].name, "Read Only");
+    assert_eq!(activations.activations[0].role, "leader");
+    assert_eq!(activations.activations[0].tool_allow, vec!["read_file"]);
+    assert!(activations.activations[0].agent_name.is_some());
+    assert!(activations.activations[0].agent_id.is_some());
+    assert!(!activations.activations[0].activated_at.is_empty());
 }

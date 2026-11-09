@@ -138,6 +138,10 @@
 | [0126](adr/0126-preview-tabs-showcase-and-setup.md) | Preview result board, file tabs/tree, essential Manage Dash, preset-first setup | Accepted | UI/Onboarding |
 | [0127](adr/0127-task-inbox-autopilot.md) | Standalone task inbox, one-task plan bridge, default-on autonomous dispatch, dependency gates, retry reconciliation | Accepted | Runtime/Scheduling |
 | [0128](adr/0128-lazy-workspace-browser-and-content-search.md) | Lazy directory listing, bounded literal content search, line-number editor, generous close targets | Accepted | UI/Workspace |
+| [0129](adr/0129-project-knowledge-sources-and-citations.md) | Project source snapshots, deterministic chunking, FTS5 retrieval, read-only source tools, event-backed citations | Accepted | Knowledge/Runtime |
+| [0130](adr/0130-project-skill-packs.md) | Project skill packs, SKILL.md import, explicit activation, narrowing tool policy | Accepted | Prompting/Runtime |
+| [0131](adr/0131-artifact-versions-and-idempotent-publication.md) | Inline artifact versions, optimistic restore, session-scoped request-key idempotency | Accepted | Artifacts/Runtime |
+| [0132](adr/0132-bounded-text-diff-and-citation-audit.md) | Bounded Myers text diff, artifact version comparison, event-derived citation audit, source collections, context-limit fix | Accepted | Runtime/Artifacts/Knowledge |
 
 ---
 

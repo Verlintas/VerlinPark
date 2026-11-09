@@ -62,6 +62,17 @@ final class AppModel {
     var mergeQueue: [MergeQueueEntry] = []
     var mailbox: [AgentMessage] = []
     var artifacts: [Artifact] = []
+    var artifactVersions: [ArtifactVersion] = []
+    var artifactVersionsArtifactID: String?
+    var artifactVersionsBusy = false
+    var artifactVersionsError: String?
+    var artifactDiff: ArtifactDiffResult?
+    var artifactDiffBusy = false
+    var artifactDiffError: String?
+    var sessionCitations: [MessageCitation] = []
+    var sessionCitationsBusy = false
+    var sessionCitationsError: String?
+    var citationAudit: CitationAudit?
     var usageLedger: UsageLedgerResult?
     var usageStatus: String?
     var shellPolicy = ShellPolicy.allow
@@ -236,6 +247,33 @@ final class AppModel {
     var schedulerStatus: SchedulerStatusResult?
     var schedulerStatusBusy = false
     var schedulerStatusError: String?
+    var sources: [ProjectSource] = []
+    var sourceStats: SourceStats?
+    var sourceCollections: [SourceCollection] = []
+    var sourceCollectionFilter: String?
+    var sourcesBusy = false
+    var sourceStatus: String?
+    var sourceSelectedID: String?
+    var sourceSelected: SourceGetResult?
+    var sourceSelectedChunk: UInt32?
+    var sourceSelectedBusy = false
+    var sourceSearchQuery = ""
+    var sourceSearchResults: [SourceSearchHit] = []
+    var sourceSearchDegraded = false
+    var sourceSearchBusy = false
+    var sourceSearchError: String?
+    var sourceDraftTitle = ""
+    var sourceDraftContent = ""
+    var sourceDraftCollection = ""
+    var sourceDraftPath = ""
+    var sourceDraftURL = ""
+    var sourceActionBusyID: String?
+    var skills: [ProjectSkill] = []
+    var skillsBusy = false
+    var skillsStatus: String?
+    var skillActivations: [SkillActivation] = []
+    var skillActivationsBusy = false
+    var skillActionBusyID: String?
     var intakeTasks: [IntakeTask] = []
     var intakeBusy = false
     var intakeStatus: String?
@@ -677,6 +715,26 @@ final class AppModel {
         taskQueue = nil
         schedulerStatus = nil
         schedulerStatusError = nil
+        sources = []
+        sourceStats = nil
+        sourceCollections = []
+        sourceCollectionFilter = nil
+        sourceStatus = nil
+        sourceSelectedID = nil
+        sourceSelected = nil
+        sourceSelectedChunk = nil
+        sourceSearchQuery = ""
+        sourceSearchResults = []
+        sourceSearchDegraded = false
+        sourceSearchError = nil
+        sourceDraftTitle = ""
+        sourceDraftContent = ""
+        sourceDraftCollection = ""
+        sourceDraftPath = ""
+        sourceDraftURL = ""
+        skills = []
+        skillsStatus = nil
+        skillActivations = []
         intakeTasks = []
         intakeStatus = nil
         intakeEditingID = nil
@@ -3392,6 +3450,487 @@ final class AppModel {
         }
     }
 
+    func loadSkills(silent: Bool = false) async {
+        guard let projectID = selectedProjectID else {
+            skills = []
+            return
+        }
+        let generation = selectionGeneration
+        if !silent {
+            skillsBusy = true
+        }
+        defer {
+            if !silent {
+                skillsBusy = false
+            }
+        }
+        do {
+            let result = try await core.skills(projectID: projectID, includeDisabled: true)
+            guard generation == selectionGeneration, projectID == selectedProjectID else {
+                return
+            }
+            skills = result.skills
+            if !silent {
+                skillsStatus = nil
+            }
+        } catch {
+            guard generation == selectionGeneration, projectID == selectedProjectID else {
+                return
+            }
+            if !silent {
+                skillsStatus = error.localizedDescription
+            }
+        }
+    }
+
+    func createSkill(
+        name: String,
+        description: String,
+        whenToUse: String,
+        version: String,
+        instructions: String,
+        toolAllow: [String],
+        toolDeny: [String],
+        profiles: [String],
+        roles: [String]
+    ) async -> ProjectSkill? {
+        guard let projectID = selectedProjectID else {
+            skillsStatus = "Select a project first."
+            return nil
+        }
+        skillsBusy = true
+        defer { skillsBusy = false }
+        do {
+            let skill = try await core.createSkill(
+                projectID: projectID,
+                name: name,
+                description: description,
+                whenToUse: whenToUse,
+                version: version.isEmpty ? nil : version,
+                instructions: instructions,
+                toolAllow: toolAllow,
+                toolDeny: toolDeny,
+                profiles: profiles,
+                roles: roles
+            )
+            skillsStatus = "Created \(skill.name)."
+            await loadSkills(silent: true)
+            return skill
+        } catch {
+            skillsStatus = error.localizedDescription
+            return nil
+        }
+    }
+
+    func updateSkill(
+        id: String,
+        name: String,
+        description: String,
+        whenToUse: String,
+        version: String,
+        instructions: String,
+        toolAllow: [String],
+        toolDeny: [String],
+        profiles: [String],
+        roles: [String]
+    ) async -> ProjectSkill? {
+        skillsBusy = true
+        defer { skillsBusy = false }
+        do {
+            let skill = try await core.updateSkill(
+                id: id,
+                name: name,
+                description: description,
+                whenToUse: whenToUse,
+                version: version.isEmpty ? nil : version,
+                instructions: instructions,
+                toolAllow: toolAllow,
+                toolDeny: toolDeny,
+                profiles: profiles,
+                roles: roles
+            )
+            skillsStatus = "Updated \(skill.name)."
+            await loadSkills(silent: true)
+            return skill
+        } catch {
+            skillsStatus = error.localizedDescription
+            return nil
+        }
+    }
+
+    func loadSkillActivations() async {
+        guard let sessionID = selectedSessionID else {
+            skillActivations = []
+            return
+        }
+        let generation = selectionGeneration
+        skillActivationsBusy = true
+        skillActivations = []
+        defer { skillActivationsBusy = false }
+        do {
+            let result = try await core.skillActivations(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            skillActivations = result.activations
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            skillActivations = []
+        }
+    }
+
+    func importSkill(path: String) async -> ProjectSkill? {
+        guard let projectID = selectedProjectID else {
+            skillsStatus = "Select a project first."
+            return nil
+        }
+        let path = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else {
+            skillsStatus = "Enter a SKILL.md path relative to the project root."
+            return nil
+        }
+        skillsBusy = true
+        defer { skillsBusy = false }
+        do {
+            let skill = try await core.importSkill(projectID: projectID, path: path)
+            skillsStatus = "Imported \(skill.name)."
+            await loadSkills(silent: true)
+            return skill
+        } catch {
+            skillsStatus = error.localizedDescription
+            return nil
+        }
+    }
+
+    func setSkillEnabled(_ skill: ProjectSkill, enabled: Bool) async {
+        skillActionBusyID = skill.id
+        defer { skillActionBusyID = nil }
+        do {
+            _ = try await core.setSkillEnabled(id: skill.id, enabled: enabled)
+            skillsStatus = enabled ? "Enabled \(skill.name)." : "Disabled \(skill.name)."
+            await loadSkills(silent: true)
+        } catch {
+            skillsStatus = error.localizedDescription
+        }
+    }
+
+    func deleteSkill(_ skill: ProjectSkill) async {
+        skillActionBusyID = skill.id
+        defer { skillActionBusyID = nil }
+        do {
+            _ = try await core.deleteSkill(id: skill.id)
+            skillsStatus = "Deleted \(skill.name)."
+            await loadSkills(silent: true)
+        } catch {
+            skillsStatus = error.localizedDescription
+        }
+    }
+
+    func loadSources(silent: Bool = false) async {
+        guard let projectID = selectedProjectID else {
+            sources = []
+            sourceStats = nil
+            return
+        }
+        let generation = selectionGeneration
+        if !silent {
+            sourcesBusy = true
+        }
+        defer {
+            if !silent {
+                sourcesBusy = false
+            }
+        }
+        do {
+            async let sourcesTask = core.sources(
+                projectID: projectID,
+                query: nil,
+                status: nil,
+                limit: 200
+            )
+            async let collectionsTask = core.sourceCollections(projectID: projectID)
+            let (result, collections) = try await (sourcesTask, collectionsTask)
+            guard generation == selectionGeneration, projectID == selectedProjectID else {
+                return
+            }
+            sources = result.sources
+            sourceStats = result.stats
+            sourceCollections = collections.collections
+            if let filter = sourceCollectionFilter,
+               !filter.isEmpty,
+               !collections.collections.contains(where: { $0.name == filter })
+            {
+                sourceCollectionFilter = nil
+            }
+            if !silent {
+                sourceStatus = nil
+            }
+            if let selectedID = sourceSelectedID,
+               !result.sources.contains(where: { $0.id == selectedID })
+            {
+                sourceSelectedID = nil
+                sourceSelected = nil
+            }
+        } catch {
+            guard generation == selectionGeneration, projectID == selectedProjectID else {
+                return
+            }
+            if !silent {
+                sourceStatus = error.localizedDescription
+            }
+        }
+    }
+
+    func loadSource(_ sourceID: String, chunkNo: UInt32? = nil) async {
+        if sourceSelectedID != sourceID {
+            sourceSelected = nil
+        }
+        sourceSelectedID = sourceID
+        sourceSelectedChunk = chunkNo
+        sourceSelectedBusy = true
+        defer { sourceSelectedBusy = false }
+        let offset = chunkNo.map { max(0, Int($0) - 4) } ?? 0
+        do {
+            let result = try await core.sourceGet(
+                sourceID: sourceID,
+                offset: offset,
+                limit: 60
+            )
+            guard sourceSelectedID == sourceID else { return }
+            sourceSelected = result
+            sourceSearchError = nil
+        } catch {
+            guard sourceSelectedID == sourceID else { return }
+            sourceStatus = error.localizedDescription
+        }
+    }
+
+    func searchSourceContents(_ rawQuery: String? = nil) async {
+        guard let projectID = selectedProjectID else { return }
+        let query = (rawQuery ?? sourceSearchQuery)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        sourceSearchQuery = query
+        sourceSearchError = nil
+        if query.isEmpty {
+            sourceSearchResults = []
+            sourceSearchDegraded = false
+            sourceSearchBusy = false
+            return
+        }
+        sourceSearchBusy = true
+        let generation = selectionGeneration
+        do {
+            let filters = sourceCollectionFilter.map { [$0] } ?? []
+            let result = try await core.searchSources(
+                projectID: projectID,
+                query: query,
+                collections: filters,
+                limit: 12
+            )
+            guard generation == selectionGeneration,
+                  sourceSearchQuery == query
+            else { return }
+            sourceSearchResults = result.hits
+            sourceSearchDegraded = result.degraded
+            sourceSearchBusy = false
+        } catch {
+            guard generation == selectionGeneration,
+                  sourceSearchQuery == query
+            else { return }
+            sourceSearchError = error.localizedDescription
+            sourceSearchBusy = false
+        }
+    }
+
+    private var sourceCollection: String? {
+        let value = sourceDraftCollection.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    func setSourceCollectionFilter(_ value: String?) async {
+        sourceCollectionFilter = value
+        if !sourceSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            await searchSourceContents(sourceSearchQuery)
+        }
+    }
+
+    func updateSourceMetadata(
+        _ source: ProjectSource,
+        title: String,
+        collection: String?,
+        labels: [String]
+    ) async -> Bool {
+        sourceActionBusyID = source.id
+        defer { sourceActionBusyID = nil }
+        do {
+            let updated = try await core.updateSourceMetadata(
+                sourceID: source.id,
+                title: title,
+                collection: collection,
+                labels: labels
+            )
+            if let index = sources.firstIndex(where: { $0.id == updated.id }) {
+                sources[index] = updated
+            }
+            if sourceSelectedID == updated.id {
+                await loadSource(updated.id, chunkNo: sourceSelectedChunk)
+            }
+            sourceStatus = "Updated \(updated.title)."
+            await loadSources(silent: true)
+            return true
+        } catch {
+            sourceStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    func addSourceNote() async -> Bool {
+        guard let projectID = selectedProjectID else {
+            sourceStatus = "Select a project first."
+            return false
+        }
+        let title = sourceDraftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = sourceDraftContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, !content.isEmpty else {
+            sourceStatus = "A source note needs a title and content."
+            return false
+        }
+        sourcesBusy = true
+        defer { sourcesBusy = false }
+        do {
+            let source = try await core.addSourceNote(
+                projectID: projectID,
+                collection: sourceCollection,
+                title: title,
+                content: content
+            )
+            sourceDraftTitle = ""
+            sourceDraftContent = ""
+            sourceStatus = "Indexed \(source.title) (\(source.chunkCount) chunks)."
+            await loadSources(silent: true)
+            await loadSource(source.id)
+            return true
+        } catch {
+            sourceStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    func addSourceFile() async -> Bool {
+        guard let projectID = selectedProjectID else { return false }
+        let path = sourceDraftPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else {
+            sourceStatus = "Enter a project-relative file path."
+            return false
+        }
+        sourcesBusy = true
+        defer { sourcesBusy = false }
+        do {
+            let source = try await core.addSourceFile(
+                projectID: projectID,
+                collection: sourceCollection,
+                path: path
+            )
+            sourceDraftPath = ""
+            sourceStatus = "Indexed \(source.title)."
+            await loadSources(silent: true)
+            await loadSource(source.id)
+            return true
+        } catch {
+            sourceStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    func addSourceURL() async -> Bool {
+        guard let projectID = selectedProjectID else { return false }
+        let url = sourceDraftURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !url.isEmpty else {
+            sourceStatus = "Enter a public http(s) URL."
+            return false
+        }
+        sourcesBusy = true
+        defer { sourcesBusy = false }
+        do {
+            let source = try await core.addSourceURL(
+                projectID: projectID,
+                collection: sourceCollection,
+                url: url
+            )
+            sourceDraftURL = ""
+            sourceStatus = "Fetched and indexed \(source.title)."
+            await loadSources(silent: true)
+            await loadSource(source.id)
+            return true
+        } catch {
+            sourceStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    func importProjectSources() async -> Bool {
+        guard let projectID = selectedProjectID else { return false }
+        sourcesBusy = true
+        defer { sourcesBusy = false }
+        do {
+            let result = try await core.importSources(
+                projectID: projectID,
+                collection: sourceCollection,
+                path: sourceDraftPath.isEmpty ? nil : sourceDraftPath,
+                maxFiles: 100
+            )
+            sourceStatus = "Imported \(result.imported.count) sources; skipped \(result.skipped)."
+            if let first = result.imported.first {
+                await loadSource(first.id)
+            }
+            await loadSources(silent: true)
+            return true
+        } catch {
+            sourceStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    func deleteSource(_ source: ProjectSource) async {
+        sourceActionBusyID = source.id
+        defer { sourceActionBusyID = nil }
+        do {
+            _ = try await core.deleteSource(sourceID: source.id)
+            if sourceSelectedID == source.id {
+                sourceSelectedID = nil
+                sourceSelected = nil
+            }
+            sourceStatus = "Removed \(source.title)."
+            await loadSources(silent: true)
+        } catch {
+            sourceStatus = error.localizedDescription
+        }
+    }
+
+    func refreshSource(_ source: ProjectSource) async {
+        sourceActionBusyID = source.id
+        defer { sourceActionBusyID = nil }
+        do {
+            let result = try await core.refreshSource(sourceID: source.id)
+            sourceStatus = "Refreshed \(result.source.title) to revision \(result.source.revision)."
+            await loadSources(silent: true)
+            await loadSource(source.id)
+        } catch {
+            sourceStatus = error.localizedDescription
+        }
+    }
+
+    func reindexSource(_ source: ProjectSource) async {
+        sourceActionBusyID = source.id
+        defer { sourceActionBusyID = nil }
+        do {
+            let result = try await core.reindexSource(sourceID: source.id)
+            sourceStatus = "Reindexed \(result.source.title) (\(result.chunks) chunks)."
+            await loadSources(silent: true)
+            await loadSource(source.id)
+        } catch {
+            sourceStatus = error.localizedDescription
+        }
+    }
+
     func loadIntakeTasks(silent: Bool = false) async {
         guard let projectID = selectedProjectID else {
             intakeTasks = []
@@ -3791,6 +4330,86 @@ final class AppModel {
                 + hex.padding(toLength: 47, withPad: " ", startingAt: 0)
                 + "  " + ascii
         }.joined(separator: "\n")
+    }
+
+    func loadSessionCitations() async {
+        guard let sessionID = selectedSessionID else {
+            sessionCitations = []
+            return
+        }
+        let generation = selectionGeneration
+        sessionCitationsBusy = true
+        sessionCitations = []
+        citationAudit = nil
+        defer { sessionCitationsBusy = false }
+        do {
+            async let citationsTask = core.sessionCitations(sessionID: sessionID)
+            async let auditTask = core.citationAudit(sessionID: sessionID)
+            let (result, auditResult) = try await (citationsTask, auditTask)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionCitations = result.citations
+            citationAudit = auditResult.audit
+            sessionCitationsError = nil
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionCitationsError = error.localizedDescription
+        }
+    }
+
+    func loadArtifactDiff(
+        artifactID: String,
+        fromVersion: Int,
+        toVersion: Int? = nil
+    ) async {
+        artifactDiffBusy = true
+        artifactDiff = nil
+        artifactDiffError = nil
+        defer { artifactDiffBusy = false }
+        do {
+            artifactDiff = try await core.artifactDiff(
+                artifactID: artifactID,
+                fromVersion: fromVersion,
+                toVersion: toVersion
+            )
+        } catch {
+            artifactDiff = nil
+            artifactDiffError = error.localizedDescription
+        }
+    }
+
+    func loadArtifactVersions(_ artifact: Artifact) async {
+        if artifactVersionsArtifactID != artifact.id {
+            artifactVersions = []
+        }
+        artifactVersionsArtifactID = artifact.id
+        artifactVersionsBusy = true
+        defer { artifactVersionsBusy = false }
+        do {
+            let result = try await core.artifactVersions(artifactID: artifact.id)
+            guard artifactVersionsArtifactID == artifact.id else { return }
+            artifactVersions = result.versions
+            artifactVersionsError = nil
+        } catch {
+            guard artifactVersionsArtifactID == artifact.id else { return }
+            artifactVersionsError = error.localizedDescription
+        }
+    }
+
+    func restoreArtifactVersion(_ version: ArtifactVersion) async -> Bool {
+        do {
+            let artifact = try await core.restoreArtifactVersion(
+                artifactID: version.artifactId,
+                version: version.version
+            )
+            if let index = artifacts.firstIndex(where: { $0.id == artifact.id }) {
+                artifacts[index] = artifact
+            }
+            await loadArtifactVersions(artifact)
+            return true
+        } catch {
+            artifactVersionsError = error.localizedDescription
+            return false
+        }
     }
 
     func openArtifact(_ artifact: Artifact) async {

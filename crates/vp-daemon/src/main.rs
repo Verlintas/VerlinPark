@@ -27,19 +27,20 @@ use vp_protocol::types::{
     AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
     AnswerQuestionResult, ApprovalGrantCreateParams, ApprovalGrantCreateResult,
     ApprovalGrantDeleteParams, ApprovalGrantDeleteResult, ApprovalGrantListParams,
-    ApprovalGrantListResult, ApprovalListResult, ArtifactBackfillParams, ArtifactGcParams,
-    ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactMaterializeParams,
-    ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult, AuthParams, AuthResult,
-    CancelSessionParams, CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams,
-    CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
-    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, CreateModelPresetParams,
-    CreateSessionParams, DashboardParams, DeleteModelPresetParams, DiscardSessionParams,
-    DoctorCheck, DoctorReport, EventListResult, ForkAuditParams, ForkRepairParams, GitLogParams,
-    GitShowParams, IntakeCreateParams, IntakeDeleteResult, IntakeListParams, IntakeTaskParams,
-    IntakeUpdateParams, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
-    ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams,
-    MailboxListResult, MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams,
-    McpCallParams, McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
+    ApprovalGrantListResult, ApprovalListResult, ArtifactBackfillParams, ArtifactDiffParams,
+    ArtifactGcParams, ArtifactGetParams, ArtifactListParams, ArtifactListResult,
+    ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult, ArtifactRestoreParams,
+    ArtifactResult, ArtifactVersionsParams, AuthParams, AuthResult, CancelSessionParams,
+    CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams, CommitSessionParams,
+    ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams, ConsoleReadParams,
+    ConsoleSignalParams, ConsoleWriteParams, CreateModelPresetParams, CreateSessionParams,
+    DashboardParams, DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport,
+    EventListResult, ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams,
+    IntakeCreateParams, IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
+    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
+    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
+    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
+    McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
     MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams, MemoryListParams,
     MemoryPolicyParams, MemoryPruneParams, MergeQueueListParams, MergeQueueListResult,
     OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectForkForestParams,
@@ -49,20 +50,25 @@ use vp_protocol::types::{
     SchedulerStatusParams, SearchParams, ServerInfo, SessionCheckpointDeleteParams,
     SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
     SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
-    SessionCompactParams, SessionCompareParams, SessionContextParams, SessionDiffParams,
-    SessionExportParams, SessionForkParams, SessionForkTreeParams, SessionImportParams,
-    SessionLineageParams, SessionListResult, SessionLogParams, SessionMergeForkParams,
-    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
-    SessionResumeParams, SessionResumeResult, SessionTodosParams, SessionTodosResult,
-    SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
-    SetProjectBudgetParams, SetSessionPriorityParams, SetShellPolicyParams,
-    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
-    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
-    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams,
-    UpdateMcpServerParams, UpdateModelPresetParams, UsageLedgerParams, WorkspaceFileParams,
+    SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
+    SessionContextParams, SessionDiffParams, SessionExportParams, SessionForkParams,
+    SessionForkTreeParams, SessionImportParams, SessionLineageParams, SessionListResult,
+    SessionLogParams, SessionMergeForkParams, SessionPauseParams, SessionPauseResult,
+    SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
+    SessionSkillActivationsParams, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
+    SetArtifactPolicyParams, SetCheckpointPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
+    SetSessionPriorityParams, SetShellPolicyParams, SetSourceCollectionParams,
+    SetSourceLabelsParams, SetTaskSchedulerPolicyParams, SetWorktreePolicyParams,
+    ShellPolicyParams, ShellPolicyResult, SkillCreateParams, SkillEnabledParams, SkillIdParams,
+    SkillImportParams, SkillListParams, SkillUpdateParams, SourceActionParams,
+    SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
+    SourceGetParams, SourceImportParams, SourceListParams, SourceSearchParams, SubscribeParams,
+    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
+    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
+    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
+    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
     WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
     WorkspaceWriteParams, WorktreePolicyParams,
 };
@@ -813,6 +819,204 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             }
             Err(response) => response_with_id(id, response),
         },
+        "artifact.diff" => match parse_params::<ArtifactDiffParams>(request.params) {
+            Ok(params) => match state.engine.artifact_diff(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "artifact.versions" => match parse_params::<ArtifactVersionsParams>(request.params) {
+            Ok(params) => match state.engine.artifact_versions(&params.artifact_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "artifact.restore" => match parse_params::<ArtifactRestoreParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .restore_artifact_version(&params.artifact_id, params.version)
+                .await
+            {
+                Ok(artifact) => RpcResponse::success(id, ArtifactResult { artifact }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "skill.list" => match parse_params::<SkillListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .list_skills(params.project_id, params.include_disabled.unwrap_or(true))
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "skill.create" => match parse_params::<SkillCreateParams>(request.params) {
+            Ok(params) => match state.engine.create_skill(params).await {
+                Ok(skill) => RpcResponse::success(id, skill),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "skill.import" => match parse_params::<SkillImportParams>(request.params) {
+            Ok(params) => match state.engine.import_skill(params).await {
+                Ok(skill) => RpcResponse::success(id, skill),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "skill.update" => match parse_params::<SkillUpdateParams>(request.params) {
+            Ok(params) => match state.engine.update_skill(params).await {
+                Ok(skill) => RpcResponse::success(id, skill),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "skill.set_enabled" => match parse_params::<SkillEnabledParams>(request.params) {
+            Ok(params) => match state.engine.set_skill_enabled(params).await {
+                Ok(skill) => RpcResponse::success(id, skill),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "skill.delete" => match parse_params::<SkillIdParams>(request.params) {
+            Ok(params) => match state.engine.delete_skill(params.id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.list" => match parse_params::<SourceListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .list_sources(params.project_id, params.query, params.status, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.update" => match parse_params::<UpdateSourceMetadataParams>(request.params) {
+            Ok(params) => match state.engine.update_source_metadata(params).await {
+                Ok(source) => RpcResponse::success(id, source),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.collections" => match parse_params::<SourceCollectionsParams>(request.params) {
+            Ok(params) => match state.engine.source_collections(params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.set_collection" => {
+            match parse_params::<SetSourceCollectionParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_source_collection(params.source_id, params.collection)
+                    .await
+                {
+                    Ok(source) => RpcResponse::success(id, source),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "source.set_labels" => match parse_params::<SetSourceLabelsParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_source_labels(params.source_id, params.labels)
+                .await
+            {
+                Ok(source) => RpcResponse::success(id, source),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.get" => match parse_params::<SourceGetParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .get_source(params.source_id, params.offset, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.add_note" => match parse_params::<SourceCreateNoteParams>(request.params) {
+            Ok(params) => match state.engine.add_source_note(params).await {
+                Ok(source) => RpcResponse::success(id, source),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.add_file" => match parse_params::<SourceCreateFileParams>(request.params) {
+            Ok(params) => match state.engine.add_source_file(params).await {
+                Ok(source) => RpcResponse::success(id, source),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.add_url" => match parse_params::<SourceCreateUrlParams>(request.params) {
+            Ok(params) => match state.engine.add_source_url(params).await {
+                Ok(source) => RpcResponse::success(id, source),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.import" => match parse_params::<SourceImportParams>(request.params) {
+            Ok(params) => match state.engine.import_sources(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.delete" => match parse_params::<SourceActionParams>(request.params) {
+            Ok(params) => match state.engine.delete_source(params.source_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.refresh" => match parse_params::<SourceActionParams>(request.params) {
+            Ok(params) => match state.engine.refresh_source(params.source_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.reindex" => match parse_params::<SourceActionParams>(request.params) {
+            Ok(params) => match state.engine.reindex_source(params.source_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "source.search" => match parse_params::<SourceSearchParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .search_sources_scoped(
+                    params.project_id,
+                    params.query,
+                    params.source_ids,
+                    params.collections,
+                    params.labels,
+                    params.limit,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "scheduler.status" => match parse_params::<SchedulerStatusParams>(request.params) {
             Ok(params) => match state.agent.scheduler_status(params.project_id).await {
                 Ok(result) => RpcResponse::success(id, result),
@@ -1185,6 +1389,43 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(events) => RpcResponse::success(id, EventListResult { events }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "skill.activations" => {
+            match parse_params::<SessionSkillActivationsParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .session_skill_activations(&params.session_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.citation_audit" => {
+            match parse_params::<SessionCitationAuditParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .session_citation_audit(&params.session_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.citations" => match parse_params::<SessionCitationsParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_citations(&params.session_id, params.message_id)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

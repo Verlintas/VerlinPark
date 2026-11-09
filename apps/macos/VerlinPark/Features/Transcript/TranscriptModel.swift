@@ -8,7 +8,7 @@ import Foundation
 /// running or approvals are resolved.
 enum TranscriptEntry: Identifiable, Equatable {
     case user(id: String, text: String)
-    case assistant(id: String, text: String, agent: String?)
+    case assistant(id: String, text: String, agent: String?, citations: [SourceCitation])
     case tool(TranscriptToolEntry)
     case approval(TranscriptApprovalEntry)
     case question(id: String)
@@ -17,7 +17,8 @@ enum TranscriptEntry: Identifiable, Equatable {
 
     var id: String {
         switch self {
-        case let .user(id, _), let .assistant(id, _, _), let .notice(id, _), let .error(id, _):
+        case let .user(id, _), let .assistant(id, _, _, _), let .notice(id, _),
+             let .error(id, _):
             id
         case let .tool(entry):
             entry.id
@@ -105,7 +106,8 @@ enum TranscriptProjection {
             "read_file", "list_dir", "grep", "write_file", "edit_file",
             "todo_write", "fetch_url", "remember", "recall", "coordinate",
             "team_status", "send_message", "read_mailbox", "list_artifacts",
-            "read_artifact", "publish_artifact",
+            "read_artifact", "publish_artifact", "search_sources", "read_source",
+            "list_sources",
         ].contains(name)
     }
 
@@ -202,11 +204,14 @@ enum TranscriptProjection {
             guard let text = event.payload.objectValue?["text"]?.stringValue, !text.isEmpty else {
                 return
             }
+            let citations = event.payload.objectValue?["citations"]
+                .flatMap { try? $0.decode([SourceCitation].self) } ?? []
             entries.append(
                 .assistant(
                     id: event.id,
                     text: text,
-                    agent: TranscriptProjection.agentLabel(event)
+                    agent: TranscriptProjection.agentLabel(event),
+                    citations: citations
                 )
             )
         }

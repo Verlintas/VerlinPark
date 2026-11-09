@@ -288,6 +288,8 @@ struct PreviewPanelView: View {
                         plan
                     case .files:
                         FilesPanel()
+                    case .sources:
+                        SourcesPanel()
                     case .history:
                         HistoryPanel()
                     case .queue:
@@ -334,6 +336,9 @@ struct PreviewPanelView: View {
         .task(id: mode) {
             if mode == .files {
                 await model.loadWorkspaceRoot()
+            }
+            if mode == .sources {
+                await model.loadSources()
             }
             if mode == .history {
                 await model.loadGitHistory()
@@ -1107,6 +1112,7 @@ private struct ArtifactRow: View {
     @Environment(AppModel.self) private var model
     let artifact: Artifact
     @State private var preview: ArtifactPreviewData?
+    @State private var showingVersions = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1123,6 +1129,20 @@ private struct ArtifactRow: View {
                     Text(compression)
                         .font(.system(size: 8, design: .monospaced))
                         .foregroundStyle(.tertiary)
+                }
+                Text("v\(artifact.version)")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(VPTheme.textTertiary)
+                if artifact.storage == "inline" {
+                    Button {
+                        showingVersions = true
+                    } label: {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 9))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .help(L10n.t("Version history"))
                 }
                 Spacer()
                 Text(artifact.agentName)
@@ -1200,6 +1220,10 @@ private struct ArtifactRow: View {
         .vpHoverLift(scale: 1.005, lift: 1)
         .task(id: artifact.id) {
             preview = await model.artifactPreviewData(artifact)
+        }
+        .sheet(isPresented: $showingVersions) {
+            ArtifactVersionsSheet(artifact: artifact)
+                .environment(model)
         }
     }
 }
@@ -1304,6 +1328,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
     case changes
     case plan
     case files
+    case sources
     case history
     case queue
     case mailbox
@@ -1322,6 +1347,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .changes: L10n.t("Changes")
         case .plan: L10n.t("Plan")
         case .files: L10n.t("Files")
+        case .sources: L10n.t("Sources")
         case .history: L10n.t("History")
         case .queue: L10n.t("Queue")
         case .mailbox: L10n.t("Mailbox")
@@ -1338,6 +1364,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .changes: "plus.forwardslash.minus"
         case .plan: "list.bullet.clipboard"
         case .files: "folder"
+        case .sources: "books.vertical"
         case .history: "clock.arrow.circlepath"
         case .queue: "arrow.triangle.merge"
         case .mailbox: "tray"
@@ -1348,7 +1375,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         }
     }
 
-    static let primary: [PreviewMode] = [.showcase, .changes, .files, .plan]
+    static let primary: [PreviewMode] = [.showcase, .changes, .files, .sources, .plan]
     static let secondary: [PreviewMode] = [
         .history, .queue, .mailbox, .cost, .console, .terminal, .trace,
     ]
@@ -2616,6 +2643,267 @@ private struct PreviewEventRow: View {
         }
         .padding(9)
         .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
+    }
+}
+
+private struct ArtifactVersionsSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let artifact: Artifact
+    @State private var restoringVersion: Int?
+    @State private var restoreError: String?
+    @State private var diffVersion: ArtifactVersion?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(artifact.name)
+                        .font(VPTheme.font(16, weight: .semibold))
+                    Text(L10n.t("Version history"))
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textSecondary)
+                }
+                Spacer()
+                if model.artifactVersionsBusy {
+                    ProgressView().controlSize(.small)
+                }
+                VPCloseButton(size: 24, help: L10n.t("Close")) { dismiss() }
+            }
+            if let restoreError {
+                Text(restoreError)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.warning)
+            }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    ForEach(model.artifactVersions) { version in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text("v\(version.version)")
+                                .font(VPTheme.mono(8, weight: .semibold))
+                                .foregroundStyle(
+                                    version.version == artifact.version
+                                        ? VPTheme.accent
+                                        : VPTheme.textSecondary
+                                )
+                                .frame(width: 28, alignment: .leading)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(version.name)
+                                    .font(VPTheme.mono(8.5, weight: .medium))
+                                Text("\(version.sizeBytes) bytes · \(version.createdAt)")
+                                    .font(VPTheme.mono(7))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                                Text(version.content.prefix(240))
+                                    .font(VPTheme.mono(7.5))
+                                    .foregroundStyle(VPTheme.textSecondary)
+                                    .lineLimit(3)
+                                    .textSelection(.enabled)
+                            }
+                            Spacer()
+                            if version.version != artifact.version {
+                                Button {
+                                    diffVersion = version
+                                } label: {
+                                    Text(L10n.t("Diff"))
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                Button {
+                                    restoringVersion = version.version
+                                    Task {
+                                        let ok = await model.restoreArtifactVersion(version)
+                                        restoringVersion = nil
+                                        if !ok {
+                                            restoreError = model.artifactVersionsError
+                                        }
+                                    }
+                                } label: {
+                                    if restoringVersion == version.version {
+                                        ProgressView().controlSize(.mini)
+                                    } else {
+                                        Text(L10n.t("Restore"))
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(restoringVersion != nil)
+                            } else {
+                                Text(L10n.t("current"))
+                                    .font(VPTheme.mono(7))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                            }
+                        }
+                        .padding(8)
+                        .background(
+                            version.version == artifact.version
+                                ? VPTheme.accent.opacity(0.08)
+                                : VPTheme.surface.opacity(0.35),
+                            in: RoundedRectangle(cornerRadius: 8)
+                        )
+                    }
+                }
+            }
+            if model.artifactVersions.isEmpty, !model.artifactVersionsBusy {
+                Text(L10n.t("No saved versions for this artifact."))
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+        }
+        .padding(20)
+        .frame(width: 600, height: 520)
+        .background { VPCrystalBackdrop() }
+        .task {
+            await model.loadArtifactVersions(artifact)
+        }
+        .sheet(item: $diffVersion) { version in
+            ArtifactDiffSheet(artifact: artifact, fromVersion: version.version)
+                .environment(model)
+        }
+    }
+}
+
+private struct ArtifactDiffSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let artifact: Artifact
+    let fromVersion: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.left.arrow.right")
+                    .foregroundStyle(VPTheme.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(artifact.name)
+                        .font(VPTheme.font(16, weight: .semibold))
+                        .lineLimit(1)
+                    if let diff = model.artifactDiff {
+                        Text("v\(diff.fromVersion) → v\(diff.toVersion)")
+                            .font(VPTheme.mono(8))
+                            .foregroundStyle(VPTheme.textSecondary)
+                    } else {
+                        Text(L10n.t("Comparing versions"))
+                            .font(VPTheme.mono(8))
+                            .foregroundStyle(VPTheme.textSecondary)
+                    }
+                }
+                Spacer()
+                if model.artifactDiffBusy {
+                    ProgressView().controlSize(.small)
+                }
+                VPCloseButton(size: 24, help: L10n.t("Close")) { dismiss() }
+            }
+
+            if let error = model.artifactDiffError {
+                Text(error)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.warning)
+            }
+
+            if let diff = model.artifactDiff?.diff {
+                HStack(spacing: 6) {
+                    diffBadge("+\(diff.additions)", tint: VPTheme.success)
+                    diffBadge("-\(diff.deletions)", tint: VPTheme.danger)
+                    diffBadge("\(diff.unchanged) unchanged", tint: VPTheme.textSecondary)
+                    if diff.truncated {
+                        diffBadge(L10n.t("truncated"), tint: VPTheme.warning)
+                    }
+                    Spacer()
+                }
+                if diff.identical {
+                    Text(L10n.t("These versions have identical text."))
+                        .font(VPTheme.mono(9))
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .padding(.vertical, 24)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    ScrollView([.vertical, .horizontal]) {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(diff.hunks) { hunk in
+                                HStack(spacing: 6) {
+                                    Text(
+                                        "@@ -\(hunk.oldStart),\(hunk.oldLines) +\(hunk.newStart),\(hunk.newLines) @@"
+                                    )
+                                    .font(VPTheme.mono(7.5, weight: .semibold))
+                                    .foregroundStyle(VPTheme.accent.opacity(0.9))
+                                    Spacer()
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(VPTheme.accent.opacity(0.06))
+                                ForEach(hunk.lines) { line in
+                                    diffLine(line)
+                                }
+                            }
+                        }
+                        .padding(.bottom, 6)
+                    }
+                    .background(VPTheme.surfaceSunken.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                    }
+                }
+            } else if !model.artifactDiffBusy, model.artifactDiffError == nil {
+                Text(L10n.t("No diff available."))
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
+            }
+        }
+        .padding(20)
+        .frame(width: 780, height: 580)
+        .background { VPCrystalBackdrop() }
+        .task(id: fromVersion) {
+            await model.loadArtifactDiff(
+                artifactID: artifact.id,
+                fromVersion: fromVersion
+            )
+        }
+    }
+
+    private func diffBadge(_ text: String, tint: Color) -> some View {
+        Text(text)
+            .font(VPTheme.mono(7, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(tint.opacity(0.10), in: Capsule())
+    }
+
+    private func diffLine(_ line: TextDiffLine) -> some View {
+        let tint: Color = switch line.kind {
+        case "add": VPTheme.success
+        case "delete": VPTheme.danger
+        default: VPTheme.textSecondary
+        }
+        let prefix = line.kind == "add" ? "+" : line.kind == "delete" ? "-" : " "
+        return HStack(alignment: .top, spacing: 0) {
+            Text(line.oldLine.map(String.init) ?? "")
+                .frame(width: 40, alignment: .trailing)
+                .foregroundStyle(VPTheme.textTertiary)
+            Text(line.newLine.map(String.init) ?? "")
+                .frame(width: 40, alignment: .trailing)
+                .foregroundStyle(VPTheme.textTertiary)
+            Text(prefix)
+                .frame(width: 18)
+                .foregroundStyle(tint)
+            Text(line.text.isEmpty ? " " : line.text)
+                .foregroundStyle(
+                    line.kind == "context" ? VPTheme.textSecondary : VPTheme.textPrimary
+                )
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+        .font(VPTheme.mono(8))
+        .padding(.horizontal, 6)
+        .padding(.vertical, 1)
+        .background(
+            line.kind == "add"
+                ? VPTheme.success.opacity(0.07)
+                : line.kind == "delete"
+                ? VPTheme.danger.opacity(0.07)
+                : Color.clear
+        )
     }
 }
 

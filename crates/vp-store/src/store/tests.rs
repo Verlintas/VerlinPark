@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn test_store() -> (TempDir, Store, TempDir) {
@@ -2506,4 +2507,495 @@ fn task_scheduler_policy_defaults_to_autonomous_intake() {
     let policy = store.get_task_scheduler_policy(&project.id).unwrap();
     assert!(!policy.include_intake);
     assert_eq!(policy.max_intake_parallel, 7);
+}
+
+fn source_fixture(
+    project_id: &str,
+    id: &str,
+    title: &str,
+    content: &str,
+) -> (Source, Vec<SourceChunk>) {
+    let now = now_rfc3339();
+    let source = Source {
+        id: id.to_string(),
+        project_id: project_id.to_string(),
+        kind: "note".to_string(),
+        collection: None,
+        title: title.to_string(),
+        uri: None,
+        mime_type: Some("text/markdown".to_string()),
+        status: "indexed".to_string(),
+        size_bytes: content.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+        revision: 1,
+        chunk_count: 1,
+        char_count: content.chars().count(),
+        token_count: 4,
+        error: None,
+        labels: vec!["test".to_string()],
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        indexed_at: Some(now),
+    };
+    let chunk = SourceChunk {
+        id: format!("{id}:0001:abcdef123456"),
+        source_id: id.to_string(),
+        chunk_no: 1,
+        heading: Some("Testing".to_string()),
+        content: content.to_string(),
+        start_offset: 0,
+        end_offset: content.len(),
+        token_count: 4,
+    };
+    (source, vec![chunk])
+}
+
+fn source_search(query: &str) -> SourceSearchQuery {
+    SourceSearchQuery {
+        all: format!("\"{query}\"*"),
+        any: format!("\"{query}\"*"),
+        terms: vec![query.to_lowercase()],
+        raw: query.to_string(),
+        prefer_like: false,
+        collections: Vec::new(),
+        labels: Vec::new(),
+    }
+}
+
+#[test]
+fn sources_round_trip_chunks_search_and_stats() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sources"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-1",
+        "Architecture notes",
+        "The runtime uses deterministic leases for integration.",
+    );
+    let inserted = store.insert_source(&source, &chunks).unwrap();
+    assert_eq!(inserted.title, "Architecture notes");
+    assert_eq!(
+        store.get_source("source-1").unwrap().unwrap().labels,
+        vec!["test"]
+    );
+    assert_eq!(
+        store
+            .list_sources(&project.id, None, None, None)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .list_sources(&project.id, Some("architecture"), None, None)
+            .unwrap()
+            .len(),
+        1
+    );
+    let page = store.source_chunks("source-1", 0, 10).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].heading.as_deref(), Some("Testing"));
+    let stats = store.source_stats(&project.id).unwrap();
+    assert_eq!(stats.sources, 1);
+    assert_eq!(stats.indexed, 1);
+    assert_eq!(stats.chunks, 1);
+
+    let (hits, degraded) = store
+        .search_source_chunks(&project.id, &[], &source_search("deterministic"), Some(8))
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert!(!degraded);
+    assert_eq!(hits[0].source_title, "Architecture notes");
+}
+
+#[test]
+fn source_search_falls_back_for_cjk_and_deletes_cascade() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sources"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-cjk",
+        "中文说明",
+        "确定性租约用于集成。",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    let query = SourceSearchQuery {
+        all: "\"no-such-fts-term\"*".to_string(),
+        any: "\"no-such-fts-term\"*".to_string(),
+        terms: vec!["确定性".to_string()],
+        raw: "确定性".to_string(),
+        prefer_like: true,
+        collections: Vec::new(),
+        labels: Vec::new(),
+    };
+    let (hits, degraded) = store
+        .search_source_chunks(&project.id, &[], &query, Some(8))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(degraded);
+    assert!(store.delete_source("source-cjk").unwrap());
+    assert!(store.get_source("source-cjk").unwrap().is_none());
+    assert!(store.source_chunks("source-cjk", 0, 10).unwrap().is_empty());
+}
+
+#[test]
+fn source_snapshots_are_durable_and_listed() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("snapshot"))
+        .unwrap();
+    let (source, chunks) =
+        source_fixture(&project.id, "source-snap", "Snapshot", "Durable content.");
+    store.insert_source(&source, &chunks).unwrap();
+    let snapshot = SourceSnapshot {
+        version: 1,
+        source: source.clone(),
+        content: "Durable content.".to_string(),
+    };
+    store.write_source_snapshot(&snapshot).unwrap();
+    let read = store
+        .read_source_snapshot(&project.id, "source-snap")
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.content, "Durable content.");
+    assert_eq!(store.list_source_snapshots().unwrap().len(), 1);
+    store
+        .delete_source_snapshot(&project.id, "source-snap")
+        .unwrap();
+    assert!(
+        store
+            .read_source_snapshot(&project.id, "source-snap")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !data
+            .path()
+            .join("sources")
+            .join(&project.id)
+            .join("source-snap.json")
+            .exists()
+    );
+}
+
+fn skill_fixture(project_id: &str, name: &str) -> Skill {
+    let now = now_rfc3339();
+    Skill {
+        id: format!("skill-{name}"),
+        project_id: project_id.to_string(),
+        name: name.to_string(),
+        slug: name.to_lowercase().replace(' ', "-"),
+        description: "A test skill".to_string(),
+        when_to_use: "When testing".to_string(),
+        version: "1.0.0".to_string(),
+        instructions: "Read the diff and report evidence.".to_string(),
+        tool_allow: vec!["read_file".to_string()],
+        tool_deny: Vec::new(),
+        profiles: vec!["coding".to_string()],
+        roles: vec!["worker".to_string()],
+        enabled: true,
+        source: "test".to_string(),
+        sha256: format!("{:x}", Sha256::digest(name.as_bytes())),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+#[test]
+fn skills_round_trip_filter_and_toggle() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("skills"))
+        .unwrap();
+    let skill = store
+        .insert_skill(&skill_fixture(&project.id, "Review"))
+        .unwrap();
+    assert_eq!(skill.name, "Review");
+    assert_eq!(skill.tool_allow, vec!["read_file"]);
+    assert_eq!(
+        store
+            .get_skill_by_slug(&project.id, "review")
+            .unwrap()
+            .unwrap()
+            .id,
+        skill.id
+    );
+    assert_eq!(
+        store.list_skills(Some(&project.id), false).unwrap().len(),
+        1
+    );
+    let disabled = store.set_skill_enabled(&skill.id, false).unwrap().unwrap();
+    assert!(!disabled.enabled);
+    assert!(
+        store
+            .list_skills(Some(&project.id), false)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.list_skills(Some(&project.id), true).unwrap().len(), 1);
+    assert!(store.delete_skill(&skill.id).unwrap());
+    assert!(store.get_skill(&skill.id).unwrap().is_none());
+}
+
+#[test]
+fn inline_artifact_versions_round_trip_and_conflict() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("artifacts"))
+        .unwrap();
+    let session = store.create_session(&project.id, "versions").unwrap();
+    let (created, _) = store
+        .create_artifact_with_event(
+            &session.id,
+            "agent-1",
+            "Leader",
+            None,
+            "Report",
+            "note",
+            "text/plain",
+            "version one",
+            "inline",
+            11,
+            "sha-one",
+            None,
+        )
+        .unwrap();
+    assert_eq!(created.version, 1);
+    let (updated, event) = store
+        .update_artifact_with_event(
+            &created.id,
+            Some(1),
+            "Report",
+            "note",
+            "text/plain",
+            "version two",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.version, 2);
+    assert_eq!(updated.content, "version two");
+    assert_eq!(event.kind, "artifact.version_published");
+    assert!(
+        store
+            .update_artifact_with_event(
+                &created.id,
+                Some(1),
+                "Report",
+                "note",
+                "text/plain",
+                "stale",
+            )
+            .is_err()
+    );
+    let versions = store.list_artifact_versions(&created.id).unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].content, "version one");
+    assert_eq!(versions[1].content, "version two");
+    let (restored, event) = store
+        .restore_artifact_version(&created.id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.version, 3);
+    assert_eq!(restored.content, "version one");
+    assert_eq!(event.kind, "artifact.version_restored");
+    assert_eq!(store.list_artifact_versions(&created.id).unwrap().len(), 3);
+    assert_eq!(store.get_artifact(&created.id).unwrap().unwrap().version, 3);
+}
+
+#[test]
+fn source_collections_and_scoped_search_filter() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("collections"))
+        .unwrap();
+    let (alpha, alpha_chunks) = source_fixture(
+        &project.id,
+        "source-alpha",
+        "Alpha runtime",
+        "Deterministic leases integrate verified work.",
+    );
+    let (beta, beta_chunks) = source_fixture(
+        &project.id,
+        "source-beta",
+        "Beta research",
+        "Deterministic retrieval supports source citations.",
+    );
+    store.insert_source(&alpha, &alpha_chunks).unwrap();
+    store.insert_source(&beta, &beta_chunks).unwrap();
+    store
+        .set_source_collection("source-alpha", Some("engineering"))
+        .unwrap();
+    store
+        .set_source_collection("source-beta", Some("research"))
+        .unwrap();
+    store
+        .set_source_labels(
+            "source-beta",
+            &["citation".to_string(), "retrieval".to_string()],
+        )
+        .unwrap();
+
+    let collections = store.list_source_collections(&project.id).unwrap();
+    assert_eq!(collections.len(), 2);
+    assert_eq!(collections[0].name.as_deref(), Some("engineering"));
+    assert_eq!(collections[0].sources, 1);
+    assert_eq!(collections[1].name.as_deref(), Some("research"));
+    assert_eq!(collections[1].labels, vec!["citation", "retrieval"]);
+
+    let mut query = source_search("deterministic");
+    query.collections = vec!["research".to_string()];
+    let (hits, _) = store
+        .search_source_chunks(&project.id, &[], &query, Some(8))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].source_id, "source-beta");
+    assert_eq!(hits[0].collection.as_deref(), Some("research"));
+    assert_eq!(hits[0].labels, vec!["citation", "retrieval"]);
+
+    query.labels = vec!["citation".to_string()];
+    let (hits, _) = store
+        .search_source_chunks(&project.id, &[], &query, Some(8))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    query.labels = vec!["missing".to_string()];
+    let (hits, _) = store
+        .search_source_chunks(&project.id, &[], &query, Some(8))
+        .unwrap();
+    assert!(hits.is_empty());
+
+    let updated = store
+        .update_source_metadata(&Source {
+            collection: Some("architecture".to_string()),
+            updated_at: now_rfc3339(),
+            ..alpha.clone()
+        })
+        .unwrap();
+    assert_eq!(updated.collection.as_deref(), Some("architecture"));
+    assert_eq!(
+        store
+            .set_source_collection("source-missing", Some("x"))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn legacy_artifacts_synthesize_current_version_and_backfill_on_update() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("legacy-artifacts"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "legacy versions")
+        .unwrap();
+    let (created, _) = store
+        .create_artifact_with_event(
+            &session.id,
+            "agent-1",
+            "Leader",
+            None,
+            "Legacy Report",
+            "note",
+            "text/plain",
+            "legacy content",
+            "inline",
+            14,
+            "legacy-sha",
+            None,
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "DELETE FROM artifact_versions WHERE artifact_id = ?1",
+            [&created.id],
+        )
+        .unwrap();
+    }
+    let versions = store.list_artifact_versions(&created.id).unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version, 1);
+    assert_eq!(versions[0].content, "legacy content");
+    assert_eq!(
+        store
+            .get_artifact_version(&created.id, 1)
+            .unwrap()
+            .unwrap()
+            .name,
+        "Legacy Report"
+    );
+    assert!(
+        store
+            .get_artifact_version(&created.id, 99)
+            .unwrap()
+            .is_none()
+    );
+
+    let (updated, _) = store
+        .update_artifact_with_event(
+            &created.id,
+            Some(1),
+            "Legacy Report",
+            "note",
+            "text/plain",
+            "updated content",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.version, 2);
+    let versions = store.list_artifact_versions(&created.id).unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].content, "legacy content");
+    assert_eq!(versions[1].content, "updated content");
+}
+
+#[test]
+fn source_search_fuses_mixed_scripts_and_non_cjk_fallback() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("mixed-search"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-mixed",
+        "Login notes",
+        "Login failure investigation. 登录失败需要检查会话。",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+
+    let mixed = SourceSearchQuery {
+        all: "\"login\"*".to_string(),
+        any: "\"login\"*".to_string(),
+        terms: vec!["login".to_string(), "登录".to_string()],
+        raw: "login 登录".to_string(),
+        prefer_like: true,
+        collections: Vec::new(),
+        labels: Vec::new(),
+    };
+    let (hits, degraded) = store
+        .search_source_chunks(&project.id, &[], &mixed, Some(5))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(degraded);
+    assert!(hits[0].content.contains("登录失败"));
+
+    let fallback = SourceSearchQuery {
+        all: "\"definitely-missing-term\"*".to_string(),
+        any: "\"definitely-missing-term\"*".to_string(),
+        terms: vec!["login".to_string(), "failure".to_string()],
+        raw: "login failure".to_string(),
+        prefer_like: false,
+        collections: Vec::new(),
+        labels: Vec::new(),
+    };
+    let (hits, degraded) = store
+        .search_source_chunks(&project.id, &[], &fallback, Some(5))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(degraded);
+    assert_eq!(hits[0].source_id, "source-mixed");
 }

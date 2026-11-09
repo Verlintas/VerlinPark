@@ -5384,3 +5384,753 @@ async fn intake_validation_and_one_task_plan_are_deterministic() {
         .unwrap_err();
     assert!(error.to_string().contains("intake"));
 }
+
+#[tokio::test]
+async fn sources_index_search_read_and_delete() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+    std::fs::write(
+        repo.path().join("docs/architecture.md"),
+        "# Runtime\n\nThe scheduler uses deterministic leases.\n\n## Sources\n\nCitations are attached to the final answer.\n",
+    )
+    .unwrap();
+    std::fs::write(repo.path().join("src_note.txt"), "A binary-ish placeholder").unwrap();
+    std::fs::write(repo.path().join("image.bin"), b"abc\0def").unwrap();
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("knowledge".into()),
+        )
+        .await
+        .unwrap();
+
+    let note = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: Some("runtime".into()),
+            title: "Integration notes".into(),
+            content: "The integrator runs git diff --check and rolls back on failure.".into(),
+            labels: vec!["runtime".into()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(note.status, "indexed");
+    assert!(note.chunk_count >= 1);
+
+    let file = engine
+        .add_source_file(SourceCreateFileParams {
+            project_id: project.id.clone(),
+            collection: Some("docs".into()),
+            path: "docs/architecture.md".into(),
+            title: None,
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(file.kind, "file");
+    assert!(file.uri.as_deref().unwrap() == "docs/architecture.md");
+    let imported = engine
+        .import_sources(SourceImportParams {
+            project_id: project.id.clone(),
+            collection: Some("imported".into()),
+            path: Some(".".into()),
+            max_files: Some(10),
+            labels: vec!["imported".into()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(imported.imported.len(), 2);
+    assert!(imported.skipped >= 1);
+
+    let list = engine
+        .list_sources(project.id.clone(), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(list.sources.len(), 4);
+    assert_eq!(list.stats.indexed, 4);
+
+    let search = engine
+        .search_sources(
+            project.id.clone(),
+            "deterministic leases".into(),
+            Vec::new(),
+            Some(5),
+        )
+        .await
+        .unwrap();
+    assert!(!search.hits.is_empty());
+    assert!(search.hits.iter().any(|hit| hit.source_id == file.id));
+
+    let page = engine
+        .get_source(file.id.clone(), Some(0), Some(10))
+        .await
+        .unwrap();
+    assert_eq!(page.source.id, file.id);
+    assert!(!page.chunks.is_empty());
+    assert!(page.total_chunks >= page.chunks.len());
+
+    let brief = engine.source_brief(&project.id).await.unwrap();
+    assert!(brief.contains("Integration notes"));
+
+    let deleted = engine.delete_source(note.id.clone()).await.unwrap();
+    assert!(deleted.deleted);
+    assert!(
+        engine
+            .list_sources(project.id, None, None, None)
+            .await
+            .unwrap()
+            .sources
+            .iter()
+            .all(|source| source.id != note.id)
+    );
+}
+
+#[tokio::test]
+async fn source_file_paths_and_oversized_content_are_rejected() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("paths".into()),
+        )
+        .await
+        .unwrap();
+    for path in ["../outside.txt", "/etc/passwd", ".git/config"] {
+        let result = engine
+            .add_source_file(SourceCreateFileParams {
+                project_id: project.id.clone(),
+                collection: None,
+                path: path.into(),
+                title: None,
+                labels: Vec::new(),
+            })
+            .await;
+        assert!(result.is_err(), "path should be rejected: {path}");
+    }
+    let error = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "empty".into(),
+            content: "   ".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("empty"));
+    let error = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id,
+            collection: None,
+            title: "Bad\nTitle".into(),
+            content: "content".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("control"));
+}
+
+#[tokio::test]
+async fn skills_create_import_filter_and_toggle() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join("review.skill.md"),
+        "---\nname: Imported Review\ndescription: Review a change\ntools: read_file, grep\nprofiles: [coding]\nroles: [leader, worker]\n---\nInspect the diff, run tests, and report evidence.\n",
+    )
+    .unwrap();
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("skills".into()),
+        )
+        .await
+        .unwrap();
+
+    let skill = engine
+        .create_skill(SkillCreateParams {
+            project_id: project.id.clone(),
+            name: "Release Review".into(),
+            description: "Review a release".into(),
+            when_to_use: "Before tagging".into(),
+            version: Some("1.2.0".into()),
+            instructions: "Read the diff and verify the release.".into(),
+            tool_allow: vec!["read_file".into()],
+            tool_deny: Vec::new(),
+            profiles: vec!["coding".into()],
+            roles: vec!["leader".into()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(skill.slug, "release-review");
+    assert!(
+        engine
+            .skill_catalog(&project.id, "leader", "coding")
+            .await
+            .unwrap()
+            .contains("Release Review")
+    );
+    assert!(
+        engine
+            .skill_catalog(&project.id, "worker", "coding")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let imported = engine
+        .import_skill(SkillImportParams {
+            project_id: project.id.clone(),
+            path: "review.skill.md".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(imported.name, "Imported Review");
+    assert_eq!(imported.tool_allow, vec!["read_file", "grep"]);
+    assert_eq!(imported.roles, vec!["leader", "worker"]);
+    assert!(
+        engine
+            .import_skill(SkillImportParams {
+                project_id: project.id.clone(),
+                path: "review.skill.md".into(),
+            })
+            .await
+            .is_err()
+    );
+
+    let updated = engine
+        .update_skill(SkillUpdateParams {
+            id: skill.id.clone(),
+            name: "Release Review".into(),
+            description: "Updated description".into(),
+            when_to_use: "Before tagging".into(),
+            version: Some("1.3.0".into()),
+            instructions: "Updated instructions.".into(),
+            tool_allow: Vec::new(),
+            tool_deny: vec!["shell".into()],
+            profiles: vec!["coding".into()],
+            roles: vec!["leader".into()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.version, "1.3.0");
+    assert_eq!(updated.tool_deny, vec!["shell"]);
+
+    let disabled = engine
+        .set_skill_enabled(SkillEnabledParams {
+            id: skill.id.clone(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    assert!(!disabled.enabled);
+    let catalog = engine
+        .skill_catalog(&project.id, "leader", "coding")
+        .await
+        .unwrap();
+    assert!(!catalog.contains("Release Review"));
+    assert!(engine.delete_skill(skill.id).await.unwrap().deleted);
+}
+
+#[tokio::test]
+async fn artifact_versions_and_restore_are_optimistic() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("artifacts".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "artifact versions".into(), None)
+        .await
+        .unwrap();
+    let artifact = engine
+        .publish_artifact(
+            &session.id,
+            "agent-1",
+            "Leader",
+            None,
+            "Report",
+            "note",
+            "text/plain",
+            "first",
+        )
+        .await
+        .unwrap();
+    assert_eq!(artifact.version, 1);
+    let updated = engine
+        .publish_artifact_version(
+            &artifact.id,
+            Some(1),
+            "Report",
+            "note",
+            "text/plain",
+            "second",
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.version, 2);
+    assert!(
+        engine
+            .publish_artifact_version(
+                &artifact.id,
+                Some(1),
+                "Report",
+                "note",
+                "text/plain",
+                "stale",
+            )
+            .await
+            .is_err()
+    );
+    let versions = engine.artifact_versions(&artifact.id).await.unwrap();
+    assert_eq!(versions.versions.len(), 2);
+    let restored = engine
+        .restore_artifact_version(&artifact.id, 1)
+        .await
+        .unwrap();
+    assert_eq!(restored.version, 3);
+    assert_eq!(restored.content, "first");
+}
+
+#[tokio::test]
+async fn source_refresh_rereads_file_content_and_bumps_revision() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let path = repo.path().join("notes.md");
+    std::fs::write(&path, "# Notes\n\nFirst version mentions alpha.").unwrap();
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("refresh".into()),
+        )
+        .await
+        .unwrap();
+    let source = engine
+        .add_source_file(SourceCreateFileParams {
+            project_id: project.id.clone(),
+            collection: Some("notes".into()),
+            path: "notes.md".into(),
+            title: None,
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(source.revision, 1);
+    std::fs::write(&path, "# Notes\n\nSecond version mentions beta.").unwrap();
+    let refreshed = engine.refresh_source(source.id.clone()).await.unwrap();
+    assert_eq!(refreshed.source.revision, 2);
+    assert_eq!(refreshed.source.title, "notes.md");
+    let search = engine
+        .search_sources(project.id, "beta".into(), Vec::new(), Some(5))
+        .await
+        .unwrap();
+    assert!(search.hits.iter().any(|hit| hit.source_id == source.id));
+    let page = engine.get_source(source.id, None, None).await.unwrap();
+    assert!(
+        page.chunks
+            .iter()
+            .any(|chunk| chunk.content.contains("beta"))
+    );
+}
+
+#[tokio::test]
+async fn artifact_request_keys_are_idempotent_per_session() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("idempotent".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "artifact keys".into(), None)
+        .await
+        .unwrap();
+    let first = engine
+        .publish_artifact_keyed(
+            &session.id,
+            "agent-1",
+            "Leader",
+            None,
+            "Report",
+            "note",
+            "text/plain",
+            "first",
+            "report-1",
+        )
+        .await
+        .unwrap();
+    let reused = engine
+        .publish_artifact_keyed(
+            &session.id,
+            "agent-1",
+            "Leader",
+            None,
+            "Report",
+            "note",
+            "text/plain",
+            "second",
+            "report-1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused.id, first.id);
+    assert_eq!(reused.content, "first");
+    let other_session = engine
+        .create_session(project.id, "artifact keys 2".into(), None)
+        .await
+        .unwrap();
+    let other = engine
+        .publish_artifact_keyed(
+            &other_session.id,
+            "agent-1",
+            "Leader",
+            None,
+            "Report",
+            "note",
+            "text/plain",
+            "other",
+            "report-1",
+        )
+        .await
+        .unwrap();
+    assert_ne!(other.id, first.id);
+    assert!(
+        engine
+            .publish_artifact_keyed(
+                &session.id,
+                "agent-1",
+                "Leader",
+                None,
+                "Report",
+                "note",
+                "text/plain",
+                "unsafe",
+                "bad key",
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn source_collections_metadata_and_scoped_search() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("collections".into()),
+        )
+        .await
+        .unwrap();
+    let engineering = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: Some("engineering".into()),
+            title: "Runtime".into(),
+            content: "The scheduler uses deterministic leases.".into(),
+            labels: vec!["runtime".into()],
+        })
+        .await
+        .unwrap();
+    let research = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: Some("research".into()),
+            title: "Retrieval".into(),
+            content: "Deterministic retrieval supports citations.".into(),
+            labels: vec!["citation".into()],
+        })
+        .await
+        .unwrap();
+    let collections = engine.source_collections(project.id.clone()).await.unwrap();
+    assert_eq!(collections.total_sources, 2);
+    assert_eq!(collections.collections.len(), 2);
+    let engineering_group = collections
+        .collections
+        .iter()
+        .find(|collection| collection.name.as_deref() == Some("engineering"))
+        .unwrap();
+    assert_eq!(engineering_group.sources, 1);
+    assert_eq!(engineering_group.labels, vec!["runtime"]);
+
+    let scoped = engine
+        .search_sources_scoped(
+            project.id.clone(),
+            "deterministic".into(),
+            Vec::new(),
+            vec!["research".into()],
+            Vec::new(),
+            Some(8),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped.hits.len(), 1);
+    assert_eq!(scoped.hits[0].source_id, research.id);
+    assert_eq!(scoped.hits[0].collection.as_deref(), Some("research"));
+
+    let label_scoped = engine
+        .search_sources_scoped(
+            project.id.clone(),
+            "deterministic".into(),
+            Vec::new(),
+            Vec::new(),
+            vec!["runtime".into()],
+            Some(8),
+        )
+        .await
+        .unwrap();
+    assert_eq!(label_scoped.hits.len(), 1);
+    assert_eq!(label_scoped.hits[0].source_id, engineering.id);
+
+    let moved = engine
+        .set_source_collection(research.id.clone(), Some("engineering".into()))
+        .await
+        .unwrap();
+    assert_eq!(moved.collection.as_deref(), Some("engineering"));
+    let snapshot = Store::open(data.path())
+        .unwrap()
+        .read_source_snapshot(&project.id, &research.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.source.collection.as_deref(), Some("engineering"));
+
+    let labelled = engine
+        .set_source_labels(
+            research.id.clone(),
+            vec!["citation".into(), "verified".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(labelled.labels, vec!["citation", "verified"]);
+    let cleared = engine
+        .set_source_collection(research.id.clone(), None)
+        .await
+        .unwrap();
+    assert!(cleared.collection.is_none());
+    assert!(
+        engine
+            .set_source_collection(engineering.id.clone(), Some("x".repeat(81)))
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .set_source_collection(engineering.id.clone(), Some("bad\ncollection".into()))
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .set_source_labels(engineering.id, vec!["bad\nlabel".into()])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn artifact_diff_reports_hunks_and_rejects_unknown_versions() {
+    use vp_protocol::types::ArtifactDiffParams;
+
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("diff".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "artifact diff".into(), None)
+        .await
+        .unwrap();
+    let artifact = engine
+        .publish_artifact(
+            &session.id,
+            "agent-1",
+            "Leader",
+            None,
+            "Report",
+            "note",
+            "text/plain",
+            "alpha\nbeta\ngamma\n",
+        )
+        .await
+        .unwrap();
+    let updated = engine
+        .publish_artifact_version(
+            &artifact.id,
+            Some(1),
+            "Report",
+            "note",
+            "text/plain",
+            "alpha\ndelta\ngamma\nepsilon\n",
+        )
+        .await
+        .unwrap();
+    let diff = engine
+        .artifact_diff(ArtifactDiffParams {
+            artifact_id: artifact.id.clone(),
+            from_version: 1,
+            to_version: Some(2),
+            context: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(diff.from_version, 1);
+    assert_eq!(diff.to_version, 2);
+    assert_eq!(diff.diff.additions, 2);
+    assert_eq!(diff.diff.deletions, 1);
+    assert!(!diff.diff.identical);
+    assert!(!diff.diff.hunks.is_empty());
+    assert!(
+        diff.diff
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .any(|line| line.kind == "add" && line.text.contains("epsilon"))
+    );
+
+    let current = engine
+        .artifact_diff(ArtifactDiffParams {
+            artifact_id: artifact.id.clone(),
+            from_version: 1,
+            to_version: None,
+            context: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(current.to_version, updated.version);
+    assert_eq!(current.diff.additions, 2);
+
+    let identical = engine
+        .artifact_diff(ArtifactDiffParams {
+            artifact_id: artifact.id.clone(),
+            from_version: 1,
+            to_version: Some(1),
+            context: None,
+        })
+        .await
+        .unwrap();
+    assert!(identical.diff.identical);
+
+    assert!(
+        engine
+            .artifact_diff(ArtifactDiffParams {
+                artifact_id: artifact.id,
+                from_version: 9,
+                to_version: None,
+                context: None,
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn citation_audit_exposes_dangling_and_unused_keys() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("audit".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "citation audit".into(), None)
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "agent.message",
+            serde_json::json!({
+                "message_id": "message-1",
+                "agent_name": "Worker",
+                "text": "The runtime uses leases [c9].",
+                "citations": [{
+                    "key": "c1",
+                    "source_id": "source-1",
+                    "source_title": "Runtime notes",
+                    "chunk_id": "chunk-1",
+                    "chunk_no": 2,
+                    "heading": "Leases",
+                    "excerpt": "deterministic leases",
+                    "score": 2.5,
+                    "origin": "search"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "agent.message",
+            serde_json::json!({
+                "message_id": "message-2",
+                "text": "A summary without an evidence marker."
+            }),
+        )
+        .await
+        .unwrap();
+    let audit = engine
+        .session_citation_audit(&session.id)
+        .await
+        .unwrap()
+        .audit;
+    assert_eq!(audit.messages.len(), 2);
+    assert_eq!(audit.messages_with_citations, 1);
+    assert_eq!(audit.messages_without_citations, 1);
+    assert_eq!(audit.total_citations, 1);
+    assert_eq!(audit.unique_sources, 1);
+    assert_eq!(audit.dangling_key_count, 1);
+    assert_eq!(audit.unused_citation_count, 1);
+    let first = audit
+        .messages
+        .iter()
+        .find(|message| message.message_id == "message-1")
+        .unwrap();
+    assert_eq!(first.referenced_keys, vec!["c9"]);
+    assert_eq!(first.dangling_keys, vec!["c9"]);
+    assert_eq!(first.unused_keys, vec!["c1"]);
+    let second = audit
+        .messages
+        .iter()
+        .find(|message| message.message_id == "message-2")
+        .unwrap();
+    assert_eq!(second.citation_count, 0);
+    assert!(second.referenced_keys.is_empty());
+    assert!(second.dangling_keys.is_empty());
+}

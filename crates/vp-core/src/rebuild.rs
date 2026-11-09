@@ -92,6 +92,9 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             store.set_memory_policy(&snapshot.project.id, &snapshot.memory_policy)?;
             store.set_orchestration_policy(&snapshot.project.id, &snapshot.orchestration_policy)?;
             store.restore_approval_grants(&snapshot.project.id, &snapshot.approval_grants)?;
+            for skill in &snapshot.skills {
+                store.insert_skill(skill)?;
+            }
             for task in &snapshot.intake_tasks {
                 let mut task = task.clone();
                 if matches!(task.status.as_str(), "dispatching" | "running") {
@@ -105,6 +108,15 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             }
         }
         let engine = Engine::new(store);
+        match engine.restore_sources_from_disk().await {
+            Ok(restored) if restored > 0 => {
+                tracing::info!(restored, "restored project knowledge sources from disk");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "failed to restore project knowledge sources");
+            }
+        }
         let mut sessions = 0usize;
         let mut skipped = skipped.clone();
         for (session, _) in prepared {
@@ -373,6 +385,31 @@ mod tests {
                 .await
                 .unwrap();
             engine
+                .add_source_note(vp_protocol::types::SourceCreateNoteParams {
+                    project_id: project.id.clone(),
+                    collection: Some("rebuild".into()),
+                    title: "Rebuild source".into(),
+                    content: "Knowledge survives a database rebuild.".into(),
+                    labels: vec!["rebuild".into()],
+                })
+                .await
+                .unwrap();
+            engine
+                .create_skill(vp_protocol::types::SkillCreateParams {
+                    project_id: project.id.clone(),
+                    name: "Rebuild skill".into(),
+                    description: "Survive a manifest rebuild.".into(),
+                    when_to_use: "When rebuilding.".into(),
+                    version: Some("1.1.0".into()),
+                    instructions: "Follow the rebuilt checklist.".into(),
+                    tool_allow: vec!["read_file".into()],
+                    tool_deny: Vec::new(),
+                    profiles: vec!["coding".into()],
+                    roles: vec!["leader".into()],
+                })
+                .await
+                .unwrap();
+            engine
                 .append_event(
                     &session.id,
                     "plan_task.started",
@@ -446,6 +483,17 @@ mod tests {
         let policy = store.get_task_scheduler_policy(&project_id).unwrap();
         assert!(policy.enabled);
         assert_eq!(policy.cooldown_secs, 30);
+        let skills = store.list_skills(Some(&project_id), true).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "Rebuild skill");
+        assert_eq!(skills[0].version, "1.1.0");
+        assert_eq!(skills[0].tool_allow, vec!["read_file"]);
+        let sources = store.list_sources(&project_id, None, None, None).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].title, "Rebuild source");
+        assert!(sources[0].chunk_count > 0);
+        let source_page = store.source_chunks(&sources[0].id, 0, 10).unwrap();
+        assert!(!source_page.is_empty());
         let intake = store
             .list_intake_tasks(Some(&project_id), None, None)
             .unwrap();

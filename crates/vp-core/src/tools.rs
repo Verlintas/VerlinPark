@@ -279,6 +279,91 @@ async fn resolve_public_address(host: &str, port: u16) -> Result<SocketAddr> {
         .unwrap_or(addresses[0]))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct FetchedUrl {
+    pub status: u16,
+    pub content_type: String,
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// Fetch a public HTTP(S) URL with the same SSRF and redirect policy used by
+/// the research tool. Callers receive the decoded body and must decide whether
+/// to render HTML or treat it as text.
+pub(crate) async fn fetch_public_url(
+    raw_url: &str,
+    max_chars: usize,
+    max_bytes: usize,
+) -> Result<FetchedUrl> {
+    let max_chars = max_chars.clamp(100, 4_000_000);
+    let max_bytes = max_bytes.clamp(1_024, 8 * 1024 * 1024);
+    let url = reqwest::Url::parse(raw_url).context("invalid URL")?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => bail!("unsupported URL scheme: {other}"),
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("URL has no host"))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if is_blocked_host(&host) {
+        bail!("local hosts are blocked");
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let mut client_builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(20))
+        .user_agent("VerlinPark/0.1 research fetcher");
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip(ip) {
+            bail!("private or local IP addresses are blocked");
+        }
+    } else {
+        let address = resolve_public_address(&host, port).await?;
+        client_builder = client_builder.resolve(&host, address);
+    }
+    let client = client_builder.build().context("building HTTP client")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| anyhow!("fetch failed: {error}"))?;
+    let status = response.status();
+    if status.is_redirection() {
+        bail!("redirects are not followed; request the final URL explicitly");
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut body = Vec::new();
+    let mut response = response;
+    let mut truncated = false;
+    while let Some(chunk) = response.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() >= max_bytes {
+            truncated = true;
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&body).to_string();
+    let mut chars = text.chars();
+    let mut output = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        truncated = true;
+        output.push_str("\n… content truncated");
+    }
+    Ok(FetchedUrl {
+        status: status.as_u16(),
+        content_type,
+        text: output,
+        truncated,
+    })
+}
+
 #[async_trait]
 impl AgentTool for FetchUrl {
     fn name(&self) -> &'static str {
@@ -310,76 +395,13 @@ impl AgentTool for FetchUrl {
             .and_then(Value::as_u64)
             .unwrap_or(8000)
             .clamp(100, 20000) as usize;
-        let url = reqwest::Url::parse(raw_url).context("invalid URL")?;
-        match url.scheme() {
-            "http" | "https" => {}
-            other => {
-                return Ok(ToolOutput::error(format!(
-                    "unsupported URL scheme: {other}"
-                )));
-            }
+        match fetch_public_url(raw_url, max_chars, max_chars.saturating_mul(4)).await {
+            Ok(fetched) => Ok(ToolOutput::ok(format!(
+                "GET {raw_url} -> {} ({})\n{}",
+                fetched.status, fetched.content_type, fetched.text
+            ))),
+            Err(error) => Ok(ToolOutput::error(error.to_string())),
         }
-        let host = url
-            .host_str()
-            .ok_or_else(|| anyhow!("URL has no host"))?
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
-        if is_blocked_host(&host) {
-            return Ok(ToolOutput::error("local hosts are blocked"));
-        }
-        let port = url.port_or_known_default().unwrap_or(80);
-        let mut client_builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(20))
-            .user_agent("VerlinPark/0.1 research fetcher");
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            if is_blocked_ip(ip) {
-                return Ok(ToolOutput::error(
-                    "private or local IP addresses are blocked",
-                ));
-            }
-        } else {
-            // Resolve and pin the address that was actually checked. Checking
-            // only the hostname would let a public name resolve to loopback or
-            // a private network between validation and connection.
-            let address = resolve_public_address(&host, port).await?;
-            client_builder = client_builder.resolve(&host, address);
-        }
-        let client = client_builder.build().context("building HTTP client")?;
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| anyhow!("fetch failed: {error}"))?;
-        let status = response.status();
-        if status.is_redirection() {
-            return Ok(ToolOutput::error(
-                "redirects are not followed; request the final URL explicitly",
-            ));
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
-        let mut body = Vec::new();
-        let mut response = response;
-        while let Some(chunk) = response.chunk().await? {
-            body.extend_from_slice(&chunk);
-            if body.len() >= max_chars * 4 {
-                break;
-            }
-        }
-        let text = String::from_utf8_lossy(&body);
-        let text = truncate(text.to_string());
-        let mut truncated = text.chars().take(max_chars).collect::<String>();
-        if truncated.len() < text.len() && !truncated.is_empty() {
-            truncated.push_str("\n… content truncated");
-        }
-        Ok(ToolOutput::ok(format!(
-            "GET {raw_url} -> {status} ({content_type})\n{truncated}"
-        )))
     }
 }
 

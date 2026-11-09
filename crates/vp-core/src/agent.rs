@@ -10,6 +10,7 @@ use async_trait::async_trait;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
+use serde_json::Value;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
@@ -18,8 +19,8 @@ use vp_protocol::types::{
     MergeQueueEntry, PlanDepartment, PlanRevisionDetailResult, PlanTask, Project,
     ReviseTeamPlanResult, RoleModels, ScheduledTask, SchedulerProjectStatus, SchedulerStatusResult,
     Session, SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
-    SessionCompactResult, SessionForkResult, SessionMergeForkResult, StoredMessage, TeamPlan,
-    TodoItem,
+    SessionCompactResult, SessionForkResult, SessionMergeForkResult, Skill, SourceCitation,
+    SourceSearchHit, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -977,6 +978,42 @@ fn context_strategy(role: AgentRole) -> ContextStrategy {
     match role {
         AgentRole::Leader | AgentRole::Manager => ContextStrategy::Summarize,
         AgentRole::Worker | AgentRole::Labour | AgentRole::Verifier => ContextStrategy::Trim,
+    }
+}
+
+#[derive(Default)]
+struct CitationRegistry {
+    by_chunk: HashMap<String, SourceCitation>,
+    order: Vec<String>,
+}
+
+impl CitationRegistry {
+    fn add_hit(&mut self, hit: &SourceSearchHit, origin: &str) -> String {
+        if let Some(existing) = self.by_chunk.get(&hit.chunk_id) {
+            return existing.key.clone();
+        }
+        let key = format!("c{}", self.order.len() + 1);
+        let citation = SourceCitation {
+            key: key.clone(),
+            source_id: hit.source_id.clone(),
+            source_title: hit.source_title.clone(),
+            chunk_id: hit.chunk_id.clone(),
+            chunk_no: hit.chunk_no,
+            heading: hit.heading.clone(),
+            excerpt: truncate_to(&hit.content, 320),
+            score: hit.score,
+            origin: origin.to_string(),
+        };
+        self.by_chunk.insert(hit.chunk_id.clone(), citation);
+        self.order.push(hit.chunk_id.clone());
+        key
+    }
+
+    fn list(&self) -> Vec<SourceCitation> {
+        self.order
+            .iter()
+            .filter_map(|chunk_id| self.by_chunk.get(chunk_id).cloned())
+            .collect()
     }
 }
 
@@ -4460,8 +4497,7 @@ impl AgentService {
             let tool_tokens = serde_json::to_string(&tools)
                 .map(|schema| estimate_context_tokens(&schema))
                 .unwrap_or(0);
-            let (threshold, hard_limit) =
-                context_limits(&config, spec.role, system_tokens, tool_tokens);
+            let (threshold, hard_limit) = context_limits(&config, spec.role);
             let loaded = load_conversation(&self.engine, session_id).await?;
             let mut conversation = loaded.messages;
             let mut conversation_ids = loaded.ids;
@@ -7844,11 +7880,18 @@ async fn compact_context_if_needed(
     }
 
     // Rolling-window fallback: keep the summary at index 0 when one exists,
-    // otherwise drop from the beginning at safe message boundaries.
+    // otherwise drop from the beginning at safe message boundaries. A manual
+    // compaction that could not produce a summary still creates headroom by
+    // trimming to half of the hard limit instead of doing nothing.
     let floor = usize::from(summary_text.is_some());
+    let trim_target = if force && summary_text.is_none() {
+        (hard_limit / 2).max(1_024)
+    } else {
+        hard_limit
+    };
     let mut retention = keep;
     loop {
-        if estimated <= hard_limit {
+        if estimated <= trim_target {
             break;
         }
         let cut = match safe_context_cut(conversation, retention, floor) {
@@ -7943,6 +7986,8 @@ async fn run_loop(
         Some(ids) => ids,
         None => &mut empty_ids,
     };
+    let mut citations = CitationRegistry::default();
+    let mut active_skill: Option<Skill> = None;
     let task_priority = if let Some(task_id) = &spec.task_id {
         engine
             .get_team_plan(&session.id)
@@ -8056,11 +8101,24 @@ async fn run_loop(
     let memory_brief = project_memory_brief(engine, &project.id, &session.goal, 6)
         .await
         .unwrap_or_default();
-    let system = if memory_brief.is_empty() {
+    let mut system = if memory_brief.is_empty() {
         system
     } else {
         format!("{system}\n\nLong-term project memory (persisted across sessions):\n{memory_brief}")
     };
+    let source_brief = engine.source_brief(&project.id).await.unwrap_or_default();
+    if !source_brief.is_empty() {
+        system.push_str("\n\nIndexed project sources (use search_sources for content):\n");
+        system.push_str(&source_brief);
+    }
+    let skill_catalog = engine
+        .skill_catalog(&project.id, spec.role.as_str(), spec.profile.as_str())
+        .await
+        .unwrap_or_default();
+    if !skill_catalog.is_empty() {
+        system.push_str("\n\nProject skills (call use_skill with the exact name):\n");
+        system.push_str(&skill_catalog);
+    }
     let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;
     let mut tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
     tools.extend(
@@ -8072,8 +8130,7 @@ async fn run_loop(
     let tool_tokens = serde_json::to_string(&tools)
         .map(|schema| estimate_context_tokens(&schema))
         .unwrap_or(0);
-    let (context_threshold, context_hard_limit) =
-        context_limits(config, spec.role, system_tokens, tool_tokens);
+    let (context_threshold, context_hard_limit) = context_limits(config, spec.role);
     let model_name = model_for(config, spec.role);
     let mut calibration = if top_level {
         load_context_calibration(engine, &session.id, &model_name).await
@@ -8173,7 +8230,15 @@ async fn run_loop(
             system: Some(system.clone()),
             max_tokens: config.max_tokens,
             temperature: Some(0.2),
-            tools: tools.clone(),
+            tools: tools
+                .iter()
+                .filter(|tool| {
+                    active_skill
+                        .as_ref()
+                        .is_none_or(|skill| skill_allows_tool(skill, &tool.name))
+                })
+                .cloned()
+                .collect(),
         };
         const MIN_OUTPUT_TOKENS: u64 = 64;
         let configured_output = config.max_tokens.unwrap_or(4096).max(1) as u64;
@@ -8430,7 +8495,7 @@ async fn run_loop(
         } else {
             Some(tool_calls.clone())
         };
-        if top_level {
+        let stored_id = if top_level {
             let stored = engine
                 .append_message(
                     &session.id,
@@ -8440,8 +8505,12 @@ async fn run_loop(
                     None,
                 )
                 .await?;
-            conversation_ids.push(Some(stored.id));
-        }
+            conversation_ids.push(Some(stored.id.clone()));
+            Some(stored.id)
+        } else {
+            None
+        };
+        let citation_records = citations.list();
         emit(
             engine,
             &session.id,
@@ -8450,6 +8519,8 @@ async fn run_loop(
             serde_json::json!({
                 "text": text,
                 "tool_calls": tool_calls,
+                "message_id": stored_id,
+                "citations": citation_records,
             }),
         )
         .await?;
@@ -8514,6 +8585,11 @@ async fn run_loop(
                     | "read_artifact"
             );
             let is_memory_tool = matches!(call.name.as_str(), "remember" | "recall");
+            let is_source_tool = matches!(
+                call.name.as_str(),
+                "search_sources" | "read_source" | "list_sources"
+            );
+            let is_skill_tool = call.name == "use_skill";
             let is_question_tool = call.name == "ask_user" && spec.role != AgentRole::Verifier;
             let is_mcp_tool = call.name == "mcp";
             let is_coordination_tool = call.name == "coordinate";
@@ -8618,8 +8694,16 @@ async fn run_loop(
                 }
             }
 
+            let skill_denied = active_skill
+                .as_ref()
+                .filter(|skill| !skill_allows_tool(skill, &call.name));
             let output = if let Some(reason) = denied_reason {
                 ToolOutput::error(reason)
+            } else if let Some(skill) = skill_denied {
+                ToolOutput::error(format!(
+                    "tool '{}' is not allowed by active skill '{}'",
+                    call.name, skill.name
+                ))
             } else if is_deliberate {
                 emit(
                     engine,
@@ -8869,6 +8953,69 @@ async fn run_loop(
                         engine.update_agent_status(&spec.id, "running").await?;
                         ToolOutput::error("User did not answer before the question timed out.")
                     }
+                }
+            } else if is_skill_tool {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                let output =
+                    match run_skill_tool(engine, project, spec, input.clone(), &mut active_skill)
+                        .await
+                    {
+                        Ok(output) => output,
+                        Err(error) => ToolOutput::error(format!("skill error: {error}")),
+                    };
+                if !output.is_error
+                    && let Some(skill) = &active_skill
+                {
+                    emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "skill.activated",
+                        serde_json::json!({
+                            "name": skill.name,
+                            "slug": skill.slug,
+                            "version": skill.version,
+                            "role": spec.role.as_str(),
+                            "profile": spec.profile.as_str(),
+                            "tool_allow": skill.tool_allow,
+                            "tool_deny": skill.tool_deny,
+                            "agent_id": spec.id,
+                            "agent_name": spec.name,
+                            "task_id": spec.task_id,
+                        }),
+                    )
+                    .await?;
+                }
+                output
+            } else if is_source_tool {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_source_tool(engine, project, &call.name, input.clone(), &mut citations)
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("source error: {error}")),
                 }
             } else if is_memory_tool {
                 emit(
@@ -9997,6 +10144,233 @@ async fn run_mcp_tool(
     }
 }
 
+fn skill_allows_tool(skill: &Skill, tool: &str) -> bool {
+    if tool == "use_skill" {
+        return true;
+    }
+    if skill
+        .tool_deny
+        .iter()
+        .any(|denied| denied == "*" || denied == tool)
+    {
+        return false;
+    }
+    skill.tool_allow.is_empty()
+        || skill
+            .tool_allow
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == tool)
+}
+
+async fn run_skill_tool(
+    engine: &Engine,
+    project: &Project,
+    spec: &AgentSpec,
+    input: Value,
+    active: &mut Option<Skill>,
+) -> Result<ToolOutput> {
+    let name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("name is required"))?;
+    let skills = engine
+        .skills_for(&project.id, spec.role.as_str(), spec.profile.as_str())
+        .await?;
+    let Some(skill) = skills.iter().find(|skill| {
+        skill.name.eq_ignore_ascii_case(name) || skill.slug.eq_ignore_ascii_case(name)
+    }) else {
+        let available = skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(ToolOutput::error(if available.is_empty() {
+            "No enabled skills apply to this role/profile.".to_string()
+        } else {
+            format!("Unknown skill '{name}'. Available skills: {available}")
+        }));
+    };
+    *active = Some(skill.clone());
+    let allow = if skill.tool_allow.is_empty() {
+        "unrestricted by this skill".to_string()
+    } else {
+        skill.tool_allow.join(", ")
+    };
+    let deny = if skill.tool_deny.is_empty() {
+        "none".to_string()
+    } else {
+        skill.tool_deny.join(", ")
+    };
+    Ok(ToolOutput::ok(truncate_to(
+        &format!(
+            "Skill '{}' v{} activated.\nAllowed tools: {allow}\nDenied tools: {deny}\n\n{}\n\nFollow these instructions for the rest of this run. Use_skill always remains available to switch skills.",
+            skill.name, skill.version, skill.instructions
+        ),
+        22_000,
+    )))
+}
+
+async fn run_source_tool(
+    engine: &Engine,
+    project: &Project,
+    name: &str,
+    input: Value,
+    citations: &mut CitationRegistry,
+) -> Result<ToolOutput> {
+    match name {
+        "search_sources" => {
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("query is required"))?;
+            let source_ids = input
+                .get("source_ids")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(20)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let collections = input
+                .get("collections")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(20)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let labels = input
+                .get("labels")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(20)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(6)
+                .clamp(1, 20) as u32;
+            let result = engine
+                .search_sources_scoped(
+                    project.id.clone(),
+                    query.to_string(),
+                    source_ids,
+                    collections,
+                    labels,
+                    Some(limit),
+                )
+                .await?;
+            if result.hits.is_empty() {
+                return Ok(ToolOutput::ok(
+                    "No matching source chunks. Try a shorter query or list_sources.",
+                ));
+            }
+            let mut output = String::new();
+            for hit in &result.hits {
+                let key = citations.add_hit(hit, "search");
+                let heading = hit.heading.as_deref().unwrap_or("untitled section");
+                output.push_str(&format!(
+                    "[{key}] {} — {} (chunk {}, score {:.2})\n{}\n\n",
+                    hit.source_title,
+                    heading,
+                    hit.chunk_no,
+                    hit.score,
+                    truncate_to(&hit.content, 1_400),
+                ));
+            }
+            if result.degraded {
+                output.push_str(
+                    "Search used the lexical fallback because the FTS index had no direct match.\n",
+                );
+            }
+            Ok(ToolOutput::ok(truncate_to(&output, 24_000)))
+        }
+        "read_source" => {
+            let source_id = input
+                .get("source_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("source_id is required"))?;
+            let chunk_no = input
+                .get("chunk_no")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .clamp(1, 500) as u32;
+            let max_chars = input
+                .get("max_chars")
+                .and_then(Value::as_u64)
+                .unwrap_or(6_000)
+                .clamp(300, 20_000) as usize;
+            let result = engine
+                .get_source(source_id.to_string(), Some(chunk_no - 1), Some(1))
+                .await?;
+            let Some(chunk) = result.chunks.first() else {
+                return Ok(ToolOutput::error(format!(
+                    "source {source_id} has no chunk {chunk_no}"
+                )));
+            };
+            let hit = SourceSearchHit {
+                source_id: result.source.id.clone(),
+                source_title: result.source.title.clone(),
+                collection: result.source.collection.clone(),
+                labels: result.source.labels.clone(),
+                chunk_id: chunk.id.clone(),
+                chunk_no: chunk.chunk_no,
+                heading: chunk.heading.clone(),
+                content: chunk.content.clone(),
+                score: 1.0,
+            };
+            let key = citations.add_hit(&hit, "read");
+            let heading = chunk.heading.as_deref().unwrap_or("untitled section");
+            Ok(ToolOutput::ok(format!(
+                "[{key}] {} — {} (chunk {} of {})\n{}",
+                result.source.title,
+                heading,
+                chunk.chunk_no,
+                result.total_chunks,
+                truncate_to(&chunk.content, max_chars),
+            )))
+        }
+        "list_sources" => {
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(20)
+                .clamp(1, 50) as u32;
+            let result = engine
+                .list_sources(project.id.clone(), None, None, Some(limit))
+                .await?;
+            if result.sources.is_empty() {
+                return Ok(ToolOutput::ok("No project sources are indexed."));
+            }
+            let mut output = String::new();
+            for source in result.sources {
+                output.push_str(&format!(
+                    "- {} · {} · {} chunks · status={}\n  id={}\n",
+                    source.title, source.kind, source.chunk_count, source.status, source.id
+                ));
+            }
+            Ok(ToolOutput::ok(truncate_to(&output, 12_000)))
+        }
+        other => Ok(ToolOutput::error(format!("unknown source tool: {other}"))),
+    }
+}
+
 async fn run_memory_tool(
     engine: &Engine,
     session: &Session,
@@ -10173,21 +10547,62 @@ async fn run_mailbox_tool(
                 .get("mime_type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("text/plain");
-            let artifact = engine
-                .publish_artifact(
-                    &session.id,
-                    &spec.id,
-                    &spec.name,
-                    spec.task_id.clone(),
-                    name,
-                    kind,
-                    mime_type,
-                    content,
-                )
-                .await?;
+            let requested_key = input
+                .get("request_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if requested_key.is_some()
+                && input
+                    .get("artifact_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            {
+                return Ok(ToolOutput::error(
+                    "publish_artifact cannot update an artifact and use a request_key at the same time",
+                ));
+            }
+            let artifact = if let Some(artifact_id) =
+                input.get("artifact_id").and_then(serde_json::Value::as_str)
+            {
+                let expected = input
+                    .get("expected_version")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+                engine
+                    .publish_artifact_version(artifact_id, expected, name, kind, mime_type, content)
+                    .await?
+            } else if let Some(request_key) = requested_key {
+                engine
+                    .publish_artifact_keyed(
+                        &session.id,
+                        &spec.id,
+                        &spec.name,
+                        spec.task_id.clone(),
+                        name,
+                        kind,
+                        mime_type,
+                        content,
+                        request_key,
+                    )
+                    .await?
+            } else {
+                engine
+                    .publish_artifact(
+                        &session.id,
+                        &spec.id,
+                        &spec.name,
+                        spec.task_id.clone(),
+                        name,
+                        kind,
+                        mime_type,
+                        content,
+                    )
+                    .await?
+            };
             Ok(ToolOutput::ok(format!(
-                "artifact {} published: {}",
-                artifact.id, artifact.name
+                "artifact {} version {} published: {}",
+                artifact.id, artifact.version, artifact.name
             )))
         }
         "list_artifacts" => {
@@ -10273,26 +10688,25 @@ fn context_window_for(config: &AgentConfig, role: AgentRole) -> u64 {
         .min(10_000_000)
 }
 
-/// Derive the summarization threshold and the hard context limit from the
-/// model window, output reserve, system prompt, and tool schemas. The fixed
-/// 24k default is gone: a 1M-token model gets a ~75% window threshold while a
-/// local 8k model gets a much lower one.
-fn context_limits(
-    config: &AgentConfig,
-    role: AgentRole,
-    system_tokens: u64,
-    tool_tokens: u64,
-) -> (u64, u64) {
+/// Derive the summarization threshold and the hard total-request limit from
+/// the model window and output reserve. The caller's estimate includes the
+/// system prompt and tool schemas, so they are not deducted a second time.
+/// The fixed 24k default is gone: a 1M-token model gets a ~75% window
+/// threshold while a local 8k model gets a much lower one.
+fn context_limits(config: &AgentConfig, role: AgentRole) -> (u64, u64) {
     let window = context_window_for(config, role);
     if window == 0 {
         return (config.compact_after_tokens, u64::MAX);
     }
     let output = u64::from(config.max_tokens.unwrap_or(4096));
-    let fixed = output
-        .saturating_add(system_tokens)
-        .saturating_add(tool_tokens)
-        .saturating_add(512);
-    let hard_limit = window.saturating_sub(fixed).max(1024);
+    // `estimated` in the compaction path includes the system prompt and tool
+    // schemas. The hard limit is therefore the budget for the whole request,
+    // not a second deduction of those same tokens. Keep a small safety reserve
+    // for provider framing and a final assistant turn.
+    let safety = 1_024u64;
+    let hard_limit = window
+        .saturating_sub(output.saturating_add(safety))
+        .max(1024);
     let threshold = if config.compact_after_tokens > 0 {
         config.compact_after_tokens.min(hard_limit)
     } else {
@@ -10361,7 +10775,10 @@ fn tool_schemas(
                 "name": {"type": "string"},
                 "kind": {"type": "string"},
                 "mime_type": {"type": "string"},
-                "content": {"type": "string", "maxLength": 100000}
+                "content": {"type": "string", "maxLength": 100000},
+                "artifact_id": {"type": "string", "description": "Update this inline artifact instead of creating a new one"},
+                "expected_version": {"type": "integer", "minimum": 1, "description": "Optimistic concurrency guard for updates"},
+                "request_key": {"type": "string", "maxLength": 160, "description": "Idempotency key scoped to this session; a repeated key returns the first artifact"}
             },
             "required": ["name", "content"]
         }),
@@ -10378,6 +10795,71 @@ fn tool_schemas(
             "type": "object",
             "properties": {"artifact_id": {"type": "string"}},
             "required": ["artifact_id"]
+        }),
+    });
+    tools.push(ToolSchema {
+        name: "search_sources".to_string(),
+        description: "Search the project's indexed knowledge sources. Returns ranked chunks with citation keys such as [c1]. Cite every used chunk with its exact key.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "maxLength": 400},
+                "source_ids": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {"type": "string"}
+                },
+                "collections": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {"type": "string"},
+                    "description": "Restrict to these collections; an empty string selects uncollected sources"
+                },
+                "labels": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {"type": "string"},
+                    "description": "Restrict to sources with any of these labels"
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+            },
+            "required": ["query"]
+        }),
+    });
+    tools.push(ToolSchema {
+        name: "read_source".to_string(),
+        description: "Read one project source chunk in full. The returned citation key must be used when quoting it.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "chunk_no": {"type": "integer", "minimum": 1},
+                "max_chars": {"type": "integer", "minimum": 300, "maximum": 20000}
+            },
+            "required": ["source_id"]
+        }),
+    });
+    tools.push(ToolSchema {
+        name: "list_sources".to_string(),
+        description:
+            "List indexed project sources and their ids. Use search_sources to read content."
+                .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+            }
+        }),
+    });
+    tools.push(ToolSchema {
+        name: "use_skill".to_string(),
+        description: "Activate a project skill by its exact name. Returns the full instructions and any tool constraints; calling another skill replaces the active one.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "maxLength": 120}
+            },
+            "required": ["name"]
         }),
     });
     tools.push(ToolSchema {
@@ -12871,7 +13353,11 @@ fn role_system_prompt(
     let base = format!(
         "Project: '{}' at {}. Session goal: '{}'. Worktree: {}. Branch: {}. {} {} \
          The project root is read-only; all writes stay inside the worktree. \
-         Do not claim success without evidence.",
+         Do not claim success without evidence. Project knowledge sources may be indexed: \
+         call search_sources before source-grounded claims, and cite each used chunk with \
+         the exact [cN] key returned by the tool. Never invent a citation key. \
+         If a project skill is listed, call use_skill with its exact name before following \
+         it; the active skill may narrow the tools you can use.",
         project.name, project.root, session.goal, worktree, spec.branch, profile_note, scope_note
     );
     match role {

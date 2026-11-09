@@ -162,6 +162,140 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// List project skill packs.
+    Skills {
+        project: String,
+        /// Include disabled skills.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Create a project skill pack.
+    SkillCreate {
+        project: String,
+        name: String,
+        description: String,
+        /// Instructions; use '-' to read from stdin.
+        instructions: String,
+        #[arg(long = "when", default_value = "")]
+        when_to_use: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long = "tool-allow")]
+        tool_allow: Vec<String>,
+        #[arg(long = "tool-deny")]
+        tool_deny: Vec<String>,
+        #[arg(long = "profile")]
+        profiles: Vec<String>,
+        #[arg(long = "role")]
+        roles: Vec<String>,
+    },
+    /// Import a SKILL.md file from the project root.
+    SkillImport { project: String, path: String },
+    /// List skill activations recorded for a session.
+    SkillActivations { session: String },
+    /// Enable or disable a project skill.
+    SkillEnabled {
+        id: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        enabled: Option<bool>,
+    },
+    /// Delete a project skill.
+    SkillDelete { id: String },
+    /// List indexed project knowledge sources.
+    Sources {
+        project: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show one source and a page of its chunks.
+    SourceGet {
+        source_id: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Add a Markdown/text note to the project knowledge base.
+    SourceNote {
+        project: String,
+        title: String,
+        /// Note body; use '-' to read from stdin.
+        content: String,
+        #[arg(long)]
+        collection: Option<String>,
+    },
+    /// Index one UTF-8 text file from the project root.
+    SourceAddFile {
+        project: String,
+        path: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        collection: Option<String>,
+    },
+    /// Fetch a public URL and index its readable text.
+    SourceAddUrl {
+        project: String,
+        url: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        collection: Option<String>,
+    },
+    /// Index text-like files under the project root.
+    SourceImport {
+        project: String,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        max_files: u32,
+        #[arg(long)]
+        collection: Option<String>,
+    },
+    /// Re-chunk and re-index one source from its durable snapshot.
+    SourceReindex { source_id: String },
+    /// Re-read a file or URL source and replace its indexed content.
+    SourceRefresh { source_id: String },
+    /// Delete one source and its chunks.
+    SourceDelete { source_id: String },
+    /// List project source collections and aggregate counts.
+    SourceCollections { project: String },
+    /// Replace a source's title, collection, and labels.
+    SourceUpdate {
+        source_id: String,
+        title: String,
+        #[arg(long)]
+        collection: Option<String>,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    /// Move a source into a collection; omit --collection to clear it.
+    SourceMove {
+        source_id: String,
+        #[arg(long)]
+        collection: Option<String>,
+    },
+    /// Replace a source's labels.
+    SourceLabels {
+        source_id: String,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    /// Search source chunks with the same lexical retrieval used by agents.
+    SourceSearch {
+        project: String,
+        query: String,
+        #[arg(long = "collection")]
+        collections: Vec<String>,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        #[arg(long, default_value_t = 8)]
+        limit: u32,
+    },
     /// Show the project-wide shared budget and spend.
     ProjectBudget { project: String },
     /// Show token/cost usage grouped by session for a project.
@@ -666,6 +800,14 @@ enum Command {
     TeamPlan { session: String },
     /// Print a Markdown transcript of the session's plan and messages.
     Transcript { session: String },
+    /// Audit citation coverage and dangling markers for a session.
+    CitationAudit { session: String },
+    /// List source citations attached to assistant messages.
+    Citations {
+        session: String,
+        #[arg(long)]
+        message: Option<String>,
+    },
     /// List the agents spawned for a session.
     Agents { session: String },
     /// List typed agent messages.
@@ -769,6 +911,19 @@ enum Command {
     MailboxGc { project: String },
     /// Read an artifact by id.
     Artifact { artifact: String },
+    /// List saved versions of an inline artifact.
+    ArtifactVersions { artifact: String },
+    /// Restore an inline artifact version as a new version.
+    ArtifactRestore { artifact: String, version: u32 },
+    /// Compare two inline artifact versions, or a version with the current one.
+    ArtifactDiff {
+        artifact: String,
+        from_version: u32,
+        #[arg(long)]
+        to_version: Option<u32>,
+        #[arg(long, default_value_t = 3)]
+        context: u32,
+    },
     /// Show the session merge queue and Integrator results.
     Queue { session: String },
     /// Retry a conflicted or failed merge queue entry after rebasing it.
@@ -1063,6 +1218,273 @@ async fn main() -> Result<()> {
                 &discovery,
                 "project.budget.get",
                 json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::Skills { project, all } => {
+            rpc(
+                &discovery,
+                "skill.list",
+                json!({"project_id": project, "include_disabled": all}),
+            )
+            .await?
+        }
+        Command::SkillCreate {
+            project,
+            name,
+            description,
+            instructions,
+            when_to_use,
+            version,
+            tool_allow,
+            tool_deny,
+            profiles,
+            roles,
+        } => {
+            let instructions = if instructions == "-" {
+                let mut buffer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buffer)
+                    .context("reading skill instructions from stdin")?;
+                buffer
+            } else {
+                instructions
+            };
+            rpc(
+                &discovery,
+                "skill.create",
+                json!({
+                    "project_id": project,
+                    "name": name,
+                    "description": description,
+                    "when_to_use": when_to_use,
+                    "version": version,
+                    "instructions": instructions,
+                    "tool_allow": tool_allow,
+                    "tool_deny": tool_deny,
+                    "profiles": profiles,
+                    "roles": roles,
+                }),
+            )
+            .await?
+        }
+        Command::SkillActivations { session } => {
+            rpc(
+                &discovery,
+                "skill.activations",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::SkillImport { project, path } => {
+            rpc(
+                &discovery,
+                "skill.import",
+                json!({"project_id": project, "path": path}),
+            )
+            .await?
+        }
+        Command::SkillEnabled { id, enabled } => {
+            rpc(
+                &discovery,
+                "skill.set_enabled",
+                json!({"id": id, "enabled": enabled.unwrap_or(true)}),
+            )
+            .await?
+        }
+        Command::SkillDelete { id } => rpc(&discovery, "skill.delete", json!({"id": id})).await?,
+        Command::Sources {
+            project,
+            query,
+            status,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "source.list",
+                json!({
+                    "project_id": project,
+                    "query": query,
+                    "status": status,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::SourceGet {
+            source_id,
+            offset,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "source.get",
+                json!({"source_id": source_id, "offset": offset, "limit": limit}),
+            )
+            .await?
+        }
+        Command::SourceNote {
+            project,
+            title,
+            content,
+            collection,
+        } => {
+            let content = if content == "-" {
+                let mut buffer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buffer)
+                    .context("reading source note from stdin")?;
+                buffer
+            } else {
+                content
+            };
+            rpc(
+                &discovery,
+                "source.add_note",
+                json!({
+                    "project_id": project,
+                    "collection": collection,
+                    "title": title,
+                    "content": content
+                }),
+            )
+            .await?
+        }
+        Command::SourceAddFile {
+            project,
+            path,
+            title,
+            collection,
+        } => {
+            rpc(
+                &discovery,
+                "source.add_file",
+                json!({
+                    "project_id": project,
+                    "collection": collection,
+                    "path": path,
+                    "title": title
+                }),
+            )
+            .await?
+        }
+        Command::SourceAddUrl {
+            project,
+            url,
+            title,
+            collection,
+        } => {
+            rpc(
+                &discovery,
+                "source.add_url",
+                json!({
+                    "project_id": project,
+                    "collection": collection,
+                    "url": url,
+                    "title": title
+                }),
+            )
+            .await?
+        }
+        Command::SourceImport {
+            project,
+            path,
+            max_files,
+            collection,
+        } => {
+            rpc(
+                &discovery,
+                "source.import",
+                json!({
+                    "project_id": project,
+                    "collection": collection,
+                    "path": path,
+                    "max_files": max_files
+                }),
+            )
+            .await?
+        }
+        Command::SourceRefresh { source_id } => {
+            rpc(
+                &discovery,
+                "source.refresh",
+                json!({"source_id": source_id}),
+            )
+            .await?
+        }
+        Command::SourceReindex { source_id } => {
+            rpc(
+                &discovery,
+                "source.reindex",
+                json!({"source_id": source_id}),
+            )
+            .await?
+        }
+        Command::SourceDelete { source_id } => {
+            rpc(&discovery, "source.delete", json!({"source_id": source_id})).await?
+        }
+        Command::SourceUpdate {
+            source_id,
+            title,
+            collection,
+            labels,
+        } => {
+            rpc(
+                &discovery,
+                "source.update",
+                json!({
+                    "source_id": source_id,
+                    "title": title,
+                    "collection": collection,
+                    "labels": labels
+                }),
+            )
+            .await?
+        }
+        Command::SourceCollections { project } => {
+            rpc(
+                &discovery,
+                "source.collections",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::SourceMove {
+            source_id,
+            collection,
+        } => {
+            rpc(
+                &discovery,
+                "source.set_collection",
+                json!({"source_id": source_id, "collection": collection}),
+            )
+            .await?
+        }
+        Command::SourceLabels { source_id, labels } => {
+            rpc(
+                &discovery,
+                "source.set_labels",
+                json!({"source_id": source_id, "labels": labels}),
+            )
+            .await?
+        }
+        Command::SourceSearch {
+            project,
+            query,
+            collections,
+            labels,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "source.search",
+                json!({
+                    "project_id": project,
+                    "query": query,
+                    "collections": collections,
+                    "labels": labels,
+                    "limit": limit
+                }),
             )
             .await?
         }
@@ -2145,6 +2567,22 @@ async fn main() -> Result<()> {
         Command::TeamPlan { session } => {
             rpc(&discovery, "team_plan.get", json!({"session_id": session})).await?
         }
+        Command::CitationAudit { session } => {
+            rpc(
+                &discovery,
+                "session.citation_audit",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Citations { session, message } => {
+            rpc(
+                &discovery,
+                "session.citations",
+                json!({"session_id": session, "message_id": message}),
+            )
+            .await?
+        }
         Command::Transcript { session } => {
             rpc(
                 &discovery,
@@ -2185,6 +2623,40 @@ async fn main() -> Result<()> {
         }
         Command::Artifacts { session } => {
             rpc(&discovery, "artifact.list", json!({"session_id": session})).await?
+        }
+        Command::ArtifactVersions { artifact } => {
+            rpc(
+                &discovery,
+                "artifact.versions",
+                json!({"artifact_id": artifact}),
+            )
+            .await?
+        }
+        Command::ArtifactDiff {
+            artifact,
+            from_version,
+            to_version,
+            context,
+        } => {
+            rpc(
+                &discovery,
+                "artifact.diff",
+                json!({
+                    "artifact_id": artifact,
+                    "from_version": from_version,
+                    "to_version": to_version,
+                    "context": context
+                }),
+            )
+            .await?
+        }
+        Command::ArtifactRestore { artifact, version } => {
+            rpc(
+                &discovery,
+                "artifact.restore",
+                json!({"artifact_id": artifact, "version": version}),
+            )
+            .await?
         }
         Command::Artifact { artifact } => {
             let value = rpc(&discovery, "artifact.get", json!({"artifact_id": artifact})).await?;
@@ -2936,6 +3408,266 @@ fn print_human(value: &Value) {
         if let Some(error) = task["last_error"].as_str() {
             println!("last error: {error}");
         }
+        return;
+    }
+    if let Some(activations) = value.get("activations").and_then(Value::as_array) {
+        if activations.is_empty() {
+            println!("No skill activations.");
+            return;
+        }
+        for activation in activations {
+            println!(
+                "{} v{}  role={} profile={}  {}",
+                activation["name"].as_str().unwrap_or("?"),
+                activation["version"].as_str().unwrap_or(""),
+                activation["role"].as_str().unwrap_or(""),
+                activation["profile"].as_str().unwrap_or(""),
+                activation["activated_at"].as_str().unwrap_or("")
+            );
+            if let Some(allow) = activation["tool_allow"].as_array()
+                && !allow.is_empty()
+            {
+                println!(
+                    "  allow: {}",
+                    allow
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if let Some(deny) = activation["tool_deny"].as_array()
+                && !deny.is_empty()
+            {
+                println!(
+                    "  deny: {}",
+                    deny.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+        return;
+    }
+    if let Some(skills) = value.get("skills").and_then(Value::as_array) {
+        if skills.is_empty() {
+            println!("No skills.");
+            return;
+        }
+        for skill in skills {
+            println!(
+                "{}  {} {}  [{}]  roles={} profiles={}",
+                skill["enabled"].as_bool().unwrap_or(false),
+                skill["name"].as_str().unwrap_or("?"),
+                skill["version"].as_str().unwrap_or(""),
+                skill["source"].as_str().unwrap_or("?"),
+                skill["roles"]
+                    .as_array()
+                    .map(|values| values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default(),
+                skill["profiles"]
+                    .as_array()
+                    .map(|values| values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default(),
+            );
+            println!("  id={}", skill["id"].as_str().unwrap_or("?"));
+            if let Some(allow) = skill["tool_allow"].as_array()
+                && !allow.is_empty()
+            {
+                println!(
+                    "  allow: {}",
+                    allow
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if let Some(deny) = skill["tool_deny"].as_array()
+                && !deny.is_empty()
+            {
+                println!(
+                    "  deny: {}",
+                    deny.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+        return;
+    }
+    if let Some(skill) = value.get("name").and_then(Value::as_str)
+        && value.get("instructions").is_some()
+        && value.get("slug").is_some()
+    {
+        println!(
+            "{} {}  enabled={}  id={}",
+            skill,
+            value["version"].as_str().unwrap_or(""),
+            value["enabled"].as_bool().unwrap_or(false),
+            value["id"].as_str().unwrap_or("?")
+        );
+        return;
+    }
+    if let Some(collections) = value.get("collections").and_then(Value::as_array)
+        && value.get("total_sources").is_some()
+    {
+        println!("{} sources", value["total_sources"].as_u64().unwrap_or(0));
+        for collection in collections {
+            println!(
+                "{:<24} {:>4} sources {:>5} chunks {:>8} bytes {:>8} tokens  labels={}",
+                collection["name"].as_str().unwrap_or("(uncollected)"),
+                collection["sources"].as_u64().unwrap_or(0),
+                collection["chunks"].as_u64().unwrap_or(0),
+                collection["bytes"].as_u64().unwrap_or(0),
+                collection["tokens"].as_u64().unwrap_or(0),
+                collection["labels"]
+                    .as_array()
+                    .map(|values| values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default()
+            );
+        }
+        return;
+    }
+    if let Some(sources) = value.get("sources").and_then(Value::as_array)
+        && value.get("stats").is_some()
+    {
+        let stats = &value["stats"];
+        println!(
+            "{} sources · {} indexed · {} failed · {} chunks · {} bytes · {} tokens",
+            stats["sources"].as_u64().unwrap_or(0),
+            stats["indexed"].as_u64().unwrap_or(0),
+            stats["failed"].as_u64().unwrap_or(0),
+            stats["chunks"].as_u64().unwrap_or(0),
+            stats["bytes"].as_u64().unwrap_or(0),
+            stats["tokens"].as_u64().unwrap_or(0),
+        );
+        for source in sources {
+            println!(
+                "{:<10} {:<8} {:>5} chunks  {}  ({})",
+                source["status"].as_str().unwrap_or("?"),
+                source["kind"].as_str().unwrap_or("?"),
+                source["chunk_count"].as_u64().unwrap_or(0),
+                source["title"].as_str().unwrap_or(""),
+                source["id"].as_str().unwrap_or("?"),
+            );
+        }
+        return;
+    }
+    if let Some(source) = value.get("source")
+        && let Some(chunks) = value.get("chunks").and_then(Value::as_array)
+    {
+        println!(
+            "{} · {} · {} chunks · {}",
+            source["kind"].as_str().unwrap_or("?"),
+            source["status"].as_str().unwrap_or("?"),
+            source["chunk_count"].as_u64().unwrap_or(0),
+            source["title"].as_str().unwrap_or(""),
+        );
+        println!("id={}", source["id"].as_str().unwrap_or("?"));
+        if let Some(uri) = source["uri"].as_str() {
+            println!("uri={uri}");
+        }
+        for chunk in chunks {
+            println!(
+                "\n[{}] {}",
+                chunk["chunk_no"].as_u64().unwrap_or(0),
+                chunk["heading"].as_str().unwrap_or("untitled section")
+            );
+            println!(
+                "{}",
+                chunk["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(1200)
+                    .collect::<String>()
+            );
+        }
+        return;
+    }
+    if let Some(hits) = value.get("hits").and_then(Value::as_array)
+        && value.get("degraded").is_some()
+    {
+        if hits.is_empty() {
+            println!("No source matches.");
+            return;
+        }
+        for hit in hits {
+            println!(
+                "{} chunk {} · {:.2} · {}",
+                hit["source_title"].as_str().unwrap_or("?"),
+                hit["chunk_no"].as_u64().unwrap_or(0),
+                hit["score"].as_f64().unwrap_or(0.0),
+                hit["heading"].as_str().unwrap_or("")
+            );
+            println!(
+                "  {}",
+                hit["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .replace('\n', " ")
+                    .chars()
+                    .take(240)
+                    .collect::<String>()
+            );
+        }
+        if value["degraded"].as_bool() == Some(true) {
+            println!("(lexical fallback)");
+        }
+        return;
+    }
+    if let Some(imported) = value.get("imported").and_then(Value::as_array)
+        && value.get("skipped").is_some()
+    {
+        println!(
+            "imported {} · skipped {} · errors {}",
+            imported.len(),
+            value["skipped"].as_u64().unwrap_or(0),
+            value["errors"].as_array().map(Vec::len).unwrap_or(0)
+        );
+        for source in imported {
+            println!(
+                "  {} ({})",
+                source["title"].as_str().unwrap_or("?"),
+                source["id"].as_str().unwrap_or("?")
+            );
+        }
+        for error in value["errors"].as_array().into_iter().flatten() {
+            println!(
+                "  error {}: {}",
+                error["path"].as_str().unwrap_or("?"),
+                error["error"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if let Some(source) = value.get("title").and_then(Value::as_str)
+        && value.get("chunk_count").is_some()
+        && value.get("sha256").is_some()
+    {
+        println!(
+            "{} · {} · {} chunks · {} · id={}",
+            value["status"].as_str().unwrap_or("?"),
+            source,
+            value["chunk_count"].as_u64().unwrap_or(0),
+            value["kind"].as_str().unwrap_or("?"),
+            value["id"].as_str().unwrap_or("?")
+        );
         return;
     }
     if let Some(matches) = value.get("matches").and_then(Value::as_array)
@@ -3824,6 +4556,145 @@ fn print_human(value: &Value) {
                 artifact["name"].as_str().unwrap_or("?"),
                 artifact["kind"].as_str().unwrap_or("?"),
                 artifact["agent_name"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if let Some(audit) = value.get("audit")
+        && audit.get("messages_with_citations").is_some()
+    {
+        println!(
+            "{} messages with citations · {} without · {} citations · {} sources · dangling {} · unused {}",
+            audit["messages_with_citations"].as_u64().unwrap_or(0),
+            audit["messages_without_citations"].as_u64().unwrap_or(0),
+            audit["total_citations"].as_u64().unwrap_or(0),
+            audit["unique_sources"].as_u64().unwrap_or(0),
+            audit["dangling_key_count"].as_u64().unwrap_or(0),
+            audit["unused_citation_count"].as_u64().unwrap_or(0),
+        );
+        for message in audit["messages"].as_array().into_iter().flatten() {
+            let dangling = message["dangling_keys"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0);
+            let unused = message["unused_keys"].as_array().map(Vec::len).unwrap_or(0);
+            if dangling == 0 && unused == 0 {
+                continue;
+            }
+            println!(
+                "  {} · citations {} · dangling {} · unused {}",
+                message["message_id"].as_str().unwrap_or("?"),
+                message["citation_count"].as_u64().unwrap_or(0),
+                message["dangling_keys"]
+                    .as_array()
+                    .map(|values| values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default(),
+                message["unused_keys"]
+                    .as_array()
+                    .map(|values| values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default()
+            );
+            println!(
+                "    {}",
+                message["excerpt"]
+                    .as_str()
+                    .unwrap_or("")
+                    .replace('\n', " ")
+                    .chars()
+                    .take(180)
+                    .collect::<String>()
+            );
+        }
+        return;
+    }
+    if let Some(citations) = value.get("citations").and_then(Value::as_array)
+        && citations.iter().all(|item| item.get("citation").is_some())
+    {
+        if citations.is_empty() {
+            println!("No citations.");
+            return;
+        }
+        for item in citations {
+            let citation = &item["citation"];
+            println!(
+                "[{}] {} · {} · chunk {} · {}",
+                citation["key"].as_str().unwrap_or("?"),
+                citation["source_title"].as_str().unwrap_or("?"),
+                citation["heading"].as_str().unwrap_or(""),
+                citation["chunk_no"].as_u64().unwrap_or(0),
+                item["message_id"].as_str().unwrap_or("?"),
+            );
+            println!("  {}", citation["excerpt"].as_str().unwrap_or(""));
+        }
+        return;
+    }
+    if let Some(diff) = value.get("diff") {
+        println!(
+            "{}  v{} -> v{}  +{} -{} unchanged {}",
+            value["name"].as_str().unwrap_or("?"),
+            value["from_version"].as_u64().unwrap_or(0),
+            value["to_version"].as_u64().unwrap_or(0),
+            diff["additions"].as_u64().unwrap_or(0),
+            diff["deletions"].as_u64().unwrap_or(0),
+            diff["unchanged"].as_u64().unwrap_or(0),
+        );
+        if diff["identical"].as_bool() == Some(true) {
+            println!("identical");
+            return;
+        }
+        for hunk in diff["hunks"].as_array().into_iter().flatten() {
+            println!(
+                "@@ -{},{} +{},{} @@",
+                hunk["old_start"].as_u64().unwrap_or(0),
+                hunk["old_lines"].as_u64().unwrap_or(0),
+                hunk["new_start"].as_u64().unwrap_or(0),
+                hunk["new_lines"].as_u64().unwrap_or(0)
+            );
+            for line in hunk["lines"].as_array().into_iter().flatten() {
+                let prefix = match line["kind"].as_str() {
+                    Some("add") => '+',
+                    Some("delete") => '-',
+                    _ => ' ',
+                };
+                let old = line["old_line"]
+                    .as_u64()
+                    .map(|value| format!("{value:>4}"))
+                    .unwrap_or_else(|| "    ".to_string());
+                let new = line["new_line"]
+                    .as_u64()
+                    .map(|value| format!("{value:>4}"))
+                    .unwrap_or_else(|| "    ".to_string());
+                println!(
+                    "{old} {new} {prefix} {}",
+                    line["text"].as_str().unwrap_or("")
+                );
+            }
+        }
+        if diff["truncated"].as_bool() == Some(true) {
+            println!("(diff truncated by the line/edit budget)");
+        }
+        return;
+    }
+    if let Some(versions) = value.get("versions").and_then(Value::as_array) {
+        if versions.is_empty() {
+            println!("No saved versions.");
+            return;
+        }
+        for version in versions {
+            println!(
+                "v{}  {}  {} bytes  {}",
+                version["version"].as_u64().unwrap_or(0),
+                version["name"].as_str().unwrap_or("?"),
+                version["size_bytes"].as_u64().unwrap_or(0),
+                version["created_at"].as_str().unwrap_or("?")
             );
         }
         return;

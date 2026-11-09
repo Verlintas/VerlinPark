@@ -48,6 +48,44 @@ final class TranscriptAndCollabTests: XCTestCase {
         XCTAssertEqual(tool.id, "tool-tool-1")
     }
 
+    func testTranscriptAttachesSourceCitationsToAssistantMessages() {
+        let events = [
+            event(
+                1,
+                "agent.message",
+                [
+                    "text": .string("The scheduler uses leases [c1]."),
+                    "message_id": .string("message-1"),
+                    "citations": .array([
+                        .object([
+                            "key": .string("c1"),
+                            "source_id": .string("source-1"),
+                            "source_title": .string("Scheduler notes"),
+                            "chunk_id": .string("chunk-1"),
+                            "chunk_no": .number(2),
+                            "heading": .string("Leases"),
+                            "excerpt": .string("deterministic leases"),
+                            "score": .number(1.5),
+                            "origin": .string("search"),
+                        ]),
+                    ]),
+                ],
+                at: "2026-11-10T10:00:00.000Z"
+            ),
+        ]
+        let entries = TranscriptProjection.build(events: events)
+        XCTAssertEqual(entries.count, 1)
+        guard case let .assistant(_, text, _, citations) = entries[0] else {
+            return XCTFail("expected an assistant entry")
+        }
+        XCTAssertEqual(text, "The scheduler uses leases [c1].")
+        XCTAssertEqual(citations.count, 1)
+        XCTAssertEqual(citations[0].key, "c1")
+        XCTAssertEqual(citations[0].sourceTitle, "Scheduler notes")
+        XCTAssertEqual(citations[0].chunkNo, 2)
+        XCTAssertEqual(citations[0].origin, "search")
+    }
+
     func testTranscriptResolvesApprovalAndKeepsRiskReason() {
         let payload: [String: JSONValue] = [
             "id": .string("approval-1"),

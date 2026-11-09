@@ -417,6 +417,471 @@ pub struct GitShowResult {
     pub truncated: bool,
 }
 
+/// Project-scoped knowledge source. The source body lives in a private JSON
+/// snapshot on disk; SQLite carries the queryable metadata and chunk index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Skill {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub slug: String,
+    pub description: String,
+    #[serde(default)]
+    pub when_to_use: String,
+    #[serde(default = "default_skill_version")]
+    pub version: String,
+    pub instructions: String,
+    #[serde(default)]
+    pub tool_allow: Vec<String>,
+    #[serde(default)]
+    pub tool_deny: Vec<String>,
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    pub source: String,
+    pub sha256: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn default_skill_version() -> String {
+    "1.0.0".to_string()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SkillListParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub include_disabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillListResult {
+    pub skills: Vec<Skill>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillCreateParams {
+    pub project_id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub when_to_use: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    pub instructions: String,
+    #[serde(default)]
+    pub tool_allow: Vec<String>,
+    #[serde(default)]
+    pub tool_deny: Vec<String>,
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillImportParams {
+    pub project_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillUpdateParams {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub when_to_use: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    pub instructions: String,
+    #[serde(default)]
+    pub tool_allow: Vec<String>,
+    #[serde(default)]
+    pub tool_deny: Vec<String>,
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillIdParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillEnabledParams {
+    pub id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillDeleteResult {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillActivation {
+    pub name: String,
+    pub slug: String,
+    pub version: String,
+    pub role: String,
+    pub profile: String,
+    #[serde(default)]
+    pub tool_allow: Vec<String>,
+    #[serde(default)]
+    pub tool_deny: Vec<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    pub activated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionSkillActivationsParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSkillActivationsResult {
+    pub activations: Vec<SkillActivation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Source {
+    pub id: String,
+    pub project_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    pub sha256: String,
+    #[serde(default = "default_source_revision")]
+    pub revision: u32,
+    #[serde(default)]
+    pub chunk_count: usize,
+    #[serde(default)]
+    pub char_count: usize,
+    #[serde(default)]
+    pub token_count: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub indexed_at: Option<String>,
+}
+
+fn default_source_revision() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceCollection {
+    /// `None` groups sources that have no collection assigned.
+    #[serde(default)]
+    pub name: Option<String>,
+    pub sources: usize,
+    pub chunks: usize,
+    pub bytes: u64,
+    pub tokens: u64,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SourceCollectionsParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCollectionsResult {
+    pub collections: Vec<SourceCollection>,
+    pub total_sources: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateSourceMetadataParams {
+    pub source_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSourceCollectionParams {
+    pub source_id: String,
+    /// An empty string or null clears the collection.
+    #[serde(default)]
+    pub collection: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSourceLabelsParams {
+    pub source_id: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceChunk {
+    pub id: String,
+    pub source_id: String,
+    pub chunk_no: u32,
+    #[serde(default)]
+    pub heading: Option<String>,
+    pub content: String,
+    #[serde(default)]
+    pub start_offset: usize,
+    #[serde(default)]
+    pub end_offset: usize,
+    #[serde(default)]
+    pub token_count: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SourceListParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceStats {
+    pub sources: usize,
+    pub indexed: usize,
+    pub failed: usize,
+    pub chunks: usize,
+    pub bytes: u64,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceListResult {
+    pub sources: Vec<Source>,
+    pub stats: SourceStats,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceGetParams {
+    pub source_id: String,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceGetResult {
+    pub source: Source,
+    pub chunks: Vec<SourceChunk>,
+    pub total_chunks: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceCreateNoteParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceCreateFileParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    pub path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceCreateUrlParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    pub url: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceImportParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub max_files: Option<u32>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceImportError {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceImportResult {
+    pub imported: Vec<Source>,
+    pub skipped: usize,
+    pub errors: Vec<SourceImportError>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceActionParams {
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDeleteResult {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceReindexResult {
+    pub source: Source,
+    pub chunks: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceSearchParams {
+    pub project_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub source_ids: Vec<String>,
+    #[serde(default)]
+    pub collections: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceSearchHit {
+    pub source_id: String,
+    pub source_title: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub chunk_id: String,
+    pub chunk_no: u32,
+    #[serde(default)]
+    pub heading: Option<String>,
+    pub content: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceSearchResult {
+    pub hits: Vec<SourceSearchHit>,
+    pub degraded: bool,
+}
+
+/// Citation evidence attached to an assistant message. The excerpt is a
+/// snapshot so a deleted or refreshed source does not erase the audit trail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceCitation {
+    pub key: String,
+    pub source_id: String,
+    pub source_title: String,
+    pub chunk_id: String,
+    pub chunk_no: u32,
+    #[serde(default)]
+    pub heading: Option<String>,
+    pub excerpt: String,
+    pub score: f64,
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageCitation {
+    pub message_id: String,
+    pub citation: SourceCitation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CitationAuditMessage {
+    pub message_id: String,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    pub excerpt: String,
+    pub citation_count: usize,
+    pub referenced_keys: Vec<String>,
+    pub dangling_keys: Vec<String>,
+    pub unused_keys: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CitationAudit {
+    pub messages: Vec<CitationAuditMessage>,
+    pub messages_with_citations: usize,
+    pub messages_without_citations: usize,
+    pub total_citations: usize,
+    pub unique_sources: usize,
+    pub dangling_key_count: usize,
+    pub unused_citation_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCitationAuditParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCitationAuditResult {
+    pub audit: CitationAudit,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCitationsParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCitationsResult {
+    pub citations: Vec<MessageCitation>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkspaceTreeParams {
     pub session_id: String,
@@ -1301,7 +1766,99 @@ pub struct Artifact {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_base64: Option<String>,
+    #[serde(default = "default_artifact_version")]
+    pub version: u32,
     pub created_at: String,
+}
+
+fn default_artifact_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArtifactVersion {
+    pub artifact_id: String,
+    pub version: u32,
+    pub name: String,
+    pub kind: String,
+    pub mime_type: String,
+    #[serde(default)]
+    pub content: String,
+    pub storage: String,
+    pub compression: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactVersionsParams {
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactVersionsResult {
+    pub versions: Vec<ArtifactVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TextDiffLine {
+    /// `context`, `add`, or `delete`.
+    pub kind: String,
+    #[serde(default)]
+    pub old_line: Option<u32>,
+    #[serde(default)]
+    pub new_line: Option<u32>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TextDiffHunk {
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub lines: Vec<TextDiffLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TextDiff {
+    pub hunks: Vec<TextDiffHunk>,
+    pub additions: u32,
+    pub deletions: u32,
+    pub unchanged: u32,
+    pub identical: bool,
+    /// True when the line budget or edit-distance cap forced a bounded result.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactDiffParams {
+    pub artifact_id: String,
+    pub from_version: u32,
+    /// `None` compares against the current artifact.
+    #[serde(default)]
+    pub to_version: Option<u32>,
+    /// Context lines around each change; clamped by the engine.
+    #[serde(default)]
+    pub context: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactDiffResult {
+    pub artifact_id: String,
+    pub name: String,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub diff: TextDiff,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactRestoreParams {
+    pub artifact_id: String,
+    pub version: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

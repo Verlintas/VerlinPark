@@ -68,6 +68,11 @@ private struct ProjectStageView: View {
             VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
             value: model.selectedSessionID
         )
+        .task(id: model.selectedProjectID) {
+            if model.selectedProjectID != nil {
+                await model.loadSkills(silent: true)
+            }
+        }
         .sheet(isPresented: $showingFork) {
             if let session = model.selectedSession {
                 ForkSessionSheet(session: session)
@@ -374,6 +379,33 @@ private struct ProjectStageView: View {
     private var composer: some View {
         VStack(spacing: 8) {
             HStack(alignment: .bottom, spacing: 10) {
+                if !enabledSkills.isEmpty {
+                    Menu {
+                        ForEach(enabledSkills) { skill in
+                            Button {
+                                insertSkill(skill)
+                            } label: {
+                                Label(
+                                    "\(skill.name) · \(skill.description)",
+                                    systemImage: "wand.and.stars"
+                                )
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "wand.and.stars")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(VPTheme.accent)
+                            .frame(width: 24, height: 24)
+                            .background(VPTheme.surfaceSunken, in: Circle())
+                            .overlay {
+                                Circle().strokeBorder(VPTheme.hairline, lineWidth: 1)
+                            }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help(L10n.t("Insert a project skill prompt"))
+                }
                 Button {
                     showingNewSession = true
                 } label: {
@@ -494,6 +526,20 @@ private struct ProjectStageView: View {
         let status = model.selectedSession?.status
         let running = status == "running" || status == "paused" || status == "queued"
         return textEmpty || model.isBusy || model.compactBusy || running
+    }
+
+    private var enabledSkills: [ProjectSkill] {
+        model.skills.filter(\.enabled)
+    }
+
+    private func insertSkill(_ skill: ProjectSkill) {
+        let instruction = "Use the \"\(skill.name)\" skill. \(skill.description)\n\n"
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            draft = instruction
+        } else {
+            draft = instruction + draft
+        }
+        composerFocused = true
     }
 
     private func send() {
@@ -772,6 +818,7 @@ struct SessionChatView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let session: Session
     @State private var transcript: [TranscriptEntry] = []
+    @State private var activeCitation: SourceCitation?
 
     private var entries: [TranscriptEntry] {
         transcript
@@ -855,6 +902,10 @@ struct SessionChatView: View {
                 transcript = TranscriptProjection.build(events: events)
             }
         }
+        .sheet(item: $activeCitation) { citation in
+            SourceCitationSheet(citation: citation)
+                .environment(model)
+        }
     }
 
     private var transcriptHeader: some View {
@@ -920,8 +971,8 @@ struct SessionChatView: View {
                             .strokeBorder(VPTheme.accent.opacity(0.18), lineWidth: 1)
                     }
             }
-        case let .assistant(_, text, agent):
-            assistantBubble(text, agent: agent)
+        case let .assistant(_, text, agent, citations):
+            assistantBubble(text, agent: agent, citations: citations)
         case let .tool(entry):
             ToolTraceRow(entry: entry)
         case let .question(id):
@@ -974,7 +1025,8 @@ struct SessionChatView: View {
     private func assistantBubble(
         _ text: String,
         agent: String? = nil,
-        streaming: Bool = false
+        streaming: Bool = false,
+        citations: [SourceCitation] = []
     ) -> some View {
         let role = role(for: agent)
         return HStack(alignment: .top, spacing: 10) {
@@ -999,11 +1051,23 @@ struct SessionChatView: View {
                 }
 
                 HStack(alignment: .bottom, spacing: 3) {
-                    Text(text)
+                    Text(citationAttributedText(text, citations: citations))
                         .font(VPTheme.font(12.5))
                         .foregroundStyle(VPTheme.textPrimary)
                         .lineSpacing(3)
+                        .tint(VPTheme.accent)
                         .textSelection(.enabled)
+                        .environment(\.openURL, OpenURLAction { url in
+                            guard url.scheme == "verlinpark",
+                                  url.host == "citation"
+                            else { return .systemAction }
+                            let key = url.lastPathComponent
+                            if let citation = citations.first(where: { $0.key == key }) {
+                                activeCitation = citation
+                                return .handled
+                            }
+                            return .systemAction
+                        })
                     if streaming {
                         VPStreamingCaret(tint: VPTheme.accent)
                     }
@@ -1022,10 +1086,92 @@ struct SessionChatView: View {
                         )
                 }
                 .animation(VPMotion.hover, value: streaming)
+
+                if !citations.isEmpty {
+                    citationStrip(citations)
+                }
             }
 
             Spacer(minLength: 40)
         }
+    }
+
+    private func citationAttributedText(
+        _ text: String,
+        citations: [SourceCitation]
+    ) -> AttributedString {
+        guard !citations.isEmpty else { return AttributedString(text) }
+        let keys = Set(citations.map(\.key))
+        let regex = try? NSRegularExpression(pattern: "\\[(c\\d+)\\]")
+        guard let regex else { return AttributedString(text) }
+        var result = AttributedString()
+        var cursor = text.startIndex
+        let fullRange = NSRange(text.startIndex..., in: text)
+        for match in regex.matches(in: text, range: fullRange) {
+            guard let range = Range(match.range, in: text),
+                  let keyRange = Range(match.range(at: 1), in: text)
+            else { continue }
+            result += AttributedString(String(text[cursor ..< range.lowerBound]))
+            let key = String(text[keyRange])
+            if keys.contains(key) {
+                var marker = AttributedString("[\(key)]")
+                marker.link = URL(string: "verlinpark://citation/\(key)")
+                marker.foregroundColor = VPTheme.accent
+                marker.font = VPTheme.mono(9.5, weight: .semibold)
+                result += marker
+            } else {
+                result += AttributedString(String(text[range]))
+            }
+            cursor = range.upperBound
+        }
+        if cursor < text.endIndex {
+            result += AttributedString(String(text[cursor...]))
+        }
+        return result
+    }
+
+    private func citationStrip(_ citations: [SourceCitation]) -> some View {
+        HStack(spacing: 5) {
+            Text("SOURCES")
+                .font(VPTheme.mono(6.5, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(VPTheme.textTertiary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(citations) { citation in
+                        Button {
+                            activeCitation = citation
+                        } label: {
+                            HStack(spacing: 3) {
+                                Text("[\(citation.key)]")
+                                    .font(VPTheme.mono(7, weight: .semibold))
+                                    .foregroundStyle(VPTheme.accent)
+                                Text(citation.sourceTitle)
+                                    .font(VPTheme.mono(7))
+                                    .foregroundStyle(VPTheme.textSecondary)
+                                    .lineLimit(1)
+                                if let heading = citation.heading, !heading.isEmpty {
+                                    Text("· \(heading)")
+                                        .font(VPTheme.mono(7))
+                                        .foregroundStyle(VPTheme.textTertiary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(VPTheme.surface.opacity(0.55), in: Capsule())
+                            .overlay {
+                                Capsule().strokeBorder(VPTheme.hairline, lineWidth: 1)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help(citation.excerpt)
+                    }
+                }
+            }
+        }
+        .padding(.leading, 2)
+        .padding(.top, 1)
     }
 
     private func role(for agent: String?) -> String {
@@ -1043,6 +1189,54 @@ struct SessionChatView: View {
             return "labour"
         }
         return "leader"
+    }
+}
+
+private struct SourceCitationSheet: View {
+    let citation: SourceCitation
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text("[\(citation.key)]")
+                    .font(VPTheme.mono(11, weight: .bold))
+                    .foregroundStyle(VPTheme.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(citation.sourceTitle)
+                        .font(VPTheme.font(14, weight: .semibold))
+                        .foregroundStyle(VPTheme.textPrimary)
+                    Text(
+                        "\(citation.heading ?? L10n.t("Untitled section")) · chunk \(citation.chunkNo)"
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textSecondary)
+                }
+                Spacer()
+                VPCloseButton(size: 24, help: L10n.t("Close")) { dismiss() }
+            }
+            Text(citation.excerpt)
+                .font(VPTheme.mono(9))
+                .foregroundStyle(VPTheme.textPrimary)
+                .lineSpacing(2)
+                .textSelection(.enabled)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(VPTheme.surfaceSunken, in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                }
+            HStack(spacing: 8) {
+                Text("origin: \(citation.origin) · score \(String(format: "%.2f", citation.score))")
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                Spacer()
+            }
+        }
+        .padding(20)
+        .frame(width: 500)
+        .background { VPCrystalBackdrop() }
     }
 }
 

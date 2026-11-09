@@ -93,6 +93,19 @@
 - **边界不变**：跨 daemon 的 fencing/merge ownership 仍未实现；intake retry 会新建 session；依赖失败不会自动级联；intake 是项目级 SQLite 状态，派发后才把审计事件写入链接 session。
 - **Preview 文件面**：`workspace.list` 单目录懒加载、`workspace.grep` bounded literal search、行号编辑器与更大关闭按钮；见 ADR-0128。内容搜索不是索引/正则，仍有 2 MiB/file 与 1,000 match 上限。
 
+### 0.5 2026-11-10 Knowledge sources, skills, artifact versions, collections, diff, citation audit
+
+- **新增而非 P0 修复**：项目知识源（note/file/URL/import）、确定性 chunking、FTS5+LIKE fallback、只读 `search_sources`/`read_source`/`list_sources`、run-scoped citations + `agent.message` 持久化 + `session.citations`；source snapshot 进入 `db-rebuild`，refresh 递增 revision 并重新索引。
+- **已知边界**：检索是词法而非 embedding，CJK/短查询依赖 LIKE fallback；PDF/OCR/音频/connector 未实现；refresh 覆盖当前 chunk，旧 citation excerpt 保留但旧完整 chunk 不保留；模型仍可能不写 `[cN]`，source strip 与 `session.citations` 提供审计兜底。
+- **skill packs**：`SKILL.md` import、project manifest/rebuild、role/profile catalog、`use_skill`、allow/deny 只收窄且 schema + execution 双重检查。Skill 是用户批准的 prompt/policy 数据，不是恶意作者的安全边界；一次只激活一个 skill。
+- **artifact versions**：inline artifact 版本/restore、`expected_version`、session request-key idempotency。文件 artifact 仍不可变；`artifact_versions` 是本地查询投影，bundle/db-rebuild 通过事件恢复当前 artifact，不保证恢复全部历史版本；request-key 在跨进程竞争下可能留下 orphan row，但 winner 稳定。
+- **collections/scoped retrieval**：source collection 与 labels 是组织/过滤标签，不是授权边界；`source.update` 同步 metadata snapshot，`source.search`/`search_sources` 对 FTS 与 literal fallback 使用同一过滤；CJK/mixed-script 查询融合两路结果。
+- **bounded diff**：`artifact.diff` 只支持 inline text；Myers edit cap 512，超限回退为 delete-all/insert-all 并标记 `truncated`；文件 artifact 仍不可 diff。diff 是行级文本比较，不是语义 AST diff。
+- **citation audit**：`session.citation_audit` 从事件派生 dangling/unused key 与 cited/uncited message；它不验证句子是否被引用内容支持，也不阻止模型写出无依据的陈述。
+- **skill usage**：成功的 `use_skill` 写 `skill.activated` 事件并由 `skill.activations` 派生；激活是 run-scoped，事件历史不表示 skill 永久生效。
+- **context limit**：修复 system/tool token 的双重扣减；手动压缩摘要失败时 trim 到 hard limit 一半。启发式估算、provider calibration 与用户配置的 context window 仍可能导致过早压缩或 provider overflow。
+- **测试/文档**：ADR-0129/0130/0131/0132；Rust/Swift 回归覆盖 source/skill/citation/artifact version/collection/diff/audit；当前 Rust 415（core 330 / protocol 2 / store 69 / providers 14，3 ignored live），Swift 110。
+
 ---
 
 ## 1. 总体判断

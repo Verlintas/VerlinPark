@@ -1104,6 +1104,7 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
     let sizeBytes: Int
     let sha256: String
     let path: String?
+    let version: Int
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -1121,8 +1122,67 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
         case sizeBytes = "size_bytes"
         case sha256
         case path
+        case version
         case createdAt = "created_at"
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        agentId = try container.decode(String.self, forKey: .agentId)
+        agentName = try container.decode(String.self, forKey: .agentName)
+        taskId = try container.decodeIfPresent(String.self, forKey: .taskId)
+        name = try container.decode(String.self, forKey: .name)
+        kind = try container.decode(String.self, forKey: .kind)
+        mimeType = try container.decode(String.self, forKey: .mimeType)
+        content = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
+        storage = try container.decodeIfPresent(String.self, forKey: .storage) ?? "inline"
+        compression = try container.decodeIfPresent(String.self, forKey: .compression)
+        sizeBytes = try container.decodeIfPresent(Int.self, forKey: .sizeBytes) ?? 0
+        sha256 = try container.decodeIfPresent(String.self, forKey: .sha256) ?? ""
+        path = try container.decodeIfPresent(String.self, forKey: .path)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+    }
+}
+
+struct ArtifactVersion: Codable, Identifiable, Hashable, Sendable {
+    let artifactId: String
+    let version: Int
+    let name: String
+    let kind: String
+    let mimeType: String
+    let content: String
+    let storage: String
+    let compression: String
+    let sizeBytes: Int
+    let sha256: String
+    let path: String?
+    let createdAt: String
+
+    var id: Int {
+        version
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case artifactId = "artifact_id"
+        case version
+        case name
+        case kind
+        case mimeType = "mime_type"
+        case content
+        case storage
+        case compression
+        case sizeBytes = "size_bytes"
+        case sha256
+        case path
+        case createdAt = "created_at"
+    }
+}
+
+struct ArtifactVersionsResult: Codable, Sendable {
+    let versions: [ArtifactVersion]
 }
 
 struct MailboxListResult: Codable, Sendable {
@@ -2726,4 +2786,503 @@ struct WorkspaceGrepResult: Codable, Sendable {
         case filesScanned = "files_scanned"
         case truncated
     }
+}
+
+struct ProjectSource: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectID: String
+    let kind: String
+    let collection: String?
+    let title: String
+    let uri: String?
+    let mimeType: String?
+    let status: String
+    let sizeBytes: UInt64
+    let sha256: String
+    let revision: UInt32
+    let chunkCount: Int
+    let charCount: Int
+    let tokenCount: UInt64
+    let error: String?
+    let labels: [String]
+    let createdAt: String
+    let updatedAt: String
+    let indexedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectID = "project_id"
+        case kind
+        case collection
+        case title
+        case uri
+        case mimeType = "mime_type"
+        case status
+        case sizeBytes = "size_bytes"
+        case sha256
+        case revision
+        case chunkCount = "chunk_count"
+        case charCount = "char_count"
+        case tokenCount = "token_count"
+        case error
+        case labels
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case indexedAt = "indexed_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "file"
+        collection = try container.decodeIfPresent(String.self, forKey: .collection)
+        title = try container.decode(String.self, forKey: .title)
+        uri = try container.decodeIfPresent(String.self, forKey: .uri)
+        mimeType = try container.decodeIfPresent(String.self, forKey: .mimeType)
+        status = try container.decodeIfPresent(String.self, forKey: .status) ?? "indexed"
+        sizeBytes = try container.decodeIfPresent(UInt64.self, forKey: .sizeBytes) ?? 0
+        sha256 = try container.decodeIfPresent(String.self, forKey: .sha256) ?? ""
+        revision = try container.decodeIfPresent(UInt32.self, forKey: .revision) ?? 1
+        chunkCount = try container.decodeIfPresent(Int.self, forKey: .chunkCount) ?? 0
+        charCount = try container.decodeIfPresent(Int.self, forKey: .charCount) ?? 0
+        tokenCount = try container.decodeIfPresent(UInt64.self, forKey: .tokenCount) ?? 0
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        labels = try container.decodeIfPresent([String].self, forKey: .labels) ?? []
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt) ?? ""
+        indexedAt = try container.decodeIfPresent(String.self, forKey: .indexedAt)
+    }
+}
+
+struct SourceChunk: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sourceID: String
+    let chunkNo: UInt32
+    let heading: String?
+    let content: String
+    let startOffset: Int
+    let endOffset: Int
+    let tokenCount: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sourceID = "source_id"
+        case chunkNo = "chunk_no"
+        case heading
+        case content
+        case startOffset = "start_offset"
+        case endOffset = "end_offset"
+        case tokenCount = "token_count"
+    }
+}
+
+struct SourceStats: Codable, Hashable, Sendable {
+    let sources: Int
+    let indexed: Int
+    let failed: Int
+    let chunks: Int
+    let bytes: UInt64
+    let tokens: UInt64
+}
+
+struct SourceListResult: Codable, Sendable {
+    let sources: [ProjectSource]
+    let stats: SourceStats
+}
+
+struct SourceGetResult: Codable, Sendable {
+    let source: ProjectSource
+    let chunks: [SourceChunk]
+    let totalChunks: Int
+
+    enum CodingKeys: String, CodingKey {
+        case source
+        case chunks
+        case totalChunks = "total_chunks"
+    }
+}
+
+struct SourceImportError: Codable, Hashable, Sendable {
+    let path: String
+    let error: String
+}
+
+struct SourceImportResult: Codable, Sendable {
+    let imported: [ProjectSource]
+    let skipped: Int
+    let errors: [SourceImportError]
+}
+
+struct SourceSearchHit: Codable, Identifiable, Hashable, Sendable {
+    let sourceID: String
+    let sourceTitle: String
+    let collection: String?
+    let labels: [String]
+    let chunkID: String
+    let chunkNo: UInt32
+    let heading: String?
+    let content: String
+    let score: Double
+
+    var id: String {
+        chunkID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sourceID = "source_id"
+        case sourceTitle = "source_title"
+        case collection
+        case labels
+        case chunkID = "chunk_id"
+        case chunkNo = "chunk_no"
+        case heading
+        case content
+        case score
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sourceID = try container.decode(String.self, forKey: .sourceID)
+        sourceTitle = try container.decode(String.self, forKey: .sourceTitle)
+        collection = try container.decodeIfPresent(String.self, forKey: .collection)
+        labels = try container.decodeIfPresent([String].self, forKey: .labels) ?? []
+        chunkID = try container.decode(String.self, forKey: .chunkID)
+        chunkNo = try container.decode(UInt32.self, forKey: .chunkNo)
+        heading = try container.decodeIfPresent(String.self, forKey: .heading)
+        content = try container.decode(String.self, forKey: .content)
+        score = try container.decode(Double.self, forKey: .score)
+    }
+}
+
+struct SourceSearchResult: Codable, Sendable {
+    let hits: [SourceSearchHit]
+    let degraded: Bool
+}
+
+struct SourceCitation: Codable, Identifiable, Hashable, Sendable {
+    let key: String
+    let sourceID: String
+    let sourceTitle: String
+    let chunkID: String
+    let chunkNo: UInt32
+    let heading: String?
+    let excerpt: String
+    let score: Double
+    let origin: String
+
+    var id: String {
+        key
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case sourceID = "source_id"
+        case sourceTitle = "source_title"
+        case chunkID = "chunk_id"
+        case chunkNo = "chunk_no"
+        case heading
+        case excerpt
+        case score
+        case origin
+    }
+}
+
+struct SourceDeleteResult: Codable, Sendable {
+    let deleted: Bool
+}
+
+struct SourceReindexResult: Codable, Sendable {
+    let source: ProjectSource
+    let chunks: Int
+}
+
+struct ProjectSkill: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectID: String
+    let name: String
+    let slug: String
+    let description: String
+    let whenToUse: String
+    let version: String
+    let instructions: String
+    let toolAllow: [String]
+    let toolDeny: [String]
+    let profiles: [String]
+    let roles: [String]
+    let enabled: Bool
+    let source: String
+    let sha256: String
+    let createdAt: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectID = "project_id"
+        case name
+        case slug
+        case description
+        case whenToUse = "when_to_use"
+        case version
+        case instructions
+        case toolAllow = "tool_allow"
+        case toolDeny = "tool_deny"
+        case profiles
+        case roles
+        case enabled
+        case source
+        case sha256
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        name = try container.decode(String.self, forKey: .name)
+        slug = try container.decodeIfPresent(String.self, forKey: .slug) ?? ""
+        description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
+        whenToUse = try container.decodeIfPresent(String.self, forKey: .whenToUse) ?? ""
+        version = try container.decodeIfPresent(String.self, forKey: .version) ?? "1.0.0"
+        instructions = try container.decodeIfPresent(String.self, forKey: .instructions) ?? ""
+        toolAllow = try container.decodeIfPresent([String].self, forKey: .toolAllow) ?? []
+        toolDeny = try container.decodeIfPresent([String].self, forKey: .toolDeny) ?? []
+        profiles = try container.decodeIfPresent([String].self, forKey: .profiles) ?? []
+        roles = try container.decodeIfPresent([String].self, forKey: .roles) ?? []
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        source = try container.decodeIfPresent(String.self, forKey: .source) ?? "user"
+        sha256 = try container.decodeIfPresent(String.self, forKey: .sha256) ?? ""
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt) ?? ""
+    }
+}
+
+struct SkillListResult: Codable, Sendable {
+    let skills: [ProjectSkill]
+}
+
+struct SkillDeleteResult: Codable, Sendable {
+    let deleted: Bool
+}
+
+struct MessageCitation: Codable, Identifiable, Hashable, Sendable {
+    let messageID: String
+    let citation: SourceCitation
+
+    var id: String {
+        "\(messageID)-\(citation.key)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case messageID = "message_id"
+        case citation
+    }
+}
+
+struct SessionCitationsResult: Codable, Sendable {
+    let citations: [MessageCitation]
+}
+
+struct SourceCollection: Codable, Identifiable, Hashable, Sendable {
+    let name: String?
+    let sources: Int
+    let chunks: Int
+    let bytes: UInt64
+    let tokens: UInt64
+    let labels: [String]
+
+    var id: String {
+        name ?? ""
+    }
+
+    var displayName: String {
+        name ?? L10n.t("Uncollected")
+    }
+}
+
+struct SourceCollectionsResult: Codable, Sendable {
+    let collections: [SourceCollection]
+    let totalSources: Int
+
+    enum CodingKeys: String, CodingKey {
+        case collections
+        case totalSources = "total_sources"
+    }
+}
+
+struct TextDiffLine: Codable, Identifiable, Hashable, Sendable {
+    let kind: String
+    let oldLine: Int?
+    let newLine: Int?
+    let text: String
+
+    var id: String {
+        "\(oldLine ?? 0)-\(newLine ?? 0)-\(kind)-\(text)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case oldLine = "old_line"
+        case newLine = "new_line"
+        case text
+    }
+}
+
+struct TextDiffHunk: Codable, Identifiable, Hashable, Sendable {
+    let oldStart: Int
+    let oldLines: Int
+    let newStart: Int
+    let newLines: Int
+    let lines: [TextDiffLine]
+
+    var id: String {
+        "\(oldStart)-\(oldLines)-\(newStart)-\(newLines)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case oldStart = "old_start"
+        case oldLines = "old_lines"
+        case newStart = "new_start"
+        case newLines = "new_lines"
+        case lines
+    }
+}
+
+struct TextDiff: Codable, Hashable, Sendable {
+    let hunks: [TextDiffHunk]
+    let additions: Int
+    let deletions: Int
+    let unchanged: Int
+    let identical: Bool
+    let truncated: Bool
+}
+
+struct ArtifactDiffResult: Codable, Sendable {
+    let artifactID: String
+    let name: String
+    let fromVersion: Int
+    let toVersion: Int
+    let diff: TextDiff
+
+    enum CodingKeys: String, CodingKey {
+        case artifactID = "artifact_id"
+        case name
+        case fromVersion = "from_version"
+        case toVersion = "to_version"
+        case diff
+    }
+}
+
+struct SkillActivation: Codable, Identifiable, Hashable, Sendable {
+    let name: String
+    let slug: String
+    let version: String
+    let role: String
+    let profile: String
+    let toolAllow: [String]
+    let toolDeny: [String]
+    let agentID: String?
+    let agentName: String?
+    let taskID: String?
+    let activatedAt: String
+
+    var id: String {
+        "\(name)-\(activatedAt)-\(agentID ?? "")"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case slug
+        case version
+        case role
+        case profile
+        case toolAllow = "tool_allow"
+        case toolDeny = "tool_deny"
+        case agentID = "agent_id"
+        case agentName = "agent_name"
+        case taskID = "task_id"
+        case activatedAt = "activated_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        slug = try container.decodeIfPresent(String.self, forKey: .slug) ?? ""
+        version = try container.decodeIfPresent(String.self, forKey: .version) ?? "1.0.0"
+        role = try container.decodeIfPresent(String.self, forKey: .role) ?? ""
+        profile = try container.decodeIfPresent(String.self, forKey: .profile) ?? ""
+        toolAllow = try container.decodeIfPresent([String].self, forKey: .toolAllow) ?? []
+        toolDeny = try container.decodeIfPresent([String].self, forKey: .toolDeny) ?? []
+        agentID = try container.decodeIfPresent(String.self, forKey: .agentID)
+        agentName = try container.decodeIfPresent(String.self, forKey: .agentName)
+        taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+        activatedAt = try container.decodeIfPresent(String.self, forKey: .activatedAt) ?? ""
+    }
+}
+
+struct SkillActivationsResult: Codable, Sendable {
+    let activations: [SkillActivation]
+}
+
+struct CitationAuditMessage: Codable, Identifiable, Hashable, Sendable {
+    let messageID: String
+    let agentName: String?
+    let excerpt: String
+    let citationCount: Int
+    let referencedKeys: [String]
+    let danglingKeys: [String]
+    let unusedKeys: [String]
+    let createdAt: String
+
+    var id: String {
+        messageID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case messageID = "message_id"
+        case agentName = "agent_name"
+        case excerpt
+        case citationCount = "citation_count"
+        case referencedKeys = "referenced_keys"
+        case danglingKeys = "dangling_keys"
+        case unusedKeys = "unused_keys"
+        case createdAt = "created_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        messageID = try container.decode(String.self, forKey: .messageID)
+        agentName = try container.decodeIfPresent(String.self, forKey: .agentName)
+        excerpt = try container.decodeIfPresent(String.self, forKey: .excerpt) ?? ""
+        citationCount = try container.decodeIfPresent(Int.self, forKey: .citationCount) ?? 0
+        referencedKeys = try container.decodeIfPresent([String].self, forKey: .referencedKeys) ?? []
+        danglingKeys = try container.decodeIfPresent([String].self, forKey: .danglingKeys) ?? []
+        unusedKeys = try container.decodeIfPresent([String].self, forKey: .unusedKeys) ?? []
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+    }
+}
+
+struct CitationAudit: Codable, Hashable, Sendable {
+    let messages: [CitationAuditMessage]
+    let messagesWithCitations: Int
+    let messagesWithoutCitations: Int
+    let totalCitations: Int
+    let uniqueSources: Int
+    let danglingKeyCount: Int
+    let unusedCitationCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case messages
+        case messagesWithCitations = "messages_with_citations"
+        case messagesWithoutCitations = "messages_without_citations"
+        case totalCitations = "total_citations"
+        case uniqueSources = "unique_sources"
+        case danglingKeyCount = "dangling_key_count"
+        case unusedCitationCount = "unused_citation_count"
+    }
+}
+
+struct SessionCitationAuditResult: Codable, Sendable {
+    let audit: CitationAudit
 }

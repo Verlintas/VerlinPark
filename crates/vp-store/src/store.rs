@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -6,16 +7,18 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AgentMessage, AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactPolicy,
-    CheckpointRetentionPolicy, Event, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer,
-    McpServerConfig, McpTransport, MemoryItem, MemoryPolicy, MergeQueueEntry, ModelPreset,
-    OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, Project, ProjectBudget,
-    ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy,
-    StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy,
-    WriteLease,
+    ArtifactVersion, CheckpointRetentionPolicy, Event, IntakeTask, IntegrationPolicy,
+    MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryItem, MemoryPolicy,
+    MergeQueueEntry, ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
+    Project, ProjectBudget, ProjectUsageSession, Question, ScheduledTask, SearchHit, Session,
+    SessionBundle, ShellPolicy, Skill, Source, SourceChunk, SourceCollection, SourceSearchHit,
+    SourceStats, StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry,
+    WorktreeRetentionPolicy, WriteLease,
 };
 
 use crate::paths;
@@ -102,6 +105,92 @@ fn map_intake_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntakeTask> {
     })
 }
 
+/// On-disk source snapshot. The JSON file is the durable copy used by
+/// `db-rebuild`; SQLite is the searchable projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceSnapshot {
+    pub version: u32,
+    pub source: Source,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceSearchQuery {
+    pub all: String,
+    pub any: String,
+    pub terms: Vec<String>,
+    pub raw: String,
+    pub prefer_like: bool,
+    /// Empty means all collections. The empty string selects uncollected rows.
+    pub collections: Vec<String>,
+    /// Empty means all labels; otherwise any requested label may match.
+    pub labels: Vec<String>,
+}
+
+fn map_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
+    let labels: String = row.get(14)?;
+    Ok(Source {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        kind: row.get(2)?,
+        title: row.get(3)?,
+        uri: row.get(4)?,
+        mime_type: row.get(5)?,
+        status: row.get(6)?,
+        size_bytes: row.get::<_, i64>(7)?.max(0) as u64,
+        sha256: row.get(8)?,
+        revision: row.get::<_, i64>(9)?.max(1) as u32,
+        chunk_count: row.get::<_, i64>(10)?.max(0) as usize,
+        char_count: row.get::<_, i64>(11)?.max(0) as usize,
+        token_count: row.get::<_, i64>(12)?.max(0) as u64,
+        error: row.get(13)?,
+        labels: serde_json::from_str(&labels).unwrap_or_default(),
+        collection: row.get(18).unwrap_or(None),
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+        indexed_at: row.get(17)?,
+    })
+}
+
+fn map_skill(row: &rusqlite::Row<'_>) -> rusqlite::Result<Skill> {
+    let tool_allow: String = row.get(8)?;
+    let tool_deny: String = row.get(9)?;
+    let profiles: String = row.get(10)?;
+    let roles: String = row.get(11)?;
+    Ok(Skill {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        slug: row.get(3)?,
+        description: row.get(4)?,
+        when_to_use: row.get(5)?,
+        version: row.get(6)?,
+        instructions: row.get(7)?,
+        tool_allow: serde_json::from_str(&tool_allow).unwrap_or_default(),
+        tool_deny: serde_json::from_str(&tool_deny).unwrap_or_default(),
+        profiles: serde_json::from_str(&profiles).unwrap_or_default(),
+        roles: serde_json::from_str(&roles).unwrap_or_default(),
+        enabled: row.get::<_, i64>(12)? != 0,
+        source: row.get(13)?,
+        sha256: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+    })
+}
+
+fn map_source_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceChunk> {
+    Ok(SourceChunk {
+        id: row.get(0)?,
+        source_id: row.get(1)?,
+        chunk_no: row.get::<_, i64>(2)?.max(0) as u32,
+        heading: row.get(3)?,
+        content: row.get(4)?,
+        start_offset: row.get::<_, i64>(5)?.max(0) as usize,
+        end_offset: row.get::<_, i64>(6)?.max(0) as usize,
+        token_count: row.get::<_, i64>(7)?.max(0) as u32,
+    })
+}
+
 /// Explicit projection repair derived from the event stream. Fields set to
 /// `None` are left untouched; `replace_plan` distinguishes "clear the plan"
 /// from "leave it alone".
@@ -154,6 +243,8 @@ pub struct ProjectManifestSnapshot {
     /// session-scoped, so the project manifest is their rebuild snapshot.
     #[serde(default)]
     pub intake_tasks: Vec<IntakeTask>,
+    #[serde(default)]
+    pub skills: Vec<Skill>,
 }
 
 /// Read the latest project snapshot for each project from `projects.jsonl`.
@@ -500,11 +591,36 @@ impl Store {
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 sha256     TEXT NOT NULL DEFAULT '',
                 path       TEXT,
+                version    INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS artifact_versions (
+                artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                version     INTEGER NOT NULL,
+                name        TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                mime_type   TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                storage     TEXT NOT NULL,
+                compression TEXT NOT NULL,
+                size_bytes  INTEGER NOT NULL,
+                sha256      TEXT NOT NULL,
+                path        TEXT,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (artifact_id, version)
             );
 
             CREATE INDEX IF NOT EXISTS idx_artifacts_session
                 ON artifacts(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS artifact_requests (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                request_key TEXT NOT NULL,
+                artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, request_key)
+            );
 
             CREATE TABLE IF NOT EXISTS usage_ledger (
                 id            TEXT PRIMARY KEY,
@@ -572,6 +688,100 @@ impl Store {
                 INSERT INTO memories_fts(rowid, title, body, tags)
                 VALUES (new.rowid, new.title, new.body, new.tags);
             END;
+
+            CREATE TABLE IF NOT EXISTS sources (
+                id          TEXT PRIMARY KEY,
+                project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                kind        TEXT NOT NULL,
+                collection  TEXT,
+                title       TEXT NOT NULL,
+                uri         TEXT,
+                mime_type   TEXT,
+                status      TEXT NOT NULL,
+                size_bytes  INTEGER NOT NULL DEFAULT 0,
+                sha256      TEXT NOT NULL,
+                revision    INTEGER NOT NULL DEFAULT 1,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                char_count  INTEGER NOT NULL DEFAULT 0,
+                token_count INTEGER NOT NULL DEFAULT 0,
+                error       TEXT,
+                labels      TEXT NOT NULL DEFAULT '[]',
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                indexed_at  TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sources_project_status
+                ON sources(project_id, status, updated_at);
+
+            CREATE TABLE IF NOT EXISTS source_chunks (
+                id            TEXT PRIMARY KEY,
+                project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                source_id     TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                chunk_no      INTEGER NOT NULL,
+                heading       TEXT,
+                content       TEXT NOT NULL,
+                start_offset  INTEGER NOT NULL DEFAULT 0,
+                end_offset    INTEGER NOT NULL DEFAULT 0,
+                token_count   INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT NOT NULL,
+                UNIQUE(source_id, chunk_no)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_chunks_project
+                ON source_chunks(project_id, source_id, chunk_no);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS source_chunks_fts USING fts5(
+                content,
+                heading,
+                content='source_chunks',
+                content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS source_chunks_fts_insert
+            AFTER INSERT ON source_chunks BEGIN
+                INSERT INTO source_chunks_fts(rowid, content, heading)
+                VALUES (new.rowid, new.content, new.heading);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS source_chunks_fts_delete
+            AFTER DELETE ON source_chunks BEGIN
+                INSERT INTO source_chunks_fts(source_chunks_fts, rowid, content, heading)
+                VALUES ('delete', old.rowid, old.content, old.heading);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS source_chunks_fts_update
+            AFTER UPDATE ON source_chunks BEGIN
+                INSERT INTO source_chunks_fts(source_chunks_fts, rowid, content, heading)
+                VALUES ('delete', old.rowid, old.content, old.heading);
+                INSERT INTO source_chunks_fts(rowid, content, heading)
+                VALUES (new.rowid, new.content, new.heading);
+            END;
+
+            CREATE TABLE IF NOT EXISTS skills (
+                id          TEXT PRIMARY KEY,
+                project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                slug        TEXT NOT NULL,
+                description TEXT NOT NULL,
+                when_to_use TEXT NOT NULL DEFAULT '',
+                version     TEXT NOT NULL DEFAULT '1.0.0',
+                instructions TEXT NOT NULL,
+                tool_allow  TEXT NOT NULL DEFAULT '[]',
+                tool_deny   TEXT NOT NULL DEFAULT '[]',
+                profiles    TEXT NOT NULL DEFAULT '[]',
+                roles       TEXT NOT NULL DEFAULT '[]',
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                source      TEXT NOT NULL DEFAULT 'user',
+                sha256      TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                UNIQUE(project_id, slug)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_skills_project_enabled
+                ON skills(project_id, enabled, updated_at);
 
             CREATE TABLE IF NOT EXISTS approval_grants (
                 id               TEXT PRIMARY KEY,
@@ -920,6 +1130,7 @@ impl Store {
             "INTEGER NOT NULL DEFAULT 1",
         )?;
         ensure_column(&conn, "intake_tasks", "deps", "TEXT NOT NULL DEFAULT '[]'")?;
+        ensure_column(&conn, "sources", "collection", "TEXT")?;
         ensure_column(
             &conn,
             "project_task_scheduler_policies",
@@ -954,6 +1165,7 @@ impl Store {
         )?;
         ensure_column(&conn, "artifacts", "sha256", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "artifacts", "path", "TEXT")?;
+        ensure_column(&conn, "artifacts", "version", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(
             &conn,
             "artifacts",
@@ -1157,6 +1369,7 @@ impl Store {
                 orchestration_policy: self.get_orchestration_policy(&project.id)?,
                 approval_grants: self.list_approval_grants(&project.id)?,
                 intake_tasks: self.list_intake_tasks(Some(&project.id), None, None)?,
+                skills: self.list_skills(Some(&project.id), true)?,
                 project,
             };
             serde_json::to_writer(&mut line_buffer, &snapshot)?;
@@ -1703,6 +1916,709 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    const SOURCE_COLUMNS: &'static str = "id, project_id, kind, title, uri, mime_type, status, \
+        size_bytes, sha256, revision, chunk_count, char_count, token_count, error, labels, \
+        created_at, updated_at, indexed_at, collection";
+
+    /// Upsert one source and replace its chunks in a single transaction. The
+    /// FTS triggers keep the external-content index in sync with the chunks.
+    pub fn insert_source(&self, source: &Source, chunks: &[SourceChunk]) -> Result<Source> {
+        let labels = serde_json::to_string(&source.labels)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO sources
+             (id, project_id, kind, collection, title, uri, mime_type, status, size_bytes,
+              sha256, revision, chunk_count, char_count, token_count, error, labels,
+              created_at, updated_at, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19)
+             ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                collection = excluded.collection,
+                title = excluded.title,
+                uri = excluded.uri,
+                mime_type = excluded.mime_type,
+                status = excluded.status,
+                size_bytes = excluded.size_bytes,
+                sha256 = excluded.sha256,
+                revision = excluded.revision,
+                chunk_count = excluded.chunk_count,
+                char_count = excluded.char_count,
+                token_count = excluded.token_count,
+                error = excluded.error,
+                labels = excluded.labels,
+                updated_at = excluded.updated_at,
+                indexed_at = excluded.indexed_at",
+            params![
+                source.id,
+                source.project_id,
+                source.kind,
+                source.collection,
+                source.title,
+                source.uri,
+                source.mime_type,
+                source.status,
+                source.size_bytes as i64,
+                source.sha256,
+                source.revision as i64,
+                source.chunk_count as i64,
+                source.char_count as i64,
+                source.token_count as i64,
+                source.error,
+                labels,
+                source.created_at,
+                source.updated_at,
+                source.indexed_at,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM source_chunks WHERE source_id = ?1",
+            params![source.id],
+        )?;
+        for chunk in chunks {
+            tx.execute(
+                "INSERT INTO source_chunks
+                 (id, project_id, source_id, chunk_no, heading, content, start_offset,
+                  end_offset, token_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    chunk.id,
+                    source.project_id,
+                    chunk.source_id,
+                    chunk.chunk_no as i64,
+                    chunk.heading,
+                    chunk.content,
+                    chunk.start_offset as i64,
+                    chunk.end_offset as i64,
+                    chunk.token_count as i64,
+                    source.updated_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+        self.get_source(&source.id)?
+            .ok_or_else(|| anyhow!("source disappeared after insert"))
+    }
+
+    pub fn get_source(&self, source_id: &str) -> Result<Option<Source>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!("SELECT {} FROM sources WHERE id = ?1", Self::SOURCE_COLUMNS),
+            params![source_id],
+            map_source,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_sources(
+        &self,
+        project_id: &str,
+        query: Option<&str>,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Source>> {
+        let conn = self.lock()?;
+        let limit = limit.unwrap_or(200).clamp(1, 1_000) as i64;
+        let query = query.map(|value| format!("%{}%", escape_like(value)));
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM sources
+             WHERE project_id = ?1
+               AND (?2 IS NULL OR status = ?2)
+               AND (?3 IS NULL OR title LIKE ?3 ESCAPE '\\' OR uri LIKE ?3 ESCAPE '\\')
+             ORDER BY updated_at DESC, id DESC LIMIT ?4",
+            Self::SOURCE_COLUMNS
+        ))?;
+        let rows = stmt.query_map(params![project_id, status, query, limit], map_source)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn source_chunks(
+        &self,
+        source_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<SourceChunk>> {
+        let conn = self.lock()?;
+        let offset = offset as i64;
+        let limit = limit.clamp(1, 200) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, source_id, chunk_no, heading, content, start_offset, end_offset,
+                    token_count
+             FROM source_chunks WHERE source_id = ?1
+             ORDER BY chunk_no ASC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(params![source_id, limit, offset], map_source_chunk)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn source_chunk_count(&self, source_id: &str) -> Result<usize> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM source_chunks WHERE source_id = ?1",
+            params![source_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn delete_source(&self, source_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute("DELETE FROM sources WHERE id = ?1", params![source_id])?;
+        Ok(changed > 0)
+    }
+
+    pub fn source_stats(&self, project_id: &str) -> Result<SourceStats> {
+        let conn = self.lock()?;
+        let mut stats = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'indexed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(chunk_count), 0),
+                    COALESCE(SUM(size_bytes), 0),
+                    COALESCE(SUM(token_count), 0)
+             FROM sources WHERE project_id = ?1",
+            params![project_id],
+            |row| {
+                Ok(SourceStats {
+                    sources: row.get::<_, i64>(0)?.max(0) as usize,
+                    indexed: row.get::<_, i64>(1)?.max(0) as usize,
+                    failed: row.get::<_, i64>(2)?.max(0) as usize,
+                    chunks: row.get::<_, i64>(3)?.max(0) as usize,
+                    bytes: row.get::<_, i64>(4)?.max(0) as u64,
+                    tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                })
+            },
+        )?;
+        let chunk_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM source_chunks WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        stats.chunks = chunk_count.max(0) as usize;
+        Ok(stats)
+    }
+
+    /// List project collections with aggregate counts. Sources without a
+    /// collection form a final `name: null` group. Labels are the distinct
+    /// labels used by sources in the group.
+    pub fn list_source_collections(&self, project_id: &str) -> Result<Vec<SourceCollection>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT NULLIF(COALESCE(NULLIF(collection, ''), ''), '') AS name,
+                    COUNT(*),
+                    COALESCE(SUM(chunk_count), 0),
+                    COALESCE(SUM(size_bytes), 0),
+                    COALESCE(SUM(token_count), 0),
+                    COALESCE(GROUP_CONCAT(labels, char(31)), '[]')
+             FROM sources
+             WHERE project_id = ?1
+             GROUP BY NULLIF(COALESCE(collection, ''), '')
+             ORDER BY name IS NULL, name COLLATE NOCASE ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            let labels_blob: String = row.get(5)?;
+            let mut labels = Vec::new();
+            for value in labels_blob.split('\u{1f}') {
+                if let Ok(values) = serde_json::from_str::<Vec<String>>(value) {
+                    for label in values {
+                        if !labels.iter().any(|existing| existing == &label) {
+                            labels.push(label);
+                        }
+                    }
+                }
+            }
+            labels.sort();
+            Ok(SourceCollection {
+                name: row.get(0)?,
+                sources: row.get::<_, i64>(1)?.max(0) as usize,
+                chunks: row.get::<_, i64>(2)?.max(0) as usize,
+                bytes: row.get::<_, i64>(3)?.max(0) as u64,
+                tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                labels,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn set_source_collection(
+        &self,
+        source_id: &str,
+        collection: Option<&str>,
+    ) -> Result<Option<Source>> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE sources SET collection = ?2, updated_at = ?3 WHERE id = ?1",
+            params![source_id, collection, now_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_source(source_id)
+    }
+
+    pub fn set_source_labels(&self, source_id: &str, labels: &[String]) -> Result<Option<Source>> {
+        let labels = serde_json::to_string(labels)?;
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE sources SET labels = ?2, updated_at = ?3 WHERE id = ?1",
+            params![source_id, labels, now_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_source(source_id)
+    }
+
+    /// Update source metadata without touching chunks or the FTS index. The
+    /// caller is responsible for keeping the durable snapshot in sync.
+    pub fn update_source_metadata(&self, source: &Source) -> Result<Source> {
+        let labels = serde_json::to_string(&source.labels)?;
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE sources
+             SET title = ?2, collection = ?3, labels = ?4, updated_at = ?5
+             WHERE id = ?1",
+            params![
+                source.id,
+                source.title,
+                source.collection,
+                labels,
+                source.updated_at
+            ],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("source not found: {}", source.id);
+        }
+        drop(conn);
+        self.get_source(&source.id)?
+            .ok_or_else(|| anyhow!("source disappeared after metadata update"))
+    }
+
+    /// Search chunks with FTS5 (all terms, then any term) and a bounded literal
+    /// fallback for CJK, short queries, or an FTS miss. Literal results are
+    /// fused with FTS results for mixed-script queries instead of discarding
+    /// one side. Returns `(hits, degraded)` where degraded marks an any-term
+    /// relaxation or a fallback scan.
+    pub fn search_source_chunks(
+        &self,
+        project_id: &str,
+        source_ids: &[String],
+        query: &SourceSearchQuery,
+        limit: Option<u32>,
+    ) -> Result<(Vec<SourceSearchHit>, bool)> {
+        let limit = limit.unwrap_or(8).clamp(1, 50) as usize;
+        let source_ids = serde_json::to_string(source_ids)?;
+        let collections = serde_json::to_string(&query.collections)?;
+        let labels = serde_json::to_string(&query.labels)?;
+        let conn = self.lock()?;
+        let filter = " AND (?3 = '[]' OR c.source_id IN (SELECT value FROM json_each(?3)))
+               AND (?4 = '[]' OR COALESCE(s.collection, '') IN (SELECT value FROM json_each(?4)))
+               AND (?5 = '[]' OR EXISTS (
+                   SELECT 1 FROM json_each(s.labels) requested
+                   WHERE requested.value IN (SELECT value FROM json_each(?5))
+               ))";
+        let sql = format!(
+            "SELECT c.source_id, s.title, s.collection, s.labels, c.id, c.chunk_no,
+                    c.heading, c.content, bm25(source_chunks_fts) AS rank
+             FROM source_chunks_fts
+             JOIN source_chunks c ON c.rowid = source_chunks_fts.rowid
+             JOIN sources s ON s.id = c.source_id
+             WHERE source_chunks_fts MATCH ?1
+               AND c.project_id = ?2
+               AND s.status = 'indexed'{filter}
+             ORDER BY rank ASC
+             LIMIT ?6"
+        );
+        let mut fused: HashMap<String, SourceSearchHit> = HashMap::new();
+        let mut degraded = false;
+        let mut needs_literal_fallback = query.prefer_like;
+        for (index, fts) in [&query.all, &query.any].into_iter().enumerate() {
+            if fts.is_empty() {
+                continue;
+            }
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    fts,
+                    project_id,
+                    source_ids,
+                    collections,
+                    labels,
+                    limit as i64
+                ],
+                |row| {
+                    let rank: f64 = row.get(8).unwrap_or(0.0);
+                    let labels_blob: String = row.get(3)?;
+                    Ok(SourceSearchHit {
+                        source_id: row.get(0)?,
+                        source_title: row.get(1)?,
+                        collection: row.get(2)?,
+                        labels: serde_json::from_str(&labels_blob).unwrap_or_default(),
+                        chunk_id: row.get(4)?,
+                        chunk_no: row.get::<_, i64>(5)?.max(0) as u32,
+                        heading: row.get(6)?,
+                        content: row.get(7)?,
+                        score: (-rank).max(0.0),
+                    })
+                },
+            );
+            let Ok(rows) = rows else {
+                degraded = true;
+                needs_literal_fallback = true;
+                break;
+            };
+            let hits = rows.collect::<Result<Vec<_>, _>>()?;
+            if hits.is_empty() {
+                continue;
+            }
+            // An any-term hit is a relaxation, not an exact match.
+            if index == 1 {
+                degraded = true;
+            }
+            for hit in hits {
+                fused.entry(hit.chunk_id.clone()).or_insert(hit);
+            }
+            // The all-terms query already found something; do not widen it a
+            // second time unless the caller explicitly wants a literal merge.
+            break;
+        }
+
+        if fused.is_empty() {
+            needs_literal_fallback = true;
+        }
+        if !needs_literal_fallback {
+            let mut hits = fused.into_values().collect::<Vec<_>>();
+            hits.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.chunk_no.cmp(&right.chunk_no))
+            });
+            hits.truncate(limit);
+            return Ok((hits, degraded));
+        }
+
+        // CJK and mixed-script queries always run the literal pass too. FTS5's
+        // unicode61 tokenizer can treat a whole CJK run as one token, while a
+        // mixed English/CJK query still benefits from the English FTS hits.
+        degraded = true;
+        let raw = query.raw.trim();
+        let mut patterns = Vec::new();
+        for value in std::iter::once(raw).chain(query.terms.iter().map(String::as_str)) {
+            if value.is_empty() {
+                continue;
+            }
+            let pattern = format!("%{}%", escape_like(value));
+            if !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+            if patterns.len() >= 40 {
+                break;
+            }
+        }
+        if patterns.is_empty() {
+            return Ok((fused.into_values().collect(), degraded));
+        }
+        let patterns = serde_json::to_string(&patterns)?;
+        let like_sql = "SELECT c.source_id, s.title, s.collection, s.labels, c.id, c.chunk_no,
+                    c.heading, c.content
+             FROM source_chunks c
+             JOIN sources s ON s.id = c.source_id
+             WHERE c.project_id = ?1
+               AND s.status = 'indexed'
+               AND (?2 = '[]' OR c.source_id IN (SELECT value FROM json_each(?2)))
+               AND (?3 = '[]' OR COALESCE(s.collection, '') IN (SELECT value FROM json_each(?3)))
+               AND (?4 = '[]' OR EXISTS (
+                   SELECT 1 FROM json_each(s.labels) requested
+                   WHERE requested.value IN (SELECT value FROM json_each(?4))
+               ))
+               AND EXISTS (
+                   SELECT 1 FROM json_each(?5) pattern
+                   WHERE c.content LIKE pattern.value ESCAPE '\\'
+                      OR c.heading LIKE pattern.value ESCAPE '\\'
+               )
+             ORDER BY c.chunk_no ASC
+             LIMIT 500";
+        let mut stmt = conn.prepare(like_sql)?;
+        let needle = raw.to_lowercase();
+        let rows = stmt.query_map(
+            params![project_id, source_ids, collections, labels, patterns],
+            |row| {
+                let labels_blob: String = row.get(3)?;
+                Ok(SourceSearchHit {
+                    source_id: row.get(0)?,
+                    source_title: row.get(1)?,
+                    collection: row.get(2)?,
+                    labels: serde_json::from_str(&labels_blob).unwrap_or_default(),
+                    chunk_id: row.get(4)?,
+                    chunk_no: row.get::<_, i64>(5)?.max(0) as u32,
+                    heading: row.get(6)?,
+                    content: row.get(7)?,
+                    score: 0.0,
+                })
+            },
+        )?;
+        for row in rows {
+            let mut hit = row?;
+            let content = hit.content.to_lowercase();
+            let heading = hit.heading.as_deref().unwrap_or("").to_lowercase();
+            let raw_matches = content.matches(&needle).count() as f64;
+            let raw_heading_matches = heading.matches(&needle).count() as f64;
+            let term_matches = query
+                .terms
+                .iter()
+                .map(|term| content.matches(term).count() + heading.matches(term).count())
+                .sum::<usize>() as f64;
+            if raw_matches == 0.0 && raw_heading_matches == 0.0 && term_matches == 0.0 {
+                continue;
+            }
+            let score = raw_matches * 4.0 + raw_heading_matches * 8.0 + term_matches;
+            if let Some(existing) = fused.get_mut(&hit.chunk_id) {
+                existing.score = existing.score.max(score);
+            } else {
+                hit.score = score;
+                fused.insert(hit.chunk_id.clone(), hit);
+            }
+        }
+        let mut hits = fused.into_values().collect::<Vec<_>>();
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.chunk_no.cmp(&right.chunk_no))
+        });
+        hits.truncate(limit);
+        Ok((hits, degraded))
+    }
+
+    fn source_dir(&self, project_id: &str) -> PathBuf {
+        self.data_dir.join("sources").join(project_id)
+    }
+
+    /// Persist the durable source snapshot before/after the SQLite projection.
+    /// A failed append must not be treated as a successful source add.
+    pub fn write_source_snapshot(&self, snapshot: &SourceSnapshot) -> Result<()> {
+        let dir = self.source_dir(&snapshot.source.project_id);
+        paths::ensure_private_dir(&dir)?;
+        let path = dir.join(format!("{}.json", snapshot.source.id));
+        let temp = dir.join(format!(".tmp-{}.json", Uuid::now_v7()));
+        let bytes = serde_json::to_vec(snapshot)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .with_context(|| format!("creating source snapshot {}", temp.display()))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &path)
+            .with_context(|| format!("replacing source snapshot {}", path.display()))?;
+        paths::ensure_private_file(&path)?;
+        Ok(())
+    }
+
+    pub fn read_source_snapshot(
+        &self,
+        project_id: &str,
+        source_id: &str,
+    ) -> Result<Option<SourceSnapshot>> {
+        let path = self
+            .source_dir(project_id)
+            .join(format!("{}.json", source_id));
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+                format!("parsing source snapshot {}", path.display())
+            })?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    pub fn delete_source_snapshot(&self, project_id: &str, source_id: &str) -> Result<()> {
+        let path = self
+            .source_dir(project_id)
+            .join(format!("{}.json", source_id));
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+
+    /// All durable snapshots, used by `db-rebuild` and source recovery.
+    pub fn list_source_snapshots(&self) -> Result<Vec<SourceSnapshot>> {
+        let root = self.data_dir.join("sources");
+        let mut snapshots = Vec::new();
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).with_context(|| format!("reading {}", root.display())),
+        };
+        for project in entries {
+            let project = match project {
+                Ok(project) => project,
+                Err(_) => continue,
+            };
+            if !project
+                .file_type()
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let files = match std::fs::read_dir(project.path()) {
+                Ok(files) => files,
+                Err(_) => continue,
+            };
+            for file in files {
+                let file = match file {
+                    Ok(file) => file,
+                    Err(_) => continue,
+                };
+                if file.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let bytes = match std::fs::read(file.path()) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(%error, path = %file.path().display(), "could not read source snapshot");
+                        continue;
+                    }
+                };
+                match serde_json::from_slice::<SourceSnapshot>(&bytes) {
+                    Ok(snapshot) => snapshots.push(snapshot),
+                    Err(error) => {
+                        tracing::warn!(%error, path = %file.path().display(), "skipping malformed source snapshot");
+                    }
+                }
+            }
+        }
+        Ok(snapshots)
+    }
+
+    const SKILL_COLUMNS: &'static str = "id, project_id, name, slug, description, when_to_use, \
+        version, instructions, tool_allow, tool_deny, profiles, roles, enabled, source, sha256, \
+        created_at, updated_at";
+
+    pub fn list_skills(
+        &self,
+        project_id: Option<&str>,
+        include_disabled: bool,
+    ) -> Result<Vec<Skill>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM skills
+             WHERE (?1 IS NULL OR project_id = ?1)
+               AND (?2 = 1 OR enabled = 1)
+             ORDER BY name COLLATE NOCASE ASC, id ASC",
+            Self::SKILL_COLUMNS
+        ))?;
+        let rows = stmt.query_map(
+            params![project_id, if include_disabled { 1 } else { 0 }],
+            map_skill,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_skill(&self, id: &str) -> Result<Option<Skill>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!("SELECT {} FROM skills WHERE id = ?1", Self::SKILL_COLUMNS),
+            params![id],
+            map_skill,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn get_skill_by_slug(&self, project_id: &str, slug: &str) -> Result<Option<Skill>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM skills WHERE project_id = ?1 AND slug = ?2",
+                Self::SKILL_COLUMNS
+            ),
+            params![project_id, slug],
+            map_skill,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn insert_skill(&self, skill: &Skill) -> Result<Skill> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO skills
+             (id, project_id, name, slug, description, when_to_use, version, instructions,
+              tool_allow, tool_deny, profiles, roles, enabled, source, sha256, created_at,
+              updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                slug = excluded.slug,
+                description = excluded.description,
+                when_to_use = excluded.when_to_use,
+                version = excluded.version,
+                instructions = excluded.instructions,
+                tool_allow = excluded.tool_allow,
+                tool_deny = excluded.tool_deny,
+                profiles = excluded.profiles,
+                roles = excluded.roles,
+                enabled = excluded.enabled,
+                source = excluded.source,
+                sha256 = excluded.sha256,
+                updated_at = excluded.updated_at",
+            params![
+                skill.id,
+                skill.project_id,
+                skill.name,
+                skill.slug,
+                skill.description,
+                skill.when_to_use,
+                skill.version,
+                skill.instructions,
+                serde_json::to_string(&skill.tool_allow)?,
+                serde_json::to_string(&skill.tool_deny)?,
+                serde_json::to_string(&skill.profiles)?,
+                serde_json::to_string(&skill.roles)?,
+                if skill.enabled { 1 } else { 0 },
+                skill.source,
+                skill.sha256,
+                skill.created_at,
+                skill.updated_at,
+            ],
+        )?;
+        drop(conn);
+        self.get_skill(&skill.id)?
+            .ok_or_else(|| anyhow!("skill disappeared after insert"))
+    }
+
+    pub fn delete_skill(&self, id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute("DELETE FROM skills WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
+    }
+
+    pub fn set_skill_enabled(&self, id: &str, enabled: bool) -> Result<Option<Skill>> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE skills SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, if enabled { 1 } else { 0 }, now_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_skill(id)
     }
 
     /// Record a coordination note and update its projection in one
@@ -2598,13 +3514,14 @@ impl Store {
             sha256: sha256.to_string(),
             path: path.map(str::to_string),
             data_base64: None,
+            version: 1,
             created_at: now_rfc3339(),
         };
         tx.execute(
             "INSERT INTO artifacts
              (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
-              content, storage, compression, size_bytes, sha256, path, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              content, storage, compression, size_bytes, sha256, path, created_at, version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)",
             params![
                 artifact.id,
                 artifact.session_id,
@@ -2623,6 +3540,7 @@ impl Store {
                 artifact.created_at
             ],
         )?;
+        insert_artifact_version_tx(&tx, &artifact)?;
         let event = insert_event_tx(
             &tx,
             session_id,
@@ -2641,6 +3559,7 @@ impl Store {
                 "sha256": artifact.sha256,
                 "path": artifact.path,
                 "content": artifact.content,
+                "version": artifact.version,
             }),
         )?;
         tx.commit()?;
@@ -2691,6 +3610,7 @@ impl Store {
             sha256: sha256.to_string(),
             path: Some(path.to_string_lossy().to_string()),
             data_base64: None,
+            version: 1,
             created_at: now_rfc3339(),
         };
         let mut conn = self.lock()?;
@@ -2698,8 +3618,8 @@ impl Store {
         tx.execute(
             "INSERT INTO artifacts
              (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
-              content, storage, compression, size_bytes, sha256, path, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', 'file', 'zstd', ?9, ?10, ?11, ?12)",
+              content, storage, compression, size_bytes, sha256, path, created_at, version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', 'file', 'zstd', ?9, ?10, ?11, ?12, 1)",
             params![
                 artifact.id,
                 artifact.session_id,
@@ -2715,6 +3635,7 @@ impl Store {
                 artifact.created_at
             ],
         )?;
+        insert_artifact_version_tx(&tx, &artifact)?;
         let event = insert_event_tx(
             &tx,
             session_id,
@@ -2733,6 +3654,7 @@ impl Store {
                 "sha256": artifact.sha256,
                 "path": artifact.path,
                 "content": "",
+                "version": artifact.version,
             }),
         )?;
         if let Err(error) = tx.commit() {
@@ -2747,11 +3669,284 @@ impl Store {
         Ok((artifact, event))
     }
 
+    /// Publish a new version of an inline text artifact. File-backed artifacts
+    /// are intentionally immutable here because their blobs also participate
+    /// in content-addressed GC.
+    pub fn update_artifact_with_event(
+        &self,
+        artifact_id: &str,
+        expected_version: Option<u32>,
+        name: &str,
+        kind: &str,
+        mime_type: &str,
+        content: &str,
+    ) -> Result<Option<(Artifact, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let current = tx
+            .query_row(
+                "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
+                        mime_type, content, storage, compression, size_bytes, sha256, path,
+                        created_at, version
+                 FROM artifacts WHERE id = ?1",
+                params![artifact_id],
+                map_artifact,
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        if current.storage != "inline" {
+            anyhow::bail!("binary artifact versions are not editable");
+        }
+        if let Some(expected) = expected_version
+            && expected != current.version
+        {
+            anyhow::bail!(
+                "artifact version conflict: expected {expected}, current {}",
+                current.version
+            );
+        }
+        // Preserve the current version for legacy artifacts that predate the
+        // version table before moving the row forward.
+        insert_artifact_version_tx(&tx, &current)?;
+        let sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let updated = Artifact {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            mime_type: mime_type.to_string(),
+            content: content.to_string(),
+            size_bytes: content.len() as u64,
+            sha256,
+            version: current.version.saturating_add(1),
+            created_at: current.created_at.clone(),
+            ..current.clone()
+        };
+        tx.execute(
+            "UPDATE artifacts
+             SET name = ?2, kind = ?3, mime_type = ?4, content = ?5, size_bytes = ?6,
+                 sha256 = ?7, version = ?8
+             WHERE id = ?1",
+            params![
+                artifact_id,
+                updated.name,
+                updated.kind,
+                updated.mime_type,
+                updated.content,
+                updated.size_bytes as i64,
+                updated.sha256,
+                updated.version as i64,
+            ],
+        )?;
+        insert_artifact_version_tx(&tx, &updated)?;
+        let event = insert_event_tx(
+            &tx,
+            &updated.session_id,
+            "artifact.version_published",
+            serde_json::json!({
+                "artifact_id": updated.id,
+                "name": updated.name,
+                "kind": updated.kind,
+                "agent_id": updated.agent_id,
+                "agent_name": updated.agent_name,
+                "task_id": updated.task_id,
+                "mime_type": updated.mime_type,
+                "storage": updated.storage,
+                "compression": updated.compression,
+                "size_bytes": updated.size_bytes,
+                "sha256": updated.sha256,
+                "path": updated.path,
+                "content": updated.content,
+                "version": updated.version,
+                "previous_version": current.version,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((updated, event)))
+    }
+
+    pub fn list_artifact_versions(&self, artifact_id: &str) -> Result<Vec<ArtifactVersion>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT artifact_id, version, name, kind, mime_type, content, storage,
+                    compression, size_bytes, sha256, path, created_at
+             FROM artifact_versions WHERE artifact_id = ?1 ORDER BY version ASC",
+        )?;
+        let rows = stmt.query_map(params![artifact_id], map_artifact_version)?;
+        let versions = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
+        if !versions.is_empty() {
+            return Ok(versions);
+        }
+        // Artifacts created before version rows existed still have a valid
+        // current version. Expose that snapshot rather than an empty history.
+        Ok(self
+            .get_artifact(artifact_id)?
+            .map(|artifact| vec![artifact_version_from_artifact(&artifact)])
+            .unwrap_or_default())
+    }
+
+    pub fn get_artifact_version(
+        &self,
+        artifact_id: &str,
+        version: u32,
+    ) -> Result<Option<ArtifactVersion>> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT artifact_id, version, name, kind, mime_type, content, storage,
+                        compression, size_bytes, sha256, path, created_at
+                 FROM artifact_versions WHERE artifact_id = ?1 AND version = ?2",
+                params![artifact_id, version as i64],
+                map_artifact_version,
+            )
+            .optional()?;
+        drop(conn);
+        if stored.is_some() {
+            return Ok(stored);
+        }
+        let Some(artifact) = self.get_artifact(artifact_id)? else {
+            return Ok(None);
+        };
+        if artifact.version != version {
+            return Ok(None);
+        }
+        Ok(Some(artifact_version_from_artifact(&artifact)))
+    }
+
+    pub fn restore_artifact_version(
+        &self,
+        artifact_id: &str,
+        version: u32,
+    ) -> Result<Option<(Artifact, Event)>> {
+        let Some(version_record) = self.get_artifact_version(artifact_id, version)? else {
+            return Ok(None);
+        };
+        if version_record.storage != "inline" {
+            anyhow::bail!("binary artifact versions cannot be restored");
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let current = tx
+            .query_row(
+                "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
+                        mime_type, content, storage, compression, size_bytes, sha256, path,
+                        created_at, version
+                 FROM artifacts WHERE id = ?1",
+                params![artifact_id],
+                map_artifact,
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        if current.storage != "inline" {
+            anyhow::bail!("binary artifact versions cannot be restored");
+        }
+        insert_artifact_version_tx(&tx, &current)?;
+        let updated = Artifact {
+            name: version_record.name,
+            kind: version_record.kind,
+            mime_type: version_record.mime_type,
+            content: version_record.content,
+            size_bytes: version_record.size_bytes,
+            sha256: version_record.sha256,
+            version: current.version.saturating_add(1),
+            ..current.clone()
+        };
+        tx.execute(
+            "UPDATE artifacts
+             SET name = ?2, kind = ?3, mime_type = ?4, content = ?5, size_bytes = ?6,
+                 sha256 = ?7, version = ?8
+             WHERE id = ?1",
+            params![
+                artifact_id,
+                updated.name,
+                updated.kind,
+                updated.mime_type,
+                updated.content,
+                updated.size_bytes as i64,
+                updated.sha256,
+                updated.version as i64,
+            ],
+        )?;
+        insert_artifact_version_tx(&tx, &updated)?;
+        let event = insert_event_tx(
+            &tx,
+            &updated.session_id,
+            "artifact.version_restored",
+            serde_json::json!({
+                "artifact_id": updated.id,
+                "name": updated.name,
+                "kind": updated.kind,
+                "agent_id": updated.agent_id,
+                "agent_name": updated.agent_name,
+                "task_id": updated.task_id,
+                "mime_type": updated.mime_type,
+                "storage": updated.storage,
+                "compression": updated.compression,
+                "size_bytes": updated.size_bytes,
+                "sha256": updated.sha256,
+                "path": updated.path,
+                "content": updated.content,
+                "version": updated.version,
+                "restored_from_version": version,
+                "previous_version": current.version,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((updated, event)))
+    }
+
+    pub fn get_artifact_by_request_key(
+        &self,
+        session_id: &str,
+        request_key: &str,
+    ) -> Result<Option<Artifact>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT a.id, a.session_id, a.agent_id, a.agent_name, a.task_id, a.name,
+                    a.kind, a.mime_type, a.content, a.storage, a.compression,
+                    a.size_bytes, a.sha256, a.path, a.created_at, a.version
+             FROM artifact_requests r
+             JOIN artifacts a ON a.id = r.artifact_id
+             WHERE r.session_id = ?1 AND r.request_key = ?2",
+            params![session_id, request_key],
+            map_artifact,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn register_artifact_request(
+        &self,
+        session_id: &str,
+        request_key: &str,
+        artifact_id: &str,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO artifact_requests (session_id, request_key, artifact_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id, request_key) DO NOTHING",
+            params![session_id, request_key, artifact_id, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn list_artifacts(&self, session_id: &str) -> Result<Vec<Artifact>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
-                    mime_type, content, storage, compression, size_bytes, sha256, path, created_at
+                    mime_type, content, storage, compression, size_bytes, sha256, path,
+                    created_at, version
              FROM artifacts WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], map_artifact)?;
@@ -2762,7 +3957,8 @@ impl Store {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
-                    mime_type, content, storage, compression, size_bytes, sha256, path, created_at
+                    mime_type, content, storage, compression, size_bytes, sha256, path,
+                    created_at, version
              FROM artifacts WHERE id = ?1",
             params![artifact_id],
             map_artifact,
@@ -2923,7 +4119,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT a.id, a.session_id, a.agent_id, a.agent_name, a.task_id, a.name,
                     a.kind, a.mime_type, a.content, a.storage, a.compression,
-                    a.size_bytes, a.sha256, a.path, a.created_at
+                    a.size_bytes, a.sha256, a.path, a.created_at, a.version
              FROM artifacts a
              JOIN sessions s ON s.id = a.session_id
              WHERE s.project_id = ?1
@@ -8424,8 +9620,77 @@ fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
         sha256: row.get(12)?,
         path: row.get(13)?,
         data_base64: None,
+        version: row.get::<_, i64>(15).unwrap_or(1).max(1) as u32,
         created_at: row.get(14)?,
     })
+}
+
+fn artifact_version_from_artifact(artifact: &Artifact) -> ArtifactVersion {
+    ArtifactVersion {
+        artifact_id: artifact.id.clone(),
+        version: artifact.version,
+        name: artifact.name.clone(),
+        kind: artifact.kind.clone(),
+        mime_type: artifact.mime_type.clone(),
+        content: artifact.content.clone(),
+        storage: artifact.storage.clone(),
+        compression: artifact.compression.clone(),
+        size_bytes: artifact.size_bytes,
+        sha256: artifact.sha256.clone(),
+        path: artifact.path.clone(),
+        created_at: artifact.created_at.clone(),
+    }
+}
+
+fn map_artifact_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactVersion> {
+    Ok(ArtifactVersion {
+        artifact_id: row.get(0)?,
+        version: row.get::<_, i64>(1)?.max(1) as u32,
+        name: row.get(2)?,
+        kind: row.get(3)?,
+        mime_type: row.get(4)?,
+        content: row.get(5)?,
+        storage: row.get(6)?,
+        compression: row.get(7)?,
+        size_bytes: row.get::<_, i64>(8)?.max(0) as u64,
+        sha256: row.get(9)?,
+        path: row.get(10)?,
+        created_at: row.get(11)?,
+    })
+}
+
+fn insert_artifact_version_tx(tx: &Transaction<'_>, artifact: &Artifact) -> Result<()> {
+    tx.execute(
+        "INSERT INTO artifact_versions
+         (artifact_id, version, name, kind, mime_type, content, storage, compression,
+          size_bytes, sha256, path, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(artifact_id, version) DO UPDATE SET
+            name = excluded.name,
+            kind = excluded.kind,
+            mime_type = excluded.mime_type,
+            content = excluded.content,
+            storage = excluded.storage,
+            compression = excluded.compression,
+            size_bytes = excluded.size_bytes,
+            sha256 = excluded.sha256,
+            path = excluded.path",
+        params![
+            artifact.id,
+            artifact.version as i64,
+            artifact.name,
+            artifact.kind,
+            artifact.mime_type,
+            artifact.content,
+            artifact.storage,
+            artifact.compression,
+            artifact.size_bytes as i64,
+            artifact.sha256,
+            artifact.path,
+            artifact.created_at,
+        ],
+    )?;
+    Ok(())
 }
 
 fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {

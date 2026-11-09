@@ -1,9 +1,123 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-10
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-10 Project knowledge sources, citations, skill packs, artifact versions
+
+这一轮把“可检索的项目知识与可复用的工作方式”接入同一个本地 runtime，并给
+artifact 增加版本和幂等发布。参考了 SourceWeft 的能力边界和 artifact 安全
+设计，但没有复制其实现或引入其运行时。
+
+### Project knowledge sources
+
+- 新增项目级 `sources`：`note` / `file` / `url`，带 collection、labels、
+  status、size、SHA-256、revision、chunk/token counts、URI、MIME。
+- 原文快照写入 `data_dir/sources/<project>/<source>.json`；SQLite 保存可查询
+  投影和 chunk 索引；`vp db-rebuild` 从快照重新 chunk 并恢复 FTS。
+- 本地文件只允许项目根内相对路径、canonicalize 后仍在根内、拒绝 `.git`/
+  `..`/symlink/非 UTF-8/NUL/大于 2 MiB；URL 复用 DNS 固定、私网阻断、无
+  redirect 的受控 fetch，并做 bounded HTML→text。
+- 文件夹 import 只处理文本类扩展名，最多 500 个文件，跳过 binary/超大/空
+  文件，已有 URI 不重复导入。
+- 新增 `source.list/get/add_note/add_file/add_url/import/delete/reindex/
+  refresh/search` RPC、`vp sources/source-*` CLI、Preview Sources 面板。
+- `source.refresh` 重新读取 file/URL 或从 snapshot 重建 note，revision +1；
+  `source.reindex` 从 snapshot 重建 chunks；搜索结果和 UI 均可直接定位 chunk。
+
+### Deterministic retrieval + citations
+
+- `vp-core::sources` 做 heading-aware chunking：Markdown heading 栈、fenced
+  code 保护、target/max/overlap、字符边界、chunk 上限 500；chunk 偏移、
+  heading path、token 估算与稳定 id。
+- `source_chunks_fts` 是 FTS5 external-content 索引；查询先 all terms 再 any
+  terms，CJK/短查询/FTS miss 走 bounded LIKE fallback，按字面出现次数和
+  heading 命中排序。默认 8、hard cap 50。
+- Agent 工具：`search_sources` / `read_source` / `list_sources`（只读）。
+  System prompt 注入 bounded source catalog；完整内容按需读取。
+- 每次 agent run 一个 `CitationRegistry`；第一次使用的 chunk 分配 `c1..cN`，
+  重复使用复用 key。Tool 输出 `[cN]`，system prompt 要求精确引用。
+- `agent.message` payload 持久化 citations（source/chunk/heading/excerpt/score/
+  origin）；`session.citations` 直接从事件派生，避免第二投影漂移；
+  `vp citations` 和 Preview Sources → Citations 可检查。
+- Stage assistant bubble 渲染 inline `[cN]` link 和 source strip；citation
+  sheet 显示快照 excerpt，即使 source 后续刷新/删除仍可审计。
+
+### Project skill packs
+
+- 项目级 `skills`：name/slug/description/when_to_use/version/instructions/
+  tool_allow/tool_deny/profiles/roles/enabled/source/sha256。
+- `SKILL.md` import 支持 YAML frontmatter（name/description/when_to_use/version/
+  tools/profiles/roles），128 KiB 文件上限；也支持 Settings 手动创建/编辑。
+- `skill.list/create/update/import/set_enabled/delete` RPC、`vp skills/skill-*`
+  CLI、Settings → Skills 面板；skill 进入 project manifest 与 `db-rebuild`。
+- System prompt 只注入匹配 role/profile 的 enabled skill catalog（最多 24 条
+  / 4,000 chars）；`use_skill(name)` 才加载完整 instructions。
+- 一次只激活一个 skill；激活后下一轮 tool schema 过滤，且每次 tool execution
+  立即检查 allow/deny。Deny 永远优先，allow 只能收窄，不能授予角色没有的
+  工具；approval/sandbox/budget/write scope 不变。`use_skill` 始终可用以便切换。
+- Stage composer 的 wand 菜单可插入 skill 提示；agent 仍通过 `use_skill` 激活。
+
+### Artifact versions + idempotent publication
+
+- `artifacts.version` 从 1 开始，新增 `artifact_versions` 版本行；inline
+  artifact 更新支持 `artifact_id` + `expected_version` 乐观并发保护，
+  写 `artifact.version_published` 事件并保留旧版本。
+- `artifact.restore` 把旧 inline 版本恢复为新版本，写
+  `artifact.version_restored` / `restored_from_version`，不重写历史。
+- `publish_artifact` 支持 session-scoped `request_key`；重复 key 返回第一次
+  提交的 artifact，`artifact_requests` 保存 winner，避免 retry 产生重复。
+- 文件 artifact 仍不可变（blob 与内容寻址 GC 边界），这是明确的限制。
+- Preview artifact card 显示 `vN`、版本历史 sheet、当前标记和 Restore；
+  CLI 增加 `artifact-versions` / `artifact-restore`。
+
+### Collections, bounded diff, citation audit, skill usage
+
+- Source 增加 nullable collection 与 labels；`source.collections` 聚合每个
+  collection 的 source/chunk/byte/token/label，`source.update` 一次更新
+  title/collection/labels 并同步 durable snapshot；`source.search` 与
+  `search_sources` 支持 collection/label filter，FTS 和 literal fallback 使用
+  同一套过滤；CJK/mixed-script 查询会把 FTS 与 literal 结果融合，而不是直接
+  放弃一侧。
+- 新增 `vp-core::textdiff`：CRLF/CR 归一化、bounded Myers O(ND)（edit cap
+  512）、输出行 cap（默认 4,000 / 硬上限 20,000）、超限时显式
+  delete-all/insert-all fallback；hunk 带 old/new 行号和 context，summary
+  计数与 truncation 标记不因渲染截断而丢失。
+- `artifact.diff` 比较两个 inline version，或某个 version 与 current；
+  文件 artifact 明确拒绝（内容寻址 blob/GC 边界）。`vp artifact-diff` 输出
+  unified-style diff，Preview 版本历史增加 Diff sheet，按行显示旧/新行号、
+  add/delete/context 配色和 truncated 提示。
+- `session.citation_audit` 从 `agent.message` 事件派生 cited/uncited message、
+  total citation、distinct source、dangling `[cN]` marker、unused citation；
+  `vp citation-audit` 与 Preview Sources → Citations 展示审计条。它是审阅
+  辅助，不声称语义事实核查。
+- `use_skill` 成功激活时写 `skill.activated` event（name/slug/version/role/
+  profile/tool policy/task）；`skill.activations` 从事件派生当前 session 的
+  激活历史，Settings → Skills 显示最近激活。
+- 修复 context limit 的双重扣减：`context_limits` 只预留 output + 1,024
+  safety；`estimated` 已包含 system/tool tokens。手动压缩且摘要失败时 trim
+  到 hard limit 的一半，确保显式操作仍创造 headroom。
+- Rust 新增 textdiff / collection / scoped search / artifact diff / citation
+  audit / skill activation 回归；Swift 新增 collection/activation/diff/audit
+  decode 与 UI 状态。
+
+### 验证
+
+- 新增 Rust 测试：source chunking/HTML/query、source store/search/snapshot、
+  source file traversal/import/refresh、citation event→`session.citations`、
+  skill frontmatter/CRUD/catalog/tool narrowing、artifact version/conflict/
+  restore/request-key、rebuild 恢复 source/skill。
+- 新增 Swift 测试：Source/Skill/Citation decode、transcript citation attach、
+  settings section count、artifact/citation UI 兼容。
+- 当前测试：Rust 415（core 330 / protocol 2 / store 69 / providers 14；另有
+  3 ignored live），Swift 110；以最终 `just test` 输出为准。
+- 文档：ADR-0129（sources/citations）、ADR-0130（skills）、ADR-0131
+  （artifact versions/idempotency）、ADR-0132（bounded diff/citation audit/
+  source collections/context-limit fix）。
 
 ---
 

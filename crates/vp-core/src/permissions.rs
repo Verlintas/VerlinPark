@@ -203,7 +203,11 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
         | "recall"
         | "ask_user"
         | "coordinate"
-        | "team_status" => {
+        | "team_status"
+        | "search_sources"
+        | "read_source"
+        | "list_sources"
+        | "use_skill" => {
             PermissionAssessment::new(RiskLevel::ReadOnly, "read-only or runtime-managed")
         }
         _ => PermissionAssessment::new(RiskLevel::External, "externally supplied tool"),

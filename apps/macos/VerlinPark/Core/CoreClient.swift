@@ -718,6 +718,58 @@ actor CoreClient {
             .artifacts
     }
 
+    func sessionCitations(
+        sessionID: String,
+        messageID: String? = nil
+    ) async throws -> SessionCitationsResult {
+        try await request(
+            method: "session.citations",
+            params: [
+                "session_id": .string(sessionID),
+                "message_id": messageID.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(SessionCitationsResult.self)
+    }
+
+    func artifactDiff(
+        artifactID: String,
+        fromVersion: Int,
+        toVersion: Int? = nil,
+        context: Int = 3
+    ) async throws -> ArtifactDiffResult {
+        try await request(
+            method: "artifact.diff",
+            params: [
+                "artifact_id": .string(artifactID),
+                "from_version": .number(Double(fromVersion)),
+                "to_version": toVersion.map { .number(Double($0)) } ?? .null,
+                "context": .number(Double(context)),
+            ]
+        )
+        .decode(ArtifactDiffResult.self)
+    }
+
+    func artifactVersions(artifactID: String) async throws -> ArtifactVersionsResult {
+        try await request(
+            method: "artifact.versions",
+            params: ["artifact_id": .string(artifactID)]
+        )
+        .decode(ArtifactVersionsResult.self)
+    }
+
+    func restoreArtifactVersion(artifactID: String, version: Int) async throws -> Artifact {
+        try await request(
+            method: "artifact.restore",
+            params: [
+                "artifact_id": .string(artifactID),
+                "version": .number(Double(version)),
+            ]
+        )
+        .decode(ArtifactResult.self)
+        .artifact
+    }
+
     func getArtifact(artifactID: String) async throws -> Artifact {
         let params: [String: JSONValue] = ["artifact_id": .string(artifactID)]
         return try await request(method: "artifact.get", params: params)
@@ -1231,6 +1283,323 @@ actor CoreClient {
         ]
         return try await request(method: "workspace.write", params: params)
             .decode(WorkspaceWriteResult.self)
+    }
+
+    func citationAudit(sessionID: String) async throws -> SessionCitationAuditResult {
+        try await request(
+            method: "session.citation_audit",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionCitationAuditResult.self)
+    }
+
+    func skillActivations(sessionID: String) async throws -> SkillActivationsResult {
+        try await request(
+            method: "skill.activations",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SkillActivationsResult.self)
+    }
+
+    func skills(
+        projectID: String,
+        includeDisabled: Bool = true
+    ) async throws -> SkillListResult {
+        try await request(
+            method: "skill.list",
+            params: [
+                "project_id": .string(projectID),
+                "include_disabled": .bool(includeDisabled),
+            ]
+        )
+        .decode(SkillListResult.self)
+    }
+
+    func createSkill(
+        projectID: String,
+        name: String,
+        description: String,
+        whenToUse: String,
+        version: String?,
+        instructions: String,
+        toolAllow: [String],
+        toolDeny: [String],
+        profiles: [String],
+        roles: [String]
+    ) async throws -> ProjectSkill {
+        try await request(
+            method: "skill.create",
+            params: [
+                "project_id": .string(projectID),
+                "name": .string(name),
+                "description": .string(description),
+                "when_to_use": .string(whenToUse),
+                "version": version.map(JSONValue.string) ?? .null,
+                "instructions": .string(instructions),
+                "tool_allow": .array(toolAllow.map(JSONValue.string)),
+                "tool_deny": .array(toolDeny.map(JSONValue.string)),
+                "profiles": .array(profiles.map(JSONValue.string)),
+                "roles": .array(roles.map(JSONValue.string)),
+            ]
+        )
+        .decode(ProjectSkill.self)
+    }
+
+    func importSkill(projectID: String, path: String) async throws -> ProjectSkill {
+        try await request(
+            method: "skill.import",
+            params: [
+                "project_id": .string(projectID),
+                "path": .string(path),
+            ]
+        )
+        .decode(ProjectSkill.self)
+    }
+
+    func updateSkill(
+        id: String,
+        name: String,
+        description: String,
+        whenToUse: String,
+        version: String?,
+        instructions: String,
+        toolAllow: [String],
+        toolDeny: [String],
+        profiles: [String],
+        roles: [String]
+    ) async throws -> ProjectSkill {
+        try await request(
+            method: "skill.update",
+            params: [
+                "id": .string(id),
+                "name": .string(name),
+                "description": .string(description),
+                "when_to_use": .string(whenToUse),
+                "version": version.map(JSONValue.string) ?? .null,
+                "instructions": .string(instructions),
+                "tool_allow": .array(toolAllow.map(JSONValue.string)),
+                "tool_deny": .array(toolDeny.map(JSONValue.string)),
+                "profiles": .array(profiles.map(JSONValue.string)),
+                "roles": .array(roles.map(JSONValue.string)),
+            ]
+        )
+        .decode(ProjectSkill.self)
+    }
+
+    func setSkillEnabled(id: String, enabled: Bool) async throws -> ProjectSkill {
+        try await request(
+            method: "skill.set_enabled",
+            params: ["id": .string(id), "enabled": .bool(enabled)]
+        )
+        .decode(ProjectSkill.self)
+    }
+
+    func deleteSkill(id: String) async throws -> SkillDeleteResult {
+        try await request(method: "skill.delete", params: ["id": .string(id)])
+            .decode(SkillDeleteResult.self)
+    }
+
+    func sources(
+        projectID: String,
+        query: String? = nil,
+        status: String? = nil,
+        limit: Int = 100
+    ) async throws -> SourceListResult {
+        try await request(
+            method: "source.list",
+            params: [
+                "project_id": .string(projectID),
+                "query": query.map(JSONValue.string) ?? .null,
+                "status": status.map(JSONValue.string) ?? .null,
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(SourceListResult.self)
+    }
+
+    func sourceGet(
+        sourceID: String,
+        offset: Int = 0,
+        limit: Int = 20
+    ) async throws -> SourceGetResult {
+        try await request(
+            method: "source.get",
+            params: [
+                "source_id": .string(sourceID),
+                "offset": .number(Double(offset)),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(SourceGetResult.self)
+    }
+
+    func addSourceNote(
+        projectID: String,
+        collection: String? = nil,
+        title: String,
+        content: String
+    ) async throws -> ProjectSource {
+        try await request(
+            method: "source.add_note",
+            params: [
+                "project_id": .string(projectID),
+                "collection": collection.map(JSONValue.string) ?? .null,
+                "title": .string(title),
+                "content": .string(content),
+            ]
+        )
+        .decode(ProjectSource.self)
+    }
+
+    func addSourceFile(
+        projectID: String,
+        collection: String? = nil,
+        path: String,
+        title: String? = nil
+    ) async throws -> ProjectSource {
+        try await request(
+            method: "source.add_file",
+            params: [
+                "project_id": .string(projectID),
+                "collection": collection.map(JSONValue.string) ?? .null,
+                "path": .string(path),
+                "title": title.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(ProjectSource.self)
+    }
+
+    func addSourceURL(
+        projectID: String,
+        collection: String? = nil,
+        url: String,
+        title: String? = nil
+    ) async throws -> ProjectSource {
+        try await request(
+            method: "source.add_url",
+            params: [
+                "project_id": .string(projectID),
+                "collection": collection.map(JSONValue.string) ?? .null,
+                "url": .string(url),
+                "title": title.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(ProjectSource.self)
+    }
+
+    func importSources(
+        projectID: String,
+        collection: String? = nil,
+        path: String? = nil,
+        maxFiles: Int = 100
+    ) async throws -> SourceImportResult {
+        try await request(
+            method: "source.import",
+            params: [
+                "project_id": .string(projectID),
+                "collection": collection.map(JSONValue.string) ?? .null,
+                "path": path.map(JSONValue.string) ?? .null,
+                "max_files": .number(Double(maxFiles)),
+            ]
+        )
+        .decode(SourceImportResult.self)
+    }
+
+    func deleteSource(sourceID: String) async throws -> SourceDeleteResult {
+        try await request(
+            method: "source.delete",
+            params: ["source_id": .string(sourceID)]
+        )
+        .decode(SourceDeleteResult.self)
+    }
+
+    func refreshSource(sourceID: String) async throws -> SourceReindexResult {
+        try await request(
+            method: "source.refresh",
+            params: ["source_id": .string(sourceID)]
+        )
+        .decode(SourceReindexResult.self)
+    }
+
+    func reindexSource(sourceID: String) async throws -> SourceReindexResult {
+        try await request(
+            method: "source.reindex",
+            params: ["source_id": .string(sourceID)]
+        )
+        .decode(SourceReindexResult.self)
+    }
+
+    func searchSources(
+        projectID: String,
+        query: String,
+        sourceIDs: [String] = [],
+        collections: [String] = [],
+        labels: [String] = [],
+        limit: Int = 8
+    ) async throws -> SourceSearchResult {
+        try await request(
+            method: "source.search",
+            params: [
+                "project_id": .string(projectID),
+                "query": .string(query),
+                "source_ids": .array(sourceIDs.map(JSONValue.string)),
+                "collections": .array(collections.map(JSONValue.string)),
+                "labels": .array(labels.map(JSONValue.string)),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(SourceSearchResult.self)
+    }
+
+    func sourceCollections(projectID: String) async throws -> SourceCollectionsResult {
+        try await request(
+            method: "source.collections",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(SourceCollectionsResult.self)
+    }
+
+    func updateSourceMetadata(
+        sourceID: String,
+        title: String,
+        collection: String?,
+        labels: [String]
+    ) async throws -> ProjectSource {
+        try await request(
+            method: "source.update",
+            params: [
+                "source_id": .string(sourceID),
+                "title": .string(title),
+                "collection": collection.map(JSONValue.string) ?? .null,
+                "labels": .array(labels.map(JSONValue.string)),
+            ]
+        )
+        .decode(ProjectSource.self)
+    }
+
+    func setSourceCollection(
+        sourceID: String,
+        collection: String?
+    ) async throws -> ProjectSource {
+        try await request(
+            method: "source.set_collection",
+            params: [
+                "source_id": .string(sourceID),
+                "collection": collection.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(ProjectSource.self)
+    }
+
+    func setSourceLabels(sourceID: String, labels: [String]) async throws -> ProjectSource {
+        try await request(
+            method: "source.set_labels",
+            params: [
+                "source_id": .string(sourceID),
+                "labels": .array(labels.map(JSONValue.string)),
+            ]
+        )
+        .decode(ProjectSource.self)
     }
 
     func schedulerStatus(projectID: String?) async throws -> SchedulerStatusResult {
