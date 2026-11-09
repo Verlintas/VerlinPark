@@ -2580,6 +2580,10 @@ pub struct SessionReplayReport {
     pub questions_matches: bool,
     #[serde(default)]
     pub task_queue_matches: bool,
+    #[serde(default)]
+    pub notes_match: bool,
+    #[serde(default)]
+    pub decisions_match: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -2589,7 +2593,7 @@ pub struct SessionReplayReport {
     pub mismatches: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentRecord {
     pub id: String,
     pub session_id: String,
@@ -2625,7 +2629,7 @@ pub struct AgentListResult {
     pub agents: Vec<AgentRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlanDepartment {
     pub name: String,
     pub manager_title: String,
@@ -2637,7 +2641,7 @@ pub struct PlanDepartment {
     pub cost_budget_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlanTask {
     pub id: String,
     pub department: String,
@@ -2662,7 +2666,7 @@ pub struct PlanTask {
     pub cost_budget_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TeamPlan {
     pub goal: String,
     pub departments: Vec<PlanDepartment>,
@@ -2696,6 +2700,9 @@ pub struct ScheduledTask {
     pub finished_at: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Earliest time an auto-retry should be dispatched. `None` means ready now.
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2751,6 +2758,406 @@ pub struct TeamPlanParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct TeamPlanResult {
     pub plan: Option<TeamPlan>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyFailurePolicy {
+    /// Mark dependents blocked with a precise unmet-dependency reason.
+    #[default]
+    Block,
+    /// Cancel dependents when a dependency fails permanently.
+    Cancel,
+    /// Keep dependents pending so a retry can unblock them.
+    Retry,
+}
+
+/// Project-level orchestration policy. It is intentionally declarative and
+/// deterministic: the runtime applies it without model routing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OrchestrationPolicy {
+    pub auto_retry_failed: bool,
+    pub max_attempts: u32,
+    pub retry_backoff_secs: u64,
+    pub retry_priority_boost: i32,
+    pub dependency_failure: DependencyFailurePolicy,
+    /// Record an escalation note once a task exhausts its retry budget.
+    pub escalate_after_retries: bool,
+    /// Close coordination blockers automatically when their task completes.
+    pub auto_resolve_blockers: bool,
+}
+
+impl Default for OrchestrationPolicy {
+    fn default() -> Self {
+        Self {
+            auto_retry_failed: true,
+            max_attempts: 2,
+            retry_backoff_secs: 30,
+            retry_priority_boost: 10,
+            dependency_failure: DependencyFailurePolicy::Block,
+            escalate_after_retries: true,
+            auto_resolve_blockers: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestrationPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetOrchestrationPolicyParams {
+    pub project_id: String,
+    pub policy: OrchestrationPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrchestrationPolicyResult {
+    pub project_id: String,
+    pub policy: OrchestrationPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanRevisionInfo {
+    pub revision: u32,
+    pub seq: u64,
+    pub kind: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub author: String,
+    pub task_count: usize,
+    #[serde(default)]
+    pub added: Vec<String>,
+    #[serde(default)]
+    pub removed: Vec<String>,
+    #[serde(default)]
+    pub changed: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanRevisionListParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanRevisionListResult {
+    pub revisions: Vec<PlanRevisionInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviseTeamPlanParams {
+    pub session_id: String,
+    pub plan: TeamPlan,
+    pub reason: String,
+    #[serde(default)]
+    pub expected_revision: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviseTeamPlanResult {
+    pub revision: PlanRevisionInfo,
+    pub plan: TeamPlan,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanRevisionGetParams {
+    pub session_id: String,
+    pub revision: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanRevisionDetailResult {
+    pub revision: PlanRevisionInfo,
+    pub plan: TeamPlan,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanRevisionRestoreParams {
+    pub session_id: String,
+    pub revision: u32,
+    pub reason: String,
+    #[serde(default)]
+    pub expected_revision: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskEditParams {
+    pub session_id: String,
+    pub task: PlanTask,
+    pub reason: String,
+    #[serde(default)]
+    pub expected_revision: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrchestrationTask {
+    pub task_id: String,
+    pub department: String,
+    pub title: String,
+    pub kind: String,
+    pub priority: i32,
+    pub status: String,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub owner_agent_id: Option<String>,
+    #[serde(default)]
+    pub owner_agent_name: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub result_summary: Option<String>,
+    #[serde(default)]
+    pub verifier_status: Option<String>,
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+    pub ready: bool,
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrchestrationDepartment {
+    pub name: String,
+    pub manager_title: String,
+    pub profile: String,
+    pub objective: String,
+    pub total_tasks: usize,
+    pub completed_tasks: usize,
+    pub active_tasks: usize,
+    pub blocked_tasks: usize,
+    pub failed_tasks: usize,
+    #[serde(default)]
+    pub manager_agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrchestrationNote {
+    pub note_id: String,
+    pub action: String,
+    pub severity: String,
+    pub status: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub target_agent_id: Option<String>,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub message: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrchestrationDecision {
+    pub decision_id: String,
+    pub action: String,
+    pub task_id: Option<String>,
+    pub detail: String,
+    pub attempt: u32,
+    pub agent_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrchestrationBlocker {
+    pub kind: String,
+    #[serde(default)]
+    pub note_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    pub message: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct OrchestrationMetrics {
+    pub total_agents: usize,
+    pub running_agents: usize,
+    pub queued_agents: usize,
+    pub failed_agents: usize,
+    pub total_tasks: usize,
+    pub completed_tasks: usize,
+    pub active_tasks: usize,
+    pub ready_tasks: usize,
+    pub blocked_tasks: usize,
+    pub failed_tasks: usize,
+    pub retrying_tasks: usize,
+    pub open_blockers: usize,
+    pub merge_queue_depth: usize,
+    pub merge_conflicts: usize,
+    pub attention_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrchestrationSnapshot {
+    pub session_id: String,
+    pub project_id: String,
+    pub goal: String,
+    pub status: String,
+    #[serde(default)]
+    pub plan: Option<TeamPlan>,
+    pub plan_revision: u32,
+    pub policy: OrchestrationPolicy,
+    #[serde(default)]
+    pub departments: Vec<OrchestrationDepartment>,
+    #[serde(default)]
+    pub tasks: Vec<OrchestrationTask>,
+    #[serde(default)]
+    pub agents: Vec<AgentRecord>,
+    #[serde(default)]
+    pub notes: Vec<OrchestrationNote>,
+    #[serde(default)]
+    pub decisions: Vec<OrchestrationDecision>,
+    #[serde(default)]
+    pub revisions: Vec<PlanRevisionInfo>,
+    #[serde(default)]
+    pub blockers: Vec<OrchestrationBlocker>,
+    pub metrics: OrchestrationMetrics,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoordinationNoteParams {
+    pub session_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub target_agent_id: Option<String>,
+    #[serde(default)]
+    pub target_note_id: Option<String>,
+    pub message: String,
+    #[serde(default)]
+    pub severity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoordinationNoteResult {
+    pub note_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeLeaseInfo {
+    pub lease_key: String,
+    pub owner_id: String,
+    pub kind: String,
+    pub session_id: Option<String>,
+    pub acquired_at: String,
+    pub heartbeat_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeLeaseListResult {
+    pub runtime_id: String,
+    pub leases: Vec<RuntimeLeaseInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeLeaseSweepResult {
+    pub removed: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestrationAdvanceParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrchestrationPreviewAction {
+    pub action: String,
+    pub task_id: String,
+    pub detail: String,
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestrationPreviewParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrchestrationPreviewResult {
+    pub session_id: String,
+    pub actions: Vec<OrchestrationPreviewAction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrchestrationAdvanceResult {
+    pub session_id: String,
+    pub actions: Vec<OrchestrationDecision>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestrationOverviewParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrchestrationSessionSummary {
+    pub session_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub goal: String,
+    pub status: String,
+    pub priority: i32,
+    pub plan_revision: u32,
+    pub metrics: OrchestrationMetrics,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub last_decision: Option<String>,
+    #[serde(default)]
+    pub last_decision_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct OrchestrationOverviewTotals {
+    pub sessions: usize,
+    pub running: usize,
+    pub attention: usize,
+    pub blocked_tasks: usize,
+    pub failed_tasks: usize,
+    pub retrying_tasks: usize,
+    pub open_blockers: usize,
+    pub merge_conflicts: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrchestrationOverviewResult {
+    pub sessions: Vec<OrchestrationSessionSummary>,
+    pub totals: OrchestrationOverviewTotals,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestrationSnapshotParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrchestrationSnapshotResult {
+    pub snapshot: OrchestrationSnapshot,
 }
 
 #[cfg(test)]

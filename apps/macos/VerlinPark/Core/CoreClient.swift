@@ -1074,6 +1074,169 @@ actor CoreClient {
         .decode(TaskQueueResult.self)
     }
 
+    func orchestrationPolicy(projectID: String) async throws -> OrchestrationPolicy {
+        try await request(
+            method: "orchestration.policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(OrchestrationPolicyResult.self)
+        .policy
+    }
+
+    func setOrchestrationPolicy(
+        projectID: String,
+        policy: OrchestrationPolicy
+    ) async throws -> OrchestrationPolicy {
+        let params: [String: JSONValue] = try [
+            "project_id": .string(projectID),
+            "policy": jsonValue(policy),
+        ]
+        return try await request(method: "orchestration.policy.set", params: params)
+            .decode(OrchestrationPolicyResult.self)
+            .policy
+    }
+
+    func orchestrationOverview(
+        projectID: String?,
+        limit: Int = 20
+    ) async throws -> OrchestrationOverviewResult {
+        var params: [String: JSONValue] = ["limit": .number(Double(limit))]
+        params["project_id"] = projectID.map(JSONValue.string) ?? .null
+        return try await request(method: "orchestration.overview", params: params)
+            .decode(OrchestrationOverviewResult.self)
+    }
+
+    func runtimeLeases() async throws -> RuntimeLeaseListResult {
+        try await request(method: "runtime.leases", params: [:])
+            .decode(RuntimeLeaseListResult.self)
+    }
+
+    func sweepRuntimeLeases() async throws -> Int {
+        try await request(method: "runtime.leases.sweep", params: [:])
+            .decode(RuntimeLeaseSweepResult.self)
+            .removed
+    }
+
+    func previewOrchestration(sessionID: String) async throws -> OrchestrationPreviewResult {
+        try await request(
+            method: "orchestration.preview",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(OrchestrationPreviewResult.self)
+    }
+
+    func advanceOrchestration(sessionID: String) async throws -> [OrchestrationDecision] {
+        try await request(
+            method: "orchestration.advance",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(OrchestrationAdvanceResult.self)
+        .actions
+    }
+
+    func orchestrationSnapshot(sessionID: String) async throws -> OrchestrationSnapshot {
+        try await request(
+            method: "orchestration.snapshot",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(OrchestrationSnapshotResult.self)
+        .snapshot
+    }
+
+    func planRevisions(sessionID: String) async throws -> [PlanRevisionInfo] {
+        try await request(
+            method: "team_plan.revisions",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(PlanRevisionListResult.self)
+        .revisions
+    }
+
+    func planRevisionDetail(
+        sessionID: String,
+        revision: Int
+    ) async throws -> PlanRevisionDetailResult {
+        try await request(
+            method: "team_plan.revision",
+            params: [
+                "session_id": .string(sessionID),
+                "revision": .number(Double(revision)),
+            ]
+        )
+        .decode(PlanRevisionDetailResult.self)
+    }
+
+    func restoreTeamPlanRevision(
+        sessionID: String,
+        revision: Int,
+        reason: String,
+        expectedRevision: Int?
+    ) async throws -> ReviseTeamPlanResult {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "revision": .number(Double(revision)),
+            "reason": .string(reason),
+        ]
+        params["expected_revision"] = expectedRevision.map { .number(Double($0)) } ?? .null
+        return try await request(method: "team_plan.restore", params: params)
+            .decode(ReviseTeamPlanResult.self)
+    }
+
+    func editPlanTask(
+        sessionID: String,
+        task: PlanTask,
+        reason: String,
+        expectedRevision: Int?
+    ) async throws -> ReviseTeamPlanResult {
+        var params: [String: JSONValue] = try [
+            "session_id": .string(sessionID),
+            "task": jsonValue(task),
+            "reason": .string(reason),
+        ]
+        params["expected_revision"] = expectedRevision.map { .number(Double($0)) } ?? .null
+        return try await request(method: "team_plan.task_edit", params: params)
+            .decode(ReviseTeamPlanResult.self)
+    }
+
+    func reviseTeamPlan(
+        sessionID: String,
+        plan: TeamPlan,
+        reason: String,
+        expectedRevision: Int?
+    ) async throws -> ReviseTeamPlanResult {
+        var params: [String: JSONValue] = try [
+            "session_id": .string(sessionID),
+            "plan": jsonValue(plan),
+            "reason": .string(reason),
+        ]
+        params["expected_revision"] = expectedRevision.map { .number(Double($0)) } ?? .null
+        return try await request(method: "team_plan.revise", params: params)
+            .decode(ReviseTeamPlanResult.self)
+    }
+
+    func coordinationNote(
+        sessionID: String,
+        action: String,
+        taskID: String?,
+        targetAgentID: String?,
+        targetNoteID: String?,
+        message: String,
+        severity: String
+    ) async throws -> String {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "action": .string(action),
+            "message": .string(message),
+            "severity": .string(severity),
+        ]
+        params["task_id"] = taskID.map(JSONValue.string) ?? .null
+        params["target_agent_id"] = targetAgentID.map(JSONValue.string) ?? .null
+        params["target_note_id"] = targetNoteID.map(JSONValue.string) ?? .null
+        return try await request(method: "coordination.note", params: params)
+            .decode(CoordinationNoteResult.self)
+            .noteId
+    }
+
     func dispatchTask(sessionID: String) async throws -> Bool {
         try await request(
             method: "task.dispatch",
@@ -1466,6 +1629,11 @@ actor CoreClient {
             "verifier": value(models.verifier),
             "labour": value(models.labour),
         ])
+    }
+
+    private func jsonValue(_ value: some Encodable) throws -> JSONValue {
+        let data = try JSONEncoder().encode(value)
+        return try JSONDecoder().decode(JSONValue.self, from: data)
     }
 
     private func request(

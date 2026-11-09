@@ -377,7 +377,10 @@ struct DashboardView: View {
             QuestionCenterCard()
         case .team:
             AgentsCard()
+            OrchestrationOverviewCard()
             TaskSchedulerCard()
+            OrchestrationPolicyCard()
+            RuntimeLeaseCard()
         case .usage:
             if let project = model.selectedProject {
                 ProjectUsageCard(project: project)

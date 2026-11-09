@@ -1,11 +1,60 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-08
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 已跑通
+> 最后更新：2026-11-09
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)  
 > 文档索引：[README.md](README.md)
 
 ---
+
+## 2026-11-09 多智能体编排硬化切片
+
+这一轮把“多 Agent 协作”从事件展示推进到可配置、可恢复、可审计、可操作的编排层，重点不是增加一个模型，而是让 runtime 对团队状态负责。
+
+### 编排控制器
+
+- 项目级 `OrchestrationPolicy`：自动重试、最大尝试次数、指数退避、重试优先级提升、依赖失败策略（block/cancel/retry）、耗尽后升级、自动解除 blocker。
+- `plan_tasks.next_attempt_at` 持久化重试门；`plan_task.retry_scheduled` / `blocked` / `unblocked` / `cancelled` 事件进入 task 投影、replay、repair 和 bundle/db-rebuild。
+- 确定性控制器动作：retry / block / unblock / cancel / escalate / resolve_blockers；每个动作写 `orchestration.decision`，不调用模型、不做模型路由。
+- 任务完成时立即运行控制器；daemon tick（`VERLINPARK_ORCHESTRATION_TICK_SECS`，默认 20s）补跑重启后到期重试和失败/阻塞 session。
+- session token/USD 预算耗尽时抑制重试并升级，避免用用户已耗尽的预算继续循环。
+- `orchestration.preview` 返回与 `advance` 相同的动作但不落库；Collab Ops 先预览再显式 Apply。
+- `orchestration.overview` 聚合最近 TeamPlan session 的 attention/running/blocked/failed/retrying/merge-conflict 指标，供 Manage Dash Mission Control。
+- CLI：`vp orchestrate <session> [--dry-run]`、`vp orchestration-preview`（通过 `orchestration.preview`）、`vp orchestration-overview`、`vp orchestration-policy[-set]`。
+
+### 持久协调与计划修订
+
+- `coordination_notes` / `orchestration_decisions` SQLite 投影：事件 + 投影原子写入；长 session 不再因 5,000 event 窗口丢失 blocker/decision。
+- `unblock` 按 note id 或 task id 解析，`resolved_at` 使用事件时间，replay 可逐字段比较。
+- 定向 coordination note 会进入目标 agent 的 durable mailbox；Plan Worker brief 包含：
+  - 直接发给它的 note；
+  - 自己 task 的 note；
+  - 最近的共享 handoff/decision/escalation；
+  - 未读 mailbox 摘要（读取时标记 read）。
+- `team_plan.revision` 返回历史 revision 的完整 plan；`team_plan.restore` 以新 revision 恢复历史 plan；`team_plan.task_edit` 只改一个 task，并复用 active/completed task 保护。
+- `SessionReplayReport` 增加 `notes_match` / `decisions_match`；`session.replay --repair` 和 bundle import 从事件重建两张投影。
+- Collab Ops 增加 Coordination Inbox、Plan Revision 详情/恢复、Task Editor、blocker resolve/reply、preview/advance 与 policy editor。
+
+### 运行时租约
+
+- `runtime_leases`（lease_key/owner/kind/session/heartbeat/expiry）跨进程 SQLite 租约。
+- Leader prompt run 和 plan-run（scheduler/resume）都获取 `session:{id}` 租约（TTL 180s，TTL/3 心跳）；释放写 `session.lease.released`，崩溃后 TTL 过期可接管。
+- `runtime.leases` / `runtime.leases.sweep` / `vp leases` / `vp leases-sweep` / Manage Dash Runtime leases 卡片。
+- 现有 data-dir 实例锁仍保留；租约不冒充分布式 fencing。
+
+### 测试与验证
+
+- Rust：新增 orchestration 纯函数/控制器测试、store 投影测试、Engine 控制循环/preview/overview/lease/revision/replay-repair 测试；总计 349 active（core 279，protocol 2，store 54，providers 14；3 ignored live）。
+- Swift：新增 snapshot/preview/lease/overview/revision 解码、graph orchestration 状态、policy、task filter 测试；总计 103。
+- Live DeepSeek E2E（2026-11-09）：provider probe 成功；单 Leader 写文件成功；真 TeamPlan（1 Manager + 2 Workers + 2 Verifiers）并行完成 T1/T2，两个 commit 经 Verifier 后进入 merge queue 并以 `--diff-check` 合并到 session branch；`orchestration.preview` 对完成 session 返回空动作；对 completed task 的 `task_edit` 被安全拒绝；`coordination.note` blocker/unblock、mailbox、`team_plan.restore`、`replay`/`repair` 均实测通过。
+
+### 仍未实现
+
+- Manager review 不是强制 gate；verifier gate 仍然是合并前唯一必需评审。
+- 自动重试只覆盖 failed task；不自动创建新 plan task，也不自动重新规划。
+- Runtime lease 不是完整分布式调度/fencing；daemon 仍假设一个 data-dir 一个实例。
+- 没有 GUI/browser agent 工具，`ComputerLease` 仍未实现。
+- 外部 ACP agent 仍是受信任二进制；不提供 credential/network sandbox。
 
 ## 当前可用的能力
 
@@ -21,6 +70,7 @@
 | Agent profile | ✅ | coding / research / verification / generic；决定工具集与 prompt；Verifier 在 isolated detached clone 中运行 |
 | ACP 外部 Agent | ✅ | `acp.agent.*` / `vp acp-*` / Settings ACP；Leader/Manager 用 `delegate_acp` 委派外部 stdio agent；Worker slot、task worktree、global capacity/write lease、Seatbelt 写沙箱 + scratch HOME、MCP 传递（stdio 总是传递，HTTP/SSE 仅在 agent capability 支持时传递）、permission→approval、timeout/cancel、Verifier/Integrator 全链路；probe 在隔离 scratch cwd 中初始化且不发送 prompt |
 | TeamPlan | ✅ | Leader 定义 departments / Manager titles / profiles / task DAG / task priority（-100..100）；runtime 校验结构、依赖、优先级和 scope 语法并持久化 |
+| 多智能体编排 | ✅ | 项目级 OrchestrationPolicy（重试/退避/依赖失败/升级/blocker 自动解除）；持久 `next_attempt_at` 重试门；确定性 controller（retry/block/unblock/cancel/escalate/resolve_blockers）；plan task 完成 + daemon tick 双入口；预算耗尽抑制重试；`orchestration.preview/advance/overview`；持久 coordination/decision 投影、定向 mailbox 交付、revision detail/restore、单 task 编辑；见 ADR-0121/0122 |
 | Manager 圆桌 | ✅ | `deliberate_team_plan`，1–3 轮，只读，后一轮看到前一轮所有 peer positions；Collab 显示按 round 分组的 Manager 立场卡片 |
 | 自动派发 | ✅ | `run_team_plan` 按依赖批次执行 ready tasks；ready task 按 priority desc + id 排序；同批筛选不重叠 scope；Manager 懒创建；失败阻塞依赖；batch abort 时先结算同批全部 task（cancelled/blocked），不留下 running 投影；`session.plan_resume` / `vp resume-plan` / Preview Resume plan 可跳过 completed task，重跑 unfinished task |
 | Task worktree | ✅ | Worker 独立 task worktree/branch；Labour 继承 Worker worktree；resume 复用/重新 attach 已有 worktree 和 branch，base 使用 merge-base，已有 commit 可重新进入 Verifier/Integrator |
@@ -70,7 +120,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：318 个测试通过（core 257、protocol 2、store 45、providers 14）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `cargo test --workspace`：349 个测试通过（core 279、protocol 2、store 54、providers 14）；另有 3 个 env-gated live provider tests 默认 ignored。
 - `xcodebuild test`：94 个 Swift 测试通过（含协议向后兼容解码、diff parser、transcript/collab、Rail session grouping 与 design-system invariants）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。

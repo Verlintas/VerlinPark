@@ -11,13 +11,36 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy,
     CheckpointRetentionPolicy, Event, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig,
-    McpTransport, MemoryItem, MemoryPolicy, MergeQueueEntry, ModelPreset, Project, ProjectBudget,
-    ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy,
-    StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy,
-    WriteLease,
+    McpTransport, MemoryItem, MemoryPolicy, MergeQueueEntry, ModelPreset, OrchestrationDecision,
+    OrchestrationNote, OrchestrationPolicy, Project, ProjectBudget, ProjectUsageSession, Question,
+    ScheduledTask, SearchHit, Session, SessionBundle, ShellPolicy, StoredMessage,
+    TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
 };
 
 use crate::paths;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeLease {
+    pub lease_key: String,
+    pub owner_id: String,
+    pub kind: String,
+    pub session_id: Option<String>,
+    pub acquired_at: String,
+    pub heartbeat_at: String,
+    pub expires_at: String,
+}
+
+fn map_runtime_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeLease> {
+    Ok(RuntimeLease {
+        lease_key: row.get(0)?,
+        owner_id: row.get(1)?,
+        kind: row.get(2)?,
+        session_id: row.get(3)?,
+        acquired_at: row.get(4)?,
+        heartbeat_at: row.get(5)?,
+        expires_at: row.get(6)?,
+    })
+}
 
 /// Explicit projection repair derived from the event stream. Fields set to
 /// `None` are left untouched; `replace_plan` distinguishes "clear the plan"
@@ -63,6 +86,8 @@ pub struct ProjectManifestSnapshot {
     pub task_scheduler_policy: TaskSchedulerPolicy,
     #[serde(default)]
     pub memory_policy: MemoryPolicy,
+    #[serde(default)]
+    pub orchestration_policy: OrchestrationPolicy,
 }
 
 /// Read the latest project snapshot for each project from `projects.jsonl`.
@@ -498,6 +523,40 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_questions_session
                 ON questions(session_id, created_at);
 
+            CREATE TABLE IF NOT EXISTS coordination_notes (
+                note_id          TEXT PRIMARY KEY,
+                session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq              INTEGER NOT NULL,
+                action           TEXT NOT NULL,
+                severity         TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                task_id          TEXT,
+                target_agent_id  TEXT,
+                agent_id         TEXT NOT NULL,
+                agent_name       TEXT NOT NULL,
+                message          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                resolved_at      TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_coordination_notes_session
+                ON coordination_notes(session_id, seq);
+
+            CREATE TABLE IF NOT EXISTS orchestration_decisions (
+                decision_id      TEXT PRIMARY KEY,
+                session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq              INTEGER NOT NULL,
+                action           TEXT NOT NULL,
+                task_id          TEXT,
+                detail           TEXT NOT NULL,
+                attempt          INTEGER NOT NULL DEFAULT 0,
+                agent_id         TEXT NOT NULL,
+                created_at       TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_orchestration_decisions_session
+                ON orchestration_decisions(session_id, seq);
+
             CREATE TABLE IF NOT EXISTS mcp_servers (
                 id          TEXT PRIMARY KEY,
                 name        TEXT NOT NULL UNIQUE,
@@ -568,6 +627,12 @@ impl Store {
                 cooldown_secs  INTEGER NOT NULL DEFAULT 60,
                 dispatch_tasks INTEGER NOT NULL DEFAULT 0,
                 updated_at     TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_orchestration_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_mailbox_policies (
@@ -644,6 +709,7 @@ impl Store {
                 write_scope  TEXT NOT NULL DEFAULT '[]',
                 attempts     INTEGER NOT NULL DEFAULT 0,
                 last_error   TEXT,
+                next_attempt_at TEXT,
                 enqueued_at  TEXT NOT NULL,
                 started_at   TEXT,
                 finished_at  TEXT,
@@ -666,6 +732,21 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_write_leases_project
                 ON write_leases(project_id, acquired_at);
+
+            CREATE TABLE IF NOT EXISTS runtime_leases (
+                lease_key     TEXT PRIMARY KEY,
+                owner_id      TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                session_id    TEXT,
+                acquired_at   TEXT NOT NULL,
+                heartbeat_at  TEXT NOT NULL,
+                expires_at    TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_runtime_leases_expiry
+                ON runtime_leases(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_leases_session
+                ON runtime_leases(session_id);
             "#,
         )?;
         let fts_migrated = conn
@@ -784,6 +865,7 @@ impl Store {
         ensure_column(&conn, "agents", "branch", "TEXT")?;
         ensure_column(&conn, "agents", "task_id", "TEXT")?;
         ensure_column(&conn, "agents", "department", "TEXT")?;
+        ensure_column(&conn, "plan_tasks", "next_attempt_at", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_reason", "TEXT")?;
         ensure_column(&conn, "sessions", "tokens_in", "INTEGER NOT NULL DEFAULT 0")?;
@@ -943,6 +1025,7 @@ impl Store {
                 budget: self.get_project_budget(&project.id)?,
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 memory_policy: self.get_memory_policy(&project.id)?,
+                orchestration_policy: self.get_orchestration_policy(&project.id)?,
                 project,
             };
             serde_json::to_writer(&mut line_buffer, &snapshot)?;
@@ -1100,6 +1183,380 @@ impl Store {
                 if policy.dispatch_tasks { 1 } else { 0 },
                 now_rfc3339()
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a coordination note and update its projection in one
+    /// transaction. Unblock events resolve an existing note (or every open
+    /// blocker for a task) and do not create a new note row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_coordination_note_with_event(
+        &self,
+        session_id: &str,
+        action: &str,
+        severity: &str,
+        task_id: Option<&str>,
+        target_agent_id: Option<&str>,
+        target_note_id: Option<&str>,
+        agent_id: &str,
+        agent_name: &str,
+        agent_role: Option<&str>,
+        message: &str,
+    ) -> Result<Event> {
+        let note_id = Uuid::now_v7().to_string();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let payload = serde_json::json!({
+            "note_id": note_id,
+            "action": action,
+            "severity": severity,
+            "task_id": task_id,
+            "target_agent_id": target_agent_id,
+            "target_note_id": target_note_id,
+            "message": message,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "agent_role": agent_role,
+        });
+        let event = insert_event_tx(&tx, session_id, "coordination.note", payload)?;
+        if action == "unblock" {
+            let changed = if let Some(target_note_id) = target_note_id {
+                tx.execute(
+                    "UPDATE coordination_notes
+                     SET status = 'resolved', resolved_at = ?1
+                     WHERE note_id = ?2 AND session_id = ?3 AND status = 'open'",
+                    params![event.created_at, target_note_id, session_id],
+                )?
+            } else if let Some(task_id) = task_id {
+                tx.execute(
+                    "UPDATE coordination_notes
+                     SET status = 'resolved', resolved_at = ?1
+                     WHERE task_id = ?2 AND session_id = ?3 AND status = 'open'",
+                    params![event.created_at, task_id, session_id],
+                )?
+            } else {
+                return Err(anyhow!("an unblock note needs a task id or target note id"));
+            };
+            if changed == 0 {
+                return Err(anyhow!("no open coordination blocker matched the unblock"));
+            }
+        }
+        if action != "unblock" {
+            let status = if action == "blocker" { "open" } else { "info" };
+            tx.execute(
+                "INSERT INTO coordination_notes
+                 (note_id, session_id, seq, action, severity, status, task_id,
+                  target_agent_id, agent_id, agent_name, message, created_at, resolved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
+                params![
+                    note_id,
+                    session_id,
+                    event.seq as i64,
+                    action,
+                    severity,
+                    status,
+                    task_id,
+                    target_agent_id,
+                    agent_id,
+                    agent_name,
+                    message,
+                    event.created_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
+    pub fn list_coordination_notes(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<Vec<OrchestrationNote>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT note_id, action, severity, status, task_id, target_agent_id,
+                    agent_id, agent_name, message, created_at, resolved_at
+             FROM coordination_notes
+             WHERE session_id = ?1
+             ORDER BY seq DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, i64::from(limit.clamp(1, 2_000))],
+            |row| {
+                Ok(OrchestrationNote {
+                    note_id: row.get(0)?,
+                    action: row.get(1)?,
+                    severity: row.get(2)?,
+                    status: row.get(3)?,
+                    task_id: row.get(4)?,
+                    target_agent_id: row.get(5)?,
+                    agent_id: row.get(6)?,
+                    agent_name: row.get(7)?,
+                    message: row.get(8)?,
+                    created_at: row.get(9)?,
+                    resolved_at: row.get(10)?,
+                })
+            },
+        )?;
+        let mut notes = rows.collect::<Result<Vec<_>, _>>()?;
+        notes.reverse();
+        Ok(notes)
+    }
+
+    /// Notes that matter to one agent: direct targets, notes on its task,
+    /// and shared handoffs/decisions/escalations. This keeps a Worker's brief
+    /// focused instead of replaying every note in the session.
+    pub fn list_coordination_notes_for_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        task_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<OrchestrationNote>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT note_id, action, severity, status, task_id, target_agent_id,
+                    agent_id, agent_name, message, created_at, resolved_at
+             FROM coordination_notes
+             WHERE session_id = ?1
+               AND (
+                    target_agent_id = ?2
+                    OR (?3 IS NOT NULL AND task_id = ?3)
+                    OR (target_agent_id IS NULL AND action IN ('handoff', 'decision', 'escalate'))
+               )
+             ORDER BY seq DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                session_id,
+                agent_id,
+                task_id,
+                i64::from(limit.clamp(1, 500))
+            ],
+            |row| {
+                Ok(OrchestrationNote {
+                    note_id: row.get(0)?,
+                    action: row.get(1)?,
+                    severity: row.get(2)?,
+                    status: row.get(3)?,
+                    task_id: row.get(4)?,
+                    target_agent_id: row.get(5)?,
+                    agent_id: row.get(6)?,
+                    agent_name: row.get(7)?,
+                    message: row.get(8)?,
+                    created_at: row.get(9)?,
+                    resolved_at: row.get(10)?,
+                })
+            },
+        )?;
+        let mut notes = rows.collect::<Result<Vec<_>, _>>()?;
+        notes.reverse();
+        Ok(notes)
+    }
+
+    pub fn replace_coordination_notes(
+        &self,
+        session_id: &str,
+        notes: &[OrchestrationNote],
+        events: &[Event],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM coordination_notes WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let seq_by_note = events
+            .iter()
+            .filter(|event| event.kind == "coordination.note")
+            .filter_map(|event| {
+                let note_id = event.payload.get("note_id")?.as_str()?;
+                Some((note_id.to_string(), event.seq))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for note in notes {
+            tx.execute(
+                "INSERT INTO coordination_notes
+                 (note_id, session_id, seq, action, severity, status, task_id,
+                  target_agent_id, agent_id, agent_name, message, created_at, resolved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    note.note_id,
+                    session_id,
+                    *seq_by_note.get(&note.note_id).unwrap_or(&0) as i64,
+                    note.action,
+                    note.severity,
+                    note.status,
+                    note.task_id,
+                    note.target_agent_id,
+                    note.agent_id,
+                    note.agent_name,
+                    note.message,
+                    note.created_at,
+                    note.resolved_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_orchestration_decision_with_event(
+        &self,
+        session_id: &str,
+        action: &str,
+        task_id: Option<&str>,
+        detail: &str,
+        attempt: u32,
+        agent_id: &str,
+    ) -> Result<Event> {
+        let decision_id = Uuid::now_v7().to_string();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "orchestration.decision",
+            serde_json::json!({
+                "decision_id": decision_id,
+                "action": action,
+                "task_id": task_id,
+                "detail": detail,
+                "attempt": attempt,
+                "agent_id": agent_id,
+            }),
+        )?;
+        tx.execute(
+            "INSERT INTO orchestration_decisions
+             (decision_id, session_id, seq, action, task_id, detail, attempt, agent_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                decision_id,
+                session_id,
+                event.seq as i64,
+                action,
+                task_id,
+                detail,
+                i64::from(attempt),
+                agent_id,
+                event.created_at
+            ],
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
+    pub fn list_orchestration_decisions(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<Vec<OrchestrationDecision>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT decision_id, action, task_id, detail, attempt, agent_id, created_at
+             FROM orchestration_decisions
+             WHERE session_id = ?1
+             ORDER BY seq DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, i64::from(limit.clamp(1, 2_000))],
+            |row| {
+                Ok(OrchestrationDecision {
+                    decision_id: row.get(0)?,
+                    action: row.get(1)?,
+                    task_id: row.get(2)?,
+                    detail: row.get(3)?,
+                    attempt: row.get::<_, i64>(4)?.max(0) as u32,
+                    agent_id: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            },
+        )?;
+        let mut decisions = rows.collect::<Result<Vec<_>, _>>()?;
+        decisions.reverse();
+        Ok(decisions)
+    }
+
+    pub fn replace_orchestration_decisions(
+        &self,
+        session_id: &str,
+        decisions: &[OrchestrationDecision],
+        events: &[Event],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM orchestration_decisions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let seq_by_decision = events
+            .iter()
+            .filter(|event| event.kind == "orchestration.decision")
+            .filter_map(|event| {
+                let decision_id = event.payload.get("decision_id")?.as_str()?;
+                Some((decision_id.to_string(), event.seq))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for decision in decisions {
+            tx.execute(
+                "INSERT INTO orchestration_decisions
+                 (decision_id, session_id, seq, action, task_id, detail, attempt, agent_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    decision.decision_id,
+                    session_id,
+                    *seq_by_decision.get(&decision.decision_id).unwrap_or(&0) as i64,
+                    decision.action,
+                    decision.task_id,
+                    decision.detail,
+                    i64::from(decision.attempt),
+                    decision.agent_id,
+                    decision.created_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_orchestration_policy(&self, project_id: &str) -> Result<OrchestrationPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT policy FROM project_orchestration_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(stored
+            .and_then(|raw| serde_json::from_str::<OrchestrationPolicy>(&raw).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn set_orchestration_policy(
+        &self,
+        project_id: &str,
+        policy: &OrchestrationPolicy,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_orchestration_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, serde_json::to_string(policy)?, now_rfc3339()],
         )?;
         Ok(())
     }
@@ -4475,6 +4932,36 @@ impl Store {
         Ok(event)
     }
 
+    /// Persist a plan revision and its event atomically. The payload is
+    /// supplied by the orchestration layer so the event carries the revision,
+    /// author, reason, and task diff.
+    pub fn set_team_plan_revision_with_event(
+        &self,
+        session_id: &str,
+        plan: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<Event> {
+        if !matches!(kind, "team_plan.submitted" | "team_plan.revised") {
+            return Err(anyhow!("invalid team plan event kind: {kind}"));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET team_plan = ?1 WHERE id = ?2",
+            params![plan, session_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let event = insert_event_tx(&tx, session_id, kind, payload)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
     pub fn get_team_plan(&self, session_id: &str) -> Result<Option<String>> {
         let conn = self.lock()?;
         conn.query_row(
@@ -4506,6 +4993,7 @@ impl Store {
             started_at: Option<String>,
             finished_at: Option<String>,
             last_error: Option<String>,
+            next_attempt_at: Option<String>,
         }
         let previous = {
             let mut stmt = tx.prepare(
@@ -4537,7 +5025,9 @@ impl Store {
                    AND type IN ('plan_task.started', 'plan_task.finished',
                                 'plan_task.interrupted', 'plan_task.retried',
                                 'plan_task.skipped', 'plan_task.cancelling',
-                                'plan_task.pausing', 'plan_task.paused', 'plan_task.resumed')
+                                'plan_task.pausing', 'plan_task.paused', 'plan_task.resumed',
+                                'plan_task.retry_scheduled', 'plan_task.blocked',
+                                'plan_task.unblocked', 'plan_task.cancelled')
                  ORDER BY seq ASC",
             )?;
             let rows = stmt.query_map(params![session_id, plan_seq as i64], |row| {
@@ -4559,6 +5049,7 @@ impl Store {
                     started_at: None,
                     finished_at: None,
                     last_error: None,
+                    next_attempt_at: None,
                 });
                 match kind.as_str() {
                     "plan_task.started" => {
@@ -4574,6 +5065,7 @@ impl Store {
                         let status = payload["task_status"].as_str().unwrap_or("failed");
                         state.status = status.to_string();
                         state.finished_at = Some(created_at);
+                        state.next_attempt_at = None;
                         state.last_error = if status == "completed" {
                             None
                         } else {
@@ -4582,6 +5074,13 @@ impl Store {
                                 .or_else(|| payload["summary"].as_str())
                                 .map(str::to_string)
                         };
+                    }
+                    "plan_task.retry_scheduled" => {
+                        state.status = "pending".to_string();
+                        state.finished_at = None;
+                        state.next_attempt_at =
+                            payload["next_attempt_at"].as_str().map(str::to_string);
+                        state.last_error = payload["reason"].as_str().map(str::to_string);
                     }
                     "plan_task.interrupted" => {
                         state.status = "interrupted".to_string();
@@ -4618,6 +5117,22 @@ impl Store {
                         state.finished_at = Some(created_at);
                         state.last_error = payload["reason"].as_str().map(str::to_string);
                     }
+                    "plan_task.blocked" => {
+                        state.status = "blocked".to_string();
+                        state.finished_at = None;
+                        state.last_error = payload["reason"].as_str().map(str::to_string);
+                    }
+                    "plan_task.unblocked" => {
+                        state.status = "pending".to_string();
+                        state.finished_at = None;
+                        state.last_error = None;
+                        state.next_attempt_at = None;
+                    }
+                    "plan_task.cancelled" => {
+                        state.status = "cancelled".to_string();
+                        state.finished_at = Some(created_at);
+                        state.last_error = payload["reason"].as_str().map(str::to_string);
+                    }
                     _ => {}
                 }
             }
@@ -4647,9 +5162,9 @@ impl Store {
             tx.execute(
                 "INSERT INTO plan_tasks
                  (session_id, plan_seq, task_id, project_id, department, title, priority,
-                  status, deps, write_scope, attempts, last_error, enqueued_at, started_at,
-                  finished_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  status, deps, write_scope, attempts, last_error, next_attempt_at, enqueued_at,
+                  started_at, finished_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     session_id,
                     plan_seq as i64,
@@ -4663,6 +5178,7 @@ impl Store {
                     serde_json::to_string(&task.write_scope)?,
                     i64::from(attempts),
                     last_error,
+                    state.and_then(|state| state.next_attempt_at.as_deref()),
                     enqueued_at,
                     started_at,
                     finished_at,
@@ -4684,7 +5200,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                     status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                    last_error
+                    last_error, next_attempt_at
              FROM plan_tasks
              WHERE (?1 IS NULL OR project_id = ?1) AND (?2 IS NULL OR session_id = ?2)
              ORDER BY project_id ASC, session_id ASC, plan_seq ASC, task_id ASC",
@@ -4709,6 +5225,7 @@ impl Store {
              LEFT JOIN project_task_scheduler_policies p ON p.project_id = t.project_id
              WHERE t.status IN ('pending', 'interrupted', 'failed', 'cancelled')
                AND s.status IN ('idle', 'failed', 'cancelled')
+               AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= ?3)
                AND COALESCE(p.enabled, ?1) = 1
              GROUP BY t.session_id, t.project_id, s.priority, p.cooldown_secs
              ORDER BY s.priority DESC, MIN(t.enqueued_at) ASC, t.session_id ASC",
@@ -4716,7 +5233,8 @@ impl Store {
         let rows = stmt.query_map(
             params![
                 if global_enabled { 1 } else { 0 },
-                default_cooldown_secs as i64
+                default_cooldown_secs as i64,
+                now_rfc3339()
             ],
             |row| {
                 Ok((
@@ -4762,9 +5280,11 @@ impl Store {
                 let changed = tx.execute(
                     "UPDATE plan_tasks
                      SET status = 'running', attempts = attempts + 1, started_at = ?1,
-                         finished_at = NULL, last_error = NULL, updated_at = ?1
+                         finished_at = NULL, last_error = NULL, next_attempt_at = NULL,
+                         updated_at = ?1
                      WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4
-                       AND status IN ('pending', 'interrupted', 'failed', 'blocked', 'cancelled')",
+                       AND status IN ('pending', 'interrupted', 'failed', 'blocked', 'cancelled')
+                       AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)",
                     params![now, session_id, plan_seq as i64, task_id],
                 )?;
                 if changed == 0 {
@@ -4773,7 +5293,7 @@ impl Store {
                 let task = tx.query_row(
                     "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                             status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                            last_error
+                            last_error, next_attempt_at
                      FROM plan_tasks
                      WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
                     params![session_id, plan_seq as i64, task_id],
@@ -4817,7 +5337,8 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE plan_tasks
-             SET status = ?1, last_error = ?2, finished_at = ?3, updated_at = ?3
+             SET status = ?1, last_error = ?2, finished_at = ?3, next_attempt_at = NULL,
+                 updated_at = ?3
              WHERE session_id = ?4 AND plan_seq = ?5 AND task_id = ?6",
             params![status, detail, now, session_id, plan_seq as i64, task_id],
         )?;
@@ -4825,7 +5346,7 @@ impl Store {
             .query_row(
                 "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                         status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                        last_error
+                        last_error, next_attempt_at
                  FROM plan_tasks
                  WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
                 params![session_id, plan_seq as i64, task_id],
@@ -4834,6 +5355,210 @@ impl Store {
             .optional()?;
         tx.commit()?;
         Ok(task)
+    }
+
+    /// Schedule an automatic retry: the task returns to pending with a
+    /// next_attempt_at gate and an event that replay/repair can reconstruct.
+    pub fn schedule_plan_task_retry_with_event(
+        &self,
+        session_id: &str,
+        plan_seq: u64,
+        task_id: &str,
+        next_attempt_at: &str,
+        reason: &str,
+    ) -> Result<Option<(ScheduledTask, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE plan_tasks
+             SET status = 'pending', finished_at = NULL, last_error = ?1,
+                 next_attempt_at = ?2, updated_at = ?3
+             WHERE session_id = ?4 AND plan_seq = ?5 AND task_id = ?6
+               AND status IN ('failed', 'blocked', 'interrupted', 'cancelled')",
+            params![
+                reason,
+                next_attempt_at,
+                now,
+                session_id,
+                plan_seq as i64,
+                task_id
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let task = tx.query_row(
+            "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
+                    status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
+                    last_error, next_attempt_at
+             FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
+            params![session_id, plan_seq, task_id],
+            map_scheduled_task,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "plan_task.retry_scheduled",
+            serde_json::json!({
+                "task_id": task_id,
+                "task_status": "pending",
+                "attempt": task.attempts,
+                "next_attempt_at": next_attempt_at,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((task, event)))
+    }
+
+    /// Move a task into `blocked` because an upstream dependency failed
+    /// permanently. Returns `None` when the task has already moved on.
+    pub fn block_plan_task_with_event(
+        &self,
+        session_id: &str,
+        plan_seq: u64,
+        task_id: &str,
+        reason: &str,
+        dependency: &str,
+    ) -> Result<Option<(ScheduledTask, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE plan_tasks
+             SET status = 'blocked', last_error = ?1, finished_at = NULL,
+                 next_attempt_at = NULL, updated_at = ?2
+             WHERE session_id = ?3 AND plan_seq = ?4 AND task_id = ?5
+               AND status IN ('pending', 'interrupted', 'retry_scheduled')",
+            params![reason, now, session_id, plan_seq as i64, task_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let task = tx.query_row(
+            "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
+                    status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
+                    last_error, next_attempt_at
+             FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
+            params![session_id, plan_seq as i64, task_id],
+            map_scheduled_task,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "plan_task.blocked",
+            serde_json::json!({
+                "task_id": task_id,
+                "task_status": "blocked",
+                "dependency": dependency,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((task, event)))
+    }
+
+    /// Return a blocked task to pending once all dependencies are satisfied.
+    pub fn unblock_plan_task_with_event(
+        &self,
+        session_id: &str,
+        plan_seq: u64,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<Option<(ScheduledTask, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE plan_tasks
+             SET status = 'pending', last_error = NULL, finished_at = NULL,
+                 next_attempt_at = NULL, updated_at = ?1
+             WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4
+               AND status = 'blocked'",
+            params![now, session_id, plan_seq as i64, task_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let task = tx.query_row(
+            "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
+                    status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
+                    last_error, next_attempt_at
+             FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
+            params![session_id, plan_seq as i64, task_id],
+            map_scheduled_task,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "plan_task.unblocked",
+            serde_json::json!({
+                "task_id": task_id,
+                "task_status": "pending",
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((task, event)))
+    }
+
+    /// Cancel a pending/blocked task, used by the dependency-failure policy.
+    pub fn cancel_plan_task_with_event(
+        &self,
+        session_id: &str,
+        plan_seq: u64,
+        task_id: &str,
+        reason: &str,
+        dependency: &str,
+    ) -> Result<Option<(ScheduledTask, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE plan_tasks
+             SET status = 'cancelled', last_error = ?1, finished_at = ?2,
+                 next_attempt_at = NULL, updated_at = ?2
+             WHERE session_id = ?3 AND plan_seq = ?4 AND task_id = ?5
+               AND status IN ('pending', 'blocked', 'interrupted', 'failed', 'retry_scheduled')",
+            params![reason, now, session_id, plan_seq as i64, task_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let task = tx.query_row(
+            "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
+                    status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
+                    last_error, next_attempt_at
+             FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
+            params![session_id, plan_seq as i64, task_id],
+            map_scheduled_task,
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "plan_task.cancelled",
+            serde_json::json!({
+                "task_id": task_id,
+                "task_status": "cancelled",
+                "dependency": dependency,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((task, event)))
     }
 
     /// Retry a terminal/blocked task after the session is no longer active.
@@ -4880,14 +5605,15 @@ impl Store {
         }
         tx.execute(
             "UPDATE plan_tasks
-             SET status = 'pending', finished_at = NULL, last_error = NULL, updated_at = ?1
+             SET status = 'pending', finished_at = NULL, last_error = NULL,
+                 next_attempt_at = NULL, updated_at = ?1
              WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4",
             params![now, session_id, plan_seq, task_id],
         )?;
         let task = tx.query_row(
             "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                     status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                    last_error
+                    last_error, next_attempt_at
              FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
             params![session_id, plan_seq, task_id],
             map_scheduled_task,
@@ -4952,7 +5678,7 @@ impl Store {
         let task = tx.query_row(
             "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                     status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                    last_error
+                    last_error, next_attempt_at
              FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
             params![session_id, plan_seq, task_id],
             map_scheduled_task,
@@ -5004,7 +5730,7 @@ impl Store {
         let task = tx.query_row(
             "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                     status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                    last_error
+                    last_error, next_attempt_at
              FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
             params![session_id, plan_seq, task_id],
             map_scheduled_task,
@@ -5068,7 +5794,7 @@ impl Store {
         let task = tx.query_row(
             "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                     status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                    last_error
+                    last_error, next_attempt_at
              FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
             params![session_id, plan_seq, task_id],
             map_scheduled_task,
@@ -5122,7 +5848,7 @@ impl Store {
         let task = tx.query_row(
             "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                     status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                    last_error
+                    last_error, next_attempt_at
              FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
             params![session_id, plan_seq, task_id],
             map_scheduled_task,
@@ -5209,7 +5935,7 @@ impl Store {
         let task = tx.query_row(
             "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                     status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                    last_error
+                    last_error, next_attempt_at
              FROM plan_tasks WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3",
             params![session_id, plan_seq, task_id],
             map_scheduled_task,
@@ -5241,7 +5967,7 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                         status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                        last_error
+                        last_error, next_attempt_at
                  FROM plan_tasks WHERE status IN ('running', 'claimed', 'cancelling', 'pausing', 'paused')
                  ORDER BY session_id ASC, plan_seq ASC, task_id ASC",
             )?;
@@ -5276,7 +6002,7 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                         status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
-                        last_error
+                        last_error, next_attempt_at
                  FROM plan_tasks
                  WHERE session_id = ?1 AND status IN ('running', 'claimed', 'cancelling', 'pausing', 'paused')
                  ORDER BY plan_seq ASC, task_id ASC",
@@ -5292,6 +6018,156 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(interrupted)
+    }
+
+    /// Sessions whose plan has failed or blocked rows that the deterministic
+    /// controller may be able to resolve. This is a bounded scan for the
+    /// daemon tick, not a scheduler priority queue.
+    pub fn orchestration_candidate_sessions(&self, limit: u32) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT s.id
+             FROM sessions s
+             JOIN plan_tasks t ON t.session_id = s.id
+             WHERE s.team_plan IS NOT NULL
+               AND t.status IN ('failed', 'blocked')
+             ORDER BY s.created_at ASC, s.id ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![i64::from(limit.clamp(1, 500))], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Acquire or refresh a daemon-wide runtime lease. Leases are SQLite-backed
+    /// so two processes pointed at the same data directory cannot run the same
+    /// session or integration step concurrently. Expired leases are removable
+    /// without operator action.
+    pub fn try_acquire_runtime_lease(
+        &self,
+        lease_key: &str,
+        owner_id: &str,
+        kind: &str,
+        session_id: Option<&str>,
+        ttl_secs: u64,
+    ) -> Result<bool> {
+        let now = time::OffsetDateTime::now_utc();
+        let now_text = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("formatting lease time")?;
+        let expires = now + time::Duration::seconds(ttl_secs.min(86_400) as i64);
+        let expires_text = expires
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("formatting lease expiry")?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM runtime_leases WHERE expires_at <= ?1",
+            params![now_text],
+        )?;
+        let existing = tx
+            .query_row(
+                "SELECT owner_id FROM runtime_leases WHERE lease_key = ?1",
+                params![lease_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match existing {
+            Some(owner) if owner != owner_id => {
+                return Ok(false);
+            }
+            Some(_) => {
+                tx.execute(
+                    "UPDATE runtime_leases
+                     SET heartbeat_at = ?1, expires_at = ?2, kind = ?3, session_id = ?4
+                     WHERE lease_key = ?5",
+                    params![now_text, expires_text, kind, session_id, lease_key],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO runtime_leases
+                     (lease_key, owner_id, kind, session_id, acquired_at, heartbeat_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                    params![
+                        lease_key,
+                        owner_id,
+                        kind,
+                        session_id,
+                        now_text,
+                        expires_text
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn renew_runtime_lease(
+        &self,
+        lease_key: &str,
+        owner_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool> {
+        let now = time::OffsetDateTime::now_utc();
+        let now_text = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("formatting lease time")?;
+        let expires = now + time::Duration::seconds(ttl_secs.min(86_400) as i64);
+        let expires_text = expires
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("formatting lease expiry")?;
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE runtime_leases
+             SET heartbeat_at = ?1, expires_at = ?2
+             WHERE lease_key = ?3 AND owner_id = ?4",
+            params![now_text, expires_text, lease_key, owner_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn release_runtime_lease(&self, lease_key: &str, owner_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "DELETE FROM runtime_leases WHERE lease_key = ?1 AND owner_id = ?2",
+            params![lease_key, owner_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn runtime_lease_owner(&self, lease_key: &str) -> Result<Option<RuntimeLease>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT lease_key, owner_id, kind, session_id, acquired_at, heartbeat_at, expires_at
+             FROM runtime_leases WHERE lease_key = ?1",
+            params![lease_key],
+            map_runtime_lease,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_runtime_leases(&self) -> Result<Vec<RuntimeLease>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT lease_key, owner_id, kind, session_id, acquired_at, heartbeat_at, expires_at
+             FROM runtime_leases ORDER BY acquired_at ASC, lease_key ASC",
+        )?;
+        let rows = stmt.query_map([], map_runtime_lease)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn clear_expired_runtime_leases(&self) -> Result<usize> {
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "DELETE FROM runtime_leases WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        Ok(changed)
     }
 
     pub fn try_acquire_write_lease(
@@ -5568,6 +6444,7 @@ impl Store {
             params![now],
         )?;
         tx.execute("DELETE FROM write_leases", [])?;
+        tx.execute("DELETE FROM runtime_leases", [])?;
 
         let mut events = Vec::new();
         for session_id in &sessions {
@@ -6800,6 +7677,7 @@ fn map_scheduled_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask
         started_at: row.get(12)?,
         finished_at: row.get(13)?,
         last_error: row.get(14)?,
+        next_attempt_at: row.get(15)?,
     })
 }
 

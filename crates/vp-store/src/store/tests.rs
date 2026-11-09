@@ -1802,3 +1802,408 @@ fn migrates_legacy_mcp_servers_to_transport_columns() {
     assert!(servers[0].url.is_none());
     assert!(servers[0].headers.is_empty());
 }
+
+#[test]
+fn orchestration_policy_round_trips_in_the_manifest() {
+    use vp_protocol::types::OrchestrationPolicy;
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    assert!(
+        store
+            .get_orchestration_policy(&project.id)
+            .unwrap()
+            .auto_retry_failed
+    );
+    let policy = OrchestrationPolicy {
+        auto_retry_failed: false,
+        max_attempts: 4,
+        retry_backoff_secs: 45,
+        retry_priority_boost: 12,
+        dependency_failure: vp_protocol::types::DependencyFailurePolicy::Cancel,
+        escalate_after_retries: false,
+        auto_resolve_blockers: false,
+    };
+    store
+        .set_orchestration_policy(&project.id, &policy)
+        .unwrap();
+    assert_eq!(store.get_orchestration_policy(&project.id).unwrap(), policy);
+    store.record_project_manifest().unwrap();
+    let manifests = crate::read_project_manifest(store.data_dir()).unwrap();
+    let manifest = manifests
+        .into_iter()
+        .find(|candidate| candidate.project.id == project.id)
+        .unwrap();
+    assert_eq!(manifest.orchestration_policy, policy);
+}
+
+#[test]
+fn plan_task_block_unblock_and_cancel_are_replayable() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "schedule").unwrap();
+    let submitted = store
+        .append_event(
+            &session.id,
+            "team_plan.submitted",
+            serde_json::json!({"goal": "schedule"}),
+        )
+        .unwrap();
+    store
+        .sync_plan_tasks(&session.id, &project.id, submitted.seq, &scheduled_plan())
+        .unwrap();
+
+    let (blocked, event) = store
+        .block_plan_task_with_event(
+            &session.id,
+            submitted.seq,
+            "T2",
+            "dependency T1 failed",
+            "T1",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked.status, "blocked");
+    assert_eq!(event.kind, "plan_task.blocked");
+    assert_eq!(event.payload["dependency"], "T1");
+
+    let (unblocked, event) = store
+        .unblock_plan_task_with_event(&session.id, submitted.seq, "T2", "dependency recovered")
+        .unwrap()
+        .unwrap();
+    assert_eq!(unblocked.status, "pending");
+    assert_eq!(event.kind, "plan_task.unblocked");
+
+    let (cancelled, event) = store
+        .cancel_plan_task_with_event(
+            &session.id,
+            submitted.seq,
+            "T2",
+            "dependency failed permanently",
+            "T1",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    assert!(cancelled.finished_at.is_some());
+    assert_eq!(event.kind, "plan_task.cancelled");
+
+    let rebuilt = store
+        .sync_plan_tasks(&session.id, &project.id, submitted.seq, &scheduled_plan())
+        .unwrap();
+    let t2 = rebuilt.iter().find(|task| task.task_id == "T2").unwrap();
+    assert_eq!(t2.status, "cancelled");
+    assert_eq!(
+        t2.last_error.as_deref(),
+        Some("dependency failed permanently")
+    );
+}
+
+#[test]
+fn scheduled_retry_is_gated_until_due() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "schedule").unwrap();
+    let submitted = store
+        .append_event(
+            &session.id,
+            "team_plan.submitted",
+            serde_json::json!({"goal": "schedule"}),
+        )
+        .unwrap();
+    store
+        .sync_plan_tasks(&session.id, &project.id, submitted.seq, &scheduled_plan())
+        .unwrap();
+    store
+        .claim_plan_tasks(&session.id, submitted.seq, &["T1".into()])
+        .unwrap();
+    store
+        .finish_plan_task(&session.id, submitted.seq, "T1", "failed", Some("boom"))
+        .unwrap();
+
+    let (scheduled, event) = store
+        .schedule_plan_task_retry_with_event(
+            &session.id,
+            submitted.seq,
+            "T1",
+            "2999-01-01T00:00:00Z",
+            "retry later",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(scheduled.status, "pending");
+    assert_eq!(
+        scheduled.next_attempt_at.as_deref(),
+        Some("2999-01-01T00:00:00Z")
+    );
+    assert_eq!(event.kind, "plan_task.retry_scheduled");
+    let claimed = store
+        .claim_plan_tasks(&session.id, submitted.seq, &["T1".into()])
+        .unwrap();
+    assert!(claimed.is_empty());
+
+    let rebuilt = store
+        .sync_plan_tasks(&session.id, &project.id, submitted.seq, &scheduled_plan())
+        .unwrap();
+    let t1 = rebuilt.iter().find(|task| task.task_id == "T1").unwrap();
+    assert_eq!(t1.status, "pending");
+    assert_eq!(t1.next_attempt_at.as_deref(), Some("2999-01-01T00:00:00Z"));
+}
+
+#[test]
+fn plan_revision_is_stored_with_an_event() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "schedule").unwrap();
+    let mut plan = scheduled_plan();
+    plan.tasks[0].title = "One revised".into();
+    let event = store
+        .set_team_plan_revision_with_event(
+            &session.id,
+            &serde_json::to_string(&plan).unwrap(),
+            "team_plan.revised",
+            serde_json::json!({
+                "revision": 2,
+                "reason": "tighten scope",
+                "author": "user",
+                "changed": ["T1"]
+            }),
+        )
+        .unwrap();
+    assert_eq!(event.kind, "team_plan.revised");
+    let stored: TeamPlan =
+        serde_json::from_str(&store.get_team_plan(&session.id).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.tasks[0].title, "One revised");
+    let events = store.recent_events(&session.id, 10).unwrap();
+    assert!(events.iter().any(|event| event.kind == "team_plan.revised"));
+}
+
+#[test]
+fn runtime_leases_are_owned_renewable_and_releasable() {
+    let (_data, store, _repo) = test_store();
+    assert!(
+        store
+            .try_acquire_runtime_lease("session:s1", "daemon-a", "session", Some("s1"), 60)
+            .unwrap()
+    );
+    // The same owner can refresh, another owner cannot take an unexpired lease.
+    assert!(
+        store
+            .try_acquire_runtime_lease("session:s1", "daemon-a", "session", Some("s1"), 60)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .try_acquire_runtime_lease("session:s1", "daemon-b", "session", Some("s1"), 60)
+            .unwrap()
+    );
+    let lease = store.runtime_lease_owner("session:s1").unwrap().unwrap();
+    assert_eq!(lease.owner_id, "daemon-a");
+    assert_eq!(lease.kind, "session");
+    assert_eq!(lease.session_id.as_deref(), Some("s1"));
+
+    assert!(
+        store
+            .renew_runtime_lease("session:s1", "daemon-a", 120)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .renew_runtime_lease("session:s1", "daemon-b", 120)
+            .unwrap()
+    );
+    assert_eq!(store.list_runtime_leases().unwrap().len(), 1);
+    assert!(
+        !store
+            .release_runtime_lease("session:s1", "daemon-b")
+            .unwrap()
+    );
+    assert!(
+        store
+            .release_runtime_lease("session:s1", "daemon-a")
+            .unwrap()
+    );
+    assert!(store.runtime_lease_owner("session:s1").unwrap().is_none());
+    assert!(
+        store
+            .try_acquire_runtime_lease("session:s1", "daemon-b", "session", Some("s1"), 60)
+            .unwrap()
+    );
+}
+
+#[test]
+fn expired_runtime_leases_can_be_swept_or_taken_over() {
+    let (_data, store, _repo) = test_store();
+    assert!(
+        store
+            .try_acquire_runtime_lease("session:s2", "daemon-a", "session", Some("s2"), 0)
+            .unwrap()
+    );
+    // A zero-TTL lease is effectively expired; a second owner can take it.
+    assert!(
+        store
+            .try_acquire_runtime_lease("session:s2", "daemon-b", "session", Some("s2"), 60)
+            .unwrap()
+    );
+    let lease = store.runtime_lease_owner("session:s2").unwrap().unwrap();
+    assert_eq!(lease.owner_id, "daemon-b");
+    let removed = store.clear_expired_runtime_leases().unwrap();
+    assert_eq!(removed, 0);
+}
+
+#[test]
+fn coordination_notes_and_unblock_are_projected_atomically() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "coordinate").unwrap();
+    let note_event = store
+        .record_coordination_note_with_event(
+            &session.id,
+            "blocker",
+            "warning",
+            Some("T1"),
+            None,
+            None,
+            "agent-1",
+            "Worker One",
+            Some("worker"),
+            "schema is unclear",
+        )
+        .unwrap();
+    let note_id = note_event.payload["note_id"].as_str().unwrap();
+    assert_eq!(note_event.kind, "coordination.note");
+    let notes = store.list_coordination_notes(&session.id, 10).unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].status, "open");
+    assert_eq!(notes[0].task_id.as_deref(), Some("T1"));
+
+    let unblock = store
+        .record_coordination_note_with_event(
+            &session.id,
+            "unblock",
+            "info",
+            Some("T1"),
+            None,
+            Some(note_id),
+            "user",
+            "User",
+            Some("user"),
+            "resolved",
+        )
+        .unwrap();
+    assert_eq!(unblock.kind, "coordination.note");
+    let notes = store.list_coordination_notes(&session.id, 10).unwrap();
+    assert_eq!(notes[0].status, "resolved");
+    assert!(notes[0].resolved_at.is_some());
+
+    // A second unblock has no open blocker to resolve and fails.
+    let error = store
+        .record_coordination_note_with_event(
+            &session.id,
+            "unblock",
+            "info",
+            Some("T1"),
+            None,
+            None,
+            "user",
+            "User",
+            Some("user"),
+            "again",
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("no open coordination blocker"));
+}
+
+#[test]
+fn orchestration_decisions_are_projected_with_events() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "decide").unwrap();
+    let event = store
+        .record_orchestration_decision_with_event(
+            &session.id,
+            "retry",
+            Some("T1"),
+            "attempt 1 failed",
+            1,
+            "orchestrator",
+        )
+        .unwrap();
+    assert_eq!(event.kind, "orchestration.decision");
+    let decisions = store.list_orchestration_decisions(&session.id, 10).unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].action, "retry");
+    assert_eq!(decisions[0].attempt, 1);
+    assert_eq!(decisions[0].task_id.as_deref(), Some("T1"));
+
+    let events = store.list_all_events(&session.id).unwrap();
+    store
+        .replace_orchestration_decisions(&session.id, &[], &events)
+        .unwrap();
+    assert!(
+        store
+            .list_orchestration_decisions(&session.id, 10)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .replace_orchestration_decisions(&session.id, &decisions, &events)
+        .unwrap();
+    assert_eq!(
+        store.list_orchestration_decisions(&session.id, 10).unwrap(),
+        decisions
+    );
+}
+
+#[test]
+fn unblock_can_target_a_note_without_a_task() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "coordinate").unwrap();
+    let blocker = store
+        .record_coordination_note_with_event(
+            &session.id,
+            "blocker",
+            "warning",
+            None,
+            None,
+            None,
+            "agent-1",
+            "Worker One",
+            Some("worker"),
+            "blocked without a task",
+        )
+        .unwrap();
+    let note_id = blocker.payload["note_id"].as_str().unwrap();
+    store
+        .record_coordination_note_with_event(
+            &session.id,
+            "unblock",
+            "info",
+            None,
+            None,
+            Some(note_id),
+            "user",
+            "User",
+            Some("user"),
+            "resolved by note",
+        )
+        .unwrap();
+    let notes = store.list_coordination_notes(&session.id, 10).unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].status, "resolved");
+    assert_eq!(notes[0].task_id, None);
+}

@@ -14,10 +14,11 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
     AgentInfo, AgentProbeResult, ApprovalMode, CapacityInfo, ConfigureAgentParams,
-    ContextCompactionSummary, ContextMeasurement, MergeQueueEntry, PlanDepartment, PlanTask,
-    Project, RoleModels, Session, SessionCheckpoint, SessionCheckpointDiffResult,
-    SessionCheckpointRestoreResult, SessionCompactResult, SessionForkResult,
-    SessionMergeForkResult, StoredMessage, TeamPlan, TodoItem,
+    ContextCompactionSummary, ContextMeasurement, MergeQueueEntry, PlanDepartment,
+    PlanRevisionDetailResult, PlanTask, Project, ReviseTeamPlanResult, RoleModels, ScheduledTask,
+    Session, SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
+    SessionCompactResult, SessionForkResult, SessionMergeForkResult, StoredMessage, TeamPlan,
+    TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -2910,6 +2911,19 @@ impl AgentService {
             }
             runs.insert(session_id.to_string(), control.clone());
         }
+        let lease = match self
+            .engine
+            .acquire_session_lease(session_id, std::time::Duration::from_secs(180))
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                if let Ok(mut runs) = self.runs.lock() {
+                    runs.remove(session_id);
+                }
+                return Err(error);
+            }
+        };
 
         let prepared: Result<()> = async {
             self.engine
@@ -2936,6 +2950,7 @@ impl AgentService {
                 .engine
                 .update_session_status(session_id, "failed")
                 .await;
+            lease.release().await;
             return Err(error);
         }
 
@@ -2946,10 +2961,12 @@ impl AgentService {
             session.priority,
             prompt.to_string(),
             control,
+            lease,
         );
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_run(
         &self,
         config: AgentConfig,
@@ -2958,6 +2975,7 @@ impl AgentService {
         priority: i32,
         prompt: String,
         control: Arc<RunControl>,
+        lease: crate::SessionLease,
     ) {
         let engine = self.engine.clone();
         let runs = self.runs.clone();
@@ -2977,6 +2995,7 @@ impl AgentService {
                 if let Ok(mut runs) = runs.lock() {
                     runs.remove(&session_id);
                 }
+                lease.release().await;
                 return;
             };
             if control.is_cancelled() {
@@ -2989,6 +3008,7 @@ impl AgentService {
                 if let Ok(mut runs) = runs.lock() {
                     runs.remove(&session_id);
                 }
+                lease.release().await;
                 return;
             }
             let status = if control.is_paused() {
@@ -3020,6 +3040,7 @@ impl AgentService {
             if let Ok(mut runs) = runs.lock() {
                 runs.remove(&session_id);
             }
+            lease.release().await;
         });
     }
 
@@ -3049,6 +3070,20 @@ impl AgentService {
                 }
                 runs.insert(session_id.clone(), control.clone());
             }
+            let lease = match self
+                .engine
+                .acquire_session_lease(&session_id, std::time::Duration::from_secs(180))
+                .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    if let Ok(mut runs) = self.runs.lock() {
+                        runs.remove(&session_id);
+                    }
+                    tracing::warn!(%error, %session_id, "could not acquire queued session lease");
+                    continue;
+                }
+            };
             self.spawn_run(
                 config.clone(),
                 session_id,
@@ -3056,6 +3091,7 @@ impl AgentService {
                 priority,
                 prompt,
                 control,
+                lease,
             );
             started += 1;
         }
@@ -3463,6 +3499,82 @@ impl AgentService {
         }
     }
 
+    /// Apply a user-requested plan revision with the configured Manager cap.
+    pub async fn revise_team_plan(
+        &self,
+        session_id: &str,
+        plan: TeamPlan,
+        reason: &str,
+        expected_revision: Option<u32>,
+    ) -> Result<ReviseTeamPlanResult> {
+        let max_managers = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().map(|config| config.max_managers))
+            .unwrap_or(5);
+        self.engine
+            .revise_team_plan(
+                session_id,
+                plan,
+                reason,
+                "user",
+                expected_revision,
+                max_managers,
+            )
+            .await
+    }
+
+    pub async fn plan_revision_detail(
+        &self,
+        session_id: &str,
+        revision: u32,
+    ) -> Result<PlanRevisionDetailResult> {
+        self.engine.plan_revision_detail(session_id, revision).await
+    }
+
+    pub async fn restore_team_plan_revision(
+        &self,
+        session_id: &str,
+        revision: u32,
+        reason: &str,
+        expected_revision: Option<u32>,
+    ) -> Result<ReviseTeamPlanResult> {
+        let max_managers = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().map(|config| config.max_managers))
+            .unwrap_or(5);
+        self.engine
+            .restore_team_plan_revision(
+                session_id,
+                revision,
+                reason,
+                expected_revision,
+                max_managers,
+            )
+            .await
+    }
+
+    pub async fn edit_plan_task(
+        &self,
+        session_id: &str,
+        task: vp_protocol::types::PlanTask,
+        reason: &str,
+        expected_revision: Option<u32>,
+    ) -> Result<ReviseTeamPlanResult> {
+        let max_managers = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().map(|config| config.max_managers))
+            .unwrap_or(5);
+        self.engine
+            .edit_plan_task(session_id, task, reason, expected_revision, max_managers)
+            .await
+    }
+
     /// Resume a stored TeamPlan without another Leader model call. Completed
     /// tasks are skipped; failed/blocked/cancelled/pending tasks are retried in
     /// dependency batches.
@@ -3716,6 +3828,19 @@ impl AgentService {
             }
             runs.insert(session_id.to_string(), control.clone());
         }
+        let lease = match self
+            .engine
+            .acquire_session_lease(session_id, std::time::Duration::from_secs(180))
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                if let Ok(mut runs) = self.runs.lock() {
+                    runs.remove(session_id);
+                }
+                return Err(error);
+            }
+        };
 
         let prepared: Result<()> = async {
             self.engine
@@ -3756,6 +3881,7 @@ impl AgentService {
                 .engine
                 .update_session_status(session_id, "failed")
                 .await;
+            lease.release().await;
             return Err(error);
         }
 
@@ -3780,6 +3906,7 @@ impl AgentService {
                 if let Ok(mut runs) = runs.lock() {
                     runs.remove(&session_id);
                 }
+                lease.release().await;
                 return;
             };
             if control.is_cancelled() {
@@ -3792,6 +3919,7 @@ impl AgentService {
                 if let Ok(mut runs) = runs.lock() {
                     runs.remove(&session_id);
                 }
+                lease.release().await;
                 return;
             }
             let status = if control.is_paused() {
@@ -3823,6 +3951,7 @@ impl AgentService {
             if let Ok(mut runs) = runs.lock() {
                 runs.remove(&session_id);
             }
+            lease.release().await;
         });
         Ok(true)
     }
@@ -8414,7 +8543,7 @@ async fn run_coordination_tool(
         return Ok(ToolOutput::ok(
             notes
                 .iter()
-                .map(format_coordination_event)
+                .map(format_coordination_note)
                 .collect::<Vec<_>>()
                 .join("\n"),
         ));
@@ -8473,16 +8602,20 @@ async fn run_coordination_tool(
             "severity must be info, warning, or critical",
         ));
     }
-    let note_id = uuid::Uuid::now_v7().to_string();
-    let payload = serde_json::json!({
-        "note_id": note_id,
-        "action": action,
-        "task_id": task_id,
-        "target_agent_id": target_agent_id,
-        "message": message,
-        "severity": severity,
-    });
-    emit(engine, &session.id, spec, "coordination.note", payload).await?;
+    engine
+        .record_coordination_note(
+            &session.id,
+            action,
+            severity,
+            task_id.as_deref(),
+            target_agent_id.as_deref(),
+            None,
+            &spec.id,
+            &spec.name,
+            Some(spec.role.as_str()),
+            message,
+        )
+        .await?;
     let scope = task_id
         .as_deref()
         .map(|task_id| format!(" for {task_id}"))
@@ -8494,59 +8627,36 @@ async fn run_coordination_tool(
     )))
 }
 
-/// Recent coordination events in ascending order, optionally bounded.
+/// Recent persisted coordination notes in ascending order.
 async fn recent_coordination_notes(
     engine: &Engine,
     session_id: &str,
     limit: usize,
-) -> Result<Vec<vp_protocol::types::Event>> {
-    let events = engine.recent_events(session_id, 1_000).await?;
-    let mut notes = events
-        .into_iter()
-        .filter(|event| event.kind == "coordination.note")
-        .collect::<Vec<_>>();
-    if notes.len() > limit {
-        notes = notes.split_off(notes.len() - limit);
-    }
-    Ok(notes)
+) -> Result<Vec<vp_protocol::types::OrchestrationNote>> {
+    engine
+        .coordination_notes(session_id, limit.clamp(1, 2_000) as u32)
+        .await
 }
 
-fn format_coordination_event(event: &vp_protocol::types::Event) -> String {
-    let action = event
-        .payload
-        .get("action")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("note");
-    let severity = event
-        .payload
-        .get("severity")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("info");
-    let agent = event
-        .payload
-        .get("agent_name")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            event
-                .payload
-                .get("agent_role")
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or("agent");
-    let task = event
-        .payload
-        .get("task_id")
-        .and_then(serde_json::Value::as_str)
+fn format_coordination_note(note: &vp_protocol::types::OrchestrationNote) -> String {
+    let task = note
+        .task_id
+        .as_deref()
         .map(|task| format!(" · {task}"))
         .unwrap_or_default();
-    let message = event
-        .payload
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    let status = if note.status == "resolved" {
+        " (resolved)"
+    } else {
+        ""
+    };
     format!(
-        "[{severity}] {action} · {agent}{task} · {}",
-        truncate_to(message, 300)
+        "[{}] {}{} · {}{} · {}",
+        note.severity,
+        note.action,
+        status,
+        note.agent_name,
+        task,
+        truncate_to(&note.message, 300)
     )
 }
 
@@ -8579,16 +8689,10 @@ async fn run_team_status(
         .iter()
         .map(|task| (task.task_id.clone(), task))
         .collect::<HashMap<_, _>>();
-    let mut statuses = HashMap::<String, String>::new();
-    for task in plan_tasks {
-        statuses.insert(
-            task.id.clone(),
-            scheduled
-                .get(&task.id)
-                .map(|task| task.status.clone())
-                .unwrap_or_else(|| "pending".to_string()),
-        );
-    }
+    let mut statuses = plan_tasks
+        .iter()
+        .map(|task| (task.id.clone(), "pending".to_string()))
+        .collect::<HashMap<_, _>>();
     for event in &recent {
         if let Some(task_id) = event
             .payload
@@ -8602,6 +8706,9 @@ async fn run_team_status(
         {
             statuses.insert(task_id.to_string(), status.to_string());
         }
+    }
+    for task in &queue.tasks {
+        statuses.insert(task.task_id.clone(), task.status.clone());
     }
     let completed = plan_tasks
         .iter()
@@ -8657,12 +8764,9 @@ async fn run_team_status(
         .iter()
         .filter(|question| question.status == "pending")
         .count();
-    let notes = recent
-        .iter()
-        .rev()
-        .filter(|event| event.kind == "coordination.note")
-        .take(note_limit)
-        .collect::<Vec<_>>();
+    let notes = engine
+        .coordination_notes(&session.id, note_limit as u32)
+        .await?;
 
     let mut lines = Vec::new();
     lines.push(format!(
@@ -8729,8 +8833,8 @@ async fn run_team_status(
     }
     if !notes.is_empty() {
         lines.push("Recent coordination:".to_string());
-        for note in notes.into_iter().rev() {
-            lines.push(format!("- {}", format_coordination_event(note)));
+        for note in notes.iter().rev() {
+            lines.push(format!("- {}", format_coordination_note(note)));
         }
     }
     Ok(ToolOutput::ok(lines.join("\n")))
@@ -9608,6 +9712,11 @@ fn tool_schemas(
                         }
                     }
                 },
+                "reason": {
+                    "type": "string",
+                    "maxLength": 1000,
+                    "description": "Required when revising an existing plan; record why the team is changing course."
+                },
                 "required": ["goal", "departments", "tasks"]
             }),
         });
@@ -10165,7 +10274,7 @@ async fn run_parallel_workers(
     }))
 }
 
-fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
+pub(crate) fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result<()> {
     if plan.goal.trim().is_empty() {
         return Err(anyhow!("team plan goal must not be empty"));
     }
@@ -10654,11 +10763,57 @@ async fn latest_plan_results(engine: &Engine, session_id: &str) -> Result<HashMa
     Ok(results)
 }
 
-async fn coordination_brief(engine: &Engine, session_id: &str, limit: usize) -> Result<String> {
-    let notes = recent_coordination_notes(engine, session_id, limit).await?;
+async fn coordination_brief_for_agent(
+    engine: &Engine,
+    session_id: &str,
+    agent_id: &str,
+    task_id: Option<&str>,
+    limit: usize,
+) -> Result<String> {
+    let notes = engine
+        .coordination_notes_for_agent(session_id, agent_id, task_id, limit.clamp(1, 50) as u32)
+        .await?;
     Ok(notes
         .iter()
-        .map(format_coordination_event)
+        .map(format_coordination_note)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Inject unread mailbox messages into a Worker brief and mark them read.
+async fn mailbox_brief(
+    engine: &Engine,
+    session_id: &str,
+    agent_id: &str,
+    limit: usize,
+) -> Result<String> {
+    let messages = engine
+        .list_agent_messages(session_id, Some(agent_id.to_string()), true)
+        .await?;
+    if messages.is_empty() {
+        return Ok(String::new());
+    }
+    let selected = messages
+        .iter()
+        .rev()
+        .take(limit.clamp(1, 20))
+        .cloned()
+        .collect::<Vec<_>>();
+    for message in selected.iter().rev() {
+        let _ = engine.mark_agent_message_read(&message.id).await;
+    }
+    Ok(selected
+        .iter()
+        .rev()
+        .map(|message| {
+            format!(
+                "[{}] {} → {} · {}",
+                message.kind,
+                message.from_name,
+                message.to_name,
+                truncate_to(&message.body, 500)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -10693,12 +10848,17 @@ async fn record_scheduled_task_finish(
     task_id: &str,
     status: &str,
     detail: Option<&str>,
-) -> Result<()> {
-    engine
+) -> Result<Option<ScheduledTask>> {
+    let task = engine
         .scheduler()
         .finish(session_id, plan_seq, task_id, status, detail)
         .await?;
-    Ok(())
+    if task.is_some()
+        && let Err(error) = engine.advance_orchestration(session_id).await
+    {
+        tracing::warn!(%error, task_id, "orchestration controller pass failed");
+    }
+    Ok(task)
 }
 
 fn task_profile(task: &PlanTask, department_profile: AgentProfile) -> AgentProfile {
@@ -11109,7 +11269,6 @@ async fn execute_team_plan(
         let mut prepared = Vec::new();
         let mut worker_slots = Vec::new();
         let plan_results = latest_plan_results(engine, &session.id).await?;
-        let coordination = coordination_brief(engine, &session.id, 5).await?;
         for task in &batch {
             let manager_spec = if let Some(spec) = manager_specs.get(&task.department) {
                 spec.clone()
@@ -11204,14 +11363,28 @@ async fn execute_team_plan(
             .await?;
             statuses.insert(task.id.clone(), "running".to_string());
             let dependency_brief = task_dependency_brief(task, &statuses, &plan_results);
+            let coordination = coordination_brief_for_agent(
+                engine,
+                &session.id,
+                &worker_spec.id,
+                Some(&task.id),
+                6,
+            )
+            .await?;
+            let mailbox = mailbox_brief(engine, &session.id, &worker_spec.id, 4).await?;
             let coordination_note = if coordination.is_empty() {
                 String::new()
             } else {
-                format!("\nRecent team coordination:\n{coordination}")
+                format!("\nRecent coordination for this task:\n{coordination}")
+            };
+            let mailbox_note = if mailbox.is_empty() {
+                String::new()
+            } else {
+                format!("\nUnread mailbox:\n{mailbox}")
             };
             let objective = format!(
                 "Execute plan task {}: {}. Department: {} ({}). Acceptance: {}. \
-                 Upstream handoffs:\n{}\n{}\
+                 Upstream handoffs:\n{}\n{}{}\
                  Work only in your task worktree and return a concise summary.",
                 task.id,
                 task.title,
@@ -11219,7 +11392,8 @@ async fn execute_team_plan(
                 manager_spec.title.as_deref().unwrap_or(&manager_spec.name),
                 acceptance,
                 dependency_brief,
-                coordination_note
+                coordination_note,
+                mailbox_note
             );
             prepared.push((
                 task.clone(),

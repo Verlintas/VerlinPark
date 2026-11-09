@@ -117,11 +117,13 @@ impl TaskScheduler {
     ) -> Result<Vec<PlanTask>> {
         let store = self.store.clone();
         let session_id = session.id.clone();
+        let project_id = session.project_id.clone();
         let priority = session.priority;
         let aging = self.aging;
         let plan = plan.clone();
         tokio::task::spawn_blocking(move || {
             let rows = store.list_plan_tasks(None, Some(&session_id))?;
+            let policy = store.get_orchestration_policy(&project_id)?;
             let rows = rows
                 .into_iter()
                 .filter(|row| row.plan_seq == plan_seq)
@@ -140,7 +142,32 @@ impl TaskScheduler {
                 .into_iter()
                 .filter(|row| is_retryable_status(&row.status))
                 .filter(|row| row.deps.iter().all(|dep| completed.contains(dep)))
-                .map(|row| (task_effective_priority(priority, &row, now, aging), row))
+                .filter(|row| {
+                    row.next_attempt_at
+                        .as_deref()
+                        .map(|next| {
+                            time::OffsetDateTime::parse(
+                                next,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .map(|next| next <= now)
+                            .unwrap_or(true)
+                        })
+                        .unwrap_or(true)
+                })
+                .map(|row| {
+                    let retry_boost = if row.attempts > 0
+                        && matches!(row.status.as_str(), "failed" | "pending")
+                    {
+                        i64::from(policy.retry_priority_boost)
+                    } else {
+                        0
+                    };
+                    (
+                        task_effective_priority(priority, &row, now, aging) + retry_boost,
+                        row,
+                    )
+                })
                 .collect::<Vec<_>>();
             // Deterministic order: effective priority, then oldest enqueue
             // time, then task id.

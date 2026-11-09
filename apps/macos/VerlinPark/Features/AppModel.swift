@@ -176,6 +176,30 @@ final class AppModel {
     /// status, attempts, dependencies, and failure reasons.
     var scheduledSessionTasks: [SchedulerTask] = []
     var scheduledSessionTasksSessionID: String?
+    var orchestrationSnapshot: OrchestrationSnapshot?
+    var orchestrationPolicy = OrchestrationPolicy.standard
+    var orchestrationPolicyBusy = false
+    var orchestrationPolicyStatus: String?
+    var collabTaskActionStatus: String?
+    var collabTaskActionBusyID: String?
+    var planRevisionBusy = false
+    var planRevisionStatus: String?
+    var planRevisionDetail: PlanRevisionDetailResult?
+    var planRevisionDetailBusy = false
+    var planRevisionDetailStatus: String?
+    var planRestoreBusy = false
+    var planRestoreStatus: String?
+    var orchestrationPreview: OrchestrationPreviewResult?
+    var orchestrationPreviewBusy = false
+    var orchestrationPreviewStatus: String?
+    var runtimeLeases: [RuntimeLease] = []
+    var runtimeLeaseOwnerID: String?
+    var runtimeLeasesBusy = false
+    var runtimeLeasesStatus: String?
+    var orchestrationOverview: OrchestrationOverviewResult?
+    var orchestrationOverviewBusy = false
+    var orchestrationOverviewStatus: String?
+    private var orchestrationRefreshTask: Task<Void, Never>?
     var taskActionBusyID: String?
     var taskActionStatus: String?
     var taskSchedulerPolicy = TaskSchedulerPolicy.disabled
@@ -454,6 +478,7 @@ final class AppModel {
             await loadAcpAgents()
             await loadMcpServers()
             await loadMemoryPolicy()
+            await loadOrchestrationPolicy()
         } catch {
             handle(error)
         }
@@ -555,6 +580,14 @@ final class AppModel {
         mergeQueue = []
         scheduledSessionTasks = []
         scheduledSessionTasksSessionID = nil
+        orchestrationSnapshot = nil
+        collabTaskActionStatus = nil
+        planRevisionStatus = nil
+        planRevisionDetail = nil
+        planRevisionDetailStatus = nil
+        planRestoreStatus = nil
+        orchestrationPreview = nil
+        orchestrationPreviewStatus = nil
         mailbox = []
         artifacts = []
         usageLedger = nil
@@ -594,6 +627,10 @@ final class AppModel {
         taskQueue = nil
         scheduledSessionTasks = []
         scheduledSessionTasksSessionID = nil
+        orchestrationSnapshot = nil
+        orchestrationPolicy = .standard
+        orchestrationPolicyStatus = nil
+        collabTaskActionStatus = nil
         gitCommits = []
         gitBranch = nil
         gitBaseCommit = nil
@@ -689,6 +726,7 @@ final class AppModel {
             await loadAgents()
             await loadMergeQueue()
             await loadScheduledSessionTasks()
+            await loadOrchestrationSnapshot()
             await loadMailbox()
             await loadTeamPlan()
             await loadQuestions()
@@ -2598,6 +2636,344 @@ final class AppModel {
         }
     }
 
+    func loadOrchestrationPolicy() async {
+        guard let projectID = selectedProjectID else {
+            orchestrationPolicy = .standard
+            orchestrationPolicyStatus = nil
+            return
+        }
+        orchestrationPolicyBusy = true
+        defer { orchestrationPolicyBusy = false }
+        do {
+            let policy = try await core.orchestrationPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            orchestrationPolicy = policy
+            orchestrationPolicyStatus = nil
+        } catch {
+            orchestrationPolicyStatus = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func saveOrchestrationPolicy(_ policy: OrchestrationPolicy) async -> Bool {
+        guard let projectID = selectedProjectID else {
+            orchestrationPolicyStatus = "Select a project first."
+            return false
+        }
+        orchestrationPolicyBusy = true
+        defer { orchestrationPolicyBusy = false }
+        do {
+            let saved = try await core.setOrchestrationPolicy(projectID: projectID, policy: policy)
+            guard projectID == selectedProjectID else { return false }
+            orchestrationPolicy = saved
+            orchestrationPolicyStatus = "Orchestration policy saved."
+            return true
+        } catch {
+            orchestrationPolicyStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    func loadOrchestrationSnapshot() async {
+        guard let sessionID = selectedSessionID else {
+            orchestrationSnapshot = nil
+            return
+        }
+        let generation = selectionGeneration
+        do {
+            let snapshot = try await core.orchestrationSnapshot(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            orchestrationSnapshot = snapshot
+            if snapshot.policy != orchestrationPolicy {
+                orchestrationPolicy = snapshot.policy
+            }
+        } catch {
+            // The graph still uses events and task rows if the snapshot fails;
+            // the next plan/task event retries it.
+        }
+    }
+
+    private func refreshOrchestrationSnapshotSoon() {
+        orchestrationRefreshTask?.cancel()
+        orchestrationRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            await self?.loadOrchestrationSnapshot()
+        }
+    }
+
+    func loadOrchestrationOverview() async {
+        orchestrationOverviewBusy = true
+        defer { orchestrationOverviewBusy = false }
+        do {
+            orchestrationOverview = try await core.orchestrationOverview(
+                projectID: selectedProjectID,
+                limit: 20
+            )
+            orchestrationOverviewStatus = nil
+        } catch {
+            orchestrationOverviewStatus = error.localizedDescription
+        }
+    }
+
+    func loadRuntimeLeases() async {
+        runtimeLeasesBusy = true
+        defer { runtimeLeasesBusy = false }
+        do {
+            let result = try await core.runtimeLeases()
+            runtimeLeaseOwnerID = result.runtimeId
+            runtimeLeases = result.leases
+            runtimeLeasesStatus = nil
+        } catch {
+            runtimeLeasesStatus = error.localizedDescription
+        }
+    }
+
+    func sweepRuntimeLeases() async {
+        runtimeLeasesBusy = true
+        defer { runtimeLeasesBusy = false }
+        do {
+            let removed = try await core.sweepRuntimeLeases()
+            runtimeLeasesStatus = "Removed \(removed) expired lease(s)."
+            await loadRuntimeLeases()
+        } catch {
+            runtimeLeasesStatus = error.localizedDescription
+        }
+    }
+
+    func previewOrchestration() async {
+        guard let sessionID = selectedSessionID else { return }
+        orchestrationPreviewBusy = true
+        defer { orchestrationPreviewBusy = false }
+        do {
+            let preview = try await core.previewOrchestration(sessionID: sessionID)
+            orchestrationPreview = preview
+            orchestrationPreviewStatus = preview.actions.isEmpty
+                ? "No orchestration action is currently needed."
+                : "\(preview.actions.count) action(s) would be applied."
+        } catch {
+            orchestrationPreviewStatus = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func advanceOrchestration() async -> Bool {
+        guard let sessionID = selectedSessionID else { return false }
+        do {
+            let actions = try await core.advanceOrchestration(sessionID: sessionID)
+            await loadScheduledSessionTasks()
+            await loadOrchestrationSnapshot()
+            collabTaskActionStatus = actions.isEmpty
+                ? "No orchestration action was needed."
+                : "Applied \(actions.count) orchestration action(s)."
+            return true
+        } catch {
+            collabTaskActionStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    func dispatchNextOrchestrationTask() async {
+        guard let sessionID = selectedSessionID else { return }
+        collabTaskActionBusyID = "__dispatch__"
+        defer { collabTaskActionBusyID = nil }
+        do {
+            let started = try await core.dispatchTask(sessionID: sessionID)
+            collabTaskActionStatus = started
+                ? "Next ready plan task dispatched."
+                : "Session is already running."
+            await loadScheduledSessionTasks()
+            await loadOrchestrationSnapshot()
+        } catch {
+            collabTaskActionStatus = error.localizedDescription
+        }
+    }
+
+    func collabTaskAction(_ task: OrchestrationTask, action: CollabTaskCommand) async {
+        collabTaskActionBusyID = task.taskId
+        defer { collabTaskActionBusyID = nil }
+        do {
+            let updated: SchedulerTask = switch action {
+            case .retry:
+                try await core.retryTask(sessionID: selectedSessionID ?? "", taskID: task.taskId)
+            case .skip:
+                try await core.skipTask(sessionID: selectedSessionID ?? "", taskID: task.taskId)
+            case .pause:
+                try await core.pauseTask(sessionID: selectedSessionID ?? "", taskID: task.taskId)
+            case .resume:
+                try await core.resumeTask(sessionID: selectedSessionID ?? "", taskID: task.taskId)
+            case .cancel:
+                try await core.cancelTask(sessionID: selectedSessionID ?? "", taskID: task.taskId)
+            }
+            collabTaskActionStatus = "\(updated.taskID) -> \(updated.status)"
+            await loadScheduledSessionTasks()
+            await loadOrchestrationSnapshot()
+        } catch {
+            collabTaskActionStatus = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func addCoordinationNote(
+        action: String,
+        taskID: String?,
+        targetAgentID: String?,
+        targetNoteID: String? = nil,
+        message: String,
+        severity: String
+    ) async -> Bool {
+        guard let sessionID = selectedSessionID else { return false }
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            collabTaskActionStatus = "Coordination message must not be empty."
+            return false
+        }
+        do {
+            _ = try await core.coordinationNote(
+                sessionID: sessionID,
+                action: action,
+                taskID: taskID,
+                targetAgentID: targetAgentID,
+                targetNoteID: targetNoteID,
+                message: trimmed,
+                severity: severity
+            )
+            await loadOrchestrationSnapshot()
+            collabTaskActionStatus = "Coordination note recorded."
+            return true
+        } catch {
+            collabTaskActionStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    func resolveOrchestrationBlocker(_ blocker: OrchestrationBlocker) async -> Bool {
+        guard blocker.taskId != nil || blocker.noteId != nil else {
+            collabTaskActionStatus = "This blocker has no task or note to resolve."
+            return false
+        }
+        return await addCoordinationNote(
+            action: "unblock",
+            taskID: blocker.taskId,
+            targetAgentID: nil,
+            targetNoteID: blocker.noteId,
+            message: "Resolved from Collab: \(blocker.message)",
+            severity: "info"
+        )
+    }
+
+    func loadPlanRevisionDetail(_ revision: Int) async {
+        guard let sessionID = selectedSessionID else { return }
+        planRevisionDetailBusy = true
+        planRevisionDetailStatus = nil
+        defer { planRevisionDetailBusy = false }
+        do {
+            planRevisionDetail = try await core.planRevisionDetail(
+                sessionID: sessionID,
+                revision: revision
+            )
+        } catch {
+            planRevisionDetailStatus = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func restorePlanRevision(
+        _ revision: Int,
+        reason: String,
+        expectedRevision: Int
+    ) async -> Bool {
+        guard let sessionID = selectedSessionID else { return false }
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            planRestoreStatus = "A restore reason is required."
+            return false
+        }
+        planRestoreBusy = true
+        defer { planRestoreBusy = false }
+        do {
+            let result = try await core.restoreTeamPlanRevision(
+                sessionID: sessionID,
+                revision: revision,
+                reason: trimmed,
+                expectedRevision: expectedRevision
+            )
+            planRestoreStatus = "Restored r\(result.revision.revision)."
+            await loadTeamPlan()
+            await loadScheduledSessionTasks()
+            await loadOrchestrationSnapshot()
+            planRevisionDetail = try? await core.planRevisionDetail(
+                sessionID: sessionID,
+                revision: result.revision.revision
+            )
+            return true
+        } catch {
+            planRestoreStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    func editPlanTask(_ task: PlanTask, reason: String) async -> Bool {
+        guard let sessionID = selectedSessionID else { return false }
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            planRevisionStatus = "An edit reason is required."
+            return false
+        }
+        planRevisionBusy = true
+        defer { planRevisionBusy = false }
+        do {
+            let result = try await core.editPlanTask(
+                sessionID: sessionID,
+                task: task,
+                reason: trimmed,
+                expectedRevision: orchestrationSnapshot?.planRevision
+            )
+            planRevisionStatus = "Task \(task.id) updated in r\(result.revision.revision)."
+            await loadTeamPlan()
+            await loadScheduledSessionTasks()
+            await loadOrchestrationSnapshot()
+            return true
+        } catch {
+            planRevisionStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    func reviseSelectedTeamPlan(
+        _ plan: TeamPlan,
+        reason: String,
+        expectedRevision: Int
+    ) async -> Bool {
+        guard let sessionID = selectedSessionID else { return false }
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            planRevisionStatus = "A revision reason is required."
+            return false
+        }
+        planRevisionBusy = true
+        defer { planRevisionBusy = false }
+        do {
+            let result = try await core.reviseTeamPlan(
+                sessionID: sessionID,
+                plan: plan,
+                reason: trimmed,
+                expectedRevision: expectedRevision
+            )
+            planRevisionStatus = "Plan revision \(result.revision.revision) recorded."
+            await loadTeamPlan()
+            await loadScheduledSessionTasks()
+            await loadOrchestrationSnapshot()
+            return true
+        } catch {
+            planRevisionStatus = error.localizedDescription
+            return false
+        }
+    }
+
     func loadTaskSchedulerPolicy() async {
         guard let projectID = selectedProjectID else {
             taskSchedulerPolicy = .disabled
@@ -3789,7 +4165,10 @@ final class AppModel {
         return switch event.type {
         case "plan_task.started", "plan_task.resumed": "running"
         case "plan_task.skipped": "skipped"
-        case "plan_task.retried": "pending"
+        case "plan_task.blocked": "blocked"
+        case "plan_task.unblocked": "pending"
+        case "plan_task.cancelled": "cancelled"
+        case "plan_task.retried", "plan_task.retry_scheduled": "pending"
         case "plan_task.cancelling": "cancelling"
         case "plan_task.pausing": "pausing"
         case "plan_task.paused": "paused"
@@ -3988,8 +4367,19 @@ final class AppModel {
                     await self.loadScheduledSessionTasks()
                 }
             }
-            if event.type.hasPrefix("plan_task.") {
+            if event.type.hasPrefix("plan_task.") || event.type == "team_plan.revised" {
                 Task { await self.loadScheduledSessionTasks() }
+            }
+            if event.type.hasPrefix("plan_task.")
+                || event.type.hasPrefix("coordination.")
+                || event.type.hasPrefix("orchestration.")
+                || event.type.hasPrefix("merge_queue.")
+                || event.type == "team_plan.submitted"
+                || event.type == "team_plan.revised"
+                || event.type == "session.updated"
+                || event.type.hasPrefix("agent.")
+            {
+                refreshOrchestrationSnapshotSoon()
             }
             if let taskID = event.payload.objectValue?["task_id"]?.stringValue,
                let status = planTaskStatus(for: event)

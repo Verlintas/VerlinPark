@@ -130,6 +130,9 @@
 | [0118](adr/0118-workspace-shell-and-command-inbox.md) | Workspace shell, command ranking, and notification inbox | Accepted | UI/State |
 | [0119](adr/0119-risk-based-approval-and-transcript.md) | Risk-based approval, compact transcript, orchestration-only Collab | Accepted | Security/UI |
 | [0120](adr/0120-dynamic-team-graph.md) | Dynamic team graph, task ownership, and coordination notes for Collab | Accepted | UI/Orchestration |
+| [0121](adr/0121-deterministic-orchestration-controller.md) | Deterministic orchestration controller, retry policy, dependency failure, preview | Accepted | Orchestration |
+| [0122](adr/0122-persisted-coordination-and-revision-safety.md) | Persisted coordination/decision projections, targeted delivery, revision inspection and task edit | Accepted | State/Orchestration |
+| [0123](adr/0123-durable-session-leases-and-overview.md) | Durable runtime session leases and cross-session Mission Control | Accepted | Runtime/Operations |
 
 ---
 

@@ -205,6 +205,103 @@ enum Command {
         #[arg(long)]
         dispatch_tasks: bool,
     },
+    /// Show the project's deterministic orchestration policy.
+    OrchestrationPolicy { project: String },
+    /// Update the project's orchestration policy.
+    OrchestrationPolicySet {
+        project: String,
+        #[arg(long)]
+        auto_retry: Option<bool>,
+        #[arg(long)]
+        max_attempts: Option<u32>,
+        #[arg(long)]
+        retry_backoff_secs: Option<u64>,
+        #[arg(long)]
+        retry_priority_boost: Option<i32>,
+        #[arg(long)]
+        dependency_failure: Option<String>,
+        #[arg(long)]
+        escalate_after_retries: Option<bool>,
+        #[arg(long)]
+        auto_resolve_blockers: Option<bool>,
+    },
+    /// Show the live orchestration snapshot for a session.
+    Orchestration { session: String },
+    /// Show a cross-session orchestration overview.
+    OrchestrationOverview {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Apply one deterministic controller pass (retry/block/unblock/escalate).
+    Orchestrate {
+        session: String,
+        /// Show the decisions without changing any task.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Record a coordination note, blocker, decision, handoff, or escalation.
+    Coordination {
+        session: String,
+        #[arg(long, default_value = "note")]
+        action: String,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, default_value = "info")]
+        severity: String,
+        message: String,
+    },
+    /// Resolve a coordination blocker for a task.
+    Unblock {
+        session: String,
+        task: String,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, default_value = "resolved from CLI")]
+        message: String,
+    },
+    /// List the stored plan revisions for a session.
+    PlanRevisions { session: String },
+    /// Show one plan revision and its stored plan.
+    PlanRevision { session: String, revision: u32 },
+    /// Restore a previous plan revision as a new revision.
+    PlanRestore {
+        session: String,
+        revision: u32,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        expected_revision: Option<u32>,
+    },
+    /// Edit one plan task through a validated plan revision.
+    TaskEdit {
+        session: String,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        expected_revision: Option<u32>,
+    },
+    /// Revise a stored TeamPlan from a JSON file (or stdin).
+    TeamPlanRevise {
+        session: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        expected_revision: Option<u32>,
+    },
+    /// List daemon-wide runtime leases (session runs and integration steps).
+    Leases,
+    /// Remove expired runtime leases left by a crashed process.
+    LeasesSweep,
     /// Show the project's shell permission policy.
     ShellPolicy { project: String },
     /// Update the project's shell network/read-deny policy.
@@ -938,6 +1035,206 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::OrchestrationPolicy { project } => {
+            rpc(
+                &discovery,
+                "orchestration.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::OrchestrationPolicySet {
+            project,
+            auto_retry,
+            max_attempts,
+            retry_backoff_secs,
+            retry_priority_boost,
+            dependency_failure,
+            escalate_after_retries,
+            auto_resolve_blockers,
+        } => {
+            let current = rpc(
+                &discovery,
+                "orchestration.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(value) = auto_retry {
+                policy["auto_retry_failed"] = json!(value);
+            }
+            if let Some(value) = max_attempts {
+                policy["max_attempts"] = json!(value);
+            }
+            if let Some(value) = retry_backoff_secs {
+                policy["retry_backoff_secs"] = json!(value);
+            }
+            if let Some(value) = retry_priority_boost {
+                policy["retry_priority_boost"] = json!(value);
+            }
+            if let Some(value) = dependency_failure {
+                policy["dependency_failure"] = json!(value);
+            }
+            if let Some(value) = escalate_after_retries {
+                policy["escalate_after_retries"] = json!(value);
+            }
+            if let Some(value) = auto_resolve_blockers {
+                policy["auto_resolve_blockers"] = json!(value);
+            }
+            rpc(
+                &discovery,
+                "orchestration.policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::Orchestration { session } => {
+            rpc(
+                &discovery,
+                "orchestration.snapshot",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::PlanRevisions { session } => {
+            rpc(
+                &discovery,
+                "team_plan.revisions",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::OrchestrationOverview { project, limit } => {
+            let mut params = json!({"limit": limit});
+            if let Some(project) = project {
+                params["project_id"] = json!(project);
+            }
+            rpc(&discovery, "orchestration.overview", params).await?
+        }
+        Command::Orchestrate { session, dry_run } => {
+            rpc(
+                &discovery,
+                if dry_run {
+                    "orchestration.preview"
+                } else {
+                    "orchestration.advance"
+                },
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Coordination {
+            session,
+            action,
+            task,
+            agent,
+            note,
+            severity,
+            message,
+        } => {
+            rpc(
+                &discovery,
+                "coordination.note",
+                json!({
+                    "session_id": session,
+                    "action": action,
+                    "task_id": task,
+                    "target_agent_id": agent,
+                    "target_note_id": note,
+                    "severity": severity,
+                    "message": message,
+                }),
+            )
+            .await?
+        }
+        Command::Unblock {
+            session,
+            task,
+            note,
+            message,
+        } => {
+            rpc(
+                &discovery,
+                "coordination.note",
+                json!({
+                    "session_id": session,
+                    "action": "unblock",
+                    "task_id": task,
+                    "target_note_id": note,
+                    "severity": "info",
+                    "message": message,
+                }),
+            )
+            .await?
+        }
+        Command::PlanRevision { session, revision } => {
+            rpc(
+                &discovery,
+                "team_plan.revision",
+                json!({"session_id": session, "revision": revision}),
+            )
+            .await?
+        }
+        Command::PlanRestore {
+            session,
+            revision,
+            reason,
+            expected_revision,
+        } => {
+            rpc(
+                &discovery,
+                "team_plan.restore",
+                json!({
+                    "session_id": session,
+                    "revision": revision,
+                    "reason": reason,
+                    "expected_revision": expected_revision,
+                }),
+            )
+            .await?
+        }
+        Command::TaskEdit {
+            session,
+            file,
+            reason,
+            expected_revision,
+        } => {
+            let raw = read_json_input(file.as_deref())?;
+            let task: Value = serde_json::from_str(&raw).context("parsing task JSON")?;
+            rpc(
+                &discovery,
+                "team_plan.task_edit",
+                json!({
+                    "session_id": session,
+                    "task": task,
+                    "reason": reason,
+                    "expected_revision": expected_revision,
+                }),
+            )
+            .await?
+        }
+        Command::TeamPlanRevise {
+            session,
+            reason,
+            file,
+            expected_revision,
+        } => {
+            let raw = read_json_input(file.as_deref())?;
+            let plan: Value = serde_json::from_str(&raw).context("parsing plan JSON")?;
+            rpc(
+                &discovery,
+                "team_plan.revise",
+                json!({
+                    "session_id": session,
+                    "plan": plan,
+                    "reason": reason,
+                    "expected_revision": expected_revision,
+                }),
+            )
+            .await?
+        }
+        Command::Leases => rpc(&discovery, "runtime.leases", json!({})).await?,
+        Command::LeasesSweep => rpc(&discovery, "runtime.leases.sweep", json!({})).await?,
         Command::ShellPolicy { project } => {
             rpc(
                 &discovery,
@@ -2020,6 +2317,19 @@ fn parse_env_pairs(values: &[String]) -> Result<std::collections::BTreeMap<Strin
     Ok(env)
 }
 
+fn read_json_input(file: Option<&std::path::Path>) -> Result<String> {
+    match file {
+        Some(path) => {
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+        }
+        None => {
+            let mut buffer = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+            Ok(buffer)
+        }
+    }
+}
+
 fn print_human(value: &Value) {
     if value.get("console_streamed").and_then(Value::as_bool) == Some(true)
         || value.get("terminal_streamed").and_then(Value::as_bool) == Some(true)
@@ -2032,6 +2342,213 @@ fn print_human(value: &Value) {
     }
     if let Some(markdown) = value.get("markdown").and_then(Value::as_str) {
         print!("{markdown}");
+        return;
+    }
+    if let Some(actions) = value.get("actions").and_then(Value::as_array)
+        && value.get("session_id").is_some()
+        && value.get("snapshot").is_none()
+    {
+        if actions.is_empty() {
+            println!("No orchestration action was needed.");
+        } else {
+            for action in actions {
+                println!(
+                    "{}  {}  {}  {}",
+                    action["action"].as_str().unwrap_or("?"),
+                    action["task_id"].as_str().unwrap_or("-"),
+                    action["attempt"].as_u64().unwrap_or(0),
+                    action["detail"].as_str().unwrap_or("")
+                );
+            }
+        }
+        return;
+    }
+    if let Some(sessions) = value.get("sessions").and_then(Value::as_array)
+        && let Some(totals) = value.get("totals")
+    {
+        println!(
+            "{} sessions · {} running · {} attention · {} blocked tasks · {} failed · {} retrying · {} conflicts",
+            totals["sessions"].as_u64().unwrap_or(0),
+            totals["running"].as_u64().unwrap_or(0),
+            totals["attention"].as_u64().unwrap_or(0),
+            totals["blocked_tasks"].as_u64().unwrap_or(0),
+            totals["failed_tasks"].as_u64().unwrap_or(0),
+            totals["retrying_tasks"].as_u64().unwrap_or(0),
+            totals["merge_conflicts"].as_u64().unwrap_or(0)
+        );
+        for session in sessions {
+            println!(
+                "  {}  [{}]  {}  r{}  tasks {}/{}  ready {}  blocked {}  failed {}",
+                session["project_name"].as_str().unwrap_or("?"),
+                session["status"].as_str().unwrap_or("?"),
+                session["goal"].as_str().unwrap_or(""),
+                session["plan_revision"].as_u64().unwrap_or(0),
+                session["metrics"]["completed_tasks"].as_u64().unwrap_or(0),
+                session["metrics"]["total_tasks"].as_u64().unwrap_or(0),
+                session["metrics"]["ready_tasks"].as_u64().unwrap_or(0),
+                session["metrics"]["blocked_tasks"].as_u64().unwrap_or(0),
+                session["metrics"]["failed_tasks"].as_u64().unwrap_or(0)
+            );
+            if let Some(blocker) = session["blockers"]
+                .as_array()
+                .and_then(|values| values.first())
+            {
+                println!("      blocker: {}", blocker.as_str().unwrap_or(""));
+            }
+            if let Some(decision) = session["last_decision"].as_str() {
+                println!("      last: {}", decision);
+            }
+        }
+        return;
+    }
+    if let Some(snapshot) = value.get("snapshot")
+        && snapshot.get("metrics").is_some()
+    {
+        let metrics = &snapshot["metrics"];
+        println!(
+            "session {}  status={}  plan={} rev={}",
+            snapshot["session_id"].as_str().unwrap_or("?"),
+            snapshot["status"].as_str().unwrap_or("?"),
+            if snapshot["plan"].is_null() {
+                "none"
+            } else {
+                "present"
+            },
+            snapshot["plan_revision"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "agents={} running={} queued={} failed={}",
+            metrics["total_agents"].as_u64().unwrap_or(0),
+            metrics["running_agents"].as_u64().unwrap_or(0),
+            metrics["queued_agents"].as_u64().unwrap_or(0),
+            metrics["failed_agents"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "tasks={} completed={} active={} ready={} blocked={} failed={} retrying={}",
+            metrics["total_tasks"].as_u64().unwrap_or(0),
+            metrics["completed_tasks"].as_u64().unwrap_or(0),
+            metrics["active_tasks"].as_u64().unwrap_or(0),
+            metrics["ready_tasks"].as_u64().unwrap_or(0),
+            metrics["blocked_tasks"].as_u64().unwrap_or(0),
+            metrics["failed_tasks"].as_u64().unwrap_or(0),
+            metrics["retrying_tasks"].as_u64().unwrap_or(0)
+        );
+        for task in snapshot["tasks"].as_array().into_iter().flatten() {
+            println!(
+                "  {} [{}/{}] {} · attempts={} {}",
+                task["task_id"].as_str().unwrap_or("?"),
+                task["department"].as_str().unwrap_or("?"),
+                task["status"].as_str().unwrap_or("?"),
+                task["title"].as_str().unwrap_or(""),
+                task["attempts"].as_u64().unwrap_or(0),
+                task["blocked_by"]
+                    .as_array()
+                    .map(|values| values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default()
+            );
+        }
+        for blocker in snapshot["blockers"].as_array().into_iter().flatten() {
+            println!(
+                "  blocker {} · {}",
+                blocker["kind"].as_str().unwrap_or("?"),
+                blocker["message"].as_str().unwrap_or("")
+            );
+        }
+        return;
+    }
+    if let Some(revision) = value.get("revision")
+        && let Some(plan) = value.get("plan")
+    {
+        println!(
+            "r{}  {}  {}  tasks={}  {}",
+            revision["revision"].as_u64().unwrap_or(0),
+            revision["kind"].as_str().unwrap_or("?"),
+            revision["author"].as_str().unwrap_or("?"),
+            revision["task_count"].as_u64().unwrap_or(0),
+            revision["reason"].as_str().unwrap_or("")
+        );
+        println!(
+            "diff: +{}  -{}  ~{}",
+            revision["added"].as_array().map(Vec::len).unwrap_or(0),
+            revision["removed"].as_array().map(Vec::len).unwrap_or(0),
+            revision["changed"].as_array().map(Vec::len).unwrap_or(0)
+        );
+        for task in plan["tasks"].as_array().into_iter().flatten() {
+            println!(
+                "  {} [{}] {}  deps={}",
+                task["id"].as_str().unwrap_or("?"),
+                task["department"].as_str().unwrap_or("?"),
+                task["title"].as_str().unwrap_or(""),
+                task["deps"]
+                    .as_array()
+                    .map(|deps| deps
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default()
+            );
+        }
+        return;
+    }
+    if let Some(revisions) = value.get("revisions").and_then(Value::as_array) {
+        if revisions.is_empty() {
+            println!("No plan revisions.");
+        }
+        for revision in revisions {
+            println!(
+                "r{}  {}  {}  tasks={}  +{} -{} ~{}  {}",
+                revision["revision"].as_u64().unwrap_or(0),
+                revision["kind"].as_str().unwrap_or("?"),
+                revision["author"].as_str().unwrap_or("?"),
+                revision["task_count"].as_u64().unwrap_or(0),
+                revision["added"].as_array().map(Vec::len).unwrap_or(0),
+                revision["removed"].as_array().map(Vec::len).unwrap_or(0),
+                revision["changed"].as_array().map(Vec::len).unwrap_or(0),
+                revision["reason"].as_str().unwrap_or("")
+            );
+        }
+        return;
+    }
+    if let Some(policy) = value.get("policy")
+        && value.get("project_id").is_some()
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(policy).unwrap_or_default()
+        );
+        return;
+    }
+    if let Some(leases) = value.get("leases").and_then(Value::as_array) {
+        println!(
+            "runtime {} · {} lease(s)",
+            value
+                .get("runtime_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?"),
+            leases.len()
+        );
+        for lease in leases {
+            println!(
+                "  {}  {}  {}  expires {}  owner {}",
+                lease["kind"].as_str().unwrap_or("?"),
+                lease["lease_key"].as_str().unwrap_or("?"),
+                lease["session_id"].as_str().unwrap_or("-"),
+                lease["expires_at"].as_str().unwrap_or("?"),
+                lease["owner_id"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if value.get("removed").is_some() {
+        println!(
+            "Removed {} expired runtime lease(s).",
+            value["removed"].as_u64().unwrap_or(0)
+        );
         return;
     }
     if let Some(hits) = value.get("hits").and_then(Value::as_array)

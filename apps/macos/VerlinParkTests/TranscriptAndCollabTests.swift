@@ -765,3 +765,424 @@ final class TranscriptAndCollabTests: XCTestCase {
         )
     }
 }
+
+final class OrchestrationSurfaceTests: XCTestCase {
+    func testPolicyUsesStableSnakeCaseKeys() throws {
+        let policy = OrchestrationPolicy(
+            autoRetryFailed: true,
+            maxAttempts: 4,
+            retryBackoffSecs: 15,
+            retryPriorityBoost: 8,
+            dependencyFailure: "cancel",
+            escalateAfterRetries: false,
+            autoResolveBlockers: true
+        )
+        let data = try JSONEncoder().encode(policy)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["auto_retry_failed"] as? Bool, true)
+        XCTAssertEqual(object["max_attempts"] as? Int, 4)
+        XCTAssertEqual(object["retry_backoff_secs"] as? Int, 15)
+        XCTAssertEqual(object["retry_priority_boost"] as? Int, 8)
+        XCTAssertEqual(object["dependency_failure"] as? String, "cancel")
+        XCTAssertEqual(object["escalate_after_retries"] as? Bool, false)
+        XCTAssertEqual(object["auto_resolve_blockers"] as? Bool, true)
+        let decoded = try JSONDecoder().decode(OrchestrationPolicy.self, from: data)
+        XCTAssertEqual(decoded, policy)
+    }
+
+    func testSnapshotDecodesDecisionsBlockersAndTaskState() throws {
+        let json = """
+        {
+          "session_id": "s1",
+          "project_id": "p1",
+          "goal": "ship",
+          "status": "running",
+          "plan": null,
+          "plan_revision": 2,
+          "policy": {
+            "auto_retry_failed": true,
+            "max_attempts": 2,
+            "retry_backoff_secs": 30,
+            "retry_priority_boost": 10,
+            "dependency_failure": "block",
+            "escalate_after_retries": true,
+            "auto_resolve_blockers": true
+          },
+          "departments": [],
+          "tasks": [{
+            "task_id": "T1",
+            "department": "Platform",
+            "title": "Build",
+            "kind": "code",
+            "priority": 5,
+            "status": "failed",
+            "deps": ["T0"],
+            "write_scope": ["src/build"],
+            "acceptance": ["tests"],
+            "attempts": 2,
+            "max_attempts": 2,
+            "owner_agent_id": "a1",
+            "owner_agent_name": "Worker One",
+            "last_error": "compile failed",
+            "result_summary": null,
+            "verifier_status": "rejected",
+            "next_attempt_at": "2026-11-09T10:00:00Z",
+            "ready": false,
+            "blocked_by": ["T0 (running)"],
+            "started_at": "2026-11-09T09:00:00Z",
+            "finished_at": "2026-11-09T09:10:00Z"
+          }],
+          "agents": [],
+          "notes": [{
+            "note_id": "n1",
+            "action": "blocker",
+            "severity": "warning",
+            "status": "open",
+            "task_id": "T1",
+            "target_agent_id": null,
+            "agent_id": "a1",
+            "agent_name": "Worker One",
+            "message": "schema is unclear",
+            "created_at": "2026-11-09T09:05:00Z",
+            "resolved_at": null
+          }],
+          "decisions": [{
+            "decision_id": "d1",
+            "action": "retry",
+            "task_id": "T1",
+            "detail": "attempt 1 failed",
+            "attempt": 1,
+            "agent_id": "orchestrator",
+            "created_at": "2026-11-09T09:06:00Z"
+          }],
+          "revisions": [{
+            "revision": 2,
+            "seq": 10,
+            "kind": "team_plan.revised",
+            "reason": "scope change",
+            "author": "leader",
+            "task_count": 1,
+            "added": [],
+            "removed": [],
+            "changed": ["T1"],
+            "created_at": "2026-11-09T09:00:00Z"
+          }],
+          "blockers": [{
+            "kind": "coordination",
+            "note_id": "n1",
+            "task_id": "T1",
+            "agent_id": "a1",
+            "agent_name": "Worker One",
+            "message": "schema is unclear",
+            "created_at": "2026-11-09T09:05:00Z"
+          }],
+          "metrics": {
+            "total_agents": 1,
+            "running_agents": 0,
+            "queued_agents": 0,
+            "failed_agents": 0,
+            "total_tasks": 1,
+            "completed_tasks": 0,
+            "active_tasks": 0,
+            "ready_tasks": 0,
+            "blocked_tasks": 0,
+            "failed_tasks": 1,
+            "retrying_tasks": 0,
+            "open_blockers": 1,
+            "merge_queue_depth": 0,
+            "merge_conflicts": 0,
+            "attention_count": 1
+          },
+          "generated_at": "2026-11-09T09:06:01Z"
+        }
+        """
+        let snapshot = try JSONDecoder().decode(
+            OrchestrationSnapshot.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(snapshot.planRevision, 2)
+        XCTAssertEqual(snapshot.tasks.count, 1)
+        let task = try XCTUnwrap(snapshot.task("T1"))
+        XCTAssertEqual(task.attempts, 2)
+        XCTAssertEqual(task.blockedBy, ["T0 (running)"])
+        XCTAssertEqual(task.verifierStatus, "rejected")
+        XCTAssertEqual(snapshot.blockers(for: "T1").first?.noteId, "n1")
+        XCTAssertEqual(snapshot.recentDecisions.first?.action, "retry")
+        XCTAssertEqual(snapshot.recentNotes.first?.status, "open")
+        XCTAssertEqual(snapshot.revisions.first?.diffLabel, "~T1")
+        XCTAssertEqual(snapshot.metrics.attentionCount, 1)
+    }
+
+    func testPlanDraftDiffReportsEveryTaskChange() {
+        let old = TeamPlan(
+            goal: "ship",
+            departments: [department()],
+            tasks: [
+                planTask("T1", title: "One"),
+                planTask("T2", title: "Two"),
+                planTask("T3", title: "Three"),
+            ]
+        )
+        let new = TeamPlan(
+            goal: "ship",
+            departments: [department()],
+            tasks: [
+                planTask("T1", title: "One revised"),
+                planTask("T3", title: "Three"),
+                planTask("T4", title: "Four"),
+            ]
+        )
+        let diff = PlanDraftDiff(old: old, new: new)
+        XCTAssertEqual(diff.changed, ["T1"])
+        XCTAssertEqual(diff.removed, ["T2"])
+        XCTAssertEqual(diff.added, ["T4"])
+        XCTAssertFalse(diff.isEmpty)
+        XCTAssertTrue(PlanDraftDiff(old: old, new: old).isEmpty)
+        XCTAssertEqual(PlanDraftDiff(old: old, new: nil).added, [])
+    }
+
+    func testTaskFilterMatchesAttentionAndActive() {
+        let failed = orchestrationTask("T1", status: "failed")
+        let running = orchestrationTask("T2", status: "running")
+        let done = orchestrationTask("T3", status: "completed")
+        XCTAssertTrue(CollabTaskFilter.attention.matches(failed))
+        XCTAssertFalse(CollabTaskFilter.attention.matches(running))
+        XCTAssertTrue(CollabTaskFilter.active.matches(running))
+        XCTAssertTrue(CollabTaskFilter.done.matches(done))
+        XCTAssertTrue(CollabTaskFilter.all.matches(failed))
+        XCTAssertFalse(CollabTaskFilter.active.matches(done))
+    }
+
+    func testTaskCommandsExposeStableLabelsAndIcons() {
+        XCTAssertFalse(CollabTaskCommand.retry.title.isEmpty)
+        XCTAssertEqual(CollabTaskCommand.pause.icon, "pause.fill")
+        XCTAssertEqual(CollabTaskCommand.resume.icon, "play.fill")
+        XCTAssertFalse(CollabTaskCommand.cancel.title.isEmpty)
+        XCTAssertEqual(Set(CollabTaskCommand.allCases.map(\.rawValue)).count, 5)
+    }
+
+    func testGraphUsesOrchestrationReadyAndBlockedState() {
+        let plan = TeamPlan(
+            goal: "ship",
+            departments: [department()],
+            tasks: [
+                planTask("T1", title: "One"),
+                planTask("T2", title: "Two"),
+            ]
+        )
+        let snapshot = OrchestrationSnapshot(
+            sessionId: "s1",
+            projectId: "p1",
+            goal: "ship",
+            status: "running",
+            plan: plan,
+            planRevision: 1,
+            policy: .standard,
+            departments: [],
+            tasks: [
+                orchestrationTask(
+                    "T1",
+                    status: "blocked",
+                    ready: false,
+                    blockedBy: ["T0 (running)"]
+                ),
+                orchestrationTask("T2", status: "pending", ready: true),
+            ],
+            agents: [],
+            notes: [],
+            decisions: [],
+            revisions: [],
+            blockers: [],
+            metrics: OrchestrationMetrics(
+                totalAgents: 0,
+                runningAgents: 0,
+                queuedAgents: 0,
+                failedAgents: 0,
+                totalTasks: 2,
+                completedTasks: 0,
+                activeTasks: 0,
+                readyTasks: 1,
+                blockedTasks: 1,
+                failedTasks: 0,
+                retryingTasks: 0,
+                openBlockers: 0,
+                mergeQueueDepth: 0,
+                mergeConflicts: 0,
+                attentionCount: 1
+            ),
+            generatedAt: "2026-11-09T09:00:00Z"
+        )
+        let layout = CollabGraphBuilder.build(
+            agents: [],
+            plan: plan,
+            statuses: [:],
+            scheduled: [],
+            events: [],
+            sessionStatus: "running",
+            goal: "ship",
+            mergeQueue: [],
+            includePlanned: true,
+            orchestration: snapshot
+        )
+        let first = layout.nodes.first { $0.taskID == "T1" }
+        let second = layout.nodes.first { $0.taskID == "T2" }
+        XCTAssertEqual(first?.blockedBy, ["T0 (running)"])
+        XCTAssertFalse(first?.ready ?? true)
+        XCTAssertTrue(second?.ready ?? false)
+        XCTAssertEqual(first?.taskStatus, "blocked")
+        XCTAssertEqual(second?.taskStatus, "pending")
+    }
+
+    func testPreviewAndRuntimeLeaseDecode() throws {
+        let preview = try JSONDecoder().decode(
+            OrchestrationPreviewResult.self,
+            from: Data(
+                """
+                {"session_id":"s1","actions":[
+                  {"action":"retry","task_id":"T1","detail":"attempt 1 failed","attempt":1},
+                  {"action":"block","task_id":"T2","detail":"dependency T1 failed (dependency T1)","attempt":2}
+                ]}
+                """.utf8
+            )
+        )
+        XCTAssertEqual(preview.sessionId, "s1")
+        XCTAssertEqual(preview.actions.count, 2)
+        XCTAssertEqual(preview.actions[0].icon, "arrow.clockwise")
+        XCTAssertEqual(preview.actions[1].taskId, "T2")
+
+        let leases = try JSONDecoder().decode(
+            RuntimeLeaseListResult.self,
+            from: Data(
+                """
+                {"runtime_id":"daemon-a","leases":[{
+                  "lease_key":"session:s1","owner_id":"daemon-a","kind":"session",
+                  "session_id":"s1","acquired_at":"2026-11-09T09:00:00Z",
+                  "heartbeat_at":"2026-11-09T09:01:00Z","expires_at":"2026-11-09T09:03:00Z"
+                }]}
+                """.utf8
+            )
+        )
+        XCTAssertEqual(leases.runtimeId, "daemon-a")
+        XCTAssertEqual(leases.leases.first?.kind, "session")
+        XCTAssertEqual(leases.leases.first?.icon, "person.badge.clock")
+    }
+
+    func testOverviewDecodesProjectAndAttentionTotals() throws {
+        let overview = try JSONDecoder().decode(
+            OrchestrationOverviewResult.self,
+            from: Data(
+                """
+                {
+                  "sessions":[{
+                    "session_id":"s1","project_id":"p1","project_name":"Demo",
+                    "goal":"ship","status":"running","priority":3,"plan_revision":2,
+                    "metrics":{
+                      "total_agents":2,"running_agents":1,"queued_agents":0,"failed_agents":0,
+                      "total_tasks":4,"completed_tasks":1,"active_tasks":1,"ready_tasks":1,
+                      "blocked_tasks":1,"failed_tasks":0,"retrying_tasks":1,"open_blockers":1,
+                      "merge_queue_depth":0,"merge_conflicts":0,"attention_count":2
+                    },
+                    "blockers":["task_blocked: T2 waits for T1"],
+                    "last_decision":"attempt 1 failed","last_decision_at":"2026-11-09T09:01:00Z"
+                  }],
+                  "totals":{
+                    "sessions":1,"running":1,"attention":1,"blocked_tasks":1,
+                    "failed_tasks":0,"retrying_tasks":1,"open_blockers":1,"merge_conflicts":0
+                  },
+                  "generated_at":"2026-11-09T09:02:00Z"
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(overview.totals.sessions, 1)
+        XCTAssertEqual(overview.sessions.first?.projectName, "Demo")
+        XCTAssertEqual(overview.sessions.first?.metrics.readyTasks, 1)
+        XCTAssertEqual(overview.sessions.first?.blockers.count, 1)
+    }
+
+    func testRevisionDetailDecodesStoredPlan() throws {
+        let detail = try JSONDecoder().decode(
+            PlanRevisionDetailResult.self,
+            from: Data(
+                """
+                {
+                  "revision":{
+                    "revision":2,"seq":9,"kind":"team_plan.revised","reason":"scope",
+                    "author":"leader","task_count":1,"added":[],"removed":[],
+                    "changed":["T1"],"created_at":"2026-11-09T09:00:00Z"
+                  },
+                  "plan":{
+                    "goal":"ship",
+                    "departments":[{"name":"Platform","manager_title":"Platform Manager",
+                      "profile":"coding","objective":"build"}],
+                    "tasks":[{"id":"T1","department":"Platform","title":"One",
+                      "kind":"code","priority":0,"deps":[],"write_scope":[],
+                      "acceptance":[]}]
+                  }
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(detail.revision.revision, 2)
+        XCTAssertEqual(detail.plan.tasks.first?.id, "T1")
+        XCTAssertEqual(detail.revision.diffLabel, "~T1")
+    }
+
+    private func department() -> PlanDepartment {
+        PlanDepartment(
+            name: "Platform",
+            managerTitle: "Platform Manager",
+            profile: "coding",
+            objective: "build",
+            tokenBudget: nil,
+            costBudgetUsd: nil
+        )
+    }
+
+    private func planTask(_ id: String, title: String) -> PlanTask {
+        PlanTask(
+            id: id,
+            department: "Platform",
+            title: title,
+            kind: "code",
+            priority: 0,
+            profile: nil,
+            deps: [],
+            writeScope: [],
+            acceptance: [],
+            tokenBudget: nil,
+            costBudgetUsd: nil
+        )
+    }
+
+    private func orchestrationTask(
+        _ id: String,
+        status: String,
+        ready: Bool? = nil,
+        blockedBy: [String] = []
+    ) -> OrchestrationTask {
+        OrchestrationTask(
+            taskId: id,
+            department: "Platform",
+            title: "Task \(id)",
+            kind: "code",
+            priority: 0,
+            status: status,
+            deps: [],
+            writeScope: [],
+            acceptance: [],
+            attempts: 0,
+            maxAttempts: 2,
+            ownerAgentId: nil,
+            ownerAgentName: nil,
+            lastError: nil,
+            resultSummary: nil,
+            verifierStatus: nil,
+            nextAttemptAt: nil,
+            ready: ready ?? (status == "pending"),
+            blockedBy: blockedBy,
+            startedAt: nil,
+            finishedAt: nil
+        )
+    }
+}

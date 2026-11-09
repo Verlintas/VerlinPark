@@ -62,6 +62,15 @@ use vp_protocol::types::{
     UpdateModelPresetParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceTreeParams,
     WorkspaceWriteParams, WorktreePolicyParams,
 };
+use vp_protocol::types::{
+    CoordinationNoteParams, CoordinationNoteResult, OrchestrationAdvanceParams,
+    OrchestrationAdvanceResult, OrchestrationOverviewParams, OrchestrationPolicyParams,
+    OrchestrationPolicyResult, OrchestrationPreviewParams, OrchestrationSnapshotParams,
+    OrchestrationSnapshotResult, PlanRevisionGetParams, PlanRevisionListParams,
+    PlanRevisionListResult, PlanRevisionRestoreParams, ReviseTeamPlanParams,
+    SetOrchestrationPolicyParams, TaskEditParams,
+};
+use vp_protocol::types::{RuntimeLeaseInfo, RuntimeLeaseListResult, RuntimeLeaseSweepResult};
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
 use vp_store::paths;
@@ -139,6 +148,7 @@ async fn main() -> Result<()> {
     spawn_checkpoint_sweeper(state.engine.clone());
     spawn_memory_sweeper(state.engine.clone());
     spawn_terminal_sweeper(state.engine.clone());
+    spawn_orchestration_controller(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
     let addr = listener.local_addr()?;
@@ -489,6 +499,205 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "orchestration.policy.get" => {
+            match parse_params::<OrchestrationPolicyParams>(request.params) {
+                Ok(params) => match state.engine.orchestration_policy(&params.project_id).await {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        OrchestrationPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "orchestration.policy.set" => {
+            match parse_params::<SetOrchestrationPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_orchestration_policy(&params.project_id, &params.policy)
+                    .await
+                {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        OrchestrationPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "runtime.leases" => match state.engine.list_runtime_leases().await {
+            Ok(leases) => RpcResponse::success(
+                id,
+                RuntimeLeaseListResult {
+                    runtime_id: state.engine.runtime_id().to_string(),
+                    leases: leases
+                        .into_iter()
+                        .map(|lease| RuntimeLeaseInfo {
+                            lease_key: lease.lease_key,
+                            owner_id: lease.owner_id,
+                            kind: lease.kind,
+                            session_id: lease.session_id,
+                            acquired_at: lease.acquired_at,
+                            heartbeat_at: lease.heartbeat_at,
+                            expires_at: lease.expires_at,
+                        })
+                        .collect(),
+                },
+            ),
+            Err(error) => internal_error(id, error),
+        },
+        "runtime.leases.sweep" => match state.engine.sweep_runtime_leases().await {
+            Ok(removed) => RpcResponse::success(id, RuntimeLeaseSweepResult { removed }),
+            Err(error) => internal_error(id, error),
+        },
+        "coordination.note" => match parse_params::<CoordinationNoteParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .record_user_coordination_note(
+                    &params.session_id,
+                    &params.action,
+                    params.task_id.as_deref(),
+                    params.target_agent_id.as_deref(),
+                    params.target_note_id.as_deref(),
+                    &params.message,
+                    params.severity.as_deref(),
+                )
+                .await
+            {
+                Ok(note_id) => RpcResponse::success(id, CoordinationNoteResult { note_id }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "orchestration.overview" => {
+            match parse_params::<OrchestrationOverviewParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .orchestration_overview(
+                        params.project_id.as_deref(),
+                        params.limit.unwrap_or(20),
+                    )
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "orchestration.preview" => {
+            match parse_params::<OrchestrationPreviewParams>(request.params) {
+                Ok(params) => match state.engine.preview_orchestration(&params.session_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "orchestration.advance" => {
+            match parse_params::<OrchestrationAdvanceParams>(request.params) {
+                Ok(params) => match state.engine.advance_orchestration(&params.session_id).await {
+                    Ok(actions) => RpcResponse::success(
+                        id,
+                        OrchestrationAdvanceResult {
+                            session_id: params.session_id,
+                            actions,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "orchestration.snapshot" => {
+            match parse_params::<OrchestrationSnapshotParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .orchestration_snapshot(&params.session_id)
+                    .await
+                {
+                    Ok(snapshot) => {
+                        RpcResponse::success(id, OrchestrationSnapshotResult { snapshot })
+                    }
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "team_plan.revisions" => match parse_params::<PlanRevisionListParams>(request.params) {
+            Ok(params) => match state.engine.plan_revisions(&params.session_id).await {
+                Ok(revisions) => RpcResponse::success(id, PlanRevisionListResult { revisions }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "team_plan.revision" => match parse_params::<PlanRevisionGetParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .plan_revision_detail(&params.session_id, params.revision)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "team_plan.restore" => match parse_params::<PlanRevisionRestoreParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .restore_team_plan_revision(
+                    &params.session_id,
+                    params.revision,
+                    &params.reason,
+                    params.expected_revision,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "team_plan.task_edit" => match parse_params::<TaskEditParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .edit_plan_task(
+                    &params.session_id,
+                    params.task,
+                    &params.reason,
+                    params.expected_revision,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "team_plan.revise" => match parse_params::<ReviseTeamPlanParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .revise_team_plan(
+                    &params.session_id,
+                    params.plan,
+                    &params.reason,
+                    params.expected_revision,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "project.shell_policy.get" => match parse_params::<ShellPolicyParams>(request.params) {
             Ok(params) => match state.engine.get_shell_policy(&params.project_id).await {
                 Ok(policy) => RpcResponse::success(
@@ -1909,6 +2118,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "project.worktree_policy.set"
             | "project.checkpoint_policy.set"
             | "project.task_scheduler.set"
+            | "orchestration.policy.set"
             | "memory.policy.set"
             | "mailbox.policy.set"
             | "artifact.policy.set"
@@ -2009,6 +2219,51 @@ fn spawn_terminal_sweeper(engine: Engine) {
                     terminals,
                     "closed idle console/terminal processes"
                 );
+            }
+        }
+    });
+}
+
+/// Run the deterministic controller for sessions with failed or blocked plan
+/// tasks. Task finishes already trigger a pass; this catches retry gates that
+/// become due later and failures that survived a daemon restart.
+fn spawn_orchestration_controller(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_ORCHESTRATION_TICK_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds.max(5)));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let candidates = match engine.orchestration_candidates(100).await {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    tracing::warn!(%error, "orchestration candidate scan failed");
+                    continue;
+                }
+            };
+            for session_id in candidates {
+                match engine.advance_orchestration(&session_id).await {
+                    Ok(actions) if !actions.is_empty() => {
+                        tracing::info!(
+                            %session_id,
+                            actions = actions.len(),
+                            "orchestration controller advanced a plan"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, %session_id, "orchestration controller pass failed");
+                    }
+                }
+            }
+            if let Err(error) = engine.sweep_runtime_leases().await {
+                tracing::warn!(%error, "runtime lease sweep failed");
             }
         }
     });

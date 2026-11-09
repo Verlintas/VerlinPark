@@ -4396,3 +4396,679 @@ async fn mcp_server_transport_configs_are_validated_and_persisted() {
     assert!(!updated.enabled);
     assert!(engine.remove_mcp_server(&server.id).await.unwrap());
 }
+
+fn orchestration_test_plan() -> TeamPlan {
+    use vp_protocol::types::{PlanDepartment, PlanTask};
+    TeamPlan {
+        goal: "ship orchestration".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "build".into(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![
+            PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "Foundation".into(),
+                kind: "coding".into(),
+                priority: 10,
+                profile: None,
+                deps: vec![],
+                write_scope: vec!["src/one".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+            PlanTask {
+                id: "T2".into(),
+                department: "impl".into(),
+                title: "Follow-up".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: vec!["T1".into()],
+                write_scope: vec!["src/two".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+        ],
+    }
+}
+
+#[tokio::test]
+async fn orchestration_advance_schedules_a_durable_retry_once() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("orch".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "orchestrate".into(), None)
+        .await
+        .unwrap();
+    let plan = orchestration_test_plan();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let queue = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .tasks;
+    let plan_seq = queue[0].plan_seq;
+    engine
+        .scheduler()
+        .claim(&session.id, plan_seq, &["T1".into()])
+        .await
+        .unwrap();
+    engine
+        .scheduler()
+        .finish(&session.id, plan_seq, "T1", "failed", Some("compile error"))
+        .await
+        .unwrap();
+
+    let preview = engine.preview_orchestration(&session.id).await.unwrap();
+    assert!(
+        preview
+            .actions
+            .iter()
+            .any(|action| action.action == "retry" && action.task_id == "T1")
+    );
+    let untouched = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(
+        untouched
+            .iter()
+            .find(|task| task.task_id == "T1")
+            .unwrap()
+            .status,
+        "failed"
+    );
+
+    let decisions = engine.advance_orchestration(&session.id).await.unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.action == "retry" && decision.task_id.as_deref() == Some("T1"))
+    );
+    let queue = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .tasks;
+    let t1 = queue.iter().find(|task| task.task_id == "T1").unwrap();
+    assert_eq!(t1.status, "pending");
+    assert!(t1.next_attempt_at.is_some());
+
+    let again = engine.advance_orchestration(&session.id).await.unwrap();
+    assert!(
+        !again
+            .iter()
+            .any(|decision| decision.action == "retry" && decision.task_id.as_deref() == Some("T1"))
+    );
+    let events = engine.recent_events(&session.id, 100).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "plan_task.retry_scheduled")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "orchestration.decision")
+    );
+}
+
+#[tokio::test]
+async fn orchestration_exhaustion_blocks_dependents_and_escalates() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("orch".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "orchestrate".into(), None)
+        .await
+        .unwrap();
+    let mut policy = engine.orchestration_policy(&project.id).await.unwrap();
+    policy.max_attempts = 1;
+    policy.retry_backoff_secs = 0;
+    engine
+        .set_orchestration_policy(&project.id, &policy)
+        .await
+        .unwrap();
+    let plan = orchestration_test_plan();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let queue = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .tasks;
+    let plan_seq = queue[0].plan_seq;
+    engine
+        .scheduler()
+        .claim(&session.id, plan_seq, &["T1".into()])
+        .await
+        .unwrap();
+    engine
+        .scheduler()
+        .finish(&session.id, plan_seq, "T1", "failed", Some("fatal"))
+        .await
+        .unwrap();
+
+    let decisions = engine.advance_orchestration(&session.id).await.unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.action == "escalate")
+    );
+    assert!(decisions.iter().any(|decision| decision.action == "block"));
+    let queue = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(
+        queue
+            .iter()
+            .find(|task| task.task_id == "T2")
+            .unwrap()
+            .status,
+        "blocked"
+    );
+    let snapshot = engine.orchestration_snapshot(&session.id).await.unwrap();
+    assert!(snapshot.metrics.blocked_tasks >= 1);
+    assert!(
+        snapshot
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == "task_failed")
+    );
+    assert!(
+        snapshot
+            .notes
+            .iter()
+            .any(|note| note.action == "escalate" && note.task_id.as_deref() == Some("T1"))
+    );
+}
+
+#[tokio::test]
+async fn plan_revision_records_a_diff_and_rejects_protected_tasks() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("orch".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "revise".into(), None)
+        .await
+        .unwrap();
+    let plan = orchestration_test_plan();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let queue = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .tasks;
+    let plan_seq = queue[0].plan_seq;
+    engine
+        .scheduler()
+        .finish(&session.id, plan_seq, "T1", "completed", Some("landed"))
+        .await
+        .unwrap();
+
+    let mut unsafe_plan = plan.clone();
+    unsafe_plan.tasks.retain(|task| task.id != "T1");
+    let error = engine
+        .revise_team_plan(
+            &session.id,
+            unsafe_plan,
+            "remove old work",
+            "leader",
+            None,
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().is_empty());
+
+    let mut revised = plan.clone();
+    revised.tasks[1].title = "Follow-up revised".into();
+    revised.tasks.push(vp_protocol::types::PlanTask {
+        id: "T3".into(),
+        department: "impl".into(),
+        title: "New verification".into(),
+        kind: "verify".into(),
+        priority: 5,
+        profile: None,
+        deps: vec!["T2".into()],
+        write_scope: vec![],
+        acceptance: vec!["tests pass".into()],
+        token_budget: None,
+        cost_budget_usd: None,
+    });
+    let result = engine
+        .revise_team_plan(
+            &session.id,
+            revised,
+            "add verification",
+            "leader",
+            Some(1),
+            5,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.revision.revision, 2);
+    assert_eq!(result.revision.changed, vec!["T2"]);
+    assert_eq!(result.revision.added, vec!["T3"]);
+    let revisions = engine.plan_revisions(&session.id).await.unwrap();
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(revisions[1].reason.as_deref(), Some("add verification"));
+    let conflict = engine
+        .revise_team_plan(&session.id, plan, "stale revision", "leader", Some(1), 5)
+        .await
+        .unwrap_err();
+    assert!(conflict.to_string().contains("revision conflict"));
+}
+
+#[tokio::test]
+async fn session_leases_serialize_two_daemons_and_release_cleanly() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let first = Engine::new(store.clone());
+    let second = Engine::new(store);
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("leases".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id.clone(), "lease me".into(), None)
+        .await
+        .unwrap();
+
+    let lease = first
+        .acquire_session_lease(&session.id, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(lease.session_id, session.id);
+    let blocked = second
+        .acquire_session_lease(&session.id, std::time::Duration::from_secs(60))
+        .await;
+    let error = match blocked {
+        Ok(_) => panic!("second daemon acquired a held session lease"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("already running"));
+    let leases = first.list_runtime_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].owner_id, first.runtime_id());
+
+    lease.release().await;
+    let leases = first.list_runtime_leases().await.unwrap();
+    assert!(leases.is_empty());
+    let second_lease = second
+        .acquire_session_lease(&session.id, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    second_lease.release().await;
+    let events = first.recent_events(&session.id, 100).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "session.lease.acquired")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "session.lease.released")
+    );
+}
+
+#[tokio::test]
+async fn coordination_and_decision_projections_replay_and_repair() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let project = engine
+        .add_project(
+            repo.path().to_str().unwrap().to_string(),
+            Some("replay".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "coordination replay".into(), None)
+        .await
+        .unwrap();
+    let event = engine
+        .record_coordination_note(
+            &session.id,
+            "blocker",
+            "warning",
+            Some("T1"),
+            None,
+            None,
+            "agent-1",
+            "Worker One",
+            Some("worker"),
+            "schema is unclear",
+        )
+        .await
+        .unwrap();
+    let note_id = event.payload["note_id"].as_str().unwrap().to_string();
+    engine
+        .record_orchestration_decision(&session.id, "escalate", Some("T1"), "manual test", 1)
+        .await
+        .unwrap();
+
+    let notes = engine.coordination_notes(&session.id, 10).await.unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note_id, note_id);
+    assert_eq!(notes[0].status, "open");
+    let decisions = engine
+        .orchestration_decisions(&session.id, 10)
+        .await
+        .unwrap();
+    assert_eq!(decisions.len(), 1);
+    let snapshot = engine.orchestration_snapshot(&session.id).await.unwrap();
+    assert_eq!(snapshot.notes.len(), 1);
+    assert_eq!(snapshot.decisions.len(), 1);
+
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
+
+    // Tamper with the derived projections; replay must notice and repair must
+    // restore them from the event stream.
+    store
+        .replace_coordination_notes(&session.id, &[], &[])
+        .unwrap();
+    store
+        .replace_orchestration_decisions(&session.id, &[], &[])
+        .unwrap();
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(!report.consistent);
+    assert!(
+        report
+            .mismatches
+            .iter()
+            .any(|mismatch| mismatch.contains("coordination notes"))
+    );
+    assert!(
+        report
+            .mismatches
+            .iter()
+            .any(|mismatch| mismatch.contains("orchestration decisions"))
+    );
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(repaired.consistent, "{:?}", repaired.mismatches);
+    assert_eq!(
+        engine
+            .coordination_notes(&session.id, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .orchestration_decisions(&session.id, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn revision_detail_task_edit_and_restore_are_optimistic() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("revisions".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "revise".into(), None)
+        .await
+        .unwrap();
+    let plan = orchestration_test_plan();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+
+    let first = engine.plan_revision_detail(&session.id, 1).await.unwrap();
+    assert_eq!(first.revision.revision, 1);
+    assert_eq!(first.plan.tasks.len(), 2);
+    assert_eq!(first.plan.tasks[0].id, "T1");
+
+    let mut edited = first.plan.tasks[1].clone();
+    edited.title = "Follow-up edited".into();
+    edited.priority = 42;
+    edited.deps = vec![];
+    let edit = engine
+        .edit_plan_task(&session.id, edited, "raise priority", Some(1), 5)
+        .await
+        .unwrap();
+    assert_eq!(edit.revision.revision, 2);
+    assert_eq!(edit.revision.changed, vec!["T2"]);
+    let second = engine.plan_revision_detail(&session.id, 2).await.unwrap();
+    assert_eq!(second.plan.tasks[1].title, "Follow-up edited");
+    assert_eq!(second.plan.tasks[1].priority, 42);
+    assert!(second.plan.tasks[1].deps.is_empty());
+
+    let restored = engine
+        .restore_team_plan_revision(&session.id, 1, "restore the original DAG", Some(2), 5)
+        .await
+        .unwrap();
+    assert_eq!(restored.revision.revision, 3);
+    assert_eq!(restored.revision.changed, vec!["T2"]);
+    assert_eq!(restored.plan.tasks[1].title, "Follow-up");
+    assert_eq!(restored.plan.tasks[1].deps, vec!["T1"]);
+
+    // A stale expected revision is rejected before mutation.
+    let error = engine
+        .restore_team_plan_revision(&session.id, 1, "stale", Some(2), 5)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("revision conflict"));
+    let revisions = engine.plan_revisions(&session.id).await.unwrap();
+    assert_eq!(revisions.len(), 3);
+    assert_eq!(
+        revisions[2].reason.as_deref(),
+        Some("restore the original DAG")
+    );
+}
+
+#[tokio::test]
+async fn targeted_coordination_notes_reach_the_agent_mailbox() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("coord".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "coordinate".into(), None)
+        .await
+        .unwrap();
+    let worker = engine
+        .create_agent(
+            &session.id,
+            "worker",
+            "Worker One",
+            Some("Implementation".into()),
+            None,
+            "test-model",
+        )
+        .await
+        .unwrap();
+    let note = engine
+        .record_coordination_note(
+            &session.id,
+            "handoff",
+            "info",
+            Some("T1"),
+            Some(&worker.id),
+            None,
+            "leader",
+            "Leader",
+            Some("leader"),
+            "T1 is ready; start with the parser.",
+        )
+        .await
+        .unwrap();
+    let note_id = note.payload["note_id"].as_str().unwrap();
+    let messages = engine
+        .list_agent_messages(&session.id, Some(worker.id.clone()), true)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].kind, "coordination");
+    assert_eq!(messages[0].body, "T1 is ready; start with the parser.");
+    assert_eq!(messages[0].payload["note_id"].as_str(), Some(note_id));
+    let notes = engine
+        .coordination_notes_for_agent(&session.id, &worker.id, Some("T1"), 10)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(
+        notes[0].target_agent_id.as_deref(),
+        Some(worker.id.as_str())
+    );
+
+    // A global handoff is visible to every agent; an unrelated note is not.
+    engine
+        .record_coordination_note(
+            &session.id,
+            "handoff",
+            "info",
+            None,
+            None,
+            None,
+            "manager-1",
+            "Manager One",
+            Some("manager"),
+            "The API contract is frozen.",
+        )
+        .await
+        .unwrap();
+    engine
+        .record_coordination_note(
+            &session.id,
+            "note",
+            "info",
+            Some("T2"),
+            None,
+            None,
+            "worker-2",
+            "Worker Two",
+            Some("worker"),
+            "Unrelated local note.",
+        )
+        .await
+        .unwrap();
+    let notes = engine
+        .coordination_notes_for_agent(&session.id, &worker.id, Some("T1"), 10)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 2);
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.message.contains("API contract"))
+    );
+    assert!(!notes.iter().any(|note| note.message.contains("Unrelated")));
+}
+
+#[tokio::test]
+async fn orchestration_overview_ranks_attention_sessions() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("overview".into()),
+        )
+        .await
+        .unwrap();
+    let calm = engine
+        .create_session(project.id.clone(), "calm plan".into(), None)
+        .await
+        .unwrap();
+    let stressed = engine
+        .create_session(project.id.clone(), "stressed plan".into(), None)
+        .await
+        .unwrap();
+    let plan = orchestration_test_plan();
+    engine.set_team_plan(&calm.id, &plan).await.unwrap();
+    engine.set_team_plan(&stressed.id, &plan).await.unwrap();
+    let queue = engine
+        .task_queue(None, Some(stressed.id.clone()))
+        .await
+        .unwrap()
+        .tasks;
+    let plan_seq = queue[0].plan_seq;
+    engine
+        .scheduler()
+        .claim(&stressed.id, plan_seq, &["T1".into()])
+        .await
+        .unwrap();
+    engine
+        .scheduler()
+        .finish(&stressed.id, plan_seq, "T1", "failed", Some("boom"))
+        .await
+        .unwrap();
+    engine.advance_orchestration(&stressed.id).await.unwrap();
+
+    let overview = engine
+        .orchestration_overview(Some(&project.id), 10)
+        .await
+        .unwrap();
+    assert_eq!(overview.totals.sessions, 2);
+    assert_eq!(overview.sessions[0].session_id, stressed.id);
+    assert!(overview.sessions[0].metrics.retrying_tasks >= 1);
+    assert!(overview.sessions[0].last_decision.is_some());
+    assert_eq!(overview.totals.retrying_tasks, 1);
+    assert!(overview.sessions[1].metrics.retrying_tasks == 0);
+}

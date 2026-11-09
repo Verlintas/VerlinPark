@@ -12,6 +12,7 @@ struct CollabGraphView: View {
     @State private var showPlanned = true
     @State private var selectedID: String?
     @State private var showFullGraph = false
+    @State private var surface: CollabSurface = .graph
 
     private var layout: CollabGraphLayout {
         CollabGraphBuilder.build(
@@ -23,7 +24,8 @@ struct CollabGraphView: View {
             sessionStatus: model.selectedSession?.status ?? "idle",
             goal: model.selectedSession?.goal ?? L10n.t("Waiting for a session"),
             mergeQueue: model.mergeQueue,
-            includePlanned: showPlanned
+            includePlanned: showPlanned,
+            orchestration: model.orchestrationSnapshot
         )
     }
 
@@ -38,48 +40,61 @@ struct CollabGraphView: View {
             CollabGraphHeader(
                 layout: layout,
                 sessionStatus: model.selectedSession?.status ?? "idle",
+                surface: $surface,
                 showPlanned: $showPlanned,
                 onExpand: { showFullGraph = true }
             )
 
-            GeometryReader { proxy in
-                Group {
-                    if layout.isEmpty {
-                        CollabGraphEmptyState(
-                            goal: model.selectedSession?.goal ?? L10n.t("Waiting for a session")
-                        )
-                    } else {
-                        ZStack(alignment: .topTrailing) {
-                            graphScroll(layout: layout)
-                            zoomControls(layout: layout, available: proxy.size)
-                                .padding(12)
-                        }
-                        .overlay(alignment: .bottom) {
-                            if let selectedNode {
-                                CollabNodeInspector(node: selectedNode) {
-                                    selectedID = nil
+            if surface == .ops {
+                CollabOpsPanel()
+            } else {
+                GeometryReader { proxy in
+                    Group {
+                        if layout.isEmpty {
+                            CollabGraphEmptyState(
+                                goal: model.selectedSession?.goal ?? L10n.t("Waiting for a session")
+                            )
+                        } else {
+                            ZStack(alignment: .topTrailing) {
+                                graphScroll(layout: layout)
+                                zoomControls(layout: layout, available: proxy.size)
+                                    .padding(12)
+                            }
+                            .overlay(alignment: .bottom) {
+                                if let selectedNode {
+                                    CollabNodeInspector(
+                                        node: selectedNode,
+                                        task: task(for: selectedNode),
+                                        blockers: blockers(for: selectedNode),
+                                        busy: model.collabTaskActionBusyID != nil,
+                                        onAction: { command in
+                                            guard let task = task(for: selectedNode) else { return }
+                                            Task { await model.collabTaskAction(task, action: command) }
+                                        },
+                                        onClose: { selectedID = nil }
+                                    )
+                                    .padding(.horizontal, 10)
+                                    .padding(.bottom, 10)
+                                    .transition(.move(edge: .bottom).combined(with: .opacity))
                                 }
-                                .padding(.horizontal, 10)
-                                .padding(.bottom, 10)
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
                             }
                         }
                     }
-                }
-                .onAppear {
-                    fit(layout: layout, available: proxy.size, minimum: 0.55)
-                }
-                .onChange(of: model.selectedSessionID) { _, _ in
-                    selectedID = nil
-                    autoFit = true
-                    fit(layout: layout, available: proxy.size, minimum: 0.55)
-                }
-                .onChange(of: layout.nodes.map(\.id)) { _, _ in
-                    if let selectedID, !layout.nodes.contains(where: { $0.id == selectedID }) {
-                        self.selectedID = nil
-                    }
-                    if autoFit {
+                    .onAppear {
                         fit(layout: layout, available: proxy.size, minimum: 0.55)
+                    }
+                    .onChange(of: model.selectedSessionID) { _, _ in
+                        selectedID = nil
+                        autoFit = true
+                        fit(layout: layout, available: proxy.size, minimum: 0.55)
+                    }
+                    .onChange(of: layout.nodes.map(\.id)) { _, _ in
+                        if let selectedID, !layout.nodes.contains(where: { $0.id == selectedID }) {
+                            self.selectedID = nil
+                        }
+                        if autoFit {
+                            fit(layout: layout, available: proxy.size, minimum: 0.55)
+                        }
                     }
                 }
             }
@@ -89,6 +104,16 @@ struct CollabGraphView: View {
             CollabExpandedGraphView()
                 .environment(model)
         }
+    }
+
+    private func task(for node: CollabGraphNode) -> OrchestrationTask? {
+        guard let taskID = node.taskID else { return nil }
+        return model.orchestrationSnapshot?.task(taskID)
+    }
+
+    private func blockers(for node: CollabGraphNode) -> [OrchestrationBlocker] {
+        guard let taskID = node.taskID else { return [] }
+        return model.orchestrationSnapshot?.blockers(for: taskID) ?? []
     }
 
     private func graphScroll(layout: CollabGraphLayout) -> some View {
@@ -238,6 +263,7 @@ struct CollabExpandedGraphView: View {
     @State private var zoom: CGFloat = 0.75
     @State private var selectedID: String?
     @State private var showPlanned = true
+    @State private var showOps = true
 
     private var layout: CollabGraphLayout {
         CollabGraphBuilder.build(
@@ -249,7 +275,8 @@ struct CollabExpandedGraphView: View {
             sessionStatus: model.selectedSession?.status ?? "idle",
             goal: model.selectedSession?.goal ?? L10n.t("Waiting for a session"),
             mergeQueue: model.mergeQueue,
-            includePlanned: showPlanned
+            includePlanned: showPlanned,
+            orchestration: model.orchestrationSnapshot
         )
     }
 
@@ -273,6 +300,18 @@ struct CollabExpandedGraphView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                Button {
+                    withAnimation(VPMotion.snap) { showOps.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: showOps ? "sidebar.right" : "sidebar.leading")
+                        Text(L10n.t("Ops"))
+                    }
+                    .font(VPTheme.mono(8, weight: .medium))
+                    .foregroundStyle(showOps ? VPTheme.accent : VPTheme.textTertiary)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 Button(L10n.t("Done")) {
                     dismiss()
                 }
@@ -288,90 +327,113 @@ struct CollabExpandedGraphView: View {
 
             VPHairline()
 
-            GeometryReader { proxy in
-                ZStack(alignment: .topTrailing) {
-                    ScrollView([.horizontal, .vertical]) {
-                        CollabGraphContent(
-                            layout: layout,
-                            selectedID: selectedID,
-                            reduceMotion: reduceMotion
-                        ) { id in
-                            withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
-                                selectedID = id
+            HStack(spacing: 0) {
+                GeometryReader { proxy in
+                    ZStack(alignment: .topTrailing) {
+                        ScrollView([.horizontal, .vertical]) {
+                            CollabGraphContent(
+                                layout: layout,
+                                selectedID: selectedID,
+                                reduceMotion: reduceMotion
+                            ) { id in
+                                withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
+                                    selectedID = id
+                                }
                             }
+                            .scaleEffect(zoom, anchor: .topLeading)
+                            .frame(
+                                width: layout.size.width * zoom,
+                                height: layout.size.height * zoom,
+                                alignment: .topLeading
+                            )
+                            .animation(
+                                VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
+                                value: layout.signature
+                            )
                         }
-                        .scaleEffect(zoom, anchor: .topLeading)
-                        .frame(
-                            width: layout.size.width * zoom,
-                            height: layout.size.height * zoom,
-                            alignment: .topLeading
-                        )
-                        .animation(
-                            VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
-                            value: layout.signature
-                        )
-                    }
-                    .scrollIndicators(.hidden)
-                    .defaultScrollAnchor(.topLeading)
+                        .scrollIndicators(.hidden)
+                        .defaultScrollAnchor(.topLeading)
 
-                    HStack(spacing: 3) {
-                        Button {
-                            withAnimation(VPMotion.snap) {
-                                zoom = max(0.30, zoom - 0.1)
+                        HStack(spacing: 3) {
+                            Button {
+                                withAnimation(VPMotion.snap) {
+                                    zoom = max(0.30, zoom - 0.1)
+                                }
+                            } label: {
+                                Image(systemName: "minus")
                             }
-                        } label: {
-                            Image(systemName: "minus")
-                        }
-                        .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
-                        Text("\(Int((zoom * 100).rounded()))%")
-                            .font(VPTheme.mono(7.5, weight: .medium))
-                            .foregroundStyle(VPTheme.textTertiary)
-                            .frame(width: 34)
-                        Button {
-                            withAnimation(VPMotion.snap) {
-                                zoom = min(1.8, zoom + 0.1)
+                            .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
+                            Text("\(Int((zoom * 100).rounded()))%")
+                                .font(VPTheme.mono(7.5, weight: .medium))
+                                .foregroundStyle(VPTheme.textTertiary)
+                                .frame(width: 34)
+                            Button {
+                                withAnimation(VPMotion.snap) {
+                                    zoom = min(1.8, zoom + 0.1)
+                                }
+                            } label: {
+                                Image(systemName: "plus")
                             }
-                        } label: {
-                            Image(systemName: "plus")
+                            .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
+                            Button {
+                                fit(layout: layout, available: proxy.size)
+                            } label: {
+                                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            }
+                            .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.accent))
                         }
-                        .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
-                        Button {
-                            fit(layout: layout, available: proxy.size)
-                        } label: {
-                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .padding(4)
+                        .background(VPTheme.surface.opacity(0.92), in: Capsule())
+                        .overlay {
+                            Capsule().strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
                         }
-                        .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.accent))
+                        .padding(12)
                     }
-                    .padding(4)
-                    .background(VPTheme.surface.opacity(0.92), in: Capsule())
-                    .overlay {
-                        Capsule().strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
+                    .overlay(alignment: .bottom) {
+                        if let selectedID,
+                           let node = layout.nodes.first(where: { $0.id == selectedID })
+                        {
+                            let task = node.taskID.flatMap { id in
+                                model.orchestrationSnapshot?.task(id)
+                            }
+                            let blockers = node.taskID.flatMap { id in
+                                model.orchestrationSnapshot?.blockers(for: id)
+                            } ?? []
+                            CollabNodeInspector(
+                                node: node,
+                                task: task,
+                                blockers: blockers,
+                                busy: model.collabTaskActionBusyID != nil,
+                                onAction: { command in
+                                    guard let task else { return }
+                                    Task { await model.collabTaskAction(task, action: command) }
+                                },
+                                onClose: { self.selectedID = nil }
+                            )
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 12)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
                     }
-                    .padding(12)
-                }
-                .overlay(alignment: .bottom) {
-                    if let selectedID,
-                       let node = layout.nodes.first(where: { $0.id == selectedID })
-                    {
-                        CollabNodeInspector(node: node) {
+                    .onAppear {
+                        fit(layout: layout, available: proxy.size)
+                    }
+                    .onChange(of: layout.nodes.map(\.id)) { _, _ in
+                        if let selectedID, !layout.nodes.contains(where: { $0.id == selectedID }) {
                             self.selectedID = nil
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 12)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
-                .onAppear {
-                    fit(layout: layout, available: proxy.size)
-                }
-                .onChange(of: layout.nodes.map(\.id)) { _, _ in
-                    if let selectedID, !layout.nodes.contains(where: { $0.id == selectedID }) {
-                        self.selectedID = nil
-                    }
+
+                if showOps {
+                    Divider()
+                    CollabOpsPanel()
+                        .frame(width: 360)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
         }
-        .frame(minWidth: 940, minHeight: 620)
+        .frame(minWidth: 1060, minHeight: 620)
         .background(VPTheme.canvas)
     }
 
@@ -398,6 +460,7 @@ struct CollabExpandedGraphView: View {
 private struct CollabGraphHeader: View {
     let layout: CollabGraphLayout
     let sessionStatus: String
+    @Binding var surface: CollabSurface
     @Binding var showPlanned: Bool
     var onExpand: (() -> Void)?
 
@@ -411,6 +474,13 @@ private struct CollabGraphHeader: View {
                         : nil
                 )
                 Spacer(minLength: 4)
+                VPSegmentedControl(
+                    segments: CollabSurface.allCases.map {
+                        VPSegment($0, title: $0.title, icon: $0.icon)
+                    },
+                    selection: $surface
+                )
+                .frame(width: 116)
                 StatusPill(status: sessionStatus)
                 if let onExpand {
                     Button(action: onExpand) {
@@ -1006,10 +1076,54 @@ private struct CollabNodeCard: View {
                 }
                 Spacer(minLength: 0)
             }
+            if node.ready || !node.blockedBy.isEmpty || node.nextAttemptAt != nil
+                || node.verifierStatus != nil || node.attempts > 0
+            {
+                orchestrationBadges
+            }
             if let activity = node.activity, !activity.isEmpty {
                 CollabActivityLine(text: activity, tint: statusColor)
             }
         }
+    }
+
+    private var orchestrationBadges: some View {
+        HStack(spacing: 3) {
+            if node.ready {
+                miniBadge("play.fill", tint: VPTheme.accent, text: L10n.t("ready"))
+            }
+            if !node.blockedBy.isEmpty {
+                miniBadge("hand.raised.fill", tint: VPTheme.warning, text: L10n.t("blocked"))
+            }
+            if node.attempts > 0 {
+                miniBadge("arrow.clockwise", tint: VPTheme.plan, text: "\(node.attempts)")
+            }
+            if node.nextAttemptAt != nil {
+                miniBadge("clock", tint: VPTheme.warning, text: L10n.t("retry"))
+            }
+            if let verifier = node.verifierStatus {
+                miniBadge(
+                    verifier == "approved" ? "checkmark.shield.fill" : "shield.slash",
+                    tint: VPTheme.statusColor(verifier),
+                    text: verifier
+                )
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func miniBadge(_ icon: String, tint: Color, text: String) -> some View {
+        HStack(spacing: 2) {
+            Image(systemName: icon)
+                .font(.system(size: 5.5, weight: .semibold))
+            Text(text.uppercased())
+                .font(VPTheme.mono(5.2, weight: .semibold))
+                .tracking(0.2)
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 3)
+        .padding(.vertical, 1.5)
+        .background(tint.opacity(0.09), in: Capsule())
     }
 
     private var compactBody: some View {
@@ -1074,6 +1188,9 @@ private struct CollabNodeCard: View {
                 }
                 Spacer(minLength: 0)
             }
+            if node.ready || !node.blockedBy.isEmpty || node.nextAttemptAt != nil {
+                orchestrationBadges
+            }
         }
     }
 
@@ -1081,6 +1198,15 @@ private struct CollabNodeCard: View {
         var parts = [node.kind.rawValue.capitalized, node.name]
         if let taskLine = node.taskLine {
             parts.append(taskLine)
+        }
+        if node.ready {
+            parts.append(L10n.t("Ready to dispatch"))
+        }
+        if !node.blockedBy.isEmpty {
+            parts.append("\(L10n.t("Blocked by")): \(node.blockedBy.joined(separator: ", "))")
+        }
+        if let verifier = node.verifierStatus {
+            parts.append("\(L10n.t("Verifier")): \(verifier)")
         }
         if let activity = node.activity {
             parts.append(activity)
@@ -1152,6 +1278,10 @@ private struct CollabTaskStatusChip: View {
 
 private struct CollabNodeInspector: View {
     let node: CollabGraphNode
+    let task: OrchestrationTask?
+    let blockers: [OrchestrationBlocker]
+    let busy: Bool
+    let onAction: (CollabTaskCommand) -> Void
     let onClose: () -> Void
 
     private var tint: Color {
@@ -1194,6 +1324,10 @@ private struct CollabNodeInspector: View {
                 .buttonStyle(VPGlassIconButtonStyle(size: 20, tint: VPTheme.textSecondary))
             }
 
+            if let task {
+                CollabInspectorActions(task: task, busy: busy, onAction: onAction)
+            }
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     if let taskLine = node.taskLine {
@@ -1204,6 +1338,41 @@ private struct CollabNodeInspector: View {
                             label: "Task status",
                             value: taskStatus,
                             tint: VPTheme.statusColor(taskStatus)
+                        )
+                    }
+                    if let task {
+                        CollabDetailRow(
+                            label: "Attempts",
+                            value: "\(task.attempts)/\(task.maxAttempts)",
+                            tint: task.attempts >= task.maxAttempts ? VPTheme.danger : VPTheme.textSecondary
+                        )
+                        if let verifier = task.verifierStatus {
+                            CollabDetailRow(
+                                label: "Verifier",
+                                value: verifier,
+                                tint: VPTheme.statusColor(verifier)
+                            )
+                        }
+                        if let next = task.nextAttemptAt {
+                            CollabDetailRow(
+                                label: "Next retry",
+                                value: VPTheme.relativeTime(next),
+                                tint: VPTheme.warning
+                            )
+                        }
+                        if !task.blockedBy.isEmpty {
+                            CollabDetailRow(
+                                label: "Blocked by",
+                                value: task.blockedBy.joined(separator: ", "),
+                                tint: VPTheme.warning
+                            )
+                        }
+                    }
+                    ForEach(blockers.prefix(2)) { blocker in
+                        CollabDetailRow(
+                            label: blocker.kind.replacingOccurrences(of: "_", with: " "),
+                            value: blocker.message,
+                            tint: VPTheme.danger
                         )
                     }
                     if let objective = node.objective, !objective.isEmpty {
@@ -1256,6 +1425,66 @@ private struct CollabNodeInspector: View {
                 .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.30), radius: 18, y: 8)
+    }
+}
+
+private struct CollabInspectorActions: View {
+    let task: OrchestrationTask
+    let busy: Bool
+    let onAction: (CollabTaskCommand) -> Void
+
+    private var commands: [CollabTaskCommand] {
+        var result: [CollabTaskCommand] = []
+        if ["failed", "blocked", "interrupted", "cancelled"].contains(task.status) {
+            result.append(.retry)
+        }
+        if ["running", "queued"].contains(task.status) {
+            result.append(.pause)
+        }
+        if ["paused", "pausing"].contains(task.status) {
+            result.append(.resume)
+        }
+        if ["pending", "failed", "blocked", "interrupted", "cancelled"].contains(task.status) {
+            result.append(.skip)
+        }
+        if ["running", "queued", "paused", "pausing"].contains(task.status) {
+            result.append(.cancel)
+        }
+        return result
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(commands) { command in
+                Button {
+                    onAction(command)
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: command.icon)
+                            .font(.system(size: 7, weight: .semibold))
+                        Text(command.title)
+                            .font(VPTheme.mono(6.4, weight: .medium))
+                    }
+                    .foregroundStyle(
+                        command == .cancel || command == .skip
+                            ? VPTheme.danger
+                            : VPTheme.accent
+                    )
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(
+                        (command == .cancel || command == .skip
+                            ? VPTheme.danger
+                            : VPTheme.accent).opacity(0.09),
+                        in: Capsule()
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(busy)
+            }
+            Spacer()
+        }
+        .padding(.top, 2)
     }
 }
 

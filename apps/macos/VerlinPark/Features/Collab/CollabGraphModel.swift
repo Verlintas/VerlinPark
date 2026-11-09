@@ -100,6 +100,10 @@ struct CollabGraphNode: Identifiable, Equatable {
     let writeScope: [String]
     let attempts: UInt32
     let lastError: String?
+    let ready: Bool
+    let blockedBy: [String]
+    let verifierStatus: String?
+    let nextAttemptAt: String?
     let progress: Double?
     let isPlaceholder: Bool
     let size: CGSize
@@ -213,6 +217,10 @@ enum CollabGraphBuilder {
         let writeScope: [String]
         let attempts: UInt32
         let lastError: String?
+        let ready: Bool
+        let blockedBy: [String]
+        let verifierStatus: String?
+        let nextAttemptAt: String?
         let progress: Double?
         let isPlaceholder: Bool
         let size: CGSize
@@ -227,16 +235,23 @@ enum CollabGraphBuilder {
         sessionStatus: String,
         goal: String,
         mergeQueue: [MergeQueueEntry],
-        includePlanned: Bool = true
+        includePlanned: Bool = true,
+        orchestration: OrchestrationSnapshot? = nil
     ) -> CollabGraphLayout {
         let planTasks = plan?.tasks ?? []
         let taskByID = Dictionary(uniqueKeysWithValues: planTasks.map { ($0.id, $0) })
         let departments = plan?.departments ?? []
-        let statusMap = mergedStatuses(plan: plan, events: statuses, scheduled: scheduled)
+        var statusMap = mergedStatuses(plan: plan, events: statuses, scheduled: scheduled)
+        for task in orchestration?.tasks ?? [] {
+            statusMap[task.taskId] = task.status
+        }
         let activity = activityByAgent(events)
         let eventTaskMap = taskAssignmentFromEvents(events)
         let scheduledByTask = Dictionary(
             uniqueKeysWithValues: scheduled.map { ($0.taskID, $0) }
+        )
+        let orchestrationByTask = Dictionary(
+            uniqueKeysWithValues: (orchestration?.tasks ?? []).map { ($0.taskId, $0) }
         )
 
         let realAgents = agents.filter {
@@ -289,6 +304,10 @@ enum CollabGraphBuilder {
                 writeScope: [],
                 attempts: 0,
                 lastError: nil,
+                ready: false,
+                blockedBy: [],
+                verifierStatus: nil,
+                nextAttemptAt: nil,
                 progress: nil,
                 isPlaceholder: true,
                 size: size(for: .group)
@@ -306,6 +325,7 @@ enum CollabGraphBuilder {
                 objective: goal,
                 activity: activity[leader.id],
                 scheduled: nil,
+                orchestration: nil,
                 statuses: statusMap,
                 planTasks: planTasks
             )
@@ -381,6 +401,7 @@ enum CollabGraphBuilder {
                 objective: objective,
                 activity: activity[agent.id],
                 scheduled: taskID.flatMap { scheduledByTask[$0] },
+                orchestration: taskID.flatMap { orchestrationByTask[$0] },
                 statuses: statusMap,
                 planTasks: planTasks
             )
@@ -410,6 +431,10 @@ enum CollabGraphBuilder {
                 writeScope: [],
                 attempts: 0,
                 lastError: nil,
+                ready: false,
+                blockedBy: [],
+                verifierStatus: nil,
+                nextAttemptAt: nil,
                 progress: nil,
                 isPlaceholder: true,
                 size: size(for: .group)
@@ -452,6 +477,10 @@ enum CollabGraphBuilder {
                     writeScope: [],
                     attempts: 0,
                     lastError: nil,
+                    ready: false,
+                    blockedBy: [],
+                    verifierStatus: nil,
+                    nextAttemptAt: nil,
                     progress: departmentProgress(
                         department: department.name,
                         planTasks: planTasks,
@@ -475,6 +504,7 @@ enum CollabGraphBuilder {
                 }
                 let id = "__planned_task__\(task.id)"
                 let managerID = managerNodeIDByDepartment[task.department] ?? rootID
+                let orchestrationTask = orchestrationByTask[task.id]
                 seeds[id] = NodeSeed(
                     id: id,
                     kind: .plannedTask,
@@ -490,13 +520,21 @@ enum CollabGraphBuilder {
                     profile: task.profile,
                     model: "",
                     branch: nil,
-                    activity: "waiting for a Worker",
+                    activity: orchestrationTask?.ready == true
+                        ? "ready to dispatch"
+                        : (orchestrationTask?.blockedBy.isEmpty == false
+                            ? "blocked by dependencies"
+                            : "waiting for a Worker"),
                     activeTool: nil,
                     deps: task.deps,
                     acceptance: task.acceptance,
                     writeScope: task.writeScope,
-                    attempts: 0,
-                    lastError: nil,
+                    attempts: UInt32(clamping: orchestrationTask?.attempts ?? 0),
+                    lastError: orchestrationTask?.lastError,
+                    ready: orchestrationTask?.ready ?? false,
+                    blockedBy: orchestrationTask?.blockedBy ?? [],
+                    verifierStatus: orchestrationTask?.verifierStatus,
+                    nextAttemptAt: orchestrationTask?.nextAttemptAt,
                     progress: nil,
                     isPlaceholder: true,
                     size: size(for: .plannedTask)
@@ -545,6 +583,10 @@ enum CollabGraphBuilder {
                 writeScope: seed.writeScope,
                 attempts: seed.attempts,
                 lastError: seed.lastError,
+                ready: seed.ready,
+                blockedBy: seed.blockedBy,
+                verifierStatus: seed.verifierStatus,
+                nextAttemptAt: seed.nextAttemptAt,
                 progress: seed.progress,
                 isPlaceholder: seed.isPlaceholder,
                 size: seed.size
@@ -637,6 +679,7 @@ enum CollabGraphBuilder {
         objective: String?,
         activity: AgentActivity?,
         scheduled: SchedulerTask?,
+        orchestration: OrchestrationTask?,
         statuses: [String: String],
         planTasks: [PlanTask]
     ) -> NodeSeed {
@@ -679,8 +722,14 @@ enum CollabGraphBuilder {
             deps: resolvedTask?.deps ?? [],
             acceptance: resolvedTask?.acceptance ?? [],
             writeScope: resolvedTask?.writeScope ?? [],
-            attempts: scheduled?.attempts ?? 0,
-            lastError: scheduled?.lastError,
+            attempts: UInt32(clamping: orchestration?.attempts ?? 0) > 0
+                ? UInt32(clamping: orchestration?.attempts ?? 0)
+                : (scheduled?.attempts ?? 0),
+            lastError: orchestration?.lastError ?? scheduled?.lastError,
+            ready: orchestration?.ready ?? false,
+            blockedBy: orchestration?.blockedBy ?? [],
+            verifierStatus: orchestration?.verifierStatus,
+            nextAttemptAt: orchestration?.nextAttemptAt ?? scheduled?.nextAttemptAt,
             progress: progress,
             isPlaceholder: false,
             size: size(for: kind)

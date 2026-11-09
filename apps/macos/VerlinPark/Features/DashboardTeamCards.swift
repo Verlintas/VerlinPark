@@ -478,6 +478,341 @@ struct PendingQuestionRow: View {
     }
 }
 
+struct OrchestrationOverviewCard: View {
+    @Environment(AppModel.self) private var model
+
+    private var overview: OrchestrationOverviewResult? {
+        model.orchestrationOverview
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Mission control")
+                    Text("Cross-session team operations")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.orchestrationOverviewBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task { await model.loadOrchestrationOverview() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.orchestrationOverviewBusy)
+            }
+
+            if let overview {
+                HStack(spacing: 14) {
+                    overviewMetric("sessions", overview.totals.sessions, .cyan)
+                    overviewMetric("running", overview.totals.running, .green)
+                    overviewMetric("attention", overview.totals.attention, .orange)
+                    overviewMetric("blocked", overview.totals.blockedTasks, .red)
+                    overviewMetric("retrying", overview.totals.retryingTasks, .purple)
+                    overviewMetric("conflicts", overview.totals.mergeConflicts, .yellow)
+                    Spacer()
+                }
+
+                if overview.sessions.isEmpty {
+                    Text("No session has a stored TeamPlan yet.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ForEach(overview.sessions.prefix(8)) { session in
+                        Button {
+                            model.selectProject(session.projectId)
+                            model.selectSession(session.sessionId)
+                        } label: {
+                            HStack(alignment: .top, spacing: 7) {
+                                Circle()
+                                    .fill(statusColor(session))
+                                    .frame(width: 6, height: 6)
+                                    .padding(.top, 4)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 5) {
+                                        Text(session.projectName)
+                                            .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                        Text(session.goal)
+                                            .font(.system(size: 9.5, weight: .medium))
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Text("r\(session.planRevision)")
+                                            .font(.system(size: 7.5, design: .monospaced))
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    HStack(spacing: 8) {
+                                        Text(session.status)
+                                            .font(.system(size: 7.5, design: .monospaced))
+                                            .foregroundStyle(statusColor(session))
+                                        Text(
+                                            "tasks \(session.metrics.completedTasks)/\(session.metrics.totalTasks)"
+                                        )
+                                        .font(.system(size: 7.5, design: .monospaced))
+                                        .foregroundStyle(.tertiary)
+                                        if session.metrics.readyTasks > 0 {
+                                            Text("ready \(session.metrics.readyTasks)")
+                                                .font(.system(size: 7.5, design: .monospaced))
+                                                .foregroundStyle(.green)
+                                        }
+                                        if session.metrics.blockedTasks > 0 {
+                                            Text("blocked \(session.metrics.blockedTasks)")
+                                                .font(.system(size: 7.5, design: .monospaced))
+                                                .foregroundStyle(.orange)
+                                        }
+                                        if session.metrics.failedTasks > 0 {
+                                            Text("failed \(session.metrics.failedTasks)")
+                                                .font(.system(size: 7.5, design: .monospaced))
+                                                .foregroundStyle(.red)
+                                        }
+                                        if session.metrics.retryingTasks > 0 {
+                                            Text("retrying \(session.metrics.retryingTasks)")
+                                                .font(.system(size: 7.5, design: .monospaced))
+                                                .foregroundStyle(.purple)
+                                        }
+                                    }
+                                    if let blocker = session.blockers.first {
+                                        Text(blocker)
+                                            .font(.system(size: 7.5, design: .monospaced))
+                                            .foregroundStyle(.orange)
+                                            .lineLimit(1)
+                                    } else if let decision = session.lastDecision {
+                                        Text(decision)
+                                            .font(.system(size: 7.5, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 7, weight: .semibold))
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.top, 4)
+                            }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 5)
+                            .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 7))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            } else if let status = model.orchestrationOverviewStatus {
+                Text(status)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+
+            Text(
+                "Mission control aggregates only stored TeamPlans and their live task projections. It is a monitor: task actions and plan revisions stay in Collab Ops, the task queue, or the CLI."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 12))
+        .onAppear {
+            Task { await model.loadOrchestrationOverview() }
+        }
+    }
+
+    private func statusColor(_ session: OrchestrationSessionSummary) -> Color {
+        if session.metrics.attentionCount > 0 {
+            return .orange
+        }
+        switch session.status {
+        case "running", "queued":
+            return .green
+        case "failed", "cancelled":
+            return .red
+        default:
+            return .secondary
+        }
+    }
+
+    private func overviewMetric(_ label: String, _ value: Int, _ tint: Color) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(tint).frame(width: 5, height: 5)
+            Text("\(value) \(label)")
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct RuntimeLeaseCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Runtime leases")
+                    Text("Cross-process session and integration ownership")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.runtimeLeasesBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task { await model.loadRuntimeLeases() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.runtimeLeasesBusy)
+                Button("Sweep expired") {
+                    Task { await model.sweepRuntimeLeases() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.runtimeLeasesBusy)
+            }
+
+            HStack(spacing: 14) {
+                leaseCount("sessions", model.runtimeLeases.filter { $0.kind == "session" }.count, tint: .cyan)
+                leaseCount(
+                    "integration",
+                    model.runtimeLeases.filter { $0.kind != "session" }.count,
+                    tint: .orange
+                )
+                if let owner = model.runtimeLeaseOwnerID {
+                    Text("daemon \(owner.prefix(8))")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+            }
+
+            if model.runtimeLeases.isEmpty {
+                Text("No runtime lease is held. Start a session run to see its heartbeat.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(model.runtimeLeases.prefix(8)) { lease in
+                    HStack(spacing: 7) {
+                        Image(systemName: lease.icon)
+                            .font(.system(size: 8))
+                            .foregroundStyle(lease.kind == "session" ? .cyan : .orange)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(lease.leaseKey)
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .lineLimit(1)
+                            Text(
+                                "\(lease.kind) · owner \(lease.ownerId.prefix(8)) · heartbeat \(VPTheme.relativeTime(lease.heartbeatAt))"
+                            )
+                            .font(.system(size: 7.5, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                        Text("expires \(VPTheme.relativeTime(lease.expiresAt))")
+                            .font(.system(size: 7.5, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+
+            if let status = model.runtimeLeasesStatus {
+                Text(status)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(
+                "The daemon holds a SQLite lease with a heartbeat for each session run. A second process pointed at the same data directory cannot take an unexpired lease, while a crashed process is recoverable after the TTL. Expired leases are swept by the daemon tick and can be removed here."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 12))
+        .onAppear {
+            Task { await model.loadRuntimeLeases() }
+        }
+    }
+
+    private func leaseCount(_ label: String, _ count: Int, tint: Color) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(tint).frame(width: 5, height: 5)
+            Text("\(count) \(label)")
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct OrchestrationPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    @State private var draft = OrchestrationPolicy.standard
+    @State private var loaded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Orchestration")
+                    Text("Deterministic retries, dependencies, and escalations")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.orchestrationPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Reload") {
+                    Task {
+                        await model.loadOrchestrationPolicy()
+                        draft = model.orchestrationPolicy
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            OrchestrationPolicyEditor(policy: $draft)
+
+            HStack {
+                if let status = model.orchestrationPolicyStatus {
+                    Text(status)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Save orchestration policy") {
+                    Task { _ = await model.saveOrchestrationPolicy(draft) }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.orchestrationPolicyBusy)
+            }
+
+            Text(
+                "The controller retries only tasks that failed, with exponential backoff stored in the task queue. When the retry budget is exhausted it can escalate a critical note and apply the dependency policy to downstream tasks. These are scheduling rules; model selection remains explicit and project-scoped."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 12))
+        .onAppear {
+            draft = model.orchestrationPolicy
+            loaded = true
+        }
+        .onChange(of: model.orchestrationPolicy) { _, policy in
+            if loaded {
+                draft = policy
+            }
+        }
+    }
+}
+
 struct TaskSchedulerCard: View {
     @Environment(AppModel.self) private var model
 

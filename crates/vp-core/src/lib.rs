@@ -22,21 +22,25 @@ use vp_protocol::types::{
     McpGetPromptResult, McpProbeResult, McpPromptListResult, McpReadResourceResult,
     McpResourceListResult, McpServer, McpServerConfig, McpServerListResult, McpToolListResult,
     MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPolicy, MemoryPolicyResult,
-    MemoryPruneResult, MergeQueueEntry, ModelPreset, ModelPresetListResult, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
-    ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
-    SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
-    SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
-    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus, SessionDiff,
-    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
-    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
-    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
-    ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
-    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
-    TerminalWriteResult, TodoItem, UpdateModelPresetParams, UsageBucket, UsageCsvResult,
-    UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult, WorkspaceTreeResult,
-    WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
-    WorktreeRetentionPolicy, WriteLease,
+    MemoryPruneResult, MergeQueueEntry, ModelPreset, ModelPresetListResult, OrchestrationDecision,
+    OrchestrationNote, OrchestrationOverviewResult, OrchestrationOverviewTotals,
+    OrchestrationPolicy, OrchestrationPreviewAction, OrchestrationPreviewResult,
+    OrchestrationSessionSummary, OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo,
+    Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
+    QuestionListResult, ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle,
+    SessionCheckpoint, SessionCheckpointDeleteResult, SessionCheckpointDiffResult,
+    SessionCheckpointListResult, SessionCheckpointPruneResult, SessionCheckpointRestoreResult,
+    SessionCheckpointStatsResult, SessionCommit, SessionCompareFile, SessionCompareResult,
+    SessionContextStatus, SessionDiff, SessionForkResult, SessionForkTreeNode,
+    SessionForkTreeResult, SessionImportResult, SessionLandResult, SessionLineageEntry,
+    SessionLineageResult, SessionLogStatus, SessionPriorityResult, SessionRehydrateResult,
+    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TaskQueueResult,
+    TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult,
+    TerminalOpenResult, TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem,
+    UpdateModelPresetParams, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
+    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
+    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
+    WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -50,6 +54,7 @@ pub mod console;
 mod dashboard;
 pub mod history;
 pub mod mcp;
+pub mod orchestration;
 pub mod permissions;
 pub mod rebuild;
 pub mod scheduler;
@@ -76,6 +81,8 @@ struct ReplayData {
     memories: Vec<MemoryItem>,
     questions: Vec<Question>,
     tasks: Vec<ScheduledTask>,
+    notes: Vec<OrchestrationNote>,
+    decisions: Vec<OrchestrationDecision>,
     events: Vec<Event>,
 }
 
@@ -98,6 +105,49 @@ pub struct Engine {
     consoles: Arc<console::ConsoleManager>,
     terminals: Arc<terminal::TerminalManager>,
     scheduler: Arc<scheduler::TaskScheduler>,
+    runtime_id: String,
+}
+
+/// A held cross-process session lease. Dropping without calling `release`
+/// aborts the heartbeat and lets the TTL expire after a crash.
+pub struct SessionLease {
+    store: Store,
+    events: broadcast::Sender<Event>,
+    pub lease_key: String,
+    pub owner_id: String,
+    pub session_id: String,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SessionLease {
+    pub async fn release(mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+        let store = self.store.clone();
+        let key = self.lease_key.clone();
+        let owner = self.owner_id.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || store.release_runtime_lease(&key, &owner)).await;
+        if let Ok(event) = self.store.append_event(
+            &self.session_id,
+            "session.lease.released",
+            serde_json::json!({
+                "lease_key": self.lease_key,
+                "owner_id": self.owner_id,
+            }),
+        ) {
+            let _ = self.events.send(event);
+        }
+    }
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+    }
 }
 
 fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
@@ -116,6 +166,21 @@ fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
         "path": artifact.path,
         "content": artifact.content,
     })
+}
+
+fn session_budget_exhausted(session: &Session) -> bool {
+    let token_spent = session.tokens_in.saturating_add(session.tokens_out);
+    if let Some(limit) = session.token_budget
+        && token_spent >= limit
+    {
+        return true;
+    }
+    if let Some(limit) = session.cost_budget_usd
+        && session.cost_spent_usd >= limit
+    {
+        return true;
+    }
+    false
 }
 
 fn add_usage_bucket(buckets: &mut HashMap<String, UsageBucket>, key: &str, entry: &UsageEntry) {
@@ -290,6 +355,7 @@ impl Engine {
             mcp: Arc::new(mcp::McpManager::from_env()),
             consoles: Arc::new(console::ConsoleManager::new()),
             terminals: Arc::new(terminal::TerminalManager::new()),
+            runtime_id: Uuid::now_v7().to_string(),
         }
     }
 
@@ -303,6 +369,102 @@ impl Engine {
 
     pub fn scheduler(&self) -> &Arc<scheduler::TaskScheduler> {
         &self.scheduler
+    }
+
+    pub fn runtime_id(&self) -> &str {
+        &self.runtime_id
+    }
+
+    /// Acquire the cross-process lease for a session run. The database row is
+    /// the authority; the in-process run map is only a fast path. A lease
+    /// heartbeat keeps a long run from expiring, and an expired lease from a
+    /// crashed daemon can be taken over after the TTL.
+    pub async fn acquire_session_lease(
+        &self,
+        session_id: &str,
+        ttl: std::time::Duration,
+    ) -> Result<SessionLease> {
+        let ttl_secs = ttl.as_secs().clamp(10, 86_400);
+        let lease_key = format!("session:{session_id}");
+        let owner_id = self.runtime_id.clone();
+        let store = self.store.clone();
+        let key = lease_key.clone();
+        let owner = owner_id.clone();
+        let session = session_id.to_string();
+        let acquired = tokio::task::spawn_blocking(move || {
+            store.try_acquire_runtime_lease(&key, &owner, "session", Some(&session), ttl_secs)
+        })
+        .await??;
+        if !acquired {
+            let store = self.store.clone();
+            let key = lease_key.clone();
+            let holder =
+                tokio::task::spawn_blocking(move || store.runtime_lease_owner(&key)).await??;
+            let detail = holder
+                .map(|lease| format!("held by {} until {}", lease.owner_id, lease.expires_at))
+                .unwrap_or_else(|| "held by another daemon".to_string());
+            anyhow::bail!("session {session_id} is already running ({detail})");
+        }
+        let event = self
+            .append_event(
+                session_id,
+                "session.lease.acquired",
+                serde_json::json!({
+                    "lease_key": lease_key,
+                    "owner_id": owner_id,
+                    "ttl_secs": ttl_secs,
+                }),
+            )
+            .await?;
+        let _ = event;
+        let heartbeat_store = self.store.clone();
+        let heartbeat_key = lease_key.clone();
+        let heartbeat_owner = owner_id.clone();
+        let heartbeat_secs = (ttl_secs / 3).max(5);
+        let heartbeat = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let store = heartbeat_store.clone();
+                let key = heartbeat_key.clone();
+                let owner = heartbeat_owner.clone();
+                let renewed = tokio::task::spawn_blocking(move || {
+                    store.renew_runtime_lease(&key, &owner, ttl_secs)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+                if !renewed {
+                    break;
+                }
+            }
+        });
+        Ok(SessionLease {
+            store: self.store.clone(),
+            events: self.events.clone(),
+            lease_key,
+            owner_id,
+            session_id: session_id.to_string(),
+            heartbeat: Some(heartbeat),
+        })
+    }
+
+    pub async fn orchestration_candidates(&self, limit: u32) -> Result<Vec<String>> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.orchestration_candidate_sessions(limit)).await?
+    }
+
+    pub async fn list_runtime_leases(&self) -> Result<Vec<vp_store::store::RuntimeLease>> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.list_runtime_leases()).await?
+    }
+
+    pub async fn sweep_runtime_leases(&self) -> Result<usize> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.clear_expired_runtime_leases()).await?
     }
 
     pub(crate) fn git_mutex(&self) -> Arc<Mutex<()>> {
@@ -1968,6 +2130,884 @@ impl Engine {
     pub async fn list_sessions(&self, project_id: Option<String>) -> Result<Vec<Session>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.list_sessions(project_id.as_deref())).await?
+    }
+
+    pub async fn orchestration_policy(&self, project_id: &str) -> Result<OrchestrationPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_orchestration_policy(&project_id)).await?
+    }
+
+    pub async fn set_orchestration_policy(
+        &self,
+        project_id: &str,
+        policy: &OrchestrationPolicy,
+    ) -> Result<OrchestrationPolicy> {
+        crate::orchestration::validate_policy(policy)?;
+        let store = self.store.clone();
+        let project_id_owned = project_id.to_string();
+        let policy_owned = policy.clone();
+        tokio::task::spawn_blocking(move || {
+            if store.get_project(&project_id_owned)?.is_none() {
+                return Err(anyhow::anyhow!("project not found: {project_id_owned}"));
+            }
+            store.set_orchestration_policy(&project_id_owned, &policy_owned)
+        })
+        .await??;
+        self.record_project_manifest().await?;
+        self.orchestration_policy(project_id).await
+    }
+
+    pub async fn plan_revisions(&self, session_id: &str) -> Result<Vec<PlanRevisionInfo>> {
+        let events = self.recent_events(session_id, 5_000).await?;
+        Ok(crate::orchestration::revisions_from_events(&events))
+    }
+
+    pub async fn revise_team_plan(
+        &self,
+        session_id: &str,
+        plan: TeamPlan,
+        reason: &str,
+        author: &str,
+        expected_revision: Option<u32>,
+        max_managers: usize,
+    ) -> Result<ReviseTeamPlanResult> {
+        let reason = reason.trim();
+        if reason.is_empty() || reason.chars().count() > 1_000 {
+            anyhow::bail!("revision reason must be 1-1000 chars");
+        }
+        let author = author.trim();
+        if author.is_empty() || author.chars().count() > 80 {
+            anyhow::bail!("revision author must be 1-80 chars");
+        }
+        let session_id = session_id.to_string();
+        let store = self.store.clone();
+        let session = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let session_id = session_id.clone();
+            move || store.get_session(&session_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        crate::ensure_session_quiescent(&session, "revise the team plan")?;
+        let current_raw = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let session_id = session_id.clone();
+            move || store.get_team_plan(&session_id)
+        })
+        .await??;
+        let current: TeamPlan = current_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .ok_or_else(|| anyhow::anyhow!("session has no TeamPlan to revise"))?;
+        let tasks = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let session_id = session_id.clone();
+            move || store.list_plan_tasks(None, Some(&session_id))
+        })
+        .await??;
+        let events = self.recent_events(&session_id, 5_000).await?;
+        let current_revision = crate::orchestration::plan_revision(&events);
+        if let Some(expected) = expected_revision
+            && expected != current_revision
+        {
+            anyhow::bail!(
+                "plan revision conflict: expected {expected}, current {current_revision}"
+            );
+        }
+        crate::agent::validate_team_plan(&plan, max_managers)?;
+        let statuses = crate::orchestration::status_map(&current, &tasks, &events);
+        crate::orchestration::ensure_revision_safe(&current, &plan, &statuses)?;
+        let diff = crate::orchestration::diff_plan(&current, &plan);
+        let revision = current_revision.saturating_add(1);
+        let payload = serde_json::json!({
+            "plan": plan,
+            "revision": revision,
+            "reason": reason,
+            "author": author,
+            "task_count": plan.tasks.len(),
+            "added": diff.added,
+            "removed": diff.removed,
+            "changed": diff.changed,
+        });
+        let plan_json = serde_json::to_string(&plan)?;
+        let event = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let session_id = session_id.clone();
+            let plan_json = plan_json.clone();
+            let payload = payload.clone();
+            move || {
+                store.set_team_plan_revision_with_event(
+                    &session_id,
+                    &plan_json,
+                    "team_plan.revised",
+                    payload,
+                )
+            }
+        })
+        .await??;
+        let _ = self.events.send(event.clone());
+        self.scheduler.sync_plan(&session, &plan).await?;
+        Ok(ReviseTeamPlanResult {
+            revision: PlanRevisionInfo {
+                revision,
+                seq: event.seq,
+                kind: event.kind,
+                reason: Some(reason.to_string()),
+                author: author.to_string(),
+                task_count: plan.tasks.len(),
+                added: diff.added,
+                removed: diff.removed,
+                changed: diff.changed,
+                created_at: event.created_at,
+            },
+            plan,
+        })
+    }
+
+    pub async fn coordination_notes(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<Vec<OrchestrationNote>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_coordination_notes(&session_id, limit))
+            .await?
+    }
+
+    pub async fn orchestration_decisions(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<Vec<OrchestrationDecision>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_orchestration_decisions(&session_id, limit))
+            .await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_coordination_note(
+        &self,
+        session_id: &str,
+        action: &str,
+        severity: &str,
+        task_id: Option<&str>,
+        target_agent_id: Option<&str>,
+        target_note_id: Option<&str>,
+        agent_id: &str,
+        agent_name: &str,
+        agent_role: Option<&str>,
+        message: &str,
+    ) -> Result<Event> {
+        let store = self.store.clone();
+        let session_id_owned = session_id.to_string();
+        let action = action.to_string();
+        let severity = severity.to_string();
+        let task_id = task_id.map(str::to_string);
+        let target_agent_id = target_agent_id.map(str::to_string);
+        let target_note_id = target_note_id.map(str::to_string);
+        let agent_id = agent_id.to_string();
+        let agent_name = agent_name.to_string();
+        let agent_role = agent_role.map(str::to_string);
+        let message = message.to_string();
+        let event = tokio::task::spawn_blocking(move || {
+            store.record_coordination_note_with_event(
+                &session_id_owned,
+                &action,
+                &severity,
+                task_id.as_deref(),
+                target_agent_id.as_deref(),
+                target_note_id.as_deref(),
+                &agent_id,
+                &agent_name,
+                agent_role.as_deref(),
+                &message,
+            )
+        })
+        .await??;
+        let _ = self.events.send(event.clone());
+        // A targeted note is also delivered to the durable mailbox so the
+        // recipient still sees it after the recent-coordination window moves on.
+        let target = event
+            .payload
+            .get("target_agent_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let note_action = event
+            .payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("note");
+        if let Some(target) = target
+            && !matches!(note_action, "unblock" | "list")
+        {
+            let agents = self.list_agents(session_id).await?;
+            if let Some(agent) = agents.iter().find(|agent| agent.id == target) {
+                let _ = self
+                    .send_agent_message(
+                        session_id,
+                        event
+                            .payload
+                            .get("agent_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("orchestrator"),
+                        event
+                            .payload
+                            .get("agent_name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Orchestrator"),
+                        &agent.id,
+                        &agent.name,
+                        "coordination",
+                        event
+                            .payload
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                        serde_json::json!({
+                            "note_id": event.payload.get("note_id"),
+                            "action": note_action,
+                            "task_id": event.payload.get("task_id"),
+                            "severity": event.payload.get("severity"),
+                        }),
+                    )
+                    .await;
+            }
+        }
+        Ok(event)
+    }
+
+    pub async fn coordination_notes_for_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        task_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<OrchestrationNote>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+        let task_id = task_id.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            store.list_coordination_notes_for_agent(
+                &session_id,
+                &agent_id,
+                task_id.as_deref(),
+                limit,
+            )
+        })
+        .await?
+    }
+
+    pub async fn plan_revision_detail(
+        &self,
+        session_id: &str,
+        revision: u32,
+    ) -> Result<PlanRevisionDetailResult> {
+        let events = self.all_events(session_id).await?;
+        let revisions = crate::orchestration::revisions_from_events(&events);
+        let info = revisions
+            .iter()
+            .find(|candidate| candidate.revision == revision)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("plan revision {revision} not found"))?;
+        let plan = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "team_plan.submitted" | "team_plan.revised"
+                )
+            })
+            .filter(|event| {
+                event
+                    .payload
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as u32)
+                    .unwrap_or_else(|| {
+                        revisions
+                            .iter()
+                            .find(|candidate| candidate.seq == event.seq)
+                            .map(|candidate| candidate.revision)
+                            .unwrap_or(0)
+                    })
+                    == revision
+            })
+            .find_map(crate::orchestration::plan::plan_from_event)
+            .ok_or_else(|| anyhow::anyhow!("plan revision {revision} has no stored plan"))?;
+        Ok(PlanRevisionDetailResult {
+            revision: info,
+            plan,
+        })
+    }
+
+    pub async fn restore_team_plan_revision(
+        &self,
+        session_id: &str,
+        revision: u32,
+        reason: &str,
+        expected_revision: Option<u32>,
+        max_managers: usize,
+    ) -> Result<ReviseTeamPlanResult> {
+        let detail = self.plan_revision_detail(session_id, revision).await?;
+        self.revise_team_plan(
+            session_id,
+            detail.plan,
+            reason,
+            "user",
+            expected_revision,
+            max_managers,
+        )
+        .await
+    }
+
+    pub async fn edit_plan_task(
+        &self,
+        session_id: &str,
+        task: vp_protocol::types::PlanTask,
+        reason: &str,
+        expected_revision: Option<u32>,
+        max_managers: usize,
+    ) -> Result<ReviseTeamPlanResult> {
+        let current = self
+            .get_team_plan(session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("session has no TeamPlan to edit"))?;
+        let mut plan = current.clone();
+        let index = plan
+            .tasks
+            .iter()
+            .position(|candidate| candidate.id == task.id)
+            .ok_or_else(|| anyhow::anyhow!("task not found in plan: {}", task.id))?;
+        plan.tasks[index] = task;
+        self.revise_team_plan(
+            session_id,
+            plan,
+            reason,
+            "user",
+            expected_revision,
+            max_managers,
+        )
+        .await
+    }
+
+    pub async fn all_events(&self, session_id: &str) -> Result<Vec<Event>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_all_events(&session_id)).await?
+    }
+
+    pub async fn orchestration_snapshot(&self, session_id: &str) -> Result<OrchestrationSnapshot> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let plan = self.get_team_plan(session_id).await?;
+        let tasks = self
+            .task_queue(None, Some(session_id.to_string()))
+            .await?
+            .tasks;
+        let agents = self.list_agents(session_id).await?;
+        let merge_queue = self.list_merge_queue(session_id).await?;
+        let questions = self
+            .list_questions(Some(session_id.to_string()))
+            .await?
+            .questions;
+        let events = self.recent_events(session_id, 5_000).await?;
+        let notes = self.coordination_notes(session_id, 2_000).await?;
+        let decisions = self.orchestration_decisions(session_id, 2_000).await?;
+        let policy = self.orchestration_policy(&session.project_id).await?;
+        Ok(crate::orchestration::build_snapshot(
+            crate::orchestration::OrchestrationInput {
+                session: &session,
+                plan: plan.as_ref(),
+                scheduled: &tasks,
+                agents: &agents,
+                events: &events,
+                merge_queue: &merge_queue,
+                questions: &questions,
+                notes: &notes,
+                decisions: &decisions,
+                policy: &policy,
+            },
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_user_coordination_note(
+        &self,
+        session_id: &str,
+        action: &str,
+        task_id: Option<&str>,
+        target_agent_id: Option<&str>,
+        target_note_id: Option<&str>,
+        message: &str,
+        severity: Option<&str>,
+    ) -> Result<String> {
+        if !matches!(
+            action,
+            "note" | "blocker" | "unblock" | "decision" | "escalate"
+        ) {
+            anyhow::bail!("unsupported coordination action: {action}");
+        }
+        let message = message.trim();
+        if message.is_empty() || message.chars().count() > 2_000 {
+            anyhow::bail!("coordination message must be 1-2000 chars");
+        }
+        let task_id = task_id.map(str::trim).filter(|task| !task.is_empty());
+        if let Some(task_id) = task_id {
+            crate::worktree::validate_task_id(task_id)?;
+        }
+        let severity = severity.unwrap_or(if matches!(action, "blocker" | "escalate") {
+            "warning"
+        } else {
+            "info"
+        });
+        if !matches!(severity, "info" | "warning" | "critical") {
+            anyhow::bail!("severity must be info, warning, or critical");
+        }
+        if let Some(target) = target_agent_id {
+            let agents = self.list_agents(session_id).await?;
+            if !agents.iter().any(|agent| agent.id == target) {
+                anyhow::bail!("target agent is not in this session: {target}");
+            }
+        }
+        if let Some(note) = target_note_id {
+            let notes = self.coordination_notes(session_id, 2_000).await?;
+            if !notes.iter().any(|candidate| candidate.note_id == note) {
+                anyhow::bail!("coordination note not found: {note}");
+            }
+        }
+        let event = self
+            .record_coordination_note(
+                session_id,
+                action,
+                severity,
+                task_id,
+                target_agent_id,
+                target_note_id,
+                "user",
+                "User",
+                Some("user"),
+                message,
+            )
+            .await?;
+        Ok(event
+            .payload
+            .get("note_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Recent TeamPlan sessions across the selected project (or all projects)
+    /// with their live metrics and top blockers. The daemon exposes this for
+    /// Manage Dash; the per-session snapshot remains the source of truth.
+    pub async fn orchestration_overview(
+        &self,
+        project_id: Option<&str>,
+        limit: u32,
+    ) -> Result<OrchestrationOverviewResult> {
+        let sessions = self.list_sessions(project_id.map(str::to_string)).await?;
+        let projects = self.list_projects().await?;
+        let project_names = projects
+            .into_iter()
+            .map(|project| (project.id, project.name))
+            .collect::<HashMap<_, _>>();
+        let limit = limit.clamp(1, 50) as usize;
+        let mut summaries = Vec::new();
+        for session in sessions.into_iter().take(limit.saturating_mul(4)) {
+            let Ok(snapshot) = self.orchestration_snapshot(&session.id).await else {
+                continue;
+            };
+            if snapshot.plan.is_none() {
+                continue;
+            }
+            let blockers = snapshot
+                .blockers
+                .iter()
+                .take(3)
+                .map(|blocker| format!("{}: {}", blocker.kind, blocker.message))
+                .collect::<Vec<_>>();
+            let last = snapshot.decisions.last().cloned();
+            summaries.push(OrchestrationSessionSummary {
+                session_id: session.id.clone(),
+                project_id: session.project_id.clone(),
+                project_name: project_names
+                    .get(&session.project_id)
+                    .cloned()
+                    .unwrap_or_else(|| session.project_id.clone()),
+                goal: session.goal.clone(),
+                status: session.status.clone(),
+                priority: session.priority,
+                plan_revision: snapshot.plan_revision,
+                metrics: snapshot.metrics.clone(),
+                blockers,
+                last_decision: last.as_ref().map(|decision| decision.detail.clone()),
+                last_decision_at: last.map(|decision| decision.created_at),
+            });
+        }
+        summaries.sort_by(|lhs, rhs| {
+            let left_attention = lhs.metrics.attention_count;
+            let right_attention = rhs.metrics.attention_count;
+            if left_attention != right_attention {
+                return right_attention.cmp(&left_attention);
+            }
+            let left_running = lhs.status == "running" || lhs.status == "queued";
+            let right_running = rhs.status == "running" || rhs.status == "queued";
+            if left_running != right_running {
+                return right_running.cmp(&left_running);
+            }
+            rhs.priority.cmp(&lhs.priority)
+        });
+        summaries.truncate(limit);
+        let totals = OrchestrationOverviewTotals {
+            sessions: summaries.len(),
+            running: summaries
+                .iter()
+                .filter(|summary| matches!(summary.status.as_str(), "running" | "queued"))
+                .count(),
+            attention: summaries
+                .iter()
+                .filter(|summary| summary.metrics.attention_count > 0)
+                .count(),
+            blocked_tasks: summaries
+                .iter()
+                .map(|summary| summary.metrics.blocked_tasks)
+                .sum(),
+            failed_tasks: summaries
+                .iter()
+                .map(|summary| summary.metrics.failed_tasks)
+                .sum(),
+            retrying_tasks: summaries
+                .iter()
+                .map(|summary| summary.metrics.retrying_tasks)
+                .sum(),
+            open_blockers: summaries
+                .iter()
+                .map(|summary| summary.metrics.open_blockers)
+                .sum(),
+            merge_conflicts: summaries
+                .iter()
+                .map(|summary| summary.metrics.merge_conflicts)
+                .sum(),
+        };
+        Ok(OrchestrationOverviewResult {
+            sessions: summaries,
+            totals,
+            generated_at: vp_protocol::now_rfc3339(),
+        })
+    }
+
+    /// Preview the controller decisions without mutating task rows or notes.
+    pub async fn preview_orchestration(
+        &self,
+        session_id: &str,
+    ) -> Result<OrchestrationPreviewResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let Some(plan) = self.get_team_plan(session_id).await? else {
+            return Ok(OrchestrationPreviewResult {
+                session_id: session_id.to_string(),
+                actions: Vec::new(),
+            });
+        };
+        let tasks = self
+            .task_queue(None, Some(session_id.to_string()))
+            .await?
+            .tasks;
+        let events = self.recent_events(session_id, 5_000).await?;
+        let notes = self.coordination_notes(session_id, 2_000).await?;
+        let policy = self.orchestration_policy(&session.project_id).await?;
+        let actions = crate::orchestration::plan_actions(crate::orchestration::ControllerInput {
+            session: &session,
+            plan: &plan,
+            scheduled: &tasks,
+            events: &events,
+            notes: &notes,
+            policy: &policy,
+            budget_exhausted: session_budget_exhausted(&session),
+        });
+        Ok(OrchestrationPreviewResult {
+            session_id: session_id.to_string(),
+            actions: actions
+                .into_iter()
+                .map(|action| OrchestrationPreviewAction {
+                    action: action.action().to_string(),
+                    task_id: action.task_id().to_string(),
+                    detail: action.detail(),
+                    attempt: action.attempt(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Run one deterministic controller pass for a session. Actions are
+    /// idempotent: retries are gated by `next_attempt_at`, blocked rows are
+    /// skipped once moved, and escalations are deduplicated by attempt.
+    pub async fn advance_orchestration(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<OrchestrationDecision>> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let Some(plan) = self.get_team_plan(session_id).await? else {
+            return Ok(Vec::new());
+        };
+        let tasks = self
+            .task_queue(None, Some(session_id.to_string()))
+            .await?
+            .tasks;
+        let events = self.recent_events(session_id, 5_000).await?;
+        let notes = self.coordination_notes(session_id, 2_000).await?;
+        let policy = self.orchestration_policy(&session.project_id).await?;
+        let actions = crate::orchestration::plan_actions(crate::orchestration::ControllerInput {
+            session: &session,
+            plan: &plan,
+            scheduled: &tasks,
+            events: &events,
+            notes: &notes,
+            policy: &policy,
+            budget_exhausted: session_budget_exhausted(&session),
+        });
+        let mut decisions = Vec::new();
+        for action in actions {
+            let task_id = action.task_id().to_string();
+            let Some(row) = tasks.iter().find(|row| row.task_id == task_id) else {
+                continue;
+            };
+            let plan_seq = row.plan_seq;
+            match &action {
+                crate::orchestration::ControllerAction::Retry {
+                    task_id,
+                    delay_secs,
+                    reason,
+                } => {
+                    if let Err(error) = self
+                        .schedule_plan_task_retry(
+                            session_id,
+                            plan_seq,
+                            task_id,
+                            std::time::Duration::from_secs(*delay_secs),
+                            reason,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, task_id, "orchestration retry failed");
+                        continue;
+                    }
+                }
+                crate::orchestration::ControllerAction::Block {
+                    task_id,
+                    dependency,
+                    reason,
+                } => {
+                    let store = self.store.clone();
+                    let session_id_owned = session_id.to_string();
+                    let task_id_owned = task_id.clone();
+                    let dependency = dependency.clone();
+                    let reason = reason.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        store.block_plan_task_with_event(
+                            &session_id_owned,
+                            plan_seq,
+                            &task_id_owned,
+                            &reason,
+                            &dependency,
+                        )
+                    })
+                    .await??;
+                    let Some((_task, event)) = result else {
+                        continue;
+                    };
+                    let _ = self.events.send(event);
+                }
+                crate::orchestration::ControllerAction::Unblock { task_id, reason } => {
+                    let store = self.store.clone();
+                    let session_id_owned = session_id.to_string();
+                    let task_id_owned = task_id.clone();
+                    let reason = reason.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        store.unblock_plan_task_with_event(
+                            &session_id_owned,
+                            plan_seq,
+                            &task_id_owned,
+                            &reason,
+                        )
+                    })
+                    .await??;
+                    let Some((_task, event)) = result else {
+                        continue;
+                    };
+                    let _ = self.events.send(event);
+                }
+                crate::orchestration::ControllerAction::Cancel {
+                    task_id,
+                    dependency,
+                    reason,
+                } => {
+                    let store = self.store.clone();
+                    let session_id_owned = session_id.to_string();
+                    let task_id_owned = task_id.clone();
+                    let dependency = dependency.clone();
+                    let reason = reason.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        store.cancel_plan_task_with_event(
+                            &session_id_owned,
+                            plan_seq,
+                            &task_id_owned,
+                            &reason,
+                            &dependency,
+                        )
+                    })
+                    .await??;
+                    let Some((_task, event)) = result else {
+                        continue;
+                    };
+                    let _ = self.events.send(event);
+                }
+                crate::orchestration::ControllerAction::Escalate {
+                    task_id,
+                    attempt: _,
+                    message,
+                } => {
+                    if let Err(error) = self
+                        .record_coordination_note(
+                            session_id,
+                            "escalate",
+                            "critical",
+                            Some(task_id),
+                            None,
+                            None,
+                            "orchestrator",
+                            "Orchestrator",
+                            Some("orchestrator"),
+                            message,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, task_id, "orchestration escalation failed");
+                        continue;
+                    }
+                }
+                crate::orchestration::ControllerAction::ResolveBlockers { task_id, count } => {
+                    if let Err(error) = self
+                        .record_coordination_note(
+                            session_id,
+                            "unblock",
+                            "info",
+                            Some(task_id),
+                            None,
+                            None,
+                            "orchestrator",
+                            "Orchestrator",
+                            Some("orchestrator"),
+                            &format!(
+                                "{task_id} completed; {count} coordination blocker(s) resolved automatically"
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, task_id, "orchestration blocker resolution failed");
+                        continue;
+                    }
+                }
+            }
+            decisions.push(
+                self.record_orchestration_decision(
+                    session_id,
+                    action.action(),
+                    Some(action.task_id()),
+                    &action.detail(),
+                    action.attempt(),
+                )
+                .await?,
+            );
+        }
+        Ok(decisions)
+    }
+
+    pub async fn record_orchestration_decision(
+        &self,
+        session_id: &str,
+        action: &str,
+        task_id: Option<&str>,
+        detail: &str,
+        attempt: u32,
+    ) -> Result<OrchestrationDecision> {
+        let store = self.store.clone();
+        let session_id_owned = session_id.to_string();
+        let action_owned = action.to_string();
+        let task_id_owned = task_id.map(str::to_string);
+        let detail_owned = detail.to_string();
+        let event = tokio::task::spawn_blocking(move || {
+            store.record_orchestration_decision_with_event(
+                &session_id_owned,
+                &action_owned,
+                task_id_owned.as_deref(),
+                &detail_owned,
+                attempt,
+                "orchestrator",
+            )
+        })
+        .await??;
+        let _ = self.events.send(event.clone());
+        Ok(OrchestrationDecision {
+            decision_id: event.payload["decision_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            action: action.to_string(),
+            task_id: task_id.map(str::to_string),
+            detail: detail.to_string(),
+            attempt,
+            agent_id: "orchestrator".to_string(),
+            created_at: event.created_at,
+        })
+    }
+
+    pub async fn schedule_plan_task_retry(
+        &self,
+        session_id: &str,
+        plan_seq: u64,
+        task_id: &str,
+        delay: std::time::Duration,
+        reason: &str,
+    ) -> Result<ScheduledTask> {
+        let next = time::OffsetDateTime::now_utc()
+            + time::Duration::seconds(delay.as_secs().min(i64::MAX as u64) as i64);
+        let next = next
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("formatting retry time")?;
+        let store = self.store.clone();
+        let session_id_owned = session_id.to_string();
+        let task_id_owned = task_id.to_string();
+        let reason_owned = reason.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.schedule_plan_task_retry_with_event(
+                &session_id_owned,
+                plan_seq,
+                &task_id_owned,
+                &next,
+                &reason_owned,
+            )
+        })
+        .await??;
+        let (task, event) =
+            result.ok_or_else(|| anyhow::anyhow!("task {task_id} cannot be retried"))?;
+        let _ = self.events.send(event);
+        self.scheduler.notify_state();
+        Ok(task)
     }
 
     pub async fn set_team_plan(&self, session_id: &str, plan: &TeamPlan) -> Result<()> {
@@ -3700,6 +4740,8 @@ impl Engine {
             let memories = store.list_session_memories(&id)?;
             let questions = store.list_session_questions(&id)?;
             let tasks = store.list_plan_tasks(None, Some(&id))?;
+            let notes = store.list_coordination_notes(&id, 2_000)?;
+            let decisions = store.list_orchestration_decisions(&id, 2_000)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -3715,6 +4757,8 @@ impl Engine {
                 memories,
                 questions,
                 tasks,
+                notes,
+                decisions,
                 events,
             })
         })
@@ -3769,6 +4813,7 @@ impl Engine {
                         started_at: None,
                         finished_at: None,
                         last_error: None,
+                        next_attempt_at: None,
                     },
                 )
             })
@@ -3785,6 +4830,10 @@ impl Engine {
                     | "plan_task.pausing"
                     | "plan_task.paused"
                     | "plan_task.resumed"
+                    | "plan_task.retry_scheduled"
+                    | "plan_task.blocked"
+                    | "plan_task.unblocked"
+                    | "plan_task.cancelled"
             ) {
                 continue;
             }
@@ -3826,6 +4875,15 @@ impl Engine {
                     };
                     task.status = status;
                     task.finished_at = Some(event.created_at.clone());
+                    task.next_attempt_at = None;
+                }
+                "plan_task.retry_scheduled" => {
+                    task.status = "pending".to_string();
+                    task.finished_at = None;
+                    task.next_attempt_at = event.payload["next_attempt_at"]
+                        .as_str()
+                        .map(str::to_string);
+                    task.last_error = event.payload["reason"].as_str().map(str::to_string);
                 }
                 "plan_task.interrupted" => {
                     task.status = "interrupted".to_string();
@@ -3836,9 +4894,26 @@ impl Engine {
                     task.status = "pending".to_string();
                     task.finished_at = None;
                     task.last_error = None;
+                    task.next_attempt_at = None;
                 }
                 "plan_task.skipped" => {
                     task.status = "skipped".to_string();
+                    task.finished_at = Some(event.created_at.clone());
+                    task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                }
+                "plan_task.blocked" => {
+                    task.status = "blocked".to_string();
+                    task.finished_at = None;
+                    task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                }
+                "plan_task.unblocked" => {
+                    task.status = "pending".to_string();
+                    task.finished_at = None;
+                    task.last_error = None;
+                    task.next_attempt_at = None;
+                }
+                "plan_task.cancelled" => {
+                    task.status = "cancelled".to_string();
                     task.finished_at = Some(event.created_at.clone());
                     task.last_error = event.payload["reason"].as_str().map(str::to_string);
                 }
@@ -4302,6 +5377,53 @@ impl Engine {
             ));
         }
 
+        let expected_notes = crate::orchestration::coordination_notes(&data.events);
+        let expected_note_values = expected_notes
+            .iter()
+            .filter_map(|note| Some((note.note_id.clone(), serde_json::to_value(note).ok()?)))
+            .collect::<HashMap<_, _>>();
+        let projected_note_values = data
+            .notes
+            .iter()
+            .filter_map(|note| Some((note.note_id.clone(), serde_json::to_value(note).ok()?)))
+            .collect::<HashMap<_, _>>();
+        let notes_match = expected_note_values == projected_note_values;
+        if !notes_match {
+            mismatches.push(format!(
+                "coordination notes: projection={}, replay={}",
+                projected_note_values.len(),
+                expected_note_values.len()
+            ));
+        }
+        let expected_decisions = crate::orchestration::decisions_from_events(&data.events);
+        let expected_decision_values = expected_decisions
+            .iter()
+            .filter_map(|decision| {
+                Some((
+                    decision.decision_id.clone(),
+                    serde_json::to_value(decision).ok()?,
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_decision_values = data
+            .decisions
+            .iter()
+            .filter_map(|decision| {
+                Some((
+                    decision.decision_id.clone(),
+                    serde_json::to_value(decision).ok()?,
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let decisions_match = expected_decision_values == projected_decision_values;
+        if !decisions_match {
+            mismatches.push(format!(
+                "orchestration decisions: projection={}, replay={}",
+                projected_decision_values.len(),
+                expected_decision_values.len()
+            ));
+        }
+
         let expected_artifacts = Self::expected_artifacts(data);
         let projected_artifacts = data
             .artifacts
@@ -4549,7 +5671,9 @@ impl Engine {
             && todos_matches
             && messages_matches
             && agents_matches
-            && queue_matches;
+            && queue_matches
+            && notes_match
+            && decisions_match;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -4567,6 +5691,8 @@ impl Engine {
             memories_matches,
             questions_matches,
             task_queue_matches,
+            notes_match,
+            decisions_match,
             consistent,
             repaired,
             rebuilt: false,
@@ -5036,6 +6162,27 @@ impl Engine {
         let event =
             tokio::task::spawn_blocking(move || store.import_session_bundle(&bundle)).await??;
         let _ = self.events.send(event);
+        // Imported archives keep their raw events; rebuild the derived
+        // coordination and decision projections so the archive is inspectable.
+        let projection_store = self.store.clone();
+        let projection_id = session_id.clone();
+        let events = {
+            let store = self.store.clone();
+            let id = session_id.clone();
+            tokio::task::spawn_blocking(move || store.list_all_events(&id)).await??
+        };
+        let notes = crate::orchestration::coordination_notes(&events);
+        let decisions = crate::orchestration::decisions_from_events(&events);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            projection_store.replace_coordination_notes(&projection_id, &notes, &events)?;
+            projection_store.replace_orchestration_decisions(
+                &projection_id,
+                &decisions,
+                &events,
+            )?;
+            Ok(())
+        })
+        .await??;
         Ok(SessionImportResult {
             project_id,
             session_id,
@@ -5131,6 +6278,25 @@ impl Engine {
         let usage_id = session_id.to_string();
         tokio::task::spawn_blocking(move || {
             usage_store.replace_usage_ledger(&usage_id, &expected_usage)
+        })
+        .await??;
+        let expected_notes = crate::orchestration::coordination_notes(&data.events);
+        let expected_decisions = crate::orchestration::decisions_from_events(&data.events);
+        let projection_store = self.store.clone();
+        let projection_id = session_id.to_string();
+        let projection_events = data.events.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            projection_store.replace_coordination_notes(
+                &projection_id,
+                &expected_notes,
+                &projection_events,
+            )?;
+            projection_store.replace_orchestration_decisions(
+                &projection_id,
+                &expected_decisions,
+                &projection_events,
+            )?;
+            Ok(())
         })
         .await??;
         self.append_event(
@@ -5355,6 +6521,25 @@ impl Engine {
         let usage_id = session_id.to_string();
         tokio::task::spawn_blocking(move || {
             usage_store.replace_usage_ledger(&usage_id, &expected_usage)
+        })
+        .await??;
+        let expected_notes = crate::orchestration::coordination_notes(&data.events);
+        let expected_decisions = crate::orchestration::decisions_from_events(&data.events);
+        let projection_store = self.store.clone();
+        let projection_id = session_id.to_string();
+        let projection_events = data.events.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            projection_store.replace_coordination_notes(
+                &projection_id,
+                &expected_notes,
+                &projection_events,
+            )?;
+            projection_store.replace_orchestration_decisions(
+                &projection_id,
+                &expected_decisions,
+                &projection_events,
+            )?;
+            Ok(())
         })
         .await??;
         self.append_event(

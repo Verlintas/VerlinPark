@@ -1943,6 +1943,7 @@ struct SchedulerTask: Codable, Identifiable, Hashable, Sendable {
     let startedAt: String?
     let finishedAt: String?
     let lastError: String?
+    let nextAttemptAt: String?
 
     var id: String {
         "\(sessionID)/\(planSeq)/\(taskID)"
@@ -1964,6 +1965,7 @@ struct SchedulerTask: Codable, Identifiable, Hashable, Sendable {
         case startedAt = "started_at"
         case finishedAt = "finished_at"
         case lastError = "last_error"
+        case nextAttemptAt = "next_attempt_at"
     }
 }
 
