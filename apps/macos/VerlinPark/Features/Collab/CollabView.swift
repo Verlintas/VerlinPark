@@ -489,7 +489,7 @@ private struct CollabGraphHeader: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 8) {
                 VPKicker(
-                    text: "Team graph",
+                    text: surface == .ops ? "Team operations" : "Team graph",
                     trailing: layout.metrics.planRevision > 1
                         ? "plan r\(layout.metrics.planRevision)"
                         : nil

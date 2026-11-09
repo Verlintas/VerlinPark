@@ -314,7 +314,7 @@ private struct CollabOpsToolbar: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
                 VPKicker(
-                    text: "Team operations",
+                    text: "Team controller",
                     trailing: snapshot.map { "plan r\($0.planRevision)" }
                 )
                 Spacer()
