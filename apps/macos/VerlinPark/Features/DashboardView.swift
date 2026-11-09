@@ -56,6 +56,17 @@ enum DashboardSection: String, CaseIterable, Identifiable {
         case .diagnostics: "stethoscope"
         }
     }
+
+    /// Essentials are the daily surfaces. Everything else is opt-in so a new
+    /// install is not confronted with nine dense sections at once.
+    var isEssential: Bool {
+        switch self {
+        case .overview, .inbox, .team, .usage:
+            true
+        case .git, .checkpoints, .storage, .policies, .diagnostics:
+            false
+        }
+    }
 }
 
 struct DashboardView: View {
@@ -72,6 +83,7 @@ struct DashboardView: View {
     @Namespace private var sectionNamespace
     @AppStorage("verlinpark.dashboard.section") private var storedSection =
         DashboardSection.overview.rawValue
+    @AppStorage("verlinpark.dashboard.advanced") private var showAdvanced = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -219,6 +231,18 @@ struct DashboardView: View {
             }
 
             Spacer(minLength: 10)
+            Toggle(isOn: $showAdvanced) {
+                Text("Advanced sections")
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .onChange(of: showAdvanced) { _, enabled in
+                if !enabled, !section.isEssential {
+                    section = .overview
+                }
+            }
             Text("⌘1–⌘9 switch sections")
                 .font(VPTheme.mono(7.5))
                 .foregroundStyle(VPTheme.textTertiary)
@@ -234,9 +258,10 @@ struct DashboardView: View {
     }
 
     private var filteredSections: [DashboardSection] {
+        let base = DashboardSection.allCases.filter { showAdvanced || $0.isEssential }
         let query = filter.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return DashboardSection.allCases }
-        return DashboardSection.allCases.filter { item in
+        guard !query.isEmpty else { return base }
+        return base.filter { item in
             item.title.localizedCaseInsensitiveContains(query)
                 || item.detail.localizedCaseInsensitiveContains(query)
         }

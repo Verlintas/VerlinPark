@@ -34,7 +34,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .general: L10n.t("Language and appearance")
         case .brand: L10n.t("Wordmark, flags, and live preview")
         case .resident: L10n.t("External Aviiya bridge")
-        case .providers: L10n.t("Models, prices, and team capacity")
+        case .providers: L10n.t("Connect a model; advanced overrides")
         case .acp: L10n.t("External stdio agents")
         case .mcp: L10n.t("Local and remote tool servers")
         case .notifications: L10n.t("Permission and background alerts")
@@ -225,6 +225,7 @@ struct GeneralSettingsView: View {
     @Environment(LanguageStore.self) private var language
     @Environment(WorkspaceLayoutStore.self) private var layout
     @Environment(AppModel.self) private var model
+    @State private var showSetupWizard = false
 
     var body: some View {
         @Bindable var layout = layout
@@ -270,6 +271,59 @@ struct GeneralSettingsView: View {
                     .font(VPTheme.mono(8))
                     .foregroundStyle(VPTheme.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Button(L10n.t("Run setup guide…")) {
+                            showSetupWizard = true
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        Spacer()
+                    }
+                    if !model.approvalGrants.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(L10n.t("Always-allowed paths").uppercased())
+                                    .font(VPTheme.mono(6.5, weight: .semibold))
+                                    .tracking(0.35)
+                                    .foregroundStyle(VPTheme.textTertiary)
+                                Spacer()
+                                if model.approvalGrantBusy {
+                                    ProgressView().controlSize(.mini)
+                                }
+                            }
+                            ForEach(model.approvalGrants.prefix(6)) { grant in
+                                HStack(spacing: 6) {
+                                    Image(systemName: "checkmark.shield")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(VPTheme.success)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(grant
+                                            .pathPrefix + (grant.includeChildren ? " (subfolders)" : ""))
+                                            .font(VPTheme.mono(8))
+                                            .foregroundStyle(VPTheme.textSecondary)
+                                            .lineLimit(1)
+                                        Text("\(grant.tool) · \(grant.createdBy)")
+                                            .font(VPTheme.mono(6.5))
+                                            .foregroundStyle(VPTheme.textTertiary)
+                                    }
+                                    Spacer()
+                                    Button {
+                                        Task { await model.deleteApprovalGrant(grant) }
+                                    } label: {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 7, weight: .semibold))
+                                            .foregroundStyle(VPTheme.textTertiary)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help(L10n.t("Remove grant"))
+                                }
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 4)
+                                .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 6))
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 9) {
@@ -368,6 +422,15 @@ struct GeneralSettingsView: View {
             .padding(24)
             .frame(maxWidth: 780, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .task {
+            await model.loadApprovalGrants()
+        }
+        .sheet(isPresented: $showSetupWizard) {
+            SetupWizardView {
+                UserDefaults.standard.set(true, forKey: "verlinpark.onboarding.completed")
+            }
+            .environment(model)
         }
     }
 
@@ -853,6 +916,95 @@ struct ProvidersSettingsView: View {
     @Environment(AppModel.self) private var model
     @AppStorage("verlinpark.session.tokenBudget") private var tokenBudget = 200_000
     @State private var showingModelPresets = false
+    @State private var selectedPreset = "auto"
+    @State private var showAdvanced = false
+    @State private var didLoadPreset = false
+
+    private struct ProviderPreset: Identifiable {
+        let id: String
+        let title: String
+        let kind: String
+        let baseURL: String
+        let model: String
+        let contextWindow: String
+        let needsKey: Bool
+        let detail: String
+    }
+
+    private let presets: [ProviderPreset] = [
+        ProviderPreset(
+            id: "deepseek",
+            title: "DeepSeek",
+            kind: "openai-compatible",
+            baseURL: "https://api.deepseek.com",
+            model: "deepseek-chat",
+            contextWindow: "128000",
+            needsKey: true,
+            detail: "OpenAI-compatible endpoint. Context and model are prefilled; change the model to deepseek-flash if you prefer it."
+        ),
+        ProviderPreset(
+            id: "openai",
+            title: "OpenAI",
+            kind: "openai-compatible",
+            baseURL: "https://api.openai.com/v1",
+            model: "gpt-4o-mini",
+            contextWindow: "128000",
+            needsKey: true,
+            detail: "Official OpenAI endpoint."
+        ),
+        ProviderPreset(
+            id: "anthropic",
+            title: "Anthropic",
+            kind: "anthropic",
+            baseURL: "https://api.anthropic.com/v1",
+            model: "claude-3-5-sonnet-latest",
+            contextWindow: "200000",
+            needsKey: true,
+            detail: "Native Anthropic Messages API."
+        ),
+        ProviderPreset(
+            id: "lmstudio",
+            title: "LM Studio",
+            kind: "openai-compatible",
+            baseURL: "http://127.0.0.1:1234/v1",
+            model: "",
+            contextWindow: "32000",
+            needsKey: false,
+            detail: "Local OpenAI-compatible server. No API key is needed."
+        ),
+        ProviderPreset(
+            id: "ollama",
+            title: "Ollama",
+            kind: "openai-compatible",
+            baseURL: "http://127.0.0.1:11434/v1",
+            model: "",
+            contextWindow: "32000",
+            needsKey: false,
+            detail: "Local OpenAI-compatible server. Pick the model name you have pulled."
+        ),
+        ProviderPreset(
+            id: "custom",
+            title: "Custom endpoint",
+            kind: "openai-compatible",
+            baseURL: "",
+            model: "",
+            contextWindow: "128000",
+            needsKey: true,
+            detail: "Any OpenAI-compatible endpoint. Set the base URL, model, and key."
+        ),
+    ]
+
+    private var currentPreset: ProviderPreset? {
+        presets.first { $0.id == selectedPreset }
+    }
+
+    private var isLocalEndpoint: Bool {
+        let url = model.providerBaseURL.lowercased()
+        return url.contains("127.0.0.1")
+            || url.contains("localhost")
+            || url.contains("0.0.0.0")
+            || (currentPreset?.needsKey == false)
+    }
 
     private func defaultBaseURL(for kind: String) -> String {
         kind == "anthropic"
@@ -860,74 +1012,98 @@ struct ProvidersSettingsView: View {
             : "https://api.openai.com/v1"
     }
 
+    private func detectPreset() -> String {
+        let url = model.providerBaseURL.lowercased()
+        if url.contains("deepseek") {
+            return "deepseek"
+        }
+        if url.contains("api.openai.com") {
+            return "openai"
+        }
+        if url.contains("anthropic") {
+            return "anthropic"
+        }
+        if url.contains("127.0.0.1:1234") {
+            return "lmstudio"
+        }
+        if url.contains("127.0.0.1:11434") {
+            return "ollama"
+        }
+        return "custom"
+    }
+
+    private func inferredContext(_ modelName: String) -> String {
+        let lower = modelName.lowercased()
+        if lower.contains("claude") {
+            return "200000"
+        }
+        if lower.contains("gemini") {
+            return "1000000"
+        }
+        if lower.contains("deepseek") {
+            return "128000"
+        }
+        if lower.contains("gpt-4o") || lower.contains("gpt-4.1") {
+            return "128000"
+        }
+        if lower.hasPrefix("o1") || lower.hasPrefix("o3") || lower.hasPrefix("o4") {
+            return "200000"
+        }
+        if lower.contains("qwen") {
+            return "131072"
+        }
+        return currentPreset?.contextWindow ?? "128000"
+    }
+
+    private func applyPreset(_ id: String, force: Bool) {
+        guard id != "auto", let preset = presets.first(where: { $0.id == id }) else { return }
+        model.providerKind = preset.kind
+        if force || model.providerBaseURL.isEmpty {
+            model.providerBaseURL = preset.baseURL
+        }
+        if force || model.providerModel.isEmpty {
+            model.providerModel = preset.model
+        }
+        if force || model.providerContextWindowText.isEmpty {
+            model.providerContextWindowText = preset.contextWindow
+        }
+    }
+
     var body: some View {
         @Bindable var model = model
 
         Form {
-            Section("Leader model") {
-                Picker("API", selection: $model.providerKind) {
-                    Text("OpenAI-compatible").tag("openai-compatible")
-                    Text("Anthropic").tag("anthropic")
-                }
-                .onChange(of: model.providerKind) { oldValue, newValue in
-                    if model.providerBaseURL.isEmpty
-                        || model.providerBaseURL == defaultBaseURL(for: oldValue)
-                    {
-                        model.providerBaseURL = defaultBaseURL(for: newValue)
+            Section("Connect a model") {
+                Picker("Provider", selection: $selectedPreset) {
+                    Text("Auto-detect").tag("auto")
+                    ForEach(presets) { preset in
+                        Text(preset.title).tag(preset.id)
                     }
                 }
-                TextField("Base URL", text: $model.providerBaseURL)
-                    .textFieldStyle(.plain).vpFrostedField()
+                .onChange(of: selectedPreset) { _, value in
+                    guard didLoadPreset else { return }
+                    applyPreset(value, force: true)
+                }
+
                 TextField("Model", text: $model.providerModel)
                     .textFieldStyle(.plain).vpFrostedField()
-                HStack(spacing: 8) {
-                    TextField("Context window (tokens)", text: $model.providerContextWindowText)
-                        .textFieldStyle(.plain).vpFrostedField()
-                    Menu("Presets") {
-                        Button("Off") { model.providerContextWindowText = "0" }
-                        Button("8k") { model.providerContextWindowText = "8000" }
-                        Button("16k") { model.providerContextWindowText = "16000" }
-                        Button("32k") { model.providerContextWindowText = "32000" }
-                        Button("64k") { model.providerContextWindowText = "64000" }
-                        Button("128k (default)") { model.providerContextWindowText = "128000" }
-                        Button("200k") { model.providerContextWindowText = "200000" }
-                        Button("1M") { model.providerContextWindowText = "1000000" }
-                        Button("2M") { model.providerContextWindowText = "2000000" }
+                    .onChange(of: model.providerModel) { _, value in
+                        guard didLoadPreset, !showAdvanced else { return }
+                        model.providerContextWindowText = inferredContext(value)
                     }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .controlSize(.small)
-                }
-                Text(
-                    "Used to derive compaction and rolling-window limits. A 1M-token model can use 1000000; a local 8k model should use 8000 and a lower max_tokens. 0 disables automatic context management."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                SecureField(
-                    model.providerHasStoredKey
-                        ? "Replace stored API key"
-                        : "API key",
-                    text: $model.providerAPIKey
-                )
-                .textFieldStyle(.plain).vpFrostedField()
-                Text(
-                    L10n.t(
+
+                if !isLocalEndpoint {
+                    SecureField(
                         model.providerHasStoredKey
-                            ? "A key is stored in Keychain. It is read only for remote providers; local endpoints never trigger a Keychain prompt. Leave this empty to keep the stored key."
-                            : "The key is stored in Keychain and sent only to the local daemon. It is never written to SQLite or logs."
+                            ? "Replace stored API key"
+                            : "Paste API key",
+                        text: $model.providerAPIKey
                     )
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                if model.providerHasStoredKey {
-                    Button(L10n.t("Remove stored key")) {
-                        model.clearStoredProviderKey()
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                    .textFieldStyle(.plain).vpFrostedField()
                 }
-                HStack {
-                    Button("Save & Connect") {
+
+                HStack(spacing: 8) {
+                    Button(L10n.t(model.providerHasStoredKey ? "Save & Reconnect" : "Save & Connect")) {
                         Task { await model.saveProviderSettings() }
                     }
                     .buttonStyle(.borderedProminent)
@@ -948,6 +1124,14 @@ struct ProvidersSettingsView: View {
                             .foregroundStyle(info.configured ? Color.green : Color.orange)
                     }
                 }
+
+                Text(currentPreset?.detail ?? L10n
+                    .t(
+                        "Pick a preset; model and context are filled automatically. Only the API key is required for remote providers."
+                    ))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 if let status = model.providerStatus {
                     Text(status)
                         .font(.system(size: 11, design: .monospaced))
@@ -962,103 +1146,178 @@ struct ProvidersSettingsView: View {
                         .contentTransition(.opacity)
                         .animation(VPMotion.snap, value: status)
                 }
-            }
 
-            Section("Role model overrides") {
-                Text(
-                    "Blank uses the base Leader model. Prices are USD per 1M tokens and are only used when a USD session budget is set. Per-role context window overrides the global value; blank uses the global model window."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                RoleModelRow(title: "Leader", config: $model.roleModels.leader)
-                RoleModelRow(title: "Manager", config: $model.roleModels.manager)
-                RoleModelRow(title: "Worker", config: $model.roleModels.worker)
-                RoleModelRow(title: "Verifier", config: $model.roleModels.verifier)
-                RoleModelRow(title: "Labour", config: $model.roleModels.labour)
-                Button("Manage Model Presets…") {
-                    showingModelPresets = true
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-
-            Section("Team capacity") {
-                Stepper("Managers: \(model.orgManagers)", value: $model.orgManagers, in: 1 ... 5)
-                Stepper("Workers: \(model.orgWorkers)", value: $model.orgWorkers, in: 1 ... 10)
-                Stepper("Labour: \(model.orgLabour)", value: $model.orgLabour, in: 1 ... 40)
-                Text(
-                    "Per-session hard caps. Defaults are 4 Managers / 6 Workers / 12 Labour; runtime limits are 5 / 10 / 40. Applying also re-saves the current provider configuration."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                Toggle("Auto-expand plan Workers", isOn: $model.autoExpandWorkers)
+                Toggle("Show advanced settings", isOn: $showAdvanced)
                     .toggleStyle(.switch)
                     .controlSize(.small)
                 Text(
-                    "When a plan has more ready tasks than the base Worker cap, expand Workers up to the hard cap of 10 while at least 20% of the session token budget remains. Off by default."
+                    "Advanced contains base URL, context window overrides, role models, team capacity, and session defaults. You normally do not need it."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                Button("Apply capacity") {
-                    Task { await model.saveOrgCaps() }
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(model.providerBusy)
             }
 
-            Section("Global capacity") {
-                if let capacity = model.agentInfo?.capacity {
-                    LabeledContent(
-                        "Workers",
-                        value: "\(capacity.workerAvailable) free / \(capacity.workerLimit)"
+            if showAdvanced {
+                Section("Connection details") {
+                    Picker("API", selection: $model.providerKind) {
+                        Text("OpenAI-compatible").tag("openai-compatible")
+                        Text("Anthropic").tag("anthropic")
+                    }
+                    .onChange(of: model.providerKind) { oldValue, newValue in
+                        if model.providerBaseURL.isEmpty
+                            || model.providerBaseURL == defaultBaseURL(for: oldValue)
+                        {
+                            model.providerBaseURL = defaultBaseURL(for: newValue)
+                        }
+                    }
+                    TextField("Base URL", text: $model.providerBaseURL)
+                        .textFieldStyle(.plain).vpFrostedField()
+                    HStack(spacing: 8) {
+                        TextField("Context window (tokens)", text: $model.providerContextWindowText)
+                            .textFieldStyle(.plain).vpFrostedField()
+                        Menu("Presets") {
+                            Button("Off") { model.providerContextWindowText = "0" }
+                            Button("8k") { model.providerContextWindowText = "8000" }
+                            Button("16k") { model.providerContextWindowText = "16000" }
+                            Button("32k") { model.providerContextWindowText = "32000" }
+                            Button("64k") { model.providerContextWindowText = "64000" }
+                            Button("128k") { model.providerContextWindowText = "128000" }
+                            Button("200k") { model.providerContextWindowText = "200000" }
+                            Button("1M") { model.providerContextWindowText = "1000000" }
+                            Button("2M") { model.providerContextWindowText = "2000000" }
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .controlSize(.small)
+                    }
+                    Text(
+                        "Auto-filled from the selected provider/model. Change it only when your endpoint has a different window. 0 disables automatic context management."
                     )
-                    LabeledContent(
-                        "Labour",
-                        value: "\(capacity.labourAvailable) free / \(capacity.labourLimit)"
-                    )
-                } else {
-                    Text("Capacity is unavailable until the daemon is connected.")
-                        .foregroundStyle(.secondary)
-                }
-                Text(
-                    "Daemon-wide Worker/Labour admission. Per-session caps still apply. Set VERLINPARK_GLOBAL_WORKERS and VERLINPARK_GLOBAL_LABOUR on the daemon to change the limits."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                Button("Refresh") {
-                    Task { await model.refreshAgentInfo() }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-
-            Section("Local endpoints") {
-                LabeledContent("LM Studio", value: "http://127.0.0.1:1234/v1")
-                LabeledContent("Ollama", value: "http://127.0.0.1:11434/v1")
-                LabeledContent("llama.cpp", value: "http://127.0.0.1:8080/v1")
-                Text("Local endpoints usually need no API key. Any OpenAI-compatible endpoint works.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
+                    if !isLocalEndpoint {
+                        SecureField(
+                            model.providerHasStoredKey
+                                ? "Replace stored API key"
+                                : "API key",
+                            text: $model.providerAPIKey
+                        )
+                        .textFieldStyle(.plain).vpFrostedField()
+                        Text(
+                            L10n.t(
+                                model.providerHasStoredKey
+                                    ? "A key is stored in Keychain. Leave this empty to keep it."
+                                    : "The key is stored in Keychain and never written to SQLite or logs."
+                            )
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    if model.providerHasStoredKey {
+                        Button(L10n.t("Remove stored key")) {
+                            model.clearStoredProviderKey()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
 
-            Section("Session defaults") {
-                TextField("Token budget", value: $tokenBudget, format: .number)
-                    .textFieldStyle(.plain).vpFrostedField()
-                    .frame(width: 160)
-                Text(
-                    "Input + output token budget for new sessions. Existing sessions keep their own budget. Provider calls reserve before they start and settle from reported usage, so the cap holds across concurrent batches."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-
-            Section("Models") {
-                LabeledContent("Routing", value: "Manual only")
-                LabeledContent("Budgets", value: "Per session · department · task")
-                Text("No hidden model switching. The user chooses models and budgets.")
-                    .font(.callout)
+                Section("Role model overrides") {
+                    Text(
+                        "Blank uses the base Leader model. Prices are USD per 1M tokens and are only used when a USD session budget is set. Per-role context window overrides the global value; blank uses the global model window."
+                    )
+                    .font(.caption)
                     .foregroundStyle(.secondary)
+                    RoleModelRow(title: "Leader", config: $model.roleModels.leader)
+                    RoleModelRow(title: "Manager", config: $model.roleModels.manager)
+                    RoleModelRow(title: "Worker", config: $model.roleModels.worker)
+                    RoleModelRow(title: "Verifier", config: $model.roleModels.verifier)
+                    RoleModelRow(title: "Labour", config: $model.roleModels.labour)
+                    Button("Manage Model Presets…") {
+                        showingModelPresets = true
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                Section("Team capacity") {
+                    Stepper("Managers: \(model.orgManagers)", value: $model.orgManagers, in: 1 ... 5)
+                    Stepper("Workers: \(model.orgWorkers)", value: $model.orgWorkers, in: 1 ... 10)
+                    Stepper("Labour: \(model.orgLabour)", value: $model.orgLabour, in: 1 ... 40)
+                    Text(
+                        "Per-session hard caps. Defaults are 4 Managers / 6 Workers / 12 Labour; runtime limits are 5 / 10 / 40. Applying also re-saves the current provider configuration."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Toggle("Auto-expand plan Workers", isOn: $model.autoExpandWorkers)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    Text(
+                        "When a plan has more ready tasks than the base Worker cap, expand Workers up to the hard cap of 10 while at least 20% of the session token budget remains. Off by default."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Button("Apply capacity") {
+                        Task { await model.saveOrgCaps() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(model.providerBusy)
+                }
+
+                Section("Global capacity") {
+                    if let capacity = model.agentInfo?.capacity {
+                        LabeledContent(
+                            "Workers",
+                            value: "\(capacity.workerAvailable) free / \(capacity.workerLimit)"
+                        )
+                        LabeledContent(
+                            "Labour",
+                            value: "\(capacity.labourAvailable) free / \(capacity.labourLimit)"
+                        )
+                    } else {
+                        Text("Capacity is unavailable until the daemon is connected.")
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(
+                        "Daemon-wide Worker/Labour admission. Per-session caps still apply. Set VERLINPARK_GLOBAL_WORKERS and VERLINPARK_GLOBAL_LABOUR on the daemon to change the limits."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Button("Refresh") {
+                        Task { await model.refreshAgentInfo() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                Section("Local endpoints") {
+                    LabeledContent("LM Studio", value: "http://127.0.0.1:1234/v1")
+                    LabeledContent("Ollama", value: "http://127.0.0.1:11434/v1")
+                    LabeledContent("llama.cpp", value: "http://127.0.0.1:8080/v1")
+                    Text("Local endpoints usually need no API key. Any OpenAI-compatible endpoint works.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Session defaults") {
+                    TextField("Token budget", value: $tokenBudget, format: .number)
+                        .textFieldStyle(.plain).vpFrostedField()
+                        .frame(width: 160)
+                    Text(
+                        "Input + output token budget for new sessions. Existing sessions keep their own budget. Provider calls reserve before they start and settle from reported usage, so the cap holds across concurrent batches."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                Section("Models") {
+                    LabeledContent("Routing", value: "Manual only")
+                    LabeledContent("Budgets", value: "Per session · department · task")
+                    Text("No hidden model switching. The user chooses models and budgets.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)
@@ -1069,6 +1328,15 @@ struct ProvidersSettingsView: View {
         .sheet(isPresented: $showingModelPresets) {
             ModelPresetsSheet()
                 .environment(model)
+        }
+        .onAppear {
+            if selectedPreset == "auto" {
+                selectedPreset = detectPreset()
+            }
+            if model.providerContextWindowText.isEmpty {
+                model.providerContextWindowText = inferredContext(model.providerModel)
+            }
+            didLoadPreset = true
         }
     }
 }

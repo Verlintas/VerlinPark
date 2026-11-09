@@ -322,6 +322,12 @@ fn assess_shell_from(command: &str, start_cwd: &Path, worktree: &Path) -> Permis
     if is_fork_bomb(trimmed) {
         return PermissionAssessment::blocked("fork bombs are never allowed");
     }
+    if trimmed.starts_with("$(") || trimmed.starts_with('`') {
+        return PermissionAssessment::new(
+            RiskLevel::HostState,
+            "shell expansion hides the command name",
+        );
+    }
 
     let mut cwd = start_cwd.to_path_buf();
     let mut best = PermissionAssessment::new(RiskLevel::ReadOnly, "read-only shell command");
@@ -352,13 +358,55 @@ fn assess_shell_from(command: &str, start_cwd: &Path, worktree: &Path) -> Permis
             pipeline_has_download = true;
         }
     }
-    if (trimmed.contains("$(") || trimmed.contains('`')) && best.risk == RiskLevel::WorkspaceWrite {
-        return PermissionAssessment::new(
-            RiskLevel::HostState,
-            "command substitution contains an unmodeled command",
-        );
+    for substitution in extract_substitutions(trimmed) {
+        best = max_assessment(best, assess_shell_from(&substitution, start_cwd, worktree));
     }
     best
+}
+
+/// Extract `$(...)` and backtick substitutions so their inner commands are
+/// classified instead of treating every substitution as host state. Common
+/// read-only checks such as `$(cat file)` or `$(git rev-parse HEAD)` therefore
+/// stay in the workspace risk tier.
+fn extract_substitutions(command: &str) -> Vec<String> {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut result = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] == '$' && chars.get(index + 1) == Some(&'(') {
+            let start = index + 2;
+            let mut depth = 1usize;
+            let mut cursor = start;
+            while cursor < chars.len() {
+                match chars[cursor] {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            if cursor < chars.len() {
+                result.push(chars[start..cursor].iter().collect());
+                index = cursor + 1;
+                continue;
+            }
+        }
+        if chars[index] == '`' {
+            let start = index + 1;
+            if let Some(offset) = chars[start..].iter().position(|ch| *ch == '`') {
+                result.push(chars[start..start + offset].iter().collect());
+                index = start + offset + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    result
 }
 
 fn max_assessment(
@@ -949,7 +997,9 @@ fn assess_git(args: &[String], cwd: &Path, worktree: &Path) -> PermissionAssessm
     while index < args.len() {
         let arg = &args[index];
         if arg == "-C" || arg == "--git-dir" || arg == "--work-tree" {
-            if let Some(path) = args.get(index + 1) {
+            if let Some(path) = args.get(index + 1)
+                && !resolve_path(cwd, path).is_some_and(|target| target.starts_with(worktree))
+            {
                 let assessment = assess_target(path, cwd, worktree, false);
                 if assessment.risk.requires_human() || assessment.blocked {
                     return assessment;
@@ -962,9 +1012,11 @@ fn assess_git(args: &[String], cwd: &Path, worktree: &Path) -> PermissionAssessm
             .strip_prefix("--git-dir=")
             .or_else(|| arg.strip_prefix("--work-tree="))
         {
-            let assessment = assess_target(path, cwd, worktree, false);
-            if assessment.risk.requires_human() || assessment.blocked {
-                return assessment;
+            if !resolve_path(cwd, path).is_some_and(|target| target.starts_with(worktree)) {
+                let assessment = assess_target(path, cwd, worktree, false);
+                if assessment.risk.requires_human() || assessment.blocked {
+                    return assessment;
+                }
             }
             index += 1;
             continue;
@@ -1700,5 +1752,28 @@ mod tests {
                 kind: "allow_once".to_string(),
             }],
         }
+    }
+
+    #[test]
+    fn read_only_git_inspection_inside_the_worktree_is_not_host_state() {
+        let assessment = shell(
+            "pwd; git -C . log --oneline -3; git -C . status --porcelain -uall; git -C . diff --stat HEAD",
+        );
+        assert!(assessment.risk < RiskLevel::HostState, "{assessment:?}");
+    }
+
+    #[test]
+    fn safe_command_substitutions_do_not_escalate_to_host_state() {
+        let worktree = worktree();
+        let safe = assess_shell_command(
+            "echo \"$(cat README.md)\" && test -f \"$(git rev-parse --show-toplevel)/README.md\"",
+            &worktree,
+        );
+        assert!(safe.risk < RiskLevel::HostState, "{safe:?}");
+        let unsafe_command = assess_shell_command("echo $(rm -rf /tmp/example)", &worktree);
+        assert!(
+            unsafe_command.risk >= RiskLevel::HostState,
+            "{unsafe_command:?}"
+        );
     }
 }

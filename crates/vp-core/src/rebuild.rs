@@ -91,6 +91,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 .set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
             store.set_memory_policy(&snapshot.project.id, &snapshot.memory_policy)?;
             store.set_orchestration_policy(&snapshot.project.id, &snapshot.orchestration_policy)?;
+            store.restore_approval_grants(&snapshot.project.id, &snapshot.approval_grants)?;
         }
         let engine = Engine::new(store);
         let mut sessions = 0usize;

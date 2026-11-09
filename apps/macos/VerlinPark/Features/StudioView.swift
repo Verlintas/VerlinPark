@@ -265,7 +265,7 @@ struct ExternalResidentPanel: View {
 struct PreviewPanelView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var mode: PreviewMode = .changes
+    @State private var mode: PreviewMode = .showcase
     @State private var showingCommit = false
     @State private var showingDiscard = false
     @State private var showingLand = false
@@ -280,6 +280,8 @@ struct PreviewPanelView: View {
                 Divider().opacity(0.3)
                 Group {
                     switch mode {
+                    case .showcase:
+                        ShowcasePanel()
                     case .changes:
                         changes
                     case .plan:
@@ -482,14 +484,41 @@ struct PreviewPanelView: View {
                 )
                 .disabled(model.diffLoading)
             }
-            VPSegmentedControl(
-                segments: PreviewMode.allCases.map {
-                    VPSegment($0, title: $0.title, icon: $0.icon)
-                },
-                selection: $mode,
-                scrollable: true,
-                compact: true
-            )
+            HStack(spacing: 6) {
+                VPSegmentedControl(
+                    segments: PreviewMode.primary.map {
+                        VPSegment($0, title: $0.title, icon: $0.icon)
+                    },
+                    selection: $mode,
+                    scrollable: true,
+                    compact: true
+                )
+                Menu {
+                    ForEach(PreviewMode.secondary) { item in
+                        Button {
+                            mode = item
+                        } label: {
+                            Label(item.title, systemImage: item.icon)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: PreviewMode.secondary.contains(mode) ? mode
+                            .icon : "ellipsis.circle")
+                            .font(.system(size: 8, weight: .semibold))
+                        Text(PreviewMode.secondary.contains(mode) ? mode.title : L10n.t("More"))
+                            .font(VPTheme.mono(7.5, weight: .medium))
+                    }
+                    .foregroundStyle(PreviewMode.secondary.contains(mode) ? VPTheme.accent : VPTheme
+                        .textTertiary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(VPTheme.surface, in: Capsule())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -997,6 +1026,79 @@ private struct MailboxMessageRow: View {
     }
 }
 
+private struct ShowcasePanel: View {
+    @Environment(AppModel.self) private var model
+
+    private var artifacts: [Artifact] {
+        model.artifacts.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L10n.t("Agent showcase"))
+                        .font(VPTheme.font(13, weight: .semibold))
+                    Text(L10n.t("Artifacts and results your agents published for you."))
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+                Spacer()
+                Text("\(artifacts.count)")
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .foregroundStyle(VPTheme.textTertiary)
+                Button {
+                    Task { await model.loadMailbox() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .buttonStyle(VPGlassIconButtonStyle(size: 22, tint: VPTheme.textSecondary))
+            }
+            .padding(14)
+
+            VPHairline()
+
+            if artifacts.isEmpty {
+                VStack(spacing: 9) {
+                    Image(systemName: "sparkles.rectangle.stack")
+                        .font(.system(size: 26, weight: .light))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text(L10n.t("Nothing on the whiteboard yet"))
+                        .font(VPTheme.font(12, weight: .semibold))
+                        .foregroundStyle(VPTheme.textSecondary)
+                    Text(L10n
+                        .t(
+                            "Ask an agent to publish a screenshot, report, or preview artifact. Published artifacts appear here as a result board."
+                        ))
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 340)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(24)
+            } else {
+                ScrollView {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 260), spacing: 10)],
+                        alignment: .leading,
+                        spacing: 10
+                    ) {
+                        ForEach(artifacts) { artifact in
+                            ArtifactRow(artifact: artifact)
+                        }
+                    }
+                    .padding(12)
+                }
+            }
+        }
+        .task {
+            await model.loadMailbox()
+        }
+    }
+}
+
 private struct ArtifactRow: View {
     @Environment(AppModel.self) private var model
     let artifact: Artifact
@@ -1194,6 +1296,7 @@ private struct UsageEntryRow: View {
 }
 
 private enum PreviewMode: String, CaseIterable, Identifiable {
+    case showcase
     case changes
     case plan
     case files
@@ -1211,6 +1314,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .showcase: L10n.t("Showcase")
         case .changes: L10n.t("Changes")
         case .plan: L10n.t("Plan")
         case .files: L10n.t("Files")
@@ -1226,6 +1330,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
 
     var icon: String {
         switch self {
+        case .showcase: "sparkles.rectangle.stack"
         case .changes: "plus.forwardslash.minus"
         case .plan: "list.bullet.clipboard"
         case .files: "folder"
@@ -1238,6 +1343,11 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .trace: "list.bullet.rectangle"
         }
     }
+
+    static let primary: [PreviewMode] = [.showcase, .changes, .files, .plan]
+    static let secondary: [PreviewMode] = [
+        .history, .queue, .mailbox, .cost, .console, .terminal, .trace,
+    ]
 }
 
 private struct HistoryPanel: View {
@@ -1463,35 +1573,65 @@ private struct HistoryPanel: View {
     }
 }
 
+private struct WorkspaceFileTab: Identifiable {
+    let path: String
+    var file: WorkspaceFileResult?
+    var draft: String
+    var error: String?
+    var status: String?
+    var saving = false
+
+    var id: String {
+        path
+    }
+
+    var dirty: Bool {
+        guard let file, file.editable else { return false }
+        return draft != file.content
+    }
+}
+
+private final class WorkspaceTreeNode: Identifiable {
+    let name: String
+    let path: String
+    let isDirectory: Bool
+    let size: UInt64
+    var children: [WorkspaceTreeNode]
+
+    var id: String {
+        path
+    }
+
+    init(name: String, path: String, isDirectory: Bool, size: UInt64, children: [WorkspaceTreeNode]) {
+        self.name = name
+        self.path = path
+        self.isDirectory = isDirectory
+        self.size = size
+        self.children = children
+    }
+}
+
 private struct FilesPanel: View {
     @Environment(AppModel.self) private var model
     @State private var hoveredPath: String?
-    @Namespace private var selectionNamespace
-    @State private var pendingEntry: WorkspaceEntry?
-    @State private var confirmDiscard = false
-    @State private var confirmClose = false
+    @State private var tabs: [WorkspaceFileTab] = []
+    @State private var activePath: String?
+    @State private var pendingClosePath: String?
 
-    private var dirty: Bool {
-        guard let file = model.workspaceFile, file.editable else { return false }
-        return model.workspaceDraft != file.content
+    private var activeTab: WorkspaceFileTab? {
+        tabs.first { $0.path == activePath }
     }
 
-    private var filteredEntries: [WorkspaceEntry] {
-        let filter = model.workspaceFilter.trimmingCharacters(in: .whitespacesAndNewlines)
-        return model.workspaceEntries.filter { entry in
-            guard !entry.isDirectory else { return false }
-            guard !filter.isEmpty else { return true }
-            return entry.path.localizedCaseInsensitiveContains(filter)
-                || entry.name.localizedCaseInsensitiveContains(filter)
-        }
+    private var tree: [WorkspaceTreeNode] {
+        Self.buildTree(model.workspaceEntries, filter: model.workspaceFilter)
     }
 
     var body: some View {
         @Bindable var model = model
         GeometryReader { proxy in
-            let compact = proxy.size.width < 560
+            let compact = proxy.size.width < 620
             if compact {
-                if model.workspaceFile != nil {
+                if activePath != nil {
                     detailPane(compact: true)
                 } else {
                     listPane(filter: $model.workspaceFilter)
@@ -1499,58 +1639,51 @@ private struct FilesPanel: View {
             } else {
                 HStack(spacing: 0) {
                     listPane(filter: $model.workspaceFilter)
-                        .frame(width: min(300, max(230, proxy.size.width * 0.40)))
+                        .frame(width: min(320, max(240, proxy.size.width * 0.36)))
                     VPHairline(vertical: true)
                     detailPane(compact: false)
                 }
             }
         }
-        .onAppear {
-            syncDraft()
-        }
-        .onChange(of: fileKey) {
-            syncDraft()
+        .task(id: model.selectedSessionID) {
+            tabs = []
+            activePath = nil
+            if model.workspaceEntries.isEmpty {
+                await model.loadWorkspaceTree()
+            }
         }
         .confirmationDialog(
-            "Discard unsaved changes?",
-            isPresented: $confirmDiscard,
-            titleVisibility: .visible
-        ) {
-            Button("Discard", role: .destructive) {
-                if let entry = pendingEntry {
-                    pendingEntry = nil
-                    Task { await model.openWorkspaceFile(entry) }
+            L10n.t("Discard unsaved changes?"),
+            isPresented: Binding(
+                get: { pendingClosePath != nil },
+                set: {
+                    if !$0 {
+                        pendingClosePath = nil
+                    }
                 }
-            }
-            Button("Cancel", role: .cancel) {
-                pendingEntry = nil
-            }
-        } message: {
-            Text("The current draft has not been saved.")
-        }
-        .confirmationDialog(
-            "Discard unsaved changes?",
-            isPresented: $confirmClose,
-            titleVisibility: .visible
+            )
         ) {
-            Button("Discard", role: .destructive) {
-                closeFile()
+            Button(L10n.t("Discard"), role: .destructive) {
+                if let path = pendingClosePath {
+                    close(path)
+                }
+                pendingClosePath = nil
             }
-            Button("Cancel", role: .cancel) {}
+            Button(L10n.t("Cancel"), role: .cancel) { pendingClosePath = nil }
         } message: {
-            Text("The current draft has not been saved.")
+            Text(L10n.t("This file has unsaved changes."))
         }
     }
 
     private func listPane(filter: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                TextField("Filter files", text: filter)
+            HStack(spacing: 7) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 9))
+                    .foregroundStyle(VPTheme.textTertiary)
+                TextField(L10n.t("Filter files"), text: filter)
                     .textFieldStyle(.plain)
                     .font(VPTheme.mono(9))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 5)
-                    .vpFieldSurface(radius: 7)
                 if model.workspaceTreeBusy {
                     ProgressView().controlSize(.small)
                 }
@@ -1568,92 +1701,44 @@ private struct FilesPanel: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(filteredEntries) { entry in
-                        Button {
-                            select(entry)
-                        } label: {
-                            HStack(spacing: 7) {
-                                Image(systemName: "doc.text")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(VPTheme.textTertiary)
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(entry.name)
-                                        .font(VPTheme.font(10, weight: .medium))
-                                        .foregroundStyle(VPTheme.textPrimary)
-                                        .lineLimit(1)
-                                    Text(entry.path)
-                                        .font(VPTheme.mono(7))
-                                        .foregroundStyle(VPTheme.textTertiary)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                }
-                                Spacer(minLength: 4)
-                                Text(formatSize(entry.size))
-                                    .font(VPTheme.mono(7))
-                                    .foregroundStyle(VPTheme.textTertiary)
-                            }
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 6)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background {
-                                if model.workspaceSelectedPath == entry.path {
-                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                        .fill(VPTheme.accent.opacity(0.10))
-                                        .overlay {
-                                            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                                .strokeBorder(VPTheme.accent.opacity(0.16), lineWidth: 1)
-                                        }
-                                        .matchedGeometryEffect(
-                                            id: "file-selection",
-                                            in: selectionNamespace
-                                        )
-                                } else if hoveredPath == entry.path {
-                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                        .fill(VPTheme.surface)
-                                }
-                            }
-                        }
-                        .buttonStyle(VPPressableButtonStyle(scale: 0.99))
-                        .onHover { hovering in
-                            if hovering {
-                                hoveredPath = entry.path
-                            } else if hoveredPath == entry.path {
-                                hoveredPath = nil
-                            }
-                        }
-                        .animation(VPMotion.hover, value: hoveredPath)
-                        .animation(VPMotion.snap, value: model.workspaceSelectedPath)
+                    ForEach(tree) { node in
+                        WorkspaceTreeNodeView(
+                            node: node,
+                            depth: 0,
+                            activePath: activePath,
+                            hoveredPath: $hoveredPath,
+                            onOpen: open
+                        )
                     }
                 }
                 .padding(.horizontal, 6)
                 .padding(.vertical, 4)
             }
 
-            if filteredEntries.isEmpty {
-                Text(
-                    model.workspaceTreeBusy
-                        ? "Loading files…"
-                        : "No files match the filter."
-                )
-                .font(VPTheme.mono(9))
-                .foregroundStyle(VPTheme.textSecondary)
-                .padding(12)
+            if tree.isEmpty {
+                Text(model.workspaceTreeBusy ? L10n.t("Loading files…") : L10n
+                    .t("No files match the filter."))
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .padding(12)
             }
         }
     }
 
     private func detailPane(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let file = model.workspaceFile {
-                detailHeader(file: file, compact: compact)
+            tabStrip(compact: compact)
+            VPHairline()
+            if let tab = activeTab {
+                detailHeader(tab: tab, compact: compact)
                 VPHairline()
-                if let error = model.workspaceFileError {
+                if let error = tab.error {
                     Text(error)
                         .font(VPTheme.mono(9))
                         .foregroundStyle(VPTheme.warning)
                         .padding(10)
                 }
-                if let status = model.workspaceSaveStatus {
+                if let status = tab.status {
                     Text(status)
                         .font(VPTheme.mono(8))
                         .foregroundStyle(status.hasPrefix("Saved") ? VPTheme.success : VPTheme.warning)
@@ -1662,94 +1747,128 @@ private struct FilesPanel: View {
                 }
                 TextEditor(
                     text: Binding(
-                        get: { model.workspaceDraft },
-                        set: { model.workspaceDraft = $0 }
+                        get: { tab.draft },
+                        set: { updateDraft($0, path: tab.path) }
                     )
                 )
                 .font(VPTheme.mono(10))
                 .foregroundStyle(VPTheme.textSecondary)
                 .scrollContentBackground(.hidden)
-                .disabled(!file.editable || model.workspaceFileBusy || model.workspaceSaveBusy)
+                .disabled(!(tab.file?.editable ?? false) || tab.saving)
                 .padding(6)
             } else {
                 VStack(spacing: 8) {
                     Image(systemName: "doc.text.magnifyingglass")
                         .font(.system(size: 24))
                         .foregroundStyle(VPTheme.textTertiary)
-                    Text(
-                        model.workspaceTreeBusy
-                            ? "Loading session files…"
-                            : "Select a file to inspect the session worktree."
-                    )
-                    .font(VPTheme.mono(9))
-                    .foregroundStyle(VPTheme.textSecondary)
-                    if model.workspaceFileBusy {
-                        ProgressView().controlSize(.small)
-                    }
+                    Text(L10n.t("Select a file to inspect the session worktree."))
+                        .font(VPTheme.mono(9))
+                        .foregroundStyle(VPTheme.textSecondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
 
-    private func detailHeader(file: WorkspaceFileResult, compact: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 7) {
+    private func tabStrip(compact: Bool) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
                 if compact {
                     Button {
-                        if dirty {
-                            confirmClose = true
-                        } else {
-                            closeFile()
-                        }
+                        activePath = nil
                     } label: {
                         Image(systemName: "chevron.left")
                             .font(.system(size: 9, weight: .semibold))
                     }
                     .buttonStyle(VPGlassIconButtonStyle(size: 22, tint: VPTheme.textSecondary))
-                    .help("Back to files")
+                    .help(L10n.t("Back to files"))
                 }
+                ForEach(tabs) { tab in
+                    HStack(spacing: 4) {
+                        Button {
+                            activePath = tab.path
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: tab.dirty ? "circle.fill" : "doc.text")
+                                    .font(.system(size: tab.dirty ? 5 : 8))
+                                    .foregroundStyle(tab.dirty ? VPTheme.accent : VPTheme.textTertiary)
+                                Text((tab.path as NSString).lastPathComponent)
+                                    .font(VPTheme.mono(
+                                        7.5,
+                                        weight: activePath == tab.path ? .semibold : .regular
+                                    ))
+                                    .foregroundStyle(activePath == tab.path ? VPTheme.textPrimary : VPTheme
+                                        .textSecondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        Button {
+                            requestClose(tab)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 6, weight: .bold))
+                                .foregroundStyle(VPTheme.textTertiary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 5)
+                    .background(
+                        activePath == tab.path ? VPTheme.accent.opacity(0.10) : VPTheme.surface,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+        }
+        .background(VPTheme.surface.opacity(0.35))
+    }
 
-                Image(systemName: file.binary ? "doc.zipper" : "doc.text")
+    private func detailHeader(tab: WorkspaceFileTab, compact _: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Image(systemName: tab.file?.binary == true ? "doc.zipper" : "doc.text")
                     .font(.system(size: 10))
                     .foregroundStyle(VPTheme.textTertiary)
-                Text(file.path)
+                Text(tab.path)
                     .font(VPTheme.mono(9))
                     .foregroundStyle(VPTheme.textSecondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
-                Text(formatSize(file.size))
-                    .font(VPTheme.mono(8))
-                    .foregroundStyle(VPTheme.textTertiary)
+                if let file = tab.file {
+                    Text(formatSize(file.size))
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
             }
-
             HStack(spacing: 5) {
-                if file.binary {
+                if tab.file?.binary == true {
                     fileBadge("binary", tint: VPTheme.warning)
                 }
-                if file.truncated {
+                if tab.file?.truncated == true {
                     fileBadge("truncated", tint: VPTheme.warning)
                 }
-                if dirty {
+                if tab.dirty {
                     fileBadge("modified", tint: VPTheme.accent)
                 }
                 Spacer(minLength: 0)
-                if file.editable {
-                    Button("Reload") {
-                        reload()
+                if tab.file?.editable == true {
+                    Button(L10n.t("Reload")) {
+                        Task { await reload(tab.path) }
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .disabled(model.workspaceSaveBusy)
-                    Button("Save") {
-                        Task {
-                            _ = await model.saveWorkspaceFile(content: model.workspaceDraft)
-                        }
+                    .disabled(tab.saving)
+                    Button(L10n.t("Save")) {
+                        Task { await save(tab.path) }
                     }
                     .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                     .controlSize(.small)
-                    .disabled(!dirty || model.workspaceSaveBusy)
+                    .disabled(!tab.dirty || tab.saving)
                 }
             }
         }
@@ -1766,62 +1885,230 @@ private struct FilesPanel: View {
             .background(tint.opacity(0.10), in: Capsule())
     }
 
-    private func closeFile() {
-        model.workspaceSelectedPath = nil
-        model.workspaceFile = nil
-        model.workspaceDraft = ""
-        model.workspaceDraftPath = nil
-    }
-
-    private var fileKey: String {
-        guard let file = model.workspaceFile else { return "" }
-        return "\(file.path):\(file.sha256)"
-    }
-
-    private func syncDraft() {
-        guard let file = model.workspaceFile else {
-            model.workspaceDraft = ""
-            model.workspaceDraftPath = nil
+    private func open(_ entry: WorkspaceEntry) {
+        if tabs.contains(where: { $0.path == entry.path }) {
+            activePath = entry.path
             return
         }
-        // Keep a preserved draft when the same file is re-opened after a view
-        // rebuild (language switch, inspector toggle). A different path or a
-        // successful reload resets the draft in AppModel.
-        if model.workspaceDraftPath != file.path {
-            model.workspaceDraft = file.content
-            model.workspaceDraftPath = file.path
+        var tab = WorkspaceFileTab(path: entry.path, file: nil, draft: "", error: nil, status: nil)
+        tab.status = L10n.t("Loading…")
+        tabs.append(tab)
+        activePath = entry.path
+        Task { await load(entry.path) }
+    }
+
+    private func load(_ path: String) async {
+        guard let file = await model.fetchWorkspaceFile(path: path) else {
+            updateTab(path) {
+                $0.error = L10n.t("Could not load this file.")
+                $0.status = nil
+            }
+            return
+        }
+        updateTab(path) {
+            $0.file = file
+            $0.draft = file.content
+            $0.error = nil
+            $0.status = nil
         }
     }
 
-    private func select(_ entry: WorkspaceEntry) {
-        if dirty {
-            pendingEntry = entry
-            confirmDiscard = true
+    private func reload(_ path: String) async {
+        updateTab(path) { $0.status = L10n.t("Reloading…") }
+        await load(path)
+    }
+
+    private func save(_ path: String) async {
+        guard let tab = tabs.first(where: { $0.path == path }) else { return }
+        updateTab(path) { $0.saving = true; $0.status = L10n.t("Saving…") }
+        let result = await model.writeWorkspaceFile(
+            path: path,
+            content: tab.draft,
+            expectedSha256: tab.file?.sha256
+        )
+        updateTab(path) {
+            $0.saving = false
+            if let result {
+                $0.file = WorkspaceFileResult(
+                    path: result.path,
+                    size: result.size,
+                    truncated: false,
+                    binary: false,
+                    content: tab.draft,
+                    sha256: result.sha256,
+                    editable: true
+                )
+                $0.status = L10n.t("Saved")
+            } else {
+                $0.status = L10n.t("Save failed")
+            }
+        }
+    }
+
+    private func updateDraft(_ value: String, path: String) {
+        updateTab(path) { $0.draft = value }
+    }
+
+    private func updateTab(_ path: String, _ mutate: (inout WorkspaceFileTab) -> Void) {
+        guard let index = tabs.firstIndex(where: { $0.path == path }) else { return }
+        mutate(&tabs[index])
+    }
+
+    private func requestClose(_ tab: WorkspaceFileTab) {
+        if tab.dirty {
+            pendingClosePath = tab.path
         } else {
-            Task { await model.openWorkspaceFile(entry) }
+            close(tab.path)
         }
     }
 
-    private func reload() {
-        guard let path = model.workspaceSelectedPath,
-              let entry = model.workspaceEntries.first(where: { $0.path == path })
-        else { return }
-        if dirty {
-            pendingEntry = entry
-            confirmDiscard = true
-        } else {
-            Task { await model.reloadWorkspaceFile() }
+    private func close(_ path: String) {
+        guard let index = tabs.firstIndex(where: { $0.path == path }) else { return }
+        tabs.remove(at: index)
+        if activePath == path {
+            activePath = tabs.indices.contains(index) ? tabs[index].path : tabs.last?.path
         }
     }
 
-    private func formatSize(_ bytes: UInt64) -> String {
-        if bytes < 1024 {
-            return "\(bytes) B"
+    private static func buildTree(_ entries: [WorkspaceEntry], filter: String) -> [WorkspaceTreeNode] {
+        let query = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let grouped = Dictionary(grouping: entries) { entry -> String in
+            let components = entry.path.split(separator: "/").map(String.init)
+            return components.dropLast().joined(separator: "/")
         }
-        if bytes < 1024 * 1024 {
-            return String(format: "%.1f KB", Double(bytes) / 1024)
+        func nodes(parent: String) -> [WorkspaceTreeNode] {
+            (grouped[parent] ?? [])
+                .sorted { lhs, rhs in
+                    if lhs.isDirectory != rhs.isDirectory {
+                        return lhs.isDirectory
+                    }
+                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                }
+                .compactMap { entry in
+                    if entry.isDirectory {
+                        let children = nodes(parent: entry.path)
+                        if !query.isEmpty, children.isEmpty {
+                            return nil
+                        }
+                        return WorkspaceTreeNode(
+                            name: entry.name,
+                            path: entry.path,
+                            isDirectory: true,
+                            size: entry.size,
+                            children: children
+                        )
+                    }
+                    if !query.isEmpty,
+                       !entry.path.lowercased().contains(query),
+                       !entry.name.lowercased().contains(query)
+                    {
+                        return nil
+                    }
+                    return WorkspaceTreeNode(
+                        name: entry.name,
+                        path: entry.path,
+                        isDirectory: false,
+                        size: entry.size,
+                        children: []
+                    )
+                }
         }
-        return String(format: "%.1f MB", Double(bytes) / 1024 / 1024)
+        return nodes(parent: "")
+    }
+}
+
+private struct WorkspaceTreeNodeView: View {
+    let node: WorkspaceTreeNode
+    let depth: Int
+    let activePath: String?
+    @Binding var hoveredPath: String?
+    let onOpen: (WorkspaceEntry) -> Void
+
+    @State private var expanded = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if node.isDirectory {
+                Button {
+                    expanded.toggle()
+                } label: {
+                    row(icon: expanded ? "folder.fill" : "folder", tint: VPTheme.plan, isActive: false)
+                }
+                .buttonStyle(.plain)
+                if expanded {
+                    ForEach(node.children) { child in
+                        WorkspaceTreeNodeView(
+                            node: child,
+                            depth: depth + 1,
+                            activePath: activePath,
+                            hoveredPath: $hoveredPath,
+                            onOpen: onOpen
+                        )
+                    }
+                }
+            } else {
+                Button {
+                    onOpen(
+                        WorkspaceEntry(
+                            path: node.path,
+                            name: node.name,
+                            kind: "file",
+                            size: node.size
+                        )
+                    )
+                } label: {
+                    row(
+                        icon: "doc.text",
+                        tint: VPTheme.textTertiary,
+                        isActive: activePath == node.path
+                    )
+                }
+                .buttonStyle(VPPressableButtonStyle(scale: 0.99))
+                .onHover { hovering in
+                    hoveredPath = hovering ? node.path : nil
+                }
+            }
+        }
+    }
+
+    private func row(icon: String, tint: Color, isActive: Bool) -> some View {
+        HStack(spacing: 5) {
+            if !node.isDirectory {
+                Spacer().frame(width: CGFloat(depth) * 10)
+            } else {
+                Spacer().frame(width: CGFloat(depth) * 10)
+            }
+            Image(systemName: icon)
+                .font(.system(size: 8.5))
+                .foregroundStyle(isActive ? VPTheme.accent : tint)
+                .frame(width: 11)
+            Text(node.name)
+                .font(VPTheme.font(
+                    node.isDirectory ? 9.5 : 10,
+                    weight: node.isDirectory ? .medium : .regular
+                ))
+                .foregroundStyle(isActive ? VPTheme.textPrimary : VPTheme.textSecondary)
+                .lineLimit(1)
+            Spacer(minLength: 3)
+            if !node.isDirectory {
+                Text(formatSize(node.size))
+                    .font(VPTheme.mono(6.8))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            if isActive {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(VPTheme.accent.opacity(0.10))
+            } else if hoveredPath == node.path, !node.isDirectory {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(VPTheme.surface)
+            }
+        }
+        .contentShape(Rectangle())
     }
 }
 
@@ -2095,4 +2382,19 @@ struct OrgPresetSheet: View {
         .padding(24)
         .frame(width: 480)
     }
+}
+
+private func formatSize(_ bytes: UInt64) -> String {
+    if bytes < 1024 {
+        return "\(bytes) B"
+    }
+    let kb = Double(bytes) / 1024
+    if kb < 1024 {
+        return String(format: "%.1f KB", kb)
+    }
+    let mb = kb / 1024
+    if mb < 1024 {
+        return String(format: "%.1f MB", mb)
+    }
+    return String(format: "%.1f GB", mb / 1024)
 }

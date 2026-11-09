@@ -5072,3 +5072,52 @@ async fn orchestration_overview_ranks_attention_sessions() {
     assert_eq!(overview.totals.retrying_tasks, 1);
     assert!(overview.sessions[1].metrics.retrying_tasks == 0);
 }
+
+#[tokio::test]
+async fn approval_grants_match_paths_and_subfolders() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("grants".into()),
+        )
+        .await
+        .unwrap();
+    engine
+        .create_approval_grant(&project.id, "write_file", "src/feature", true, "user")
+        .await
+        .unwrap();
+    let matching = serde_json::json!({"path": "src/feature/lib.rs"});
+    let sibling = serde_json::json!({"path": "src/other/lib.rs"});
+    assert!(
+        engine
+            .approval_grant_matches(&project.id, "write_file", &matching)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !engine
+            .approval_grant_matches(&project.id, "write_file", &sibling)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !engine
+            .approval_grant_matches(&project.id, "edit_file", &matching)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !engine
+            .approval_grant_matches(
+                &project.id,
+                "write_file",
+                &serde_json::json!({"command": "ls"})
+            )
+            .await
+            .unwrap()
+    );
+}

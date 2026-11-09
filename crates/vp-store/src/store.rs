@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AcpAgent, AgentMessage, AgentRecord, Approval, Artifact, ArtifactPolicy,
+    AcpAgent, AgentMessage, AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactPolicy,
     CheckpointRetentionPolicy, Event, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig,
     McpTransport, MemoryItem, MemoryPolicy, MergeQueueEntry, ModelPreset, OrchestrationDecision,
     OrchestrationNote, OrchestrationPolicy, Project, ProjectBudget, ProjectUsageSession, Question,
@@ -88,6 +88,8 @@ pub struct ProjectManifestSnapshot {
     pub memory_policy: MemoryPolicy,
     #[serde(default)]
     pub orchestration_policy: OrchestrationPolicy,
+    #[serde(default)]
+    pub approval_grants: Vec<ApprovalGrant>,
 }
 
 /// Read the latest project snapshot for each project from `projects.jsonl`.
@@ -506,6 +508,19 @@ impl Store {
                 INSERT INTO memories_fts(rowid, title, body, tags)
                 VALUES (new.rowid, new.title, new.body, new.tags);
             END;
+
+            CREATE TABLE IF NOT EXISTS approval_grants (
+                id               TEXT PRIMARY KEY,
+                project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                tool              TEXT NOT NULL,
+                path_prefix       TEXT NOT NULL,
+                include_children  INTEGER NOT NULL DEFAULT 0,
+                created_by        TEXT NOT NULL,
+                created_at        TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_approval_grants_project
+                ON approval_grants(project_id, created_at);
 
             CREATE TABLE IF NOT EXISTS questions (
                 id          TEXT PRIMARY KEY,
@@ -1026,6 +1041,7 @@ impl Store {
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 memory_policy: self.get_memory_policy(&project.id)?,
                 orchestration_policy: self.get_orchestration_policy(&project.id)?,
+                approval_grants: self.list_approval_grants(&project.id)?,
                 project,
             };
             serde_json::to_writer(&mut line_buffer, &snapshot)?;
@@ -1523,6 +1539,98 @@ impl Store {
                     i64::from(decision.attempt),
                     decision.agent_id,
                     decision.created_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_approval_grants(&self, project_id: &str) -> Result<Vec<ApprovalGrant>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, tool, path_prefix, include_children, created_by, created_at
+             FROM approval_grants WHERE project_id = ?1
+             ORDER BY created_at DESC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok(ApprovalGrant {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                tool: row.get(2)?,
+                path_prefix: row.get(3)?,
+                include_children: row.get::<_, i64>(4)? != 0,
+                created_by: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn create_approval_grant(
+        &self,
+        project_id: &str,
+        tool: &str,
+        path_prefix: &str,
+        include_children: bool,
+        created_by: &str,
+    ) -> Result<ApprovalGrant> {
+        let grant = ApprovalGrant {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            tool: tool.to_string(),
+            path_prefix: path_prefix.to_string(),
+            include_children,
+            created_by: created_by.to_string(),
+            created_at: now_rfc3339(),
+        };
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO approval_grants
+             (id, project_id, tool, path_prefix, include_children, created_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                grant.id,
+                grant.project_id,
+                grant.tool,
+                grant.path_prefix,
+                if grant.include_children { 1 } else { 0 },
+                grant.created_by,
+                grant.created_at
+            ],
+        )?;
+        Ok(grant)
+    }
+
+    pub fn delete_approval_grant(&self, id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        Ok(conn.execute("DELETE FROM approval_grants WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn restore_approval_grants(
+        &self,
+        project_id: &str,
+        grants: &[ApprovalGrant],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM approval_grants WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        for grant in grants {
+            tx.execute(
+                "INSERT INTO approval_grants
+                 (id, project_id, tool, path_prefix, include_children, created_by, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    grant.id,
+                    project_id,
+                    grant.tool,
+                    grant.path_prefix,
+                    if grant.include_children { 1 } else { 0 },
+                    grant.created_by,
+                    grant.created_at
                 ],
             )?;
         }

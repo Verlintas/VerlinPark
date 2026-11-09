@@ -3400,6 +3400,14 @@ fn team_plan_validates_task_and_department_budgets() {
     let plan: TeamPlan = serde_json::from_value(base.clone()).unwrap();
     validate_team_plan(&plan, 5).unwrap();
 
+    let mut read_only_worker = base.clone();
+    read_only_worker["departments"][0]["profile"] = serde_json::json!("generic");
+    read_only_worker["tasks"][0]["write_scope"] = serde_json::json!(["src/lib.rs"]);
+    assert!(
+        validate_team_plan(&serde_json::from_value(read_only_worker).unwrap(), 5).is_err(),
+        "a write task must not be assigned to a generic read-only Worker"
+    );
+
     let mut zero_department = base.clone();
     zero_department["departments"][0]["token_budget"] = serde_json::json!(0);
     assert!(validate_team_plan(&serde_json::from_value(zero_department).unwrap(), 5).is_err());
@@ -6433,17 +6441,20 @@ async fn manual_compaction_surfaces_failure_and_releases_the_session() {
             .unwrap();
     }
 
-    let error = service.compact_now(&session.id).await.unwrap_err();
-    assert!(error.to_string().contains("context compaction failed"));
-    assert!(error.to_string().contains("summary unavailable"));
-    // The failed run must have released the registry, so a second manual
-    // compaction can proceed instead of reporting "already running".
-    let result = service.compact_now(&session.id).await.unwrap();
-    assert!(result.compacted);
+    // A failed summary falls back to a rolling trim, so the control is still
+    // useful and the run registry is released. The second call gets the
+    // recovered summary from the provider.
+    let first = service.compact_now(&session.id).await.unwrap();
+    assert!(first.compacted);
     assert_eq!(
-        result.compaction.map(|summary| summary.mode),
-        Some("summary".into())
+        first.compaction.map(|summary| summary.mode),
+        Some("trim".into())
     );
+    // The registry is released: a second call proceeds instead of reporting
+    // that the session is already running. It may be a no-op when the trim
+    // already left fewer than the retained tail.
+    let result = service.compact_now(&session.id).await.unwrap();
+    assert!(result.compacted || result.compaction.is_none());
 }
 
 #[tokio::test]
@@ -6665,6 +6676,7 @@ async fn trims_older_messages_when_summarization_fails() {
         0,
         1.0,
         false,
+        super::ContextStrategy::Summarize,
     )
     .await
     .unwrap();
@@ -6765,6 +6777,7 @@ async fn compaction_counts_system_and_tool_tokens() {
         40,
         1.0,
         false,
+        super::ContextStrategy::Summarize,
     )
     .await
     .unwrap();
@@ -6863,6 +6876,7 @@ async fn compaction_applies_context_calibration() {
         40,
         2.0,
         false,
+        super::ContextStrategy::Trim,
     )
     .await
     .unwrap();
@@ -7146,4 +7160,99 @@ async fn fork_merge_rejects_a_dirty_source_worktree() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("uncommitted changes"));
+}
+
+#[test]
+fn context_strategy_prefers_summary_for_leaders_and_trim_for_workers() {
+    assert_eq!(
+        super::context_strategy(super::AgentRole::Leader),
+        super::ContextStrategy::Summarize
+    );
+    assert_eq!(
+        super::context_strategy(super::AgentRole::Manager),
+        super::ContextStrategy::Summarize
+    );
+    assert_eq!(
+        super::context_strategy(super::AgentRole::Worker),
+        super::ContextStrategy::Trim
+    );
+    assert_eq!(
+        super::context_strategy(super::AgentRole::Labour),
+        super::ContextStrategy::Trim
+    );
+    assert_eq!(
+        super::context_strategy(super::AgentRole::Verifier),
+        super::ContextStrategy::Trim
+    );
+}
+
+#[tokio::test]
+async fn completed_task_results_become_persistent_project_memory() {
+    let data = tempfile::TempDir::new().unwrap();
+    let repo = tempfile::TempDir::new().unwrap();
+    std::fs::write(repo.path().join("README.md"), "memory\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "test@verlinpark.local"],
+        vec!["config", "user.name", "VerlinPark Test"],
+        vec!["add", "."],
+        vec!["commit", "-q", "-m", "initial"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let engine = Engine::new(vp_store::Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("memory".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "remember work".into(), None)
+        .await
+        .unwrap();
+    super::record_task_memory(
+        &engine,
+        &session.id,
+        "T1",
+        "Implemented the parser and tests.",
+    )
+    .await;
+    super::record_task_memory(&engine, &session.id, "T1", "duplicate should not append").await;
+    let memories = engine
+        .list_memories(
+            &project.id,
+            Some("Task T1 result".into()),
+            Some("task_result".into()),
+            10,
+        )
+        .await
+        .unwrap()
+        .memories;
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].title, "Task T1 result");
+    assert!(memories[0].body.contains("Implemented the parser"));
+    assert!(memories[0].tags.contains(&"T1".to_string()));
+}
+
+#[test]
+fn blocked_worker_reports_are_not_successful_task_completions() {
+    assert!(super::worker_report_reports_failure(
+        "## N1 — BLOCKED (task not completed; no write tool)"
+    ));
+    assert!(super::worker_report_reports_failure(
+        "permission denied while editing"
+    ));
+    assert!(!super::worker_report_reports_failure(
+        "No changes were required; the existing implementation already satisfies the task."
+    ));
 }

@@ -2207,3 +2207,27 @@ fn unblock_can_target_a_note_without_a_task() {
     assert_eq!(notes[0].status, "resolved");
     assert_eq!(notes[0].task_id, None);
 }
+
+#[test]
+fn approval_grants_are_scoped_and_deletable() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let grant = store
+        .create_approval_grant(&project.id, "write_file", "src", true, "user")
+        .unwrap();
+    assert!(grant.include_children);
+    let grants = store.list_approval_grants(&project.id).unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].path_prefix, "src");
+    store.record_project_manifest().unwrap();
+    let manifest = crate::read_project_manifest(store.data_dir()).unwrap();
+    let snapshot = manifest
+        .into_iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.approval_grants.len(), 1);
+    assert!(store.delete_approval_grant(&grant.id).unwrap());
+    assert!(store.list_approval_grants(&project.id).unwrap().is_empty());
+}

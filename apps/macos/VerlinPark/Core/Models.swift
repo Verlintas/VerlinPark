@@ -2434,3 +2434,35 @@ struct TeamPlan: Codable, Sendable {
 struct TeamPlanResult: Codable, Sendable {
     let plan: TeamPlan?
 }
+
+struct ApprovalGrant: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let tool: String
+    let pathPrefix: String
+    let includeChildren: Bool
+    let createdBy: String
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case tool
+        case pathPrefix = "path_prefix"
+        case includeChildren = "include_children"
+        case createdBy = "created_by"
+        case createdAt = "created_at"
+    }
+}
+
+struct ApprovalGrantListResult: Codable, Sendable {
+    let grants: [ApprovalGrant]
+}
+
+struct ApprovalGrantCreateResult: Codable, Sendable {
+    let grant: ApprovalGrant
+}
+
+struct ApprovalGrantDeleteResult: Codable, Sendable {
+    let deleted: Bool
+}

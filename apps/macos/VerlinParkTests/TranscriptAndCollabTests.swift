@@ -86,6 +86,35 @@ final class TranscriptAndCollabTests: XCTestCase {
         XCTAssertEqual(approval.approval.approvalReason, "process or system power control")
     }
 
+    func testRoutineToolCallsDoNotClutterTheTranscript() {
+        let events = [
+            event(1, "tool.started", ["tool_call_id": .string("r1"), "name": .string("read_file")]),
+            event(2, "tool.finished", [
+                "tool_call_id": .string("r1"), "name": .string("read_file"),
+                "output": .string("contents"), "is_error": .bool(false),
+            ]),
+            event(3, "tool.started", ["tool_call_id": .string("w1"), "name": .string("write_file")]),
+            event(4, "tool.finished", [
+                "tool_call_id": .string("w1"), "name": .string("write_file"),
+                "output": .string("written"), "is_error": .bool(false),
+            ]),
+        ]
+        XCTAssertTrue(TranscriptProjection.build(events: events).isEmpty)
+
+        let failed = TranscriptProjection.build(events: [
+            event(1, "tool.started", ["tool_call_id": .string("r2"), "name": .string("read_file")]),
+            event(2, "tool.finished", [
+                "tool_call_id": .string("r2"), "name": .string("read_file"),
+                "output": .string("permission denied"), "is_error": .bool(true),
+            ]),
+        ])
+        XCTAssertEqual(failed.count, 1)
+        guard case let .tool(tool) = failed[0] else {
+            return XCTFail("expected a failed tool entry")
+        }
+        XCTAssertTrue(tool.isError)
+    }
+
     func testToolTraceSummariesCoverStructuredInputs() {
         XCTAssertEqual(
             ToolTrace.summary(

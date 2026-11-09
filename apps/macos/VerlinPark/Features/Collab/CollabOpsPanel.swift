@@ -27,6 +27,35 @@ enum CollabSurface: String, CaseIterable, Identifiable {
     }
 }
 
+enum CollabOpsTab: String, CaseIterable, Identifiable {
+    case overview
+    case board
+    case inbox
+    case history
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .overview: L10n.t("Overview")
+        case .board: L10n.t("Board")
+        case .inbox: L10n.t("Inbox")
+        case .history: L10n.t("History")
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .overview: "gauge.with.dots.needle.33percent"
+        case .board: "rectangle.3.group"
+        case .inbox: "tray.full"
+        case .history: "clock.arrow.circlepath"
+        }
+    }
+}
+
 struct CollabOpsPanel: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -40,6 +69,7 @@ struct CollabOpsPanel: View {
     @State private var selectedRevision: RevisionSelection?
     @State private var editingTask: OrchestrationTask?
     @State private var showPreview = false
+    @State private var opsTab: CollabOpsTab = .overview
     @State private var filter = CollabTaskFilter.all
     @State private var search = ""
     @State private var expandedDepartments = Set<String>()
@@ -78,83 +108,90 @@ struct CollabOpsPanel: View {
                     if let status = model.collabTaskActionStatus, !status.isEmpty {
                         CollabOpsNotice(text: status, tint: VPTheme.info)
                     }
-                    CollabOpsReadyQueue(
-                        tasks: snapshot.tasks.filter(\.ready),
-                        busyID: model.collabTaskActionBusyID,
-                        onDispatch: { Task { await model.dispatchNextOrchestrationTask() } },
-                        onAction: perform
-                    )
-                    CollabOpsBlockers(
-                        blockers: snapshot.blockers,
-                        notes: snapshot.notes,
-                        tasks: snapshot.tasks,
-                        busyID: model.collabTaskActionBusyID,
-                        onResolve: { blocker in
-                            Task { await model.resolveOrchestrationBlocker(blocker) }
-                        },
-                        onAction: perform,
-                        onCompose: { blocker in
-                            composeAction = blocker.kind == "coordination" ? "unblock" : "escalate"
-                            composeTaskID = blocker.taskId
-                            composeAgentID = blocker.agentId
-                            showCompose = true
-                        }
-                    )
-                    CollabOpsCoordinationInbox(
-                        notes: snapshot.notes,
-                        busy: model.collabTaskActionBusyID != nil,
-                        onResolve: { note in
-                            Task {
-                                _ = await model.resolveOrchestrationBlocker(
-                                    OrchestrationBlocker(
-                                        kind: "coordination",
-                                        noteId: note.noteId,
-                                        taskId: note.taskId,
-                                        agentId: note.agentId,
-                                        agentName: note.agentName,
-                                        message: note.message,
-                                        createdAt: note.createdAt
-                                    )
-                                )
+                    CollabOpsTabBar(selection: $opsTab, snapshot: snapshot)
+                    switch opsTab {
+                    case .overview:
+                        CollabOpsReadyQueue(
+                            tasks: snapshot.tasks.filter(\.ready),
+                            busyID: model.collabTaskActionBusyID,
+                            onDispatch: { Task { await model.dispatchNextOrchestrationTask() } },
+                            onAction: perform
+                        )
+                        CollabOpsBlockers(
+                            blockers: snapshot.blockers,
+                            notes: snapshot.notes,
+                            tasks: snapshot.tasks,
+                            busyID: model.collabTaskActionBusyID,
+                            onResolve: { blocker in
+                                Task { await model.resolveOrchestrationBlocker(blocker) }
+                            },
+                            onAction: perform,
+                            onCompose: { blocker in
+                                composeAction = blocker.kind == "coordination" ? "unblock" : "escalate"
+                                composeTaskID = blocker.taskId
+                                composeAgentID = blocker.agentId
+                                showCompose = true
                             }
-                        },
-                        onReply: { note in
-                            composeAction = "note"
-                            composeTaskID = note.taskId
-                            composeAgentID = note.agentId
-                            showCompose = true
-                        },
-                        onBlock: { note in
-                            composeAction = "blocker"
-                            composeTaskID = note.taskId
-                            composeAgentID = note.agentId
-                            showCompose = true
+                        )
+                    case .board:
+                        CollabOpsTaskBoard(
+                            tasks: snapshot.tasks,
+                            filter: $filter,
+                            search: $search,
+                            expandedDepartments: $expandedDepartments,
+                            busyID: model.collabTaskActionBusyID,
+                            onAction: perform,
+                            onEdit: { task in editingTask = task }
+                        )
+                    case .inbox:
+                        CollabOpsCoordinationInbox(
+                            notes: snapshot.notes,
+                            busy: model.collabTaskActionBusyID != nil,
+                            onResolve: { note in
+                                Task {
+                                    _ = await model.resolveOrchestrationBlocker(
+                                        OrchestrationBlocker(
+                                            kind: "coordination",
+                                            noteId: note.noteId,
+                                            taskId: note.taskId,
+                                            agentId: note.agentId,
+                                            agentName: note.agentName,
+                                            message: note.message,
+                                            createdAt: note.createdAt
+                                        )
+                                    )
+                                }
+                            },
+                            onReply: { note in
+                                composeAction = "note"
+                                composeTaskID = note.taskId
+                                composeAgentID = note.agentId
+                                showCompose = true
+                            },
+                            onBlock: { note in
+                                composeAction = "blocker"
+                                composeTaskID = note.taskId
+                                composeAgentID = note.agentId
+                                showCompose = true
+                            }
+                        )
+                    case .history:
+                        CollabOpsRevisionTimeline(
+                            revisions: snapshot.revisions,
+                            currentRevision: snapshot.planRevision,
+                            onRevise: { showRevision = true },
+                            onSelect: { revision in
+                                selectedRevision = RevisionSelection(revision: revision)
+                                Task { await model.loadPlanRevisionDetail(revision) }
+                            }
+                        )
+                        CollabOpsDecisionFeed(
+                            decisions: snapshot.recentDecisions,
+                            notes: snapshot.recentNotes
+                        )
+                        CollabOpsPolicySummary(policy: snapshot.policy) {
+                            showPolicy = true
                         }
-                    )
-                    CollabOpsTaskBoard(
-                        tasks: snapshot.tasks,
-                        filter: $filter,
-                        search: $search,
-                        expandedDepartments: $expandedDepartments,
-                        busyID: model.collabTaskActionBusyID,
-                        onAction: perform,
-                        onEdit: { task in editingTask = task }
-                    )
-                    CollabOpsRevisionTimeline(
-                        revisions: snapshot.revisions,
-                        currentRevision: snapshot.planRevision,
-                        onRevise: { showRevision = true },
-                        onSelect: { revision in
-                            selectedRevision = RevisionSelection(revision: revision)
-                            Task { await model.loadPlanRevisionDetail(revision) }
-                        }
-                    )
-                    CollabOpsDecisionFeed(
-                        decisions: snapshot.recentDecisions,
-                        notes: snapshot.recentNotes
-                    )
-                    CollabOpsPolicySummary(policy: snapshot.policy) {
-                        showPolicy = true
                     }
                 } else if let session = model.selectedSession {
                     CollabOpsEmptyState(session: session)
@@ -293,10 +330,10 @@ private struct CollabOpsToolbar: View {
 
             HStack(spacing: 5) {
                 CollabOpsActionButton(
-                    icon: "arrow.clockwise",
-                    title: "Refresh",
-                    tint: VPTheme.textSecondary,
-                    action: onRefresh
+                    icon: "play.circle",
+                    title: "Run next",
+                    tint: VPTheme.success,
+                    action: onDispatch
                 )
                 CollabOpsActionButton(
                     icon: "eye",
@@ -305,38 +342,34 @@ private struct CollabOpsToolbar: View {
                     action: onPreview
                 )
                 CollabOpsActionButton(
-                    icon: "gearshape.2",
-                    title: "Advance",
-                    tint: VPTheme.accent,
-                    action: onAdvance
-                )
-                CollabOpsActionButton(
-                    icon: "play.circle",
-                    title: "Run next",
-                    tint: VPTheme.success,
-                    action: onDispatch
-                )
-                CollabOpsActionButton(
                     icon: "bubble.left.and.bubble.right",
                     title: "Coordinate",
-                    tint: VPTheme.info,
+                    tint: VPTheme.plan,
                     action: onCoordinate
                 )
-            }
-
-            HStack(spacing: 5) {
-                CollabOpsActionButton(
-                    icon: "square.and.pencil",
-                    title: "Revise plan",
-                    tint: VPTheme.plan,
-                    action: onRevise
-                )
-                CollabOpsActionButton(
-                    icon: "dial.medium",
-                    title: "Policy",
-                    tint: VPTheme.warning,
-                    action: onPolicy
-                )
+                Spacer(minLength: 0)
+                Menu {
+                    Button { onRefresh() } label: {
+                        Label(L10n.t("Refresh"), systemImage: "arrow.clockwise")
+                    }
+                    Button { onAdvance() } label: {
+                        Label(L10n.t("Apply controller actions"), systemImage: "gearshape.2")
+                    }
+                    Divider()
+                    Button { onRevise() } label: {
+                        Label(L10n.t("Revise plan…"), systemImage: "square.and.pencil")
+                    }
+                    Button { onPolicy() } label: {
+                        Label(L10n.t("Orchestration policy…"), systemImage: "dial.medium")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(VPTheme.textSecondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
             }
         }
     }
@@ -2702,6 +2735,71 @@ private struct CollabOpsCoordinationInbox: View {
         case "decision": return VPTheme.plan
         case "handoff": return VPTheme.info
         default: return VPTheme.textSecondary
+        }
+    }
+}
+
+private struct CollabOpsTabBar: View {
+    @Binding var selection: CollabOpsTab
+    let snapshot: OrchestrationSnapshot
+
+    private func count(_ tab: CollabOpsTab) -> Int? {
+        switch tab {
+        case .overview:
+            snapshot.tasks.filter(\.ready).count + snapshot.blockers.count
+        case .board:
+            snapshot.tasks.count
+        case .inbox:
+            snapshot.notes.filter { $0.status == "open" }.count
+        case .history:
+            snapshot.revisions.count + snapshot.decisions.count
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(CollabOpsTab.allCases) { tab in
+                Button {
+                    withAnimation(VPMotion.snap) { selection = tab }
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: tab.icon)
+                            .font(.system(size: 7, weight: .semibold))
+                        Text(tab.title)
+                            .font(VPTheme.mono(6.8, weight: .medium))
+                        if let count = count(tab), count > 0 {
+                            Text("\(count)")
+                                .font(VPTheme.mono(5.8, weight: .semibold))
+                                .foregroundStyle(
+                                    selection == tab
+                                        ? VPTheme.accent
+                                        : VPTheme.textTertiary
+                                )
+                        }
+                    }
+                    .foregroundStyle(
+                        selection == tab
+                            ? VPTheme.accent
+                            : VPTheme.textTertiary
+                    )
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity)
+                    .background(
+                        selection == tab
+                            ? VPTheme.accent.opacity(0.10)
+                            : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(3)
+        .background(VPTheme.surface.opacity(0.55), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(VPTheme.hairline, lineWidth: 1)
         }
     }
 }

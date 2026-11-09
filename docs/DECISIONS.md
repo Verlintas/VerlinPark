@@ -133,6 +133,9 @@
 | [0121](adr/0121-deterministic-orchestration-controller.md) | Deterministic orchestration controller, retry policy, dependency failure, preview | Accepted | Orchestration |
 | [0122](adr/0122-persisted-coordination-and-revision-safety.md) | Persisted coordination/decision projections, targeted delivery, revision inspection and task edit | Accepted | State/Orchestration |
 | [0123](adr/0123-durable-session-leases-and-overview.md) | Durable runtime session leases and cross-session Mission Control | Accepted | Runtime/Operations |
+| [0124](adr/0124-role-aware-context-and-memory.md) | Role-aware context strategies and automatic persistent team memory | Accepted | Runtime/Orchestration |
+| [0125](adr/0125-approval-grants-and-routine-activity.md) | Path-scoped approval grants, substitution classification, quiet routine tools | Accepted | Permissions/UI |
+| [0126](adr/0126-preview-tabs-showcase-and-setup.md) | Preview result board, file tabs/tree, essential Manage Dash, preset-first setup | Accepted | UI/Onboarding |
 
 ---
 

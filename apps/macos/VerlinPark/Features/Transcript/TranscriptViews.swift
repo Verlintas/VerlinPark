@@ -156,6 +156,33 @@ struct ApprovalNotice: View {
         return entry.isDenied ? VPTheme.danger : VPTheme.success
     }
 
+    private var approvalPath: String? {
+        Self.findPath(in: entry.approval.input)
+    }
+
+    private static func findPath(in value: JSONValue) -> String? {
+        if case let .object(object) = value {
+            for key in ["path", "file", "file_path", "target", "destination", "workdir"] {
+                if case let .string(path) = object[key] ?? .null, !path.isEmpty {
+                    return path
+                }
+            }
+            for child in object.values {
+                if let path = findPath(in: child) {
+                    return path
+                }
+            }
+        }
+        if case let .array(values) = value {
+            for child in values {
+                if let path = findPath(in: child) {
+                    return path
+                }
+            }
+        }
+        return nil
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 7) {
@@ -258,6 +285,20 @@ struct ApprovalNotice: View {
                     .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                     .controlSize(.small)
 
+                    if let approvalPath {
+                        Menu(L10n.t("Always allow")) {
+                            Button(L10n.t("This file")) {
+                                allow(path: approvalPath, includeChildren: false)
+                            }
+                            Button(L10n.t("This folder and subfolders")) {
+                                allow(path: approvalPath, includeChildren: true)
+                            }
+                        }
+                        .menuStyle(.borderlessButton)
+                        .font(VPTheme.mono(8))
+                        .fixedSize()
+                    }
+
                     if pending {
                         ProgressView()
                             .controlSize(.small)
@@ -278,6 +319,11 @@ struct ApprovalNotice: View {
         }
         .padding(.leading, 10)
         .padding(.vertical, 7)
+        .task {
+            if entry.isPending {
+                await model.loadApprovalGrants()
+            }
+        }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             entry.isPending ? VPTheme.warning.opacity(0.045) : Color.clear
@@ -299,5 +345,20 @@ struct ApprovalNotice: View {
 
     private var statusIcon: String {
         entry.isDenied ? "xmark.shield" : "checkmark.shield"
+    }
+
+    private func allow(path: String, includeChildren: Bool) {
+        pending = true
+        errorMessage = nil
+        Task {
+            if await !model.allowApprovalPath(
+                entry.approval,
+                path: path,
+                includeChildren: includeChildren
+            ) {
+                pending = false
+                errorMessage = L10n.t("Approval could not be resolved.")
+            }
+        }
     }
 }

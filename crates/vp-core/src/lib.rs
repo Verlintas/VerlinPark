@@ -13,34 +13,34 @@ use async_recursion::async_recursion;
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::types::{
-    AcpAgent, AcpAgentListResult, AcpProbeResult, AgentMessage, AgentRecord, Approval, Artifact,
-    ArtifactBackfillResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
-    CheckpointPolicyResult, CheckpointRetentionPolicy, ConsoleCloseResult, ConsoleOpenResult,
-    ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult, ContextCompactionSummary,
-    ContextMeasurement, ContextUsage, CreateModelPresetParams, DoctorCheck, Event, GitLogResult,
-    GitShowResult, IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult,
-    McpGetPromptResult, McpProbeResult, McpPromptListResult, McpReadResourceResult,
-    McpResourceListResult, McpServer, McpServerConfig, McpServerListResult, McpToolListResult,
-    MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPolicy, MemoryPolicyResult,
-    MemoryPruneResult, MergeQueueEntry, ModelPreset, ModelPresetListResult, OrchestrationDecision,
-    OrchestrationNote, OrchestrationOverviewResult, OrchestrationOverviewTotals,
-    OrchestrationPolicy, OrchestrationPreviewAction, OrchestrationPreviewResult,
-    OrchestrationSessionSummary, OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo,
-    Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
-    QuestionListResult, ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle,
-    SessionCheckpoint, SessionCheckpointDeleteResult, SessionCheckpointDiffResult,
-    SessionCheckpointListResult, SessionCheckpointPruneResult, SessionCheckpointRestoreResult,
-    SessionCheckpointStatsResult, SessionCommit, SessionCompareFile, SessionCompareResult,
-    SessionContextStatus, SessionDiff, SessionForkResult, SessionForkTreeNode,
-    SessionForkTreeResult, SessionImportResult, SessionLandResult, SessionLineageEntry,
-    SessionLineageResult, SessionLogStatus, SessionPriorityResult, SessionRehydrateResult,
-    SessionReplayReport, SessionTranscriptResult, ShellPolicy, StoredMessage, TaskQueueResult,
-    TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult,
-    TerminalOpenResult, TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem,
-    UpdateModelPresetParams, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
-    UsageTotals, WorkspaceFileResult, WorkspaceTreeResult, WorkspaceWriteResult,
-    WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy,
-    WriteLease,
+    AcpAgent, AcpAgentListResult, AcpProbeResult, AgentMessage, AgentRecord, Approval,
+    ApprovalGrant, Artifact, ArtifactBackfillResult, ArtifactGcResult, ArtifactMaterialization,
+    ArtifactPolicy, CheckpointPolicyResult, CheckpointRetentionPolicy, ConsoleCloseResult,
+    ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult,
+    ContextCompactionSummary, ContextMeasurement, ContextUsage, CreateModelPresetParams,
+    DoctorCheck, Event, GitLogResult, GitShowResult, IntegrationPolicy, MailboxGcResult,
+    MailboxPolicy, McpCallResult, McpGetPromptResult, McpProbeResult, McpPromptListResult,
+    McpReadResourceResult, McpResourceListResult, McpServer, McpServerConfig, McpServerListResult,
+    McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPolicy,
+    MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, ModelPreset, ModelPresetListResult,
+    OrchestrationDecision, OrchestrationNote, OrchestrationOverviewResult,
+    OrchestrationOverviewTotals, OrchestrationPolicy, OrchestrationPreviewAction,
+    OrchestrationPreviewResult, OrchestrationSessionSummary, OrchestrationSnapshot,
+    PlanRevisionDetailResult, PlanRevisionInfo, Project, ProjectBudget, ProjectBudgetResult,
+    ProjectUsageResult, PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult,
+    ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
+    SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
+    SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
+    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus, SessionDiff,
+    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
+    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
+    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport, SessionTranscriptResult,
+    ShellPolicy, StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
+    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    TerminalWriteResult, TodoItem, UpdateModelPresetParams, UsageBucket, UsageCsvResult,
+    UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult, WorkspaceTreeResult,
+    WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
+    WorktreeRetentionPolicy, WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::SessionRepair;
@@ -166,6 +166,35 @@ fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
         "path": artifact.path,
         "content": artifact.content,
     })
+}
+
+fn approval_grant_paths(input: &serde_json::Value) -> Vec<String> {
+    fn walk(value: &serde_json::Value, paths: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if matches!(
+                        key.as_str(),
+                        "path" | "file" | "file_path" | "target" | "destination" | "workdir"
+                    ) && let Some(path) = value.as_str()
+                    {
+                        paths.push(path.to_string());
+                    } else {
+                        walk(value, paths);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    walk(value, paths);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut paths = Vec::new();
+    walk(input, &mut paths);
+    paths
 }
 
 fn session_budget_exhausted(session: &Session) -> bool {
@@ -6852,6 +6881,92 @@ impl Engine {
     pub async fn list_approvals(&self, session_id: Option<String>) -> Result<Vec<Approval>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.list_approvals(session_id.as_deref())).await?
+    }
+
+    pub async fn list_approval_grants(&self, project_id: &str) -> Result<Vec<ApprovalGrant>> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_approval_grants(&project_id)).await?
+    }
+
+    pub async fn create_approval_grant(
+        &self,
+        project_id: &str,
+        tool: &str,
+        path_prefix: &str,
+        include_children: bool,
+        created_by: &str,
+    ) -> Result<ApprovalGrant> {
+        let tool = tool.trim();
+        let path_prefix = path_prefix.trim().trim_start_matches("./");
+        if tool.is_empty() || tool.chars().count() > 120 {
+            anyhow::bail!("approval tool must be 1-120 characters");
+        }
+        if path_prefix.is_empty() || path_prefix.chars().count() > 1_000 {
+            anyhow::bail!("approval path must be 1-1000 characters");
+        }
+        if path_prefix.contains('$') || path_prefix.contains('~') {
+            anyhow::bail!("approval path cannot contain shell or home expansion");
+        }
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        let tool = tool.to_string();
+        let path_prefix = path_prefix.to_string();
+        let created_by = created_by.to_string();
+        let grant = tokio::task::spawn_blocking(move || {
+            store.create_approval_grant(
+                &project_id,
+                &tool,
+                &path_prefix,
+                include_children,
+                &created_by,
+            )
+        })
+        .await??;
+        self.record_project_manifest().await?;
+        Ok(grant)
+    }
+
+    pub async fn delete_approval_grant(&self, id: &str) -> Result<bool> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let deleted =
+            tokio::task::spawn_blocking(move || store.delete_approval_grant(&id)).await??;
+        if deleted {
+            self.record_project_manifest().await?;
+        }
+        Ok(deleted)
+    }
+
+    /// Return true when a project grant covers this tool call. Grants only
+    /// match explicit path fields; shell commands and opaque tools still go
+    /// through the normal risk assessment.
+    pub async fn approval_grant_matches(
+        &self,
+        project_id: &str,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> Result<bool> {
+        let paths = approval_grant_paths(input);
+        if paths.is_empty() {
+            return Ok(false);
+        }
+        let grants = self.list_approval_grants(project_id).await?;
+        Ok(grants.iter().any(|grant| {
+            (grant.tool == tool || grant.tool == "*")
+                && paths.iter().any(|path| {
+                    let path = path.trim().trim_start_matches("./");
+                    if grant.include_children {
+                        path == grant.path_prefix
+                            || path.starts_with(&format!(
+                                "{}/",
+                                grant.path_prefix.trim_end_matches('/')
+                            ))
+                    } else {
+                        path == grant.path_prefix
+                    }
+                })
+        }))
     }
 
     pub async fn request_approval(

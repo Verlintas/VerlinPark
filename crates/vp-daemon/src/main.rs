@@ -25,7 +25,9 @@ use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes
 use vp_protocol::types::{
     AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams, AddProjectParams,
     AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
-    AnswerQuestionResult, ApprovalListResult, ArtifactBackfillParams, ArtifactGcParams,
+    AnswerQuestionResult, ApprovalGrantCreateParams, ApprovalGrantCreateResult,
+    ApprovalGrantDeleteParams, ApprovalGrantDeleteResult, ApprovalGrantListParams,
+    ApprovalGrantListResult, ApprovalListResult, ArtifactBackfillParams, ArtifactGcParams,
     ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactMaterializeParams,
     ArtifactPolicyParams, ArtifactPolicyResult, ArtifactResult, AuthParams, AuthResult,
     CancelSessionParams, CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams,
@@ -2072,6 +2074,41 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "approval.grants" => match parse_params::<ApprovalGrantListParams>(request.params) {
+            Ok(params) => match state.engine.list_approval_grants(&params.project_id).await {
+                Ok(grants) => RpcResponse::success(id, ApprovalGrantListResult { grants }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "approval.grant.create" => {
+            match parse_params::<ApprovalGrantCreateParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .create_approval_grant(
+                        &params.project_id,
+                        &params.tool,
+                        &params.path_prefix,
+                        params.include_children,
+                        "user",
+                    )
+                    .await
+                {
+                    Ok(grant) => RpcResponse::success(id, ApprovalGrantCreateResult { grant }),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "approval.grant.delete" => {
+            match parse_params::<ApprovalGrantDeleteParams>(request.params) {
+                Ok(params) => match state.engine.delete_approval_grant(&params.id).await {
+                    Ok(deleted) => RpcResponse::success(id, ApprovalGrantDeleteResult { deleted }),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "approval.list" => {
             let params: ListApprovalsParams = if request.params.is_null() {
                 ListApprovalsParams { session_id: None }

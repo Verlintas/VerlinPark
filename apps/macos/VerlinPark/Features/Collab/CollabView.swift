@@ -98,6 +98,10 @@ struct CollabGraphView: View {
                     }
                 }
             }
+            if surface == .graph {
+                VPHairline()
+                CollabLiveStrip()
+            }
         }
         .background(VPTheme.canvas)
         .sheet(isPresented: $showFullGraph) {
@@ -148,7 +152,7 @@ struct CollabGraphView: View {
             Button {
                 autoFit = false
                 withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
-                    zoom = max(0.35, zoom - 0.1)
+                    zoom = steppedZoom(zoom - 0.05)
                 }
             } label: {
                 Image(systemName: "minus")
@@ -156,16 +160,25 @@ struct CollabGraphView: View {
             .buttonStyle(VPGlassIconButtonStyle(size: 24, tint: VPTheme.textSecondary))
             .help(L10n.t("Zoom out"))
 
-            Text("\(Int((zoom * 100).rounded()))%")
-                .font(VPTheme.mono(7.5, weight: .medium))
-                .foregroundStyle(VPTheme.textTertiary)
-                .frame(width: 34)
-                .contentTransition(.numericText())
+            Button {
+                autoFit = false
+                withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
+                    zoom = 1
+                }
+            } label: {
+                Text("\(Int((zoom * 100).rounded()))%")
+                    .font(VPTheme.mono(7.5, weight: .medium))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .frame(width: 34)
+                    .contentTransition(.numericText())
+            }
+            .buttonStyle(.plain)
+            .help(L10n.t("Reset to 100%"))
 
             Button {
                 autoFit = false
                 withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
-                    zoom = min(1.8, zoom + 0.1)
+                    zoom = steppedZoom(zoom + 0.05)
                 }
             } label: {
                 Image(systemName: "plus")
@@ -201,7 +214,7 @@ struct CollabGraphView: View {
             height: max(150, available.height - 30)
         )
         let scale = min(
-            1.05,
+            1.0,
             max(
                 minimum,
                 min(usable.width / layout.size.width, usable.height / layout.size.height)
@@ -210,6 +223,10 @@ struct CollabGraphView: View {
         withAnimation(VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion)) {
             zoom = scale
         }
+    }
+
+    private func steppedZoom(_ value: CGFloat) -> CGFloat {
+        (value * 20).rounded() / 20
     }
 
     private func structureKey(_ layout: CollabGraphLayout) -> String {
@@ -260,7 +277,7 @@ struct CollabExpandedGraphView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    @State private var zoom: CGFloat = 0.75
+    @State private var zoom: CGFloat = 1
     @State private var selectedID: String?
     @State private var showPlanned = true
     @State private var showOps = true
@@ -437,10 +454,14 @@ struct CollabExpandedGraphView: View {
         .background(VPTheme.canvas)
     }
 
+    private func steppedZoom(_ value: CGFloat) -> CGFloat {
+        (value * 20).rounded() / 20
+    }
+
     private func fit(layout: CollabGraphLayout, available: CGSize) {
         guard layout.size.width > 0, layout.size.height > 0 else { return }
         let scale = min(
-            1.05,
+            1.0,
             max(
                 0.35,
                 min(
@@ -474,13 +495,6 @@ private struct CollabGraphHeader: View {
                         : nil
                 )
                 Spacer(minLength: 4)
-                VPSegmentedControl(
-                    segments: CollabSurface.allCases.map {
-                        VPSegment($0, title: $0.title, icon: $0.icon)
-                    },
-                    selection: $surface
-                )
-                .frame(width: 116)
                 StatusPill(status: sessionStatus)
                 if let onExpand {
                     Button(action: onExpand) {
@@ -502,6 +516,15 @@ private struct CollabGraphHeader: View {
                     .help(L10n.t("Open the full team graph"))
                 }
             }
+
+            VPSegmentedControl(
+                segments: CollabSurface.allCases.map {
+                    VPSegment($0, title: $0.title, icon: $0.icon)
+                },
+                selection: $surface
+            )
+            .frame(maxWidth: .infinity)
+            .frame(height: 24)
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 5) {
@@ -1551,5 +1574,106 @@ private struct CollabGraphEmptyState: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
+    }
+}
+
+private struct CollabLiveStrip: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var running: [AgentRecord] {
+        model.agents.filter {
+            ["running", "verifying", "merging", "thinking"].contains($0.status)
+        }
+    }
+
+    private var latest: (text: String, at: String)? {
+        for event in model.events.reversed() {
+            switch event.type {
+            case "tool.started":
+                let name = event.payload.objectValue?["name"]?.stringValue ?? "tool"
+                let agent = event.payload.objectValue?["agent_name"]?.stringValue
+                return ("\(agent ?? "Agent") · \(name)", event.createdAt)
+            case "coordination.note":
+                let message = event.payload.objectValue?["message"]?.stringValue ?? "coordination note"
+                let agent = event.payload.objectValue?["agent_name"]?.stringValue ?? "Agent"
+                return ("\(agent) · \(message)", event.createdAt)
+            case "plan_task.finished":
+                let task = event.payload.objectValue?["task_id"]?.stringValue ?? "task"
+                let status = event.payload.objectValue?["task_status"]?.stringValue ?? "finished"
+                return ("\(task) · \(status)", event.createdAt)
+            case "merge_queue.enqueued", "merge_queue.updated":
+                let status = event.payload.objectValue?["status"]?.stringValue ?? "updated"
+                return ("merge queue · \(status)", event.createdAt)
+            default:
+                continue
+            }
+        }
+        return nil
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VPStatusDot(
+                color: running.isEmpty ? VPTheme.textTertiary : VPTheme.success,
+                pulsing: !running.isEmpty,
+                size: 4
+            )
+            Text(running.isEmpty ? L10n.t("Team idle") : L10n.t("Live team"))
+                .font(VPTheme.mono(7, weight: .semibold))
+                .tracking(0.4)
+                .foregroundStyle(running.isEmpty ? VPTheme.textTertiary : VPTheme.success)
+
+            if running.isEmpty {
+                Text("\(model.agents.count) agents on standby")
+                    .font(VPTheme.mono(6.8))
+                    .foregroundStyle(VPTheme.textTertiary)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 5) {
+                        ForEach(running.prefix(5)) { agent in
+                            HStack(spacing: 3) {
+                                Image(systemName: VPTheme.roleIcon(agent.role))
+                                    .font(.system(size: 6, weight: .semibold))
+                                    .foregroundStyle(VPTheme.roleColor(agent.role))
+                                Text(agent.name)
+                                    .font(VPTheme.mono(6.4))
+                                    .foregroundStyle(VPTheme.textSecondary)
+                                    .lineLimit(1)
+                                if let task = agent.taskId {
+                                    Text(task)
+                                        .font(VPTheme.mono(5.8))
+                                        .foregroundStyle(VPTheme.textTertiary)
+                                }
+                            }
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(VPTheme.surface, in: Capsule())
+                        }
+                    }
+                }
+            }
+
+            Spacer(minLength: 4)
+
+            if let latest {
+                Text(latest.text)
+                    .font(VPTheme.mono(6.6))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 190, alignment: .trailing)
+                Text(VPTheme.relativeTime(latest.at))
+                    .font(VPTheme.mono(5.8))
+                    .foregroundStyle(VPTheme.textTertiary.opacity(0.8))
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(VPTheme.surface.opacity(0.35))
+        .animation(
+            VPMotion.resolved(VPMotion.smooth, reduceMotion: reduceMotion),
+            value: running.map(\.id)
+        )
     }
 }

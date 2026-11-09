@@ -1323,6 +1323,50 @@ pub struct ArtifactResult {
     pub artifact: Artifact,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalGrant {
+    pub id: String,
+    pub project_id: String,
+    pub tool: String,
+    pub path_prefix: String,
+    pub include_children: bool,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalGrantListParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalGrantListResult {
+    pub grants: Vec<ApprovalGrant>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalGrantCreateParams {
+    pub project_id: String,
+    pub tool: String,
+    pub path_prefix: String,
+    pub include_children: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalGrantCreateResult {
+    pub grant: ApprovalGrant,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalGrantDeleteParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalGrantDeleteResult {
+    pub deleted: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Approval {
     pub id: String,

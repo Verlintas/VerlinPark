@@ -1527,6 +1527,43 @@ actor CoreClient {
         _ = try await request(method: "session.prompt", params: params)
     }
 
+    func listApprovalGrants(projectID: String) async throws -> [ApprovalGrant] {
+        try await request(
+            method: "approval.grants",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ApprovalGrantListResult.self)
+        .grants
+    }
+
+    func createApprovalGrant(
+        projectID: String,
+        tool: String,
+        pathPrefix: String,
+        includeChildren: Bool
+    ) async throws -> ApprovalGrant {
+        try await request(
+            method: "approval.grant.create",
+            params: [
+                "project_id": .string(projectID),
+                "tool": .string(tool),
+                "path_prefix": .string(pathPrefix),
+                "include_children": .bool(includeChildren),
+            ]
+        )
+        .decode(ApprovalGrantCreateResult.self)
+        .grant
+    }
+
+    func deleteApprovalGrant(id: String) async throws -> Bool {
+        try await request(
+            method: "approval.grant.delete",
+            params: ["id": .string(id)]
+        )
+        .decode(ApprovalGrantDeleteResult.self)
+        .deleted
+    }
+
     func listApprovals(sessionID: String?) async throws -> [Approval] {
         let params: [String: JSONValue] = [
             "session_id": sessionID.map(JSONValue.string) ?? .null,

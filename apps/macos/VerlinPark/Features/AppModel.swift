@@ -276,6 +276,9 @@ final class AppModel {
     var providerHasStoredKey =
         UserDefaults.standard.bool(forKey: "provider.hasAPIKey")
     var approvalMode = AgentApprovalMode.stored
+    var approvalGrants: [ApprovalGrant] = []
+    var approvalGrantBusy = false
+    var approvalGrantStatus: String?
     var providerStatus: String?
     var providerBusy = false
     var providerProbeBusy = false
@@ -479,6 +482,7 @@ final class AppModel {
             await loadMcpServers()
             await loadMemoryPolicy()
             await loadOrchestrationPolicy()
+            await loadApprovalGrants()
         } catch {
             handle(error)
         }
@@ -1723,6 +1727,35 @@ final class AppModel {
         }
     }
 
+    func fetchWorkspaceFile(path: String) async -> WorkspaceFileResult? {
+        guard let sessionID = selectedSessionID else { return nil }
+        do {
+            return try await core.workspaceFile(sessionID: sessionID, path: path)
+        } catch {
+            handle(error)
+            return nil
+        }
+    }
+
+    func writeWorkspaceFile(
+        path: String,
+        content: String,
+        expectedSha256: String?
+    ) async -> WorkspaceWriteResult? {
+        guard let sessionID = selectedSessionID else { return nil }
+        do {
+            return try await core.workspaceWrite(
+                sessionID: sessionID,
+                path: path,
+                content: content,
+                expectedSha256: expectedSha256
+            )
+        } catch {
+            handle(error)
+            return nil
+        }
+    }
+
     func openWorkspaceFile(_ entry: WorkspaceEntry) async {
         guard !entry.isDirectory, let sessionID = selectedSessionID else { return }
         workspaceSelectedPath = entry.path
@@ -2380,6 +2413,56 @@ final class AppModel {
         integrationMaxAutoAttempts = 1
         integrationMaxTokensText = ""
         await saveIntegrationPolicy()
+    }
+
+    func loadApprovalGrants() async {
+        guard let projectID = selectedProjectID else {
+            approvalGrants = []
+            return
+        }
+        do {
+            approvalGrants = try await core.listApprovalGrants(projectID: projectID)
+        } catch {
+            approvalGrantStatus = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func allowApprovalPath(
+        _ approval: Approval,
+        path: String,
+        includeChildren: Bool
+    ) async -> Bool {
+        guard let projectID = selectedProjectID else { return false }
+        approvalGrantBusy = true
+        defer { approvalGrantBusy = false }
+        do {
+            let grant = try await core.createApprovalGrant(
+                projectID: projectID,
+                tool: approval.tool,
+                pathPrefix: path,
+                includeChildren: includeChildren
+            )
+            approvalGrants.insert(grant, at: 0)
+            approvalGrantStatus = includeChildren
+                ? "Always allowing \(path) and subfolders."
+                : "Always allowing \(path)."
+            return await resolveApproval(approval.id, approved: true)
+        } catch {
+            approvalGrantStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    func deleteApprovalGrant(_ grant: ApprovalGrant) async {
+        approvalGrantBusy = true
+        defer { approvalGrantBusy = false }
+        do {
+            _ = try await core.deleteApprovalGrant(id: grant.id)
+            approvalGrants.removeAll { $0.id == grant.id }
+        } catch {
+            approvalGrantStatus = error.localizedDescription
+        }
     }
 
     func resolveApproval(_ id: String, approved: Bool) async -> Bool {

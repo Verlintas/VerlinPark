@@ -98,6 +98,17 @@ enum TranscriptProjection {
         return builder.entries
     }
 
+    /// Low-signal operations stay in the audit event stream but do not
+    /// clutter the conversation. Errors still surface.
+    static func isRoutineTool(_ name: String) -> Bool {
+        [
+            "read_file", "list_dir", "grep", "write_file", "edit_file",
+            "todo_write", "fetch_url", "remember", "recall", "coordinate",
+            "team_status", "send_message", "read_mailbox", "list_artifacts",
+            "read_artifact", "publish_artifact",
+        ].contains(name)
+    }
+
     static func date(_ value: String) -> Date? {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -206,6 +217,9 @@ enum TranscriptProjection {
             else {
                 return
             }
+            if TranscriptProjection.isRoutineTool(name) {
+                return
+            }
             let entry = TranscriptToolEntry(
                 toolCallID: toolCallID,
                 name: name,
@@ -232,6 +246,11 @@ enum TranscriptProjection {
             }
             let output = event.payload.objectValue?["output"]?.stringValue ?? ""
             let isError = event.payload.objectValue?["is_error"]?.boolValue ?? false
+            if TranscriptProjection.isRoutineTool(name), !isError,
+               toolIndices[toolCallID] == nil
+            {
+                return
+            }
             let entry = TranscriptToolEntry(
                 toolCallID: toolCallID,
                 name: name,

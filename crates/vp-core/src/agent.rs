@@ -961,6 +961,24 @@ impl AgentProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextStrategy {
+    /// Provider summary followed by a rolling trim. Used for the Leader and
+    /// Managers, where preserving intent and cross-task context matters.
+    Summarize,
+    /// Provider-free rolling trim. Used for Workers and Labour, where the
+    /// current objective and recent tool results are more valuable than a
+    /// verbose summary and the extra model call is avoidable.
+    Trim,
+}
+
+fn context_strategy(role: AgentRole) -> ContextStrategy {
+    match role {
+        AgentRole::Leader | AgentRole::Manager => ContextStrategy::Summarize,
+        AgentRole::Worker | AgentRole::Labour | AgentRole::Verifier => ContextStrategy::Trim,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AgentSpec {
     id: String,
@@ -3700,6 +3718,7 @@ impl AgentService {
                 system_tokens.saturating_add(tool_tokens),
                 calibration.factor,
                 true,
+                context_strategy(spec.role),
             )
             .await?;
             if changed {
@@ -5305,7 +5324,27 @@ impl acp::AcpHost for AcpWorkerHost {
 
     async fn permission(&self, request: acp::AcpPermissionRequest) -> acp::AcpPermissionDecision {
         let assessment = assess_acp_permission(&request, &self.spec.worktree);
-        let decision = decide(self.approval_mode, &assessment, self.auto_approve);
+        let granted = !self.auto_approve
+            && self
+                .engine
+                .approval_grant_matches(
+                    &self.session.project_id,
+                    &format!("acp.{}", self.acp_name),
+                    request
+                        .raw_input
+                        .as_ref()
+                        .unwrap_or(&serde_json::Value::Null),
+                )
+                .await
+                .unwrap_or(false);
+        let decision = if granted {
+            crate::permissions::ApprovalDecision::Allow {
+                risk: assessment.risk,
+                reason: "matched a project approval grant".to_string(),
+            }
+        } else {
+            decide(self.approval_mode, &assessment, self.auto_approve)
+        };
         let tool_call_id = format!("acp:{}:{}", self.spec.id, request.tool_call_id);
         let (risk, reason) = match decision {
             ApprovalDecision::Allow { risk, reason } => {
@@ -5821,6 +5860,20 @@ Additional instructions:
     }
 }
 
+fn worker_report_reports_failure(summary: &str) -> bool {
+    let lower = summary.to_ascii_lowercase();
+    [
+        "blocked",
+        "permission denied",
+        "no write tool",
+        "cannot proceed",
+        "could not complete",
+        "unable to complete",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 enum WorkerFinish {
     Done { report: String, success: bool },
     Cancelled,
@@ -5887,7 +5940,7 @@ async fn finish_worker(
         .await?;
         return Ok(WorkerFinish::Done {
             report: format!("no changes to merge\n{}", truncate(summary)),
-            success: true,
+            success: !worker_report_reports_failure(summary),
         });
     };
 
@@ -6779,6 +6832,7 @@ async fn compact_context_if_needed(
     base_tokens: u64,
     calibration: f64,
     force: bool,
+    strategy: ContextStrategy,
 ) -> Result<bool> {
     if budget.exhausted() {
         return Ok(false);
@@ -6798,7 +6852,13 @@ async fn compact_context_if_needed(
         estimate_messages_tokens(conversation).saturating_add(base_tokens),
         calibration,
     );
-    if !force && estimated_before < compact_threshold && estimated_before <= hard_limit {
+    let triggered = match strategy {
+        ContextStrategy::Summarize => {
+            estimated_before >= compact_threshold || estimated_before > hard_limit
+        }
+        ContextStrategy::Trim => estimated_before > hard_limit,
+    };
+    if !force && !triggered {
         return Ok(false);
     }
     let mut estimated = estimated_before;
@@ -6815,12 +6875,18 @@ async fn compact_context_if_needed(
     let mut usage_tokens = (0u64, 0u64);
     let mut usage_estimated = true;
 
-    if (force || (compact_threshold > 0 && estimated >= compact_threshold))
+    if strategy == ContextStrategy::Summarize
+        && (force || (compact_threshold > 0 && estimated >= compact_threshold))
         && let Some(cut) = safe_context_cut(conversation, keep, 0)
-        && let Some(through) = conversation_ids
-            .get(cut.saturating_sub(1))
-            .cloned()
-            .flatten()
+        && let Some(through) = (if conversation_ids.is_empty() {
+            Some(None)
+        } else {
+            conversation_ids
+                .get(cut.saturating_sub(1))
+                .cloned()
+                .flatten()
+                .map(Some)
+        })
     {
         let summary_window = context_window_for(config, spec.role);
         let summary_budget = if summary_window > 0 {
@@ -6913,7 +6979,7 @@ async fn compact_context_if_needed(
                             conversation_ids.insert(0, None);
                             summarized_messages = cut;
                             summary_text = Some(prefixed);
-                            through_id = Some(through);
+                            through_id = through;
                             usage_tokens = (input_tokens, output_tokens);
                             usage_estimated = estimated_usage;
                             estimated = calibrate_context_tokens(
@@ -6943,16 +7009,30 @@ async fn compact_context_if_needed(
     // Rolling-window fallback: keep the summary at index 0 when one exists,
     // otherwise drop from the beginning at safe message boundaries.
     let floor = usize::from(summary_text.is_some());
-    while estimated > hard_limit {
-        let Some(cut) = safe_context_cut(conversation, keep, floor) else {
+    let mut retention = keep;
+    loop {
+        if estimated <= hard_limit {
             break;
+        }
+        let cut = match safe_context_cut(conversation, retention, floor) {
+            Some(cut) => cut,
+            None if retention > 2 => {
+                retention = 2;
+                continue;
+            }
+            None => break,
         };
         if cut <= floor {
             break;
         }
-        let Some(through) = conversation_ids.get(cut - 1).cloned().flatten() else {
+        let through = conversation_ids.get(cut - 1).cloned().flatten();
+        if !conversation_ids.is_empty() && through.is_none() {
+            if retention > 2 {
+                retention = 2;
+                continue;
+            }
             break;
-        };
+        }
         let removed = cut - floor;
         if floor == 0 {
             conversation.drain(..cut);
@@ -6962,7 +7042,9 @@ async fn compact_context_if_needed(
             conversation_ids.drain(floor..cut);
         }
         dropped_messages = dropped_messages.saturating_add(removed);
-        through_id = Some(through);
+        if through.is_some() {
+            through_id = through;
+        }
         estimated = calibrate_context_tokens(
             estimate_messages_tokens(conversation).saturating_add(base_tokens),
             calibration,
@@ -7134,6 +7216,14 @@ async fn run_loop(
         git_branch: Some(spec.branch.clone()),
     };
     let system = role_system_prompt(spec.role, project, session, spec, objective);
+    let memory_brief = project_memory_brief(engine, &project.id, &session.goal, 6)
+        .await
+        .unwrap_or_default();
+    let system = if memory_brief.is_empty() {
+        system
+    } else {
+        format!("{system}\n\nLong-term project memory (persisted across sessions):\n{memory_brief}")
+    };
     let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;
     let mut tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
     tools.extend(
@@ -7191,7 +7281,7 @@ async fn run_loop(
             )
             .await?;
         }
-        if top_level {
+        {
             compact_context_if_needed(
                 engine,
                 config,
@@ -7206,6 +7296,7 @@ async fn run_loop(
                 system_tokens.saturating_add(tool_tokens),
                 calibration.factor,
                 false,
+                context_strategy(spec.role),
             )
             .await?;
             if control.is_cancelled() {
@@ -7604,7 +7695,19 @@ async fn run_loop(
                     "dynamic MCP tool execution can change host or remote state",
                 );
             }
-            let decision = decide(config.approval_mode, &assessment, spec.auto_approve);
+            let granted = !spec.auto_approve
+                && engine
+                    .approval_grant_matches(&session.project_id, &call.name, &input)
+                    .await
+                    .unwrap_or(false);
+            let decision = if granted {
+                crate::permissions::ApprovalDecision::Allow {
+                    risk: assessment.risk,
+                    reason: "matched a project approval grant".to_string(),
+                }
+            } else {
+                decide(config.approval_mode, &assessment, spec.auto_approve)
+            };
             let mut denied_reason: Option<String> = None;
             match decision {
                 ApprovalDecision::Allow { risk, reason } => {
@@ -10337,15 +10440,30 @@ pub(crate) fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result
         if !ids.insert(id.to_string()) {
             return Err(anyhow!("duplicate task id: {id}"));
         }
-        if !plan
+        let Some(department) = plan
             .departments
             .iter()
-            .any(|department| department.name == task.department)
-        {
+            .find(|department| department.name == task.department)
+        else {
             return Err(anyhow!(
                 "task '{}' references unknown department '{}'",
                 id,
                 task.department
+            ));
+        };
+        let needs_write = !task.write_scope.is_empty()
+            || matches!(
+                task.kind.to_ascii_lowercase().as_str(),
+                "coding" | "code" | "implement" | "implementation" | "edit" | "fix"
+            );
+        let resolved_profile = task
+            .profile
+            .as_deref()
+            .unwrap_or(department.profile.as_str());
+        if needs_write && matches!(resolved_profile, "generic" | "verification") {
+            return Err(anyhow!(
+                "task '{}' needs a writable profile: set task.profile=\"coding\" or use a coding department",
+                id
             ));
         }
         if task.title.trim().is_empty() {
@@ -10763,6 +10881,42 @@ async fn latest_plan_results(engine: &Engine, session_id: &str) -> Result<HashMa
     Ok(results)
 }
 
+async fn project_memory_brief(
+    engine: &Engine,
+    project_id: &str,
+    query: &str,
+    limit: u32,
+) -> Result<String> {
+    let query = query.trim();
+    let mut memories = if query.is_empty() {
+        Vec::new()
+    } else {
+        engine
+            .list_memories(project_id, Some(query.to_string()), None, limit)
+            .await?
+            .memories
+    };
+    if memories.is_empty() {
+        memories = engine
+            .list_memories(project_id, None, None, limit)
+            .await?
+            .memories;
+    }
+    Ok(memories
+        .iter()
+        .map(|memory| {
+            format!(
+                "[{}] {} · {} · {}",
+                memory.kind,
+                memory.title,
+                memory.agent_name,
+                truncate_to(&memory.body, 420)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 async fn coordination_brief_for_agent(
     engine: &Engine,
     session_id: &str,
@@ -10853,12 +11007,52 @@ async fn record_scheduled_task_finish(
         .scheduler()
         .finish(session_id, plan_seq, task_id, status, detail)
         .await?;
+    if status == "completed"
+        && let Some(summary) = detail.map(str::trim).filter(|summary| !summary.is_empty())
+    {
+        record_task_memory(engine, session_id, task_id, summary).await;
+    }
     if task.is_some()
         && let Err(error) = engine.advance_orchestration(session_id).await
     {
         tracing::warn!(%error, task_id, "orchestration controller pass failed");
     }
     Ok(task)
+}
+
+async fn record_task_memory(engine: &Engine, session_id: &str, task_id: &str, summary: &str) {
+    let Ok((_session, project)) = load_session_project(engine.store().clone(), session_id).await
+    else {
+        return;
+    };
+    let title = format!("Task {task_id} result");
+    let existing = engine
+        .list_memories(
+            &project.id,
+            Some(title.clone()),
+            Some("task_result".into()),
+            3,
+        )
+        .await
+        .map(|result| result.memories)
+        .unwrap_or_default();
+    if existing.iter().any(|memory| memory.title == title) {
+        return;
+    }
+    if let Err(error) = engine
+        .create_memory_as(
+            session_id,
+            "orchestrator",
+            "Orchestrator",
+            "task_result",
+            &title,
+            &truncate_to(summary, 8_000),
+            vec![task_id.to_string(), "task_result".to_string()],
+        )
+        .await
+    {
+        tracing::warn!(%error, task_id, "failed to persist task result memory");
+    }
 }
 
 fn task_profile(task: &PlanTask, department_profile: AgentProfile) -> AgentProfile {
@@ -11372,6 +11566,19 @@ async fn execute_team_plan(
             )
             .await?;
             let mailbox = mailbox_brief(engine, &session.id, &worker_spec.id, 4).await?;
+            let memory_brief = project_memory_brief(
+                engine,
+                &project.id,
+                &format!("{} {}", task.title, task.department),
+                4,
+            )
+            .await
+            .unwrap_or_default();
+            let memory_note = if memory_brief.is_empty() {
+                String::new()
+            } else {
+                format!("\nRelevant long-term memory:\n{memory_brief}")
+            };
             let coordination_note = if coordination.is_empty() {
                 String::new()
             } else {
@@ -11384,7 +11591,7 @@ async fn execute_team_plan(
             };
             let objective = format!(
                 "Execute plan task {}: {}. Department: {} ({}). Acceptance: {}. \
-                 Upstream handoffs:\n{}\n{}{}\
+                 Upstream handoffs:\n{}\n{}{}{}\
                  Work only in your task worktree and return a concise summary.",
                 task.id,
                 task.title,
@@ -11392,6 +11599,7 @@ async fn execute_team_plan(
                 manager_spec.title.as_deref().unwrap_or(&manager_spec.name),
                 acceptance,
                 dependency_brief,
+                memory_note,
                 coordination_note,
                 mailbox_note
             );
@@ -11538,7 +11746,7 @@ async fn execute_team_plan(
                                 plan_seq,
                                 &task.id,
                                 status,
-                                (status != "completed").then_some(report.as_str()),
+                                Some(report.as_str()),
                             )
                             .await?;
                             reports.push(format!(
@@ -11833,8 +12041,12 @@ fn role_system_prompt(
         AgentRole::Leader => format!(
             "{base}\n\
              You are VerlinPark's Leader agent, {}. Keep a short plan with todo_write. \
-             For a goal that spans multiple areas, delegate department-level objectives to \
-             Managers with delegate(role=\"manager\"). Give every Manager a distinct title \
+             Prefer a real team for non-trivial work: if the objective has multiple steps, \
+             files, or verification needs, submit a TeamPlan and use run_team_plan. Do the \
+             work directly only when it is genuinely small (for example a one-file edit or a \
+             quick inspection) or the user explicitly asks for no team. Do not use a team as \
+             ceremony for a tiny task. For a goal that spans multiple areas, delegate \
+             department-level objectives to Managers with delegate(role=\"manager\"). Give every Manager a distinct title \
              (for example Discovery, Implementation, Quality) via the title field; each title \
              defines that Manager's department role. Managers will split work and delegate to \
              Workers; Workers may use Labour. Do not delegate directly to Workers or Labour. \

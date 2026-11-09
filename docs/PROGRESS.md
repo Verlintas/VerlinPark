@@ -44,8 +44,8 @@
 
 ### 测试与验证
 
-- Rust：新增 orchestration 纯函数/控制器测试、store 投影测试、Engine 控制循环/preview/overview/lease/revision/replay-repair 测试；总计 349 active（core 279，protocol 2，store 54，providers 14；3 ignored live）。
-- Swift：新增 snapshot/preview/lease/overview/revision 解码、graph orchestration 状态、policy、task filter 测试；总计 103。
+- Rust：新增 orchestration 纯函数/控制器测试、store 投影测试、Engine 控制循环/preview/overview/lease/revision/replay-repair 测试；总计 356 active（core 285，protocol 2，store 55，providers 14；3 ignored live）。
+- Swift：新增 snapshot/preview/lease/overview/revision 解码、graph orchestration 状态、policy、task filter 测试；总计 104。
 - Live DeepSeek E2E（2026-11-09）：provider probe 成功；单 Leader 写文件成功；真 TeamPlan（1 Manager + 2 Workers + 2 Verifiers）并行完成 T1/T2，两个 commit 经 Verifier 后进入 merge queue 并以 `--diff-check` 合并到 session branch；`orchestration.preview` 对完成 session 返回空动作；对 completed task 的 `task_edit` 被安全拒绝；`coordination.note` blocker/unblock、mailbox、`team_plan.restore`、`replay`/`repair` 均实测通过。
 
 ### 仍未实现
@@ -55,6 +55,43 @@
 - Runtime lease 不是完整分布式调度/fencing；daemon 仍假设一个 data-dir 一个实例。
 - 没有 GUI/browser agent 工具，`ComputerLease` 仍未实现。
 - 外部 ACP agent 仍是受信任二进制；不提供 credential/network sandbox。
+
+## 2026-11-09 体验、上下文与权限修订
+
+这一轮处理真实使用反馈，不再只增加编排能力。
+
+### Collab / Preview / Manage Dash
+- Collab 顶部 Graph/Ops 改为整行分段控件，不再出现 “G…”/“O…”。
+- 图页底部新增实时 Live strip：运行中的 Agent、最近 tool/coordination/task/merge 活动与相对时间。
+- Ops 改为 Overview / Board / Inbox / History 四个页签；主命令只保留 Run next、Preview、Coordinate 和 More 菜单，减少首屏卡片与按钮。
+- 缩放默认 100%，每次 5%，按 5% 吸附；点击百分比立即回到 100%。宽屏 sheet 同样处理。
+- Preview 默认 Showcase（Agent 成果白板），展示 published artifacts；Changes/Files/Plan 为主分类，History/Queue/Mailbox/Cost/Console/Terminal/Trace 收进 More。
+- Files 面板改为递归文件夹树 + 浏览器式文件标签页；每个标签独立 draft、dirty、save/reload、关闭确认。
+- Manage Dash 默认只显示 Overview / Inbox / Team & Tasks / Usage；其余高级段通过 “Advanced sections” 开关显示。
+
+### Provider / 首次使用
+- Providers 首屏改为预设优先：DeepSeek / OpenAI / Anthropic / LM Studio / Ollama / Custom；自动填 base URL、model、context window。
+- 常用模型族自动推断 context；API key 是远程 provider 唯一必填项。
+- Role overrides、team/global capacity、base URL、context override、session defaults 收入 Advanced。
+- 新增 first-run Setup Wizard：连接模型 → 选择项目 → 完成；可 Skip，可从 Settings → General 重新打开。
+- 新安装默认是 smart approvals、Verifier gate、确定性 Integrator、默认团队 cap 和 200k session budget，不要求先配置高级项。
+
+### 权限与对话
+- 修复 `$()` / backtick 命令替换被一律判为 host_state 的误报：内部命令递归分类，常见 `$(cat file)`、`$(git rev-parse HEAD)` 不再触发审批；危险内部命令仍升级。
+- 新增项目级 `approval_grants`（tool + path prefix + include_children）；审批卡支持 “This file / This folder and subfolders”，Settings 可查看/删除。
+- smart 模式仍只对 host/destructive 请求人工；workspace 写和常规构建/测试不打断。
+- Transcript 不再记录 routine tool（read/write/grep/todo/fetch/remember/recall/coordinate/team_status/mailbox/artifact）成功调用；错误仍显示，完整审计仍在事件流。
+- ACP permission 也检查 approval grant。
+
+### 上下文与长期记忆
+- 角色化 context 策略：Leader/Manager 使用 summary + rolling window；Worker/Labour/Verifier 使用 provider-free rolling window。
+- compaction 对所有角色运行，不再只覆盖 top-level；hard limit 压力下保留窗口可降到 2 条消息，summary 保留。
+- 手动 compaction 在 summary provider 失败时回退 trim，不再留下 “already running” 状态。
+- 完成 plan task 自动写入 `task_result` project memory（按 title 幂等）；system prompt 自动注入相关长期记忆，Plan Worker 额外获得 task-specific memory brief。
+- 记忆仍通过 SQLite/event 持久化，受项目 memory retention 策略管理。
+
+### 协作倾向
+- Leader prompt 明确：非平凡、多文件、多步骤或需要验证的工作优先提交 TeamPlan 并 run_team_plan；只有真正小任务或用户明确要求不用团队时才直接执行。
 
 ## 当前可用的能力
 
@@ -120,7 +157,7 @@
 
 ## 验证
 
-- `cargo test --workspace`：349 个测试通过（core 279、protocol 2、store 54、providers 14）；另有 3 个 env-gated live provider tests 默认 ignored。
+- `cargo test --workspace`：356 个测试通过（core 285、protocol 2、store 55、providers 14）；另有 3 个 env-gated live provider tests 默认 ignored。
 - `xcodebuild test`：94 个 Swift 测试通过（含协议向后兼容解码、diff parser、transcript/collab、Rail session grouping 与 design-system invariants）。
 - `just lint`：fmt + clippy `-D warnings` + swiftformat lint 通过。
 - Live provider E2E：`OPENAI_API_KEY=... cargo test -p vp-providers --test live -- --ignored --nocapture`；Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`，本地 endpoint 用 `VERLINPARK_LIVE_BASE_URL` / `VERLINPARK_LIVE_MODEL`。

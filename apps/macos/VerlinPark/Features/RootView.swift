@@ -17,6 +17,8 @@ struct RootView: View {
     @State private var showCommandPalette = false
     @State private var focusMode = false
     @State private var studioTab: StudioTab = .collab
+    @State private var showSetupWizard = false
+    @AppStorage("verlinpark.onboarding.completed") private var onboardingCompleted = false
 
     var body: some View {
         workspace
@@ -43,6 +45,12 @@ struct RootView: View {
                 NotificationCenterView()
                     .environment(model)
             }
+            .sheet(isPresented: $showSetupWizard) {
+                SetupWizardView {
+                    onboardingCompleted = true
+                }
+                .environment(model)
+            }
             .overlay { commandPaletteOverlay }
             .overlay(alignment: .topTrailing) { toastOverlay }
             .onChange(of: commandRouter.sequence) { _, _ in
@@ -50,6 +58,13 @@ struct RootView: View {
             }
             .animation(VPMotion.snap, value: showCommandPalette)
             .animation(VPMotion.smooth, value: focusMode)
+            .task {
+                guard !onboardingCompleted else { return }
+                try? await Task.sleep(for: .seconds(1.2))
+                if !onboardingCompleted {
+                    showSetupWizard = true
+                }
+            }
     }
 
     private var workspace: some View {
