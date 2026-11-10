@@ -33,17 +33,18 @@ an Agent Swarm and it does not create agent-to-agent messaging.
 | `watch_task_ids` | JSON list of plan task ids from the stored TeamPlan |
 | `watch_mode` | `all` or `any` |
 | `deadline_at` | optional RFC3339 fallback wake |
-| `status` | `pending`, `ready`, `delivered`, `cancelled`, `failed` |
+| `status` | `pending`, `ready`, `delivering`, `delivered`, `cancelled`, `failed` |
 | `attempts`, `max_attempts` | bounded start-failure accounting |
 | `wake_reason` | `watch` or `deadline` once ready |
 | `outcomes` | frozen task id/title/status snapshot captured at wake |
 | `last_error`, `next_attempt_at` | retry backoff and terminal reason |
 | `created_at`, `ready_at`, `delivered_at`, `updated_at` | lifecycle timestamps |
 
-The events are `session.continuation.created`, `.ready`, `.retrying`,
-`.delivered`, `.cancelled`, and `.failed`. Every transition is committed with
-its event before projection visibility; the projection is rebuilt from the
-latest event per id by replay/repair, project bundles, and `vp db-rebuild`.
+The events are `session.continuation.created`, `.ready`, `.delivering`,
+`.retrying`, `.delivered`, `.cancelled`, and `.failed`. Every transition is
+committed with its event before projection visibility; the projection is
+rebuilt from the latest event per id by replay/repair, project bundles, and
+`vp db-rebuild`.
 
 ### 2. Creation validation
 
@@ -74,6 +75,15 @@ then attempts delivery in the same pass. Delivery requires the session to be
 `waiting_input` keep the row ready and retry on a later tick. At most one start
 attempt is made per session per tick.
 
+Before calling `start`, the pass atomically claims the row as `delivering` and
+emits `session.continuation.delivering`. Only the pass whose claim commits may
+start the run; a racing pass sees no claimable row and skips. A crash after the
+claim but before the delivery result is resolved cannot be rolled forward
+safely: daemon recovery marks every surviving `delivering` row `failed` with
+`daemon restarted while delivering; not retried automatically`. This is
+deliberately fail-closed; the operator inspects the session and re-defers if
+needed rather than risking a duplicate run.
+
 ### 4. Delivery through the normal start path
 
 Ready continuations call `AgentService::start(session_id, prompt)`, the same
@@ -92,10 +102,11 @@ Operator prompt:
 ```
 
 The context note is capped at 2,000 characters and titles at 120 characters.
-`delivered` is recorded only after `start` returns success. A start error is
-persisted with an attempt increment and a deterministic backoff; after the
-bounded cap (default 3, maximum 3) the row becomes `failed` and is not retried.
-A delivered row is never started again.
+`delivered` is recorded only after `start` returns success, and only from the
+`delivering` claim owned by that pass. A start error is persisted with an
+attempt increment and a deterministic backoff; after the bounded cap (default
+3, maximum 3) the row becomes `failed` and is not retried. A delivered row is
+never started again.
 
 ### 5. Terminal session states
 
@@ -127,8 +138,12 @@ not model-authored scheduling.
 - A provider that is unconfigured or unhealthy consumes the bounded start-attempt
   budget and eventually fails the continuation; the operator can inspect
   `last_error` and re-defer after fixing configuration.
+- Delivery is fail-closed across a daemon crash. A row caught in `delivering`
+  becomes failed on recovery instead of being redelivered; the operator must
+  inspect the session and explicitly re-defer.
 - Continuation wake/inspection is cooperative: an in-flight run is never
   interrupted, and a ready row waits for the session to become quiescent.
 - This round does not add cross-process continuation ownership, automatic
   creation from agent output, recurring continuations, or a distributed
-  scheduler. Future multi-daemon work would need a fencing/ownership design.
+  scheduler. The `delivering` claim is a single-daemon SQLite transition; future
+  multi-daemon work would need a fencing/ownership design.

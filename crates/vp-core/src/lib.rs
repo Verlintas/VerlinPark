@@ -4927,11 +4927,11 @@ impl Engine {
         if let Some(status) = status
             && !matches!(
                 status,
-                "pending" | "ready" | "delivered" | "cancelled" | "failed"
+                "pending" | "ready" | "delivering" | "delivered" | "cancelled" | "failed"
             )
         {
             anyhow::bail!(
-                "continuation status must be pending, ready, delivered, cancelled, or failed"
+                "continuation status must be pending, ready, delivering, delivered, cancelled, or failed"
             );
         }
         let store = self.store.clone();
@@ -4984,6 +4984,24 @@ impl Engine {
             store.mark_session_continuation_ready_with_event(&id, &reason, &outcomes)
         })
         .await??;
+        let Some((continuation, event)) = result else {
+            return Ok(None);
+        };
+        let _ = self.events.send(event);
+        Ok(Some(continuation))
+    }
+
+    /// Atomically claim a ready row for one delivery attempt. Returns `None`
+    /// when another pass already claimed or completed it.
+    pub async fn claim_session_continuation(
+        &self,
+        id: &str,
+    ) -> Result<Option<SessionContinuation>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let result =
+            tokio::task::spawn_blocking(move || store.claim_session_continuation_with_event(&id))
+                .await??;
         let Some((continuation, event)) = result else {
             return Ok(None);
         };
@@ -10850,6 +10868,7 @@ fn replay_continuations(events: &[Event]) -> Vec<SessionContinuation> {
             event.kind.as_str(),
             "session.continuation.created"
                 | "session.continuation.ready"
+                | "session.continuation.delivering"
                 | "session.continuation.retrying"
                 | "session.continuation.delivered"
                 | "session.continuation.cancelled"

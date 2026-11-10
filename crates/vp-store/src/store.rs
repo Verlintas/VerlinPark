@@ -7164,6 +7164,41 @@ impl Store {
         Ok(Some((continuation, event)))
     }
 
+    /// Atomically claim a ready row for one delivery attempt. Only the caller
+    /// whose claim commits may call `start`; a racing pass sees zero rows and
+    /// skips. A crash after this transition leaves `delivering`, which daemon
+    /// recovery fails closed instead of delivering again.
+    pub fn claim_session_continuation_with_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<(SessionContinuation, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE session_continuations
+             SET status = 'delivering', next_attempt_at = NULL, updated_at = ?1
+             WHERE id = ?2 AND status = 'ready'",
+            params![now, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let continuation = query_session_continuation_tx(&tx, id)?
+            .ok_or_else(|| anyhow!("continuation disappeared during claim: {id}"))?;
+        let event = insert_event_tx(
+            &tx,
+            &continuation.session_id,
+            "session.continuation.delivering",
+            serde_json::to_value(&continuation)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((continuation, event)))
+    }
+
     pub fn mark_session_continuation_delivered_with_event(
         &self,
         id: &str,
@@ -7174,7 +7209,7 @@ impl Store {
         let changed = tx.execute(
             "UPDATE session_continuations
              SET status = 'delivered', delivered_at = ?1, next_attempt_at = NULL, updated_at = ?1
-             WHERE id = ?2 AND status = 'ready'",
+             WHERE id = ?2 AND status = 'delivering'",
             params![now, id],
         )?;
         if changed == 0 {
@@ -7208,8 +7243,9 @@ impl Store {
         let tx = conn.transaction()?;
         let changed = tx.execute(
             "UPDATE session_continuations
-             SET attempts = attempts + 1, last_error = ?1, next_attempt_at = ?2, updated_at = ?3
-             WHERE id = ?4 AND status = 'ready'",
+             SET status = 'ready', attempts = attempts + 1, last_error = ?1,
+                 next_attempt_at = ?2, updated_at = ?3
+             WHERE id = ?4 AND status IN ('ready', 'delivering')",
             params![error, next_attempt_at, now, id],
         )?;
         if changed == 0 {
@@ -7246,7 +7282,7 @@ impl Store {
             "UPDATE session_continuations
              SET status = 'failed', attempts = attempts + 1, last_error = ?1,
                  next_attempt_at = NULL, updated_at = ?2
-             WHERE id = ?3 AND status IN ('pending', 'ready')",
+             WHERE id = ?3 AND status IN ('pending', 'ready', 'delivering')",
             params![error, now, id],
         )?;
         if changed == 0 {
@@ -9607,6 +9643,23 @@ impl Store {
             "UPDATE steering_messages SET status = 'cancelled' WHERE status = 'pending'",
             [],
         )?;
+        let interrupted_continuations = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {SESSION_CONTINUATION_COLUMNS}
+                 FROM session_continuations WHERE status = 'delivering'
+                 ORDER BY created_at ASC, id ASC"
+            ))?;
+            let rows = stmt.query_map([], map_session_continuation)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "UPDATE session_continuations
+             SET status = 'failed',
+                 last_error = 'daemon restarted while delivering; not retried automatically',
+                 next_attempt_at = NULL, updated_at = ?1
+             WHERE status = 'delivering'",
+            params![now],
+        )?;
         tx.execute(
             "UPDATE plan_tasks
              SET status = 'interrupted',
@@ -9713,6 +9766,29 @@ impl Store {
                 &tx,
                 &cancelled.session_id,
                 "steering.cancelled",
+                payload,
+            )?);
+        }
+        for continuation in &interrupted_continuations {
+            let mut failed = continuation.clone();
+            failed.status = "failed".to_string();
+            failed.last_error =
+                Some("daemon restarted while delivering; not retried automatically".to_string());
+            failed.next_attempt_at = None;
+            failed.updated_at = now.clone();
+            let mut payload = serde_json::to_value(&failed)?;
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "reason".into(),
+                    serde_json::json!(
+                        "daemon restarted while delivering; not retried automatically"
+                    ),
+                );
+            }
+            events.push(insert_event_tx(
+                &tx,
+                &failed.session_id,
+                "session.continuation.failed",
                 payload,
             )?);
         }

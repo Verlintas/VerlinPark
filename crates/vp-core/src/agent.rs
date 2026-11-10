@@ -3729,6 +3729,16 @@ impl AgentService {
                 _ => continue,
             }
 
+            attempted_sessions.insert(continuation.session_id.clone());
+            let Some(continuation) = self
+                .engine
+                .claim_session_continuation(&continuation.id)
+                .await?
+            else {
+                // Another reconciliation pass already claimed this row. It is
+                // now `delivering`; this pass must not start a duplicate run.
+                continue;
+            };
             let reason = continuation.wake_reason.as_deref().unwrap_or("watch");
             let prompt = crate::continuation::render_prompt(
                 &continuation.id,
@@ -3736,7 +3746,6 @@ impl AgentService {
                 reason,
                 &continuation.outcomes,
             );
-            attempted_sessions.insert(continuation.session_id.clone());
             match self.start(&continuation.session_id, &prompt).await {
                 Ok(()) => {
                     self.engine

@@ -8911,6 +8911,13 @@ async fn deferred_continuation_waits_for_active_session_and_delivers_once() {
     assert_eq!(
         events
             .iter()
+            .filter(|event| event.kind == "session.continuation.delivering")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
             .filter(|event| event.kind == "session.continuation.delivered")
             .count(),
         1
@@ -9028,6 +9035,11 @@ async fn deferred_continuation_start_failures_back_off_and_respect_attempt_cap()
         events
             .iter()
             .any(|event| event.kind == "session.continuation.retrying")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "session.continuation.delivering")
     );
     let replay = engine.replay_session(&session.id).await.unwrap();
     assert!(replay.continuations_match, "{:?}", replay.mismatches);
@@ -9152,6 +9164,122 @@ async fn deferred_continuation_deadline_fallback_wakes_without_watched_tasks() {
     assert!(after.continuations[0].outcomes.is_empty());
     assert_eq!(after.continuations[0].attempts, 1);
     assert!(after.continuations[0].last_error.is_some());
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+}
+
+#[tokio::test]
+async fn deferred_continuation_claim_has_one_winner_and_recovery_fails_closed() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let engine = Engine::new(store);
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    init_repo(&repo);
+    let project = engine
+        .store()
+        .add_project(repo.to_str().unwrap(), Some("continuation claim"))
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "claim".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &continuation_test_plan())
+        .await
+        .unwrap();
+    let continuation = engine
+        .defer_session(
+            &session.id,
+            "claim once",
+            vec!["T1".into()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .continuation;
+    engine.skip_plan_task(&session.id, "T1").await.unwrap();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .mark_session_continuation_ready(&continuation.id, "watch", &[])
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (left, right) = tokio::join!(
+        engine.claim_session_continuation(&continuation.id),
+        engine.claim_session_continuation(&continuation.id)
+    );
+    let winners = usize::from(left.unwrap().is_some()) + usize::from(right.unwrap().is_some());
+    assert_eq!(winners, 1, "exactly one reconciliation pass may claim");
+    let listed = engine
+        .session_continuations(&session.id, Some("delivering"), Some(10))
+        .await
+        .unwrap();
+    assert_eq!(listed.continuations.len(), 1);
+    assert_eq!(listed.continuations[0].status, "delivering");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.delivering")
+            .count(),
+        1
+    );
+
+    let service = AgentService::unconfigured(engine.clone());
+    assert_eq!(service.reconcile_session_continuations().await.unwrap(), 0);
+    assert!(
+        !engine
+            .list_messages(&session.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.content.starts_with("[Deferred continuation #"))
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "session.continuation.delivered")
+    );
+
+    engine.recover_interrupted_sessions().await.unwrap();
+    let recovered = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(recovered.continuations[0].id, continuation.id);
+    assert_eq!(recovered.continuations[0].status, "failed");
+    assert_eq!(
+        recovered.continuations[0].last_error.as_deref(),
+        Some("daemon restarted while delivering; not retried automatically")
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.continuation.failed"
+            && event.payload["reason"]
+                == "daemon restarted while delivering; not retried automatically"
+    }));
+    assert_eq!(service.reconcile_session_continuations().await.unwrap(), 0);
     let replay = engine.replay_session(&session.id).await.unwrap();
     assert!(replay.continuations_match, "{:?}", replay.mismatches);
     assert!(replay.consistent, "{:?}", replay.mismatches);
