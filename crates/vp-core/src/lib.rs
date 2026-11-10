@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::tools::ToolContext;
+use crate::tools::{ToolContext, ToolOutput};
 use anyhow::{Context, Result, anyhow};
 use async_recursion::async_recursion;
 use ignore::WalkBuilder;
@@ -60,6 +60,7 @@ use crate::budget::BudgetRegistry;
 
 pub mod acp;
 pub mod agent;
+pub mod browser;
 pub mod budget;
 pub mod console;
 mod dashboard;
@@ -120,6 +121,7 @@ pub struct Engine {
     mcp: Arc<mcp::McpManager>,
     consoles: Arc<console::ConsoleManager>,
     terminals: Arc<terminal::TerminalManager>,
+    browsers: Arc<browser::BrowserManager>,
     scheduler: Arc<scheduler::TaskScheduler>,
     runtime_id: String,
 }
@@ -191,6 +193,54 @@ impl RuntimeLeaseGuard {
 }
 
 impl Drop for RuntimeLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+    }
+}
+
+/// A held daemon-wide lease over an interactive surface such as the browser.
+/// It has its own SQLite row and audit events; it is not a worktree write
+/// scope. Dropping the guard stops the heartbeat and leaves the row to expire
+/// after the TTL, which is the crash path. Normal callers release explicitly.
+pub struct ComputerLeaseGuard {
+    store: Store,
+    events: broadcast::Sender<Event>,
+    pub lease: vp_store::store::ComputerLease,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ComputerLeaseGuard {
+    pub fn lease_id(&self) -> &str {
+        &self.lease.lease_id
+    }
+
+    pub fn surface(&self) -> &str {
+        &self.lease.surface
+    }
+
+    pub async fn release(mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+        let store = self.store.clone();
+        let lease_id = self.lease.lease_id.clone();
+        let owner = self.lease.owner_id.clone();
+        let event = tokio::task::spawn_blocking(move || {
+            store.release_computer_lease(&lease_id, Some(&owner))
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+        if let Some(event) = event {
+            let _ = self.events.send(event);
+        }
+    }
+}
+
+impl Drop for ComputerLeaseGuard {
     fn drop(&mut self) {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
@@ -424,6 +474,7 @@ fn detect_pr_cli(origin: &str) -> PrCli {
 impl Engine {
     pub fn new(store: Store) -> Self {
         let (events, _) = broadcast::channel(2048);
+        let data_dir = store.data_dir().to_path_buf();
         Self {
             scheduler: Arc::new(scheduler::TaskScheduler::new(store.clone())),
             store,
@@ -436,6 +487,7 @@ impl Engine {
             mcp: Arc::new(mcp::McpManager::from_env()),
             consoles: Arc::new(console::ConsoleManager::new()),
             terminals: Arc::new(terminal::TerminalManager::new()),
+            browsers: Arc::new(browser::BrowserManager::new(data_dir)),
             runtime_id: Uuid::now_v7().to_string(),
         }
     }
@@ -648,6 +700,128 @@ impl Engine {
     pub async fn sweep_runtime_leases(&self) -> Result<usize> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.clear_expired_runtime_leases()).await?
+    }
+
+    /// Acquire the daemon-wide browser/GUI surface lease. The SQLite row is
+    /// the authority; an unexpired lease on the same surface fails fast with
+    /// the holder instead of queueing. The guard heartbeats at TTL/3.
+    pub async fn acquire_computer_lease(
+        &self,
+        surface: &str,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        ttl: std::time::Duration,
+    ) -> Result<ComputerLeaseGuard> {
+        let ttl_secs = ttl.as_secs().clamp(10, 3_600);
+        let store = self.store.clone();
+        let owner_id = self.runtime_id.clone();
+        let surface_owned = surface.to_string();
+        let session_owned = session_id.to_string();
+        let agent_owned = agent_id.to_string();
+        let agent_name_owned = agent_name.to_string();
+        let attempt = tokio::task::spawn_blocking(move || {
+            store.acquire_computer_lease(
+                &surface_owned,
+                &owner_id,
+                &session_owned,
+                &agent_owned,
+                &agent_name_owned,
+                ttl_secs,
+            )
+        })
+        .await??;
+        match attempt {
+            vp_store::store::ComputerLeaseAttempt::Acquired { lease, events } => {
+                for event in events {
+                    let _ = self.events.send(event);
+                }
+                let heartbeat_store = self.store.clone();
+                let heartbeat_owner = lease.owner_id.clone();
+                let heartbeat_lease = lease.lease_id.clone();
+                let heartbeat_secs = (ttl_secs / 3).max(5);
+                let heartbeat = tokio::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        let store = heartbeat_store.clone();
+                        let owner = heartbeat_owner.clone();
+                        let lease = heartbeat_lease.clone();
+                        let renewed = tokio::task::spawn_blocking(move || {
+                            store.renew_computer_lease(&lease, &owner, ttl_secs)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(false);
+                        if !renewed {
+                            break;
+                        }
+                    }
+                });
+                Ok(ComputerLeaseGuard {
+                    store: self.store.clone(),
+                    events: self.events.clone(),
+                    lease,
+                    heartbeat: Some(heartbeat),
+                })
+            }
+            vp_store::store::ComputerLeaseAttempt::Busy { holder, events } => {
+                for event in events {
+                    let _ = self.events.send(event);
+                }
+                let detail = holder
+                    .map(|holder| {
+                        format!(
+                            "held by session {} agent {} until {}",
+                            holder.session_id, holder.agent_name, holder.expires_at
+                        )
+                    })
+                    .unwrap_or_else(|| "held by another runtime".to_string());
+                anyhow::bail!("{surface} computer surface is busy ({detail})")
+            }
+        }
+    }
+
+    /// Operator release of a stuck surface lease. Normal agents release their
+    /// guard, which also enforces the owner id.
+    pub async fn release_computer_lease(&self, lease_id: &str) -> Result<bool> {
+        let store = self.store.clone();
+        let lease_id = lease_id.to_string();
+        let event =
+            tokio::task::spawn_blocking(move || store.release_computer_lease(&lease_id, None))
+                .await??;
+        if let Some(event) = event {
+            let _ = self.events.send(event);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn list_computer_leases(&self) -> Result<Vec<vp_store::store::ComputerLease>> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.list_computer_leases()).await?
+    }
+
+    pub async fn computer_lease_active(&self, lease_id: &str) -> Result<bool> {
+        let store = self.store.clone();
+        let lease_id = lease_id.to_string();
+        let lease = tokio::task::spawn_blocking(move || store.computer_lease(&lease_id)).await??;
+        Ok(lease.is_some())
+    }
+
+    pub async fn sweep_computer_leases(&self) -> Result<usize> {
+        let store = self.store.clone();
+        let (removed, events) =
+            tokio::task::spawn_blocking(move || store.clear_expired_computer_leases()).await??;
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        Ok(removed)
     }
 
     pub(crate) fn git_mutex(&self) -> Arc<Mutex<()>> {
@@ -9137,6 +9311,36 @@ impl Engine {
         self.mcp.get_prompt(&server, name, arguments).await
     }
 
+    /// Run one bounded browser action for an agent. The helper is session- and
+    /// worktree-scoped, uses a non-persistent WebKit store, and holds the
+    /// daemon-wide `browser` ComputerLease for its lifetime.
+    pub async fn browser_action(
+        &self,
+        session_id: &str,
+        worktree: &std::path::Path,
+        agent_id: &str,
+        agent_name: &str,
+        input: serde_json::Value,
+    ) -> Result<ToolOutput> {
+        let target = browser::BrowserTarget {
+            session_id,
+            worktree,
+            agent_id,
+            agent_name,
+        };
+        self.browsers.action(self, &target, input).await
+    }
+
+    /// Stop browser helpers owned by a session before scratch cleanup.
+    pub async fn stop_session_browsers(&self, session_id: &str) -> usize {
+        self.browsers.stop_session(session_id).await
+    }
+
+    /// Stop browsers idle beyond the configured TTL.
+    pub async fn sweep_idle_browsers(&self, idle: std::time::Duration) -> usize {
+        self.browsers.sweep_idle(idle).await
+    }
+
     pub async fn console_open(&self, session_id: &str) -> Result<ConsoleOpenResult> {
         let store = self.store.clone();
         let id = session_id.to_string();
@@ -9595,6 +9799,7 @@ impl Engine {
             }
             let path = PathBuf::from(&worktree);
             if !path.exists() {
+                self.stop_session_browsers(&session.id).await;
                 let sandbox = sandbox_root.join(&session.id);
                 let _ =
                     tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&sandbox)).await?;
@@ -9640,6 +9845,7 @@ impl Engine {
             }
             crate::tooling::process::stop_worktree_processes(&path);
             crate::tooling::lsp::stop_lsp_servers(&path);
+            self.stop_session_browsers(&session.id).await;
             match tokio::task::spawn_blocking({
                 let root = project_root.clone();
                 let path = path.clone();

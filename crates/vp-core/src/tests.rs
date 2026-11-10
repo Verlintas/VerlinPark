@@ -4775,6 +4775,342 @@ async fn session_leases_serialize_two_daemons_and_release_cleanly() {
 }
 
 #[tokio::test]
+async fn computer_leases_serialize_browser_surfaces_and_release_cleanly() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let first = Engine::new(store.clone());
+    let second = Engine::new(store);
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("computer lease".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "browser lease".into(), None)
+        .await
+        .unwrap();
+    let lease = first
+        .acquire_computer_lease(
+            "browser",
+            &session.id,
+            "agent-a",
+            "Agent A",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease.surface(), "browser");
+    assert_eq!(lease.lease.owner_id, first.runtime_id());
+
+    let blocked = second
+        .acquire_computer_lease(
+            "browser",
+            &session.id,
+            "agent-b",
+            "Agent B",
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+    let error = match blocked {
+        Ok(_) => panic!("second engine acquired a held browser lease"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("busy"));
+    let leases = first.list_computer_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].session_id, session.id);
+    assert_eq!(leases[0].agent_name, "Agent A");
+
+    lease.release().await;
+    assert!(first.list_computer_leases().await.unwrap().is_empty());
+    let second_lease = second
+        .acquire_computer_lease(
+            "browser",
+            &session.id,
+            "agent-b",
+            "Agent B",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_lease.lease.agent_name, "Agent B");
+    assert!(
+        first
+            .release_computer_lease(second_lease.lease_id())
+            .await
+            .unwrap()
+    );
+    assert!(first.list_computer_leases().await.unwrap().is_empty());
+
+    let events = first.recent_events(&session.id, 100).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "computer.lease.acquired")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "computer.lease.denied")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "computer.lease.released")
+    );
+}
+
+#[tokio::test]
+async fn expired_computer_leases_are_swept_by_the_engine() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("computer sweep".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "expire".into(), None)
+        .await
+        .unwrap();
+    let attempt = store
+        .acquire_computer_lease("browser", "owner-a", &session.id, "agent-a", "Agent A", 0)
+        .unwrap();
+    match attempt {
+        vp_store::store::ComputerLeaseAttempt::Acquired { .. } => {}
+        vp_store::store::ComputerLeaseAttempt::Busy { .. } => panic!("lease was busy"),
+    }
+    let removed = engine.sweep_computer_leases().await.unwrap();
+    assert_eq!(removed, 1);
+    assert!(engine.list_computer_leases().await.unwrap().is_empty());
+    let events = engine.recent_events(&session.id, 50).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "computer.lease.expired")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the built macOS WKWebView helper and a logged-in GUI session"]
+async fn browser_helper_opens_local_page_and_saves_screenshot() {
+    use axum::Router;
+    use axum::routing::get;
+
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("browser helper".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "browser smoke".into(), None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(session.worktree.clone().expect("session worktree"));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/",
+        get(|| async {
+            axum::response::Html(
+                "<!doctype html><html><head><title>Browser Test</title></head><body>\
+                 <h1 id=\"title\">Browser Test</h1>\
+                 <button id=\"press\" onclick=\"document.getElementById('title').textContent='Clicked'\">Press</button>\
+                 </body></html>",
+            )
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let opened = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({"action": "open", "url": format!("http://{address}/")}),
+        )
+        .await
+        .unwrap();
+    assert!(!opened.is_error, "{}", opened.content);
+    let snapshot = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({"action": "snapshot"}),
+        )
+        .await
+        .unwrap();
+    assert!(!snapshot.is_error, "{}", snapshot.content);
+    assert!(
+        snapshot.content.contains("Browser Test"),
+        "{}",
+        snapshot.content
+    );
+    assert!(
+        snapshot.content.contains("[e1] button \"Press\""),
+        "{}",
+        snapshot.content
+    );
+
+    let clicked = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({"action": "click", "selector": "#press"}),
+        )
+        .await
+        .unwrap();
+    assert!(!clicked.is_error, "{}", clicked.content);
+    let after_click = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({"action": "snapshot"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        after_click.content.contains("Clicked"),
+        "{}",
+        after_click.content
+    );
+
+    let evaluated = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({
+                "action": "evaluate",
+                "script": "console.warn('browser smoke'); return document.title;",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!evaluated.is_error, "{}", evaluated.content);
+    assert!(
+        evaluated.content.contains("Browser Test"),
+        "{}",
+        evaluated.content
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let console = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({"action": "console"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        console.content.contains("browser smoke"),
+        "{}",
+        console.content
+    );
+    let waited = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({
+                "action": "wait_for",
+                "condition": "selector",
+                "value": "#title",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!waited.is_error, "{}", waited.content);
+
+    let missing = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({"action": "click", "selector": "#missing"}),
+        )
+        .await
+        .unwrap();
+    assert!(missing.is_error);
+    let still_open = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({"action": "snapshot"}),
+        )
+        .await
+        .unwrap();
+    assert!(!still_open.is_error, "{}", still_open.content);
+
+    let screenshot = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({"action": "screenshot", "path": "browser/smoke.png"}),
+        )
+        .await
+        .unwrap();
+    assert!(!screenshot.is_error, "{}", screenshot.content);
+    assert!(worktree.join("browser/smoke.png").is_file());
+
+    let closed = engine
+        .browser_action(
+            &session.id,
+            &worktree,
+            "agent-browser",
+            "Agent Browser",
+            serde_json::json!({"action": "close"}),
+        )
+        .await
+        .unwrap();
+    assert!(!closed.is_error, "{}", closed.content);
+    assert!(engine.list_computer_leases().await.unwrap().is_empty());
+    assert!(
+        !data
+            .path()
+            .join("sandbox")
+            .join(&session.id)
+            .join("browser-helper")
+            .exists()
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn coordination_and_decision_projections_replay_and_repair() {
     let data = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();

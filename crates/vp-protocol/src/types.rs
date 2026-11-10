@@ -3968,6 +3968,40 @@ pub struct RuntimeLeaseSweepResult {
     pub removed: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ComputerLeaseInfo {
+    pub lease_id: String,
+    pub surface: String,
+    pub owner_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub acquired_at: String,
+    pub heartbeat_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerLeaseListResult {
+    pub runtime_id: String,
+    pub leases: Vec<ComputerLeaseInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerLeaseSweepResult {
+    pub removed: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComputerLeaseReleaseParams {
+    pub lease_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerLeaseReleaseResult {
+    pub released: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrchestrationAdvanceParams {
     pub session_id: String,

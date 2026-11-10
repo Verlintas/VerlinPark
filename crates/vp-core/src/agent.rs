@@ -991,6 +991,7 @@ impl AgentRole {
                         | "process"
                         | "wait_for"
                         | "local_http"
+                        | "browser"
                 ),
                 AgentProfile::Research => matches!(
                     name,
@@ -8935,6 +8936,8 @@ async fn run_loop(
                 && matches!(spec.role, AgentRole::Leader | AgentRole::Manager);
             let is_tool_search = call.name == "tool_search";
             let is_artifact_file = call.name == "publish_artifact_file";
+            let is_browser =
+                call.name == "browser" && spec.role.allows_tool(spec.profile, "browser");
             let dynamic_mcp_tool = dynamic_mcp_tools
                 .iter()
                 .find(|binding| binding.exposed_name == call.name);
@@ -9262,6 +9265,32 @@ async fn run_loop(
                 match run_publish_artifact_file(engine, session, spec, input.clone()).await {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("artifact publish error: {error}")),
+                }
+            } else if is_browser {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match engine
+                    .browser_action(
+                        &session.id,
+                        &spec.worktree,
+                        &spec.id,
+                        &spec.name,
+                        input.clone(),
+                    )
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("browser error: {error}")),
                 }
             } else if is_mailbox_tool {
                 emit(
@@ -12089,6 +12118,38 @@ fn tool_schemas(
                     "summary": {"type": "string", "description": "Evidence and decision, max 2000 chars"}
                 },
                 "required": ["approved", "summary"]
+            }),
+        });
+    }
+    if role.allows_tool(profile, "browser") {
+        tools.push(ToolSchema {
+            name: "browser".to_string(),
+            description: "Drive a sandboxed local WKWebView: open localhost or worktree pages, inspect the accessibility/DOM tree, click/type/press/select, wait, read console logs, and save screenshots. External navigation is refused. The browser surface is serialized by the daemon ComputerLease. Use evaluate only when the user approves JavaScript execution."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["open", "snapshot", "click", "type", "press", "select", "wait_for", "screenshot", "console", "evaluate", "close"]
+                    },
+                    "url": {"type": "string", "description": "open: localhost HTTP(S) or a worktree file URL"},
+                    "ref": {"type": "string", "description": "Element reference from snapshot, e.g. e12"},
+                    "selector": {"type": "string", "description": "CSS selector alternative to ref"},
+                    "text": {"type": "string", "description": "type: text to enter"},
+                    "clear": {"type": "boolean", "description": "type: replace the current value; console: clear the bounded log buffer; default true for type"},
+                    "key": {"type": "string", "description": "press: key such as Enter, Tab, Escape, ArrowDown"},
+                    "value": {"type": "string", "description": "select: option value"},
+                    "condition": {"type": "string", "enum": ["selector", "text", "url"]},
+                    "timeout_ms": {"type": "integer", "minimum": 50, "maximum": 60000},
+                    "max_chars": {"type": "integer", "minimum": 200, "maximum": 24000, "description": "snapshot: cap visible text"},
+                    "max_nodes": {"type": "integer", "minimum": 1, "maximum": 1200},
+                    "path": {"type": "string", "description": "screenshot: worktree-relative output path; defaults under .verlinpark/browser"},
+                    "full_page": {"type": "boolean", "description": "screenshot: accepted for compatibility; v1 captures the viewport"},
+                    "script": {"type": "string", "description": "evaluate: explicit approval-gated JavaScript"}
+                },
+                "required": ["action"],
+                "additionalProperties": false
             }),
         });
     }

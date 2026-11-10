@@ -212,6 +212,30 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
             RiskLevel::WorkspaceWrite,
             "task control changes the persisted plan state",
         ),
+        "browser" => {
+            let action = input
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("snapshot")
+                .to_ascii_lowercase();
+            match action.as_str() {
+                "evaluate" => PermissionAssessment::new(
+                    RiskLevel::HostState,
+                    "browser JavaScript evaluation can read page state and trigger network requests",
+                ),
+                "snapshot" | "console" | "close" => {
+                    PermissionAssessment::new(RiskLevel::ReadOnly, "read-only browser inspection")
+                }
+                "screenshot" => PermissionAssessment::new(
+                    RiskLevel::WorkspaceWrite,
+                    "browser screenshot writes a file inside the worktree",
+                ),
+                _ => PermissionAssessment::new(
+                    RiskLevel::WorkspaceWrite,
+                    "browser navigation or input changes local UI state",
+                ),
+            }
+        }
         "run_project_task" | "code_diagnostics" => {
             if input.get("kind").and_then(Value::as_str) == Some("custom") {
                 let command = input
@@ -1853,5 +1877,34 @@ mod tests {
             unsafe_command.risk >= RiskLevel::HostState,
             "{unsafe_command:?}"
         );
+    }
+
+    #[test]
+    fn browser_actions_are_risk_classified_by_effect() {
+        let worktree = worktree();
+        let snapshot = assess_tool_call(
+            "browser",
+            &serde_json::json!({"action": "snapshot"}),
+            &worktree,
+        );
+        assert_eq!(snapshot.risk, RiskLevel::ReadOnly);
+        let click = assess_tool_call(
+            "browser",
+            &serde_json::json!({"action": "click", "ref": "e1"}),
+            &worktree,
+        );
+        assert_eq!(click.risk, RiskLevel::WorkspaceWrite);
+        let screenshot = assess_tool_call(
+            "browser",
+            &serde_json::json!({"action": "screenshot", "path": "browser/a.png"}),
+            &worktree,
+        );
+        assert_eq!(screenshot.risk, RiskLevel::WorkspaceWrite);
+        let evaluate = assess_tool_call(
+            "browser",
+            &serde_json::json!({"action": "evaluate", "script": "document.title"}),
+            &worktree,
+        );
+        assert_eq!(evaluate.risk, RiskLevel::HostState);
     }
 }

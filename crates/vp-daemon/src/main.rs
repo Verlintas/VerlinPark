@@ -73,6 +73,11 @@ use vp_protocol::types::{
     WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
+    ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
+    ComputerLeaseReleaseResult, ComputerLeaseSweepResult, RuntimeLeaseInfo, RuntimeLeaseListResult,
+    RuntimeLeaseSweepResult,
+};
+use vp_protocol::types::{
     CoordinationNoteParams, CoordinationNoteResult, OrchestrationAdvanceParams,
     OrchestrationAdvanceResult, OrchestrationOverviewParams, OrchestrationPolicyParams,
     OrchestrationPolicyResult, OrchestrationPreviewParams, OrchestrationSnapshotParams,
@@ -80,7 +85,6 @@ use vp_protocol::types::{
     PlanRevisionListResult, PlanRevisionRestoreParams, ReviseTeamPlanParams,
     SetOrchestrationPolicyParams, TaskEditParams,
 };
-use vp_protocol::types::{RuntimeLeaseInfo, RuntimeLeaseListResult, RuntimeLeaseSweepResult};
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
 use vp_store::paths;
@@ -158,6 +162,7 @@ async fn main() -> Result<()> {
     spawn_checkpoint_sweeper(state.engine.clone());
     spawn_memory_sweeper(state.engine.clone());
     spawn_terminal_sweeper(state.engine.clone());
+    spawn_browser_sweeper(state.engine.clone());
     spawn_orchestration_controller(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
@@ -568,6 +573,44 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Ok(removed) => RpcResponse::success(id, RuntimeLeaseSweepResult { removed }),
             Err(error) => internal_error(id, error),
         },
+        "computer.leases" => match state.engine.list_computer_leases().await {
+            Ok(leases) => RpcResponse::success(
+                id,
+                ComputerLeaseListResult {
+                    runtime_id: state.engine.runtime_id().to_string(),
+                    leases: leases
+                        .into_iter()
+                        .map(|lease| ComputerLeaseInfo {
+                            lease_id: lease.lease_id,
+                            surface: lease.surface,
+                            owner_id: lease.owner_id,
+                            session_id: lease.session_id,
+                            agent_id: lease.agent_id,
+                            agent_name: lease.agent_name,
+                            acquired_at: lease.acquired_at,
+                            heartbeat_at: lease.heartbeat_at,
+                            expires_at: lease.expires_at,
+                        })
+                        .collect(),
+                },
+            ),
+            Err(error) => internal_error(id, error),
+        },
+        "computer.leases.sweep" => match state.engine.sweep_computer_leases().await {
+            Ok(removed) => RpcResponse::success(id, ComputerLeaseSweepResult { removed }),
+            Err(error) => internal_error(id, error),
+        },
+        "computer.leases.release" => {
+            match parse_params::<ComputerLeaseReleaseParams>(request.params) {
+                Ok(params) => match state.engine.release_computer_lease(&params.lease_id).await {
+                    Ok(released) => {
+                        RpcResponse::success(id, ComputerLeaseReleaseResult { released })
+                    }
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "coordination.note" => match parse_params::<CoordinationNoteParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -2620,6 +2663,25 @@ fn spawn_terminal_sweeper(engine: Engine) {
     });
 }
 
+fn spawn_browser_sweeper(engine: Engine) {
+    let idle = vp_core::browser::BrowserManager::idle_default();
+    if idle.is_zero() {
+        return;
+    }
+    let interval_secs = (idle.as_secs() / 4).clamp(15, 300);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let browsers = engine.sweep_idle_browsers(idle).await;
+            if browsers > 0 {
+                tracing::info!(browsers, "closed idle browser helpers");
+            }
+        }
+    });
+}
+
 /// Run the deterministic controller for sessions with failed or blocked plan
 /// tasks. Task finishes already trigger a pass; this catches retry gates that
 /// become due later and failures that survived a daemon restart.
@@ -2660,6 +2722,9 @@ fn spawn_orchestration_controller(engine: Engine) {
             }
             if let Err(error) = engine.sweep_runtime_leases().await {
                 tracing::warn!(%error, "runtime lease sweep failed");
+            }
+            if let Err(error) = engine.sweep_computer_leases().await {
+                tracing::warn!(%error, "computer lease sweep failed");
             }
         }
     });

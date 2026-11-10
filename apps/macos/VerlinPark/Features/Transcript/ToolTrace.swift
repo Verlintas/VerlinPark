@@ -57,6 +57,14 @@ enum ToolTrace {
             let path = string(input, "path") ?? ""
             let query = string(input, "query") ?? ""
             return query.isEmpty ? path : "\(path) · \(query)"
+        case "browser":
+            let action = string(input, "action") ?? "snapshot"
+            let detail = string(input, "url")
+                ?? string(input, "ref")
+                ?? string(input, "selector")
+                ?? string(input, "condition")
+                ?? ""
+            return detail.isEmpty ? action : "\(action) · \(detail)"
         case "budget_status":
             return "budgets"
         case "task_detail", "task_control":
@@ -134,6 +142,8 @@ enum ToolTrace {
             return "doc.text.magnifyingglass"
         case "budget_status", "task_detail", "task_control", "tool_search":
             return "gauge"
+        case "browser":
+            return "safari"
         case "shell":
             return "terminal"
         case "fetch_url":

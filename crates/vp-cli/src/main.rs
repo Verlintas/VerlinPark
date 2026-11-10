@@ -444,6 +444,15 @@ enum Command {
     Leases,
     /// Remove expired runtime leases left by a crashed process.
     LeasesSweep,
+    /// Show daemon-wide computer browser/GUI leases; optionally sweep or release.
+    Computer {
+        /// Remove expired computer leases.
+        #[arg(long)]
+        sweep: bool,
+        /// Release a stuck lease by id (operator override).
+        #[arg(long)]
+        release: Option<String>,
+    },
     /// Show the project's shell permission policy.
     ShellPolicy { project: String },
     /// Update the project's shell network/read-deny policy.
@@ -1789,6 +1798,20 @@ async fn main() -> Result<()> {
         }
         Command::Leases => rpc(&discovery, "runtime.leases", json!({})).await?,
         Command::LeasesSweep => rpc(&discovery, "runtime.leases.sweep", json!({})).await?,
+        Command::Computer { sweep, release } => {
+            if let Some(lease_id) = release {
+                rpc(
+                    &discovery,
+                    "computer.leases.release",
+                    json!({"lease_id": lease_id}),
+                )
+                .await?
+            } else if sweep {
+                rpc(&discovery, "computer.leases.sweep", json!({})).await?
+            } else {
+                rpc(&discovery, "computer.leases", json!({})).await?
+            }
+        }
         Command::ShellPolicy { project } => {
             rpc(
                 &discovery,

@@ -1633,11 +1633,20 @@ fn recovery_interrupts_tasks_and_clears_leases() {
     store
         .try_acquire_write_lease(&project.id, &session.id, "agent-a", &["src/one".into()])
         .unwrap();
+    store
+        .acquire_computer_lease("browser", "daemon-a", &session.id, "agent-a", "Agent A", 60)
+        .unwrap();
     store.update_session_status(&session.id, "running").unwrap();
 
     let (recovered, events) = store.recover_state().unwrap();
     assert_eq!(recovered, vec![session.id.clone()]);
     assert!(store.list_write_leases(None, None).unwrap().is_empty());
+    assert!(store.list_computer_leases().unwrap().is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "computer.lease.expired")
+    );
     let tasks = store.list_plan_tasks(Some(&project.id), None).unwrap();
     assert_eq!(
         tasks
@@ -2071,6 +2080,130 @@ fn expired_runtime_leases_can_be_swept_or_taken_over() {
     assert_eq!(lease.owner_id, "daemon-b");
     let removed = store.clear_expired_runtime_leases().unwrap();
     assert_eq!(removed, 0);
+}
+
+#[test]
+fn computer_leases_are_exclusive_owned_and_audited() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("browser"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let acquired = store
+        .acquire_computer_lease("browser", "owner-a", &first.id, "agent-a", "Agent A", 60)
+        .unwrap();
+    let lease = match acquired {
+        ComputerLeaseAttempt::Acquired { lease, events } => {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == "computer.lease.acquired")
+            );
+            lease
+        }
+        ComputerLeaseAttempt::Busy { .. } => panic!("first computer lease was busy"),
+    };
+    assert_eq!(lease.surface, "browser");
+    assert_eq!(lease.session_id, first.id);
+    assert_eq!(store.list_computer_leases().unwrap().len(), 1);
+
+    let busy = store
+        .acquire_computer_lease("browser", "owner-b", &second.id, "agent-b", "Agent B", 60)
+        .unwrap();
+    match busy {
+        ComputerLeaseAttempt::Acquired { .. } => panic!("second computer lease was acquired"),
+        ComputerLeaseAttempt::Busy { holder, events } => {
+            assert_eq!(
+                holder.as_ref().map(|lease| lease.session_id.as_str()),
+                Some(first.id.as_str())
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == "computer.lease.denied")
+            );
+        }
+    }
+    assert!(
+        !store
+            .renew_computer_lease(&lease.lease_id, "owner-b", 60)
+            .unwrap()
+    );
+    assert!(
+        store
+            .renew_computer_lease(&lease.lease_id, "owner-a", 60)
+            .unwrap()
+    );
+    assert!(
+        store
+            .release_computer_lease(&lease.lease_id, Some("owner-b"))
+            .unwrap()
+            .is_none()
+    );
+    let released = store
+        .release_computer_lease(&lease.lease_id, Some("owner-a"))
+        .unwrap()
+        .expect("release event");
+    assert_eq!(released.kind, "computer.lease.released");
+    assert!(store.list_computer_leases().unwrap().is_empty());
+
+    let events = store.recent_events(&first.id, 20).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "computer.lease.acquired")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "computer.lease.released")
+    );
+    let attempts = store.recent_events(&second.id, 20).unwrap();
+    assert!(
+        attempts
+            .iter()
+            .any(|event| event.kind == "computer.lease.denied")
+    );
+}
+
+#[test]
+fn expired_computer_leases_are_swept_or_taken_over() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("browser"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let acquired = store
+        .acquire_computer_lease("browser", "owner-a", &first.id, "agent-a", "Agent A", 0)
+        .unwrap();
+    let lease = match acquired {
+        ComputerLeaseAttempt::Acquired { lease, .. } => lease,
+        ComputerLeaseAttempt::Busy { .. } => panic!("zero-ttl computer lease was busy"),
+    };
+    let takeover = store
+        .acquire_computer_lease("browser", "owner-b", &second.id, "agent-b", "Agent B", 60)
+        .unwrap();
+    let new_lease = match takeover {
+        ComputerLeaseAttempt::Acquired { lease, events } => {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == "computer.lease.expired")
+            );
+            lease
+        }
+        ComputerLeaseAttempt::Busy { .. } => panic!("expired computer lease was not taken over"),
+    };
+    assert_ne!(lease.lease_id, new_lease.lease_id);
+    assert_eq!(
+        store.list_computer_leases().unwrap()[0].owner_id,
+        "owner-b".to_string()
+    );
+    let (removed, events) = store.clear_expired_computer_leases().unwrap();
+    assert_eq!(removed, 0);
+    assert!(events.is_empty());
 }
 
 #[test]

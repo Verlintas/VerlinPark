@@ -46,6 +46,51 @@ fn map_runtime_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeLease> 
     })
 }
 
+/// A daemon-wide lease over an interactive computer surface (browser or GUI).
+/// It is deliberately separate from the worktree write-scope leases: a
+/// `ComputerLease` serializes visual/interactive state, not file writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputerLease {
+    pub lease_id: String,
+    pub surface: String,
+    pub owner_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub acquired_at: String,
+    pub heartbeat_at: String,
+    pub expires_at: String,
+}
+
+fn map_computer_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComputerLease> {
+    Ok(ComputerLease {
+        lease_id: row.get(0)?,
+        surface: row.get(1)?,
+        owner_id: row.get(2)?,
+        session_id: row.get(3)?,
+        agent_id: row.get(4)?,
+        agent_name: row.get(5)?,
+        acquired_at: row.get(6)?,
+        heartbeat_at: row.get(7)?,
+        expires_at: row.get(8)?,
+    })
+}
+
+/// Outcome of a computer-lease acquisition. The event list contains any
+/// expired leases removed in the same transaction plus the acquisition or
+/// contention audit event, so the engine can broadcast them after commit.
+#[derive(Debug, Clone)]
+pub enum ComputerLeaseAttempt {
+    Acquired {
+        lease: ComputerLease,
+        events: Vec<Event>,
+    },
+    Busy {
+        holder: Option<ComputerLease>,
+        events: Vec<Event>,
+    },
+}
+
 /// Input for creating a standalone intake task. Kept in the store layer so
 /// the engine and tests construct the same shape without a 15-argument call.
 #[derive(Debug, Clone)]
@@ -1074,6 +1119,23 @@ impl Store {
                 ON runtime_leases(expires_at);
             CREATE INDEX IF NOT EXISTS idx_runtime_leases_session
                 ON runtime_leases(session_id);
+
+            CREATE TABLE IF NOT EXISTS computer_leases (
+                lease_id      TEXT PRIMARY KEY,
+                surface       TEXT NOT NULL UNIQUE,
+                owner_id      TEXT NOT NULL,
+                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                agent_id      TEXT NOT NULL,
+                agent_name    TEXT NOT NULL,
+                acquired_at   TEXT NOT NULL,
+                heartbeat_at  TEXT NOT NULL,
+                expires_at    TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_computer_leases_expiry
+                ON computer_leases(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_computer_leases_session
+                ON computer_leases(session_id);
             "#,
         )?;
         let fts_migrated = conn
@@ -8017,6 +8079,276 @@ impl Store {
         Ok(changed)
     }
 
+    /// Acquire the daemon-wide lease for an interactive surface. Expired
+    /// leases are removed and audited in the same transaction; an unexpired
+    /// lease on the same surface returns the current holder without changing
+    /// it. The caller must hold and renew the returned lease ID.
+    pub fn acquire_computer_lease(
+        &self,
+        surface: &str,
+        owner_id: &str,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        ttl_secs: u64,
+    ) -> Result<ComputerLeaseAttempt> {
+        let surface = surface.trim();
+        if surface.is_empty() || surface.len() > 64 {
+            anyhow::bail!("computer lease surface must be between 1 and 64 characters");
+        }
+        if owner_id.trim().is_empty() || agent_id.trim().is_empty() {
+            anyhow::bail!("computer lease owner and agent are required");
+        }
+        let now = time::OffsetDateTime::now_utc();
+        let now_text = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("formatting computer lease time")?;
+        let expires = now + time::Duration::seconds(ttl_secs.min(86_400) as i64);
+        let expires_text = expires
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("formatting computer lease expiry")?;
+        let mut events = Vec::new();
+        let outcome = {
+            let mut conn = self.lock()?;
+            let tx = conn.transaction()?;
+            let expired = {
+                let mut stmt = tx.prepare(
+                    "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                            acquired_at, heartbeat_at, expires_at
+                     FROM computer_leases WHERE expires_at <= ?1
+                     ORDER BY expires_at ASC, lease_id ASC",
+                )?;
+                let rows = stmt.query_map(params![now_text], map_computer_lease)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for lease in &expired {
+                tx.execute(
+                    "DELETE FROM computer_leases WHERE lease_id = ?1",
+                    params![&lease.lease_id],
+                )?;
+                events.push(insert_event_tx(
+                    &tx,
+                    &lease.session_id,
+                    "computer.lease.expired",
+                    serde_json::json!({
+                        "lease": lease,
+                        "reason": "expired before a new acquisition",
+                    }),
+                )?);
+            }
+            let holder = tx
+                .query_row(
+                    "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                            acquired_at, heartbeat_at, expires_at
+                     FROM computer_leases WHERE surface = ?1",
+                    params![surface],
+                    map_computer_lease,
+                )
+                .optional()?;
+            if let Some(holder) = holder {
+                events.push(insert_event_tx(
+                    &tx,
+                    session_id,
+                    "computer.lease.denied",
+                    serde_json::json!({
+                        "surface": surface,
+                        "holder": holder,
+                        "owner_id": owner_id,
+                    }),
+                )?);
+                tx.commit()?;
+                ComputerLeaseAttempt::Busy {
+                    holder: Some(holder),
+                    events,
+                }
+            } else {
+                let lease = ComputerLease {
+                    lease_id: Uuid::now_v7().to_string(),
+                    surface: surface.to_string(),
+                    owner_id: owner_id.to_string(),
+                    session_id: session_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    agent_name: agent_name.to_string(),
+                    acquired_at: now_text.clone(),
+                    heartbeat_at: now_text.clone(),
+                    expires_at: expires_text,
+                };
+                tx.execute(
+                    "INSERT INTO computer_leases
+                     (lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                      acquired_at, heartbeat_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        &lease.lease_id,
+                        &lease.surface,
+                        &lease.owner_id,
+                        &lease.session_id,
+                        &lease.agent_id,
+                        &lease.agent_name,
+                        &lease.acquired_at,
+                        &lease.heartbeat_at,
+                        &lease.expires_at,
+                    ],
+                )?;
+                events.push(insert_event_tx(
+                    &tx,
+                    &lease.session_id,
+                    "computer.lease.acquired",
+                    serde_json::to_value(&lease)?,
+                )?);
+                tx.commit()?;
+                ComputerLeaseAttempt::Acquired { lease, events }
+            }
+        };
+        let mirror_events = match &outcome {
+            ComputerLeaseAttempt::Acquired { events, .. }
+            | ComputerLeaseAttempt::Busy { events, .. } => events.clone(),
+        };
+        for event in &mirror_events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append computer lease event mirror");
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub fn renew_computer_lease(
+        &self,
+        lease_id: &str,
+        owner_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool> {
+        let now = time::OffsetDateTime::now_utc();
+        let now_text = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("formatting computer lease time")?;
+        let expires = now + time::Duration::seconds(ttl_secs.min(86_400) as i64);
+        let expires_text = expires
+            .format(&time::format_description::well_known::Rfc3339)
+            .context("formatting computer lease expiry")?;
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE computer_leases
+             SET heartbeat_at = ?1, expires_at = ?2
+             WHERE lease_id = ?3 AND owner_id = ?4",
+            params![now_text, expires_text, lease_id, owner_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Release a computer lease. `owner_id` is enforced for runtime guards;
+    /// `None` lets an operator clear a stuck lease through the CLI/RPC.
+    pub fn release_computer_lease(
+        &self,
+        lease_id: &str,
+        owner_id: Option<&str>,
+    ) -> Result<Option<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let lease = tx
+            .query_row(
+                "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                        acquired_at, heartbeat_at, expires_at
+                 FROM computer_leases WHERE lease_id = ?1",
+                params![lease_id],
+                map_computer_lease,
+            )
+            .optional()?;
+        let Some(lease) = lease else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        if let Some(owner_id) = owner_id
+            && lease.owner_id != owner_id
+        {
+            tx.commit()?;
+            return Ok(None);
+        }
+        tx.execute(
+            "DELETE FROM computer_leases WHERE lease_id = ?1",
+            params![lease_id],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &lease.session_id,
+            "computer.lease.released",
+            serde_json::json!({
+                "lease": lease,
+                "reason": if owner_id.is_some() { "released by owner" } else { "released by operator" },
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append computer lease release mirror");
+        }
+        Ok(Some(event))
+    }
+
+    pub fn list_computer_leases(&self) -> Result<Vec<ComputerLease>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                    acquired_at, heartbeat_at, expires_at
+             FROM computer_leases ORDER BY surface ASC, acquired_at ASC",
+        )?;
+        let rows = stmt.query_map([], map_computer_lease)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn computer_lease(&self, lease_id: &str) -> Result<Option<ComputerLease>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                    acquired_at, heartbeat_at, expires_at
+             FROM computer_leases WHERE lease_id = ?1",
+            params![lease_id],
+            map_computer_lease,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Remove expired computer leases and return their audit events. The
+    /// engine broadcasts the events after the transaction commits.
+    pub fn clear_expired_computer_leases(&self) -> Result<(usize, Vec<Event>)> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let expired = {
+            let mut stmt = tx.prepare(
+                "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                        acquired_at, heartbeat_at, expires_at
+                 FROM computer_leases WHERE expires_at <= ?1
+                 ORDER BY expires_at ASC, lease_id ASC",
+            )?;
+            let rows = stmt.query_map(params![now], map_computer_lease)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut events = Vec::new();
+        for lease in &expired {
+            tx.execute(
+                "DELETE FROM computer_leases WHERE lease_id = ?1",
+                params![&lease.lease_id],
+            )?;
+            events.push(insert_event_tx(
+                &tx,
+                &lease.session_id,
+                "computer.lease.expired",
+                serde_json::json!({
+                    "lease": lease,
+                    "reason": "expired during lease sweep",
+                }),
+            )?);
+        }
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append computer lease expiry mirror");
+            }
+        }
+        Ok((expired.len(), events))
+    }
+
     pub fn try_acquire_write_lease(
         &self,
         project_id: &str,
@@ -8300,8 +8632,29 @@ impl Store {
         )?;
         tx.execute("DELETE FROM write_leases", [])?;
         tx.execute("DELETE FROM runtime_leases", [])?;
+        let interrupted_computer_leases = {
+            let mut stmt = tx.prepare(
+                "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                        acquired_at, heartbeat_at, expires_at
+                 FROM computer_leases ORDER BY acquired_at ASC, lease_id ASC",
+            )?;
+            let rows = stmt.query_map([], map_computer_lease)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute("DELETE FROM computer_leases", [])?;
 
         let mut events = Vec::new();
+        for lease in &interrupted_computer_leases {
+            events.push(insert_event_tx(
+                &tx,
+                &lease.session_id,
+                "computer.lease.expired",
+                serde_json::json!({
+                    "lease": lease,
+                    "reason": "daemon restarted while the computer surface was leased",
+                }),
+            )?);
+        }
         for session_id in &sessions {
             events.push(insert_event_tx(
                 &tx,

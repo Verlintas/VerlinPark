@@ -8024,13 +8024,17 @@ fn tool_role_matrix_matches_the_tooling_roadmap() {
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "web_search"));
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "apply_patch"));
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "run_project_task"));
+    assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "browser"));
 
     assert!(AgentRole::Verifier.allows_tool(AgentProfile::Verification, "run_project_task"));
     assert!(!AgentRole::Verifier.allows_tool(AgentProfile::Verification, "apply_patch"));
+    assert!(!AgentRole::Verifier.allows_tool(AgentProfile::Verification, "browser"));
 
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "apply_patch"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "file_manage"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "git"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "browser"));
+    assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "browser"));
     assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "apply_patch"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Research, "read_files"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Research, "web_search"));

@@ -45,6 +45,13 @@ HELPER_DIR="$APP/Contents/Helpers"
 mkdir -p "$HELPER_DIR"
 cp "$ROOT/target/release/verlinpadd" "$HELPER_DIR/verlinpadd"
 chmod +x "$HELPER_DIR/verlinpadd"
+BROWSER_HELPER="$ROOT/apps/macos/build/Build/Products/Release/VerlinParkBrowserHelper"
+if [[ -x "$BROWSER_HELPER" ]]; then
+  cp "$BROWSER_HELPER" "$HELPER_DIR/VerlinParkBrowserHelper"
+  chmod +x "$HELPER_DIR/VerlinParkBrowserHelper"
+else
+  echo "warning: VerlinParkBrowserHelper not built; browser tool will report unavailable" >&2
+fi
 
 if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
   echo "==> Developer ID signing: $SIGN_IDENTITY"

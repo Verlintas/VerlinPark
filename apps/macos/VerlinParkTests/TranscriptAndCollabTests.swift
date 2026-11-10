@@ -205,6 +205,16 @@ final class TranscriptAndCollabTests: XCTestCase {
             ),
             "Cargo.toml · package.version"
         )
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "browser",
+                input: .object([
+                    "action": .string("open"),
+                    "url": .string("http://127.0.0.1:3000"),
+                ])
+            ),
+            "open · http://127.0.0.1:3000"
+        )
         XCTAssertTrue(
             ToolTrace.isHostSensitive(
                 name: "shell",
