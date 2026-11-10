@@ -3729,6 +3729,19 @@ impl AgentService {
                 "idle" | "failed" | "cancelled" => {}
                 _ => continue,
             }
+            // Stall recovery owns the next plan resume when it is already
+            // cancelling or waiting for quiescence. Let it complete first so a
+            // ready continuation cannot race the recovered task.
+            let recovery_active = self
+                .engine
+                .orchestration_recoveries(&continuation.session_id)
+                .await?
+                .recoveries
+                .iter()
+                .any(|recovery| matches!(recovery.status.as_str(), "requested" | "waiting_cancel"));
+            if recovery_active {
+                continue;
+            }
 
             attempted_sessions.insert(continuation.session_id.clone());
             let Some(continuation) = self

@@ -4008,8 +4008,9 @@ pub struct OrchestrationPolicy {
     /// What to do after repeated stall observations. The default keeps the
     /// telemetry-only behavior from ADR-0139.
     pub stall_recovery: StallRecoveryMode,
-    /// Consecutive `orchestration.stall` observations required before an
-    /// escalation or recovery request is considered.
+    /// `orchestration.stall` observations required before an escalation or
+    /// recovery request is considered. After an earlier recovery transition,
+    /// this many additional observations are required for the next one.
     pub stall_min_observations: u32,
     /// Maximum automatic stall-recovery retries per task/plan revision.
     /// `0` disables recovery retries even when `stall_recovery` is `retry`.

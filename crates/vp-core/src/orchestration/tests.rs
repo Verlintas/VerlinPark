@@ -205,10 +205,14 @@ fn stall_recovery_escalates_once_per_window() {
     );
     assert_eq!(
         decide_stall_recovery(&policy, Some(&existing), &stall(3, "running")),
+        StallRecoveryDecision::None
+    );
+    assert_eq!(
+        decide_stall_recovery(&policy, Some(&existing), &stall(4, "running")),
         StallRecoveryDecision::Escalate
     );
     assert_eq!(
-        decide_stall_recovery(&policy, Some(&existing), &stall(3, "completed")),
+        decide_stall_recovery(&policy, Some(&existing), &stall(4, "completed")),
         StallRecoveryDecision::None
     );
 }
@@ -235,11 +239,15 @@ fn stall_recovery_retry_requests_once_and_respects_attempts() {
     let retried = recovery_row("retried", 1, 2);
     assert_eq!(
         decide_stall_recovery(&policy, Some(&retried), &stall(3, "running")),
+        StallRecoveryDecision::None
+    );
+    assert_eq!(
+        decide_stall_recovery(&policy, Some(&retried), &stall(4, "running")),
         StallRecoveryDecision::Retry
     );
     let exhausted = recovery_row("retried", 2, 2);
     assert!(matches!(
-        decide_stall_recovery(&policy, Some(&exhausted), &stall(3, "running")),
+        decide_stall_recovery(&policy, Some(&exhausted), &stall(4, "running")),
         StallRecoveryDecision::Exhausted { .. }
     ));
     let failed = recovery_row("failed", 2, 3);

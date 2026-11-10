@@ -37,7 +37,7 @@ worktree lifecycle.
 | Field | Default | Bounds | Meaning |
 |---|---|---|---|
 | `stall_recovery` | `observe` | `observe`, `escalate`, `retry` | What a repeated stall may trigger |
-| `stall_min_observations` | `2` | `1..=10` | Consecutive stall observations required |
+| `stall_min_observations` | `2` | `1..=10` | Stall observations required before a transition; after an earlier recovery, a fresh window of this many additional observations is required |
 | `stall_max_attempts` | `1` | `0..=5` | Automatic recovery retries per task/plan revision; `0` disables retries |
 | `stall_grace_secs` | `300` | `0..=86400` | Time allowed for cancellation and session quiescence |
 

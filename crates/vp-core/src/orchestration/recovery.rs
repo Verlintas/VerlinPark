@@ -77,8 +77,15 @@ pub fn decide_stall_recovery(
             // A request or cooperative cancellation is already in flight.
             return StallRecoveryDecision::None;
         }
-        if recovery.last_stall_count >= stall.stall_count {
-            // This stall window already produced a recovery transition.
+        // `stall_count` is cumulative per task/plan revision. A recovery row
+        // records the last count that produced a transition, so a later
+        // transition needs a fresh window of `stall_min_observations`, not one
+        // extra event after an earlier recovery.
+        if stall.stall_count
+            < recovery
+                .last_stall_count
+                .saturating_add(policy.stall_min_observations.max(1))
+        {
             return StallRecoveryDecision::None;
         }
     }
