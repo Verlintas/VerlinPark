@@ -5461,9 +5461,13 @@ impl Store {
         let cutoff = older_than_days
             .map(|days| time::OffsetDateTime::now_utc() - time::Duration::days(i64::from(days)));
         let conn = self.lock()?;
+        // Pinning is explicit operator intent to retain a memory. Prune must
+        // never silently delete a pinned row, and `keep_latest` counts only
+        // unpinned rows so pinning one item cannot push another pinned item
+        // out of the budget.
         let mut stmt = conn.prepare(
             "SELECT id, created_at FROM memories
-             WHERE project_id = ?1 ORDER BY created_at DESC",
+             WHERE project_id = ?1 AND pinned = 0 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![project_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

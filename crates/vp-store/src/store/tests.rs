@@ -796,6 +796,64 @@ fn deletes_and_prunes_memories_with_events() {
 }
 
 #[test]
+fn prune_never_removes_pinned_memories() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "memory pins").unwrap();
+    let mut memories = Vec::new();
+    for index in 0..3 {
+        let (memory, _) = store
+            .create_memory_with_event(
+                &session.id,
+                &project.id,
+                "agent-1",
+                "Leader",
+                "note",
+                &format!("pinned {index}"),
+                &format!("body {index}"),
+                &[],
+            )
+            .unwrap();
+        memories.push(memory);
+    }
+    let (pinned, event) = store
+        .update_memory_with_event(&memories[2].id, None, Some(true), None)
+        .unwrap()
+        .unwrap();
+    assert!(pinned.pinned);
+    assert_eq!(event.kind, "memory.updated");
+
+    // The pinned newest row is excluded before `keep_latest` is applied, so
+    // only the row beyond the unpinned budget is a prune candidate.
+    let ids = store
+        .memory_ids_for_prune(&project.id, None, Some(1))
+        .unwrap();
+    assert_eq!(ids, vec![memories[0].id.clone()]);
+
+    // Age-based pruning must also leave the pinned row alone.
+    {
+        let conn = store.lock().unwrap();
+        for memory in &memories {
+            conn.execute(
+                "UPDATE memories SET created_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+                params![memory.id],
+            )
+            .unwrap();
+        }
+    }
+    let mut by_age = store
+        .memory_ids_for_prune(&project.id, Some(30), None)
+        .unwrap();
+    let mut expected = vec![memories[0].id.clone(), memories[1].id.clone()];
+    by_age.sort();
+    expected.sort();
+    assert_eq!(by_age, expected);
+    assert!(by_age.iter().all(|id| id != &memories[2].id));
+}
+
+#[test]
 fn prunes_memories_older_than_a_cutoff() {
     let (_data, store, repo) = test_store();
     let project = store
