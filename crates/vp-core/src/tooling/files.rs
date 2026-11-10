@@ -1493,7 +1493,7 @@ fn mode_string(metadata: &std::fs::Metadata) -> String {
     }
 }
 
-fn mime_for_path(path: &Path) -> &'static str {
+pub(crate) fn mime_for_path(path: &Path) -> &'static str {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())

@@ -5,10 +5,14 @@
 //! model to compose long shell/search/read chains.
 
 pub mod code;
+pub mod data;
 pub mod diff;
 pub mod files;
 pub mod fs;
 pub mod git;
 pub mod http;
+pub mod lsp;
+pub mod media;
 pub mod process;
 pub mod project;
+pub mod web;

@@ -144,6 +144,11 @@ impl ToolRegistry {
                 Arc::new(crate::tooling::process::ProcessTool),
                 Arc::new(crate::tooling::process::WaitFor),
                 Arc::new(crate::tooling::http::LocalHttp),
+                Arc::new(crate::tooling::lsp::LspQuery),
+                Arc::new(crate::tooling::web::WebSearch),
+                Arc::new(crate::tooling::media::ReadPdf),
+                Arc::new(crate::tooling::media::ReadImage),
+                Arc::new(crate::tooling::data::DataQuery),
             ],
         }
     }
@@ -1933,6 +1938,38 @@ mod tests {
             .await
             .unwrap();
         assert!(output.content.contains("hello.txt:2"));
+    }
+
+    #[test]
+    fn registry_tool_names_are_unique_and_cover_the_tooling_wave() {
+        let registry = ToolRegistry::default_tools();
+        let names = registry
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<Vec<_>>();
+        let unique = names.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), unique.len(), "duplicate tool names: {names:?}");
+        for expected in [
+            "apply_patch",
+            "find_files",
+            "project_profile",
+            "run_project_task",
+            "git",
+            "repo_map",
+            "lsp_query",
+            "web_search",
+            "read_pdf",
+            "read_image",
+            "data_query",
+            "process",
+            "local_http",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing {expected}"
+            );
+        }
     }
 
     #[test]

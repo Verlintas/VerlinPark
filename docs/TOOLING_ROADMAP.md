@@ -1,6 +1,6 @@
 # VerlinPark Agent Tooling Roadmap
 
-> **Status:** Wave A, Wave B, and selected Wave C tools implemented on 2026-11-10; media/search/introspection/GUI tools deferred.<br>
+> **Status:** Wave A/B/C, optional LSP, provider search, document readers, and runtime introspection implemented on 2026-11-10; office documents, browser, and computer tools remain deferred.<br>
 > **Date:** 2026-11-10<br>
 > **Code baseline:** working tree after `c64e1b8`; see ADR-0134.<br>
 > **Implementation budget:** ~10,000–30,000 code lines, target core ~24k, hard planning cap 30k<br>
@@ -39,11 +39,20 @@ Implemented in this wave (see ADR-0134 and PROGRESS):
 - parallel read-only registry tools (max 4, stable ordering);
 - `process`, `wait_for`, `local_http`, upgraded `fetch_url` (covers the
   readability/metadata part of W-02; no separate `read_url` tool yet);
+- optional `lsp_query` over installed rust-analyzer/sourcekit-lsp/
+  typescript-language-server/pyright/gopls/clangd servers;
+- provider-backed `web_search` (SearXNG, Brave, Tavily via environment config);
+- `read_pdf`, `read_image` (metadata + optional tesseract OCR), and `data_query`
+  for JSON/YAML/TOML/CSV;
+- runtime `budget_status`, `task_detail`, `task_control`, `tool_search`, and
+  `publish_artifact_file` with role-aware dispatch;
 - role/permission matrix, tests, UI tool labels.
 
-Still open: `web_search`, LSP backend, PDF/image/office reading,
-`publish_artifact_file`, `budget_status`, `task_detail`, `tool_search`,
-`task_control`, `data_query`, `browser`, `computer`.
+Still open: office documents (`read_document`), browser, and computer control.
+Browser was spiked with headless Chrome/CDP but deferred: Chrome's network
+service and nested sandbox do not work reliably under the daemon's Seatbelt
+profile, and running it unsandboxed would violate the worktree write boundary.
+A future browser needs a dedicated helper process or a WebKit-backed host.
 
 ---
 
@@ -1004,23 +1013,23 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 [x] C-06 affected_tests
 [x] C-07 dependency_graph
 [x] C-08 build_context
-[–] C-05 lsp_query
+[x] C-05 lsp_query
 
 [x] S-01 process
 [x] S-02 wait_for
 [x] S-03 local_http
-[–] W-01 web_search
+[x] W-01 web_search
 [~] W-02 read_url (readability/metadata landed in fetch_url; separate tool not added)
-[–] M-02 read_pdf
-[–] M-01 read_image
-[–] A-01 publish_artifact_file
-[–] T-01 budget_status
-[–] T-02 task_detail
-[–] T-03 tool_search
-[–] T-04 task_control (only after task lifecycle hardening)
-[–] D-01 data_query
+[x] M-02 read_pdf
+[x] M-01 read_image
+[x] A-01 publish_artifact_file
+[x] T-01 budget_status
+[x] T-02 task_detail
+[x] T-03 tool_search
+[x] T-04 task_control
+[x] D-01 data_query
 
-[–] U-01 browser (stretch)
+[–] U-01 browser (stretch; deferred after sandbox spike)
 [–] U-02 computer (stretch)
 [–] M-03 read_document (stretch)
 ```

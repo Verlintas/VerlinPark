@@ -208,6 +208,10 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
                 PermissionAssessment::new(RiskLevel::ReadOnly, "process control")
             }
         }
+        "task_control" => PermissionAssessment::new(
+            RiskLevel::WorkspaceWrite,
+            "task control changes the persisted plan state",
+        ),
         "run_project_task" | "code_diagnostics" => {
             if input.get("kind").and_then(Value::as_str) == Some("custom") {
                 let command = input
@@ -236,6 +240,15 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
         | "dependency_graph"
         | "build_context"
         | "affected_tests"
+        | "lsp_query"
+        | "web_search"
+        | "read_pdf"
+        | "read_image"
+        | "data_query"
+        | "budget_status"
+        | "task_detail"
+        | "tool_search"
+        | "publish_artifact_file"
         | "wait_for"
         | "fetch_url"
         | "delegate"

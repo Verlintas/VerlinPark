@@ -580,11 +580,16 @@ just test                  # Rust + xcodebuild test (40 Swift tests)
 - `git` 工具只读；stage/commit/branch 仍由 runtime/merge queue 拥有。
 - Manager 仍是 code read-only；Verifier 仍不能写代码；approval、write scope、
   capacity、budget、Verifier gate 均未放宽。
-- 当前测试：Rust 451（core 365 / protocol 2 / store 70 / providers 14；3 个
-  live ignored），Swift 以最新 Xcode 测试输出为准。此前本文记录的 358/104
-  是历史基线。
+- 当前测试：Rust 470（core 384 / protocol 2 / store 70 / providers 14；3 个
+  live ignored），Swift 110。此前本文记录的 358/104 是历史基线。
+- 新增 optional LSP、provider search、PDF/image/data reader、runtime
+  budget/task/tool/artifact 工具；LSP 不自动安装，search 需要显式 provider
+  配置，PDF 页边界 best-effort，image OCR 需要 tesseract，data query 是
+  deterministic path subset。
+- Browser/computer 仍未交付。headless Chrome/CDP 在 daemon Seatbelt 内无法
+  可靠加载 HTTP 页面；unsandboxed 运行会违反 worktree 写边界，因此没有把
+  半成品 browser 工具注册给 agent。
 
-仍未解决：web_search、LSP backend、PDF/image/office 读取、
-publish_artifact_file、budget_status/task_detail/tool_search、task_control、
-data_query、browser/computer，以及本文既有的分布式 scheduler/fencing、
-完整 shell read/network confinement、默认自动冲突解决等。
+仍未解决：office documents、browser/computer、完整 ComputerLease，以及本文
+既有的分布式 scheduler/fencing、完整 shell read/network confinement、默认
+自动冲突解决等。

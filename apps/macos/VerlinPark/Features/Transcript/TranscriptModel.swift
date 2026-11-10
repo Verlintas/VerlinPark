@@ -107,6 +107,8 @@ enum TranscriptProjection {
             "find_files", "file_info", "read_files", "project_profile", "git",
             "repo_map", "find_symbol", "find_references", "dependency_graph",
             "build_context", "affected_tests", "code_diagnostics",
+            "lsp_query", "read_pdf", "read_image", "data_query",
+            "budget_status", "task_detail", "tool_search",
             "todo_write", "fetch_url", "remember", "recall", "coordinate",
             "team_status", "send_message", "read_mailbox", "list_artifacts",
             "read_artifact", "publish_artifact", "search_sources", "read_source",

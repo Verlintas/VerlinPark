@@ -8015,6 +8015,12 @@ async fn active_skill_narrows_tools_at_execution_time() {
 fn tool_role_matrix_matches_the_tooling_roadmap() {
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "project_profile"));
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "git"));
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "lsp_query"));
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "read_pdf"));
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "read_image"));
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "data_query"));
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Research, "web_search"));
+    assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "web_search"));
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "apply_patch"));
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "run_project_task"));
 
@@ -8026,6 +8032,8 @@ fn tool_role_matrix_matches_the_tooling_roadmap() {
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "git"));
     assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "apply_patch"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Research, "read_files"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Research, "web_search"));
+    assert!(!AgentRole::Worker.allows_tool(AgentProfile::Coding, "web_search"));
     assert!(!AgentRole::Worker.allows_tool(AgentProfile::Generic, "shell"));
 }
 
@@ -8105,5 +8113,163 @@ async fn executes_parallel_reads_and_structured_patch_tools() {
         events.iter().any(|event| {
             event.kind == "agent.turn_finished" && event.payload["parallel"] == true
         })
+    );
+}
+
+#[tokio::test]
+async fn exposes_runtime_budget_search_and_artifact_tools() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "budget".into(),
+                    name: "budget_status".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "search".into(),
+                    name: "tool_search".into(),
+                    arguments: r#"{"query":"read file"}"#.into(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "artifact".into(),
+                    name: "publish_artifact_file".into(),
+                    arguments: r#"{"path":"README.md","name":"readme","kind":"report"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("runtime tools complete".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "runtime tools".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "inspect runtime tools")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let budget = events
+        .iter()
+        .find(|event| event.kind == "tool.finished" && event.payload["name"] == "budget_status")
+        .expect("budget result");
+    assert!(budget.payload["structured"]["session"].is_object());
+    assert_eq!(budget.payload["structured"]["unlimited"], false);
+    let search = events
+        .iter()
+        .find(|event| event.kind == "tool.finished" && event.payload["name"] == "tool_search")
+        .expect("tool search result");
+    assert!(
+        search.payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("read_file")
+    );
+    let artifact = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished" && event.payload["name"] == "publish_artifact_file"
+        })
+        .expect("artifact result");
+    assert!(!artifact.payload["is_error"].as_bool().unwrap());
+    let artifacts = engine.list_artifacts(&session.id).await.unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].name, "readme");
+    assert_eq!(artifacts[0].kind, "report");
+}
+
+#[tokio::test]
+async fn task_detail_and_control_wrappers_are_event_backed() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, _service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "task tools".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan = TeamPlan {
+        goal: "task tools".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "build".into(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![PlanTask {
+            id: "T1".into(),
+            department: "impl".into(),
+            title: "One".into(),
+            kind: "coding".into(),
+            priority: 0,
+            profile: None,
+            deps: Vec::new(),
+            write_scope: vec!["src/t1".into()],
+            acceptance: vec!["done".into()],
+            token_budget: Some(1000),
+            cost_budget_usd: None,
+        }],
+    };
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let spec = AgentSpec {
+        id: "agent-1".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: Some("T1".into()),
+        department: Some("impl".into()),
+        profile: AgentProfile::Coding,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from(session.worktree.clone().unwrap()),
+        branch: session.branch.clone().unwrap(),
+        session_worktree: PathBuf::from(session.worktree.clone().unwrap()),
+        session_branch: session.branch.clone().unwrap(),
+        write_scope: vec!["src/t1".into()],
+        base_commit: session.base_commit.clone().unwrap_or_default(),
+    };
+    let detail = run_task_detail(&engine, &session, &spec, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(!detail.is_error, "{}", detail.content);
+    assert_eq!(detail.structured.as_ref().unwrap()["task_id"], "T1");
+    assert_eq!(detail.structured.as_ref().unwrap()["acceptance"][0], "done");
+    let skipped = run_task_control(
+        &engine,
+        &session,
+        &spec,
+        serde_json::json!({"action": "skip", "task_id": "T1"}),
+    )
+    .await
+    .unwrap();
+    assert!(!skipped.is_error, "{}", skipped.content);
+    assert_eq!(
+        skipped.structured.as_ref().unwrap()["task"]["status"],
+        "skipped"
     );
 }

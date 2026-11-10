@@ -191,6 +191,20 @@ final class TranscriptAndCollabTests: XCTestCase {
             ),
             "test · sources_"
         )
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "lsp_query",
+                input: .object(["action": .string("definition"), "path": .string("src/lib.rs")])
+            ),
+            "definition · src/lib.rs"
+        )
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "data_query",
+                input: .object(["path": .string("Cargo.toml"), "query": .string("package.version")])
+            ),
+            "Cargo.toml · package.version"
+        )
         XCTAssertTrue(
             ToolTrace.isHostSensitive(
                 name: "shell",

@@ -9639,6 +9639,7 @@ impl Engine {
                 continue;
             }
             crate::tooling::process::stop_worktree_processes(&path);
+            crate::tooling::lsp::stop_lsp_servers(&path);
             match tokio::task::spawn_blocking({
                 let root = project_root.clone();
                 let path = path.clone();

@@ -1,10 +1,84 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-10
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/data readers/runtime introspection 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-10 Optional LSP, provider search, document readers, runtime tools
+
+这一轮补齐上一轮留下的高价值工具缺口，同时把“不能可靠实现的东西”明确
+标成未实现，而不是交付半成品。
+
+### LSP（可选，不自动安装）
+
+- 新增 `lsp_query`：definition / references / hover / symbols /
+  workspace_symbols / diagnostics。
+- 发现 `rust-analyzer`、`sourcekit-lsp`、`typescript-language-server`、
+  `pyright-langserver`/`pylsp`、`gopls`、`clangd`、`jdtls`、
+  `kotlin-language-server`；缺少 server 时返回 `LSP_UNAVAILABLE`。
+- server 在 shell sandbox 下启动，按 worktree/language 缓存；支持
+  `workspace/configuration`、`workspace/workspaceFolders` 等 server 请求；
+  idle 15 分钟或 worktree 删除时终止。
+- document 在每次查询前 didOpen/didChange 同步；pull diagnostics 不支持时
+  回退到 `textDocument/publishDiagnostics` 缓存。
+- 位置使用 1-based line/column，内部转换为 LSP 的 0-based UTF-16 position。
+
+### Web search（显式 provider）
+
+- 新增 `web_search`：SearXNG、Brave、Tavily，按环境变量显式配置，不做隐藏
+  routing，不伪造结果。
+- `VERLINPARK_SEARCH_PROVIDER`、`VERLINPARK_SEARCH_ENDPOINT`、
+  `VERLINPARK_SEARCH_API_KEY`、`VERLINPARK_SEARCH_LANGUAGE`、
+  `VERLINPARK_SEARCH_SAFE`、`VERLINPARK_SEARCH_TIMEOUT_SECS`。
+- 结果归一化为 title/url/snippet/source/published/rank/citation_id；TTL 5
+  分钟缓存；snippet 只作为线索，阅读正文仍走 `fetch_url`。
+- shell policy 拒绝 network 时直接 `NETWORK_DENIED`。
+
+### PDF / image / structured data
+
+- `read_pdf`：有界 PDF 文本提取，64 MiB 输入、2 MiB 文本、可选 page range；
+  有 form-feed 页边界时按页输出，没有时明确 warning，不假装精确页数。
+- `read_image`：sandboxed `sips` 读取宽高/格式/哈希；`ocr=true` 且本机有
+  `tesseract` 时才 OCR，缺失时 warning + metadata，不伪造 OCR 文本。
+- `data_query`：JSON/YAML/TOML/CSV，确定性 path 子集（key/index/wildcard/
+  recursive descent），支持 offset/limit/columns/pretty；不执行任意代码。
+
+### Runtime introspection / control
+
+- `budget_status`：session/task/department/project 的 token/USD/time 已用、
+  剩余、reserved、unlimited 状态。
+- `task_detail`：acceptance/deps/write_scope/attempts/status/budgets/usage/
+  changed paths/current task。
+- `task_control`：Leader/Manager 对 TeamPlan task 执行 event-backed
+  retry/skip/cancel/pause/resume。
+- `tool_search`：搜索 built-in 与 MCP 工具，MCP 结果返回 server/tool 对，
+  可通过 generic `mcp action=call` 调用；Manager/Verifier 只能 inspect。
+- `publish_artifact_file`：把 worktree 里的截图/日志/报告发布为 content-
+  addressed artifact（5 MiB 上限，复用现有 retention GC）。
+
+### Browser spike（未交付）
+
+尝试了 headless Chrome + CDP（open/snapshot/click/type/press/select/wait/
+screenshot/console/evaluate）。结论是：Chrome 的 network service 和嵌套
+sandbox 在 daemon 的 Seatbelt 写沙箱内无法可靠加载本地 HTTP 页面；关闭
+Chrome 自身 sandbox 并扩大 temp/crashpad 写权限仍只能加载 data URL。
+直接 unsandboxed 运行会违反 worktree 写边界，因此本轮没有注册 browser 工具。
+未来需要独立 helper 进程或 WebKit-backed host，并配套 ComputerLease。
+
+### 测试
+
+- 新增 LSP framing/UTF-16/symbol mapping、SearXNG mock、PDF page selection、
+  image metadata（sandboxed sips）、data query path/CSV、runtime budget/
+  tool_search/artifact 事件测试。
+- 当前 Rust 测试 470（core 384 / protocol 2 / store 70 / providers 14；3 个
+  live ignored），Swift 110；`just lint` 与 `just test` 通过。
+
+剩余：office documents、browser、computer、完整 ComputerLease、跨进程
+browser lease。见 [TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)。
 
 ---
 
@@ -76,7 +150,7 @@
 - 新增 Rust 单测覆盖 patch 回滚/hash/CRLF/path escape、find/file info/read
   files/file manage、project detection、task parser、git query、code index、
   process lifecycle、local HTTP、并行 read 事件与 structured tool event。
-- 当前 Rust 测试 451 个（core 365 / protocol 2 / store 70 / providers 14；3 个 live 测试 ignored）；新工具不改变 approval、
+- 上一轮 Rust 测试 451 个（core 365 / protocol 2 / store 70 / providers 14；3 个 live 测试 ignored）；新工具不改变 approval、
   sandbox、write scope、Verifier、capacity、budget 语义。
 
 剩余未实现：web_search、LSP backend、PDF/image/office 读取、

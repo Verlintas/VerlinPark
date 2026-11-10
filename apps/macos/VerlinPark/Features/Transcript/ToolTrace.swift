@@ -41,6 +41,28 @@ enum ToolTrace {
             let action = string(input, "action") ?? "status"
             let path = string(input, "path") ?? ""
             return path.isEmpty ? action : "\(action) · \(path)"
+        case "lsp_query":
+            let action = string(input, "action") ?? "symbols"
+            let path = string(input, "path") ?? ""
+            return path.isEmpty ? action : "\(action) · \(path)"
+        case "web_search":
+            return string(input, "query") ?? "web search"
+        case "read_pdf", "read_image":
+            return string(input, "path") ?? ""
+        case "data_query":
+            let path = string(input, "path") ?? ""
+            let query = string(input, "query") ?? ""
+            return query.isEmpty ? path : "\(path) · \(query)"
+        case "budget_status":
+            return "budgets"
+        case "task_detail", "task_control":
+            let action = string(input, "action") ?? ""
+            let task = string(input, "task_id") ?? ""
+            return [action, task].filter { !$0.isEmpty }.joined(separator: " · ")
+        case "tool_search":
+            return string(input, "query") ?? "tool catalog"
+        case "publish_artifact_file":
+            return string(input, "path") ?? "artifact"
         case "shell":
             return collapsed(string(input, "command") ?? "")
         case "fetch_url":
@@ -100,6 +122,14 @@ enum ToolTrace {
             return "hammer"
         case "git":
             return "arrow.triangle.branch"
+        case "lsp_query":
+            return "magnifyingglass"
+        case "web_search":
+            return "globe"
+        case "read_pdf", "read_image", "data_query":
+            return "doc.text.magnifyingglass"
+        case "budget_status", "task_detail", "task_control", "tool_search":
+            return "gauge"
         case "shell":
             return "terminal"
         case "fetch_url":

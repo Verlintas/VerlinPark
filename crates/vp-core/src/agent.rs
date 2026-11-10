@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
@@ -919,7 +919,12 @@ impl AgentRole {
                         | "dependency_graph"
                         | "build_context"
                         | "affected_tests"
-                ) || (profile == AgentProfile::Research && name == "fetch_url")
+                        | "lsp_query"
+                        | "read_pdf"
+                        | "read_image"
+                        | "data_query"
+                ) || (profile == AgentProfile::Research
+                    && matches!(name, "fetch_url" | "web_search"))
             }
             Self::Verifier => {
                 matches!(
@@ -938,13 +943,18 @@ impl AgentRole {
                         | "dependency_graph"
                         | "build_context"
                         | "affected_tests"
+                        | "lsp_query"
+                        | "read_pdf"
+                        | "read_image"
+                        | "data_query"
                         | "shell"
                         | "run_project_task"
                         | "code_diagnostics"
                         | "process"
                         | "wait_for"
                         | "local_http"
-                ) || (profile == AgentProfile::Research && name == "fetch_url")
+                ) || (profile == AgentProfile::Research
+                    && matches!(name, "fetch_url" | "web_search"))
             }
             Self::Worker | Self::Labour => match profile {
                 AgentProfile::Coding => matches!(
@@ -970,6 +980,10 @@ impl AgentRole {
                         | "dependency_graph"
                         | "build_context"
                         | "affected_tests"
+                        | "lsp_query"
+                        | "read_pdf"
+                        | "read_image"
+                        | "data_query"
                         | "code_diagnostics"
                         | "process"
                         | "wait_for"
@@ -993,6 +1007,11 @@ impl AgentRole {
                         | "dependency_graph"
                         | "build_context"
                         | "affected_tests"
+                        | "lsp_query"
+                        | "read_pdf"
+                        | "read_image"
+                        | "data_query"
+                        | "web_search"
                         | "local_http"
                 ),
                 AgentProfile::Verification => matches!(
@@ -1014,6 +1033,10 @@ impl AgentRole {
                         | "dependency_graph"
                         | "build_context"
                         | "affected_tests"
+                        | "lsp_query"
+                        | "read_pdf"
+                        | "read_image"
+                        | "data_query"
                         | "code_diagnostics"
                         | "process"
                         | "wait_for"
@@ -1035,6 +1058,10 @@ impl AgentRole {
                         | "dependency_graph"
                         | "build_context"
                         | "affected_tests"
+                        | "lsp_query"
+                        | "read_pdf"
+                        | "read_image"
+                        | "data_query"
                 ),
             },
         }
@@ -8896,6 +8923,12 @@ async fn run_loop(
             let is_mcp_tool = call.name == "mcp";
             let is_coordination_tool = call.name == "coordinate";
             let is_team_status = call.name == "team_status";
+            let is_budget_status = call.name == "budget_status";
+            let is_task_detail = call.name == "task_detail";
+            let is_task_control = call.name == "task_control"
+                && matches!(spec.role, AgentRole::Leader | AgentRole::Manager);
+            let is_tool_search = call.name == "tool_search";
+            let is_artifact_file = call.name == "publish_artifact_file";
             let dynamic_mcp_tool = dynamic_mcp_tools
                 .iter()
                 .find(|binding| binding.exposed_name == call.name);
@@ -9137,6 +9170,92 @@ async fn run_loop(
                 match run_team_status(engine, session, input.clone()).await {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("team status error: {error}")),
+                }
+            } else if is_budget_status {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_budget_status(engine, session, project, spec, budget, &plan_budget).await
+                {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("budget status error: {error}")),
+                }
+            } else if is_task_detail {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_task_detail(engine, session, spec, input.clone()).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("task detail error: {error}")),
+                }
+            } else if is_task_control {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_task_control(engine, session, spec, input.clone()).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("task control error: {error}")),
+                }
+            } else if is_tool_search {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_tool_search(config, engine, spec, input.clone()).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("tool search error: {error}")),
+                }
+            } else if is_artifact_file {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_publish_artifact_file(engine, session, spec, input.clone()).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("artifact publish error: {error}")),
                 }
             } else if is_mailbox_tool {
                 emit(
@@ -10228,6 +10347,466 @@ async fn run_team_status(
         }
     }
     Ok(ToolOutput::ok(lines.join("\n")))
+}
+
+async fn run_budget_status(
+    engine: &Engine,
+    session: &Session,
+    project: &Project,
+    spec: &AgentSpec,
+    budget: &SessionBudget,
+    plan_budget: &PlanBudgetScope,
+) -> Result<ToolOutput> {
+    let unlimited = budget.is_unlimited();
+    let spent_tokens = budget.spent();
+    let spent_cost = budget.cost_spent();
+    let (task_tokens, task_cost, department_tokens, department_cost) = engine
+        .usage_spent(
+            &session.id,
+            spec.task_id.as_deref(),
+            spec.department.as_deref(),
+        )
+        .await?;
+    let project_budget = engine.get_project_budget(&project.id).await?;
+    let session_value = json!({
+        "limit_tokens": budget.limit,
+        "spent_tokens": spent_tokens,
+        "remaining_tokens": budget.limit.map(|limit| limit.saturating_sub(spent_tokens)),
+        "limit_cost_usd": budget.cost_limit,
+        "spent_cost_usd": spent_cost,
+        "reserved_cost_usd": budget.reserved_cost(),
+        "remaining_cost_usd": budget
+            .cost_limit
+            .map(|limit| (limit - spent_cost - budget.reserved_cost()).max(0.0)),
+        "time_limit_secs": budget.time_limit.map(|limit| limit.as_secs()),
+        "elapsed_secs": budget.elapsed_secs(),
+        "remaining_time_secs": budget
+            .time_limit
+            .map(|limit| limit.saturating_sub(Duration::from_secs(budget.elapsed_secs())).as_secs()),
+        "unlimited": unlimited,
+    });
+    let task_value = spec.task_id.as_ref().map(|task_id| {
+        json!({
+            "task_id": task_id,
+            "limit_tokens": plan_budget.task_tokens,
+            "spent_tokens": task_tokens,
+            "remaining_tokens": plan_budget.task_tokens.map(|limit| limit.saturating_sub(task_tokens)),
+            "limit_cost_usd": plan_budget.task_cost,
+            "spent_cost_usd": task_cost,
+            "remaining_cost_usd": plan_budget.task_cost.map(|limit| (limit - task_cost).max(0.0)),
+        })
+    });
+    let department_value = spec.department.as_ref().map(|department| {
+        json!({
+            "department": department,
+            "limit_tokens": plan_budget.department_tokens,
+            "spent_tokens": department_tokens,
+            "remaining_tokens": plan_budget.department_tokens.map(|limit| limit.saturating_sub(department_tokens)),
+            "limit_cost_usd": plan_budget.department_cost,
+            "spent_cost_usd": department_cost,
+            "remaining_cost_usd": plan_budget.department_cost.map(|limit| (limit - department_cost).max(0.0)),
+        })
+    });
+    let project_value = json!({
+        "project_id": project.id,
+        "limit_tokens": project_budget.budget.token_budget,
+        "spent_tokens": project_budget.spent_tokens,
+        "remaining_tokens": project_budget.budget.token_budget.map(|limit| limit.saturating_sub(project_budget.spent_tokens)),
+        "limit_cost_usd": project_budget.budget.cost_budget_usd,
+        "spent_cost_usd": project_budget.spent_cost_usd,
+        "remaining_cost_usd": project_budget.budget.cost_budget_usd.map(|limit| (limit - project_budget.spent_cost_usd).max(0.0)),
+    });
+    let text = format!(
+        "session tokens {}/{} · USD ${:.4}/{}{} · elapsed {}s{}\ntask tokens {}{} · department tokens {}{} · project tokens {}/{}",
+        spent_tokens,
+        budget
+            .limit
+            .map(|limit| limit.to_string())
+            .unwrap_or_else(|| "unlimited".to_string()),
+        spent_cost,
+        budget
+            .cost_limit
+            .map(|limit| format!("{limit:.4}"))
+            .unwrap_or_else(|| "unlimited".to_string()),
+        if unlimited { " · unlimited mode" } else { "" },
+        budget.elapsed_secs(),
+        budget
+            .time_limit
+            .map(|limit| format!("/{}", limit.as_secs()))
+            .unwrap_or_default(),
+        spec.task_id.as_deref().unwrap_or("none"),
+        plan_budget
+            .task_tokens
+            .map(|limit| format!("/{limit}"))
+            .unwrap_or_default(),
+        spec.department.as_deref().unwrap_or("none"),
+        plan_budget
+            .department_tokens
+            .map(|limit| format!("/{limit}"))
+            .unwrap_or_default(),
+        project_budget.spent_tokens,
+        project_budget
+            .budget
+            .token_budget
+            .map(|limit| limit.to_string())
+            .unwrap_or_else(|| "unlimited".to_string()),
+    );
+    Ok(ToolOutput::ok_structured(
+        truncate(&text),
+        json!({
+            "session": session_value,
+            "task": task_value,
+            "department": department_value,
+            "project": project_value,
+            "unlimited": unlimited,
+        }),
+    ))
+}
+
+async fn run_task_detail(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    input: Value,
+) -> Result<ToolOutput> {
+    let task_id = input
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| spec.task_id.clone())
+        .ok_or_else(|| anyhow!("task_id is required outside a plan task"))?;
+    let plan = engine
+        .get_team_plan(&session.id)
+        .await?
+        .ok_or_else(|| anyhow!("session has no stored TeamPlan"))?;
+    let plan_task = plan
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| anyhow!("task {task_id} is not in the stored TeamPlan"))?;
+    let queue = engine.task_queue(None, Some(session.id.clone())).await?;
+    let scheduled = queue.tasks.iter().find(|task| task.task_id == task_id);
+    let (task_tokens, task_cost, _, _) = engine
+        .usage_spent(&session.id, Some(&task_id), Some(&plan_task.department))
+        .await?;
+    let changed_paths = crate::tooling::project::git_changed_paths(&spec.worktree)
+        .into_iter()
+        .take(100)
+        .collect::<Vec<_>>();
+    let structured = json!({
+        "task_id": task_id,
+        "department": plan_task.department,
+        "title": plan_task.title,
+        "kind": plan_task.kind,
+        "priority": plan_task.priority,
+        "profile": plan_task.profile,
+        "deps": plan_task.deps,
+        "write_scope": plan_task.write_scope,
+        "acceptance": plan_task.acceptance,
+        "token_budget": plan_task.token_budget,
+        "cost_budget_usd": plan_task.cost_budget_usd,
+        "spent_tokens": task_tokens,
+        "spent_cost_usd": task_cost,
+        "status": scheduled.map(|task| task.status.clone()),
+        "attempts": scheduled.map(|task| task.attempts),
+        "last_error": scheduled.and_then(|task| task.last_error.clone()),
+        "next_attempt_at": scheduled.and_then(|task| task.next_attempt_at.clone()),
+        "started_at": scheduled.and_then(|task| task.started_at.clone()),
+        "finished_at": scheduled.and_then(|task| task.finished_at.clone()),
+        "changed_paths": changed_paths,
+        "current_agent_task": spec.task_id.as_deref() == Some(task_id.as_str()),
+    });
+    let text = format!(
+        "{} · {} · {} · {} attempt(s) · tokens {}{} · changed {} file(s)",
+        plan_task.title,
+        plan_task.department,
+        scheduled
+            .map(|task| task.status.as_str())
+            .unwrap_or("not queued"),
+        scheduled.map(|task| task.attempts).unwrap_or(0),
+        task_tokens,
+        plan_task
+            .token_budget
+            .map(|limit| format!("/{limit}"))
+            .unwrap_or_default(),
+        changed_paths.len()
+    );
+    Ok(ToolOutput::ok_structured(truncate(&text), structured))
+}
+
+async fn run_task_control(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    input: Value,
+) -> Result<ToolOutput> {
+    if !matches!(spec.role, AgentRole::Leader | AgentRole::Manager) {
+        return Ok(ToolOutput::error_structured(
+            "only Leader or Manager may control plan tasks",
+            json!({"code": "PERMISSION_DENIED"}),
+        ));
+    }
+    let action = input
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("action is required"))?;
+    let task_id = input
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("task_id is required"))?;
+    let plan = engine
+        .get_team_plan(&session.id)
+        .await?
+        .ok_or_else(|| anyhow!("session has no stored TeamPlan"))?;
+    if !plan.tasks.iter().any(|task| task.id == task_id) {
+        return Ok(ToolOutput::error_structured(
+            format!("task {task_id} is not in the stored TeamPlan"),
+            json!({"code": "TASK_NOT_FOUND", "task_id": task_id}),
+        ));
+    }
+    let result = match action {
+        "retry" => engine.retry_plan_task(&session.id, task_id).await,
+        "skip" => engine.skip_plan_task(&session.id, task_id).await,
+        "cancel" => engine.request_plan_task_cancel(&session.id, task_id).await,
+        "pause" => engine.pause_plan_task(&session.id, task_id).await,
+        "resume" => engine.resume_plan_task(&session.id, task_id).await,
+        other => {
+            return Ok(ToolOutput::error_structured(
+                format!("unsupported task action: {other}"),
+                json!({"code": "INVALID_ARGUMENT", "action": other}),
+            ));
+        }
+    };
+    match result {
+        Ok(task) => {
+            let structured = serde_json::to_value(&task).unwrap_or_else(|_| json!({}));
+            Ok(ToolOutput::ok_structured(
+                format!("{action} applied to {task_id} (status {})", task.status),
+                json!({
+                    "action": action,
+                    "task": structured,
+                }),
+            ))
+        }
+        Err(error) => Ok(ToolOutput::error_structured(
+            format!("{action} failed for {task_id}: {error}"),
+            json!({"code": "TASK_CONTROL_FAILED", "action": action, "task_id": task_id}),
+        )),
+    }
+}
+
+async fn run_tool_search(
+    config: &AgentConfig,
+    engine: &Engine,
+    spec: &AgentSpec,
+    input: Value,
+) -> Result<ToolOutput> {
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .clamp(1, 50) as usize;
+    let include_schema = input
+        .get("include_schema")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut results = Vec::new();
+    for tool in config
+        .tools
+        .schemas()
+        .into_iter()
+        .filter(|tool| spec.role.allows_tool(spec.profile, &tool.name))
+    {
+        let score = tool_match_score(&tool.name, &tool.description, &query);
+        if score <= 0.0 {
+            continue;
+        }
+        let mut value = json!({
+            "name": tool.name,
+            "kind": "builtin",
+            "description": tool.description.chars().take(400).collect::<String>(),
+            "callable": true,
+            "score": score,
+        });
+        if include_schema {
+            value["parameters_preview"] = json!(bounded_schema(&tool.parameters));
+        }
+        results.push(value);
+    }
+    let mcp_callable = matches!(
+        spec.role,
+        AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+    );
+    let servers = engine.list_mcp_servers().await?.servers;
+    for server in servers.into_iter().filter(|server| server.enabled).take(20) {
+        let Ok(tools) = engine.mcp_tools(&server.id).await else {
+            continue;
+        };
+        for tool in tools.tools.into_iter().take(100) {
+            let exposed = dynamic_mcp_tool_name(&server.name, &tool.name);
+            let score = tool_match_score(&exposed, &tool.description, &query);
+            if score <= 0.0 {
+                continue;
+            }
+            let mut value = json!({
+                "name": exposed,
+                "kind": "mcp",
+                "server_id": server.id,
+                "server_name": server.name,
+                "tool_name": tool.name,
+                "description": tool.description.chars().take(400).collect::<String>(),
+                "callable": mcp_callable,
+                "score": score,
+            });
+            if include_schema {
+                value["parameters_preview"] = json!(bounded_schema(&tool.input_schema));
+            }
+            results.push(value);
+        }
+    }
+    results.sort_by(|left, right| {
+        right["score"]
+            .as_f64()
+            .partial_cmp(&left["score"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left["kind"].as_str().cmp(&right["kind"].as_str()))
+            .then_with(|| left["name"].as_str().cmp(&right["name"].as_str()))
+    });
+    results.truncate(limit);
+    let rendered = results
+        .iter()
+        .map(|result| {
+            format!(
+                "{} · {}{} · {}",
+                result["name"].as_str().unwrap_or("?"),
+                result["kind"].as_str().unwrap_or("tool"),
+                if result["kind"] == "mcp" {
+                    result["server_id"]
+                        .as_str()
+                        .map(|server| format!(" ({server})"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                result["description"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mcp_hint = if results.iter().any(|result| result["kind"] == "mcp") {
+        if mcp_callable {
+            "\nCall an MCP result with mcp action=call server=<server_id> tool=<tool_name> arguments={...}."
+        } else {
+            "\nThis role can inspect MCP tools but cannot call them."
+        }
+    } else {
+        ""
+    };
+    Ok(ToolOutput::ok_structured(
+        truncate(&format!("{rendered}{mcp_hint}")),
+        json!({
+            "query": query,
+            "tools": results,
+            "count": results.len(),
+            "mcp_callable": mcp_callable,
+        }),
+    ))
+}
+
+fn tool_match_score(name: &str, description: &str, query: &str) -> f64 {
+    if query.trim().is_empty() {
+        return 1.0;
+    }
+    let name = name.to_ascii_lowercase();
+    let description = description.to_ascii_lowercase();
+    let query = query.to_ascii_lowercase();
+    let tokens = query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.len() > 1)
+        .collect::<Vec<_>>();
+    if name == query {
+        return 1.0;
+    }
+    if name.contains(&query) {
+        return 0.9;
+    }
+    if !tokens.is_empty() && tokens.iter().all(|token| name.contains(token)) {
+        return 0.8;
+    }
+    if !tokens.is_empty() && tokens.iter().all(|token| description.contains(token)) {
+        return 0.5;
+    }
+    0.0
+}
+
+fn bounded_schema(value: &Value) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_default()
+        .chars()
+        .take(800)
+        .collect()
+}
+
+async fn run_publish_artifact_file(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    input: Value,
+) -> Result<ToolOutput> {
+    let relative = input
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("path is required"))?;
+    let absolute = crate::tools::safe_existing_path(&spec.worktree, relative)?;
+    if !absolute.is_file() {
+        return Ok(ToolOutput::error_structured(
+            "artifact source must be a file",
+            json!({"code": "INVALID_ARGUMENT", "path": relative}),
+        ));
+    }
+    let name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            absolute
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "artifact".to_string());
+    let kind = input.get("kind").and_then(Value::as_str).unwrap_or("file");
+    let mime_type = input
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::tooling::files::mime_for_path(&absolute).to_string());
+    let artifact = engine
+        .publish_artifact_file(
+            &session.id,
+            &spec.id,
+            &spec.name,
+            spec.task_id.clone(),
+            &name,
+            kind,
+            &mime_type,
+            &absolute,
+            &spec.worktree,
+        )
+        .await?;
+    let structured = serde_json::to_value(&artifact).unwrap_or_else(|_| json!({}));
+    Ok(ToolOutput::ok_structured(
+        format!(
+            "published {} ({}) as {} · {} bytes",
+            name, mime_type, artifact.id, artifact.size_bytes
+        ),
+        structured,
+    ))
 }
 
 async fn run_mcp_tool(
@@ -11507,6 +12086,74 @@ fn tool_schemas(
             }),
         });
     }
+    tools.push(ToolSchema {
+        name: "budget_status".to_string(),
+        description: "Report remaining session, task, department, and project token/USD/time budgets, including whether unlimited mode is active."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    });
+    tools.push(ToolSchema {
+        name: "task_detail".to_string(),
+        description: "Return the current or requested plan task: acceptance, dependencies, write scope, attempts, status, budgets, usage, and changed paths."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Defaults to the agent's current task"}
+            },
+            "additionalProperties": false
+        }),
+    });
+    if matches!(role, AgentRole::Leader | AgentRole::Manager) {
+        tools.push(ToolSchema {
+            name: "task_control".to_string(),
+            description: "Retry, skip, cancel, pause, or resume a task in this session's stored TeamPlan. Event-backed and audited."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["retry", "skip", "cancel", "pause", "resume"]},
+                    "task_id": {"type": "string"}
+                },
+                "required": ["action", "task_id"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    tools.push(ToolSchema {
+        name: "tool_search".to_string(),
+        description: "Search built-in tools and configured MCP tools by name or description. MCP results include the server/tool pair for the generic mcp call action."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Optional search text; empty lists available tools"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Default 20"},
+                "include_schema": {"type": "boolean", "description": "Include a bounded parameter schema preview; default false"}
+            },
+            "additionalProperties": false
+        }),
+    });
+    tools.push(ToolSchema {
+        name: "publish_artifact_file".to_string(),
+        description: "Publish an existing worktree file (screenshot, log, report, generated asset) as a session artifact. Max 5 MiB; content-addressed and retention-managed."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path relative to the worktree root"},
+                "name": {"type": "string", "description": "Optional display name; defaults to the file name"},
+                "kind": {"type": "string", "description": "Optional category such as image, log, report, diff"},
+                "mime_type": {"type": "string", "description": "Optional MIME type; inferred from the extension when omitted"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+    });
     if role == AgentRole::Manager && allow_delegation {
         tools.push(ToolSchema {
             name: "delegate_many".to_string(),
