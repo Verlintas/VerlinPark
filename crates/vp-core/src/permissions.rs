@@ -244,6 +244,7 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
         | "web_search"
         | "read_pdf"
         | "read_image"
+        | "read_document"
         | "data_query"
         | "budget_status"
         | "task_detail"
@@ -1558,6 +1559,14 @@ mod tests {
             decide(now, &safe, false),
             ApprovalDecision::Allow { .. }
         ));
+    }
+
+    #[test]
+    fn media_and_document_readers_are_read_only() {
+        for tool in ["read_pdf", "read_image", "read_document", "data_query"] {
+            let assessment = assess(tool, json!({"path": "report.bin"}));
+            assert_eq!(assessment.risk, RiskLevel::ReadOnly, "{tool}");
+        }
     }
 
     #[test]

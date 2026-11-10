@@ -13,6 +13,7 @@ pub mod git;
 pub mod http;
 pub mod lsp;
 pub mod media;
+pub mod office;
 pub mod process;
 pub mod project;
 pub mod web;

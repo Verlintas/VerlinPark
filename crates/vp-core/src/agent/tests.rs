@@ -8018,6 +8018,7 @@ fn tool_role_matrix_matches_the_tooling_roadmap() {
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "lsp_query"));
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "read_pdf"));
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "read_image"));
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "read_document"));
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "data_query"));
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Research, "web_search"));
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "web_search"));

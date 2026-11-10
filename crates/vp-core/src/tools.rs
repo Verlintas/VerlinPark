@@ -148,6 +148,7 @@ impl ToolRegistry {
                 Arc::new(crate::tooling::web::WebSearch),
                 Arc::new(crate::tooling::media::ReadPdf),
                 Arc::new(crate::tooling::media::ReadImage),
+                Arc::new(crate::tooling::office::ReadDocument),
                 Arc::new(crate::tooling::data::DataQuery),
             ],
         }
@@ -1883,7 +1884,11 @@ pub(crate) fn bounded_structured(value: Option<Value>) -> Option<Value> {
 
 pub(crate) fn truncate(mut content: String) -> String {
     if content.len() > MAX_TOOL_OUTPUT {
-        content.truncate(MAX_TOOL_OUTPUT);
+        let mut end = MAX_TOOL_OUTPUT;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
         content.push_str("\n… output truncated");
     }
     content
@@ -1961,6 +1966,7 @@ mod tests {
             "web_search",
             "read_pdf",
             "read_image",
+            "read_document",
             "data_query",
             "process",
             "local_http",
@@ -2484,6 +2490,16 @@ mod tests {
             .unwrap();
         assert!(output.is_error, "{}", output.content);
         assert!(!target.join("file").exists());
+    }
+
+    #[test]
+    fn truncation_respects_utf8_boundaries() {
+        let mut content = "a".repeat(MAX_TOOL_OUTPUT - 1);
+        content.push('é');
+        let truncated = truncate(content);
+        assert!(truncated.ends_with("… output truncated"));
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(!truncated.contains('é'));
     }
 
     #[cfg(target_os = "macos")]

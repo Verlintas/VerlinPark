@@ -17,6 +17,74 @@ use crate::tools::{AgentTool, ToolContext, ToolOutput, safe_existing_path, trunc
 const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PDF_CHARS: usize = 2_000_000;
 
+#[derive(Debug, Default)]
+struct PdfMetadata {
+    page_count: Option<usize>,
+    title: Option<String>,
+    author: Option<String>,
+    subject: Option<String>,
+    creator: Option<String>,
+    producer: Option<String>,
+    created: Option<String>,
+    modified: Option<String>,
+}
+
+fn pdf_metadata(path: &Path) -> Option<PdfMetadata> {
+    let document = lopdf::Document::load(path).ok()?;
+    let page_count = Some(document.get_pages().len());
+    let info = document
+        .trailer
+        .get(b"Info")
+        .ok()
+        .and_then(|object| match object {
+            lopdf::Object::Reference(id) => document.get_object(*id).ok(),
+            other => Some(other),
+        })
+        .and_then(|object| object.as_dict().ok());
+    let string =
+        |key: &[u8]| info.and_then(|dictionary| pdf_info_string(&document, dictionary, key));
+    Some(PdfMetadata {
+        page_count,
+        title: string(b"Title"),
+        author: string(b"Author"),
+        subject: string(b"Subject"),
+        creator: string(b"Creator"),
+        producer: string(b"Producer"),
+        created: string(b"CreationDate"),
+        modified: string(b"ModDate"),
+    })
+}
+
+fn pdf_info_string(
+    document: &lopdf::Document,
+    dictionary: &lopdf::Dictionary,
+    key: &[u8],
+) -> Option<String> {
+    let object = dictionary.get(key).ok()?;
+    let object = match object {
+        lopdf::Object::Reference(id) => document.get_object(*id).ok()?,
+        other => other,
+    };
+    let bytes = object.as_str().ok()?;
+    let decoded = if let Some(bytes) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        let units = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair))
+            .collect::<Vec<_>>();
+        String::from_utf16(&units).unwrap_or_default()
+    } else if let Ok(text) = std::str::from_utf8(bytes) {
+        text.to_string()
+    } else {
+        // PDFDocEncoding is close enough to Latin-1 for display metadata. It is
+        // never used for security decisions or text extraction.
+        bytes.iter().map(|byte| char::from(*byte)).collect()
+    };
+    let decoded = decoded.trim();
+    (!decoded.is_empty()).then(|| decoded.chars().take(300).collect())
+}
+
 pub struct ReadPdf;
 
 #[async_trait]
@@ -83,24 +151,27 @@ impl AgentTool for ReadPdf {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let extraction_path = path.clone();
-        let text =
-            match tokio::task::spawn_blocking(move || pdf_extract::extract_text(extraction_path))
-                .await
-            {
-                Ok(Ok(text)) => text,
-                Ok(Err(error)) => {
-                    return Ok(ToolOutput::error_structured(
-                        format!("PDF extraction failed: {error}"),
-                        json!({"code": "PDF_EXTRACT_FAILED", "path": relative}),
-                    ));
-                }
-                Err(error) => {
-                    return Ok(ToolOutput::error_structured(
-                        format!("PDF extraction task failed: {error}"),
-                        json!({"code": "PDF_EXTRACT_FAILED", "path": relative}),
-                    ));
-                }
-            };
+        let extraction = tokio::task::spawn_blocking(move || {
+            let text = pdf_extract::extract_text(&extraction_path);
+            let metadata = pdf_metadata(&extraction_path);
+            (text, metadata)
+        })
+        .await;
+        let (text, pdf_metadata) = match extraction {
+            Ok((Ok(text), metadata)) => (text, metadata),
+            Ok((Err(error), _)) => {
+                return Ok(ToolOutput::error_structured(
+                    format!("PDF extraction failed: {error}"),
+                    json!({"code": "PDF_EXTRACT_FAILED", "path": relative}),
+                ));
+            }
+            Err(error) => {
+                return Ok(ToolOutput::error_structured(
+                    format!("PDF extraction task failed: {error}"),
+                    json!({"code": "PDF_EXTRACT_FAILED", "path": relative}),
+                ));
+            }
+        };
         if text.len() > MAX_PDF_CHARS {
             return Ok(ToolOutput::error_structured(
                 format!("extracted text exceeds {MAX_PDF_CHARS} bytes; use a page range"),
@@ -108,7 +179,39 @@ impl AgentTool for ReadPdf {
             ));
         }
         let pages = text.split('\u{0c}').map(str::to_string).collect::<Vec<_>>();
-        let has_page_boundaries = pages.len() > 1;
+        let boundary_count = pages.len();
+        let has_page_boundaries = boundary_count > 1;
+        let metadata_page_count = pdf_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.page_count);
+        let page_count = metadata_page_count.unwrap_or(if has_page_boundaries {
+            boundary_count
+        } else {
+            1
+        });
+        let page_count_source = if metadata_page_count.is_some() {
+            "pdf-metadata"
+        } else if has_page_boundaries {
+            "text-boundaries"
+        } else {
+            "unknown"
+        };
+        let mut warnings = Vec::new();
+        if pdf_metadata.is_none() {
+            warnings.push("PDF metadata could not be read; page count is best effort".to_string());
+        }
+        if let Some(metadata_page_count) = metadata_page_count
+            && has_page_boundaries
+            && metadata_page_count != boundary_count
+        {
+            warnings.push(format!(
+                "PDF metadata reports {metadata_page_count} page(s) but text extraction produced {boundary_count} boundary(ies)"
+            ));
+        }
+        if page_selection.is_some() && !has_page_boundaries {
+            warnings
+                .push("page boundaries were not available; the full text was returned".to_string());
+        }
         let selected = select_pages(&pages, page_selection.as_ref());
         let include_markers = include_markers && has_page_boundaries;
         let mut output = String::new();
@@ -133,13 +236,31 @@ impl AgentTool for ReadPdf {
             visible.push_str("\n… content truncated");
         }
         let byte_hash = sha256_file(&path)?;
-        let page_count = if has_page_boundaries { pages.len() } else { 1 };
+        let metadata_value = pdf_metadata
+            .as_ref()
+            .map(|metadata| {
+                json!({
+                    "title": metadata.title,
+                    "author": metadata.author,
+                    "subject": metadata.subject,
+                    "creator": metadata.creator,
+                    "producer": metadata.producer,
+                    "created": metadata.created,
+                    "modified": metadata.modified,
+                })
+            })
+            .unwrap_or(Value::Null);
         let summary = format!(
-            "{} · {} page boundary(ies) · {} bytes extracted · {} lines",
+            "{} · {} page(s) · {} bytes extracted · {} lines{}",
             relative,
             page_count,
             text.len(),
-            utf8_line_count(&text)
+            utf8_line_count(&text),
+            if has_page_boundaries {
+                " · page boundaries available"
+            } else {
+                " · page boundaries unavailable"
+            }
         );
         Ok(ToolOutput::ok_structured(
             truncate(format!("{summary}\n{visible}")),
@@ -148,17 +269,17 @@ impl AgentTool for ReadPdf {
                 "size_bytes": metadata.len(),
                 "sha256": byte_hash,
                 "page_count": page_count,
+                "page_count_source": page_count_source,
+                "metadata_page_count": metadata_page_count,
                 "page_boundaries_available": has_page_boundaries,
+                "boundary_count": boundary_count,
                 "pages_requested": page_selection,
                 "extracted_bytes": text.len(),
                 "extracted_lines": utf8_line_count(&text),
                 "text": visible,
                 "truncated": visible.ends_with("… content truncated"),
-                "warnings": if page_selection.is_some() && !has_page_boundaries {
-                    vec!["page boundaries were not available; the full text was returned"]
-                } else {
-                    Vec::<&str>::new()
-                },
+                "warnings": warnings,
+                "metadata": metadata_value,
                 "confidence": "pdf-text-extractor",
             }),
         ))
@@ -234,6 +355,77 @@ mod tests {
     }
 }
 
+#[derive(Debug, Default)]
+struct OcrResult {
+    text: String,
+    truncated: bool,
+    words: usize,
+    confidence: Option<f32>,
+    confidence_min: Option<f32>,
+    confidence_max: Option<f32>,
+}
+
+fn parse_tesseract_tsv(tsv: &str, max_chars: usize) -> OcrResult {
+    let mut result = OcrResult::default();
+    let mut last_line = None;
+    let mut weighted_confidence = 0.0f32;
+    let mut confidence_weight = 0usize;
+    for line in tsv.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 12 {
+            continue;
+        }
+        let confidence = match fields[10].trim().parse::<f32>() {
+            Ok(confidence) if confidence >= 0.0 => confidence,
+            _ => continue,
+        };
+        let word = fields[11..].join("\t").trim().to_string();
+        if word.is_empty() {
+            continue;
+        }
+        let line_key = (
+            fields[2].parse::<u32>().unwrap_or(0),
+            fields[3].parse::<u32>().unwrap_or(0),
+            fields[4].parse::<u32>().unwrap_or(0),
+        );
+        if !result.text.is_empty() {
+            result.text.push(if last_line == Some(line_key) {
+                ' '
+            } else {
+                '\n'
+            });
+        }
+        result.text.push_str(&word);
+        last_line = Some(line_key);
+        let weight = word.chars().count().max(1);
+        weighted_confidence += confidence * weight as f32;
+        confidence_weight += weight;
+        result.words += 1;
+        result.confidence_min = Some(
+            result
+                .confidence_min
+                .map_or(confidence, |current| current.min(confidence)),
+        );
+        result.confidence_max = Some(
+            result
+                .confidence_max
+                .map_or(confidence, |current| current.max(confidence)),
+        );
+    }
+    if confidence_weight > 0 {
+        result.confidence =
+            Some((weighted_confidence / confidence_weight as f32 * 10.0).round() / 10.0);
+    }
+    let mut chars = result.text.chars();
+    let mut text = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        text.push_str("\n… OCR text truncated");
+        result.truncated = true;
+    }
+    result.text = text;
+    result
+}
+
 pub struct ReadImage;
 
 #[async_trait]
@@ -291,14 +483,13 @@ impl AgentTool for ReadImage {
             .unwrap_or(20_000)
             .clamp(100, 200_000) as usize;
         let mut warnings = Vec::new();
-        let mut ocr_text = None;
-        let mut ocr_engine = None;
+        let mut ocr_result = None;
         if ocr {
             if which("tesseract").is_none() {
                 warnings.push("tesseract is not installed; OCR skipped".to_string());
             } else {
                 let command = format!(
-                    "tesseract {} stdout --psm 6",
+                    "tesseract {} stdout --psm 6 tsv",
                     shell_quote(&path.to_string_lossy())
                 );
                 match crate::tools::run_sandboxed_shell_captured(
@@ -309,13 +500,16 @@ impl AgentTool for ReadImage {
                 .await
                 {
                     Ok(captured) if captured.exit_code == 0 => {
-                        let mut chars = captured.stdout.chars();
-                        let mut text = chars.by_ref().take(max_chars).collect::<String>();
-                        if chars.next().is_some() {
-                            text.push_str("\n… OCR text truncated");
+                        let result = parse_tesseract_tsv(&captured.stdout, max_chars);
+                        if result.words == 0 {
+                            warnings
+                                .push("tesseract completed but recognized no words".to_string());
                         }
-                        ocr_text = Some(text);
-                        ocr_engine = Some("tesseract");
+                        if result.truncated {
+                            warnings
+                                .push(format!("OCR text was truncated at {max_chars} characters"));
+                        }
+                        ocr_result = Some(result);
                     }
                     Ok(captured) => {
                         warnings.push(format!(
@@ -328,8 +522,22 @@ impl AgentTool for ReadImage {
                 }
             }
         }
+        let ocr_text = ocr_result.as_ref().map(|result| result.text.clone());
         let hash = sha256_file(&path)?;
         let mime = crate::tooling::files::mime_for_path(&path);
+        let ocr_summary = ocr_result
+            .as_ref()
+            .map(|result| {
+                format!(
+                    " · {} OCR chars{}",
+                    result.text.chars().count(),
+                    result
+                        .confidence
+                        .map(|confidence| format!(" · {confidence:.1}% OCR confidence"))
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
         let summary = format!(
             "{} · {}x{} · {} · {} bytes{}",
             relative,
@@ -337,10 +545,7 @@ impl AgentTool for ReadImage {
             height,
             format,
             metadata.len(),
-            ocr_text
-                .as_ref()
-                .map(|text| format!(" · {} OCR chars", text.chars().count()))
-                .unwrap_or_default()
+            ocr_summary
         );
         Ok(ToolOutput::ok_structured(
             truncate(format!(
@@ -355,8 +560,12 @@ impl AgentTool for ReadImage {
                 "width": width,
                 "height": height,
                 "format": format,
-                "ocr_engine": ocr_engine,
+                "ocr_engine": ocr_result.as_ref().map(|_| "tesseract-tsv"),
                 "ocr_text": ocr_text,
+                "ocr_confidence": ocr_result.as_ref().and_then(|result| result.confidence),
+                "ocr_confidence_min": ocr_result.as_ref().and_then(|result| result.confidence_min),
+                "ocr_confidence_max": ocr_result.as_ref().and_then(|result| result.confidence_max),
+                "ocr_words": ocr_result.as_ref().map(|result| result.words),
                 "warnings": warnings,
             }),
         ))
@@ -503,7 +712,12 @@ mod image_tests {
         let catalog_id = doc.add_object(dictionary! {
             "Type" => "Catalog", "Pages" => pages_id
         });
+        let info_id = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Metadata Title"),
+            "Author" => Object::string_literal("Tester"),
+        });
         doc.trailer.set("Root", catalog_id);
+        doc.trailer.set("Info", info_id);
         doc.save(&path).unwrap();
 
         let output = ReadPdf
@@ -515,5 +729,30 @@ mod image_tests {
             .unwrap();
         assert!(!output.is_error, "{}", output.content);
         assert!(output.content.contains("Hello PDF"), "{}", output.content);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["page_count"], 1);
+        assert_eq!(structured["page_count_source"], "pdf-metadata");
+        assert_eq!(structured["metadata"]["title"], "Metadata Title");
+        assert_eq!(structured["metadata"]["author"], "Tester");
+    }
+
+    #[test]
+    fn parses_tesseract_tsv_confidence_and_line_breaks() {
+        let tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+5\t1\t1\t1\t1\t1\t0\t0\t10\t10\t96.0\tHello\n\
+5\t1\t1\t1\t1\t2\t10\t0\t10\t10\t90.0\tworld\n\
+5\t1\t1\t1\t2\t1\t0\t12\t10\t10\t80.0\tNext\n\
+5\t1\t1\t1\t2\t2\t10\t12\t10\t10\t-1\t\n";
+        let result = parse_tesseract_tsv(tsv, 20_000);
+        assert_eq!(result.text, "Hello world\nNext");
+        assert_eq!(result.words, 3);
+        assert_eq!(result.confidence, Some(89.3));
+        assert_eq!(result.confidence_min, Some(80.0));
+        assert_eq!(result.confidence_max, Some(96.0));
+        assert!(!result.truncated);
+
+        let truncated = parse_tesseract_tsv(tsv, 5);
+        assert_eq!(truncated.text, "Hello\n… OCR text truncated");
+        assert!(truncated.truncated);
     }
 }

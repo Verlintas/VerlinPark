@@ -922,6 +922,7 @@ impl AgentRole {
                         | "lsp_query"
                         | "read_pdf"
                         | "read_image"
+                        | "read_document"
                         | "data_query"
                 ) || (profile == AgentProfile::Research
                     && matches!(name, "fetch_url" | "web_search"))
@@ -946,6 +947,7 @@ impl AgentRole {
                         | "lsp_query"
                         | "read_pdf"
                         | "read_image"
+                        | "read_document"
                         | "data_query"
                         | "shell"
                         | "run_project_task"
@@ -983,6 +985,7 @@ impl AgentRole {
                         | "lsp_query"
                         | "read_pdf"
                         | "read_image"
+                        | "read_document"
                         | "data_query"
                         | "code_diagnostics"
                         | "process"
@@ -1010,6 +1013,7 @@ impl AgentRole {
                         | "lsp_query"
                         | "read_pdf"
                         | "read_image"
+                        | "read_document"
                         | "data_query"
                         | "web_search"
                         | "local_http"
@@ -1036,6 +1040,7 @@ impl AgentRole {
                         | "lsp_query"
                         | "read_pdf"
                         | "read_image"
+                        | "read_document"
                         | "data_query"
                         | "code_diagnostics"
                         | "process"
@@ -1061,6 +1066,7 @@ impl AgentRole {
                         | "lsp_query"
                         | "read_pdf"
                         | "read_image"
+                        | "read_document"
                         | "data_query"
                 ),
             },

@@ -49,6 +49,10 @@ enum ToolTrace {
             return string(input, "query") ?? "web search"
         case "read_pdf", "read_image":
             return string(input, "path") ?? ""
+        case "read_document":
+            let path = string(input, "path") ?? ""
+            let filter = string(input, "sheets") ?? string(input, "pages") ?? ""
+            return filter.isEmpty ? path : "\(path) · \(filter)"
         case "data_query":
             let path = string(input, "path") ?? ""
             let query = string(input, "query") ?? ""
@@ -126,7 +130,7 @@ enum ToolTrace {
             return "magnifyingglass"
         case "web_search":
             return "globe"
-        case "read_pdf", "read_image", "data_query":
+        case "read_pdf", "read_image", "read_document", "data_query":
             return "doc.text.magnifyingglass"
         case "budget_status", "task_detail", "task_control", "tool_search":
             return "gauge"
