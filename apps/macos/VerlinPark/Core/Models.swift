@@ -371,11 +371,26 @@ struct MemoryPolicy: Codable, Equatable, Sendable {
     let enabled: Bool
     let maxItems: Int?
     let maxAgeDays: Int?
+    /// TTL applied to automatic task-result memories.
+    let taskResultVerifyDays: Int?
+    /// TTL applied to other memories when they are explicitly verified.
+    let defaultVerifyDays: Int?
+    /// Replace a same-key memory instead of keeping an older active claim.
+    let autoSupersede: Bool?
+    /// Character budget for the memory brief injected into a run.
+    let briefMaxChars: Int?
+    /// Opt-in daemon sweep that marks expired memories stale.
+    let sweepStale: Bool?
 
     enum CodingKeys: String, CodingKey {
         case enabled
         case maxItems = "max_items"
         case maxAgeDays = "max_age_days"
+        case taskResultVerifyDays = "task_result_verify_days"
+        case defaultVerifyDays = "default_verify_days"
+        case autoSupersede = "auto_supersede"
+        case briefMaxChars = "brief_max_chars"
+        case sweepStale = "sweep_stale"
     }
 }
 
@@ -411,6 +426,24 @@ struct MemoryPruneResult: Codable, Sendable {
     }
 }
 
+struct MemoryEvidence: Codable, Hashable, Sendable {
+    let kind: String
+    let reference: String
+    let note: String?
+
+    var label: String {
+        switch kind {
+        case "commit": "commit \(reference.prefix(8))"
+        case "path": "path \(reference)"
+        case "task": "task \(reference)"
+        case "session": "session \(reference.prefix(8))"
+        case "event": "event \(reference)"
+        case "url": reference
+        default: "\(kind) \(reference)"
+        }
+    }
+}
+
 struct MemoryItem: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let sessionId: String
@@ -422,6 +455,53 @@ struct MemoryItem: Codable, Identifiable, Hashable, Sendable {
     let body: String
     let tags: [String]
     let createdAt: String
+    let status: String?
+    let source: String?
+    let evidence: [MemoryEvidence]?
+    let supersedes: [String]?
+    let supersededBy: String?
+    let pinned: Bool?
+    let useCount: Int?
+    let lastUsedAt: String?
+    let lastVerifiedAt: String?
+    let verifyAfter: String?
+    let staleReason: String?
+
+    var displayStatus: String {
+        status ?? "active"
+    }
+
+    var displaySource: String {
+        source ?? "agent"
+    }
+
+    var isPinned: Bool {
+        pinned ?? false
+    }
+
+    var evidenceCount: Int {
+        evidence?.count ?? 0
+    }
+
+    /// Compact provenance for the memory row. The full evidence list remains
+    /// available in the model but is too noisy for a dense dashboard.
+    var evidenceLabelParts: [String] {
+        Array((evidence ?? []).prefix(3)).map(\.label)
+    }
+
+    var isActive: Bool {
+        displayStatus == "active"
+    }
+
+    var statusDetail: String? {
+        if let staleReason, !staleReason.isEmpty {
+            return staleReason
+        }
+        if let verifyAfter {
+            return "verify after \(verifyAfter)"
+        }
+        return nil
+    }
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -434,6 +514,69 @@ struct MemoryItem: Codable, Identifiable, Hashable, Sendable {
         case body
         case tags
         case createdAt = "created_at"
+        case status
+        case source
+        case evidence
+        case supersedes
+        case supersededBy = "superseded_by"
+        case pinned
+        case useCount = "use_count"
+        case lastUsedAt = "last_used_at"
+        case lastVerifiedAt = "last_verified_at"
+        case verifyAfter = "verify_after"
+        case staleReason = "stale_reason"
+    }
+}
+
+struct MemoryUpdateResult: Codable, Sendable {
+    let memory: MemoryItem
+}
+
+struct MemoryVerificationCheck: Codable, Hashable, Sendable {
+    let evidence: MemoryEvidence
+    let status: String
+    let detail: String
+}
+
+struct MemoryVerifyResult: Codable, Sendable {
+    let memory: MemoryItem
+    let checks: [MemoryVerificationCheck]
+}
+
+struct MemoryStatCount: Codable, Hashable, Sendable {
+    let key: String
+    let count: Int
+}
+
+struct MemoryStatsResult: Codable, Sendable {
+    let projectId: String
+    let total: Int
+    let byStatus: [MemoryStatCount]
+    let bySource: [MemoryStatCount]
+    let byKind: [MemoryStatCount]
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case total
+        case byStatus = "by_status"
+        case bySource = "by_source"
+        case byKind = "by_kind"
+    }
+}
+
+struct MemorySweepResult: Codable, Sendable {
+    let projectId: String
+    let candidates: Int
+    let markedStale: Int
+    let memoryIds: [String]
+    let dryRun: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case candidates
+        case markedStale = "marked_stale"
+        case memoryIds = "memory_ids"
+        case dryRun = "dry_run"
     }
 }
 

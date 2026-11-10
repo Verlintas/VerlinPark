@@ -5,8 +5,16 @@ struct MemoryRow: View {
     let memory: MemoryItem
     @State private var confirmDelete = false
 
+    private var statusColor: Color {
+        switch memory.displayStatus {
+        case "active": memory.isPinned ? VPTheme.accent : VPTheme.success
+        case "stale": VPTheme.warning
+        default: VPTheme.textTertiary
+        }
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Text(memory.kind.uppercased())
                     .font(.system(size: 8, weight: .medium, design: .monospaced))
@@ -17,9 +25,38 @@ struct MemoryRow: View {
                 Text(memory.title)
                     .font(.system(size: 9, weight: .medium))
                 Spacer()
-                Text(memory.agentName)
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                Text(memory.displayStatus.uppercased())
+                    .font(.system(size: 7.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(statusColor.opacity(0.1), in: Capsule())
+                if model.memoryActionBusyID == memory.id {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Button {
+                        Task { await model.toggleMemoryPin(memory) }
+                    } label: {
+                        Image(systemName: memory.isPinned ? "pin.fill" : "pin")
+                            .font(.system(size: 8))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(memory.isPinned ? VPTheme.accent : .secondary)
+                    .help(memory.isPinned ? "Unpin memory" : "Pin memory")
+                    .disabled(model.memoryBusy)
+                    if !memory.evidenceLabelParts.isEmpty {
+                        Button {
+                            Task { await model.verifyMemory(memory) }
+                        } label: {
+                            Image(systemName: "checkmark.seal")
+                                .font(.system(size: 8))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("Verify evidence references")
+                        .disabled(model.memoryBusy)
+                    }
+                }
                 Button {
                     confirmDelete = true
                 } label: {
@@ -31,10 +68,37 @@ struct MemoryRow: View {
                 .help("Delete memory")
                 .disabled(model.memoryBusy)
             }
+            HStack(spacing: 8) {
+                Text(memory.displaySource)
+                Text(memory.agentName)
+                if memory.evidenceCount > 0 {
+                    Text("\(memory.evidenceCount) evidence")
+                }
+                if let useCount = memory.useCount, useCount > 0 {
+                    Text("used \(useCount)×")
+                }
+                if let verified = memory.lastVerifiedAt {
+                    Text("verified \(verified.prefix(10))")
+                }
+            }
+            .font(.system(size: 7.5, design: .monospaced))
+            .foregroundStyle(.tertiary)
             Text(memory.body)
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
+            if !memory.evidenceLabelParts.isEmpty {
+                Text(memory.evidenceLabelParts.joined(separator: " · "))
+                    .font(.system(size: 7.5, design: .monospaced))
+                    .foregroundStyle(VPTheme.accentDeep)
+                    .lineLimit(2)
+            }
+            if let detail = memory.statusDetail, !detail.isEmpty, memory.displayStatus != "active" {
+                Text(detail)
+                    .font(.system(size: 7.5, design: .monospaced))
+                    .foregroundStyle(statusColor)
+                    .lineLimit(2)
+            }
             if !memory.tags.isEmpty {
                 Text(memory.tags.map { "#\($0)" }.joined(separator: " "))
                     .font(.system(size: 8, design: .monospaced))
@@ -62,6 +126,7 @@ struct MemoryRow: View {
 struct MemoryPolicyCard: View {
     @Environment(AppModel.self) private var model
     let project: Project
+    @State private var showAdvanced = false
 
     var body: some View {
         @Bindable var model = model
@@ -100,10 +165,47 @@ struct MemoryPolicyCard: View {
                     .foregroundStyle(.tertiary)
             }
             Text(
-                "Off by default. The daemon sweeps enabled policies periodically (default hourly) and emits event-backed deletions. At least one limit is required to enable."
+                "Off by default. The daemon sweeps enabled policies periodically (default hourly) and emits event-backed deletions. Pinned memories are never pruned. At least one limit is required to enable."
             )
             .font(.system(size: 9, design: .monospaced))
             .foregroundStyle(.secondary)
+            DisclosureGroup("Verification & retrieval", isExpanded: $showAdvanced) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        TextField(
+                            "task-result verify days",
+                            text: $model.memoryPolicyTaskResultVerifyDays
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 150)
+                        TextField(
+                            "default verify days",
+                            text: $model.memoryPolicyDefaultVerifyDays
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 150)
+                        TextField("brief chars", text: $model.memoryPolicyBriefMaxChars)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 100)
+                    }
+                    Toggle("Supersede a same-title active memory", isOn: $model.memoryPolicyAutoSupersede)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    Toggle("Hourly stale sweep (opt-in)", isOn: $model.memoryPolicySweepStale)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    Text(
+                        "Stale is a warning, not a fact check: verification only checks commit ancestry, path existence, and cheap record ids. URL evidence is reported unchecked. Sweeping marks expired active memories stale and never deletes them."
+                    )
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                }
+                .padding(.top, 6)
+            }
+            .font(.system(size: 9, design: .monospaced))
             if let status = model.memoryPolicyStatus {
                 Text(status)
                     .font(.system(size: 8, design: .monospaced))

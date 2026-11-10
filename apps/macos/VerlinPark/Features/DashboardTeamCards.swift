@@ -249,6 +249,13 @@ struct MemoryCard: View {
     let project: Project
     @State private var confirmPrune = false
 
+    private func statsSummary(_ stats: MemoryStatsResult) -> String {
+        func count(_ key: String) -> Int {
+            stats.byStatus.first { $0.key == key }?.count ?? 0
+        }
+        return "\(stats.total) total · \(count("active")) active · \(count("stale")) stale · \(count("superseded")) superseded"
+    }
+
     var body: some View {
         @Bindable var model = model
         VStack(alignment: .leading, spacing: 10) {
@@ -268,17 +275,41 @@ struct MemoryCard: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(model.memoryBusy)
+                Button("Sweep stale") {
+                    Task { await model.sweepStaleMemories() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.memoryBusy || model.memorySweepBusy)
+                .help("Mark memories past their verification window stale")
                 Button("Prune") {
                     confirmPrune = true
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(model.memoryBusy || model.memories.isEmpty)
-                .help("Delete memories older than 30 days")
+                .help("Delete unpinned memories older than 30 days")
             }
-            Text("Durable decisions, facts, conventions, and sources shared across sessions.")
+            Text("Evidence-backed decisions, facts, conventions, and task results shared across sessions.")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                Toggle("Include stale", isOn: $model.memoryIncludeStale)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .onChange(of: model.memoryIncludeStale) { _, _ in
+                        Task { await model.loadMemories() }
+                    }
+                if let stats = model.memoryStats {
+                    Text(statsSummary(stats))
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                } else if let status = model.memoryStatsStatus {
+                    Text(status)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
             HStack(spacing: 8) {
                 TextField("Search memories", text: $model.memoryQuery)
                     .textFieldStyle(.roundedBorder)
@@ -364,7 +395,9 @@ struct MemoryCard: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Only memories created more than 30 days ago are removed. Recent memories are kept.")
+            Text(
+                "Only unpinned memories created more than 30 days ago are removed. Recent and pinned memories are kept."
+            )
         }
     }
 }

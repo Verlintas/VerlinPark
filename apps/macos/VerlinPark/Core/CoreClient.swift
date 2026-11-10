@@ -2090,17 +2090,65 @@ actor CoreClient {
         projectID: String,
         query: String?,
         kind: String?,
+        status: String? = nil,
+        includeStale: Bool = false,
         limit: Int = 50
     ) async throws -> [MemoryItem] {
         let params: [String: JSONValue] = [
             "project_id": .string(projectID),
             "query": query.map(JSONValue.string) ?? .null,
             "kind": kind.map(JSONValue.string) ?? .null,
+            "status": status.map(JSONValue.string) ?? .null,
+            "include_stale": .bool(includeStale),
             "limit": .number(Double(limit)),
         ]
         return try await request(method: "memory.list", params: params)
             .decode(MemoryListResult.self)
             .memories
+    }
+
+    func memoryUpdate(
+        id: String,
+        status: String?,
+        pinned: Bool?,
+        tags: [String]?
+    ) async throws -> MemoryItem {
+        let params: [String: JSONValue] = [
+            "id": .string(id),
+            "status": status.map(JSONValue.string) ?? .null,
+            "pinned": pinned.map(JSONValue.bool) ?? .null,
+            "tags": tags.map { .array($0.map(JSONValue.string)) } ?? .null,
+        ]
+        return try await request(method: "memory.update", params: params)
+            .decode(MemoryUpdateResult.self)
+            .memory
+    }
+
+    func memoryVerify(id: String) async throws -> MemoryVerifyResult {
+        try await request(method: "memory.verify", params: ["id": .string(id)])
+            .decode(MemoryVerifyResult.self)
+    }
+
+    func memorySweep(
+        projectID: String,
+        olderThanDays: Int?,
+        dryRun: Bool
+    ) async throws -> MemorySweepResult {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "older_than_days": olderThanDays.map { .number(Double($0)) } ?? .null,
+            "dry_run": .bool(dryRun),
+        ]
+        return try await request(method: "memory.sweep", params: params)
+            .decode(MemorySweepResult.self)
+    }
+
+    func memoryStats(projectID: String) async throws -> MemoryStatsResult {
+        try await request(
+            method: "memory.stats",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(MemoryStatsResult.self)
     }
 
     func createMemory(
@@ -2133,18 +2181,26 @@ actor CoreClient {
 
     func setMemoryPolicy(
         projectID: String,
-        enabled: Bool,
-        maxItems: Int?,
-        maxAgeDays: Int?
+        policy: MemoryPolicy
     ) async throws -> MemoryPolicy {
-        let policy: [String: JSONValue] = [
-            "enabled": .bool(enabled),
-            "max_items": maxItems.map { .number(Double($0)) } ?? .null,
-            "max_age_days": maxAgeDays.map { .number(Double($0)) } ?? .null,
+        // Send every field: the daemon replaces the whole policy object, and
+        // omitting v2 fields would silently reset verification TTLs or the
+        // staleness sweep whenever retention is saved.
+        let body: [String: JSONValue] = [
+            "enabled": .bool(policy.enabled),
+            "max_items": policy.maxItems.map { .number(Double($0)) } ?? .null,
+            "max_age_days": policy.maxAgeDays.map { .number(Double($0)) } ?? .null,
+            "task_result_verify_days": policy.taskResultVerifyDays.map { .number(Double($0)) }
+                ?? .number(90),
+            "default_verify_days": policy.defaultVerifyDays.map { .number(Double($0)) }
+                ?? .number(365),
+            "auto_supersede": .bool(policy.autoSupersede ?? true),
+            "brief_max_chars": policy.briefMaxChars.map { .number(Double($0)) } ?? .number(4000),
+            "sweep_stale": .bool(policy.sweepStale ?? false),
         ]
         let params: [String: JSONValue] = [
             "project_id": .string(projectID),
-            "policy": .object(policy),
+            "policy": .object(body),
         ]
         return try await request(method: "memory.policy.set", params: params)
             .decode(MemoryPolicyResult.self)

@@ -185,11 +185,21 @@ final class AppModel {
     var memoryPolicyEnabled = false
     var memoryPolicyMaxItems = "1000"
     var memoryPolicyMaxAgeDays = "180"
+    var memoryPolicyTaskResultVerifyDays = "90"
+    var memoryPolicyDefaultVerifyDays = "365"
+    var memoryPolicyAutoSupersede = true
+    var memoryPolicyBriefMaxChars = "4000"
+    var memoryPolicySweepStale = false
     var memoryPolicyBusy = false
     var memoryPolicyStatus: String?
     var memoryNewKind = "note"
     var memoryNewTitle = ""
     var memoryNewBody = ""
+    var memoryIncludeStale = false
+    var memoryStats: MemoryStatsResult?
+    var memoryStatsStatus: String?
+    var memoryActionBusyID: String?
+    var memorySweepBusy = false
     var projectTokenBudgetText = ""
     var projectCostBudgetText = ""
     var projectBudgetBusy = false
@@ -1785,6 +1795,11 @@ final class AppModel {
             memoryPolicyEnabled = false
             memoryPolicyMaxItems = "1000"
             memoryPolicyMaxAgeDays = "180"
+            memoryPolicyTaskResultVerifyDays = "90"
+            memoryPolicyDefaultVerifyDays = "365"
+            memoryPolicyAutoSupersede = true
+            memoryPolicyBriefMaxChars = "4000"
+            memoryPolicySweepStale = false
             memoryPolicyStatus = nil
             return
         }
@@ -1807,14 +1822,34 @@ final class AppModel {
         }
         let itemsText = memoryPolicyMaxItems.trimmingCharacters(in: .whitespacesAndNewlines)
         let daysText = memoryPolicyMaxAgeDays.trimmingCharacters(in: .whitespacesAndNewlines)
+        let taskResultText = memoryPolicyTaskResultVerifyDays
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let defaultVerifyText = memoryPolicyDefaultVerifyDays
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let briefText = memoryPolicyBriefMaxChars.trimmingCharacters(in: .whitespacesAndNewlines)
         let maxItems = itemsText.isEmpty ? nil : Int(itemsText)
         let maxAgeDays = daysText.isEmpty ? nil : Int(daysText)
+        let taskResultVerifyDays = taskResultText.isEmpty ? nil : Int(taskResultText)
+        let defaultVerifyDays = defaultVerifyText.isEmpty ? nil : Int(defaultVerifyText)
+        let briefMaxChars = briefText.isEmpty ? nil : Int(briefText)
         if !itemsText.isEmpty, maxItems == nil {
             memoryPolicyStatus = "Max items must be a whole number."
             return
         }
         if !daysText.isEmpty, maxAgeDays == nil {
             memoryPolicyStatus = "Max age days must be a whole number."
+            return
+        }
+        if !taskResultText.isEmpty, taskResultVerifyDays == nil {
+            memoryPolicyStatus = "Task-result verification days must be a whole number."
+            return
+        }
+        if !defaultVerifyText.isEmpty, defaultVerifyDays == nil {
+            memoryPolicyStatus = "Default verification days must be a whole number."
+            return
+        }
+        if !briefText.isEmpty, briefMaxChars == nil {
+            memoryPolicyStatus = "Brief character budget must be a whole number."
             return
         }
         if memoryPolicyEnabled, maxItems == nil, maxAgeDays == nil {
@@ -1826,12 +1861,19 @@ final class AppModel {
         do {
             let policy = try await core.setMemoryPolicy(
                 projectID: projectID,
-                enabled: memoryPolicyEnabled,
-                maxItems: maxItems,
-                maxAgeDays: maxAgeDays
+                policy: MemoryPolicy(
+                    enabled: memoryPolicyEnabled,
+                    maxItems: maxItems,
+                    maxAgeDays: maxAgeDays,
+                    taskResultVerifyDays: taskResultVerifyDays,
+                    defaultVerifyDays: defaultVerifyDays,
+                    autoSupersede: memoryPolicyAutoSupersede,
+                    briefMaxChars: briefMaxChars,
+                    sweepStale: memoryPolicySweepStale
+                )
             )
             applyMemoryPolicy(policy)
-            memoryPolicyStatus = "Memory retention policy saved."
+            memoryPolicyStatus = "Memory policy saved."
         } catch {
             memoryPolicyStatus = error.localizedDescription
             handle(error)
@@ -1842,6 +1884,11 @@ final class AppModel {
         memoryPolicyEnabled = policy.enabled
         memoryPolicyMaxItems = policy.maxItems.map(String.init) ?? ""
         memoryPolicyMaxAgeDays = policy.maxAgeDays.map(String.init) ?? ""
+        memoryPolicyTaskResultVerifyDays = policy.taskResultVerifyDays.map(String.init) ?? "90"
+        memoryPolicyDefaultVerifyDays = policy.defaultVerifyDays.map(String.init) ?? "365"
+        memoryPolicyAutoSupersede = policy.autoSupersede ?? true
+        memoryPolicyBriefMaxChars = policy.briefMaxChars.map(String.init) ?? "4000"
+        memoryPolicySweepStale = policy.sweepStale ?? false
     }
 
     func loadGitHistory() async {
@@ -2434,6 +2481,7 @@ final class AppModel {
                 projectID: projectID,
                 query: query.isEmpty ? nil : query,
                 kind: nil,
+                includeStale: memoryIncludeStale,
                 limit: 50
             )
             guard projectID == selectedProjectID else { return }
@@ -2441,6 +2489,91 @@ final class AppModel {
             memoryStatus = nil
         } catch {
             memoryStatus = error.localizedDescription
+        }
+        await loadMemoryStats()
+    }
+
+    func loadMemoryStats() async {
+        guard let projectID = selectedProjectID else {
+            memoryStats = nil
+            return
+        }
+        do {
+            let stats = try await core.memoryStats(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            memoryStats = stats
+            memoryStatsStatus = nil
+        } catch {
+            memoryStatsStatus = error.localizedDescription
+        }
+    }
+
+    func toggleMemoryPin(_ memory: MemoryItem) async {
+        memoryActionBusyID = memory.id
+        defer { memoryActionBusyID = nil }
+        do {
+            _ = try await core.memoryUpdate(
+                id: memory.id,
+                status: nil,
+                pinned: !memory.isPinned,
+                tags: nil
+            )
+            memoryStatus = memory.isPinned ? "Memory unpinned." : "Memory pinned."
+            await loadMemories()
+        } catch {
+            memoryStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func verifyMemory(_ memory: MemoryItem) async {
+        memoryActionBusyID = memory.id
+        defer { memoryActionBusyID = nil }
+        do {
+            let result = try await core.memoryVerify(id: memory.id)
+            let checked = result.checks.filter { $0.status != "unchecked" }.count
+            let missing = result.checks.filter { $0.status == "missing" }.count
+            if missing > 0 {
+                memoryStatus =
+                    "Verification found \(missing) missing evidence reference(s); the memory is now stale."
+            } else if checked == 0 {
+                memoryStatus =
+                    "No locally checkable evidence. The memory was left unchanged rather than treated as verified."
+            } else {
+                memoryStatus = "Verified \(checked) evidence reference(s)."
+            }
+            await loadMemories()
+        } catch {
+            memoryStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func sweepStaleMemories() async {
+        guard let projectID = selectedProjectID else { return }
+        memorySweepBusy = true
+        defer { memorySweepBusy = false }
+        do {
+            let preview = try await core.memorySweep(
+                projectID: projectID,
+                olderThanDays: nil,
+                dryRun: true
+            )
+            guard preview.candidates > 0 else {
+                memoryStatus = "No memories are past their verification window."
+                return
+            }
+            let result = try await core.memorySweep(
+                projectID: projectID,
+                olderThanDays: nil,
+                dryRun: false
+            )
+            memoryStatus =
+                "Marked \(result.markedStale) of \(result.candidates) expired memories stale."
+            await loadMemories()
+        } catch {
+            memoryStatus = error.localizedDescription
+            handle(error)
         }
     }
 
