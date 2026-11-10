@@ -8138,6 +8138,11 @@ async fn exposes_runtime_budget_search_and_artifact_tools() {
                     arguments: r#"{"query":"read file"}"#.into(),
                 }),
                 StreamEvent::ToolCall(ToolCall {
+                    id: "search_browser".into(),
+                    name: "tool_search".into(),
+                    arguments: r#"{"query":"browser"}"#.into(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
                     id: "artifact".into(),
                     name: "publish_artifact_file".into(),
                     arguments: r#"{"path":"README.md","name":"readme","kind":"report"}"#.into(),
@@ -8185,6 +8190,20 @@ async fn exposes_runtime_budget_search_and_artifact_tools() {
             .as_str()
             .unwrap()
             .contains("read_file")
+    );
+    let browser_search = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "tool_search"
+                && event.payload["tool_call_id"] == "search_browser"
+        })
+        .expect("browser tool search result");
+    assert!(
+        browser_search.payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("browser")
     );
     let artifact = events
         .iter()

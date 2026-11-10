@@ -10652,11 +10652,13 @@ async fn run_tool_search(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut results = Vec::new();
-    for tool in config
-        .tools
-        .schemas()
+    // Mirror the exact tool bundle advertised to this role, including
+    // special-cased tools such as `browser` that are not in the registry.
+    // `tool_search` itself is omitted so a generic query does not return the
+    // discovery tool as its own result.
+    for tool in tool_schemas(config, spec.role, spec.profile, spec.allow_delegation)
         .into_iter()
-        .filter(|tool| spec.role.allows_tool(spec.profile, &tool.name))
+        .filter(|tool| tool.name != "tool_search")
     {
         let score = tool_match_score(&tool.name, &tool.description, &query);
         if score <= 0.0 {
