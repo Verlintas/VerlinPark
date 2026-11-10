@@ -903,12 +903,48 @@ impl AgentRole {
         match self {
             Self::Leader => true,
             Self::Manager => {
-                matches!(name, "read_file" | "list_dir" | "grep")
-                    || (profile == AgentProfile::Research && name == "fetch_url")
+                matches!(
+                    name,
+                    "read_file"
+                        | "list_dir"
+                        | "grep"
+                        | "find_files"
+                        | "file_info"
+                        | "read_files"
+                        | "project_profile"
+                        | "git"
+                        | "repo_map"
+                        | "find_symbol"
+                        | "find_references"
+                        | "dependency_graph"
+                        | "build_context"
+                        | "affected_tests"
+                ) || (profile == AgentProfile::Research && name == "fetch_url")
             }
             Self::Verifier => {
-                matches!(name, "read_file" | "list_dir" | "grep" | "shell")
-                    || (profile == AgentProfile::Research && name == "fetch_url")
+                matches!(
+                    name,
+                    "read_file"
+                        | "list_dir"
+                        | "grep"
+                        | "find_files"
+                        | "file_info"
+                        | "read_files"
+                        | "project_profile"
+                        | "git"
+                        | "repo_map"
+                        | "find_symbol"
+                        | "find_references"
+                        | "dependency_graph"
+                        | "build_context"
+                        | "affected_tests"
+                        | "shell"
+                        | "run_project_task"
+                        | "code_diagnostics"
+                        | "process"
+                        | "wait_for"
+                        | "local_http"
+                ) || (profile == AgentProfile::Research && name == "fetch_url")
             }
             Self::Worker | Self::Labour => match profile {
                 AgentProfile::Coding => matches!(
@@ -920,16 +956,86 @@ impl AgentRole {
                         | "write_file"
                         | "shell"
                         | "fetch_url"
+                        | "find_files"
+                        | "file_info"
+                        | "read_files"
+                        | "apply_patch"
+                        | "file_manage"
+                        | "project_profile"
+                        | "run_project_task"
+                        | "git"
+                        | "repo_map"
+                        | "find_symbol"
+                        | "find_references"
+                        | "dependency_graph"
+                        | "build_context"
+                        | "affected_tests"
+                        | "code_diagnostics"
+                        | "process"
+                        | "wait_for"
+                        | "local_http"
                 ),
                 AgentProfile::Research => matches!(
                     name,
-                    "read_file" | "list_dir" | "grep" | "write_file" | "fetch_url"
+                    "read_file"
+                        | "list_dir"
+                        | "grep"
+                        | "write_file"
+                        | "fetch_url"
+                        | "find_files"
+                        | "file_info"
+                        | "read_files"
+                        | "project_profile"
+                        | "git"
+                        | "repo_map"
+                        | "find_symbol"
+                        | "find_references"
+                        | "dependency_graph"
+                        | "build_context"
+                        | "affected_tests"
+                        | "local_http"
                 ),
                 AgentProfile::Verification => matches!(
                     name,
-                    "read_file" | "list_dir" | "grep" | "shell" | "fetch_url"
+                    "read_file"
+                        | "list_dir"
+                        | "grep"
+                        | "shell"
+                        | "fetch_url"
+                        | "find_files"
+                        | "file_info"
+                        | "read_files"
+                        | "project_profile"
+                        | "run_project_task"
+                        | "git"
+                        | "repo_map"
+                        | "find_symbol"
+                        | "find_references"
+                        | "dependency_graph"
+                        | "build_context"
+                        | "affected_tests"
+                        | "code_diagnostics"
+                        | "process"
+                        | "wait_for"
+                        | "local_http"
                 ),
-                AgentProfile::Generic => matches!(name, "read_file" | "list_dir" | "grep"),
+                AgentProfile::Generic => matches!(
+                    name,
+                    "read_file"
+                        | "list_dir"
+                        | "grep"
+                        | "find_files"
+                        | "file_info"
+                        | "read_files"
+                        | "project_profile"
+                        | "git"
+                        | "repo_map"
+                        | "find_symbol"
+                        | "find_references"
+                        | "dependency_graph"
+                        | "build_context"
+                        | "affected_tests"
+                ),
             },
         }
     }
@@ -7928,7 +8034,11 @@ async fn compact_context_if_needed(
     // trimming to half of the hard limit instead of doing nothing.
     let floor = usize::from(summary_text.is_some());
     let trim_target = if force && summary_text.is_none() {
-        (hard_limit / 2).max(1_024)
+        // A manual compaction that could not produce a summary still makes
+        // headroom. Cap the target at `estimated - 1` so even a small context
+        // produces a deterministic trim instead of reporting failure without
+        // changing anything.
+        (hard_limit / 2).max(1_024).min(estimated.saturating_sub(1))
     } else {
         hard_limit
     };
@@ -8174,6 +8284,15 @@ async fn run_loop(
         .map(|schema| estimate_context_tokens(&schema))
         .unwrap_or(0);
     let (context_threshold, context_hard_limit) = context_limits(config, spec.role);
+    if context_hard_limit != u64::MAX
+        && system_tokens.saturating_add(tool_tokens) > context_hard_limit
+    {
+        return Err(anyhow!(
+            "system prompt and tool schemas (~{} tokens) exceed the model context hard limit ({}); increase VERLINPARK_CONTEXT_WINDOW or role context_window, or reduce enabled tools/MCP servers",
+            system_tokens.saturating_add(tool_tokens),
+            context_hard_limit
+        ));
+    }
     let model_name = model_for(config, spec.role);
     let mut calibration = if top_level {
         load_context_calibration(engine, &session.id, &model_name).await
@@ -8590,6 +8709,143 @@ async fn run_loop(
             )
             .await?;
             return Ok(LoopOutcome::Final(text));
+        }
+
+        let safe_parallel_batch = tool_calls.len() > 1
+            && tool_calls.iter().all(|call| {
+                is_parallel_safe_tool(&call.name)
+                    && spec.role.allows_tool(spec.profile, &call.name)
+                    && active_skill
+                        .as_ref()
+                        .is_none_or(|skill| skill_allows_tool(skill, &call.name))
+                    && config.tools.get(&call.name).is_some()
+            });
+        if safe_parallel_batch {
+            let mut prepared = Vec::new();
+            for (index, call) in tool_calls.iter().enumerate() {
+                let call_id = if call.id.is_empty() {
+                    format!("call_{}_{}", turn, index)
+                } else {
+                    call.id.clone()
+                };
+                let input: serde_json::Value =
+                    serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+                let assessment = assess_tool_call(&call.name, &input, &spec.worktree);
+                if !matches!(
+                    decide(config.approval_mode, &assessment, spec.auto_approve),
+                    ApprovalDecision::Allow { .. }
+                ) {
+                    prepared.clear();
+                    break;
+                }
+                let tool = config
+                    .tools
+                    .get(&call.name)
+                    .expect("parallel tools are registry-backed");
+                prepared.push((index, call_id, call.name.clone(), input, tool));
+            }
+            if !prepared.is_empty() {
+                for (_, call_id, name, input, _) in &prepared {
+                    emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "tool.started",
+                        serde_json::json!({
+                            "tool_call_id": call_id,
+                            "name": name,
+                            "input": input,
+                        }),
+                    )
+                    .await?;
+                }
+                let mut cancel_rx = control.subscribe();
+                let mut pending = prepared.into_iter();
+                let mut set = tokio::task::JoinSet::new();
+                for _ in 0..4 {
+                    let Some((index, call_id, name, input, tool)) = pending.next() else {
+                        break;
+                    };
+                    let context = tool_context.clone();
+                    set.spawn(async move {
+                        let output = match tool.execute(&context, input).await {
+                            Ok(output) => output,
+                            Err(error) => ToolOutput::error(format!("tool error: {error}")),
+                        };
+                        (index, call_id, name, output)
+                    });
+                }
+                let mut results = Vec::new();
+                loop {
+                    if set.is_empty() && pending.len() == 0 {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = cancel_rx.changed() => {
+                            set.abort_all();
+                            return Ok(LoopOutcome::Cancelled);
+                        }
+                        joined = set.join_next() => {
+                            match joined {
+                                Some(Ok(item)) => results.push(item),
+                                Some(Err(error)) => {
+                                    return Err(anyhow!("parallel tool task failed: {error}"));
+                                }
+                                None => break,
+                            }
+                            if let Some((index, call_id, name, input, tool)) = pending.next() {
+                                let context = tool_context.clone();
+                                set.spawn(async move {
+                                    let output = match tool.execute(&context, input).await {
+                                        Ok(output) => output,
+                                        Err(error) => ToolOutput::error(format!("tool error: {error}")),
+                                    };
+                                    (index, call_id, name, output)
+                                });
+                            }
+                        }
+                    }
+                }
+                results.sort_by_key(|(index, _, _, _)| *index);
+                for (_, call_id, name, output) in results {
+                    emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "tool.finished",
+                        serde_json::json!({
+                            "tool_call_id": call_id,
+                            "name": name,
+                            "output": truncate(&output.content),
+                            "is_error": output.is_error,
+                            "structured": crate::tools::bounded_structured(output.structured.clone()),
+                        }),
+                    )
+                    .await?;
+                    if top_level {
+                        let stored = engine
+                            .append_message(
+                                &session.id,
+                                "tool",
+                                &output.content,
+                                serde_json::json!([]),
+                                Some(call_id.clone()),
+                            )
+                            .await?;
+                        conversation_ids.push(Some(stored.id));
+                    }
+                    conversation.push(ChatMessage::tool(call_id, output.content));
+                }
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "agent.turn_finished",
+                    serde_json::json!({"turn": turn + 1, "parallel": true}),
+                )
+                .await?;
+                continue;
+            }
         }
 
         for (index, call) in tool_calls.into_iter().enumerate() {
@@ -9503,6 +9759,7 @@ async fn run_loop(
                     "name": call.name,
                     "output": truncate(&output.content),
                     "is_error": output.is_error,
+                    "structured": crate::tools::bounded_structured(output.structured.clone()),
                 }),
             )
             .await?;
@@ -10772,6 +11029,29 @@ fn role_price(config: &AgentConfig, role: AgentRole) -> (f64, f64) {
 
 fn usage_cost(input: u64, output: u64, input_price: f64, output_price: f64) -> f64 {
     (input as f64 / 1_000_000.0) * input_price + (output as f64 / 1_000_000.0) * output_price
+}
+
+/// Registry tools that only read repository state and can safely run in a
+/// bounded parallel batch. `shell` and `fetch_url` are deliberately excluded:
+/// shell commands can mutate state and network calls should not fan out.
+fn is_parallel_safe_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "list_dir"
+            | "grep"
+            | "find_files"
+            | "file_info"
+            | "read_files"
+            | "project_profile"
+            | "git"
+            | "repo_map"
+            | "find_symbol"
+            | "find_references"
+            | "dependency_graph"
+            | "build_context"
+            | "affected_tests"
+    )
 }
 
 fn tool_schemas(

@@ -138,7 +138,7 @@ fn set_compaction(service: &AgentService, after_tokens: u64, keep_messages: usiz
         .clone();
     config.compact_after_tokens = after_tokens;
     config.compact_keep_messages = keep_messages;
-    config.context_window = 8_000;
+    config.context_window = 32_000;
     *service.config.write().unwrap() = Some(config);
 }
 
@@ -8009,4 +8009,101 @@ async fn active_skill_narrows_tools_at_execution_time() {
     assert!(activations.activations[0].agent_name.is_some());
     assert!(activations.activations[0].agent_id.is_some());
     assert!(!activations.activations[0].activated_at.is_empty());
+}
+
+#[test]
+fn tool_role_matrix_matches_the_tooling_roadmap() {
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "project_profile"));
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "git"));
+    assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "apply_patch"));
+    assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "run_project_task"));
+
+    assert!(AgentRole::Verifier.allows_tool(AgentProfile::Verification, "run_project_task"));
+    assert!(!AgentRole::Verifier.allows_tool(AgentProfile::Verification, "apply_patch"));
+
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "apply_patch"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "file_manage"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "git"));
+    assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "apply_patch"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Research, "read_files"));
+    assert!(!AgentRole::Worker.allows_tool(AgentProfile::Generic, "shell"));
+}
+
+#[tokio::test]
+async fn executes_parallel_reads_and_structured_patch_tools() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "find".into(),
+                    name: "find_files".into(),
+                    arguments: r#"{"pattern":"**/*.md"}"#.into(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "read".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "patch".into(),
+                    name: "apply_patch".into(),
+                    arguments: serde_json::json!({
+                        "patch": "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+hello\n+world\n"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("tool round complete".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "tooling smoke".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "exercise tools").await.unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let content = engine.workspace_file(&session.id, "new.txt").await.unwrap();
+    assert_eq!(content.content, "hello\nworld\n");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let find = events
+        .iter()
+        .find(|event| event.kind == "tool.finished" && event.payload["name"] == "find_files")
+        .expect("find_files result");
+    assert!(
+        find.payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("README.md")
+    );
+    assert!(find.payload["structured"].is_object());
+    let patch = events
+        .iter()
+        .find(|event| event.kind == "tool.finished" && event.payload["name"] == "apply_patch")
+        .expect("apply_patch result");
+    assert_eq!(patch.payload["structured"]["files"][0]["status"], "created");
+    assert!(!patch.payload["is_error"].as_bool().unwrap());
+    assert!(
+        events.iter().any(|event| {
+            event.kind == "agent.turn_finished" && event.payload["parallel"] == true
+        })
+    );
 }

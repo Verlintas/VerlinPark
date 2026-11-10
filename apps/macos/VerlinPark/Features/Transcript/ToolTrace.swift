@@ -8,12 +8,39 @@ import Foundation
 enum ToolTrace {
     static func summary(name: String, input: JSONValue) -> String {
         switch name {
-        case "read_file", "write_file", "edit_file", "list_dir", "workspace_read":
+        case "read_file", "write_file", "edit_file", "list_dir", "workspace_read", "file_info":
             return string(input, "path") ?? ""
+        case "read_files":
+            let count = arrayCount(input, "files")
+            return "\(count) file\(count == 1 ? "" : "s")"
         case "grep":
             let pattern = string(input, "pattern") ?? ""
             let path = string(input, "path") ?? "."
             return pattern.isEmpty ? path : "\(pattern) · \(path)"
+        case "find_files":
+            let pattern = string(input, "pattern") ?? "**/*"
+            let path = string(input, "path") ?? "."
+            return "\(pattern) · \(path)"
+        case "apply_patch":
+            return "unified patch"
+        case "file_manage":
+            let action = string(input, "action") ?? "manage"
+            let source = string(input, "source") ?? ""
+            let destination = string(input, "destination") ?? ""
+            return [action, source, destination]
+                .filter { !$0.isEmpty }
+                .joined(separator: " · ")
+        case "project_profile":
+            return "detected commands"
+        case "run_project_task":
+            let kind = string(input, "kind") ?? "task"
+            let package = string(input, "package") ?? ""
+            let filter = string(input, "filter") ?? ""
+            return [kind, package, filter].filter { !$0.isEmpty }.joined(separator: " · ")
+        case "git":
+            let action = string(input, "action") ?? "status"
+            let path = string(input, "path") ?? ""
+            return path.isEmpty ? action : "\(action) · \(path)"
         case "shell":
             return collapsed(string(input, "command") ?? "")
         case "fetch_url":
@@ -65,10 +92,14 @@ enum ToolTrace {
             return "exclamationmark.triangle"
         }
         switch name {
-        case "read_file", "list_dir", "grep", "workspace_read":
+        case "read_file", "list_dir", "grep", "find_files", "read_files", "file_info", "workspace_read":
             return "magnifyingglass"
-        case "write_file", "edit_file":
+        case "write_file", "edit_file", "apply_patch", "file_manage":
             return "pencil"
+        case "project_profile", "run_project_task":
+            return "hammer"
+        case "git":
+            return "arrow.triangle.branch"
         case "shell":
             return "terminal"
         case "fetch_url":

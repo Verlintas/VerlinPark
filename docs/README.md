@@ -12,7 +12,7 @@
 | **Current** | [audit/2026-11-09-findings.md](audit/2026-11-09-findings.md) | 2026-11-09 全量审查完整台账（[CSV](audit/2026-11-09-findings.csv)）；116 个原始 finding 合并为 65 条并保留全部来源 ID |
 | **Design** | [ARCHITECTURE.md](ARCHITECTURE.md) | 目标架构、协议、数据模型、状态机；实现状态见 PROGRESS/AUDIT |
 | **Design** | [PLAN.md](PLAN.md) | 长期产品计划、范围、里程碑、风险；保留早期设计章节作为背景 |
-| **Design** | [TOOLING_ROADMAP.md](TOOLING_ROADMAP.md) | Agent 工具缺口完整清单、智能工具设计、角色矩阵与 10–30k LOC 实施预算 |
+| **Current** | [TOOLING_ROADMAP.md](TOOLING_ROADMAP.md) | Agent 工具完整清单、已实现 wave 状态、剩余 media/search/introspection/GUI 缺口与设计预算 |
 | **Reference** | [DECISIONS.md](DECISIONS.md) | Accepted ADR 索引；改架构先加 ADR |
 | **Reference** | [RESEARCH.md](RESEARCH.md) | 2026-10 的竞品/技术调研；历史背景，不是当前状态 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |

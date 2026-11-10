@@ -74,6 +74,7 @@ pub mod skills;
 pub mod sources;
 pub mod terminal;
 pub mod textdiff;
+pub mod tooling;
 pub mod update;
 pub mod workspace;
 
@@ -286,7 +287,7 @@ fn sorted_usage_buckets(buckets: HashMap<String, UsageBucket>) -> Vec<UsageBucke
     values
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(data))
 }
@@ -9637,6 +9638,7 @@ impl Engine {
                 });
                 continue;
             }
+            crate::tooling::process::stop_worktree_processes(&path);
             match tokio::task::spawn_blocking({
                 let root = project_root.clone();
                 let path = path.clone();

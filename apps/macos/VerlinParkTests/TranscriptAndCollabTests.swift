@@ -136,6 +136,11 @@ final class TranscriptAndCollabTests: XCTestCase {
                 "tool_call_id": .string("w1"), "name": .string("write_file"),
                 "output": .string("written"), "is_error": .bool(false),
             ]),
+            event(5, "tool.started", ["tool_call_id": .string("f1"), "name": .string("find_files")]),
+            event(6, "tool.finished", [
+                "tool_call_id": .string("f1"), "name": .string("find_files"),
+                "output": .string("src/lib.rs"), "is_error": .bool(false),
+            ]),
         ]
         XCTAssertTrue(TranscriptProjection.build(events: events).isEmpty)
 
@@ -171,6 +176,20 @@ final class TranscriptAndCollabTests: XCTestCase {
                 ])
             ),
             "call · docs · search"
+        )
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "find_files",
+                input: .object(["pattern": .string("**/*.swift"), "path": .string("apps")])
+            ),
+            "**/*.swift · apps"
+        )
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "run_project_task",
+                input: .object(["kind": .string("test"), "filter": .string("sources_")])
+            ),
+            "test · sources_"
         )
         XCTAssertTrue(
             ToolTrace.isHostSensitive(

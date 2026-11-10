@@ -1,8 +1,8 @@
 # VerlinPark Agent Tooling Roadmap
 
-> **Status:** Planning baseline; no implementation started for the gap list below.<br>
+> **Status:** Wave A, Wave B, and selected Wave C tools implemented on 2026-11-10; media/search/introspection/GUI tools deferred.<br>
 > **Date:** 2026-11-10<br>
-> **Code baseline:** `926d9ef` (`feat(budget): add explicit unlimited session mode`)<br>
+> **Code baseline:** working tree after `c64e1b8`; see ADR-0134.<br>
 > **Implementation budget:** ~10,000–30,000 code lines, target core ~24k, hard planning cap 30k<br>
 > **Purpose:** Preserve the complete missing-tool inventory and design intent across
 > context compression. This file is the source of truth for the tooling work; update
@@ -23,6 +23,27 @@
 
 Do not implement a tool merely because it has a row here. The priority and
 budget gates in section 7 decide the order.
+
+---
+
+### Implementation status (2026-11-10)
+
+Implemented in this wave (see ADR-0134 and PROGRESS):
+
+- structured `ToolOutput` + 32 KiB event cap;
+- atomic `write_file`/`edit_file`, `apply_patch`, `file_manage`, `find_files`,
+  `file_info`, `read_files`;
+- `project_profile`, `run_project_task`, `affected_tests`, read-only `git`;
+- lexical `repo_map`, `find_symbol`, `find_references`, `dependency_graph`,
+  `build_context`, `code_diagnostics`;
+- parallel read-only registry tools (max 4, stable ordering);
+- `process`, `wait_for`, `local_http`, upgraded `fetch_url` (covers the
+  readability/metadata part of W-02; no separate `read_url` tool yet);
+- role/permission matrix, tests, UI tool labels.
+
+Still open: `web_search`, LSP backend, PDF/image/office reading,
+`publish_artifact_file`, `budget_status`, `task_detail`, `tool_search`,
+`task_control`, `data_query`, `browser`, `computer`.
 
 ---
 
@@ -81,7 +102,10 @@ Not an LLM inside every tool. Smart means:
 
 ---
 
-## 2. Current tool surface (baseline `926d9ef`)
+## 2. Pre-wave tool surface (baseline `926d9ef`, historical)
+
+This section records the original seven-tool baseline for design context. The
+post-wave tool surface is listed in section 0 and in `docs/PROGRESS.md`.
 
 ### 2.1 Core file/code tools (the 7 base tools)
 
@@ -956,45 +980,45 @@ macOS UI.
 Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 
 ```text
-[ ] R-02 structured tool result contract
-[ ] E-01 atomic write/edit + hash + diff
-[ ] E-02 structured read_file
-[ ] E-03 structured grep
-[ ] E-04 paginated list_dir
-[ ] E-05 structured shell result
-[ ] E-06 fetch_url upgrade
-[ ] F-01 apply_patch
-[ ] F-02 find_files
-[ ] F-03 file_manage
-[ ] F-04 read_files batch
-[ ] F-05 file_info
-[ ] P-01 project_profile
-[ ] P-02 run_project_task
-[ ] G-01 git
-[ ] R-01 parallel read-only tool calls
+[x] R-02 structured tool result contract
+[x] E-01 atomic write/edit + hash + diff
+[x] E-02 structured read_file
+[x] E-03 structured grep
+[x] E-04 paginated list_dir
+[x] E-05 structured shell result
+[x] E-06 fetch_url upgrade
+[x] F-01 apply_patch
+[x] F-02 find_files
+[x] F-03 file_manage
+[x] F-04 read_files batch
+[x] F-05 file_info
+[x] P-01 project_profile
+[x] P-02 run_project_task
+[x] G-01 git
+[x] R-01 parallel read-only tool calls
 
-[ ] C-01 repo_map
-[ ] C-02 find_symbol
-[ ] C-03 find_references
-[ ] C-04 code_diagnostics
-[ ] C-06 affected_tests
-[ ] C-07 dependency_graph
-[ ] C-08 build_context
-[ ] C-05 lsp_query
+[x] C-01 repo_map
+[x] C-02 find_symbol
+[x] C-03 find_references
+[x] C-04 code_diagnostics
+[x] C-06 affected_tests
+[x] C-07 dependency_graph
+[x] C-08 build_context
+[–] C-05 lsp_query
 
-[ ] S-01 process
-[ ] S-02 wait_for
-[ ] S-03 local_http
-[ ] W-01 web_search
-[ ] W-02 read_url
-[ ] M-02 read_pdf
-[ ] M-01 read_image
-[ ] A-01 publish_artifact_file
-[ ] T-01 budget_status
-[ ] T-02 task_detail
-[ ] T-03 tool_search
-[ ] T-04 task_control (only after task lifecycle hardening)
-[ ] D-01 data_query
+[x] S-01 process
+[x] S-02 wait_for
+[x] S-03 local_http
+[–] W-01 web_search
+[~] W-02 read_url (readability/metadata landed in fetch_url; separate tool not added)
+[–] M-02 read_pdf
+[–] M-01 read_image
+[–] A-01 publish_artifact_file
+[–] T-01 budget_status
+[–] T-02 task_detail
+[–] T-03 tool_search
+[–] T-04 task_control (only after task lifecycle hardening)
+[–] D-01 data_query
 
 [–] U-01 browser (stretch)
 [–] U-02 computer (stretch)

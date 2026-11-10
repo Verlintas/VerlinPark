@@ -155,7 +155,7 @@ pub fn decide(
 
 pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> PermissionAssessment {
     match name {
-        "write_file" | "edit_file" => {
+        "write_file" | "edit_file" | "apply_patch" | "file_manage" => {
             let path = input
                 .get("path")
                 .and_then(Value::as_str)
@@ -182,9 +182,61 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
         // MCP tools are projected into the agent schema under names chosen by
         // the server. Unknown tools therefore use the same conservative
         // external classification instead of being treated as local reads.
+        "local_http" => {
+            let method = input
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("GET")
+                .to_ascii_uppercase();
+            if matches!(method.as_str(), "GET" | "HEAD") {
+                PermissionAssessment::new(RiskLevel::ReadOnly, "read-only local HTTP request")
+            } else {
+                PermissionAssessment::new(
+                    RiskLevel::WorkspaceWrite,
+                    "local HTTP request can change service state",
+                )
+            }
+        }
+        "process" => {
+            if input.get("action").and_then(Value::as_str) == Some("start") {
+                let command = input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assess_shell_command(command, worktree)
+            } else {
+                PermissionAssessment::new(RiskLevel::ReadOnly, "process control")
+            }
+        }
+        "run_project_task" | "code_diagnostics" => {
+            if input.get("kind").and_then(Value::as_str) == Some("custom") {
+                let command = input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assess_shell_command(command, worktree)
+            } else {
+                PermissionAssessment::new(
+                    RiskLevel::WorkspaceWrite,
+                    "detected project task runs under the shell sandbox",
+                )
+            }
+        }
         "read_file"
         | "list_dir"
         | "grep"
+        | "find_files"
+        | "file_info"
+        | "read_files"
+        | "project_profile"
+        | "git"
+        | "repo_map"
+        | "find_symbol"
+        | "find_references"
+        | "dependency_graph"
+        | "build_context"
+        | "affected_tests"
+        | "wait_for"
         | "fetch_url"
         | "delegate"
         | "delegate_many"

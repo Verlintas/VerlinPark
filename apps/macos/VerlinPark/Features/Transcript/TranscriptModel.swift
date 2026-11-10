@@ -104,6 +104,9 @@ enum TranscriptProjection {
     static func isRoutineTool(_ name: String) -> Bool {
         [
             "read_file", "list_dir", "grep", "write_file", "edit_file",
+            "find_files", "file_info", "read_files", "project_profile", "git",
+            "repo_map", "find_symbol", "find_references", "dependency_graph",
+            "build_context", "affected_tests", "code_diagnostics",
             "todo_write", "fetch_url", "remember", "recall", "coordinate",
             "team_status", "send_message", "read_mailbox", "list_artifacts",
             "read_artifact", "publish_artifact", "search_sources", "read_source",

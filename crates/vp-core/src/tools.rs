@@ -1,15 +1,18 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
+
+use crate::tooling::diff::render_diff;
+use crate::tooling::fs::{atomic_write, sha256_hex, utf8_line_count};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -54,6 +57,10 @@ pub struct ToolContext {
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// Optional machine-readable result for the event stream and UI. The
+    /// provider still receives `content`; tools must keep that rendering
+    /// concise and actionable.
+    pub structured: Option<Value>,
 }
 
 impl ToolOutput {
@@ -61,6 +68,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            structured: None,
         }
     }
 
@@ -68,7 +76,29 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            structured: None,
         }
+    }
+
+    pub fn ok_structured(content: impl Into<String>, structured: Value) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            structured: Some(structured),
+        }
+    }
+
+    pub fn error_structured(content: impl Into<String>, structured: Value) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            structured: Some(structured),
+        }
+    }
+
+    pub fn with_structured(mut self, structured: Value) -> Self {
+        self.structured = Some(structured);
+        self
     }
 }
 
@@ -96,6 +126,24 @@ impl ToolRegistry {
                 Arc::new(WriteFile),
                 Arc::new(Shell),
                 Arc::new(FetchUrl),
+                Arc::new(crate::tooling::files::FindFiles),
+                Arc::new(crate::tooling::files::FileInfo),
+                Arc::new(crate::tooling::files::ReadFiles),
+                Arc::new(crate::tooling::files::ApplyPatch),
+                Arc::new(crate::tooling::files::FileManage),
+                Arc::new(crate::tooling::project::ProjectProfile),
+                Arc::new(crate::tooling::project::RunProjectTask),
+                Arc::new(crate::tooling::git::GitQuery),
+                Arc::new(crate::tooling::code::RepoMap),
+                Arc::new(crate::tooling::code::FindSymbol),
+                Arc::new(crate::tooling::code::FindReferences),
+                Arc::new(crate::tooling::code::CodeDiagnostics),
+                Arc::new(crate::tooling::code::AffectedTests),
+                Arc::new(crate::tooling::code::DependencyGraph),
+                Arc::new(crate::tooling::code::BuildContext),
+                Arc::new(crate::tooling::process::ProcessTool),
+                Arc::new(crate::tooling::process::WaitFor),
+                Arc::new(crate::tooling::http::LocalHttp),
             ],
         }
     }
@@ -285,11 +333,13 @@ pub(crate) struct FetchedUrl {
     pub content_type: String,
     pub text: String,
     pub truncated: bool,
+    pub final_url: String,
+    pub redirects: Vec<String>,
 }
 
-/// Fetch a public HTTP(S) URL with the same SSRF and redirect policy used by
-/// the research tool. Callers receive the decoded body and must decide whether
-/// to render HTML or treat it as text.
+/// Fetch a public HTTP(S) URL with SSRF checks on every redirect hop. Callers
+/// receive the decoded body and decide whether to render HTML or treat it as
+/// text.
 pub(crate) async fn fetch_public_url(
     raw_url: &str,
     max_chars: usize,
@@ -297,10 +347,93 @@ pub(crate) async fn fetch_public_url(
 ) -> Result<FetchedUrl> {
     let max_chars = max_chars.clamp(100, 4_000_000);
     let max_bytes = max_bytes.clamp(1_024, 8 * 1024 * 1024);
-    let url = reqwest::Url::parse(raw_url).context("invalid URL")?;
+    let mut current = reqwest::Url::parse(raw_url).context("invalid URL")?;
+    let mut redirects = Vec::new();
+    for hop in 0..=5 {
+        validate_public_url(&current).await?;
+        let host = current
+            .host_str()
+            .ok_or_else(|| anyhow!("URL has no host"))?
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let port = current.port_or_known_default().unwrap_or(80);
+        let mut client_builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(20))
+            .user_agent("VerlinPark/0.1 research fetcher");
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if is_blocked_ip(ip) {
+                bail!("private or local IP addresses are blocked");
+            }
+        } else {
+            let address = resolve_public_address(&host, port).await?;
+            client_builder = client_builder.resolve(&host, address);
+        }
+        let client = client_builder.build().context("building HTTP client")?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|error| anyhow!("fetch failed: {error}"))?;
+        let status = response.status();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow!("redirect response has no Location header"))?;
+            if hop >= 5 {
+                bail!("too many redirects (max 5)");
+            }
+            let next = current
+                .join(location)
+                .map_err(|error| anyhow!("invalid redirect location: {error}"))?;
+            redirects.push(next.to_string());
+            current = next;
+            continue;
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let mut body = Vec::new();
+        let mut response = response;
+        let mut truncated = false;
+        while let Some(chunk) = response.chunk().await? {
+            body.extend_from_slice(&chunk);
+            if body.len() >= max_bytes {
+                truncated = true;
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&body).to_string();
+        let mut chars = text.chars();
+        let mut output = chars.by_ref().take(max_chars).collect::<String>();
+        if chars.next().is_some() {
+            truncated = true;
+            output.push_str("\n… content truncated");
+        }
+        return Ok(FetchedUrl {
+            status: status.as_u16(),
+            content_type,
+            text: output,
+            truncated,
+            final_url: current.to_string(),
+            redirects,
+        });
+    }
+    bail!("too many redirects (max 5)")
+}
+
+async fn validate_public_url(url: &reqwest::Url) -> Result<()> {
     match url.scheme() {
         "http" | "https" => {}
         other => bail!("unsupported URL scheme: {other}"),
+    }
+    if url.username() != "" || url.password().is_some() {
+        bail!("URL credentials are not allowed");
     }
     let host = url
         .host_str()
@@ -310,58 +443,53 @@ pub(crate) async fn fetch_public_url(
     if is_blocked_host(&host) {
         bail!("local hosts are blocked");
     }
-    let port = url.port_or_known_default().unwrap_or(80);
-    let mut client_builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20))
-        .user_agent("VerlinPark/0.1 research fetcher");
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip(ip) {
-            bail!("private or local IP addresses are blocked");
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_blocked_ip(ip)
+    {
+        bail!("private or local IP addresses are blocked");
+    }
+    Ok(())
+}
+
+fn html_title(html: &str) -> Option<String> {
+    static TITLE: OnceLock<Regex> = OnceLock::new();
+    let regex = TITLE.get_or_init(|| Regex::new(r"(?is)<title\b[^>]*>(.*?)</title\s*>").unwrap());
+    let raw = regex.captures(html)?.get(1)?.as_str();
+    let text = crate::sources::html_to_text(raw);
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.chars().take(300).collect())
+}
+
+fn html_links(html: &str, base: &reqwest::Url) -> Vec<String> {
+    static LINK: OnceLock<Regex> = OnceLock::new();
+    let regex = LINK.get_or_init(|| Regex::new(r#"(?is)href\s*=\s*["']([^"']+)["']"#).unwrap());
+    let mut links = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for captures in regex.captures_iter(html) {
+        let Some(href) = captures.get(1).map(|value| value.as_str()) else {
+            continue;
+        };
+        if href.starts_with('#') || href.starts_with("javascript:") || href.starts_with("mailto:") {
+            continue;
         }
-    } else {
-        let address = resolve_public_address(&host, port).await?;
-        client_builder = client_builder.resolve(&host, address);
-    }
-    let client = client_builder.build().context("building HTTP client")?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| anyhow!("fetch failed: {error}"))?;
-    let status = response.status();
-    if status.is_redirection() {
-        bail!("redirects are not followed; request the final URL explicitly");
-    }
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    let mut body = Vec::new();
-    let mut response = response;
-    let mut truncated = false;
-    while let Some(chunk) = response.chunk().await? {
-        body.extend_from_slice(&chunk);
-        if body.len() >= max_bytes {
-            truncated = true;
-            break;
+        let Ok(url) = base.join(href) else {
+            continue;
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || url.username() != ""
+            || url.password().is_some()
+        {
+            continue;
+        }
+        let value = url.to_string();
+        if seen.insert(value.clone()) {
+            links.push(value);
+            if links.len() >= 50 {
+                break;
+            }
         }
     }
-    let text = String::from_utf8_lossy(&body).to_string();
-    let mut chars = text.chars();
-    let mut output = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        truncated = true;
-        output.push_str("\n… content truncated");
-    }
-    Ok(FetchedUrl {
-        status: status.as_u16(),
-        content_type,
-        text: output,
-        truncated,
-    })
+    links
 }
 
 #[async_trait]
@@ -371,7 +499,7 @@ impl AgentTool for FetchUrl {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch a public HTTP(S) URL for research. Returns text content, truncated."
+        "Fetch a public HTTP(S) URL with redirects and SSRF protection. HTML is reduced to readable text with a title and links."
     }
 
     fn schema(&self) -> Value {
@@ -379,7 +507,8 @@ impl AgentTool for FetchUrl {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "Public http(s) URL"},
-                "max_chars": {"type": "integer", "minimum": 100, "maximum": 20000}
+                "max_chars": {"type": "integer", "minimum": 100, "maximum": 20000},
+                "include_links": {"type": "boolean", "description": "Return extracted links; default true"}
             },
             "required": ["url"]
         })
@@ -395,12 +524,86 @@ impl AgentTool for FetchUrl {
             .and_then(Value::as_u64)
             .unwrap_or(8000)
             .clamp(100, 20000) as usize;
+        let include_links = input
+            .get("include_links")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         match fetch_public_url(raw_url, max_chars, max_chars.saturating_mul(4)).await {
-            Ok(fetched) => Ok(ToolOutput::ok(format!(
-                "GET {raw_url} -> {} ({})\n{}",
-                fetched.status, fetched.content_type, fetched.text
-            ))),
-            Err(error) => Ok(ToolOutput::error(error.to_string())),
+            Ok(fetched) => {
+                let content_type = fetched.content_type.to_ascii_lowercase();
+                if content_type.starts_with("image/")
+                    || content_type.starts_with("audio/")
+                    || content_type.starts_with("video/")
+                    || content_type.contains("pdf")
+                    || content_type.contains("octet-stream")
+                {
+                    return Ok(ToolOutput::error_structured(
+                        format!("binary content is not readable as text: {content_type}"),
+                        json!({
+                            "code": "UNSUPPORTED_CONTENT",
+                            "content_type": fetched.content_type,
+                            "final_url": fetched.final_url,
+                        }),
+                    ));
+                }
+                let is_html = content_type.contains("html")
+                    || fetched.text.trim_start().starts_with("<!doctype")
+                    || fetched.text.trim_start().starts_with("<html");
+                let title = is_html.then(|| html_title(&fetched.text)).flatten();
+                let links = if is_html && include_links {
+                    html_links(
+                        &fetched.text,
+                        &reqwest::Url::parse(&fetched.final_url)
+                            .unwrap_or_else(|_| reqwest::Url::parse("https://invalid").unwrap()),
+                    )
+                } else {
+                    Vec::new()
+                };
+                let content = if is_html {
+                    crate::sources::html_to_text(&fetched.text)
+                } else {
+                    fetched.text.clone()
+                };
+                let mut content_chars = content.chars();
+                let mut visible = content_chars.by_ref().take(max_chars).collect::<String>();
+                if content_chars.next().is_some() {
+                    visible.push_str("\n… content truncated");
+                }
+                let hash = sha256_hex(fetched.text.as_bytes());
+                let header = format!(
+                    "GET {raw_url} -> {} ({}){}{}",
+                    fetched.status,
+                    fetched.content_type,
+                    if fetched.redirects.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {} redirect(s)", fetched.redirects.len())
+                    },
+                    title
+                        .as_ref()
+                        .map(|title| format!(" · {title}"))
+                        .unwrap_or_default()
+                );
+                Ok(ToolOutput::ok_structured(
+                    truncate(format!("{header}\n{visible}")),
+                    json!({
+                        "ok": fetched.status < 400,
+                        "status": fetched.status,
+                        "content_type": fetched.content_type,
+                        "final_url": fetched.final_url,
+                        "redirects": fetched.redirects,
+                        "title": title,
+                        "links": links,
+                        "text": visible,
+                        "sha256": hash,
+                        "truncated": fetched.truncated,
+                    }),
+                ))
+            }
+            Err(error) => Ok(ToolOutput::error_structured(
+                error.to_string(),
+                json!({"code": "FETCH_ERROR", "url": raw_url}),
+            )),
         }
     }
 }
@@ -412,14 +615,14 @@ impl AgentTool for ReadFile {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 text file from the project. Returns line-numbered content."
+        "Read a UTF-8 text file from the project. Returns line-numbered content and a content hash for stale-read checks."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path relative to the project root"},
+                "path": {"type": "string", "description": "Path relative to the worktree root"},
                 "offset": {"type": "integer", "minimum": 0, "description": "Zero-based starting line"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum lines"}
             },
@@ -437,19 +640,62 @@ impl AgentTool for ReadFile {
         let path = safe_existing_path(&context.root, path)?;
         let metadata = tokio::fs::metadata(&path).await?;
         if metadata.len() > MAX_READ_FILE_BYTES {
-            return Ok(ToolOutput::error(format!(
-                "file is {} bytes; read_file is limited to {} bytes. Use shell head/sed for a targeted read.",
-                metadata.len(),
-                MAX_READ_FILE_BYTES
-            )));
+            return Ok(ToolOutput::error_structured(
+                format!(
+                    "file is {} bytes; read_file is limited to {} bytes. Use a bounded offset read or shell sed/head.",
+                    metadata.len(),
+                    MAX_READ_FILE_BYTES
+                ),
+                json!({
+                    "code": "FILE_TOO_LARGE",
+                    "path": path,
+                    "size_bytes": metadata.len(),
+                    "limit_bytes": MAX_READ_FILE_BYTES,
+                }),
+            ));
         }
         let content = tokio::fs::read_to_string(&path).await?;
-        let lines: Vec<&str> = content.lines().skip(offset).take(limit).collect();
-        let mut out = format!("{} ({} lines)\n", path.display(), content.lines().count());
-        for (index, line) in lines.iter().enumerate() {
-            out.push_str(&format!("{:>5} | {}\n", offset + index + 1, line));
+        let total_lines = content.lines().count();
+        let lines = content
+            .lines()
+            .skip(offset)
+            .take(limit)
+            .enumerate()
+            .map(|(index, line)| format!("{:>5} | {}", offset + index + 1, line))
+            .collect::<Vec<_>>();
+        let returned = lines.len();
+        let truncated = offset > 0 || offset.saturating_add(returned) < total_lines;
+        let hash = sha256_hex(content.as_bytes());
+        let mut out = format!(
+            "{} ({} lines, sha256 {})\n",
+            path.display(),
+            total_lines,
+            hash
+        );
+        out.push_str(&lines.join("\n"));
+        if truncated {
+            out.push('\n');
+            out.push_str(&format!(
+                "… showing lines {}-{} of {}; next_offset={}",
+                offset.saturating_add(1),
+                offset.saturating_add(returned),
+                total_lines,
+                offset.saturating_add(returned)
+            ));
         }
-        Ok(ToolOutput::ok(truncate(out)))
+        Ok(ToolOutput::ok_structured(
+            truncate(out),
+            json!({
+                "path": path,
+                "sha256": hash,
+                "total_lines": total_lines,
+                "offset": offset,
+                "lines": returned,
+                "truncated": truncated,
+                "next_offset": truncated.then_some(offset.saturating_add(returned)),
+                "encoding": "utf-8",
+            }),
+        ))
     }
 }
 
@@ -460,34 +706,100 @@ impl AgentTool for ListDir {
     }
 
     fn description(&self) -> &'static str {
-        "List files and directories under a project-relative path."
+        "List files and directories under a project-relative path. One level only; use find_files for recursive discovery."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path relative to the project root; default ."}
+                "path": {"type": "string", "description": "Path relative to the worktree root; default ."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum entries; default 500"},
+                "cursor": {"type": "integer", "minimum": 0, "description": "Zero-based entry offset for pagination"},
+                "include_hidden": {"type": "boolean", "description": "Include dotfiles; default true"}
             }
         })
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let relative = input.get("path").and_then(Value::as_str).unwrap_or(".");
+        let include_hidden = input
+            .get("include_hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(500)
+            .clamp(1, 2_000) as usize;
+        let cursor = input.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
         let path = safe_existing_path(&context.root, relative)?;
         let mut entries = Vec::new();
         let mut reader = tokio::fs::read_dir(&path).await?;
         while let Some(entry) = reader.next_entry().await? {
             let metadata = entry.metadata().await?;
             let name = entry.file_name().to_string_lossy().to_string();
-            entries.push(if metadata.is_dir() {
-                format!("{name}/")
-            } else {
-                format!("{name} ({} bytes)", metadata.len())
-            });
+            if !include_hidden && name.starts_with('.') {
+                continue;
+            }
+            entries.push((name, metadata.is_dir(), metadata.len()));
         }
-        entries.sort();
-        Ok(ToolOutput::ok(truncate(entries.join("\n"))))
+        entries.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.0.to_lowercase().cmp(&right.0.to_lowercase()))
+        });
+        let total = entries.len();
+        let page = entries
+            .iter()
+            .skip(cursor)
+            .take(limit)
+            .map(|(name, is_dir, size)| {
+                json!({
+                    "name": name,
+                    "type": if *is_dir { "dir" } else { "file" },
+                    "size_bytes": size,
+                })
+            })
+            .collect::<Vec<_>>();
+        let lines = page
+            .iter()
+            .map(|entry| {
+                let name = entry["name"].as_str().unwrap_or_default();
+                if entry["type"] == "dir" {
+                    format!("{name}/")
+                } else {
+                    format!(
+                        "{name} ({} bytes)",
+                        entry["size_bytes"].as_u64().unwrap_or(0)
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let next_cursor = cursor.saturating_add(page.len());
+        let truncated = next_cursor < total;
+        let mut rendered = lines.join("\n");
+        if truncated || cursor > 0 {
+            rendered.push_str(&format!(
+                "\n… showing entries {}-{} of {}; next_cursor={}",
+                cursor.saturating_add(1),
+                next_cursor,
+                total,
+                next_cursor
+            ));
+        }
+        Ok(ToolOutput::ok_structured(
+            truncate(rendered),
+            json!({
+                "path": path,
+                "entries": page,
+                "total": total,
+                "cursor": cursor,
+                "next_cursor": truncated.then_some(next_cursor),
+                "truncated": truncated,
+            }),
+        ))
     }
 }
 
@@ -498,7 +810,7 @@ impl AgentTool for Grep {
     }
 
     fn description(&self) -> &'static str {
-        "Search project files with a regular expression. Returns path:line matches."
+        "Search project files with a regular expression. Returns path:line matches plus machine-readable context."
     }
 
     fn schema(&self) -> Value {
@@ -506,8 +818,11 @@ impl AgentTool for Grep {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Rust regex pattern"},
-                "path": {"type": "string", "description": "Directory or file relative to project root; default ."},
+                "path": {"type": "string", "description": "Directory or file relative to the worktree root; default ."},
                 "glob": {"type": "string", "description": "Optional glob such as **/*.rs"},
+                "case_sensitive": {"type": "boolean", "description": "Default true"},
+                "context": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Context lines around each match"},
+                "path_only": {"type": "boolean", "description": "Return one path per matching file"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500}
             },
             "required": ["pattern"]
@@ -519,10 +834,30 @@ impl AgentTool for Grep {
             .get("pattern")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("pattern is required"))?;
-        let regex = Regex::new(pattern).context("invalid regex")?;
+        let case_sensitive = input
+            .get("case_sensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let regex = RegexBuilder::new(pattern)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .context("invalid regex")?;
         let relative = input.get("path").and_then(Value::as_str).unwrap_or(".");
         let search_path = safe_existing_path(&context.root, relative)?;
-        let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(100)
+            .clamp(1, 500) as usize;
+        let context_lines = input
+            .get("context")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(5) as usize;
+        let path_only = input
+            .get("path_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let globset = input
             .get("glob")
             .and_then(Value::as_str)
@@ -530,10 +865,14 @@ impl AgentTool for Grep {
             .transpose()?;
 
         let mut matches = Vec::new();
+        let mut seen_paths = std::collections::HashSet::new();
+        let mut files_scanned = 0usize;
+        let mut truncated = false;
         let mut builder = WalkBuilder::new(&search_path);
         builder.hidden(false).git_ignore(true).require_git(false);
-        for entry in builder.build().flatten() {
+        'files: for entry in builder.build().flatten() {
             if matches.len() >= limit {
+                truncated = true;
                 break;
             }
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -557,22 +896,91 @@ impl AgentTool for Grep {
             if content.contains('\0') {
                 continue;
             }
-            for (line_index, line) in content.lines().enumerate() {
-                if regex.is_match(line) {
-                    let relative = path.strip_prefix(&context.root).unwrap_or(path);
-                    matches.push(format!(
-                        "{}:{}: {}",
-                        relative.display(),
-                        line_index + 1,
-                        line
-                    ));
-                    if matches.len() >= limit {
-                        break;
+            files_scanned = files_scanned.saturating_add(1);
+            let lines = content.lines().collect::<Vec<_>>();
+            let relative_path = path
+                .strip_prefix(&context.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            for (line_index, line) in lines.iter().enumerate() {
+                if !regex.is_match(line) {
+                    continue;
+                }
+                if path_only {
+                    if seen_paths.insert(relative_path.clone()) {
+                        matches.push(json!({
+                            "path": relative_path,
+                            "line": line_index + 1,
+                            "text": line,
+                        }));
                     }
+                    if matches.len() >= limit {
+                        truncated = true;
+                        break 'files;
+                    }
+                    continue;
+                }
+                let start = line_index.saturating_sub(context_lines);
+                let end = (line_index + context_lines + 1).min(lines.len());
+                let before = lines[start..line_index].to_vec();
+                let after = lines[line_index + 1..end].to_vec();
+                matches.push(json!({
+                    "path": relative_path,
+                    "line": line_index + 1,
+                    "text": line,
+                    "context_before": before,
+                    "context_after": after,
+                }));
+                if matches.len() >= limit {
+                    truncated = true;
+                    break 'files;
                 }
             }
         }
-        Ok(ToolOutput::ok(truncate(matches.join("\n"))))
+        let rendered = if path_only {
+            let mut paths = matches
+                .iter()
+                .filter_map(|entry| entry["path"].as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            paths.dedup();
+            paths.join("\n")
+        } else {
+            matches
+                .iter()
+                .map(|entry| {
+                    let mut block = String::new();
+                    if let Some(before) = entry["context_before"].as_array() {
+                        for line in before {
+                            block.push_str(&format!("  {}\n", line.as_str().unwrap_or("")));
+                        }
+                    }
+                    block.push_str(&format!(
+                        "{}:{}: {}",
+                        entry["path"].as_str().unwrap_or("?"),
+                        entry["line"].as_u64().unwrap_or(0),
+                        entry["text"].as_str().unwrap_or("")
+                    ));
+                    if let Some(after) = entry["context_after"].as_array() {
+                        for line in after {
+                            block.push_str(&format!("\n  {}", line.as_str().unwrap_or("")));
+                        }
+                    }
+                    block
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Ok(ToolOutput::ok_structured(
+            truncate(rendered),
+            json!({
+                "matches": matches,
+                "match_count": matches.len(),
+                "files_scanned": files_scanned,
+                "truncated": truncated,
+            }),
+        ))
     }
 }
 
@@ -583,7 +991,7 @@ impl AgentTool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Replace an exact string in an existing UTF-8 file."
+        "Replace an exact string in an existing UTF-8 file atomically. Returns a bounded diff and content hashes."
     }
 
     fn schema(&self) -> Value {
@@ -593,7 +1001,9 @@ impl AgentTool for EditFile {
                 "path": {"type": "string", "description": "Path relative to the worktree root"},
                 "old_string": {"type": "string", "description": "Exact text to replace"},
                 "new_string": {"type": "string", "description": "Replacement text"},
-                "replace_all": {"type": "boolean", "description": "Replace every match; default false"}
+                "replace_all": {"type": "boolean", "description": "Replace every match; default false"},
+                "expected_sha256": {"type": "string", "description": "Reject the edit if the current file hash differs"},
+                "dry_run": {"type": "boolean", "description": "Validate and return a diff without writing"}
             },
             "required": ["path", "old_string", "new_string"]
         })
@@ -616,35 +1026,86 @@ impl AgentTool for EditFile {
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let dry_run = input
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if old_string.is_empty() {
-            return Ok(ToolOutput::error("old_string must not be empty"));
+            return Ok(ToolOutput::error_structured(
+                "old_string must not be empty",
+                json!({"code": "INVALID_ARGUMENT", "path": path}),
+            ));
         }
         let path = safe_existing_path(&context.root, path)?;
         if path_is_git_metadata(&context.root, &path) {
-            return Ok(ToolOutput::error(
+            return Ok(ToolOutput::error_structured(
                 "refusing to edit Git metadata through a file tool",
+                json!({"code": "PATH_ESCAPE", "path": path}),
             ));
         }
         let content = tokio::fs::read_to_string(&path).await?;
+        let before_hash = sha256_hex(content.as_bytes());
+        if let Some(expected) = input.get("expected_sha256").and_then(Value::as_str)
+            && expected != before_hash
+        {
+            return Ok(ToolOutput::error_structured(
+                "file hash changed since it was read",
+                json!({
+                    "code": "HASH_MISMATCH",
+                    "path": path,
+                    "expected_sha256": expected,
+                    "actual_sha256": before_hash,
+                }),
+            ));
+        }
         let matches = content.matches(old_string).count();
         if matches == 0 {
-            return Ok(ToolOutput::error("old_string was not found"));
+            return Ok(ToolOutput::error_structured(
+                "old_string was not found",
+                json!({"code": "PATCH_CONFLICT", "path": path}),
+            ));
         }
         if matches > 1 && !replace_all {
-            return Ok(ToolOutput::error(format!(
-                "old_string matched {matches} times; provide more context or set replace_all"
-            )));
+            return Ok(ToolOutput::error_structured(
+                format!(
+                    "old_string matched {matches} times; provide more context or set replace_all"
+                ),
+                json!({
+                    "code": "PATCH_CONFLICT",
+                    "path": path,
+                    "matches": matches,
+                }),
+            ));
         }
         let replaced = if replace_all {
             content.replace(old_string, new_string)
         } else {
             content.replacen(old_string, new_string, 1)
         };
-        tokio::fs::write(&path, replaced).await?;
-        Ok(ToolOutput::ok(format!(
-            "replaced {matches} occurrence(s) in {}",
-            path.display()
-        )))
+        let after_hash = sha256_hex(replaced.as_bytes());
+        let diff = render_diff(&content, &replaced, 3);
+        if !dry_run {
+            atomic_write(&path, replaced.as_bytes())?;
+            crate::tooling::code::invalidate_index(&context.root);
+        }
+        let content_text = format!(
+            "{} {matches} occurrence(s) in {}\n{}",
+            if dry_run { "would replace" } else { "replaced" },
+            path.display(),
+            diff
+        );
+        Ok(ToolOutput::ok_structured(
+            truncate(content_text),
+            json!({
+                "path": path,
+                "replacements": matches,
+                "dry_run": dry_run,
+                "before_sha256": before_hash,
+                "after_sha256": after_hash,
+                "diff": diff,
+                "bytes": replaced.len(),
+            }),
+        ))
     }
 }
 
@@ -655,15 +1116,17 @@ impl AgentTool for WriteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Create or overwrite a UTF-8 file in the session worktree."
+        "Create or overwrite a UTF-8 file atomically in the worktree. Returns the content hash and a bounded diff when replacing a file."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path relative to the project root"},
-                "content": {"type": "string", "description": "Full file content"}
+                "path": {"type": "string", "description": "Path relative to the worktree root"},
+                "content": {"type": "string", "description": "Full file content"},
+                "expected_sha256": {"type": "string", "description": "Reject the write if the current file hash differs"},
+                "dry_run": {"type": "boolean", "description": "Validate and return a diff without writing"}
             },
             "required": ["path", "content"]
         })
@@ -678,16 +1141,72 @@ impl AgentTool for WriteFile {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("content is required"))?;
+        let dry_run = input
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let path = safe_write_path(&context.root, path)?;
+        let old_content = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let mut before_hash = None;
+        if let Some(old) = &old_content {
+            let hash = sha256_hex(old.as_bytes());
+            before_hash = Some(hash.clone());
+            if let Some(expected) = input.get("expected_sha256").and_then(Value::as_str)
+                && expected != hash
+            {
+                return Ok(ToolOutput::error_structured(
+                    "file hash changed since it was read",
+                    json!({
+                        "code": "HASH_MISMATCH",
+                        "path": path,
+                        "expected_sha256": expected,
+                        "actual_sha256": hash,
+                    }),
+                ));
+            }
+        } else if input.get("expected_sha256").is_some() {
+            return Ok(ToolOutput::error_structured(
+                "expected_sha256 was provided but the file does not exist",
+                json!({"code": "HASH_MISMATCH", "path": path}),
+            ));
+        }
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&path, content).await?;
-        Ok(ToolOutput::ok(format!(
-            "wrote {} bytes to {}",
+        if !dry_run {
+            atomic_write(&path, content.as_bytes())?;
+            crate::tooling::code::invalidate_index(&context.root);
+        }
+        let after_hash = sha256_hex(content.as_bytes());
+        let diff = old_content
+            .as_deref()
+            .map(|old| render_diff(old, content, 3))
+            .unwrap_or_default();
+        let created = old_content.is_none();
+        let content_text = format!(
+            "{} {} bytes to {}\n{}",
+            if dry_run { "would write" } else { "wrote" },
             content.len(),
-            path.display()
-        )))
+            path.display(),
+            diff
+        );
+        Ok(ToolOutput::ok_structured(
+            truncate(content_text),
+            json!({
+                "path": path,
+                "bytes": content.len(),
+                "created": created,
+                "dry_run": dry_run,
+                "sha256": after_hash,
+                "before_sha256": before_hash,
+                "diff": diff,
+                "line_count": utf8_line_count(content),
+            }),
+        ))
     }
 }
 
@@ -942,27 +1461,89 @@ impl AgentTool for Shell {
             .and_then(Value::as_u64)
             .unwrap_or(120)
             .min(900);
-        let (exit, text) =
-            run_sandboxed_shell(context, command, Duration::from_secs(timeout_secs)).await?;
-        let result = format!("exit {exit}\n{}", truncate(text));
-        if exit == 0 {
-            Ok(ToolOutput::ok(result))
+        let started = std::time::Instant::now();
+        let captured =
+            match run_sandboxed_shell_captured(context, command, Duration::from_secs(timeout_secs))
+                .await
+            {
+                Ok(captured) => captured,
+                Err(error) => {
+                    return Ok(ToolOutput::error_structured(
+                        error.to_string(),
+                        json!({
+                            "code": if error.to_string().contains("timed out") {
+                                "COMMAND_TIMEOUT"
+                            } else {
+                                "COMMAND_FAILED"
+                            },
+                            "command": command,
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                        }),
+                    ));
+                }
+            };
+        crate::tooling::code::invalidate_index(&context.root);
+        let mut warnings = Vec::new();
+        if captured.stdout_truncated {
+            warnings.push("stdout capped at 1 MiB");
+        }
+        if captured.stderr_truncated {
+            warnings.push("stderr capped at 1 MiB");
+        }
+        let mut text = format!("exit {}\n", captured.exit_code);
+        if !warnings.is_empty() {
+            text.push_str(&format!("[{}]\n", warnings.join("; ")));
+        }
+        if !captured.stdout.is_empty() {
+            text.push_str(&captured.stdout);
+            if !captured.stdout.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        if !captured.stderr.is_empty() {
+            text.push_str("[stderr]\n");
+            text.push_str(&captured.stderr);
+            if !captured.stderr.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        let structured = json!({
+            "ok": captured.exit_code == 0,
+            "command": command,
+            "exit_code": captured.exit_code,
+            "stdout": captured.stdout,
+            "stderr": captured.stderr,
+            "stdout_truncated": captured.stdout_truncated,
+            "stderr_truncated": captured.stderr_truncated,
+            "elapsed_ms": captured.duration_ms,
+            "warnings": warnings,
+        });
+        let text = truncate(text);
+        if captured.exit_code == 0 {
+            Ok(ToolOutput::ok_structured(text, structured))
         } else {
-            Ok(ToolOutput::error(result))
+            Ok(ToolOutput::error_structured(text, structured))
         }
     }
 }
 
-/// Run a non-interactive shell under the write sandbox and return its exit
-/// code plus bounded combined output. Used by the shell tool and by the
-/// deterministic Integrator command so both share the same Seatbelt policy,
-/// environment allowlist, process-group cleanup, and output caps.
-pub(crate) async fn run_sandboxed_shell(
+/// Structured shell capture used by the shell and project-task tools.
+#[derive(Debug, Clone)]
+pub(crate) struct ShellCapture {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub duration_ms: u64,
+}
+
+pub(crate) async fn run_sandboxed_shell_captured(
     context: &ToolContext,
     command: &str,
     timeout_duration: Duration,
-) -> Result<(i32, String)> {
-    run_sandboxed_shell_with(context, "/bin/sh", &["-c"], command, timeout_duration).await
+) -> Result<ShellCapture> {
+    run_sandboxed_shell_with_captured(context, "/bin/sh", &["-c"], command, timeout_duration).await
 }
 
 /// Login-shell variant used by the Integrator command for compatibility with
@@ -973,16 +1554,27 @@ pub(crate) async fn run_sandboxed_login_shell(
     command: &str,
     timeout_duration: Duration,
 ) -> Result<(i32, String)> {
-    run_sandboxed_shell_with(context, "/bin/sh", &["-lc"], command, timeout_duration).await
+    let captured =
+        run_sandboxed_shell_with_captured(context, "/bin/sh", &["-lc"], command, timeout_duration)
+            .await?;
+    let mut text = captured.stdout;
+    if !captured.stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&captured.stderr);
+    }
+    Ok((captured.exit_code, text))
 }
 
-async fn run_sandboxed_shell_with(
+async fn run_sandboxed_shell_with_captured(
     context: &ToolContext,
     program: &str,
     args: &[&str],
     command: &str,
     timeout_duration: Duration,
-) -> Result<(i32, String)> {
+) -> Result<ShellCapture> {
+    let started = std::time::Instant::now();
     let mut process = sandboxed_command(context).await?;
     process
         .arg(program)
@@ -1021,32 +1613,22 @@ async fn run_sandboxed_shell_with(
     let stderr = stderr_task
         .await
         .map_err(|error| anyhow!("shell stderr reader failed: {error}"))?;
-    let mut text = stdout.text;
-    if !stderr.text.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&stderr.text);
-    }
-    let mut notes = Vec::new();
-    if stdout.truncated {
-        notes.push("stdout capped at 1 MiB");
-    }
-    if stderr.truncated {
-        notes.push("stderr capped at 1 MiB");
-    }
-    if !notes.is_empty() {
-        text = format!("[{}]\n{}", notes.join("; "), text);
-    }
-    Ok((status.code().unwrap_or(-1), text))
+    Ok(ShellCapture {
+        exit_code: status.code().unwrap_or(-1),
+        stdout: stdout.text,
+        stderr: stderr.text,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
 }
 
-struct CappedStream {
+pub(crate) struct CappedStream {
     text: String,
     truncated: bool,
 }
 
-async fn read_capped_stream<R>(mut reader: R) -> CappedStream
+pub(crate) async fn read_capped_stream<R>(mut reader: R) -> CappedStream
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -1186,13 +1768,13 @@ fn resolve_common_dir(git_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| git_dir.to_path_buf())
 }
 
-fn build_globset(pattern: &str) -> Result<GlobSet> {
+pub(crate) fn build_globset(pattern: &str) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     builder.add(Glob::new(pattern)?);
     Ok(builder.build()?)
 }
 
-fn safe_existing_path(root: &Path, relative: &str) -> Result<PathBuf> {
+pub(crate) fn safe_existing_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let root = root.canonicalize()?;
     let path = Path::new(relative);
     if path.is_absolute() {
@@ -1208,7 +1790,7 @@ fn safe_existing_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn safe_write_path(root: &Path, relative: &str) -> Result<PathBuf> {
+pub(crate) fn safe_write_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let root = root.canonicalize()?;
     let path = Path::new(relative);
     if path.is_absolute() {
@@ -1259,7 +1841,7 @@ fn safe_write_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(target)
 }
 
-fn path_is_git_metadata(root: &Path, path: &Path) -> bool {
+pub(crate) fn path_is_git_metadata(root: &Path, path: &Path) -> bool {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     path.strip_prefix(root)
         .ok()
@@ -1272,7 +1854,29 @@ fn path_is_git_metadata(root: &Path, path: &Path) -> bool {
         })
 }
 
-fn truncate(mut content: String) -> String {
+/// Cap machine-readable tool payloads before they enter the event stream. The
+/// provider-facing text is already bounded; this prevents a verbose structured
+/// result from bloating persisted events.
+pub(crate) fn bounded_structured(value: Option<Value>) -> Option<Value> {
+    const MAX_STRUCTURED_BYTES: usize = 32 * 1024;
+    let value = value?;
+    let text = serde_json::to_string(&value).ok()?;
+    if text.len() <= MAX_STRUCTURED_BYTES {
+        return Some(value);
+    }
+    let summary = value
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("structured result exceeded the event cap");
+    Some(json!({
+        "truncated": true,
+        "summary": summary,
+        "original_bytes": text.len(),
+        "note": "full result is available in the tool text; structured data was capped at 32 KiB",
+    }))
+}
+
+pub(crate) fn truncate(mut content: String) -> String {
     if content.len() > MAX_TOOL_OUTPUT {
         content.truncate(MAX_TOOL_OUTPUT);
         content.push_str("\n… output truncated");
@@ -1329,6 +1933,19 @@ mod tests {
             .await
             .unwrap();
         assert!(output.content.contains("hello.txt:2"));
+    }
+
+    #[test]
+    fn extracts_html_title_and_links() {
+        let html = r##"<html><head><title>Example &amp; Docs</title></head><body>
+            <a href="/guide">Guide</a><a href="https://example.com/x">X</a>
+            <a href="#local">skip</a></body></html>"##;
+        assert_eq!(html_title(html).as_deref(), Some("Example & Docs"));
+        let base = reqwest::Url::parse("https://example.com/docs/").unwrap();
+        let links = html_links(html, &base);
+        assert!(links.contains(&"https://example.com/guide".to_string()));
+        assert!(links.contains(&"https://example.com/x".to_string()));
+        assert!(!links.iter().any(|link| link.contains("#local")));
     }
 
     #[tokio::test]
@@ -1661,7 +2278,9 @@ mod tests {
                 }),
             )
             .await;
-        assert!(result.is_err());
+        let result = result.unwrap();
+        assert!(result.is_error, "{}", result.content);
+        assert!(result.content.contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(3));
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(!root.join("marker").exists());
@@ -1824,8 +2443,9 @@ mod tests {
                 &context,
                 json!({"command": format!("echo pwn > {}/file", target.display())}),
             )
-            .await;
-        assert!(output.is_err());
+            .await
+            .unwrap();
+        assert!(output.is_error, "{}", output.content);
         assert!(!target.join("file").exists());
     }
 

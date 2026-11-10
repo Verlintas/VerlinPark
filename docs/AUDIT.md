@@ -565,3 +565,26 @@ just test                  # Rust + xcodebuild test (40 Swift tests)
 
 审计基线 CI：GitHub Actions run `40902407039`（commit `cbef2e6`）成功。
 硬化后 CI 以最新提交为准。
+
+## 7. 2026-11-10 Agent tooling wave note
+
+这一轮新增的 Agent 工具不改变既有安全边界，也不是对本文 P0/P1 finding 的修复：
+
+- 所有文件写入仍走 worktree canonical jail、`.git` 拒绝、symlink 检查和
+  Seatbelt；`apply_patch` 先校验全部文件再写，失败回滚已写文件。
+- `process` 仍是 sandboxed 子进程，不是跨越 daemon restart 的进程管理器；
+  `local_http` 仅允许 localhost；`fetch_url` 每次 redirect 重新做 SSRF/DNS
+  校验，但仍是本机网络的受控外发，不是完整网络隔离。
+- code intelligence 是 bounded lexical index，结果标记
+  `confidence: "lexical"`；没有 LSP/type information，也不声称精确引用。
+- `git` 工具只读；stage/commit/branch 仍由 runtime/merge queue 拥有。
+- Manager 仍是 code read-only；Verifier 仍不能写代码；approval、write scope、
+  capacity、budget、Verifier gate 均未放宽。
+- 当前测试：Rust 451（core 365 / protocol 2 / store 70 / providers 14；3 个
+  live ignored），Swift 以最新 Xcode 测试输出为准。此前本文记录的 358/104
+  是历史基线。
+
+仍未解决：web_search、LSP backend、PDF/image/office 读取、
+publish_artifact_file、budget_status/task_detail/tool_search、task_control、
+data_query、browser/computer，以及本文既有的分布式 scheduler/fencing、
+完整 shell read/network confinement、默认自动冲突解决等。

@@ -1,10 +1,88 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-10
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-10 Deterministic agent tooling wave
+
+这一轮把 Agent 的“手和眼睛”从 7 个基础工具扩展成一套端侧确定性的工程工具。
+目标不是增加工具数量，而是让模型少猜命令、少拼 shell、少做 read/grep/parse
+循环；所有写入仍然受 worktree jail、Seatbelt、approval、Verifier 和预算约束。
+
+### 结构化结果与安全写入
+
+- `ToolOutput` 增加可选 `structured` JSON；provider 仍收到有界文本，事件流
+  增加结构化结果；事件持久化上限 32 KiB，超出时降级为摘要。
+- `write_file` / `edit_file` 改为同目录临时文件 + fsync + rename 原子写；
+  支持 `expected_sha256`、`dry_run`、bounded diff，歧义替换默认拒绝。
+- 新增 `apply_patch`：解析 unified diff，先校验全部路径/hunk/hash 再写；
+  任一文件失败会回滚已写文件；支持 create/delete/dry-run/expected hash。
+- 新增 `file_manage`：mkdir/move/copy/delete，dry-run、hash 校验、递归删除
+  显式确认；所有路径仍走 canonical worktree jail。
+- 新增 `find_files`、`file_info`、`read_files`：递归 glob、hash/MIME/行数/
+  symlink/Git 状态、批量区间读取；避免 shell `find`/`cat` 拼接。
+
+### 项目识别与任务执行
+
+- 新增 `project_profile`：检测 Rust/Cargo、Swift/SwiftPM/Xcode、Node/npm/
+  pnpm/yarn/bun、Python/uv/poetry/pytest/ruff/mypy、Go、CMake、Gradle/Maven；
+  justfile/Makefile recipe 可覆盖默认命令；每条命令带 source/confidence。
+- 新增 `run_project_task`：按 profile 运行 build/test/lint/format/typecheck/
+  check/custom；支持 package、filter、changed_only、timeout、dry_run；在现有
+  shell sandbox 内执行；解析 cargo/swift/xcodebuild/pytest/go/jest 输出为
+  `failures[]`（path/line/column/test/message），大输出保留 bounded tail。
+- 新增 `affected_tests`：从 changed paths 或 Git base ref 映射测试文件；
+  Rust integration tests、Python、Go、Swift、TS/JS 有确定性规则；结果明确
+  标记 lexical confidence，找不到时回退完整测试套件。
+- 新增只读 `git`：status/diff/log/show/blame/files；不提供 stage/commit/
+  branch 写操作，提交与集成分支仍由 runtime/merge queue 拥有。
+
+### 代码智能与上下文
+
+- 新增 bounded lexical code index（缓存 20s，写入/shell 后 eager invalidate）：
+  `repo_map`、`find_symbol`、`find_references`、`dependency_graph`、
+  `build_context`；所有结果标记 `confidence: "lexical"`，不冒充 LSP。
+- `code_diagnostics` 运行检测到的 check/lint 命令并返回结构化诊断；LSP
+  backend 尚未实现，显式返回 `LSP_UNAVAILABLE`。
+- `build_context` 按 goal 组装 symbol/file/test/profile/git 上下文包，带
+  citations 和 token budget；不调用模型、不做 embedding。
+
+### 并行与长驻服务
+
+- 一轮只包含只读 registry 工具时，runtime 以最多 4 个并发执行并保持结果
+  顺序；shell、网络、写入、approval、delegation、skill activation 仍串行。
+- 新增 `process`：start/list/status/read/write/signal/wait/stop；sandboxed
+  stdio、每流 2 MiB ring buffer、每 worktree 最多 8 个、默认 1h idle TTL。
+  v1 明确不跨 daemon restart 持久化。
+- 新增 `wait_for`：本地 TCP port、localhost URL、process log regex；不再靠
+  `sleep` 猜服务是否就绪。
+- 新增 `local_http`：仅 localhost/127.0.0.1/[::1]，支持 headers/JSON body/
+  local redirects；GET/HEAD 只读，其他方法走 workspace-write risk；secret
+  headers 不回声；不注入 ambient credentials。
+- `fetch_url` 升级：最多 5 次 redirect，每跳重新做 SSRF/DNS 校验；HTML 走
+  readability 文本提取；返回 final_url/title/links/hash；二进制内容显式拒绝。
+
+### 权限与测试
+
+- 新工具加入 role/profile matrix：Manager 保持 code read-only；Verifier 获得
+  只读代码智能 + run_project_task/code_diagnostics；coding Worker/Labour 获得
+  写、patch、project task、git read、code intel、process、local HTTP；research
+  获得只读 code intel + localhost HTTP；generic 保持只读。
+- 新增 Rust 单测覆盖 patch 回滚/hash/CRLF/path escape、find/file info/read
+  files/file manage、project detection、task parser、git query、code index、
+  process lifecycle、local HTTP、并行 read 事件与 structured tool event。
+- 当前 Rust 测试 451 个（core 365 / protocol 2 / store 70 / providers 14；3 个 live 测试 ignored）；新工具不改变 approval、
+  sandbox、write scope、Verifier、capacity、budget 语义。
+
+剩余未实现：web_search、LSP backend、PDF/image/office 读取、
+publish_artifact_file、budget_status/task_detail/tool_search、task_control、
+data_query，以及 browser/computer GUI 工具。详见
+[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)。
 
 ---
 
