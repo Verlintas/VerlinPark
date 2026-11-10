@@ -404,6 +404,13 @@ struct DashboardView: View {
             AgentsCard()
             IntakeTasksCard()
             OrchestrationOverviewCard()
+            if let status = model.longTaskStatus, !status.isEmpty {
+                LongTaskStatusLine(message: status)
+            }
+            RecoveryCard()
+            ContinuationCard()
+            SteeringCard()
+            TaskStallCard()
             TaskSchedulerCard()
             OrchestrationPolicyCard()
             RuntimeLeaseCard()
@@ -483,6 +490,7 @@ struct DashboardView: View {
             await model.loadIntakeTasks()
             await model.loadDashboardSnapshot()
             await model.refreshAgentInfo()
+            await model.refreshLongTaskState()
         case .usage:
             await model.loadProjectUsage()
             await model.loadProjectBudget()

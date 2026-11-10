@@ -1708,6 +1708,112 @@ actor CoreClient {
         .snapshot
     }
 
+    func steerSession(
+        sessionID: String,
+        body: String,
+        agentID: String?,
+        taskID: String?
+    ) async throws -> SessionSteerResult {
+        try await request(
+            method: "session.steer",
+            params: [
+                "session_id": .string(sessionID),
+                "body": .string(body),
+                "agent_id": agentID.map(JSONValue.string) ?? .null,
+                "task_id": taskID.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(SessionSteerResult.self)
+    }
+
+    func sessionSteering(
+        sessionID: String,
+        status: String?,
+        limit: Int?
+    ) async throws -> SessionSteeringResult {
+        try await request(
+            method: "session.steering",
+            params: [
+                "session_id": .string(sessionID),
+                "status": status.map(JSONValue.string) ?? .null,
+                "limit": limit.map { .number(Double($0)) } ?? .null,
+            ]
+        )
+        .decode(SessionSteeringResult.self)
+    }
+
+    func cancelSteering(id: String) async throws -> SessionSteeringCancelResult {
+        try await request(
+            method: "session.steering.cancel",
+            params: ["id": .string(id)]
+        )
+        .decode(SessionSteeringCancelResult.self)
+    }
+
+    func deferSession(
+        sessionID: String,
+        body: String,
+        watchTaskIDs: [String],
+        watchMode: String,
+        afterSecs: UInt64?,
+        deadlineAt: String?
+    ) async throws -> SessionDeferResult {
+        try await request(
+            method: "session.defer",
+            params: [
+                "session_id": .string(sessionID),
+                "body": .string(body),
+                "watch_task_ids": .array(watchTaskIDs.map(JSONValue.string)),
+                "watch_mode": .string(watchMode),
+                "after_secs": afterSecs.map { .number(Double($0)) } ?? .null,
+                "deadline_at": deadlineAt.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(SessionDeferResult.self)
+    }
+
+    func sessionContinuations(
+        sessionID: String,
+        status: String?,
+        limit: Int?
+    ) async throws -> SessionContinuationsResult {
+        try await request(
+            method: "session.continuations",
+            params: [
+                "session_id": .string(sessionID),
+                "status": status.map(JSONValue.string) ?? .null,
+                "limit": limit.map { .number(Double($0)) } ?? .null,
+            ]
+        )
+        .decode(SessionContinuationsResult.self)
+    }
+
+    func cancelContinuation(id: String) async throws -> SessionContinuationCancelResult {
+        try await request(
+            method: "session.continuation.cancel",
+            params: ["id": .string(id)]
+        )
+        .decode(SessionContinuationCancelResult.self)
+    }
+
+    func orchestrationRecoveries(
+        sessionID: String
+    ) async throws -> OrchestrationRecoveriesResult {
+        try await request(
+            method: "orchestration.recoveries",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(OrchestrationRecoveriesResult.self)
+    }
+
+    func sessionStalls(sessionID: String) async throws -> SessionStallsResult {
+        try await request(
+            method: "session.stalls",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionStallsResult.self)
+    }
+
     func planRevisions(sessionID: String) async throws -> [PlanRevisionInfo] {
         try await request(
             method: "team_plan.revisions",

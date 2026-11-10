@@ -233,7 +233,20 @@ final class AppModel {
     var orchestrationOverview: OrchestrationOverviewResult?
     var orchestrationOverviewBusy = false
     var orchestrationOverviewStatus: String?
+    var steeringMessages: [SteeringMessage] = []
+    var continuations: [SessionContinuation] = []
+    var recoveries: [OrchestrationRecovery] = []
+    var taskProgress: [PlanTaskProgress] = []
+    var taskStalls: [TaskStall] = []
+    var stallThresholdSecs: UInt64 = 0
+    var longTaskBusy = false
+    var longTaskStatus: String?
+    var steeringSubmitBusy = false
+    var steeringCancelBusyID: String?
+    var continuationSubmitBusy = false
+    var continuationActionBusyID: String?
     private var orchestrationRefreshTask: Task<Void, Never>?
+    private var longTaskRefreshTask: Task<Void, Never>?
     var taskActionBusyID: String?
     var taskActionStatus: String?
     var taskSchedulerPolicy = TaskSchedulerPolicy.disabled
@@ -426,6 +439,22 @@ final class AppModel {
         notices.count(where: { !$0.isRead })
     }
 
+    var pendingContinuationCount: Int {
+        continuations.count(where: \.isPending)
+    }
+
+    var activeRecoveryCount: Int {
+        recoveries.count(where: \.isActiveRecovery)
+    }
+
+    var hasLongTaskAttention: Bool {
+        pendingContinuationCount > 0 || activeRecoveryCount > 0
+    }
+
+    func clearLongTaskStatus() {
+        longTaskStatus = nil
+    }
+
     var selectedProject: Project? {
         projects.first { $0.id == selectedProjectID }
     }
@@ -461,6 +490,22 @@ final class AppModel {
 
     private func isCurrent(sessionID: String, generation: Int) -> Bool {
         selectedSessionID == sessionID && selectionGeneration == generation
+    }
+
+    private func resetLongTaskState() {
+        longTaskRefreshTask?.cancel()
+        steeringMessages = []
+        continuations = []
+        recoveries = []
+        taskProgress = []
+        taskStalls = []
+        stallThresholdSecs = 0
+        longTaskBusy = false
+        longTaskStatus = nil
+        steeringSubmitBusy = false
+        steeringCancelBusyID = nil
+        continuationSubmitBusy = false
+        continuationActionBusyID = nil
     }
 
     func start() async {
@@ -636,6 +681,7 @@ final class AppModel {
             projectUsageStatus = nil
             teamPlan = nil
             planTaskStatuses = [:]
+            resetLongTaskState()
             lastCommit = nil
             lastLanding = nil
             lastPullRequest = nil
@@ -768,6 +814,7 @@ final class AppModel {
         Task { await loadWorktreePolicy() }
         teamPlan = nil
         planTaskStatuses = [:]
+        resetLongTaskState()
         lastCommit = nil
         lastLanding = nil
         lastPullRequest = nil
@@ -830,6 +877,7 @@ final class AppModel {
         workspaceFileError = nil
         teamPlan = nil
         planTaskStatuses = [:]
+        resetLongTaskState()
         lastCommit = nil
         lastLanding = nil
         lastPullRequest = nil
@@ -843,6 +891,7 @@ final class AppModel {
             await loadMergeQueue()
             await loadScheduledSessionTasks()
             await loadOrchestrationSnapshot()
+            await refreshLongTaskState()
             await loadMailbox()
             await loadTeamPlan()
             await loadQuestions()
@@ -3127,6 +3176,280 @@ final class AppModel {
         }
     }
 
+    // MARK: - Long-task operator controls
+
+    func loadSteering() async {
+        guard let sessionID = selectedSessionID else {
+            steeringMessages = []
+            return
+        }
+        await loadSteering(sessionID: sessionID, generation: selectionGeneration)
+    }
+
+    private func loadSteering(sessionID: String, generation: Int) async {
+        do {
+            let result = try await core.sessionSteering(
+                sessionID: sessionID,
+                status: nil,
+                limit: 50
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            steeringMessages = result.steering
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            longTaskStatus = error.localizedDescription
+        }
+    }
+
+    func loadContinuations() async {
+        guard let sessionID = selectedSessionID else {
+            continuations = []
+            return
+        }
+        await loadContinuations(sessionID: sessionID, generation: selectionGeneration)
+    }
+
+    private func loadContinuations(sessionID: String, generation: Int) async {
+        do {
+            let result = try await core.sessionContinuations(
+                sessionID: sessionID,
+                status: nil,
+                limit: 50
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            continuations = result.continuations
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            longTaskStatus = error.localizedDescription
+        }
+    }
+
+    func loadRecoveries() async {
+        guard let sessionID = selectedSessionID else {
+            recoveries = []
+            return
+        }
+        await loadRecoveries(sessionID: sessionID, generation: selectionGeneration)
+    }
+
+    private func loadRecoveries(sessionID: String, generation: Int) async {
+        do {
+            let result = try await core.orchestrationRecoveries(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            recoveries = result.recoveries
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            longTaskStatus = error.localizedDescription
+        }
+    }
+
+    func loadStalls() async {
+        guard let sessionID = selectedSessionID else {
+            taskProgress = []
+            taskStalls = []
+            stallThresholdSecs = 0
+            return
+        }
+        await loadStalls(sessionID: sessionID, generation: selectionGeneration)
+    }
+
+    private func loadStalls(sessionID: String, generation: Int) async {
+        do {
+            let result = try await core.sessionStalls(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            taskProgress = result.progress
+            taskStalls = result.stalls
+            stallThresholdSecs = result.thresholdSecs
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            longTaskStatus = error.localizedDescription
+        }
+    }
+
+    func refreshRecoveries() async {
+        await loadRecoveries()
+    }
+
+    func refreshStalls() async {
+        await loadStalls()
+    }
+
+    func refreshLongTaskState() async {
+        guard let sessionID = selectedSessionID else {
+            steeringMessages = []
+            continuations = []
+            recoveries = []
+            taskProgress = []
+            taskStalls = []
+            stallThresholdSecs = 0
+            return
+        }
+        let generation = selectionGeneration
+        longTaskBusy = true
+        defer {
+            if generation == selectionGeneration {
+                longTaskBusy = false
+            }
+        }
+        await loadSteering(sessionID: sessionID, generation: generation)
+        await loadContinuations(sessionID: sessionID, generation: generation)
+        await loadRecoveries(sessionID: sessionID, generation: generation)
+        await loadStalls(sessionID: sessionID, generation: generation)
+    }
+
+    private func refreshLongTaskStateSoon() {
+        longTaskRefreshTask?.cancel()
+        longTaskRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            await self?.refreshLongTaskState()
+        }
+    }
+
+    @discardableResult
+    func steerSession(body: String, agentID: String?, taskID: String?) async -> String? {
+        guard let sessionID = selectedSessionID else {
+            let message = L10n.t("Select a session first.")
+            longTaskStatus = message
+            return message
+        }
+        let trimmed: String
+        switch LongTaskRules.validateSteeringBody(body) {
+        case let .success(value):
+            trimmed = value
+        case let .failure(error):
+            longTaskStatus = error.message
+            return error.message
+        }
+        guard !steeringSubmitBusy else { return nil }
+        let generation = selectionGeneration
+        steeringSubmitBusy = true
+        defer { steeringSubmitBusy = false }
+        do {
+            _ = try await core.steerSession(
+                sessionID: sessionID,
+                body: trimmed,
+                agentID: agentID,
+                taskID: taskID
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return nil }
+            await loadSteering(sessionID: sessionID, generation: generation)
+            longTaskStatus =
+                L10n.t("Steering queued. It is delivered at the target run's next provider boundary.")
+            return nil
+        } catch {
+            let message = error.localizedDescription
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                longTaskStatus = message
+            }
+            return message
+        }
+    }
+
+    func cancelSteering(id: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        let generation = selectionGeneration
+        steeringCancelBusyID = id
+        defer {
+            if generation == selectionGeneration {
+                steeringCancelBusyID = nil
+            }
+        }
+        do {
+            _ = try await core.cancelSteering(id: id)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            await loadSteering(sessionID: sessionID, generation: generation)
+            longTaskStatus = L10n.t("Steering cancelled.")
+        } catch {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                longTaskStatus = error.localizedDescription
+            }
+        }
+    }
+
+    @discardableResult
+    func deferContinuation(
+        body: String,
+        watchTaskIDs: [String],
+        watchMode: String,
+        afterSecs: UInt64?,
+        deadlineAt: String?
+    ) async -> String? {
+        guard let sessionID = selectedSessionID else {
+            let message = L10n.t("Select a session first.")
+            longTaskStatus = message
+            return message
+        }
+        let trimmed: String
+        switch LongTaskRules.validateSteeringBody(body) {
+        case let .success(value):
+            trimmed = value
+        case let .failure(error):
+            longTaskStatus = error.message
+            return error.message
+        }
+        guard !watchTaskIDs.isEmpty || afterSecs != nil || deadlineAt != nil else {
+            let error = LongTaskValidationError.emptyWakeCondition
+            longTaskStatus = error.message
+            return error.message
+        }
+        let mode: String
+        switch LongTaskRules.normalizeWatchMode(watchMode) {
+        case let .success(value):
+            mode = value
+        case let .failure(error):
+            longTaskStatus = error.message
+            return error.message
+        }
+        guard !continuationSubmitBusy else { return nil }
+        let generation = selectionGeneration
+        continuationSubmitBusy = true
+        defer { continuationSubmitBusy = false }
+        do {
+            _ = try await core.deferSession(
+                sessionID: sessionID,
+                body: trimmed,
+                watchTaskIDs: watchTaskIDs,
+                watchMode: mode,
+                afterSecs: afterSecs,
+                deadlineAt: deadlineAt
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return nil }
+            await loadContinuations(sessionID: sessionID, generation: generation)
+            longTaskStatus = L10n.t(
+                "Continuation created. The daemon starts it only after the watch condition or deadline, and only when the session is idle."
+            )
+            return nil
+        } catch {
+            let message = error.localizedDescription
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                longTaskStatus = message
+            }
+            return message
+        }
+    }
+
+    func cancelContinuation(id: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        let generation = selectionGeneration
+        continuationActionBusyID = id
+        defer {
+            if generation == selectionGeneration {
+                continuationActionBusyID = nil
+            }
+        }
+        do {
+            _ = try await core.cancelContinuation(id: id)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            await loadContinuations(sessionID: sessionID, generation: generation)
+            longTaskStatus = L10n.t("Continuation cancelled.")
+        } catch {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                longTaskStatus = error.localizedDescription
+            }
+        }
+    }
+
     func loadOrchestrationOverview() async {
         orchestrationOverviewBusy = true
         defer { orchestrationOverviewBusy = false }
@@ -5367,6 +5690,7 @@ final class AppModel {
             await loadMergeQueue()
             await loadTeamPlan()
             await loadDiff()
+            await refreshLongTaskState()
         } catch {
             if selectedProjectID == projectID, generation == selectionGeneration {
                 handle(error)
@@ -5676,6 +6000,14 @@ final class AppModel {
                let status = planTaskStatus(for: event)
             {
                 planTaskStatuses[taskID] = status
+            }
+            if event.type.hasPrefix("steering.")
+                || event.type.hasPrefix("session.continuation.")
+                || event.type.hasPrefix("orchestration.recovery_")
+                || event.type == "orchestration.stall"
+                || event.type.hasPrefix("plan_task.")
+            {
+                refreshLongTaskStateSoon()
             }
         }
 

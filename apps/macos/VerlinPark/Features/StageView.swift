@@ -47,6 +47,8 @@ private struct ProjectStageView: View {
     @State private var draft = ""
     @State private var showingContext = false
     @State private var showingFork = false
+    @State private var showingSteer = false
+    @State private var showingDefer = false
     @FocusState private var composerFocused: Bool
     @State private var composerHovering = false
 
@@ -76,6 +78,18 @@ private struct ProjectStageView: View {
         .sheet(isPresented: $showingFork) {
             if let session = model.selectedSession {
                 ForkSessionSheet(session: session)
+                    .environment(model)
+            }
+        }
+        .sheet(isPresented: $showingSteer) {
+            if let session = model.selectedSession {
+                SteerSheet(session: session)
+                    .environment(model)
+            }
+        }
+        .sheet(isPresented: $showingDefer) {
+            if let session = model.selectedSession {
+                DeferSheet(session: session)
                     .environment(model)
             }
         }
@@ -172,6 +186,9 @@ private struct ProjectStageView: View {
                                     .environment(model)
                             }
                         }
+                        if model.hasLongTaskAttention {
+                            longTaskAttentionPill
+                        }
                     } else {
                         Text(project.root)
                             .lineLimit(1)
@@ -235,6 +252,19 @@ private struct ProjectStageView: View {
                 .buttonStyle(VPGlassIconButtonStyle(size: 26, tint: VPTheme.accent))
                 .help("New session · ⌘N")
 
+                if let session = model.selectedSession,
+                   ["running", "paused"].contains(session.status)
+                {
+                    Button {
+                        showingSteer = true
+                    } label: {
+                        Image(systemName: "arrow.up.message")
+                    }
+                    .buttonStyle(VPGlassIconButtonStyle(size: 26))
+                    .help("Steer run…")
+                    .accessibilityLabel(L10n.t("Steer run"))
+                }
+
                 Button {
                     withAnimation(VPMotion.smooth) {
                         inspectorVisible.toggle()
@@ -284,6 +314,8 @@ private struct ProjectStageView: View {
                         Button("Export Transcript…") {
                             Task { await model.exportTranscript() }
                         }
+                        Button("Defer Continuation…") { showingDefer = true }
+                            .disabled(["imported", "landed"].contains(session.status))
                     } label: {
                         Image(systemName: "ellipsis")
                     }
@@ -303,6 +335,41 @@ private struct ProjectStageView: View {
                 endPoint: .bottomTrailing
             )
         }
+    }
+
+    private var longTaskAttentionPill: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "hourglass")
+                .font(.system(size: 7.5, weight: .semibold))
+            if model.pendingContinuationCount > 0 {
+                Text(
+                    L10n.format(
+                        "%lld deferred",
+                        model.pendingContinuationCount
+                    )
+                )
+            }
+            if model.pendingContinuationCount > 0, model.activeRecoveryCount > 0 {
+                Text("·")
+            }
+            if model.activeRecoveryCount > 0 {
+                Text(L10n.format("%lld recovery", model.activeRecoveryCount))
+            }
+        }
+        .font(VPTheme.mono(7.5, weight: .semibold))
+        .foregroundStyle(VPTheme.warning)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(VPTheme.warning.opacity(0.10), in: Capsule())
+        .overlay {
+            Capsule().strokeBorder(VPTheme.warning.opacity(0.24), lineWidth: 1)
+        }
+        .help(
+            L10n.t(
+                "Deferred continuations waiting to start plus active stall recoveries."
+            )
+        )
+        .accessibilityLabel(L10n.t("Long-task operations pending"))
     }
 
     private func tokenUsageLabel(_ session: Session) -> String {

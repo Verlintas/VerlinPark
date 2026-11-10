@@ -112,17 +112,18 @@ enum VPTheme {
 
     static func statusColor(_ status: String) -> Color {
         switch status.lowercased() {
-        case "running", "verifying", "merging", "thinking", "in_progress":
+        case "running", "verifying", "merging", "thinking", "in_progress", "delivering":
             accent
-        case "queued", "paused", "waiting", "waiting_input":
+        case "queued", "paused", "waiting", "waiting_input", "pending", "ready", "requested",
+             "waiting_cancel":
             warning
         case "failed", "cancelled", "offline", "blocked", "interrupted":
             danger
-        case "done", "completed", "connected", "landed", "merged":
+        case "done", "completed", "connected", "landed", "merged", "delivered":
             success
-        case "conflict", "changes_requested":
+        case "conflict", "changes_requested", "escalated":
             warning
-        case "approved":
+        case "approved", "retried":
             info
         default:
             textTertiary

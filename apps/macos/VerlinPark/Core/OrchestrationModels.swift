@@ -574,3 +574,539 @@ struct OrchestrationOverviewResult: Codable, Sendable {
         case generatedAt = "generated_at"
     }
 }
+
+// MARK: - Long-task operator controls
+
+/// One persisted operator steering request. Delivery is cooperative: the agent
+/// loop drains pending rows immediately before its next provider request.
+struct SteeringMessage: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    let agentId: String
+    let taskId: String?
+    let body: String
+    let status: String
+    let createdAt: String
+    let deliveredAt: String?
+
+    var isPending: Bool {
+        status == "pending"
+    }
+
+    var isTerminal: Bool {
+        status == "delivered" || status == "cancelled"
+    }
+
+    var displayStatus: String {
+        switch status {
+        case "pending": L10n.t("Pending")
+        case "delivered": L10n.t("Delivered")
+        case "cancelled": L10n.t("Cancelled")
+        default: status
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case agentId = "agent_id"
+        case taskId = "task_id"
+        case body
+        case status
+        case createdAt = "created_at"
+        case deliveredAt = "delivered_at"
+    }
+}
+
+struct SessionSteerResult: Codable, Sendable {
+    let steering: SteeringMessage
+}
+
+struct SessionSteeringResult: Codable, Sendable {
+    let sessionId: String
+    let steering: [SteeringMessage]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case steering
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        steering = try container.decodeIfPresent([SteeringMessage].self, forKey: .steering) ?? []
+    }
+}
+
+struct SessionSteeringCancelResult: Codable, Sendable {
+    let cancelled: Bool
+    let steering: SteeringMessage
+}
+
+/// Compact outcome captured when a deferred continuation wakes. It is frozen
+/// at wake time so later plan revisions cannot rewrite the wake context.
+struct ContinuationOutcome: Codable, Identifiable, Hashable, Sendable {
+    let taskId: String
+    let title: String
+    let status: String
+
+    var id: String {
+        taskId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case taskId = "task_id"
+        case title
+        case status
+    }
+}
+
+/// A persisted, operator-created deferred continuation. It never adds a plan
+/// task or bypasses a dependency, approval, budget, or verification gate.
+struct SessionContinuation: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    let projectId: String
+    let body: String
+    let watchTaskIds: [String]
+    let watchMode: String
+    let deadlineAt: String?
+    let status: String
+    let attempts: Int
+    let maxAttempts: Int
+    let wakeReason: String?
+    let outcomes: [ContinuationOutcome]
+    let lastError: String?
+    let nextAttemptAt: String?
+    let createdAt: String
+    let readyAt: String?
+    let deliveredAt: String?
+    let updatedAt: String
+
+    /// Waiting continuations are `pending` plus `ready` rows that the scheduler
+    /// has not claimed for delivery yet.
+    var isPending: Bool {
+        status == "pending" || status == "ready"
+    }
+
+    var isTerminal: Bool {
+        status == "delivered" || status == "cancelled" || status == "failed"
+    }
+
+    var isCancelable: Bool {
+        status == "pending" || status == "ready" || status == "delivering"
+    }
+
+    var displayStatus: String {
+        switch status {
+        case "pending": L10n.t("Pending")
+        case "ready": L10n.t("Ready")
+        case "delivering": L10n.t("Delivering")
+        case "delivered": L10n.t("Delivered")
+        case "cancelled": L10n.t("Cancelled")
+        case "failed": L10n.t("Failed")
+        default: status
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case projectId = "project_id"
+        case body
+        case watchTaskIds = "watch_task_ids"
+        case watchMode = "watch_mode"
+        case deadlineAt = "deadline_at"
+        case status
+        case attempts
+        case maxAttempts = "max_attempts"
+        case wakeReason = "wake_reason"
+        case outcomes
+        case lastError = "last_error"
+        case nextAttemptAt = "next_attempt_at"
+        case createdAt = "created_at"
+        case readyAt = "ready_at"
+        case deliveredAt = "delivered_at"
+        case updatedAt = "updated_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        body = try container.decode(String.self, forKey: .body)
+        watchTaskIds = try container.decodeIfPresent([String].self, forKey: .watchTaskIds) ?? []
+        watchMode = try container.decodeIfPresent(String.self, forKey: .watchMode) ?? "all"
+        deadlineAt = try container.decodeIfPresent(String.self, forKey: .deadlineAt)
+        status = try container.decode(String.self, forKey: .status)
+        attempts = try container.decodeIfPresent(Int.self, forKey: .attempts) ?? 0
+        maxAttempts = try container.decodeIfPresent(Int.self, forKey: .maxAttempts) ?? 3
+        wakeReason = try container.decodeIfPresent(String.self, forKey: .wakeReason)
+        outcomes = try container.decodeIfPresent([ContinuationOutcome].self, forKey: .outcomes) ?? []
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        nextAttemptAt = try container.decodeIfPresent(String.self, forKey: .nextAttemptAt)
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+        readyAt = try container.decodeIfPresent(String.self, forKey: .readyAt)
+        deliveredAt = try container.decodeIfPresent(String.self, forKey: .deliveredAt)
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt) ?? createdAt
+    }
+
+    /// The daemon only starts a continuation when the session is quiescent and
+    /// startable through the ordinary `start` path.
+    func isStartable(sessionStatus: String) -> Bool {
+        LongTaskRules.isSessionStartable(sessionStatus)
+    }
+}
+
+struct SessionDeferResult: Codable, Sendable {
+    let continuation: SessionContinuation
+}
+
+struct SessionContinuationsResult: Codable, Sendable {
+    let sessionId: String
+    let continuations: [SessionContinuation]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case continuations
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        continuations =
+            try container.decodeIfPresent([SessionContinuation].self, forKey: .continuations) ?? []
+    }
+}
+
+struct SessionContinuationCancelResult: Codable, Sendable {
+    let cancelled: Bool
+    let continuation: SessionContinuation
+}
+
+/// One policy-gated stall recovery row. `observe` never writes one; only a
+/// project policy set to `escalate` or `retry` creates recoveries.
+struct OrchestrationRecovery: Codable, Identifiable, Hashable, Sendable {
+    let sessionId: String
+    let projectId: String
+    let planSeq: UInt64
+    let taskId: String
+    let department: String
+    let action: String
+    let status: String
+    let attempts: Int
+    let lastStallCount: Int
+    let requestedAt: String
+    let updatedAt: String
+    let lastError: String?
+    let nextActionAt: String?
+
+    var id: String {
+        "\(sessionId)/\(planSeq)/\(taskId)"
+    }
+
+    var isActiveRecovery: Bool {
+        status == "requested" || status == "waiting_cancel"
+    }
+
+    var isTerminal: Bool {
+        !isActiveRecovery
+    }
+
+    var displayAction: String {
+        switch action {
+        case "retry": L10n.t("Retry")
+        case "escalate": L10n.t("Escalate")
+        default: action
+        }
+    }
+
+    var displayStatus: String {
+        switch status {
+        case "requested": L10n.t("Requested")
+        case "waiting_cancel": L10n.t("Waiting for cancellation")
+        case "retried": L10n.t("Retried")
+        case "escalated": L10n.t("Escalated")
+        case "failed": L10n.t("Failed")
+        case "unnecessary": L10n.t("Unnecessary")
+        default: status
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case projectId = "project_id"
+        case planSeq = "plan_seq"
+        case taskId = "task_id"
+        case department
+        case action
+        case status
+        case attempts
+        case lastStallCount = "last_stall_count"
+        case requestedAt = "requested_at"
+        case updatedAt = "updated_at"
+        case lastError = "last_error"
+        case nextActionAt = "next_action_at"
+    }
+}
+
+struct OrchestrationRecoveriesResult: Codable, Sendable {
+    let sessionId: String
+    let recoveries: [OrchestrationRecovery]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case recoveries
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        recoveries =
+            try container.decodeIfPresent([OrchestrationRecovery].self, forKey: .recoveries) ?? []
+    }
+}
+
+/// Runtime progress telemetry for a task-scoped agent run. This is
+/// observation state, not a replayed projection.
+struct PlanTaskProgress: Codable, Identifiable, Hashable, Sendable {
+    let sessionId: String
+    let projectId: String
+    let planSeq: UInt64
+    let taskId: String
+    let lastProgressAt: String?
+    let stallCount: Int
+    let lastTurn: Int?
+    let lastTool: String?
+    let updatedAt: String
+
+    var id: String {
+        "\(sessionId)/\(planSeq)/\(taskId)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case projectId = "project_id"
+        case planSeq = "plan_seq"
+        case taskId = "task_id"
+        case lastProgressAt = "last_progress_at"
+        case stallCount = "stall_count"
+        case lastTurn = "last_turn"
+        case lastTool = "last_tool"
+        case updatedAt = "updated_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        planSeq = try container.decode(UInt64.self, forKey: .planSeq)
+        taskId = try container.decode(String.self, forKey: .taskId)
+        lastProgressAt = try container.decodeIfPresent(String.self, forKey: .lastProgressAt)
+        stallCount = try container.decodeIfPresent(Int.self, forKey: .stallCount) ?? 0
+        lastTurn = try container.decodeIfPresent(Int.self, forKey: .lastTurn)
+        lastTool = try container.decodeIfPresent(String.self, forKey: .lastTool)
+        updatedAt = try container.decode(String.self, forKey: .updatedAt)
+    }
+}
+
+/// One observability-only stall observation. The sweep never cancels or
+/// retries a task by itself.
+struct TaskStall: Codable, Identifiable, Hashable, Sendable {
+    let sessionId: String
+    let projectId: String
+    let planSeq: UInt64
+    let taskId: String
+    let department: String
+    let title: String
+    let status: String
+    let attempts: Int
+    let ageSecs: UInt64
+    let stallCount: Int
+    let lastProgressAt: String
+    let lastTurn: Int?
+    let lastTool: String?
+    let observedAt: String
+
+    var id: String {
+        "\(sessionId)/\(planSeq)/\(taskId)/\(observedAt)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case projectId = "project_id"
+        case planSeq = "plan_seq"
+        case taskId = "task_id"
+        case department
+        case title
+        case status
+        case attempts
+        case ageSecs = "age_secs"
+        case stallCount = "stall_count"
+        case lastProgressAt = "last_progress_at"
+        case lastTurn = "last_turn"
+        case lastTool = "last_tool"
+        case observedAt = "observed_at"
+    }
+}
+
+struct SessionStallsResult: Codable, Sendable {
+    let sessionId: String
+    let thresholdSecs: UInt64
+    let progress: [PlanTaskProgress]
+    let stalls: [TaskStall]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case thresholdSecs = "threshold_secs"
+        case progress
+        case stalls
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        thresholdSecs = try container.decodeIfPresent(UInt64.self, forKey: .thresholdSecs) ?? 0
+        progress = try container.decodeIfPresent([PlanTaskProgress].self, forKey: .progress) ?? []
+        stalls = try container.decodeIfPresent([TaskStall].self, forKey: .stalls) ?? []
+    }
+}
+
+enum LongTaskValidationError: Error, Equatable, Sendable {
+    case emptyBody
+    case bodyTooLong
+    case emptyWakeCondition
+    case invalidWatchMode
+    case tooManyWatchTasks
+    case invalidAfterMinutes
+    case deadlineInPast
+    case deadlineTooFar
+
+    var message: String {
+        switch self {
+        case .emptyBody:
+            L10n.t("Enter a prompt for this action.")
+        case .bodyTooLong:
+            L10n.t("Keep the prompt at 4,000 characters or fewer.")
+        case .emptyWakeCondition:
+            L10n.t("Watch at least one task or add a deadline.")
+        case .invalidWatchMode:
+            L10n.t("Choose whether all watched tasks or any watched task should wake the run.")
+        case .tooManyWatchTasks:
+            L10n.t("A continuation may watch at most 100 tasks.")
+        case .invalidAfterMinutes:
+            L10n.t("Enter a deadline between 1 and 43,200 minutes.")
+        case .deadlineInPast:
+            L10n.t("The deadline must be in the future.")
+        case .deadlineTooFar:
+            L10n.t("The deadline must be within 30 days.")
+        }
+    }
+}
+
+/// Pure, testable validation for the long-task operator sheets. It mirrors the
+/// daemon limits so the UI can explain a bad input before issuing an RPC; the
+/// daemon remains the authority.
+enum LongTaskRules {
+    static let maxBodyChars = 4000
+    static let maxWatchTasks = 100
+    static let maxDeadlineSecs: TimeInterval = 30 * 24 * 60 * 60
+
+    static func validateSteeringBody(_ body: String) -> Result<String, LongTaskValidationError> {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .failure(.emptyBody) }
+        guard trimmed.count <= maxBodyChars else { return .failure(.bodyTooLong) }
+        return .success(trimmed)
+    }
+
+    static func isSessionStartable(_ status: String) -> Bool {
+        ["idle", "failed", "cancelled"].contains(status)
+    }
+
+    static func isTerminalTaskStatus(_ status: String) -> Bool {
+        ["completed", "failed", "cancelled", "skipped", "interrupted"].contains(status)
+    }
+
+    static func normalizeWatchMode(_ mode: String) -> Result<String, LongTaskValidationError> {
+        let normalized = mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard normalized == "all" || normalized == "any" else {
+            return .failure(.invalidWatchMode)
+        }
+        return .success(normalized)
+    }
+
+    static func validateDefer(
+        body: String,
+        watchTaskIDs: [String],
+        watchMode: String,
+        afterMinutes: Int?,
+        deadline: Date?,
+        now: Date = Date()
+    ) -> Result<LongTaskDeferPayload, LongTaskValidationError> {
+        let trimmed: String
+        switch validateSteeringBody(body) {
+        case let .success(value):
+            trimmed = value
+        case let .failure(error):
+            return .failure(error)
+        }
+
+        var seen: Set<String> = []
+        let watchIDs = watchTaskIDs
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .filter { seen.insert($0).inserted }
+        guard watchIDs.count <= maxWatchTasks else { return .failure(.tooManyWatchTasks) }
+
+        let mode: String
+        switch normalizeWatchMode(watchMode) {
+        case let .success(value):
+            mode = value
+        case let .failure(error):
+            return .failure(error)
+        }
+
+        if afterMinutes != nil, deadline != nil {
+            return .failure(.invalidAfterMinutes)
+        }
+        guard !watchIDs.isEmpty || afterMinutes != nil || deadline != nil else {
+            return .failure(.emptyWakeCondition)
+        }
+
+        var afterSecs: UInt64?
+        var deadlineAt: String?
+        if let minutes = afterMinutes {
+            guard minutes > 0, Double(minutes) * 60 <= maxDeadlineSecs else {
+                return .failure(.invalidAfterMinutes)
+            }
+            afterSecs = UInt64(minutes) * 60
+        } else if let deadline {
+            let interval = deadline.timeIntervalSince(now)
+            guard interval > 0 else { return .failure(.deadlineInPast) }
+            guard interval <= maxDeadlineSecs else { return .failure(.deadlineTooFar) }
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime]
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            deadlineAt = formatter.string(from: deadline)
+        }
+
+        return .success(
+            LongTaskDeferPayload(
+                body: trimmed,
+                watchTaskIDs: watchIDs,
+                watchMode: mode,
+                afterSecs: afterSecs,
+                deadlineAt: deadlineAt
+            )
+        )
+    }
+}
+
+struct LongTaskDeferPayload: Equatable, Sendable {
+    let body: String
+    let watchTaskIDs: [String]
+    let watchMode: String
+    let afterSecs: UInt64?
+    let deadlineAt: String?
+}
