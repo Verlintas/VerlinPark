@@ -86,12 +86,16 @@ role checks:
 `publish_artifact_file` reuses the existing content-addressed artifact store,
 5 MiB cap, worktree path jail, and retention GC.
 
-### 5. Browser/computer remain deferred
+### 5. Browser/computer remained deferred at this ADR
 
-No browser or computer tool is registered. The target `ComputerLease` is still
-unimplemented because there is no GUI/browser tool to serialize. This is
-deliberate: a half-working or unsandboxed browser is worse than an explicit
-gap.
+No browser or computer tool was registered by this ADR. The target
+`ComputerLease` was still unimplemented because there was no GUI/browser tool to
+serialize. This was deliberate: a half-working or unsandboxed browser is worse
+than an explicit gap.
+
+**Later status (2026-11-10):** ADR-0137 supersedes the browser deferral. A
+Seatbelt-confined WKWebView helper plus a single-daemon `ComputerLease` now
+implement the browser surface. Native macOS computer control remains deferred.
 
 ## Consequences
 

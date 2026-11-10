@@ -1,8 +1,8 @@
 # VerlinPark Agent Tooling Roadmap
 
-> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, and runtime introspection implemented on 2026-11-10; browser and computer tools remain deferred.<br>
+> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, sandboxed WKWebView browser + ComputerLease, and runtime introspection implemented on 2026-11-10; native macOS computer control remains deferred.<br>
 > **Date:** 2026-11-10<br>
-> **Code baseline:** working tree after `c64e1b8`; see ADR-0134.<br>
+> **Code baseline:** 2026-11-10 tooling + office + browser wave; see ADR-0134/0136/0137.<br>
 > **Implementation budget:** ~10,000–30,000 code lines, target core ~24k, hard planning cap 30k<br>
 > **Purpose:** Preserve the complete missing-tool inventory and design intent across
 > context compression. This file is the source of truth for the tooling work; update
@@ -28,7 +28,7 @@ budget gates in section 7 decide the order.
 
 ### Implementation status (2026-11-10)
 
-Implemented in this wave (see ADR-0134 and PROGRESS):
+Implemented in this wave (see ADR-0134/0136/0137 and PROGRESS):
 
 - structured `ToolOutput` + 32 KiB event cap;
 - atomic `write_file`/`edit_file`, `apply_patch`, `file_manage`, `find_files`,
@@ -50,11 +50,17 @@ Implemented in this wave (see ADR-0134 and PROGRESS):
   OCR confidence, and PDF metadata/page counts;
 - role/permission matrix, tests, UI tool labels.
 
-Still open: browser and computer control.
-Browser was spiked with headless Chrome/CDP but deferred: Chrome's network
-service and nested sandbox do not work reliably under the daemon's Seatbelt
-profile, and running it unsandboxed would violate the worktree write boundary.
-A future browser needs a dedicated helper process or a WebKit-backed host.
+Implemented browser: a daemon-launched WKWebView helper under its own Seatbelt
+profile, with localhost/worktree navigation, DOM snapshots, input, console,
+approval-gated `evaluate`, viewport screenshots, and a daemon-wide
+`ComputerLease`. See ADR-0137 for the exact boundaries: page JavaScript is not
+network-isolated, the browser requires a GUI session, and the lease is
+single-daemon, fail-fast, and not a distributed fencing token.
+
+Still open: native macOS computer control. The headless Chrome/CDP spike failed
+because Chrome's network service was unreliable under the nested Seatbelt
+profile; the shipped WKWebView helper resolves that specific failure without
+weakening the worktree write boundary.
 
 ---
 
@@ -239,8 +245,9 @@ estimates including tests and ecosystem parsers, not an additive promise. If the
 core implementation crosses 24k, drop optional items in this order: `C-05`
 LSP, `T-04` task control, `D-01` data query, then optional parsers/edge cases.
 If it crosses 30k before the core is usable, stop and re-plan rather than
-shipping half-tools. Browser/computer and office documents are outside the core
-cap and start only after the core is green and explicitly promoted.
+shipping half-tools. Browser and office documents were promoted after the core
+was green; native macOS computer control remains outside the core cap and starts
+only after explicit promotion.
 
 ---
 
@@ -804,8 +811,12 @@ Local-only by default; return readiness evidence and last error.
 
 ### U-01 — `browser`
 
+**Status:** Implemented 2026-11-10; see ADR-0137.
+
 **Actions:** `open`, `snapshot`, `click`, `type`, `press`, `select`, `wait_for`,
-`screenshot`, `console`, `close`.
+`screenshot`, `console`, `evaluate`, `close`. (`evaluate` is approval-gated and
+classified `HostState`; the other write/input actions are `WorkspaceWrite`, and
+inspection/close are read-only.)
 
 **Behavior:**
 
@@ -820,10 +831,16 @@ Local-only by default; return readiness evidence and last error.
 - ComputerLease serializes browser use per machine/session.
 - Local URLs only by default; external navigation requires policy.
 
-**Decision needed:** WKWebView helper vs Playwright-compatible sidecar. Start
-with a spike; the tool schema stays stable either way.
+**Decision:** WKWebView helper selected over Chrome/CDP or a Playwright sidecar;
+see ADR-0137. The helper runs under a write-confined Seatbelt profile and is
+serialized by `ComputerLease`.
 
-**LOC:** 3,000–5,000. Stretch; do not start before core + code intelligence.
+**Implemented boundaries:** localhost/worktree `file:` navigation only; DOM
+snapshot rather than native AX; synthetic input; viewport-only screenshots;
+no page-script network isolation; logged-in GUI session required;
+single-daemon fail-fast lease with no queue or fairness policy.
+
+**LOC:** 3,000–5,000. Shipped; native `computer` remains a separate stretch item.
 
 ---
 
@@ -971,10 +988,11 @@ Exit criteria:
 
 ### Wave D — "UI/computer" (stretch, 5.5–9k)
 
-Only after A–C and only if the LOC budget remains under 30k. Start with a
-capability spike and a stable schema; do not ship a half-working GUI tool.
-Prioritize `browser` over `computer` for web frontends; `computer` for native
-macOS UI.
+The browser slice shipped with a WKWebView helper and `ComputerLease`; native
+`computer` control remains deferred. Start it only after A–C and only if the LOC
+budget remains under 30k, with a capability spike and a stable schema; do not
+ship a half-working GUI tool. Keep `browser` and `computer` on the same lease
+surface.
 
 ### Hard stop rules
 
@@ -1031,8 +1049,8 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 [x] T-04 task_control
 [x] D-01 data_query
 
-[–] U-01 browser (stretch; deferred after sandbox spike)
-[–] U-02 computer (stretch)
+[x] U-01 browser (WKWebView helper + ComputerLease; see ADR-0137)
+[–] U-02 computer (native macOS; deferred)
 [x] M-03 read_document
 ```
 
@@ -1048,7 +1066,8 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 | `process`, `wait_for` | yes | no | yes (test/build) | yes | no | yes | no |
 | `local_http` | yes | no | yes | yes | yes (localhost) | yes | no |
 | `web_search`, `read_url` | yes | research only | research only | research/coding | yes | research only | no |
-| `browser`, `computer` | yes | no | no | coding/frontend | no | no | no |
+| `browser` | yes | no | no | coding/frontend | no | no | no |
+| `computer` (not implemented) | yes | no | no | coding | no | no | no |
 | `read_pdf`, `read_image` | yes | yes | yes | yes | yes | yes | yes |
 | `budget_status`, `task_detail` | yes | yes | yes | own/session | own/session | own/session | own/session |
 | `task_control` | yes | own plan only | no | no | no | no | no |
@@ -1120,7 +1139,7 @@ Stable error codes (examples): `PATH_ESCAPE`, `HASH_MISMATCH`, `PATCH_CONFLICT`,
 - Performance: `repo_map`, `grep`, `find_files`, `run_project_task` on the 10k-file
   fixture; enforce bounded latency and output.
 - UI: structured tool cards, truncation, artifact links.
-- Regression: all existing 419 Rust / 110 Swift tests remain green.
+- Regression: all existing 490 Rust / 110 Swift tests remain green.
 
 ### Acceptance for the whole program
 
@@ -1170,8 +1189,9 @@ Do not implement these as core agent tools in this budget:
    with Rust, Swift, TS/JS, Python, Go; fallback for the rest.
 3. **LSP lifecycle:** per-session server process vs per-worktree vs global; idle
    timeout and crash restart policy.
-4. **Browser backend:** WKWebView helper vs Playwright sidecar. Decide after a
-   spike; the schema should not depend on the backend.
+4. **Browser backend:** Resolved for v1 with the WKWebView helper (ADR-0137);
+   a Playwright sidecar was rejected because it does not fit the write-confined
+   helper model. The tool schema remains backend-independent.
 5. **Search provider:** Brave/Tavily/SearXNG/custom; where keys live (Keychain)
    and how results are cached.
 6. **Process persistence:** session-scoped only for v1; explicit non-goal across

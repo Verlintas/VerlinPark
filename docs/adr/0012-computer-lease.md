@@ -27,3 +27,20 @@
 - 需要 `ComputerLease` 服务、队列、优先级/aging、事件和 UI。
 - Orca/OpenCode 等未来 computer backend 也必须走同一个 lease。
 - shell 并行仍需要写作用域和 Git 锁，不能把 lease 当作唯一并发控制。
+
+## 实施状态（2026-11-10）
+
+ADR-0137 已实现第一版 `ComputerLease`，但当前范围小于本 ADR 的目标：
+
+- 已实现：SQLite `computer_leases`、owner/session/agent、120 秒 TTL、
+  TTL/3 心跳、过期回收、acquire/denied/released/expired 审计事件、
+  daemon recovery、`computer.leases` / `sweep` / `release` 和 `vp computer`。
+- 已接入：`browser` surface；browser helper 持有 lease。
+- 未实现：优先级/aging 队列、公平调度、等待者、UI holder 展示、分布式
+  fencing，以及 native macOS computer backend。
+- 当前冲突策略是 fail-fast 并返回 holder，而不是排队。
+- 当前持有粒度是 browser helper 生命周期，而不是单次工具调用；heartbeat
+  在 helper 存活期间续租。
+- lease 事件是 daemon 运维审计事件，不是 session replay projection。
+- `write_leases`（worktree 写作用域）与 `computer_leases` 仍然是两套独立
+  机制；本 ADR 的“shell 并行”结论不变。

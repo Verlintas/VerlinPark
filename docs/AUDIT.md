@@ -22,7 +22,7 @@
 - **P1-5 部分修复**：session status、usage、agent status、team plan、todos、messages、merge queue、recovery 使用 event+projection 原子事务；`session.replay` / `vp replay --repair` 可检查并修复覆盖的关键投影；agent roster 已通过 `agent.snapshot` 覆盖；`session.export` / `--rebuild` / `session.import` 已实现；导入 session 默认是只读 archive、保留 approvals；`session.rehydrate` 可显式重建 session worktree，并按 branch 分组 remap imported agent task-worktrees。
 - **仍未解决**：完整 shell read jail/网络隔离、完整 event sourcing、静默自动冲突解决、其他 forge PR、shell scratch 回收、部分 merge 状态的人工检查、外部 ACP agent 的网络/凭证边界、mid-stream 断点续传。
 
-当前测试：Rust 358（core 286 / protocol 2 / store 56 / providers 14；另有 3 个 ignored live tests），Swift 104。CI 以最新提交为准。
+该轮测试：Rust 358（core 286 / protocol 2 / store 56 / providers 14；另有 3 个 ignored live tests），Swift 104。最新数字见文末当前状态。
 
 ### 0.1 2026-10-31 跟进
 
@@ -105,7 +105,7 @@
 - **skill usage**：成功的 `use_skill` 写 `skill.activated` 事件并由 `skill.activations` 派生；激活是 run-scoped，事件历史不表示 skill 永久生效。
 - **context limit**：修复 system/tool token 的双重扣减；手动压缩摘要失败时 trim 到 hard limit 一半。启发式估算、provider calibration 与用户配置的 context window 仍可能导致过早压缩或 provider overflow。
 - **unlimited budget**：显式 `Session.unlimited` 绕过 session/plan/department/project 经济预算门，并在运行中通过共享 atomic flag 生效；数字预算保留以便关闭后恢复。它不绕过 capacity、approvals、sandbox、Verifier、context、max turns 或 provider timeout。项目 shared pool 可被单个 unlimited session 绕过，这是显式用户选择；没有隐藏自动延期或外部硬上限。
-- **测试/文档**：ADR-0129/0130/0131/0132；Rust/Swift 回归覆盖 source/skill/citation/artifact version/collection/diff/audit；当前 Rust 419（core 333 / protocol 2 / store 70 / providers 14，3 ignored live），Swift 110。
+- **测试/文档**：ADR-0129/0130/0131/0132；Rust/Swift 回归覆盖 source/skill/citation/artifact version/collection/diff/audit；该轮 Rust 419（core 333 / protocol 2 / store 70 / providers 14，3 ignored live），Swift 110。
 
 ---
 
@@ -580,15 +580,22 @@ just test                  # Rust + xcodebuild test (40 Swift tests)
 - `git` 工具只读；stage/commit/branch 仍由 runtime/merge queue 拥有。
 - Manager 仍是 code read-only；Verifier 仍不能写代码；approval、write scope、
   capacity、budget、Verifier gate 均未放宽。
-- 当前测试：Rust 482（core 396 / protocol 2 / store 70 / providers 14；3 个
-  live ignored），Swift 110。此前本文记录的 358/104 是历史基线。
+- 当前测试：Rust 490（core 402 + 1 ignored / protocol 2 / store 72 /
+  providers 14；另有 3 个 live ignored），Swift 110。此前本文记录的
+  358/104 是历史基线。
 - 新增 optional LSP、provider search、PDF/image/office-document/data reader、
-  runtime budget/task/tool/artifact 工具；LSP 不自动安装，search 需要显式
-  provider 配置，PDF 页边界 best-effort，image OCR 需要 tesseract，office
-  只提取可读结构，data query 是 deterministic path subset。
-- Browser/computer 仍未交付。headless Chrome/CDP 在 daemon Seatbelt 内无法
-  可靠加载 HTTP 页面；unsandboxed 运行会违反 worktree 写边界，因此没有把
-  半成品 browser 工具注册给 agent。
+  runtime budget/task/tool/artifact 工具，以及 sandboxed WKWebView browser +
+  ComputerLease；LSP 不自动安装，search 需要显式 provider 配置，PDF 页边界
+  best-effort，image OCR 需要 tesseract，office 只提取可读结构，data query
+  是 deterministic path subset，browser 不是 network boundary。
+- Browser 已交付为 daemon 启动的 WKWebView helper：独立 Seatbelt profile、
+  scratch 写入、worktree 写入 deny、localhost/worktree `file:` 导航、
+  非持久 WebKit store、DOM snapshot、input/console/evaluate/viewport
+  screenshot，以及 daemon-wide `ComputerLease`。限制明确：需要 GUI session，
+  page JavaScript 不被网络隔离，snapshot 不是 native AX，screenshot 只截
+  viewport，ComputerLease 是单 daemon、fail-fast、无队列/公平调度，且不是
+  replay projection。native macOS `computer` 控制仍未交付。
 
-仍未解决：browser/computer、完整 ComputerLease，以及本文既有的分布式
-scheduler/fencing、完整 shell read/network confinement、默认自动冲突解决等。
+仍未解决：native macOS computer、fair/distributed ComputerLease，以及本文
+既有的分布式 scheduler/fencing、完整 shell read/network confinement、默认
+自动冲突解决等。

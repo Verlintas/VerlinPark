@@ -1,10 +1,99 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-10
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-10 Browser helper and daemon-wide ComputerLease
+
+这一轮把 browser 和 ComputerLease 从“设计缺口”变成可运行实现，同时明确
+它不是无边界浏览器，也不是 distributed lease。
+
+### ComputerLease
+
+- 新增 SQLite `computer_leases`，一行一个交互 surface；当前 surface 是
+  `browser`。
+- 记录 lease id、surface、owner、session、agent id/name、acquired/heartbeat/
+  expires 时间。
+- TTL 120 秒，心跳每 TTL/3；过期行在 acquire 事务内删除并写
+  `computer.lease.expired`。
+- acquire 冲突 fail-fast，返回当前 holder；没有隐藏队列。
+- 审计事件：`computer.lease.acquired` / `denied` / `released` / `expired`。
+  它们是 daemon 运维事件，不是 session replay projection。
+- daemon recovery 清理残留 lease；`computer.leases`、
+  `computer.leases.sweep`、`computer.leases.release` 三个 RPC 和
+  `vp computer [--sweep|--release <id>]` 提供状态、过期清理和运维释放。
+- 与 `write_leases` 分离：`write_leases` 串行 worktree 写作用域；
+  `computer_leases` 串行视觉/交互 surface。
+
+### Browser helper
+
+- 新增 Swift/WKWebView `VerlinParkBrowserHelper` 可执行文件，由 daemon 通过
+  独立 Seatbelt profile 启动：
+  - 允许普通读取和 localhost 网络；
+  - 写入只允许 helper scratch、`/dev/null`、`/dev/zero`；
+  - 显式 deny worktree 写入；
+  - deny Apple event；
+  - 没有 daemon 的 sandbox marker 时 helper 拒绝启动，避免意外 unsandboxed
+    运行。
+- 非持久 WebKit data store，使用 scratch `HOME`/`TMPDIR`/cache；不共享用户
+  cookie、local storage 或网站数据。
+- 导航限制：`localhost` / `127.0.0.1` / `[::1]` 的 HTTP(S)，以及当前
+  worktree 内的 `file:` 页面；拒绝 URL credentials、外部 host、`data:` URL
+  和其它 scheme。helper 侧重复校验。
+- 阻止 download、新窗口、file picker、JavaScript dialog；confirm/prompt
+  被拒绝或取消。
+- 动作：`open`、`snapshot`、`click`、`type`、`press`、`select`、`wait_for`、
+  `screenshot`、`console`、`evaluate`、`close`。
+- `snapshot` 是 DOM 派生的 accessibility-shaped tree，带稳定 `eN` 引用、
+  role/name/text/value/checked/disabled、URL、title、viewport；不是 native
+  macOS AX，也不默认返回完整 HTML。
+- `screenshot` 为 viewport-only PNG；helper 先写 scratch，daemon 再经 path
+  jail、symlink-parent 检查、16 MiB cap、atomic write 和 SHA-256 写入
+  worktree，默认 `.verlinpark/browser/`。
+- `evaluate` 是唯一 JavaScript 执行动作，风险级别 `HostState`：`smart` /
+  `strict` 询问，`unattended` 拒绝。
+- 角色：Leader 和 coding Worker/Labour；Manager、Verifier、research、
+  verification、generic 不可用。
+- 生命周期：每个 `(session, worktree)` 一个 helper；close、idle sweep 和
+  session cleanup 显式释放 lease；daemon exit 停止 helper，残留 lease 由 TTL
+  过期或下次 daemon recovery 清理；`VERLINPARK_BROWSER_IDLE_SECS` 默认 600。
+  helper 崩溃/超时后下一次动作重建。
+- 打包：Xcode target `VerlinParkBrowserHelper`；`just bundle` 和
+  `just package` 把 helper 复制到 daemon 旁边；`VERLINPARK_BROWSER_HELPER`
+  可覆盖路径。缺失 helper 返回显式
+  `BROWSER_HELPER_UNAVAILABLE`，不是 stub。
+- `tool_search` 现在从该角色实际收到的完整 tool bundle 搜索，包含
+  `browser` 等 special-cased 工具。
+
+### 边界
+
+- macOS-only，需要已登录的 GUI session；不是 headless CI browser。
+- helper 的 Seatbelt profile 只约束 helper 自身写入；WebKit 的 XPC 服务是
+  Apple 签名的系统服务。**page JavaScript 仍可向外部 host 发起网络请求**，
+  browser 不是 network isolation boundary。
+- `snapshot` 是 DOM-derived，不是 native AX；synthetic input 不覆盖所有
+  浏览器默认行为。
+- screenshot 只截 viewport；`full_page` 参数被接受但不生效。
+- ComputerLease 是单 daemon SQLite lease，不是 distributed fencing token；
+  冲突 fail-fast，无优先级/aging 队列或公平调度；manual acquire 不暴露。
+- helper 必须随 app/daemon 构建；source-only checkout 未构建 Xcode target 时
+  会得到明确 unavailable 错误。
+
+### 测试
+
+- 新增 lease contention/ownership/expiry/sweep/recovery 和 browser URL/
+  permission/helper lifecycle 测试。
+- ignored 的真实 helper 集成测试：
+  `cargo test -p vp-core browser_helper_opens_local_page_and_saves_screenshot -- --ignored`
+  （需要已构建 helper 和 GUI session）；本轮在主工作区已验证通过。
+- 当前 Rust 测试 490（core 402 + 1 ignored / protocol 2 / store 72 /
+  providers 14；另有 3 个 live ignored），Swift 110；`just lint`、
+  `just test`、`just bundle` 通过。
 
 ---
 
@@ -52,7 +141,7 @@
 - 加密文档拒绝；超大文档需要外部转换。
 - Office 输出仍受 40 KB tool-content cap 限制；structured data 受 32 KiB
   event cap 限制。
-- 不触碰 browser/ComputerLease。
+- 这一轮不包含 browser/ComputerLease；同一日期后续切片已实现，见上节。
 
 ---
 
@@ -108,25 +197,28 @@
 - `publish_artifact_file`：把 worktree 里的截图/日志/报告发布为 content-
   addressed artifact（5 MiB 上限，复用现有 retention GC）。
 
-### Browser spike（未交付）
+### Browser spike（历史；已被 WKWebView helper 取代）
 
 尝试了 headless Chrome + CDP（open/snapshot/click/type/press/select/wait/
 screenshot/console/evaluate）。结论是：Chrome 的 network service 和嵌套
 sandbox 在 daemon 的 Seatbelt 写沙箱内无法可靠加载本地 HTTP 页面；关闭
 Chrome 自身 sandbox 并扩大 temp/crashpad 写权限仍只能加载 data URL。
-直接 unsandboxed 运行会违反 worktree 写边界，因此本轮没有注册 browser 工具。
-未来需要独立 helper 进程或 WebKit-backed host，并配套 ComputerLease。
+直接 unsandboxed 运行会违反 worktree 写边界，因此这一轮没有注册 browser
+工具。后续切片改用 daemon 启动的 WKWebView helper，并配套 ComputerLease；
+见本文顶部的 Browser helper 章节和 ADR-0137。
 
 ### 测试
 
 - 新增 LSP framing/UTF-16/symbol mapping、SearXNG mock、PDF page selection、
   image metadata（sandboxed sips）、data query path/CSV、runtime budget/
   tool_search/artifact 事件测试。
-- 当前 Rust 测试 482（core 396 / protocol 2 / store 70 / providers 14；3 个
-  live ignored），Swift 110；`just lint` 与 `just test` 通过。
+- 当前 Rust 测试 490（core 402 + 1 ignored / protocol 2 / store 72 /
+  providers 14；另有 3 个 live ignored），Swift 110；`just lint`、
+  `just test`、`just bundle` 通过。
 
-剩余：office documents、browser、computer、完整 ComputerLease、跨进程
-browser lease。见 [TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)。
+剩余：native macOS computer、优先级/aging 的 ComputerLease 队列、跨进程
+distributed lease，以及 browser 的 network-isolation 和 native AX 增强。
+见 [TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)。
 
 ---
 

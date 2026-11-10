@@ -146,6 +146,7 @@
 | [0134](adr/0134-deterministic-agent-tooling-wave.md) | Atomic patches, project tasks, Git reads, lexical code intelligence, parallel reads, processes, local HTTP, and structured results | Accepted | Runtime/Agent Tools |
 | [0135](adr/0135-optional-lsp-search-media-and-runtime-tools.md) | Optional language servers, provider-backed search, PDF/image/data readers, runtime introspection, and deferred browser | Accepted | Runtime/Agent Tools/Knowledge |
 | [0136](adr/0136-office-documents-and-media.md) | Bounded DOCX/PPTX/XLSX/ODF reader, OCR confidence, and PDF metadata/page counts | Accepted | Runtime/Agent Tools/Media |
+| [0137](adr/0137-browser-helper-and-computer-lease.md) | Seatbelt-confined WKWebView browser helper and single-daemon ComputerLease | Accepted | Runtime/Agent Tools/MacOS |
 
 ---
 
