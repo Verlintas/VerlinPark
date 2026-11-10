@@ -2,7 +2,7 @@
 //!
 //! M1 adds the Leader agent loop, tool registry, approvals, and event stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,9 +25,11 @@ use vp_protocol::types::{
     IntakeCreateParams, IntakeListResult, IntakeTask, IntakeUpdateParams, IntegrationPolicy,
     MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult, McpProbeResult,
     McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer, McpServerConfig,
-    McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult,
-    MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, MessageCitation,
-    ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
+    McpServerListResult, McpToolListResult, MemoryBriefResult, MemoryDeleteResult, MemoryEvidence,
+    MemoryItem, MemoryListResult, MemoryMatch, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult,
+    MemorySearchParams, MemorySearchResult, MemoryStatsResult, MemorySweepResult,
+    MemoryUpdateResult, MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry,
+    MessageCitation, ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
     OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
     OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
     OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
@@ -60,7 +62,8 @@ use vp_protocol::types::{
 };
 use vp_store::Store;
 use vp_store::store::{
-    DeliveredSteering, NewIntakeTask, SessionRepair, SourceSearchQuery, SourceSnapshot,
+    DeliveredSteering, MemoryCandidate, NewIntakeTask, NewMemory, SessionRepair, SourceSearchQuery,
+    SourceSnapshot,
 };
 
 use crate::budget::BudgetRegistry;
@@ -74,6 +77,7 @@ pub mod continuation;
 mod dashboard;
 pub mod history;
 pub mod mcp;
+pub mod memory;
 pub mod orchestration;
 pub mod permissions;
 pub mod rebuild;
@@ -372,6 +376,21 @@ fn validate_memory_policy(policy: &MemoryPolicy) -> Result<()> {
     }
     if policy.enabled && policy.max_items.is_none() && policy.max_age_days.is_none() {
         anyhow::bail!("enabled memory policy requires max_items or max_age_days");
+    }
+    for (name, days) in [
+        ("task_result_verify_days", policy.task_result_verify_days),
+        ("default_verify_days", policy.default_verify_days),
+    ] {
+        if let Some(days) = days
+            && !(1..=36_500).contains(&days)
+        {
+            anyhow::bail!("memory {name} must be between 1 and 36500 (or null to disable)");
+        }
+    }
+    if let Some(max_chars) = policy.brief_max_chars
+        && !(200..=100_000).contains(&max_chars)
+    {
+        anyhow::bail!("memory brief_max_chars must be between 200 and 100000");
     }
     Ok(())
 }
@@ -6986,6 +7005,39 @@ impl Engine {
         body: &str,
         tags: Vec<String>,
     ) -> Result<MemoryItem> {
+        self.create_memory_with_metadata(
+            session_id,
+            agent_id,
+            agent_name,
+            kind,
+            title,
+            body,
+            tags,
+            "agent",
+            Vec::new(),
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Create a memory with explicit provenance. The policy's
+    /// `auto_supersede` and verify TTLs apply; duplicate content is idempotent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_memory_with_metadata(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+        tags: Vec<String>,
+        source: &str,
+        evidence: Vec<MemoryEvidence>,
+        pinned: bool,
+        verify_after: Option<String>,
+    ) -> Result<MemoryItem> {
         let kind = kind.trim();
         let title = title.trim();
         if kind.is_empty() || kind.chars().count() > 40 {
@@ -7000,11 +7052,41 @@ impl Engine {
         if tags.len() > 10 || tags.iter().any(|tag| tag.chars().count() > 40) {
             anyhow::bail!("at most 10 tags of 40 characters are allowed");
         }
+        if source.trim().is_empty() || source.chars().count() > 40 {
+            anyhow::bail!("memory source must be 1-40 characters");
+        }
+        if evidence.len() > 64 {
+            anyhow::bail!("memory supports at most 64 evidence entries");
+        }
+        for item in &evidence {
+            if item.kind.trim().is_empty()
+                || item.kind.chars().count() > 40
+                || item.reference.trim().is_empty()
+                || item.reference.chars().count() > 4_096
+            {
+                anyhow::bail!(
+                    "memory evidence requires a 1-40 char kind and 1-4096 char reference"
+                );
+            }
+        }
         let store = self.store.clone();
         let session_id_owned = session_id.to_string();
         let session = tokio::task::spawn_blocking(move || store.get_session(&session_id_owned))
             .await??
             .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let store = self.store.clone();
+        let policy_project = session.project_id.clone();
+        let policy =
+            tokio::task::spawn_blocking(move || store.get_memory_policy(&policy_project)).await??;
+        let verify_days = if source == "task_result" {
+            policy.task_result_verify_days
+        } else {
+            policy.default_verify_days
+        };
+        let verify_after = verify_after.or_else(|| memory_verify_after(verify_days));
         let store = self.store.clone();
         let session_id = session.id;
         let project_id = session.project_id;
@@ -7013,23 +7095,33 @@ impl Engine {
         let kind = kind.to_string();
         let title = title.to_string();
         let body = body.to_string();
-        let (memory, event) = tokio::task::spawn_blocking(move || {
-            store.create_memory_with_event(
-                &session_id,
-                &project_id,
-                &agent_id,
-                &agent_name,
-                &kind,
-                &title,
-                &body,
-                &tags,
-            )
+        let source = source.to_string();
+        let outcome = tokio::task::spawn_blocking(move || {
+            store.create_memory_with_metadata_event(NewMemory {
+                session_id: &session_id,
+                project_id: &project_id,
+                agent_id: &agent_id,
+                agent_name: &agent_name,
+                kind: &kind,
+                title: &title,
+                body: &body,
+                tags: &tags,
+                source: &source,
+                evidence: &evidence,
+                pinned,
+                verify_after: verify_after.as_deref(),
+                dedupe: true,
+                auto_supersede: policy.auto_supersede,
+            })
         })
         .await??;
-        let _ = self.events.send(event);
-        Ok(memory)
+        for event in outcome.events {
+            let _ = self.events.send(event);
+        }
+        Ok(outcome.memory)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_memory(
         &self,
         session_id: &str,
@@ -7049,13 +7141,428 @@ impl Engine {
         kind: Option<String>,
         limit: u32,
     ) -> Result<MemoryListResult> {
+        self.list_memories_filtered(project_id, query, kind, None, false, limit)
+            .await
+    }
+
+    /// Active memories by default; exact `status` wins over `include_stale`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_memories_filtered(
+        &self,
+        project_id: &str,
+        query: Option<String>,
+        kind: Option<String>,
+        status: Option<String>,
+        include_stale: bool,
+        limit: u32,
+    ) -> Result<MemoryListResult> {
         let store = self.store.clone();
         let project_id = project_id.to_string();
         let memories = tokio::task::spawn_blocking(move || {
-            store.list_memories(&project_id, query.as_deref(), kind.as_deref(), limit)
+            store.list_memories_filtered(
+                &project_id,
+                query.as_deref(),
+                kind.as_deref(),
+                status.as_deref(),
+                include_stale,
+                limit,
+            )
         })
         .await??;
         Ok(MemoryListResult { memories })
+    }
+
+    pub async fn memory_search(&self, params: MemorySearchParams) -> Result<MemorySearchResult> {
+        let query_text = params.query.trim().to_string();
+        let store = self.store.clone();
+        let project_id = params.project_id.clone();
+        let kind = params.kind.clone();
+        let kinds = params.kinds.clone();
+        let include_stale = params.include_stale;
+        let limit = params.limit.unwrap_or(20).clamp(1, 100);
+        let mut candidates = tokio::task::spawn_blocking(move || {
+            store.memory_candidates(
+                &project_id,
+                &query_text,
+                kind.as_deref(),
+                &kinds,
+                include_stale,
+                limit,
+            )
+        })
+        .await??;
+        if let Some(task_id) = params
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|task_id| !task_id.is_empty())
+        {
+            let store = self.store.clone();
+            let project_id = params.project_id.clone();
+            let task_id = task_id.to_string();
+            let extra = tokio::task::spawn_blocking(move || {
+                store.memory_task_candidates(&project_id, &task_id, include_stale, limit)
+            })
+            .await??;
+            let mut seen = candidates
+                .iter()
+                .map(|candidate| candidate.memory.id.clone())
+                .collect::<HashSet<_>>();
+            for memory in extra {
+                if seen.insert(memory.id.clone()) {
+                    candidates.push(MemoryCandidate {
+                        memory,
+                        lexical: 0.0,
+                        fts: false,
+                    });
+                }
+            }
+        }
+        let query = crate::memory::MemoryQuery {
+            text: params.query,
+            task_id: params.task_id,
+            department: params.department,
+            paths: params.paths,
+        };
+        let mut matches = crate::memory::rank_candidates(
+            candidates,
+            &query,
+            time::OffsetDateTime::now_utc(),
+            include_stale,
+        );
+        if let Some(max_chars) = params.max_chars {
+            matches = crate::memory::select_brief(&matches, max_chars).memories;
+        }
+        matches.truncate(limit as usize);
+        Ok(MemorySearchResult { memories: matches })
+    }
+
+    /// Build the injected project-memory brief. Usage is observed per selected
+    /// memory and session, and `memory.used` is idempotent for that pair.
+    pub async fn memory_brief(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<MemoryBriefResult> {
+        self.memory_brief_with_department(session_id, task_id, None)
+            .await
+    }
+
+    /// Same as `memory_brief`, with an explicit department override for agents
+    /// that carry a department but no plan-task row.
+    pub async fn memory_brief_with_department(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        department_override: Option<&str>,
+    ) -> Result<MemoryBriefResult> {
+        let store = self.store.clone();
+        let lookup = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&lookup))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let project_id = session.project_id.clone();
+        let policy = self.get_memory_policy(&project_id).await?.policy;
+        let brief_max_chars = policy.brief_max_chars.unwrap_or(4_000).clamp(200, 100_000);
+
+        let mut text_parts = vec![session.goal.clone()];
+        if let Some(task_id) = task_id {
+            text_parts.push(task_id.to_string());
+        }
+        let mut department = department_override
+            .map(str::trim)
+            .filter(|department| !department.is_empty())
+            .map(str::to_string);
+        let mut paths = Vec::new();
+        if let Some(task_id) = task_id {
+            if let Some(plan) = self.get_team_plan(session_id).await?
+                && let Some(task) = plan.tasks.iter().find(|task| task.id == task_id)
+            {
+                if !task.title.trim().is_empty() {
+                    text_parts.push(task.title.clone());
+                }
+                text_parts.push(task.department.clone());
+                text_parts.extend(task.write_scope.iter().cloned());
+                text_parts.extend(task.acceptance.iter().cloned());
+                department = Some(task.department.clone());
+                paths = task.write_scope.clone();
+            }
+            if department.is_none() {
+                let store = self.store.clone();
+                let lookup = session_id.to_string();
+                if let Ok(tasks) =
+                    tokio::task::spawn_blocking(move || store.list_plan_tasks(None, Some(&lookup)))
+                        .await?
+                    && let Some(task) = tasks.into_iter().find(|task| task.task_id == task_id)
+                {
+                    if !task.title.trim().is_empty() {
+                        text_parts.push(task.title);
+                    }
+                    text_parts.push(task.department.clone());
+                    text_parts.extend(task.write_scope.iter().cloned());
+                    department = Some(task.department);
+                    paths = task.write_scope;
+                }
+            }
+        }
+
+        let search = MemorySearchParams {
+            project_id: project_id.clone(),
+            query: text_parts.join(" "),
+            kind: None,
+            kinds: Vec::new(),
+            task_id: task_id.map(str::to_string),
+            department,
+            paths,
+            limit: Some(20),
+            include_stale: false,
+            max_chars: None,
+        };
+        let mut matches = self.memory_search(search).await?.memories;
+
+        if matches.is_empty() {
+            let store = self.store.clone();
+            let project = project_id.clone();
+            let recent = tokio::task::spawn_blocking(move || {
+                store.list_memories_filtered(&project, None, None, None, false, 8)
+            })
+            .await??;
+            matches = recent
+                .into_iter()
+                .map(|memory| MemoryMatch {
+                    memory,
+                    score: 0.0,
+                    reasons: vec!["recent-fallback".to_string()],
+                })
+                .collect();
+        }
+
+        let selection = crate::memory::select_brief(&matches, brief_max_chars);
+        for matched in &selection.memories {
+            let store = self.store.clone();
+            let memory_id = matched.memory.id.clone();
+            let using_session = session_id.to_string();
+            if let Ok(Some((_, event))) = tokio::task::spawn_blocking(move || {
+                store.record_memory_use_with_event(&memory_id, &using_session)
+            })
+            .await
+            .unwrap_or(Ok(None))
+            {
+                let _ = self.events.send(event);
+            }
+        }
+        Ok(MemoryBriefResult {
+            text: selection.text,
+            memories: selection.memories,
+        })
+    }
+
+    /// Update lifecycle metadata only. Title and body are immutable so
+    /// provenance cannot be rewritten after the fact.
+    pub async fn memory_update(
+        &self,
+        id: &str,
+        status: Option<&str>,
+        pinned: Option<bool>,
+        tags: Option<Vec<String>>,
+    ) -> Result<MemoryUpdateResult> {
+        if let Some(status) = status
+            && !matches!(status, "active" | "stale" | "superseded" | "archived")
+        {
+            anyhow::bail!("memory status must be active, stale, superseded, or archived");
+        }
+        if status.is_none() && pinned.is_none() && tags.is_none() {
+            anyhow::bail!("memory update requires status, pinned, or tags");
+        }
+        if let Some(tags) = &tags
+            && (tags.len() > 10 || tags.iter().any(|tag| tag.chars().count() > 40))
+        {
+            anyhow::bail!("at most 10 tags of 40 characters are allowed");
+        }
+        let store = self.store.clone();
+        let memory_id = id.to_string();
+        let status = status.map(str::to_string);
+        let tags_for_store = tags.clone();
+        let updated = tokio::task::spawn_blocking(move || {
+            store.update_memory_with_event(
+                &memory_id,
+                status.as_deref(),
+                pinned,
+                tags_for_store.as_deref(),
+            )
+        })
+        .await??;
+        let Some((memory, event)) = updated else {
+            anyhow::bail!("memory not found: {id}");
+        };
+        let _ = self.events.send(event);
+        Ok(MemoryUpdateResult { memory })
+    }
+
+    /// Check evidence locally, then explicitly verify or mark stale. This never
+    /// asks a model to judge whether a claim is true.
+    pub async fn memory_verify(&self, id: &str) -> Result<MemoryVerifyResult> {
+        let store = self.store.clone();
+        let memory_id = id.to_string();
+        let memory = tokio::task::spawn_blocking(move || store.get_memory(&memory_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("memory not found: {id}"))?;
+        if matches!(memory.status.as_str(), "superseded" | "archived") {
+            anyhow::bail!(
+                "memory {id} is {}; restore it with memory.update before verifying",
+                memory.status
+            );
+        }
+        let store = self.store.clone();
+        let project_id = memory.project_id.clone();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found for memory: {id}"))?;
+        let root = PathBuf::from(&project.root);
+        let store = self.store.clone();
+        let session_id = memory.session_id.clone();
+        let project_id = memory.project_id.clone();
+        let evidence = memory.evidence.clone();
+        let checks = tokio::task::spawn_blocking(move || {
+            verify_memory_evidence(&store, &root, &project_id, &session_id, &evidence)
+        })
+        .await?;
+
+        let failed = checks
+            .iter()
+            .find(|check| check.status == "missing")
+            .map(|check| {
+                format!(
+                    "evidence verification failed: {} {}: {}",
+                    check.evidence.kind, check.evidence.reference, check.detail
+                )
+            });
+        let checked = checks
+            .iter()
+            .filter(|check| check.status != "unchecked")
+            .count();
+        let store = self.store.clone();
+        let memory_id = id.to_string();
+        let mut memory = memory;
+        let mut event = None;
+        if let Some(reason) = failed {
+            let updated = tokio::task::spawn_blocking(move || {
+                store.mark_memory_stale_with_event(&memory_id, &reason)
+            })
+            .await??;
+            let Some((stale, stale_event)) = updated else {
+                anyhow::bail!("memory not found: {id}");
+            };
+            memory = stale;
+            event = Some(stale_event);
+        } else if checked > 0 || checks.is_empty() {
+            // A memory with only unchecked evidence (for example a URL) is not
+            // silently treated as verified.
+            let policy = self.get_memory_policy(&memory.project_id).await?.policy;
+            let verified_at = now_rfc3339();
+            let verify_after = memory_verify_after(policy.default_verify_days);
+            let updated = tokio::task::spawn_blocking(move || {
+                store.mark_memory_verified_with_event(
+                    &memory_id,
+                    &verified_at,
+                    verify_after.as_deref(),
+                )
+            })
+            .await??;
+            let Some((verified, verified_event)) = updated else {
+                anyhow::bail!("memory not found: {id}");
+            };
+            memory = verified;
+            event = Some(verified_event);
+        }
+        if let Some(event) = event {
+            let _ = self.events.send(event);
+        }
+        Ok(MemoryVerifyResult { memory, checks })
+    }
+
+    /// Mark expired active, non-pinned memories stale. Never deletes and never
+    /// restores. `dry_run` returns candidates without mutating.
+    pub async fn memory_sweep(
+        &self,
+        project_id: &str,
+        older_than_days: Option<u32>,
+        dry_run: bool,
+    ) -> Result<MemorySweepResult> {
+        if let Some(days) = older_than_days
+            && !(1..=36_500).contains(&days)
+        {
+            anyhow::bail!("memory sweep older_than_days must be between 1 and 36500");
+        }
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let candidates = tokio::task::spawn_blocking(move || {
+            store.memory_sweep_candidates(&project, older_than_days)
+        })
+        .await??;
+        let memory_ids = candidates
+            .iter()
+            .map(|memory| memory.id.clone())
+            .collect::<Vec<_>>();
+        let mut marked_stale = 0;
+        if !dry_run {
+            for id in &memory_ids {
+                let store = self.store.clone();
+                let memory_id = id.clone();
+                let updated = tokio::task::spawn_blocking(move || {
+                    store.mark_memory_stale_with_event(&memory_id, "verification expired")
+                })
+                .await??;
+                if let Some((_, event)) = updated {
+                    let _ = self.events.send(event);
+                    marked_stale += 1;
+                }
+            }
+        }
+        Ok(MemorySweepResult {
+            project_id: project_id.to_string(),
+            candidates: memory_ids.len(),
+            marked_stale,
+            memory_ids,
+            dry_run,
+        })
+    }
+
+    pub async fn memory_stats(&self, project_id: &str) -> Result<MemoryStatsResult> {
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let stats = tokio::task::spawn_blocking(move || store.memory_stats(&project)).await??;
+        Ok(MemoryStatsResult {
+            project_id: project_id.to_string(),
+            total: stats.total,
+            by_status: stats.by_status,
+            by_source: stats.by_source,
+            by_kind: stats.by_kind,
+        })
+    }
+
+    /// Daemon tick: sweep only projects whose policy opted into `sweep_stale`.
+    pub async fn sweep_memory_staleness(&self) -> Result<(usize, usize)> {
+        let store = self.store.clone();
+        let policies =
+            tokio::task::spawn_blocking(move || store.list_memory_sweep_policies()).await??;
+        let mut projects = 0;
+        let mut marked = 0;
+        for (project_id, policy) in policies {
+            if !policy.sweep_stale {
+                continue;
+            }
+            match self.memory_sweep(&project_id, None, false).await {
+                Ok(result) => {
+                    projects += 1;
+                    marked += result.marked_stale;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %project_id, "memory staleness sweep failed");
+                }
+            }
+        }
+        Ok((projects, marked))
     }
 
     pub async fn delete_memory(&self, id: &str) -> Result<MemoryDeleteResult> {
@@ -8347,7 +8854,8 @@ impl Engine {
         let mut replay_memories = HashMap::new();
         for event in &data.events {
             match event.kind.as_str() {
-                "memory.created" => {
+                "memory.created" | "memory.updated" | "memory.verified" | "memory.stale"
+                | "memory.superseded" | "memory.used" => {
                     if let Ok(memory) = serde_json::from_value::<MemoryItem>(event.payload.clone())
                     {
                         replay_memories.insert(memory.id.clone(), serde_json::to_value(memory)?);
@@ -8733,13 +9241,22 @@ impl Engine {
         };
 
         let memories = {
-            let mut items = Vec::new();
+            let mut items: Vec<MemoryItem> = Vec::new();
             let mut valid = true;
             for event in &data.events {
                 match event.kind.as_str() {
-                    "memory.created" => {
+                    "memory.created" | "memory.updated" | "memory.verified" | "memory.stale"
+                    | "memory.superseded" | "memory.used" => {
                         match serde_json::from_value::<MemoryItem>(event.payload.clone()) {
-                            Ok(memory) => items.push(memory),
+                            Ok(memory) => {
+                                if let Some(existing) =
+                                    items.iter_mut().find(|item| item.id == memory.id)
+                                {
+                                    *existing = memory;
+                                } else {
+                                    items.push(memory);
+                                }
+                            }
                             Err(_) => {
                                 valid = false;
                                 break;
@@ -10978,6 +11495,211 @@ impl Engine {
         }
         Ok(MailboxGcResult { removed })
     }
+}
+
+fn memory_verify_after(days: Option<u32>) -> Option<String> {
+    let days = days?;
+    let when = time::OffsetDateTime::now_utc() + time::Duration::days(i64::from(days));
+    Some(
+        when.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| now_rfc3339()),
+    )
+}
+
+fn verify_memory_evidence(
+    store: &Store,
+    project_root: &Path,
+    project_id: &str,
+    memory_session_id: &str,
+    evidence: &[MemoryEvidence],
+) -> Vec<MemoryVerificationCheck> {
+    evidence
+        .iter()
+        .map(|item| {
+            let (status, detail) = match item.kind.as_str() {
+                "commit" => verify_commit_evidence(project_root, &item.reference),
+                "path" => verify_path_evidence(project_root, &item.reference),
+                "task" => match store.plan_task_exists(project_id, item.reference.trim()) {
+                    Ok(true) => (
+                        "verified".to_string(),
+                        "task exists in this project".to_string(),
+                    ),
+                    Ok(false) => (
+                        "missing".to_string(),
+                        "task not found in this project".to_string(),
+                    ),
+                    Err(error) => (
+                        "unchecked".to_string(),
+                        format!("task lookup failed: {error}"),
+                    ),
+                },
+                "session" => match store.get_session(item.reference.trim()) {
+                    Ok(Some(_)) => ("verified".to_string(), "session exists".to_string()),
+                    Ok(None) => ("missing".to_string(), "session not found".to_string()),
+                    Err(error) => (
+                        "unchecked".to_string(),
+                        format!("session lookup failed: {error}"),
+                    ),
+                },
+                "event" => match parse_event_reference(&item.reference, memory_session_id) {
+                    Some((session_id, seq)) => match store.event_exists(&session_id, seq) {
+                        Ok(true) => (
+                            "verified".to_string(),
+                            format!("event {session_id}:{seq} exists"),
+                        ),
+                        Ok(false) => (
+                            "missing".to_string(),
+                            format!("event {session_id}:{seq} not found"),
+                        ),
+                        Err(error) => (
+                            "unchecked".to_string(),
+                            format!("event lookup failed: {error}"),
+                        ),
+                    },
+                    None => (
+                        "unchecked".to_string(),
+                        "event reference is not '<session>:<seq>' or '<seq>'".to_string(),
+                    ),
+                },
+                "url" => (
+                    "unchecked".to_string(),
+                    "URL evidence is not fetched by local verification".to_string(),
+                ),
+                other => (
+                    "unchecked".to_string(),
+                    format!("unsupported evidence kind: {other}"),
+                ),
+            };
+            MemoryVerificationCheck {
+                evidence: item.clone(),
+                status,
+                detail,
+            }
+        })
+        .collect()
+}
+
+fn verify_commit_evidence(project_root: &Path, reference: &str) -> (String, String) {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return ("missing".to_string(), "empty commit reference".to_string());
+    }
+    let repo = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["rev-parse", "--git-dir"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output();
+    match repo {
+        Ok(output) if output.status.success() => {}
+        Ok(_) | Err(_) => {
+            return (
+                "unchecked".to_string(),
+                "project root is not a git repository".to_string(),
+            );
+        }
+    }
+    let object = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["cat-file", "-e", &format!("{reference}^{{commit}}")])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output();
+    match object {
+        Ok(output) if output.status.success() => {}
+        Ok(_) => {
+            return (
+                "missing".to_string(),
+                format!("commit object {reference} not found"),
+            );
+        }
+        Err(error) => {
+            return (
+                "missing".to_string(),
+                format!("git cat-file failed: {error}"),
+            );
+        }
+    }
+    let ancestor = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["merge-base", "--is-ancestor", reference, "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output();
+    match ancestor {
+        Ok(output) if output.status.success() => (
+            "verified".to_string(),
+            format!("{reference} is an ancestor of HEAD"),
+        ),
+        Ok(output) if output.status.code() == Some(1) => (
+            "missing".to_string(),
+            format!("{reference} is not an ancestor of HEAD"),
+        ),
+        Ok(output) => (
+            "missing".to_string(),
+            format!(
+                "git merge-base failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ),
+        Err(error) => (
+            "missing".to_string(),
+            format!("git merge-base failed: {error}"),
+        ),
+    }
+}
+
+fn verify_path_evidence(project_root: &Path, reference: &str) -> (String, String) {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return ("missing".to_string(), "empty path reference".to_string());
+    }
+    let path = Path::new(reference);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return (
+            "missing".to_string(),
+            "path escapes the project root".to_string(),
+        );
+    }
+    let candidate = project_root.join(path);
+    if !candidate.exists() {
+        return (
+            "missing".to_string(),
+            "path not found under the project root".to_string(),
+        );
+    }
+    if let (Ok(root), Ok(resolved)) = (project_root.canonicalize(), candidate.canonicalize())
+        && !resolved.starts_with(&root)
+    {
+        return (
+            "missing".to_string(),
+            "path resolves outside the project root".to_string(),
+        );
+    }
+    (
+        "verified".to_string(),
+        format!("exists at {}", candidate.display()),
+    )
+}
+
+fn parse_event_reference(reference: &str, fallback_session_id: &str) -> Option<(String, u64)> {
+    let reference = reference.trim();
+    if let Some((session_id, seq)) = reference.split_once(':') {
+        let seq = seq.trim().parse::<u64>().ok()?;
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return None;
+        }
+        return Some((session_id.to_string(), seq));
+    }
+    reference
+        .parse::<u64>()
+        .ok()
+        .map(|seq| (fallback_session_id.to_string(), seq))
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {

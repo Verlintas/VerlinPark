@@ -7618,7 +7618,15 @@ async fn completed_task_results_become_persistent_project_memory() {
         "Implemented the parser and tests.",
     )
     .await;
-    super::record_task_memory(&engine, &session.id, "T1", "duplicate should not append").await;
+    // Identical content is idempotent; a retried task with different content
+    // supersedes the previous active row (covered by the evidence test).
+    super::record_task_memory(
+        &engine,
+        &session.id,
+        "T1",
+        "Implemented the parser and tests.",
+    )
+    .await;
     let memories = engine
         .list_memories(
             &project.id,
@@ -9598,5 +9606,167 @@ async fn stall_recovery_budget_exhaustion_does_not_resume() {
             .unwrap()
             .iter()
             .any(|note| note.action == "escalate")
+    );
+}
+
+#[tokio::test]
+async fn task_result_memory_carries_evidence_and_retries_supersede() {
+    let data = tempfile::TempDir::new().unwrap();
+    let repo = tempfile::TempDir::new().unwrap();
+    std::fs::write(repo.path().join("README.md"), "memory\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "test@verlinpark.local"],
+        vec!["config", "user.name", "VerlinPark Test"],
+        vec!["add", "."],
+        vec!["commit", "-q", "-m", "initial"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let base = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    std::fs::write(repo.path().join("README.md"), "memory v2\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "task change"]] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let commit = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    let engine = Engine::new(vp_store::Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("memory evidence".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "evidence".into(), None)
+        .await
+        .unwrap();
+    let (entry, _) = engine
+        .store()
+        .enqueue_merge_with_event(
+            &session.id,
+            "worker-1",
+            "Worker",
+            Some("T1"),
+            "vp/task",
+            &commit,
+            &base,
+            None,
+        )
+        .unwrap();
+    engine
+        .store()
+        .update_merge_queue_entry_with_event(&entry.id, "merged", Some("ok"))
+        .unwrap();
+
+    super::record_task_memory(&engine, &session.id, "T1", "First task summary.").await;
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &project.id,
+            None,
+            Some("task_result"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    let memory = &active[0];
+    assert_eq!(memory.source, "task_result");
+    assert!(memory.verify_after.is_some());
+    assert!(
+        memory
+            .evidence
+            .iter()
+            .any(|evidence| { evidence.kind == "task" && evidence.reference == "T1" })
+    );
+    assert!(
+        memory
+            .evidence
+            .iter()
+            .any(|evidence| { evidence.kind == "session" && evidence.reference == session.id })
+    );
+    assert!(
+        memory
+            .evidence
+            .iter()
+            .any(|evidence| { evidence.kind == "commit" && evidence.reference == commit })
+    );
+    assert!(
+        memory
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == "path" && evidence.reference == "README.md")
+    );
+
+    super::record_task_memory(&engine, &session.id, "T1", "Second task summary.").await;
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &project.id,
+            None,
+            Some("task_result"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(active[0].body.contains("Second task summary"));
+    assert_eq!(active[0].supersedes.len(), 1);
+    let superseded = engine
+        .store()
+        .list_memories_filtered(
+            &project.id,
+            None,
+            Some("task_result"),
+            Some("superseded"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(superseded.len(), 1);
+    assert!(superseded[0].body.contains("First task summary"));
+    assert_eq!(
+        superseded[0].superseded_by.as_deref(),
+        Some(active[0].id.as_str())
     );
 }

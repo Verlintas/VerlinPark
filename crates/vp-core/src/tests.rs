@@ -532,6 +532,7 @@ async fn sweeps_enabled_memory_policies() {
                     enabled: true,
                     max_items: None,
                     max_age_days: None,
+                    ..MemoryPolicy::default()
                 },
             )
             .await
@@ -545,6 +546,7 @@ async fn sweeps_enabled_memory_policies() {
                     enabled: true,
                     max_items: Some(0),
                     max_age_days: None,
+                    ..MemoryPolicy::default()
                 },
             )
             .await
@@ -554,6 +556,7 @@ async fn sweeps_enabled_memory_policies() {
         enabled: true,
         max_items: Some(1),
         max_age_days: None,
+        ..MemoryPolicy::default()
     };
     engine
         .set_memory_policy(&project.id, policy.clone())
@@ -7698,4 +7701,440 @@ async fn deferred_continuations_can_be_cancelled_once() {
     let replay = engine.replay_session(&session.id).await.unwrap();
     assert!(replay.continuations_match, "{:?}", replay.mismatches);
     assert!(replay.consistent, "{:?}", replay.mismatches);
+}
+
+#[tokio::test]
+async fn evidence_backed_memory_ranks_briefs_verifies_and_sweeps() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let head = String::from_utf8_lossy(
+        &Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("memory v2".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "parser work".into(), None)
+        .await
+        .unwrap();
+
+    let task_memory = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "worker-1",
+            "Worker",
+            "decision",
+            "Parser design",
+            "Parser uses an explicit tokenizer and a deterministic grammar.",
+            vec!["T1".to_string(), "architecture".to_string()],
+            "operator",
+            vec![
+                MemoryEvidence {
+                    kind: "task".to_string(),
+                    reference: "T1".to_string(),
+                    note: None,
+                },
+                MemoryEvidence {
+                    kind: "path".to_string(),
+                    reference: "src/api".to_string(),
+                    note: None,
+                },
+            ],
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_memory_as(
+            &session.id,
+            "agent-1",
+            "Leader",
+            "fact",
+            "Unrelated note",
+            "The build uses cargo.",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let search = engine
+        .memory_search(MemorySearchParams {
+            project_id: project.id.clone(),
+            query: "parser tokenizer".to_string(),
+            kind: None,
+            kinds: Vec::new(),
+            task_id: Some("T1".to_string()),
+            department: None,
+            paths: vec!["src/api/handlers".to_string()],
+            limit: Some(5),
+            include_stale: false,
+            max_chars: None,
+        })
+        .await
+        .unwrap();
+    assert!(!search.memories.is_empty());
+    assert_eq!(search.memories[0].memory.id, task_memory.id);
+    assert!(
+        search.memories[0]
+            .reasons
+            .iter()
+            .any(|reason| reason == "task:T1")
+    );
+    assert!(
+        search.memories[0]
+            .reasons
+            .iter()
+            .any(|reason| reason == "path:src/api/handlers")
+    );
+    assert!(
+        search.memories[0]
+            .reasons
+            .iter()
+            .any(|reason| reason == "pinned")
+    );
+
+    // Structural task evidence is a candidate path even without lexical
+    // overlap with the query text.
+    let structural = engine
+        .memory_search(MemorySearchParams {
+            project_id: project.id.clone(),
+            query: "zzz-no-lexical-hit".to_string(),
+            kind: None,
+            kinds: Vec::new(),
+            task_id: Some("T1".to_string()),
+            department: None,
+            paths: Vec::new(),
+            limit: Some(5),
+            include_stale: false,
+            max_chars: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        structural
+            .memories
+            .iter()
+            .any(|memory| memory.memory.id == task_memory.id)
+    );
+
+    let brief = engine.memory_brief(&session.id, Some("T1")).await.unwrap();
+    assert!(brief.text.contains("Parser design"));
+    assert!(
+        brief
+            .memories
+            .iter()
+            .any(|memory| memory.memory.id == task_memory.id)
+    );
+    let used = engine.store().get_memory(&task_memory.id).unwrap().unwrap();
+    assert_eq!(used.use_count, 1);
+    // Usage is observed once per (memory, session), even across repeated briefs.
+    engine.memory_brief(&session.id, Some("T1")).await.unwrap();
+    let used_again = engine.store().get_memory(&task_memory.id).unwrap().unwrap();
+    assert_eq!(used_again.use_count, 1);
+
+    let updated = engine
+        .memory_update(
+            &task_memory.id,
+            Some("archived"),
+            Some(false),
+            Some(vec!["parser".to_string()]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.memory.status, "archived");
+    assert!(!updated.memory.pinned);
+    assert_eq!(updated.memory.tags, vec!["parser".to_string()]);
+    engine
+        .memory_update(&task_memory.id, Some("active"), Some(true), None)
+        .await
+        .unwrap();
+
+    let verifiable = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "worker-1",
+            "Worker",
+            "fact",
+            "Verified checkout",
+            "README exists at the project root.",
+            Vec::new(),
+            "task_result",
+            vec![
+                MemoryEvidence {
+                    kind: "commit".to_string(),
+                    reference: head.clone(),
+                    note: None,
+                },
+                MemoryEvidence {
+                    kind: "path".to_string(),
+                    reference: "README.md".to_string(),
+                    note: None,
+                },
+            ],
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let verified = engine.memory_verify(&verifiable.id).await.unwrap();
+    assert_eq!(verified.memory.status, "active");
+    assert!(verified.memory.last_verified_at.is_some());
+    assert!(verified.memory.verify_after.is_some());
+    assert!(
+        verified
+            .checks
+            .iter()
+            .all(|check| check.status == "verified")
+    );
+
+    let broken = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "worker-1",
+            "Worker",
+            "fact",
+            "Broken evidence",
+            "This commit does not exist.",
+            Vec::new(),
+            "agent",
+            vec![MemoryEvidence {
+                kind: "commit".to_string(),
+                reference: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                note: None,
+            }],
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let failed = engine.memory_verify(&broken.id).await.unwrap();
+    assert_eq!(failed.memory.status, "stale");
+    assert!(
+        failed
+            .memory
+            .stale_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("verification failed"))
+    );
+    assert!(failed.checks.iter().any(|check| check.status == "missing"));
+
+    let url_only = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "worker-1",
+            "Worker",
+            "source",
+            "Remote reference",
+            "A URL that local verification cannot fetch.",
+            Vec::new(),
+            "agent",
+            vec![MemoryEvidence {
+                kind: "url".to_string(),
+                reference: "https://example.test/spec".to_string(),
+                note: None,
+            }],
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let unchecked = engine.memory_verify(&url_only.id).await.unwrap();
+    assert_eq!(unchecked.memory.status, "active");
+    assert!(unchecked.memory.last_verified_at.is_none());
+    assert!(
+        unchecked
+            .checks
+            .iter()
+            .all(|check| check.status == "unchecked")
+    );
+
+    let expired = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "agent-1",
+            "Leader",
+            "fact",
+            "Expired fact",
+            "An expired active fact.",
+            Vec::new(),
+            "agent",
+            Vec::new(),
+            false,
+            Some("2020-01-01T00:00:00Z".to_string()),
+        )
+        .await
+        .unwrap();
+    let pinned_expired = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "agent-1",
+            "Leader",
+            "fact",
+            "Pinned expired fact",
+            "Pinned memories are never swept.",
+            Vec::new(),
+            "agent",
+            Vec::new(),
+            true,
+            Some("2020-01-01T00:00:00Z".to_string()),
+        )
+        .await
+        .unwrap();
+    let dry_run = engine.memory_sweep(&project.id, None, true).await.unwrap();
+    assert!(dry_run.candidates >= 1);
+    assert_eq!(dry_run.marked_stale, 0);
+    assert_eq!(
+        engine
+            .store()
+            .get_memory(&expired.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "active"
+    );
+    let swept = engine.memory_sweep(&project.id, None, false).await.unwrap();
+    assert!(swept.marked_stale >= 1);
+    assert_eq!(
+        engine
+            .store()
+            .get_memory(&expired.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "stale"
+    );
+    assert_eq!(
+        engine
+            .store()
+            .get_memory(&pinned_expired.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "active"
+    );
+
+    let stats = engine.memory_stats(&project.id).await.unwrap();
+    assert!(stats.total >= 5);
+    assert!(stats.by_status.iter().any(|count| count.key == "stale"));
+    assert!(stats.by_source.iter().any(|count| count.key == "operator"));
+
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.memories_matches);
+    assert!(replay.consistent);
+}
+
+#[tokio::test]
+async fn memory_projection_folds_lifecycle_events_repairs_and_bundles() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("memory replay".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "replay".into(), None)
+        .await
+        .unwrap();
+    let _first = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "agent-1",
+            "Leader",
+            "decision",
+            "Replay decision",
+            "First body.",
+            vec!["architecture".to_string()],
+            "agent",
+            vec![MemoryEvidence {
+                kind: "path".to_string(),
+                reference: "README.md".to_string(),
+                note: None,
+            }],
+            false,
+            Some("2999-01-01T00:00:00Z".to_string()),
+        )
+        .await
+        .unwrap();
+    let second = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "agent-1",
+            "Leader",
+            "decision",
+            "Replay decision",
+            "Second body supersedes the first.",
+            vec!["architecture".to_string()],
+            "operator",
+            Vec::new(),
+            true,
+            Some("2999-01-01T00:00:00Z".to_string()),
+        )
+        .await
+        .unwrap();
+    engine.memory_verify(&second.id).await.unwrap();
+    engine.memory_brief(&session.id, None).await.unwrap();
+    engine
+        .memory_update(&second.id, Some("stale"), None, None)
+        .await
+        .unwrap();
+    engine
+        .memory_update(&second.id, Some("active"), None, None)
+        .await
+        .unwrap();
+
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.memories_matches);
+    assert!(replay.consistent);
+
+    let bundle = engine.export_session(&session.id).await.unwrap();
+    assert_eq!(bundle.memories.len(), 2);
+    let imported_dir = TempDir::new().unwrap();
+    let imported = Store::open(imported_dir.path()).unwrap();
+    imported.import_session_bundle(&bundle).unwrap();
+    let mut expected = bundle.memories.clone();
+    expected.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut actual = imported.list_session_memories(&session.id).unwrap();
+    actual.sort_by(|left, right| left.id.cmp(&right.id));
+    assert_eq!(actual, expected);
+    assert!(
+        actual
+            .iter()
+            .any(|memory| memory.status == "superseded" && memory.superseded_by.is_some())
+    );
+    assert!(
+        actual
+            .iter()
+            .any(|memory| memory.use_count > 0 && memory.last_used_at.is_some())
+    );
+
+    engine
+        .store()
+        .replace_session_memories(&session.id, &[])
+        .unwrap();
+    let drifted = engine.replay_session(&session.id).await.unwrap();
+    assert!(!drifted.memories_matches);
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(repaired.consistent);
+    let repaired_memories = engine.store().list_session_memories(&session.id).unwrap();
+    assert_eq!(repaired_memories.len(), 2);
 }

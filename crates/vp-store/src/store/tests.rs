@@ -854,6 +854,11 @@ fn round_trips_memory_retention_policy() {
         enabled: true,
         max_items: Some(200),
         max_age_days: Some(30),
+        task_result_verify_days: Some(14),
+        default_verify_days: None,
+        auto_supersede: false,
+        brief_max_chars: Some(2048),
+        sweep_stale: true,
     };
     store.set_memory_policy(&project.id, &policy).unwrap();
     assert_eq!(store.get_memory_policy(&project.id).unwrap(), policy);
@@ -861,6 +866,9 @@ fn round_trips_memory_retention_policy() {
     assert_eq!(enabled.len(), 1);
     assert_eq!(enabled[0].0, project.id);
     assert_eq!(enabled[0].1, policy);
+    let sweeping = store.list_memory_sweep_policies().unwrap();
+    assert_eq!(sweeping.len(), 1);
+    assert_eq!(sweeping[0].1, policy);
     store
         .set_memory_policy(
             &project.id,
@@ -871,6 +879,8 @@ fn round_trips_memory_retention_policy() {
         )
         .unwrap();
     assert!(store.list_enabled_memory_policies().unwrap().is_empty());
+    // Staleness sweeping is independent of the retention toggle.
+    assert_eq!(store.list_memory_sweep_policies().unwrap().len(), 1);
 }
 
 #[test]
@@ -3175,4 +3185,325 @@ fn session_unlimited_flag_round_trips_with_event() {
             .set_session_unlimited_with_event("missing", true)
             .is_err()
     );
+}
+
+fn memory_evidence(kind: &str, reference: &str) -> MemoryEvidence {
+    MemoryEvidence {
+        kind: kind.to_string(),
+        reference: reference.to_string(),
+        note: None,
+    }
+}
+
+#[test]
+fn memory_create_is_idempotent_and_supersedes_atomically() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("memory v2"))
+        .unwrap();
+    let session = store.create_session(&project.id, "memory v2").unwrap();
+    let tags = vec!["T3".to_string(), "architecture".to_string()];
+    let evidence = vec![
+        memory_evidence("task", "T3"),
+        memory_evidence("path", "src/api"),
+    ];
+    let first = store
+        .create_memory_with_metadata_event(NewMemory {
+            session_id: &session.id,
+            project_id: &project.id,
+            agent_id: "agent-1",
+            agent_name: "Leader",
+            kind: "decision",
+            title: "Keep merges deterministic",
+            body: "The Integrator must not depend on an LLM.",
+            tags: &tags,
+            source: "operator",
+            evidence: &evidence,
+            pinned: true,
+            verify_after: Some("2999-01-01T00:00:00Z"),
+            dedupe: true,
+            auto_supersede: true,
+        })
+        .unwrap();
+    assert!(first.created);
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(first.events[0].kind, "memory.created");
+    assert_eq!(first.memory.source, "operator");
+    assert_eq!(first.memory.status, "active");
+    assert_eq!(first.memory.evidence, evidence);
+    assert!(first.memory.pinned);
+    assert_eq!(
+        first.memory.verify_after.as_deref(),
+        Some("2999-01-01T00:00:00Z")
+    );
+
+    let duplicate = store
+        .create_memory_with_metadata_event(NewMemory {
+            session_id: &session.id,
+            project_id: &project.id,
+            agent_id: "agent-1",
+            agent_name: "Leader",
+            kind: "Decision",
+            title: "  Keep   merges deterministic ",
+            body: "The Integrator must not depend on an LLM.",
+            tags: &tags,
+            source: "operator",
+            evidence: &evidence,
+            pinned: false,
+            verify_after: None,
+            dedupe: true,
+            auto_supersede: true,
+        })
+        .unwrap();
+    assert!(!duplicate.created);
+    assert!(duplicate.events.is_empty());
+    assert_eq!(duplicate.memory.id, first.memory.id);
+
+    let second = store
+        .create_memory_with_metadata_event(NewMemory {
+            session_id: &session.id,
+            project_id: &project.id,
+            agent_id: "agent-1",
+            agent_name: "Leader",
+            kind: "decision",
+            title: "Keep merges deterministic",
+            body: "The Integrator is deterministic and verified.",
+            tags: &tags,
+            source: "operator",
+            evidence: &evidence,
+            pinned: false,
+            verify_after: Some("2999-01-01T00:00:00Z"),
+            dedupe: true,
+            auto_supersede: true,
+        })
+        .unwrap();
+    assert!(second.created);
+    assert_eq!(second.events.len(), 2);
+    assert_eq!(second.events[0].kind, "memory.superseded");
+    assert_eq!(second.events[0].payload["id"], first.memory.id);
+    assert_eq!(second.events[0].payload["status"], "superseded");
+    assert_eq!(second.events[1].kind, "memory.created");
+    assert_eq!(second.memory.supersedes, vec![first.memory.id.clone()]);
+
+    let old = store.get_memory(&first.memory.id).unwrap().unwrap();
+    assert_eq!(old.status, "superseded");
+    assert_eq!(
+        old.superseded_by.as_deref(),
+        Some(second.memory.id.as_str())
+    );
+    let active = store.list_memories(&project.id, None, None, 10).unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, second.memory.id);
+    let superseded = store
+        .list_memories_filtered(&project.id, None, None, Some("superseded"), false, 10)
+        .unwrap();
+    assert_eq!(superseded.len(), 1);
+    assert_eq!(superseded[0].id, first.memory.id);
+
+    // Conflicting content without auto-supersede is deduped, never duplicated.
+    let blocked = store
+        .create_memory_with_metadata_event(NewMemory {
+            session_id: &session.id,
+            project_id: &project.id,
+            agent_id: "agent-1",
+            agent_name: "Leader",
+            kind: "decision",
+            title: "Keep merges deterministic",
+            body: "Conflicting unverified claim.",
+            tags: &tags,
+            source: "agent",
+            evidence: &[],
+            pinned: false,
+            verify_after: None,
+            dedupe: true,
+            auto_supersede: false,
+        })
+        .unwrap();
+    assert!(!blocked.created);
+    assert!(blocked.events.is_empty());
+    assert_eq!(blocked.memory.id, second.memory.id);
+    assert_eq!(
+        store
+            .list_memories(&project.id, None, None, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Explicit dedupe=false is the escape hatch for deliberate duplicates.
+    let forced = store
+        .create_memory_with_metadata_event(NewMemory {
+            session_id: &session.id,
+            project_id: &project.id,
+            agent_id: "agent-1",
+            agent_name: "Leader",
+            kind: "decision",
+            title: "Keep merges deterministic",
+            body: "Deliberate duplicate row.",
+            tags: &tags,
+            source: "operator",
+            evidence: &[],
+            pinned: false,
+            verify_after: None,
+            dedupe: false,
+            auto_supersede: false,
+        })
+        .unwrap();
+    assert!(forced.created);
+    assert_eq!(forced.events.len(), 1);
+}
+
+#[test]
+fn memory_update_verify_stale_and_usage_are_event_backed() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("memory v2"))
+        .unwrap();
+    let session = store.create_session(&project.id, "memory v2").unwrap();
+    let created = store
+        .create_memory_with_metadata_event(NewMemory {
+            session_id: &session.id,
+            project_id: &project.id,
+            agent_id: "agent-1",
+            agent_name: "Leader",
+            kind: "fact",
+            title: "Build command",
+            body: "cargo test --workspace",
+            tags: &[],
+            source: "agent",
+            evidence: &[],
+            pinned: false,
+            verify_after: None,
+            dedupe: true,
+            auto_supersede: true,
+        })
+        .unwrap();
+    let id = created.memory.id;
+    let (updated, event) = store
+        .update_memory_with_event(&id, Some("stale"), Some(true), Some(&["build".to_string()]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.kind, "memory.updated");
+    assert_eq!(updated.status, "stale");
+    assert!(updated.pinned);
+    assert_eq!(
+        updated.stale_reason.as_deref(),
+        Some("operator marked stale")
+    );
+    assert_eq!(updated.tags, vec!["build".to_string()]);
+
+    let (verified, event) = store
+        .mark_memory_verified_with_event(&id, "2026-11-11T00:00:00Z", Some("2027-11-11T00:00:00Z"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.kind, "memory.verified");
+    assert_eq!(verified.status, "active");
+    assert!(verified.stale_reason.is_none());
+    assert_eq!(
+        verified.last_verified_at.as_deref(),
+        Some("2026-11-11T00:00:00Z")
+    );
+
+    let (stale, event) = store
+        .mark_memory_stale_with_event(&id, "verification expired")
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.kind, "memory.stale");
+    assert_eq!(stale.status, "stale");
+    assert_eq!(stale.stale_reason.as_deref(), Some("verification expired"));
+
+    let other_session = store.create_session(&project.id, "other").unwrap();
+    let (used, event) = store
+        .record_memory_use_with_event(&id, &other_session.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.kind, "memory.used");
+    assert_eq!(used.use_count, 1);
+    assert!(used.last_used_at.is_some());
+    assert!(
+        store
+            .record_memory_use_with_event(&id, &other_session.id)
+            .unwrap()
+            .is_none()
+    );
+    let (used_again, _) = store
+        .record_memory_use_with_event(&id, &session.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(used_again.use_count, 2);
+}
+
+#[test]
+fn memory_list_hides_stale_by_default_and_stats_count_lifecycle() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("memory v2"))
+        .unwrap();
+    let session = store.create_session(&project.id, "memory v2").unwrap();
+    let create = |title: &str, pinned: bool, verify_after: Option<&str>| {
+        store
+            .create_memory_with_metadata_event(NewMemory {
+                session_id: &session.id,
+                project_id: &project.id,
+                agent_id: "agent-1",
+                agent_name: "Leader",
+                kind: "fact",
+                title,
+                body: "body",
+                tags: &[],
+                source: "agent",
+                evidence: &[],
+                pinned,
+                verify_after,
+                dedupe: true,
+                auto_supersede: true,
+            })
+            .unwrap()
+            .memory
+    };
+    let expired = create("expired", false, Some("2020-01-01T00:00:00Z"));
+    let future = create("future", false, Some("2999-01-01T00:00:00Z"));
+    let pinned = create("pinned", true, Some("2020-01-01T00:00:00Z"));
+
+    let candidates = store.memory_sweep_candidates(&project.id, None).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].id, expired.id);
+
+    store
+        .mark_memory_stale_with_event(&expired.id, "verification expired")
+        .unwrap();
+    let active = store.list_memories(&project.id, None, None, 10).unwrap();
+    assert_eq!(active.len(), 2);
+    assert!(!active.iter().any(|memory| memory.id == expired.id));
+    let with_stale = store
+        .list_memories_filtered(&project.id, None, None, None, true, 10)
+        .unwrap();
+    assert_eq!(with_stale.len(), 3);
+    let only_stale = store
+        .list_memories_filtered(&project.id, None, None, Some("stale"), false, 10)
+        .unwrap();
+    assert_eq!(only_stale.len(), 1);
+
+    let stats = store.memory_stats(&project.id).unwrap();
+    assert_eq!(stats.total, 3);
+    assert!(
+        stats
+            .by_status
+            .iter()
+            .any(|count| count.key == "stale" && count.count == 1)
+    );
+    assert!(
+        stats
+            .by_source
+            .iter()
+            .any(|count| count.key == "agent" && count.count == 3)
+    );
+    assert!(
+        stats
+            .by_kind
+            .iter()
+            .any(|count| count.key == "fact" && count.count == 3)
+    );
+    assert!(!future.id.is_empty());
+    assert!(pinned.pinned);
 }

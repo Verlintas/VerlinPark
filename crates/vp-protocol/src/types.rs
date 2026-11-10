@@ -1302,6 +1302,37 @@ pub struct AgentMessage {
     pub read_at: Option<String>,
 }
 
+fn default_memory_status() -> String {
+    "active".to_string()
+}
+
+fn default_memory_source() -> String {
+    "agent".to_string()
+}
+
+fn default_task_result_verify_days() -> Option<u32> {
+    Some(90)
+}
+
+fn default_memory_verify_days() -> Option<u32> {
+    Some(365)
+}
+
+fn default_brief_max_chars() -> Option<u32> {
+    Some(4000)
+}
+
+/// One provenance reference attached to a memory. Kinds are validated strings
+/// (`commit`, `path`, `task`, `session`, `event`, `url`) so unknown future
+/// values still decode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEvidence {
+    pub kind: String,
+    pub reference: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryItem {
     pub id: String,
@@ -1315,6 +1346,38 @@ pub struct MemoryItem {
     #[serde(default)]
     pub tags: Vec<String>,
     pub created_at: String,
+    /// `active`, `stale`, `superseded`, or `archived`.
+    #[serde(default = "default_memory_status")]
+    pub status: String,
+    /// `agent`, `task_result`, `operator`, `orchestrator`, or `import`.
+    #[serde(default = "default_memory_source")]
+    pub source: String,
+    #[serde(default)]
+    pub evidence: Vec<MemoryEvidence>,
+    #[serde(default)]
+    pub supersedes: Vec<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub use_count: u32,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub last_verified_at: Option<String>,
+    #[serde(default)]
+    pub verify_after: Option<String>,
+    #[serde(default)]
+    pub stale_reason: Option<String>,
+}
+
+/// A ranked memory plus the deterministic reasons it surfaced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryMatch {
+    pub memory: MemoryItem,
+    pub score: f64,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1326,11 +1389,136 @@ pub struct MemoryListParams {
     pub kind: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Exact status filter. Takes precedence over `include_stale`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Include `stale` rows when no exact status is requested.
+    #[serde(default)]
+    pub include_stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryListResult {
     pub memories: Vec<MemoryItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemorySearchParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub query: String,
+    /// Legacy single-kind filter, kept for symmetry with `memory.list`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub include_stale: bool,
+    /// Optional total brief text budget. When set, low-ranked matches are
+    /// dropped instead of returning more text than requested.
+    #[serde(default)]
+    pub max_chars: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemorySearchResult {
+    pub memories: Vec<MemoryMatch>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryBriefParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryBriefResult {
+    pub text: String,
+    pub memories: Vec<MemoryMatch>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryUpdateParams {
+    pub id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryUpdateResult {
+    pub memory: MemoryItem,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryVerifyParams {
+    pub id: String,
+}
+
+/// Per-evidence outcome for `memory.verify`. `status` is `verified`, `missing`,
+/// or `unchecked`; unchecked evidence is reported, never silently approved as
+/// fact-checked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryVerificationCheck {
+    pub evidence: MemoryEvidence,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryVerifyResult {
+    pub memory: MemoryItem,
+    pub checks: Vec<MemoryVerificationCheck>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemorySweepParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemorySweepResult {
+    pub project_id: String,
+    pub candidates: usize,
+    pub marked_stale: usize,
+    pub memory_ids: Vec<String>,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryStatsParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryStatCount {
+    pub key: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryStatsResult {
+    pub project_id: String,
+    pub total: u32,
+    pub by_status: Vec<MemoryStatCount>,
+    pub by_source: Vec<MemoryStatCount>,
+    pub by_kind: Vec<MemoryStatCount>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1379,12 +1567,29 @@ pub struct MemoryPruneResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryPolicy {
+    /// Auto-prune retention toggle. Staleness sweeping is `sweep_stale`.
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub max_items: Option<u32>,
     #[serde(default)]
     pub max_age_days: Option<u32>,
+    /// TTL applied to task-result memories after auto-capture.
+    #[serde(default = "default_task_result_verify_days")]
+    pub task_result_verify_days: Option<u32>,
+    /// TTL applied to explicitly created memories and successful verifies.
+    #[serde(default = "default_memory_verify_days")]
+    pub default_verify_days: Option<u32>,
+    /// Allow a same-key create with different content to supersede the previous
+    /// active row instead of creating a second active row.
+    #[serde(default = "default_true")]
+    pub auto_supersede: bool,
+    /// Character budget for an injected memory brief.
+    #[serde(default = "default_brief_max_chars")]
+    pub brief_max_chars: Option<u32>,
+    /// Opt-in daemon sweep that marks expired memories stale. Never deletes.
+    #[serde(default)]
+    pub sweep_stale: bool,
 }
 
 impl Default for MemoryPolicy {
@@ -1393,6 +1598,11 @@ impl Default for MemoryPolicy {
             enabled: false,
             max_items: Some(1000),
             max_age_days: Some(180),
+            task_result_verify_days: Some(90),
+            default_verify_days: Some(365),
+            auto_supersede: true,
+            brief_max_chars: Some(4000),
+            sweep_stale: false,
         }
     }
 }
@@ -4474,6 +4684,110 @@ pub struct OrchestrationSnapshotResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn memory_items_decode_legacy_defaults_and_round_trip_provenance() {
+        let legacy: MemoryItem = serde_json::from_value(json!({
+            "id": "mem-1",
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "agent_id": "agent-1",
+            "agent_name": "Leader",
+            "kind": "decision",
+            "title": "Use deterministic merge",
+            "body": "The Integrator is deterministic.",
+            "tags": ["architecture"],
+            "created_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy.status, "active");
+        assert_eq!(legacy.source, "agent");
+        assert!(legacy.evidence.is_empty());
+        assert!(legacy.supersedes.is_empty());
+        assert!(legacy.superseded_by.is_none());
+        assert!(!legacy.pinned);
+        assert_eq!(legacy.use_count, 0);
+        assert!(legacy.verify_after.is_none());
+
+        let current = MemoryItem {
+            status: "stale".to_string(),
+            source: "task_result".to_string(),
+            evidence: vec![
+                MemoryEvidence {
+                    kind: "task".to_string(),
+                    reference: "T3".to_string(),
+                    note: Some("completed".to_string()),
+                },
+                MemoryEvidence {
+                    kind: "commit".to_string(),
+                    reference: "abcdef1".to_string(),
+                    note: None,
+                },
+            ],
+            supersedes: vec!["mem-0".to_string()],
+            superseded_by: Some("mem-2".to_string()),
+            pinned: true,
+            use_count: 4,
+            last_used_at: Some("2026-11-11T01:00:00Z".to_string()),
+            last_verified_at: Some("2026-11-11T00:30:00Z".to_string()),
+            verify_after: Some("2027-02-09T00:00:00Z".to_string()),
+            stale_reason: Some("verification expired".to_string()),
+            ..legacy
+        };
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded["status"], "stale");
+        assert_eq!(encoded["source"], "task_result");
+        assert_eq!(encoded["evidence"][0]["kind"], "task");
+        let decoded: MemoryItem = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, current);
+
+        let matched = MemoryMatch {
+            memory: current,
+            score: 1.25,
+            reasons: vec!["fts".to_string(), "task:T3".to_string()],
+        };
+        let encoded = serde_json::to_value(&matched).unwrap();
+        let decoded: MemoryMatch = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, matched);
+    }
+
+    #[test]
+    fn memory_policy_decode_defaults_and_round_trips_new_fields() {
+        let legacy: MemoryPolicy = serde_json::from_value(json!({
+            "enabled": true,
+            "max_items": 100,
+            "max_age_days": 30
+        }))
+        .unwrap();
+        assert_eq!(legacy.task_result_verify_days, Some(90));
+        assert_eq!(legacy.default_verify_days, Some(365));
+        assert!(legacy.auto_supersede);
+        assert_eq!(legacy.brief_max_chars, Some(4000));
+        assert!(!legacy.sweep_stale);
+
+        let current: MemoryPolicy = serde_json::from_value(json!({
+            "enabled": false,
+            "task_result_verify_days": 14,
+            "default_verify_days": null,
+            "auto_supersede": false,
+            "brief_max_chars": 2048,
+            "sweep_stale": true
+        }))
+        .unwrap();
+        assert_eq!(current.task_result_verify_days, Some(14));
+        assert_eq!(current.default_verify_days, None);
+        assert!(!current.auto_supersede);
+        assert_eq!(current.brief_max_chars, Some(2048));
+        assert!(current.sweep_stale);
+        let encoded = serde_json::to_value(&current).unwrap();
+        let decoded: MemoryPolicy = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, current);
+
+        let params: MemoryListParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert!(params.status.is_none());
+        assert!(!params.include_stale);
+    }
 
     #[test]
     fn auth_params_accept_legacy_clients_without_a_protocol() {

@@ -41,21 +41,23 @@ use vp_protocol::types::{
     ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
     MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
     McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
-    MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams, MemoryListParams,
-    MemoryPolicyParams, MemoryPruneParams, MergeQueueListParams, MergeQueueListResult,
-    OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectForkForestParams,
-    ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
-    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
-    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult,
-    SchedulerStatusParams, SearchParams, ServerInfo, SessionCheckpointDeleteParams,
-    SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
-    SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
-    SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
-    SessionContextParams, SessionContinuationCancelParams, SessionContinuationsParams,
-    SessionDeferParams, SessionDiffParams, SessionExportParams, SessionForkParams,
-    SessionForkTreeParams, SessionImportParams, SessionLineageParams, SessionListResult,
-    SessionLogParams, SessionMergeForkParams, SessionPauseParams, SessionPauseResult,
-    SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
+    MemoryBriefParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
+    MemoryListParams, MemoryPolicyParams, MemoryPruneParams, MemorySearchParams, MemoryStatsParams,
+    MemorySweepParams, MemoryUpdateParams, MemoryVerifyParams, MergeQueueListParams,
+    MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectBudgetParams,
+    ProjectForkForestParams, ProjectListResult, ProjectUsageParams, PromptParams, PromptResult,
+    QuestionListParams, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
+    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
+    RetryMergeResult, SchedulerStatusParams, SearchParams, ServerInfo,
+    SessionCheckpointDeleteParams, SessionCheckpointDiffParams, SessionCheckpointListParams,
+    SessionCheckpointParams, SessionCheckpointPruneParams, SessionCheckpointRestoreParams,
+    SessionCheckpointStatsParams, SessionCitationAuditParams, SessionCitationsParams,
+    SessionCompactParams, SessionCompareParams, SessionContextParams,
+    SessionContinuationCancelParams, SessionContinuationsParams, SessionDeferParams,
+    SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
+    SessionImportParams, SessionLineageParams, SessionListResult, SessionLogParams,
+    SessionMergeForkParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
+    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
     SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
     SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
@@ -164,6 +166,7 @@ async fn main() -> Result<()> {
     spawn_worktree_sweeper(state.engine.clone());
     spawn_checkpoint_sweeper(state.engine.clone());
     spawn_memory_sweeper(state.engine.clone());
+    spawn_memory_stale_sweeper(state.engine.clone());
     spawn_terminal_sweeper(state.engine.clone());
     spawn_browser_sweeper(state.engine.clone());
     spawn_task_stall_sweeper(state.engine.clone());
@@ -2281,14 +2284,75 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "memory.list" => match parse_params::<MemoryListParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .list_memories(
+                .list_memories_filtered(
                     &params.project_id,
                     params.query,
                     params.kind,
+                    params.status,
+                    params.include_stale,
                     params.limit.unwrap_or(100),
                 )
                 .await
             {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.search" => match parse_params::<MemorySearchParams>(request.params) {
+            Ok(params) => match state.engine.memory_search(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.brief" => match parse_params::<MemoryBriefParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .memory_brief(&params.session_id, params.task_id.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.update" => match parse_params::<MemoryUpdateParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .memory_update(
+                    &params.id,
+                    params.status.as_deref(),
+                    params.pinned,
+                    params.tags,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.verify" => match parse_params::<MemoryVerifyParams>(request.params) {
+            Ok(params) => match state.engine.memory_verify(&params.id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.sweep" => match parse_params::<MemorySweepParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .memory_sweep(&params.project_id, params.older_than_days, params.dry_run)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.stats" => match parse_params::<MemoryStatsParams>(request.params) {
+            Ok(params) => match state.engine.memory_stats(&params.project_id).await {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
@@ -2916,6 +2980,36 @@ fn spawn_memory_sweeper(engine: Engine) {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%error, "automatic memory retention failed");
+                }
+            }
+        }
+    });
+}
+
+fn spawn_memory_stale_sweeper(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_MEMORY_STALE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3600);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine.sweep_memory_staleness().await {
+                Ok((projects, marked)) if marked > 0 => {
+                    tracing::info!(
+                        projects,
+                        marked,
+                        "automatic memory staleness sweep marked memories stale"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "automatic memory staleness sweep failed");
                 }
             }
         }

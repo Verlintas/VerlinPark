@@ -8847,9 +8847,14 @@ async fn run_loop_body(
         stable_prefix.push_str("\n\nProject skills (call use_skill with the exact name):\n");
         stable_prefix.push_str(&skill_catalog);
     }
-    let memory_brief = project_memory_brief(engine, &project.id, &session.goal, 6)
-        .await
-        .unwrap_or_default();
+    let memory_brief = project_memory_brief(
+        engine,
+        &session.id,
+        spec.task_id.as_deref(),
+        spec.department.as_deref(),
+    )
+    .await
+    .unwrap_or_default();
     let mut system = format!("{}\n\n{}", stable_prefix, prompt.run_context);
     if !memory_brief.is_empty() {
         system.push_str("\n\nRun memory (retrieved for this session):\n");
@@ -13921,38 +13926,14 @@ async fn latest_plan_results(engine: &Engine, session_id: &str) -> Result<HashMa
 
 async fn project_memory_brief(
     engine: &Engine,
-    project_id: &str,
-    query: &str,
-    limit: u32,
+    session_id: &str,
+    task_id: Option<&str>,
+    department: Option<&str>,
 ) -> Result<String> {
-    let query = query.trim();
-    let mut memories = if query.is_empty() {
-        Vec::new()
-    } else {
-        engine
-            .list_memories(project_id, Some(query.to_string()), None, limit)
-            .await?
-            .memories
-    };
-    if memories.is_empty() {
-        memories = engine
-            .list_memories(project_id, None, None, limit)
-            .await?
-            .memories;
-    }
-    Ok(memories
-        .iter()
-        .map(|memory| {
-            format!(
-                "[{}] {} · {} · {}",
-                memory.kind,
-                memory.title,
-                memory.agent_name,
-                truncate_to(&memory.body, 420)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
+    let brief = engine
+        .memory_brief_with_department(session_id, task_id, department)
+        .await?;
+    Ok(brief.text)
 }
 
 async fn coordination_brief_for_agent(
@@ -14064,21 +14045,64 @@ async fn record_task_memory(engine: &Engine, session_id: &str, task_id: &str, su
         return;
     };
     let title = format!("Task {task_id} result");
-    let existing = engine
-        .list_memories(
-            &project.id,
-            Some(title.clone()),
-            Some("task_result".into()),
-            3,
-        )
-        .await
-        .map(|result| result.memories)
-        .unwrap_or_default();
-    if existing.iter().any(|memory| memory.title == title) {
-        return;
+    let mut evidence = vec![
+        vp_protocol::types::MemoryEvidence {
+            kind: "task".to_string(),
+            reference: task_id.to_string(),
+            note: None,
+        },
+        vp_protocol::types::MemoryEvidence {
+            kind: "session".to_string(),
+            reference: session_id.to_string(),
+            note: None,
+        },
+    ];
+    let store = engine.store().clone();
+    let lookup_session = session_id.to_string();
+    let lookup_task = task_id.to_string();
+    let merged = tokio::task::spawn_blocking(move || {
+        store.latest_merged_entry_for_task(&lookup_session, &lookup_task)
+    })
+    .await
+    .ok()
+    .and_then(std::result::Result::ok)
+    .flatten();
+    if let Some(entry) = merged {
+        evidence.push(vp_protocol::types::MemoryEvidence {
+            kind: "commit".to_string(),
+            reference: entry.commit.clone(),
+            note: None,
+        });
+        if !entry.base_commit.trim().is_empty()
+            && let Ok(paths) = crate::git_output(
+                std::path::Path::new(&project.root),
+                &[
+                    "diff",
+                    "--name-only",
+                    &format!("{}..{}", entry.base_commit, entry.commit),
+                ],
+            )
+        {
+            for path in paths
+                .lines()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .take(20)
+            {
+                evidence.push(vp_protocol::types::MemoryEvidence {
+                    kind: "path".to_string(),
+                    reference: path.to_string(),
+                    note: None,
+                });
+            }
+        }
     }
+    let Ok(policy) = engine.get_memory_policy(&project.id).await else {
+        return;
+    };
+    let verify_after = crate::memory_verify_after(policy.policy.task_result_verify_days);
     if let Err(error) = engine
-        .create_memory_as(
+        .create_memory_with_metadata(
             session_id,
             "orchestrator",
             "Orchestrator",
@@ -14086,6 +14110,10 @@ async fn record_task_memory(engine: &Engine, session_id: &str, task_id: &str, su
             &title,
             &truncate_to(summary, 8_000),
             vec![task_id.to_string(), "task_result".to_string()],
+            "task_result",
+            evidence,
+            false,
+            verify_after,
         )
         .await
     {
@@ -14604,14 +14632,10 @@ async fn execute_team_plan(
             )
             .await?;
             let mailbox = mailbox_brief(engine, &session.id, &worker_spec.id, 4).await?;
-            let memory_brief = project_memory_brief(
-                engine,
-                &project.id,
-                &format!("{} {}", task.title, task.department),
-                4,
-            )
-            .await
-            .unwrap_or_default();
+            let memory_brief =
+                project_memory_brief(engine, &session.id, Some(&task.id), Some(&task.department))
+                    .await
+                    .unwrap_or_default();
             let memory_note = if memory_brief.is_empty() {
                 String::new()
             } else {

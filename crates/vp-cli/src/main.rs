@@ -916,7 +916,60 @@ enum Command {
         kind: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Include stale memories when no exact status is requested.
+        #[arg(long = "include-stale")]
+        include_stale: bool,
+        /// Filter by exact status (active, stale, superseded, archived).
+        #[arg(long)]
+        status: Option<String>,
     },
+    /// Rank project memories with deterministic lexical/structural scoring.
+    MemorySearch {
+        project: String,
+        query: String,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        department: Option<String>,
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long = "include-stale")]
+        include_stale: bool,
+    },
+    /// Print the exact memory brief that would be injected for a session.
+    MemoryBrief {
+        session: String,
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Update memory lifecycle metadata (title and body stay immutable).
+    MemoryUpdate {
+        memory: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        pin: bool,
+        #[arg(long)]
+        unpin: bool,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Verify memory evidence locally and update its status.
+    MemoryVerify { memory: String },
+    /// Mark expired active memories stale (never deletes).
+    MemorySweep {
+        project: String,
+        #[arg(long)]
+        days: Option<u32>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show memory counts by status, source, and kind.
+    MemoryStats { project: String },
     /// Add a project memory tied to a session.
     Remember {
         session: String,
@@ -2888,6 +2941,8 @@ async fn main() -> Result<()> {
             query,
             kind,
             limit,
+            include_stale,
+            status,
         } => {
             rpc(
                 &discovery,
@@ -2896,7 +2951,9 @@ async fn main() -> Result<()> {
                     "project_id": project,
                     "query": query,
                     "kind": kind,
-                    "limit": limit
+                    "limit": limit,
+                    "include_stale": include_stale,
+                    "status": status
                 }),
             )
             .await?
@@ -2923,6 +2980,95 @@ async fn main() -> Result<()> {
         }
         Command::MemoryDelete { memory } => {
             rpc(&discovery, "memory.delete", json!({"id": memory})).await?
+        }
+        Command::MemorySearch {
+            project,
+            query,
+            task,
+            department,
+            paths,
+            kinds,
+            limit,
+            include_stale,
+        } => {
+            rpc(
+                &discovery,
+                "memory.search",
+                json!({
+                    "project_id": project,
+                    "query": query,
+                    "task_id": task,
+                    "department": department,
+                    "paths": paths,
+                    "kinds": kinds,
+                    "limit": limit,
+                    "include_stale": include_stale
+                }),
+            )
+            .await?
+        }
+        Command::MemoryBrief { session, task } => {
+            rpc(
+                &discovery,
+                "memory.brief",
+                json!({"session_id": session, "task_id": task}),
+            )
+            .await?
+        }
+        Command::MemoryUpdate {
+            memory,
+            status,
+            pin,
+            unpin,
+            tags,
+        } => {
+            if pin && unpin {
+                bail!("--pin and --unpin cannot be combined");
+            }
+            let pinned = if pin {
+                Some(true)
+            } else if unpin {
+                Some(false)
+            } else {
+                None
+            };
+            let tags = if tags.is_empty() { None } else { Some(tags) };
+            if status.is_none() && pinned.is_none() && tags.is_none() {
+                bail!("memory update requires --status, --pin/--unpin, or --tag");
+            }
+            rpc(
+                &discovery,
+                "memory.update",
+                json!({
+                    "id": memory,
+                    "status": status,
+                    "pinned": pinned,
+                    "tags": tags
+                }),
+            )
+            .await?
+        }
+        Command::MemoryVerify { memory } => {
+            rpc(&discovery, "memory.verify", json!({"id": memory})).await?
+        }
+        Command::MemorySweep {
+            project,
+            days,
+            dry_run,
+        } => {
+            rpc(
+                &discovery,
+                "memory.sweep",
+                json!({
+                    "project_id": project,
+                    "older_than_days": days,
+                    "dry_run": dry_run
+                }),
+            )
+            .await?
+        }
+        Command::MemoryStats { project } => {
+            rpc(&discovery, "memory.stats", json!({"project_id": project})).await?
         }
         Command::MemoryPrune {
             project,
@@ -2964,6 +3110,14 @@ async fn main() -> Result<()> {
             } else {
                 (max_items, max_age_days)
             };
+            // Preserve v2 lifecycle settings that this command does not edit.
+            let current = rpc(
+                &discovery,
+                "memory.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let policy = current.get("policy").cloned().unwrap_or_default();
             rpc(
                 &discovery,
                 "memory.policy.set",
@@ -2972,7 +3126,12 @@ async fn main() -> Result<()> {
                     "policy": {
                         "enabled": !clear && !disable,
                         "max_items": max_items,
-                        "max_age_days": max_age_days
+                        "max_age_days": max_age_days,
+                        "task_result_verify_days": policy.get("task_result_verify_days").cloned().unwrap_or(json!(90)),
+                        "default_verify_days": policy.get("default_verify_days").cloned().unwrap_or(json!(365)),
+                        "auto_supersede": policy.get("auto_supersede").cloned().unwrap_or(json!(true)),
+                        "brief_max_chars": policy.get("brief_max_chars").cloned().unwrap_or(json!(4000)),
+                        "sweep_stale": policy.get("sweep_stale").cloned().unwrap_or(json!(false))
                     }
                 }),
             )
@@ -4197,7 +4356,9 @@ fn print_human(value: &Value) {
         );
         return;
     }
-    if let Some(checks) = value.get("checks").and_then(Value::as_array) {
+    if let Some(checks) = value.get("checks").and_then(Value::as_array)
+        && value.get("ok").is_some()
+    {
         println!(
             "{}",
             if value["ok"].as_bool().unwrap_or(false) {
@@ -4546,13 +4707,127 @@ fn print_human(value: &Value) {
         print!("{content}");
         return;
     }
+    if let Some(text) = value.get("text").and_then(Value::as_str)
+        && let Some(memories) = value.get("memories").and_then(Value::as_array)
+    {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+        if !memories.is_empty() {
+            let ids = memories
+                .iter()
+                .filter_map(|memory| memory.get("memory"))
+                .filter_map(|memory| memory["id"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("selected: {ids}");
+        }
+        return;
+    }
+    if let Some(memories) = value.get("memories").and_then(Value::as_array)
+        && memories.iter().any(|memory| memory.get("score").is_some())
+    {
+        for matched in memories {
+            let memory = &matched["memory"];
+            let reasons = matched["reasons"]
+                .as_array()
+                .map(|reasons| {
+                    reasons
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!(
+                "{:>8.3} [{}·{}] {} · {}",
+                matched["score"].as_f64().unwrap_or(0.0),
+                memory["kind"].as_str().unwrap_or("note"),
+                memory["source"].as_str().unwrap_or("agent"),
+                memory["title"].as_str().unwrap_or("?"),
+                memory["id"].as_str().unwrap_or("?")
+            );
+            println!("  reasons: {reasons}");
+            println!("  {}", memory["body"].as_str().unwrap_or(""));
+        }
+        return;
+    }
+    if let Some(checks) = value.get("checks").and_then(Value::as_array)
+        && let Some(memory) = value.get("memory")
+    {
+        for check in checks {
+            println!(
+                "{} {} · {} · {}",
+                check["status"].as_str().unwrap_or("unchecked"),
+                check["evidence"]["kind"].as_str().unwrap_or("?"),
+                check["evidence"]["reference"].as_str().unwrap_or("?"),
+                check["detail"].as_str().unwrap_or("")
+            );
+        }
+        println!(
+            "memory {} status={} verified_at={} stale_reason={}",
+            memory["id"].as_str().unwrap_or("?"),
+            memory["status"].as_str().unwrap_or("active"),
+            memory["last_verified_at"].as_str().unwrap_or("never"),
+            memory["stale_reason"].as_str().unwrap_or("none")
+        );
+        return;
+    }
+    if value.get("by_status").and_then(Value::as_array).is_some() && value.get("total").is_some() {
+        println!(
+            "memory stats: total={}",
+            value["total"].as_u64().unwrap_or(0)
+        );
+        for key in ["by_status", "by_source", "by_kind"] {
+            let counts = value[key]
+                .as_array()
+                .map(|counts| {
+                    counts
+                        .iter()
+                        .map(|count| {
+                            format!(
+                                "{}={}",
+                                count["key"].as_str().unwrap_or("?"),
+                                count["count"].as_u64().unwrap_or(0)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            println!("  {key}: {counts}");
+        }
+        return;
+    }
+    if value.get("marked_stale").is_some() && value.get("candidates").is_some() {
+        println!(
+            "memory sweep: candidates={} marked_stale={} dry_run={}",
+            value["candidates"].as_u64().unwrap_or(0),
+            value["marked_stale"].as_u64().unwrap_or(0),
+            value["dry_run"].as_bool().unwrap_or(false)
+        );
+        if let Some(ids) = value.get("memory_ids").and_then(Value::as_array)
+            && !ids.is_empty()
+        {
+            println!(
+                "  ids: {}",
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        return;
+    }
     if let Some(memories) = value.get("memories").and_then(Value::as_array) {
         for memory in memories {
             println!(
-                "[{}] {} · {} · {}",
+                "[{}·{}] {} · {} · {}",
                 memory["kind"].as_str().unwrap_or("note"),
+                memory["source"].as_str().unwrap_or("agent"),
                 memory["title"].as_str().unwrap_or("?"),
-                memory["agent_name"].as_str().unwrap_or("?"),
+                memory["status"].as_str().unwrap_or("active"),
                 memory["id"].as_str().unwrap_or("?")
             );
             println!("  {}", memory["body"].as_str().unwrap_or(""));
@@ -4576,7 +4851,7 @@ fn print_human(value: &Value) {
         && policy.get("enabled").is_some()
     {
         println!(
-            "memory policy enabled={} max_items={} max_age_days={}",
+            "memory policy enabled={} max_items={} max_age_days={} task_result_verify_days={} default_verify_days={} auto_supersede={} brief_max_chars={} sweep_stale={}",
             policy["enabled"].as_bool().unwrap_or(false),
             policy["max_items"]
                 .as_u64()
@@ -4585,7 +4860,21 @@ fn print_human(value: &Value) {
             policy["max_age_days"]
                 .as_u64()
                 .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            policy["task_result_verify_days"]
+                .as_u64()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            policy["default_verify_days"]
+                .as_u64()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            policy["auto_supersede"].as_bool().unwrap_or(true),
+            policy["brief_max_chars"]
+                .as_u64()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            policy["sweep_stale"].as_bool().unwrap_or(false)
         );
         return;
     }
@@ -4600,10 +4889,13 @@ fn print_human(value: &Value) {
     }
     if let Some(memory) = value.get("memory") {
         println!(
-            "remembered [{}] {} · {}",
+            "[{}·{}] {} · {} · status={} source={}",
             memory["kind"].as_str().unwrap_or("note"),
+            memory["source"].as_str().unwrap_or("agent"),
             memory["title"].as_str().unwrap_or("?"),
-            memory["id"].as_str().unwrap_or("?")
+            memory["id"].as_str().unwrap_or("?"),
+            memory["status"].as_str().unwrap_or("active"),
+            memory["source"].as_str().unwrap_or("agent")
         );
         return;
     }

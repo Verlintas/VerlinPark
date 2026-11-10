@@ -13,10 +13,10 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AgentMessage, AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactPolicy,
     ArtifactVersion, CheckpointRetentionPolicy, ContinuationOutcome, Event, IntakeTask,
-    IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryItem,
-    MemoryPolicy, MergeQueueEntry, ModelPreset, OrchestrationDecision, OrchestrationNote,
-    OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, Project, ProjectBudget,
-    ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle,
+    IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryEvidence,
+    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, ModelPreset, OrchestrationDecision,
+    OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, Project,
+    ProjectBudget, ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle,
     SessionContinuation, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
     SourceSearchHit, SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall,
     TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
@@ -264,6 +264,55 @@ pub struct SessionRepair {
     pub continuations: Option<Vec<SessionContinuation>>,
     pub recoveries: Option<Vec<OrchestrationRecovery>>,
     pub artifact_warnings: Vec<String>,
+}
+
+/// A memory creation request with provenance. The plain
+/// `create_memory_with_event` shim delegates here with source `agent` and no
+/// evidence.
+pub struct NewMemory<'a> {
+    pub session_id: &'a str,
+    pub project_id: &'a str,
+    pub agent_id: &'a str,
+    pub agent_name: &'a str,
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub tags: &'a [String],
+    pub source: &'a str,
+    pub evidence: &'a [MemoryEvidence],
+    pub pinned: bool,
+    pub verify_after: Option<&'a str>,
+    /// Collapse an exact same-key/same-content create into the existing row.
+    pub dedupe: bool,
+    /// Allow a same-key create with different content to supersede the active
+    /// row. Ignored when `dedupe` is false.
+    pub auto_supersede: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryCreateOutcome {
+    pub memory: MemoryItem,
+    pub created: bool,
+    /// `memory.superseded` for the old row (if any) followed by
+    /// `memory.created` for the new row. Empty when the create was idempotent.
+    pub events: Vec<Event>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryCandidate {
+    pub memory: MemoryItem,
+    /// Lexical relevance in 0..=1 derived from FTS bm25 or the LIKE fallback.
+    pub lexical: f64,
+    /// True when the candidate came from FTS5 rather than LIKE.
+    pub fts: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryStatsSnapshot {
+    pub total: u32,
+    pub by_status: Vec<MemoryStatCount>,
+    pub by_source: Vec<MemoryStatCount>,
+    pub by_kind: Vec<MemoryStatCount>,
 }
 
 /// A steering row delivered at a turn boundary, plus the optional persisted
@@ -722,7 +771,18 @@ impl Store {
                 title       TEXT NOT NULL,
                 body        TEXT NOT NULL,
                 tags        TEXT NOT NULL,
-                created_at  TEXT NOT NULL
+                created_at  TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'active',
+                source      TEXT NOT NULL DEFAULT 'agent',
+                evidence    TEXT NOT NULL DEFAULT '[]',
+                supersedes  TEXT NOT NULL DEFAULT '[]',
+                superseded_by TEXT,
+                pinned      INTEGER NOT NULL DEFAULT 0,
+                use_count   INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                last_verified_at TEXT,
+                verify_after TEXT,
+                stale_reason TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_memories_project
@@ -730,6 +790,19 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_memories_session
                 ON memories(session_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_memories_project_status
+                ON memories(project_id, status, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_memories_project_kind_title
+                ON memories(project_id, kind, title);
+
+            CREATE TABLE IF NOT EXISTS memory_usage (
+                memory_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL,
+                used_at    TEXT NOT NULL,
+                PRIMARY KEY(memory_id, session_id)
+            );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 title,
@@ -1383,6 +1456,69 @@ impl Store {
         ensure_column(&conn, "agents", "branch", "TEXT")?;
         ensure_column(&conn, "agents", "task_id", "TEXT")?;
         ensure_column(&conn, "agents", "department", "TEXT")?;
+        ensure_column(
+            &conn,
+            "memories",
+            "status",
+            "TEXT NOT NULL DEFAULT 'active'",
+        )?;
+        ensure_column(&conn, "memories", "source", "TEXT NOT NULL DEFAULT 'agent'")?;
+        ensure_column(&conn, "memories", "evidence", "TEXT NOT NULL DEFAULT '[]'")?;
+        ensure_column(
+            &conn,
+            "memories",
+            "supersedes",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(&conn, "memories", "superseded_by", "TEXT")?;
+        ensure_column(&conn, "memories", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "memories", "use_count", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "memories", "last_used_at", "TEXT")?;
+        ensure_column(&conn, "memories", "last_verified_at", "TEXT")?;
+        ensure_column(&conn, "memories", "verify_after", "TEXT")?;
+        ensure_column(&conn, "memories", "stale_reason", "TEXT")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_project_status
+                 ON memories(project_id, status, created_at);
+             CREATE INDEX IF NOT EXISTS idx_memories_project_kind_title
+                 ON memories(project_id, kind, title);
+             CREATE TABLE IF NOT EXISTS memory_usage (
+                 memory_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                 session_id TEXT NOT NULL,
+                 used_at    TEXT NOT NULL,
+                 PRIMARY KEY(memory_id, session_id)
+             );",
+        )?;
+        ensure_column(
+            &conn,
+            "project_memory_policies",
+            "task_result_verify_days",
+            "INTEGER NOT NULL DEFAULT 90",
+        )?;
+        ensure_column(
+            &conn,
+            "project_memory_policies",
+            "default_verify_days",
+            "INTEGER NOT NULL DEFAULT 365",
+        )?;
+        ensure_column(
+            &conn,
+            "project_memory_policies",
+            "auto_supersede",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        ensure_column(
+            &conn,
+            "project_memory_policies",
+            "brief_max_chars",
+            "INTEGER NOT NULL DEFAULT 4000",
+        )?;
+        ensure_column(
+            &conn,
+            "project_memory_policies",
+            "sweep_stale",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&conn, "merge_queue", "pre_merge_commit", "TEXT")?;
         ensure_column(&conn, "plan_tasks", "next_attempt_at", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
@@ -4609,6 +4745,11 @@ impl Store {
         Ok(())
     }
 
+    /// Compatibility shim for callers that predate evidence-backed memory.
+    /// Delegates with source `agent`, no evidence, and dedupe enabled. When the
+    /// create is idempotent no event is written, so the existing
+    /// `memory.created` event is returned if one exists (or a non-persisted
+    /// payload-only placeholder for imported rows).
     #[allow(clippy::too_many_arguments)]
     pub fn create_memory_with_event(
         &self,
@@ -4621,48 +4762,122 @@ impl Store {
         body: &str,
         tags: &[String],
     ) -> Result<(MemoryItem, Event)> {
-        let memory = MemoryItem {
-            id: Uuid::now_v7().to_string(),
-            session_id: session_id.to_string(),
-            project_id: project_id.to_string(),
-            agent_id: agent_id.to_string(),
-            agent_name: agent_name.to_string(),
-            kind: kind.to_string(),
-            title: title.to_string(),
-            body: body.to_string(),
-            tags: tags.to_vec(),
-            created_at: now_rfc3339(),
-        };
+        let outcome = self.create_memory_with_metadata_event(NewMemory {
+            session_id,
+            project_id,
+            agent_id,
+            agent_name,
+            kind,
+            title,
+            body,
+            tags,
+            source: "agent",
+            evidence: &[],
+            pinned: false,
+            verify_after: None,
+            dedupe: true,
+            auto_supersede: true,
+        })?;
+        let event = outcome
+            .events
+            .iter()
+            .find(|event| event.kind == "memory.created")
+            .cloned()
+            .or_else(|| outcome.events.into_iter().next())
+            .unwrap_or_else(|| Event {
+                session_id: outcome.memory.session_id.clone(),
+                seq: 0,
+                kind: "memory.created".to_string(),
+                payload: serde_json::to_value(&outcome.memory).unwrap_or_default(),
+                created_at: outcome.memory.created_at.clone(),
+            });
+        Ok((outcome.memory, event))
+    }
+
+    /// Create a memory with provenance in one transaction. A normalized
+    /// (kind, title) key may have at most one active row: an exact duplicate is
+    /// idempotent, and conflicting content supersedes the previous row when
+    /// both `dedupe` and `auto_supersede` are set.
+    pub fn create_memory_with_metadata_event(
+        &self,
+        new: NewMemory<'_>,
+    ) -> Result<MemoryCreateOutcome> {
+        let new_id = Uuid::now_v7().to_string();
+        let now = now_rfc3339();
+        let mut supersedes = Vec::new();
+        let mut events = Vec::new();
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO memories
-             (id, session_id, project_id, agent_id, agent_name, kind, title, body, tags, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                memory.id,
-                memory.session_id,
-                memory.project_id,
-                memory.agent_id,
-                memory.agent_name,
-                memory.kind,
-                memory.title,
-                memory.body,
-                serde_json::to_string(&memory.tags)?,
-                memory.created_at
-            ],
-        )?;
+        if new.dedupe
+            && let Some(mut existing) =
+                active_memory_for_key_tx(&tx, new.project_id, new.kind, new.title)?
+        {
+            let same_content = existing.body.trim() == new.body.trim()
+                && existing.evidence == new.evidence
+                && existing.source == new.source;
+            if same_content || !new.auto_supersede {
+                tx.commit()?;
+                return Ok(MemoryCreateOutcome {
+                    memory: existing,
+                    created: false,
+                    events: Vec::new(),
+                });
+            }
+            existing.status = "superseded".to_string();
+            existing.superseded_by = Some(new_id.clone());
+            update_memory_projection_tx(&tx, &existing)?;
+            let event = insert_event_tx(
+                &tx,
+                &existing.session_id,
+                "memory.superseded",
+                serde_json::to_value(&existing)?,
+            )?;
+            supersedes.push(existing.id.clone());
+            events.push(event);
+        }
+        let memory = MemoryItem {
+            id: new_id,
+            session_id: new.session_id.to_string(),
+            project_id: new.project_id.to_string(),
+            agent_id: new.agent_id.to_string(),
+            agent_name: new.agent_name.to_string(),
+            kind: new.kind.to_string(),
+            title: new.title.to_string(),
+            body: new.body.to_string(),
+            tags: new.tags.to_vec(),
+            created_at: now,
+            status: "active".to_string(),
+            source: new.source.to_string(),
+            evidence: new.evidence.to_vec(),
+            supersedes,
+            superseded_by: None,
+            pinned: new.pinned,
+            use_count: 0,
+            last_used_at: None,
+            last_verified_at: None,
+            verify_after: new.verify_after.map(str::to_string),
+            stale_reason: None,
+        };
+        insert_memory_tx(&tx, &memory)?;
         let event = insert_event_tx(
             &tx,
-            session_id,
+            &memory.session_id,
             "memory.created",
             serde_json::to_value(&memory)?,
         )?;
+        events.push(event);
         tx.commit()?;
-        if let Err(error) = self.append_event_mirror(&event) {
-            tracing::warn!(%error, "failed to append event mirror");
+        drop(conn);
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
         }
-        Ok((memory, event))
+        Ok(MemoryCreateOutcome {
+            memory,
+            created: true,
+            events,
+        })
     }
 
     pub fn list_memories(
@@ -4672,10 +4887,25 @@ impl Store {
         kind: Option<&str>,
         limit: u32,
     ) -> Result<Vec<MemoryItem>> {
+        self.list_memories_filtered(project_id, query, kind, None, false, limit)
+    }
+
+    /// Active memories by default; `stale` only when `include_stale` is set.
+    /// An exact `status` filter takes precedence over `include_stale`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_memories_filtered(
+        &self,
+        project_id: &str,
+        query: Option<&str>,
+        kind: Option<&str>,
+        status: Option<&str>,
+        include_stale: bool,
+        limit: u32,
+    ) -> Result<Vec<MemoryItem>> {
         if let Some(query) = query
             && let Some(query) = fts_query(query)
         {
-            match self.list_memories_fts(project_id, &query, kind, limit) {
+            match self.list_memories_fts(project_id, &query, kind, status, include_stale, limit) {
                 Ok(memories) if !memories.is_empty() => return Ok(memories),
                 Ok(_) => {}
                 Err(error) => {
@@ -4687,97 +4917,263 @@ impl Store {
         let pattern = query.map(|query| format!("%{query}%"));
         let mut stmt = conn.prepare(
             "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
-                    tags, created_at
-             FROM memories
-             WHERE project_id = ?1
-               AND (?2 IS NULL OR title LIKE ?2 OR body LIKE ?2 OR tags LIKE ?2)
-               AND (?3 IS NULL OR kind = ?3)
-             ORDER BY created_at DESC
-             LIMIT ?4",
+                    tags, created_at, status, source, evidence, supersedes, superseded_by,
+                    pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
+             FROM memories m
+             WHERE m.project_id = ?1
+               AND (?2 IS NULL OR m.title LIKE ?2 OR m.body LIKE ?2 OR m.tags LIKE ?2)
+               AND (?3 IS NULL OR m.kind = ?3)
+               AND (
+                   (?4 IS NOT NULL AND m.status = ?4)
+                   OR (?4 IS NULL AND (m.status = 'active' OR (?5 = 1 AND m.status = 'stale')))
+               )
+             ORDER BY m.created_at DESC, m.id ASC
+             LIMIT ?6",
         )?;
         let rows = stmt.query_map(
-            params![project_id, pattern, kind, limit.clamp(1, 500) as i64],
+            params![
+                project_id,
+                pattern,
+                kind,
+                status,
+                if include_stale { 1 } else { 0 },
+                limit.clamp(1, 500) as i64
+            ],
+            map_memory_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn list_memories_fts(
+        &self,
+        project_id: &str,
+        query: &str,
+        kind: Option<&str>,
+        status: Option<&str>,
+        include_stale: bool,
+        limit: u32,
+    ) -> Result<Vec<MemoryItem>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.project_id, m.agent_id, m.agent_name, m.kind,
+                    m.title, m.body, m.tags, m.created_at, m.status, m.source, m.evidence,
+                    m.supersedes, m.superseded_by, m.pinned, m.use_count, m.last_used_at,
+                    m.last_verified_at, m.verify_after, m.stale_reason
+             FROM memories_fts
+             JOIN memories m ON m.rowid = memories_fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND m.project_id = ?2
+               AND (?3 IS NULL OR m.kind = ?3)
+               AND (
+                   (?4 IS NOT NULL AND m.status = ?4)
+                   OR (?4 IS NULL AND (m.status = 'active' OR (?5 = 1 AND m.status = 'stale')))
+               )
+             ORDER BY bm25(memories_fts), m.created_at DESC, m.id ASC
+             LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                query,
+                project_id,
+                kind,
+                status,
+                if include_stale { 1 } else { 0 },
+                limit.clamp(1, 500) as i64
+            ],
+            map_memory_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Ranked candidates for deterministic retrieval. Up to 200 rows; status
+    /// filtering matches `list_memories_filtered`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn memory_candidates(
+        &self,
+        project_id: &str,
+        query: &str,
+        kind: Option<&str>,
+        kinds: &[String],
+        include_stale: bool,
+        limit: u32,
+    ) -> Result<Vec<MemoryCandidate>> {
+        let mut candidates = Vec::new();
+        if let Some(fts) = fts_query(query) {
+            match self.memory_candidates_fts(project_id, &fts, kind, include_stale, limit) {
+                Ok(found) if !found.is_empty() => candidates = found,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "memory candidate FTS search failed; falling back to LIKE");
+                }
+            }
+        }
+        if candidates.is_empty() {
+            candidates =
+                self.memory_candidates_like(project_id, query, kind, include_stale, limit)?;
+        }
+        if !kinds.is_empty() {
+            candidates.retain(|candidate| kinds.iter().any(|kind| kind == &candidate.memory.kind));
+        }
+        candidates.truncate(limit.clamp(1, 200) as usize);
+        Ok(candidates)
+    }
+
+    fn memory_candidates_fts(
+        &self,
+        project_id: &str,
+        query: &str,
+        kind: Option<&str>,
+        include_stale: bool,
+        limit: u32,
+    ) -> Result<Vec<MemoryCandidate>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.project_id, m.agent_id, m.agent_name, m.kind,
+                    m.title, m.body, m.tags, m.created_at, m.status, m.source, m.evidence,
+                    m.supersedes, m.superseded_by, m.pinned, m.use_count, m.last_used_at,
+                    m.last_verified_at, m.verify_after, m.stale_reason,
+                    bm25(memories_fts, 3.0, 1.0, 2.0) AS rank
+             FROM memories_fts
+             JOIN memories m ON m.rowid = memories_fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND m.project_id = ?2
+               AND (?3 IS NULL OR m.kind = ?3)
+               AND (m.status = 'active' OR (?4 = 1 AND m.status = 'stale'))
+             ORDER BY rank ASC, m.created_at DESC, m.id ASC
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                query,
+                project_id,
+                kind,
+                if include_stale { 1 } else { 0 },
+                limit.clamp(1, 200) as i64
+            ],
             |row| {
-                let tags: String = row.get(8)?;
-                Ok(MemoryItem {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    project_id: row.get(2)?,
-                    agent_id: row.get(3)?,
-                    agent_name: row.get(4)?,
-                    kind: row.get(5)?,
-                    title: row.get(6)?,
-                    body: row.get(7)?,
-                    tags: serde_json::from_str(&tags).unwrap_or_default(),
-                    created_at: row.get(9)?,
+                let rank: f64 = row.get(21)?;
+                let relevance = (-rank).max(0.0);
+                Ok(MemoryCandidate {
+                    memory: map_memory_row(row)?,
+                    lexical: if relevance <= 0.0 {
+                        0.01
+                    } else {
+                        relevance / (1.0 + relevance)
+                    },
+                    fts: true,
                 })
             },
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    fn list_memories_fts(
+    fn memory_candidates_like(
         &self,
         project_id: &str,
         query: &str,
         kind: Option<&str>,
+        include_stale: bool,
         limit: u32,
-    ) -> Result<Vec<MemoryItem>> {
+    ) -> Result<Vec<MemoryCandidate>> {
         let conn = self.lock()?;
+        let pattern = format!("%{}%", query.trim());
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.session_id, m.project_id, m.agent_id, m.agent_name, m.kind,
-                    m.title, m.body, m.tags, m.created_at
-             FROM memories_fts
-             JOIN memories m ON m.rowid = memories_fts.rowid
-             WHERE memories_fts MATCH ?1
-               AND m.project_id = ?2
+            "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                    tags, created_at, status, source, evidence, supersedes, superseded_by,
+                    pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
+             FROM memories m
+             WHERE m.project_id = ?1
+               AND (?2 = '%%' OR m.title LIKE ?2 OR m.body LIKE ?2 OR m.tags LIKE ?2)
                AND (?3 IS NULL OR m.kind = ?3)
-             ORDER BY bm25(memories_fts), m.created_at DESC
-             LIMIT ?4",
+               AND (m.status = 'active' OR (?4 = 1 AND m.status = 'stale'))
+             ORDER BY m.created_at DESC, m.id ASC
+             LIMIT ?5",
         )?;
         let rows = stmt.query_map(
-            params![query, project_id, kind, limit.clamp(1, 500) as i64],
+            params![
+                project_id,
+                pattern,
+                kind,
+                if include_stale { 1 } else { 0 },
+                limit.clamp(1, 200) as i64
+            ],
             |row| {
-                let tags: String = row.get(8)?;
-                Ok(MemoryItem {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    project_id: row.get(2)?,
-                    agent_id: row.get(3)?,
-                    agent_name: row.get(4)?,
-                    kind: row.get(5)?,
-                    title: row.get(6)?,
-                    body: row.get(7)?,
-                    tags: serde_json::from_str(&tags).unwrap_or_default(),
-                    created_at: row.get(9)?,
+                let memory = map_memory_row(row)?;
+                Ok(MemoryCandidate {
+                    lexical: like_memory_lexical(&memory, query),
+                    memory,
+                    fts: false,
                 })
             },
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_memory(&self, id: &str) -> Result<Option<MemoryItem>> {
+        let conn = self.lock()?;
+        get_memory_tx(&conn, id)
+    }
+
+    /// Structural supplement for `memory.search`: active/stale rows whose task
+    /// evidence or tag exactly matches `task_id`, even when the lexical query
+    /// does not. This keeps task-specific memories eligible for the structural
+    /// boost in ranking.
+    pub fn memory_task_candidates(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        include_stale: bool,
+        limit: u32,
+    ) -> Result<Vec<MemoryItem>> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", escape_like(task_id));
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                    tags, created_at, status, source, evidence, supersedes, superseded_by,
+                    pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
+             FROM memories m
+             WHERE m.project_id = ?1
+               AND (m.status = 'active' OR (?2 = 1 AND m.status = 'stale'))
+               AND (m.tags LIKE ?3 ESCAPE '\\' OR m.evidence LIKE ?3 ESCAPE '\\')
+             ORDER BY m.created_at DESC, m.id ASC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                if include_stale { 1 } else { 0 },
+                pattern,
+                limit.clamp(1, 200) as i64
+            ],
+            map_memory_row,
+        )?;
+        let mut candidates =
+            rows.collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|memory| {
+                    memory.evidence.iter().any(|evidence| {
+                        evidence.kind == "task" && evidence.reference.trim() == task_id
+                    }) || memory.tags.iter().any(|tag| tag.trim() == task_id)
+                })
+                .collect::<Vec<_>>();
+        candidates.truncate(limit.clamp(1, 200) as usize);
+        Ok(candidates)
     }
 
     pub fn list_session_memories(&self, session_id: &str) -> Result<Vec<MemoryItem>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
-                    tags, created_at
-             FROM memories WHERE session_id = ?1 ORDER BY created_at ASC",
+                    tags, created_at, status, source, evidence, supersedes, superseded_by,
+                    pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
+             FROM memories WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
-        let rows = stmt.query_map(params![session_id], |row| {
-            let tags: String = row.get(8)?;
-            Ok(MemoryItem {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                project_id: row.get(2)?,
-                agent_id: row.get(3)?,
-                agent_name: row.get(4)?,
-                kind: row.get(5)?,
-                title: row.get(6)?,
-                body: row.get(7)?,
-                tags: serde_json::from_str(&tags).unwrap_or_default(),
-                created_at: row.get(9)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![session_id], map_memory_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -4788,29 +5184,7 @@ impl Store {
     ) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM memories WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        for memory in memories {
-            tx.execute(
-                "INSERT INTO memories
-                 (id, session_id, project_id, agent_id, agent_name, kind, title, body, tags, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    memory.id,
-                    memory.session_id,
-                    memory.project_id,
-                    memory.agent_id,
-                    memory.agent_name,
-                    memory.kind,
-                    memory.title,
-                    memory.body,
-                    serde_json::to_string(&memory.tags)?,
-                    memory.created_at
-                ],
-            )?;
-        }
+        replace_session_memories_tx(&tx, session_id, memories)?;
         tx.commit()?;
         Ok(())
     }
@@ -4823,30 +5197,7 @@ impl Store {
         let tx = conn.transaction()?;
         let mut removed = Vec::new();
         for id in ids {
-            let memory = tx
-                .query_row(
-                    "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
-                            tags, created_at
-                     FROM memories WHERE id = ?1",
-                    params![id],
-                    |row| {
-                        let tags: String = row.get(8)?;
-                        Ok(MemoryItem {
-                            id: row.get(0)?,
-                            session_id: row.get(1)?,
-                            project_id: row.get(2)?,
-                            agent_id: row.get(3)?,
-                            agent_name: row.get(4)?,
-                            kind: row.get(5)?,
-                            title: row.get(6)?,
-                            body: row.get(7)?,
-                            tags: serde_json::from_str(&tags).unwrap_or_default(),
-                            created_at: row.get(9)?,
-                        })
-                    },
-                )
-                .optional()?;
-            let Some(memory) = memory else {
+            let Some(memory) = get_memory_tx(&tx, id)? else {
                 continue;
             };
             tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
@@ -4866,6 +5217,236 @@ impl Store {
             }
         }
         Ok(removed)
+    }
+
+    /// Full-item update. `memory.updated` carries the entire updated row so
+    /// replay is last-write-wins.
+    pub fn update_memory_with_event(
+        &self,
+        id: &str,
+        status: Option<&str>,
+        pinned: Option<bool>,
+        tags: Option<&[String]>,
+    ) -> Result<Option<(MemoryItem, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut memory) = get_memory_tx(&tx, id)? else {
+            return Ok(None);
+        };
+        if let Some(status) = status {
+            memory.status = status.to_string();
+            if status == "stale" {
+                if memory.stale_reason.is_none() {
+                    memory.stale_reason = Some("operator marked stale".to_string());
+                }
+            } else {
+                memory.stale_reason = None;
+            }
+        }
+        if let Some(pinned) = pinned {
+            memory.pinned = pinned;
+        }
+        if let Some(tags) = tags {
+            memory.tags = tags.to_vec();
+        }
+        update_memory_projection_tx(&tx, &memory)?;
+        let event = insert_event_tx(
+            &tx,
+            &memory.session_id,
+            "memory.updated",
+            serde_json::to_value(&memory)?,
+        )?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((memory, event)))
+    }
+
+    pub fn mark_memory_verified_with_event(
+        &self,
+        id: &str,
+        verified_at: &str,
+        verify_after: Option<&str>,
+    ) -> Result<Option<(MemoryItem, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut memory) = get_memory_tx(&tx, id)? else {
+            return Ok(None);
+        };
+        memory.status = "active".to_string();
+        memory.stale_reason = None;
+        memory.last_verified_at = Some(verified_at.to_string());
+        memory.verify_after = verify_after.map(str::to_string);
+        update_memory_projection_tx(&tx, &memory)?;
+        let event = insert_event_tx(
+            &tx,
+            &memory.session_id,
+            "memory.verified",
+            serde_json::to_value(&memory)?,
+        )?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((memory, event)))
+    }
+
+    pub fn mark_memory_stale_with_event(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<Option<(MemoryItem, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut memory) = get_memory_tx(&tx, id)? else {
+            return Ok(None);
+        };
+        memory.status = "stale".to_string();
+        memory.stale_reason = Some(reason.to_string());
+        update_memory_projection_tx(&tx, &memory)?;
+        let event = insert_event_tx(
+            &tx,
+            &memory.session_id,
+            "memory.stale",
+            serde_json::to_value(&memory)?,
+        )?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((memory, event)))
+    }
+
+    /// Observed usage. Idempotent per (memory, session): replaying the same
+    /// selection never increments `use_count` twice.
+    pub fn record_memory_use_with_event(
+        &self,
+        id: &str,
+        using_session_id: &str,
+    ) -> Result<Option<(MemoryItem, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut memory) = get_memory_tx(&tx, id)? else {
+            return Ok(None);
+        };
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO memory_usage (memory_id, session_id, used_at)
+             VALUES (?1, ?2, ?3)",
+            params![id, using_session_id, now_rfc3339()],
+        )?;
+        if inserted == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        memory.use_count = memory.use_count.saturating_add(1);
+        memory.last_used_at = Some(now_rfc3339());
+        update_memory_projection_tx(&tx, &memory)?;
+        let event = insert_event_tx(
+            &tx,
+            &memory.session_id,
+            "memory.used",
+            serde_json::to_value(&memory)?,
+        )?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((memory, event)))
+    }
+
+    /// Active, non-pinned rows whose explicit TTL expired, or (when the
+    /// override is supplied) rows older than the cutoff.
+    pub fn memory_sweep_candidates(
+        &self,
+        project_id: &str,
+        older_than_days: Option<u32>,
+    ) -> Result<Vec<MemoryItem>> {
+        let now = time::OffsetDateTime::now_utc();
+        let cutoff = older_than_days.map(|days| now - time::Duration::days(i64::from(days)));
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                    tags, created_at, status, source, evidence, supersedes, superseded_by,
+                    pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
+             FROM memories
+             WHERE project_id = ?1 AND status = 'active' AND pinned = 0
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], map_memory_row)?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let memory = row?;
+            let expired = memory.verify_after.as_deref().is_some_and(|verify_after| {
+                parse_rfc3339(verify_after).is_some_and(|verify_after| verify_after < now)
+            });
+            let too_old = cutoff.is_some_and(|cutoff| {
+                parse_rfc3339(&memory.created_at).is_some_and(|created_at| created_at < cutoff)
+            });
+            if expired || too_old {
+                candidates.push(memory);
+            }
+        }
+        Ok(candidates)
+    }
+
+    pub fn memory_stats(&self, project_id: &str) -> Result<MemoryStatsSnapshot> {
+        let conn = self.lock()?;
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(MemoryStatsSnapshot {
+            total: u32::try_from(total).unwrap_or(u32::MAX),
+            by_status: memory_count_group(&conn, project_id, "status")?,
+            by_source: memory_count_group(&conn, project_id, "source")?,
+            by_kind: memory_count_group(&conn, project_id, "kind")?,
+        })
+    }
+
+    pub fn plan_task_exists(&self, project_id: &str, task_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM plan_tasks WHERE project_id = ?1 AND task_id = ?2",
+            params![project_id, task_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn event_exists(&self, session_id: &str, seq: u64) -> Result<bool> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND seq = ?2",
+            params![session_id, seq as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn latest_merged_entry_for_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<MergeQueueEntry>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash,
+                    base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+             FROM merge_queue
+             WHERE session_id = ?1 AND task_id = ?2 AND status = 'merged'
+             ORDER BY updated_at DESC, created_at DESC, id ASC
+             LIMIT 1",
+            params![session_id, task_id],
+            map_merge_queue_entry,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn memory_ids_for_prune(
@@ -4892,12 +5473,7 @@ impl Store {
             let (id, created_at) = row?;
             let beyond_keep = keep_latest.is_some_and(|keep| index >= keep as usize);
             let old = cutoff.is_some_and(|cutoff| {
-                time::OffsetDateTime::parse(
-                    &created_at,
-                    &time::format_description::well_known::Rfc3339,
-                )
-                .map(|created_at| created_at < cutoff)
-                .unwrap_or(false)
+                parse_rfc3339(&created_at).is_some_and(|created_at| created_at < cutoff)
             });
             if beyond_keep || old {
                 ids.push(id);
@@ -4910,20 +5486,11 @@ impl Store {
         let conn = self.lock()?;
         let stored = conn
             .query_row(
-                "SELECT enabled, max_items, max_age_days
+                "SELECT enabled, max_items, max_age_days, task_result_verify_days,
+                        default_verify_days, auto_supersede, brief_max_chars, sweep_stale
                  FROM project_memory_policies WHERE project_id = ?1",
                 params![project_id],
-                |row| {
-                    Ok(MemoryPolicy {
-                        enabled: row.get::<_, i64>(0)? != 0,
-                        max_items: row
-                            .get::<_, Option<i64>>(1)?
-                            .and_then(|value| u32::try_from(value).ok()),
-                        max_age_days: row
-                            .get::<_, Option<i64>>(2)?
-                            .and_then(|value| u32::try_from(value).ok()),
-                    })
-                },
+                map_memory_policy_row,
             )
             .optional()?;
         Ok(stored.unwrap_or_default())
@@ -4933,18 +5500,29 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO project_memory_policies
-             (project_id, enabled, max_items, max_age_days, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             (project_id, enabled, max_items, max_age_days, task_result_verify_days,
+              default_verify_days, auto_supersede, brief_max_chars, sweep_stale, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(project_id) DO UPDATE SET
                 enabled = excluded.enabled,
                 max_items = excluded.max_items,
                 max_age_days = excluded.max_age_days,
+                task_result_verify_days = excluded.task_result_verify_days,
+                default_verify_days = excluded.default_verify_days,
+                auto_supersede = excluded.auto_supersede,
+                brief_max_chars = excluded.brief_max_chars,
+                sweep_stale = excluded.sweep_stale,
                 updated_at = excluded.updated_at",
             params![
                 project_id,
                 if policy.enabled { 1 } else { 0 },
                 policy.max_items.map(i64::from),
                 policy.max_age_days.map(i64::from),
+                optional_count_to_db(policy.task_result_verify_days),
+                optional_count_to_db(policy.default_verify_days),
+                if policy.auto_supersede { 1 } else { 0 },
+                optional_count_to_db(policy.brief_max_chars),
+                if policy.sweep_stale { 1 } else { 0 },
                 now_rfc3339()
             ],
         )?;
@@ -4954,7 +5532,8 @@ impl Store {
     pub fn list_enabled_memory_policies(&self) -> Result<Vec<(String, MemoryPolicy)>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT project_id, enabled, max_items, max_age_days
+            "SELECT project_id, enabled, max_items, max_age_days, task_result_verify_days,
+                    default_verify_days, auto_supersede, brief_max_chars, sweep_stale
              FROM project_memory_policies WHERE enabled = 1",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -4968,6 +5547,44 @@ impl Store {
                     max_age_days: row
                         .get::<_, Option<i64>>(3)?
                         .and_then(|value| u32::try_from(value).ok()),
+                    task_result_verify_days: optional_count_from_db(row.get::<_, i64>(4)?),
+                    default_verify_days: optional_count_from_db(row.get::<_, i64>(5)?),
+                    auto_supersede: row.get::<_, i64>(6)? != 0,
+                    brief_max_chars: optional_count_from_db(row.get::<_, i64>(7)?),
+                    sweep_stale: row.get::<_, i64>(8)? != 0,
+                },
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Projects that opted into daemon staleness sweeping. Independent of the
+    /// retention (`enabled`) toggle.
+    pub fn list_memory_sweep_policies(&self) -> Result<Vec<(String, MemoryPolicy)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT project_id, enabled, max_items, max_age_days, task_result_verify_days,
+                    default_verify_days, auto_supersede, brief_max_chars, sweep_stale
+             FROM project_memory_policies WHERE sweep_stale = 1",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                MemoryPolicy {
+                    enabled: row.get::<_, i64>(1)? != 0,
+                    max_items: row
+                        .get::<_, Option<i64>>(2)?
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|value| *value > 0),
+                    max_age_days: row
+                        .get::<_, Option<i64>>(3)?
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|value| *value > 0),
+                    task_result_verify_days: optional_count_from_db(row.get::<_, i64>(4)?),
+                    default_verify_days: optional_count_from_db(row.get::<_, i64>(5)?),
+                    auto_supersede: row.get::<_, i64>(6)? != 0,
+                    brief_max_chars: optional_count_from_db(row.get::<_, i64>(7)?),
+                    sweep_stale: row.get::<_, i64>(8)? != 0,
                 },
             ))
         })?;
@@ -10452,29 +11069,7 @@ impl Store {
             }
         }
         if let Some(memories) = &repair.memories {
-            tx.execute(
-                "DELETE FROM memories WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            for memory in memories {
-                tx.execute(
-                    "INSERT INTO memories
-                     (id, session_id, project_id, agent_id, agent_name, kind, title, body, tags, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        memory.id,
-                        memory.session_id,
-                        memory.project_id,
-                        memory.agent_id,
-                        memory.agent_name,
-                        memory.kind,
-                        memory.title,
-                        memory.body,
-                        serde_json::to_string(&memory.tags)?,
-                        memory.created_at
-                    ],
-                )?;
-            }
+            replace_session_memories_tx(&tx, session_id, memories)?;
         }
         if let Some(questions) = &repair.questions {
             tx.execute(
@@ -10867,23 +11462,7 @@ impl Store {
             )?;
         }
         for memory in &bundle.memories {
-            tx.execute(
-                "INSERT INTO memories
-                 (id, session_id, project_id, agent_id, agent_name, kind, title, body, tags, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    memory.id,
-                    memory.session_id,
-                    memory.project_id,
-                    memory.agent_id,
-                    memory.agent_name,
-                    memory.kind,
-                    memory.title,
-                    memory.body,
-                    serde_json::to_string(&memory.tags)?,
-                    memory.created_at
-                ],
-            )?;
+            insert_memory_tx(&tx, memory)?;
         }
         for question in &bundle.questions {
             tx.execute(
@@ -11938,6 +12517,290 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         created_at: row.get(14)?,
         priority: row.get(15)?,
     })
+}
+
+fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryItem> {
+    let tags: String = row.get(8)?;
+    let evidence: String = row.get(12)?;
+    let supersedes: String = row.get(13)?;
+    Ok(MemoryItem {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        project_id: row.get(2)?,
+        agent_id: row.get(3)?,
+        agent_name: row.get(4)?,
+        kind: row.get(5)?,
+        title: row.get(6)?,
+        body: row.get(7)?,
+        tags: serde_json::from_str(&tags).unwrap_or_default(),
+        created_at: row.get(9)?,
+        status: row.get(10)?,
+        source: row.get(11)?,
+        evidence: serde_json::from_str(&evidence).unwrap_or_default(),
+        supersedes: serde_json::from_str(&supersedes).unwrap_or_default(),
+        superseded_by: row.get(14)?,
+        pinned: row.get::<_, i64>(15)? != 0,
+        use_count: u32::try_from(row.get::<_, i64>(16)?).unwrap_or(u32::MAX),
+        last_used_at: row.get(17)?,
+        last_verified_at: row.get(18)?,
+        verify_after: row.get(19)?,
+        stale_reason: row.get(20)?,
+    })
+}
+
+fn map_memory_policy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryPolicy> {
+    Ok(MemoryPolicy {
+        enabled: row.get::<_, i64>(0)? != 0,
+        max_items: row
+            .get::<_, Option<i64>>(1)?
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0),
+        max_age_days: row
+            .get::<_, Option<i64>>(2)?
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0),
+        task_result_verify_days: optional_count_from_db(row.get::<_, i64>(3)?),
+        default_verify_days: optional_count_from_db(row.get::<_, i64>(4)?),
+        auto_supersede: row.get::<_, i64>(5)? != 0,
+        brief_max_chars: optional_count_from_db(row.get::<_, i64>(6)?),
+        sweep_stale: row.get::<_, i64>(7)? != 0,
+    })
+}
+
+fn optional_count_to_db(value: Option<u32>) -> i64 {
+    value.map_or(0, i64::from)
+}
+
+fn optional_count_from_db(value: i64) -> Option<u32> {
+    u32::try_from(value).ok().filter(|value| *value > 0)
+}
+
+fn insert_memory_tx(tx: &Transaction<'_>, memory: &MemoryItem) -> Result<()> {
+    tx.execute(
+        "INSERT INTO memories
+         (id, session_id, project_id, agent_id, agent_name, kind, title, body, tags, created_at,
+          status, source, evidence, supersedes, superseded_by, pinned, use_count, last_used_at,
+          last_verified_at, verify_after, stale_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                 ?18, ?19, ?20, ?21)",
+        params![
+            &memory.id,
+            &memory.session_id,
+            &memory.project_id,
+            &memory.agent_id,
+            &memory.agent_name,
+            &memory.kind,
+            &memory.title,
+            &memory.body,
+            serde_json::to_string(&memory.tags)?,
+            &memory.created_at,
+            if memory.status.is_empty() {
+                "active"
+            } else {
+                &memory.status
+            },
+            if memory.source.is_empty() {
+                "agent"
+            } else {
+                &memory.source
+            },
+            serde_json::to_string(&memory.evidence)?,
+            serde_json::to_string(&memory.supersedes)?,
+            &memory.superseded_by,
+            if memory.pinned { 1 } else { 0 },
+            i64::from(memory.use_count),
+            &memory.last_used_at,
+            &memory.last_verified_at,
+            &memory.verify_after,
+            &memory.stale_reason
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_memory_projection_tx(tx: &Transaction<'_>, memory: &MemoryItem) -> Result<()> {
+    tx.execute(
+        "UPDATE memories SET
+             tags = ?2,
+             status = ?3,
+             source = ?4,
+             evidence = ?5,
+             supersedes = ?6,
+             superseded_by = ?7,
+             pinned = ?8,
+             use_count = ?9,
+             last_used_at = ?10,
+             last_verified_at = ?11,
+             verify_after = ?12,
+             stale_reason = ?13
+         WHERE id = ?1",
+        params![
+            &memory.id,
+            serde_json::to_string(&memory.tags)?,
+            &memory.status,
+            &memory.source,
+            serde_json::to_string(&memory.evidence)?,
+            serde_json::to_string(&memory.supersedes)?,
+            &memory.superseded_by,
+            if memory.pinned { 1 } else { 0 },
+            i64::from(memory.use_count),
+            &memory.last_used_at,
+            &memory.last_verified_at,
+            &memory.verify_after,
+            &memory.stale_reason
+        ],
+    )?;
+    Ok(())
+}
+
+fn replace_session_memories_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    memories: &[MemoryItem],
+) -> Result<()> {
+    // Usage rows cascade with memory deletion. Preserve the observed
+    // (memory, session) pairs across repair so replaying a brief stays
+    // idempotent for rows that still exist.
+    let usage = {
+        let mut stmt = tx.prepare(
+            "SELECT u.memory_id, u.session_id, u.used_at
+             FROM memory_usage u
+             JOIN memories m ON m.id = u.memory_id
+             WHERE m.session_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.execute(
+        "DELETE FROM memories WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    for memory in memories {
+        insert_memory_tx(tx, memory)?;
+    }
+    for (memory_id, using_session_id, used_at) in usage {
+        tx.execute(
+            "INSERT OR IGNORE INTO memory_usage (memory_id, session_id, used_at)
+             SELECT id, ?2, ?3 FROM memories WHERE id = ?1",
+            params![memory_id, using_session_id, used_at],
+        )?;
+    }
+    Ok(())
+}
+
+fn get_memory_tx(conn: &Connection, id: &str) -> Result<Option<MemoryItem>> {
+    conn.query_row(
+        "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                tags, created_at, status, source, evidence, supersedes, superseded_by,
+                pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
+         FROM memories WHERE id = ?1",
+        params![id],
+        map_memory_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn normalize_memory_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn active_memory_for_key_tx(
+    conn: &Connection,
+    project_id: &str,
+    kind: &str,
+    title: &str,
+) -> Result<Option<MemoryItem>> {
+    let key_kind = normalize_memory_key(kind);
+    let key_title = normalize_memory_key(title);
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                tags, created_at, status, source, evidence, supersedes, superseded_by,
+                pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
+         FROM memories
+         WHERE project_id = ?1 AND status = 'active'
+         ORDER BY created_at DESC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![project_id], map_memory_row)?;
+    for row in rows {
+        let memory = row?;
+        if normalize_memory_key(&memory.kind) == key_kind
+            && normalize_memory_key(&memory.title) == key_title
+        {
+            return Ok(Some(memory));
+        }
+    }
+    Ok(None)
+}
+
+fn like_memory_lexical(memory: &MemoryItem, query: &str) -> f64 {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return 0.0;
+    }
+    let title = memory.title.to_lowercase();
+    let body = memory.body.to_lowercase();
+    let tags = memory.tags.join(" ").to_lowercase();
+    let mut score: f64 = 0.0;
+    if title.contains(&query) {
+        score += 0.7;
+    } else if body.contains(&query) {
+        score += 0.4;
+    } else if tags.contains(&query) {
+        score += 0.3;
+    }
+    for term in query.split_whitespace() {
+        if title.contains(term) {
+            score += 0.15;
+        }
+        if body.contains(term) {
+            score += 0.05;
+        }
+        if tags.contains(term) {
+            score += 0.05;
+        }
+    }
+    score.min(1.0)
+}
+
+fn memory_count_group(
+    conn: &Connection,
+    project_id: &str,
+    column: &str,
+) -> Result<Vec<MemoryStatCount>> {
+    // `column` is only ever a fixed call-site literal, never user input.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {column}, COUNT(*) FROM memories WHERE project_id = ?1 GROUP BY {column}"
+    ))?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        let count: i64 = row.get(1)?;
+        Ok(MemoryStatCount {
+            key: row.get(0)?,
+            count: u32::try_from(count).unwrap_or(u32::MAX),
+        })
+    })?;
+    let mut counts = rows.collect::<Result<Vec<_>, _>>()?;
+    counts.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    Ok(counts)
+}
+
+fn parse_rfc3339(value: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
