@@ -96,6 +96,10 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub system: Option<String>,
+    /// Optional marker for providers with explicit prompt caching: when this is
+    /// an exact prefix of `system`, the adapter may place a cache breakpoint
+    /// after it. It never adds or removes prompt content.
+    pub system_stable_prefix: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub tools: Vec<ToolSchema>,
@@ -107,6 +111,7 @@ impl ChatRequest {
             model: model.into(),
             messages,
             system: None,
+            system_stable_prefix: None,
             max_tokens: None,
             temperature: None,
             tools: Vec::new(),
@@ -119,8 +124,14 @@ pub enum StreamEvent {
     TextDelta(String),
     ToolCall(ToolCall),
     Usage {
+        /// Total provider input tokens. This is deliberately the provider's
+        /// total: uncached input + cache reads + cache writes.
         input_tokens: u32,
         output_tokens: u32,
+        /// Subset of `input_tokens` served from the provider prompt cache.
+        cache_read_tokens: u32,
+        /// Subset of `input_tokens` written to the provider prompt cache.
+        cache_write_tokens: u32,
     },
     Done,
 }
@@ -226,12 +237,45 @@ pub(crate) fn openai_usage(value: &Value) -> Option<StreamEvent> {
         .pointer("/usage/completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
+    // OpenAI reports `prompt_tokens_details.cached_tokens`; several compatible
+    // servers also expose DeepSeek-style cache-hit fields. Cache writes are not
+    // standard OpenAI metadata, but accept the vendor fields when present.
+    let cache_read = value
+        .pointer("/usage/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .pointer("/usage/prompt_cache_hit_tokens")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    let cache_write = value
+        .pointer("/usage/prompt_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .pointer("/usage/cache_write_tokens")
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            value
+                .pointer("/usage/prompt_cache_write_tokens")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    // Cache tokens are parts of the total input, never additive. Clamp
+    // inconsistent provider reports so cost accounting cannot double count.
+    let input_u64 = u64::from(input);
+    let cache_read = cache_read.min(input_u64);
+    let cache_write = cache_write.min(input_u64.saturating_sub(cache_read));
     if input == 0 && output == 0 {
         None
     } else {
         Some(StreamEvent::Usage {
             input_tokens: input,
             output_tokens: output,
+            cache_read_tokens: cache_read as u32,
+            cache_write_tokens: cache_write as u32,
         })
     }
 }

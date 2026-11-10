@@ -814,6 +814,18 @@ struct PreviewPanelView: View {
                                 value: String(format: "$%.4f", ledger.totals.costUsd)
                             )
                         }
+                        if let cacheRead = ledger.totals.cacheReadTokens, cacheRead > 0 {
+                            HStack(spacing: 10) {
+                                Text(
+                                    "Cache read \(cacheRead) · write \(ledger.totals.cacheWriteTokens ?? 0)"
+                                )
+                                if let hitRate = ledger.totals.cacheHitRate {
+                                    Text(String(format: "· %.1f%% hit rate", hitRate * 100))
+                                }
+                            }
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        }
 
                         UsageBucketSection(title: "BY ROLE", buckets: ledger.totals.byRole)
                         UsageBucketSection(
@@ -1269,6 +1281,11 @@ private struct UsageBucketSection: View {
                         Text("\(bucket.inputTokens + bucket.outputTokens) tok")
                             .font(.system(size: 8, design: .monospaced))
                             .foregroundStyle(.secondary)
+                        if let cacheRead = bucket.cacheReadTokens, cacheRead > 0 {
+                            Text("cache \(cacheRead)")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
                         Text(String(format: "$%.4f", bucket.costUsd))
                             .font(.system(size: 8, design: .monospaced))
                             .foregroundStyle(.secondary)
@@ -1316,6 +1333,11 @@ private struct UsageEntryRow: View {
                 Text("in \(entry.inputTokens) · out \(entry.outputTokens)")
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.secondary)
+                if let cacheRead = entry.cacheReadTokens, cacheRead > 0 {
+                    Text("cache \(cacheRead)/\(entry.cacheWriteTokens ?? 0)")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
         .padding(8)

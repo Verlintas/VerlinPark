@@ -213,6 +213,14 @@ pub struct RoleModelConfig {
     pub input_usd_per_million: Option<f64>,
     #[serde(default)]
     pub output_usd_per_million: Option<f64>,
+    /// Optional price for input tokens served from the provider prompt cache.
+    /// Unset falls back to the full input price (conservative).
+    #[serde(default)]
+    pub cache_read_usd_per_million: Option<f64>,
+    /// Optional price for input tokens written to the provider prompt cache.
+    /// Unset falls back to the full input price (conservative).
+    #[serde(default)]
+    pub cache_write_usd_per_million: Option<f64>,
     /// Optional context window for this role's model, in tokens.
     #[serde(default)]
     pub context_window: Option<u64>,
@@ -2105,6 +2113,12 @@ pub struct UsageEntry {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Subset of `input_tokens` served from the provider prompt cache.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Subset of `input_tokens` written to the provider prompt cache.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     #[serde(default)]
     pub estimated: bool,
     #[serde(default)]
@@ -2118,6 +2132,10 @@ pub struct UsageBucket {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub cost_usd: f64,
 }
 
@@ -2126,6 +2144,10 @@ pub struct UsageTotals {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub cost_usd: f64,
     pub by_role: Vec<UsageBucket>,
     pub by_model: Vec<UsageBucket>,
@@ -2184,6 +2206,10 @@ pub struct ProjectUsageSession {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub cost_usd: f64,
 }
 
@@ -4244,6 +4270,35 @@ mod tests {
         let current: AuthParams =
             serde_json::from_value(json!({"token": "abc", "protocol": 2})).unwrap();
         assert_eq!(current.protocol, Some(2));
+    }
+
+    #[test]
+    fn usage_entries_and_role_prices_decode_without_cache_fields() {
+        let entry: UsageEntry = serde_json::from_value(json!({
+            "id": "usage-1",
+            "session_id": "session-1",
+            "agent_id": "agent-1",
+            "agent_name": "Worker",
+            "role": "worker",
+            "model": "model",
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "estimated": false,
+            "cost_usd": 0.1,
+            "created_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(entry.cache_read_tokens, 0);
+        assert_eq!(entry.cache_write_tokens, 0);
+
+        let config: RoleModelConfig = serde_json::from_value(json!({
+            "model": "claude",
+            "input_usd_per_million": 3.0,
+            "output_usd_per_million": 15.0
+        }))
+        .unwrap();
+        assert!(config.cache_read_usd_per_million.is_none());
+        assert!(config.cache_write_usd_per_million.is_none());
     }
 
     #[test]

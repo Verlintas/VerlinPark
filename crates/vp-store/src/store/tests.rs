@@ -334,17 +334,17 @@ fn groups_project_usage_by_session() {
     let beta = store.create_session(&project.id, "beta").unwrap();
     store
         .add_usage_entry_with_events(
-            &alpha.id, "a1", "Alpha", "worker", None, None, "m", 10, 5, false, 0.5,
+            &alpha.id, "a1", "Alpha", "worker", None, None, "m", 10, 5, 4, 1, false, 0.5,
         )
         .unwrap();
     store
         .add_usage_entry_with_events(
-            &alpha.id, "a1", "Alpha", "worker", None, None, "m", 2, 1, true, 0.0,
+            &alpha.id, "a1", "Alpha", "worker", None, None, "m", 2, 1, 0, 0, true, 0.0,
         )
         .unwrap();
     store
         .add_usage_entry_with_events(
-            &beta.id, "b1", "Beta", "leader", None, None, "m", 7, 3, false, 0.25,
+            &beta.id, "b1", "Beta", "leader", None, None, "m", 7, 3, 2, 0, false, 0.25,
         )
         .unwrap();
 
@@ -354,10 +354,13 @@ fn groups_project_usage_by_session() {
     assert_eq!(alpha_usage.calls, 2);
     assert_eq!(alpha_usage.input_tokens, 12);
     assert_eq!(alpha_usage.output_tokens, 6);
+    assert_eq!(alpha_usage.cache_read_tokens, 4);
+    assert_eq!(alpha_usage.cache_write_tokens, 1);
     assert!((alpha_usage.cost_usd - 0.5).abs() < 1e-9);
     let beta_usage = usage.iter().find(|row| row.session_id == beta.id).unwrap();
     assert_eq!(beta_usage.calls, 1);
     assert_eq!(beta_usage.input_tokens, 7);
+    assert_eq!(beta_usage.cache_read_tokens, 2);
 }
 
 #[test]

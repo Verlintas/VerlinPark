@@ -321,11 +321,59 @@ mod tests {
                 StreamEvent::TextDelta(" world".to_string()),
                 StreamEvent::Usage {
                     input_tokens: 12,
-                    output_tokens: 3
+                    output_tokens: 3,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 },
                 StreamEvent::Done,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn parses_openai_cached_prompt_tokens() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"cached\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":8,\"cache_write_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "test-model",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+            .unwrap();
+        let mut usage = None;
+        while let Some(item) = stream.next().await {
+            if let StreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } = item.unwrap()
+            {
+                usage = Some((
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                ));
+            }
+        }
+        assert_eq!(usage, Some((20, 5, 8, 2)));
     }
 
     #[tokio::test]

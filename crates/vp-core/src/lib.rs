@@ -328,6 +328,12 @@ fn add_usage_bucket(buckets: &mut HashMap<String, UsageBucket>, key: &str, entry
     bucket.calls = bucket.calls.saturating_add(1);
     bucket.input_tokens = bucket.input_tokens.saturating_add(entry.input_tokens);
     bucket.output_tokens = bucket.output_tokens.saturating_add(entry.output_tokens);
+    bucket.cache_read_tokens = bucket
+        .cache_read_tokens
+        .saturating_add(entry.cache_read_tokens);
+    bucket.cache_write_tokens = bucket
+        .cache_write_tokens
+        .saturating_add(entry.cache_write_tokens);
     bucket.cost_usd += entry.cost_usd;
 }
 
@@ -5557,6 +5563,30 @@ impl Engine {
         estimated: bool,
         cost_usd: f64,
     ) -> Result<UsageEntry> {
+        self.record_agent_usage_with_cache(
+            session_id, agent_id, agent_name, role, task_id, department, model, input, output, 0,
+            0, estimated, cost_usd,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_agent_usage_with_cache(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        role: &str,
+        task_id: Option<String>,
+        department: Option<String>,
+        model: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        estimated: bool,
+        cost_usd: f64,
+    ) -> Result<UsageEntry> {
         let cost_usd = if cost_usd.is_finite() && cost_usd > 0.0 {
             cost_usd
         } else {
@@ -5579,6 +5609,8 @@ impl Engine {
                 &model,
                 input,
                 output,
+                cache_read,
+                cache_write,
                 estimated,
                 cost_usd,
             )
@@ -5606,6 +5638,12 @@ impl Engine {
         for entry in &entries {
             totals.input_tokens = totals.input_tokens.saturating_add(entry.input_tokens);
             totals.output_tokens = totals.output_tokens.saturating_add(entry.output_tokens);
+            totals.cache_read_tokens = totals
+                .cache_read_tokens
+                .saturating_add(entry.cache_read_tokens);
+            totals.cache_write_tokens = totals
+                .cache_write_tokens
+                .saturating_add(entry.cache_write_tokens);
             totals.cost_usd += entry.cost_usd;
             add_usage_bucket(&mut by_role, &entry.role, entry);
             add_usage_bucket(&mut by_model, &entry.model, entry);
@@ -5636,7 +5674,7 @@ impl Engine {
     pub async fn usage_csv(&self, session_id: &str) -> Result<UsageCsvResult> {
         let ledger = self.usage_ledger(session_id).await?;
         let mut csv = String::from(
-            "created_at,agent_name,role,task_id,department,model,input_tokens,output_tokens,total_tokens,estimated,cost_usd\n",
+            "created_at,agent_name,role,task_id,department,model,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,total_tokens,estimated,cost_usd\n",
         );
         for entry in ledger.entries {
             let fields = [
@@ -5647,6 +5685,8 @@ impl Engine {
                 entry.department.unwrap_or_default(),
                 entry.model,
                 entry.input_tokens.to_string(),
+                entry.cache_read_tokens.to_string(),
+                entry.cache_write_tokens.to_string(),
                 entry.output_tokens.to_string(),
                 (entry.input_tokens + entry.output_tokens).to_string(),
                 entry.estimated.to_string(),
@@ -6169,6 +6209,12 @@ impl Engine {
             totals.calls = totals.calls.saturating_add(session.calls);
             totals.input_tokens = totals.input_tokens.saturating_add(session.input_tokens);
             totals.output_tokens = totals.output_tokens.saturating_add(session.output_tokens);
+            totals.cache_read_tokens = totals
+                .cache_read_tokens
+                .saturating_add(session.cache_read_tokens);
+            totals.cache_write_tokens = totals
+                .cache_write_tokens
+                .saturating_add(session.cache_write_tokens);
             totals.cost_usd += session.cost_usd;
         }
         Ok(ProjectUsageResult {
@@ -7396,6 +7442,16 @@ impl Engine {
                     .get("output_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0),
+                cache_read_tokens: event
+                    .payload
+                    .get("cache_read_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                cache_write_tokens: event
+                    .payload
+                    .get("cache_write_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
                 estimated: event
                     .payload
                     .get("estimated")
@@ -7421,6 +7477,8 @@ impl Engine {
             && left.model == right.model
             && left.input_tokens == right.input_tokens
             && left.output_tokens == right.output_tokens
+            && left.cache_read_tokens == right.cache_read_tokens
+            && left.cache_write_tokens == right.cache_write_tokens
             && left.estimated == right.estimated
             && left.cost_usd.to_bits() == right.cost_usd.to_bits()
     }

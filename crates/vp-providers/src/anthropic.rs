@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     ChatMessage, ChatRequest, EventStream, Provider, ProviderError, StreamEvent, ToolCall,
-    provider_client, provider_error_from_stream, send_with_retry,
+    ToolSchema, provider_client, provider_error_from_stream, send_with_retry,
 };
 
 /// Anthropic Messages API adapter.
@@ -72,6 +72,47 @@ fn anthropic_message(message: &ChatMessage) -> Option<Value> {
     Some(json!({"role": message.role, "content": message.content}))
 }
 
+fn anthropic_system(system: String, stable_prefix: Option<&str>) -> Value {
+    let Some(prefix) = stable_prefix.filter(|prefix| {
+        !prefix.is_empty() && system.starts_with(prefix) && prefix.len() <= system.len()
+    }) else {
+        // Keep the historical single-string system shape when no cache
+        // breakpoint is requested.
+        return json!(system);
+    };
+    let mut blocks = Vec::with_capacity(2);
+    blocks.push(json!({
+        "type": "text",
+        "text": prefix,
+        "cache_control": {"type": "ephemeral"},
+    }));
+    let remainder = &system[prefix.len()..];
+    if !remainder.is_empty() {
+        blocks.push(json!({"type": "text", "text": remainder}));
+    }
+    json!(blocks)
+}
+
+fn anthropic_tools(tools: &[ToolSchema]) -> Value {
+    let mut values = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.parameters,
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(last) = values.last_mut() {
+        // The tool block is the first part of Anthropic's cache prefix. A
+        // breakpoint on the last tool keeps the whole stable bundle reusable
+        // without changing the schema when skills activate.
+        last["cache_control"] = json!({"type": "ephemeral"});
+    }
+    json!(values)
+}
+
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn id(&self) -> &str {
@@ -94,24 +135,15 @@ impl Provider for AnthropicProvider {
             "max_tokens": request.max_tokens.unwrap_or(4096),
             "stream": true,
         });
+        let stable_prefix = request.system_stable_prefix.clone();
         if let Some(system) = request.system {
-            body["system"] = json!(system);
+            body["system"] = anthropic_system(system, stable_prefix.as_deref());
         }
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
         }
         if !request.tools.is_empty() {
-            body["tools"] = json!(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.parameters,
-                    }))
-                    .collect::<Vec<_>>()
-            );
+            body["tools"] = anthropic_tools(&request.tools);
         }
 
         let response = send_with_retry(|| {
@@ -138,6 +170,8 @@ impl Provider for AnthropicProvider {
         let mapped = async_stream::stream! {
             let mut input_tokens = 0u32;
             let mut output_tokens = 0u32;
+            let mut cache_read_tokens = 0u32;
+            let mut cache_write_tokens = 0u32;
             let mut tool_calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
             let mut saw_done = false;
             let mut stream = stream;
@@ -211,23 +245,56 @@ impl Provider for AnthropicProvider {
                                 }
                             }
                             "message_start" => {
-                                if let Some(input) = value
-                                    .pointer("/message/usage/input_tokens")
+                                let usage = value.pointer("/message/usage");
+                                if let Some(input) = usage
+                                    .and_then(|usage| usage.get("input_tokens"))
                                     .and_then(Value::as_u64)
                                 {
                                     input_tokens = input as u32;
                                 }
+                                if let Some(read) = usage
+                                    .and_then(|usage| usage.get("cache_read_input_tokens"))
+                                    .and_then(Value::as_u64)
+                                {
+                                    cache_read_tokens = read as u32;
+                                }
+                                if let Some(write) = usage
+                                    .and_then(|usage| usage.get("cache_creation_input_tokens"))
+                                    .and_then(Value::as_u64)
+                                {
+                                    cache_write_tokens = write as u32;
+                                }
                             }
                             "message_delta" => {
-                                if let Some(output) = value
-                                    .pointer("/usage/output_tokens")
-                                    .and_then(Value::as_u64)
+                                let usage = value.get("usage");
+                                if let Some(output) =
+                                    usage.and_then(|usage| usage.get("output_tokens")).and_then(Value::as_u64)
                                 {
                                     output_tokens = output as u32;
                                 }
+                                if let Some(read) = usage
+                                    .and_then(|usage| usage.get("cache_read_input_tokens"))
+                                    .and_then(Value::as_u64)
+                                {
+                                    cache_read_tokens = read as u32;
+                                }
+                                if let Some(write) = usage
+                                    .and_then(|usage| usage.get("cache_creation_input_tokens"))
+                                    .and_then(Value::as_u64)
+                                {
+                                    cache_write_tokens = write as u32;
+                                }
+                                // Anthropic's `input_tokens` excludes cache
+                                // reads and writes. Our public contract keeps
+                                // `input_tokens` as the total provider input.
+                                let total_input = input_tokens
+                                    .saturating_add(cache_read_tokens)
+                                    .saturating_add(cache_write_tokens);
                                 yield Ok(StreamEvent::Usage {
-                                    input_tokens,
+                                    input_tokens: total_input,
                                     output_tokens,
+                                    cache_read_tokens,
+                                    cache_write_tokens,
                                 });
                             }
                             "message_stop" => {
@@ -311,9 +378,137 @@ mod tests {
         assert!(events.contains(&StreamEvent::TextDelta(" there".to_string())));
         assert!(events.contains(&StreamEvent::Usage {
             input_tokens: 12,
-            output_tokens: 3
+            output_tokens: 3,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         }));
         assert_eq!(events.last(), Some(&StreamEvent::Done));
+    }
+
+    #[test]
+    fn anthropic_system_keeps_the_string_shape_without_a_marker() {
+        assert_eq!(anthropic_system("hello".to_string(), None), json!("hello"));
+        assert_eq!(
+            anthropic_system("hello".to_string(), Some("not-a-prefix")),
+            json!("hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn parses_anthropic_cache_usage_fields() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":20}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"cached\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::with_base_url(
+            "test",
+            format!("{}/v1", server.uri()),
+            Some("test-key".to_string()),
+        );
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "claude-test",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+            .unwrap();
+        let mut usage = None;
+        while let Some(item) = stream.next().await {
+            if let StreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } = item.unwrap()
+            {
+                usage = Some((
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                ));
+            }
+        }
+        assert_eq!(usage, Some((132, 4, 100, 20)));
+    }
+
+    #[tokio::test]
+    async fn marks_tool_and_stable_system_cache_breakpoints() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "event: message_start\n",
+                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                        "event: message_delta\n",
+                        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n",
+                        "event: message_stop\n",
+                        "data: {\"type\":\"message_stop\"}\n\n",
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::with_base_url(
+            "test",
+            format!("{}/v1", server.uri()),
+            Some("test-key".to_string()),
+        );
+        let stable = "Stable role charter.";
+        let volatile = "Run context: worktree=/tmp/task.";
+        let mut request =
+            ChatRequest::new("claude-test", vec![ChatMessage::user("read the readme")]);
+        request.system = Some(format!("{stable}\n\n{volatile}"));
+        request.system_stable_prefix = Some(stable.to_string());
+        request.tools = vec![
+            crate::ToolSchema {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+            crate::ToolSchema {
+                name: "write_file".to_string(),
+                description: "Write a file".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+        ];
+        let _ = provider.stream_chat(request).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["system"][0]["text"], stable);
+        assert_eq!(
+            body["system"][0]["cache_control"]["type"],
+            json!("ephemeral")
+        );
+        assert_eq!(body["system"][1]["text"], format!("\n\n{volatile}"));
+        assert!(body["system"][1].get("cache_control").is_none());
+        assert_eq!(body["tools"][0]["name"], "read_file");
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["name"], "write_file");
+        assert_eq!(
+            body["tools"][1]["cache_control"]["type"],
+            json!("ephemeral")
+        );
     }
     #[tokio::test]
     async fn retries_rate_limits() {

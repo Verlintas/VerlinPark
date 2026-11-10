@@ -1564,6 +1564,20 @@ private struct RoleModelRow: View {
                     text: priceBinding(\.inputUsdPerMillion)
                 )
                 metricField(
+                    "Cache read $ / 1M",
+                    placeholder: "input",
+                    text: priceBinding(\.cacheReadUsdPerMillion)
+                )
+                metricField(
+                    "Cache write $ / 1M",
+                    placeholder: "input",
+                    text: priceBinding(\.cacheWriteUsdPerMillion)
+                )
+            }
+            .padding(.leading, 75)
+
+            HStack(alignment: .top, spacing: 8) {
+                metricField(
                     "Output $ / 1M",
                     placeholder: "0",
                     text: priceBinding(\.outputUsdPerMillion)

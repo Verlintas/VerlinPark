@@ -650,7 +650,7 @@ async fn exports_usage_as_escaped_csv() {
         .await
         .unwrap();
     engine
-        .record_agent_usage(
+        .record_agent_usage_with_cache(
             &session.id,
             "agent-1",
             "Worker, One",
@@ -660,6 +660,8 @@ async fn exports_usage_as_escaped_csv() {
             "test-model",
             10,
             5,
+            4,
+            1,
             true,
             0.25,
         )
@@ -673,7 +675,7 @@ async fn exports_usage_as_escaped_csv() {
     assert!(
         result
             .csv
-            .contains(",worker,T1,impl,test-model,10,5,15,true,0.250000")
+            .contains(",worker,T1,impl,test-model,10,4,1,5,15,true,0.250000")
     );
 }
 
@@ -2702,7 +2704,7 @@ async fn replay_checks_critical_projections() {
         .await
         .unwrap();
     engine
-        .record_agent_usage(
+        .record_agent_usage_with_cache(
             &session.id,
             &agent.id,
             &agent.name,
@@ -2712,6 +2714,8 @@ async fn replay_checks_critical_projections() {
             "test",
             11,
             5,
+            6,
+            1,
             false,
             0.125,
         )
@@ -2855,6 +2859,9 @@ async fn replay_checks_critical_projections() {
             .iter()
             .any(|entry| entry.cost_usd == 0.125)
     );
+    assert!(imported_usage.entries.iter().any(|entry| {
+        entry.input_tokens == 11 && entry.cache_read_tokens == 6 && entry.cache_write_tokens == 1
+    }));
     assert_eq!(imported_usage.totals.input_tokens, 18);
     let imported_approvals = imported_engine
         .list_approvals(Some(session.id.clone()))

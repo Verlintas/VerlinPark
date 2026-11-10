@@ -134,6 +134,8 @@
 "configured" = "已配置";
 "Input $ / 1M" = "输入 $ / 1M";
 "Output $ / 1M" = "输出 $ / 1M";
+"Cache read $ / 1M" = "缓存读取 $ / 1M";
+"Cache write $ / 1M" = "缓存写入 $ / 1M";
 "Context window" = "上下文窗口";
 "Override base model" = "覆盖基础模型";
 "Team capacity" = "团队容量";

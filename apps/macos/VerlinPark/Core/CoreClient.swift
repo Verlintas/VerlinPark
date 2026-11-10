@@ -2219,6 +2219,12 @@ actor CoreClient {
             if let price = role.outputUsdPerMillion, price > 0 {
                 object["output_usd_per_million"] = .number(price)
             }
+            if let price = role.cacheReadUsdPerMillion, price > 0 {
+                object["cache_read_usd_per_million"] = .number(price)
+            }
+            if let price = role.cacheWriteUsdPerMillion, price > 0 {
+                object["cache_write_usd_per_million"] = .number(price)
+            }
             if let contextWindow = role.contextWindow, contextWindow > 0 {
                 object["context_window"] = .number(Double(contextWindow))
             }

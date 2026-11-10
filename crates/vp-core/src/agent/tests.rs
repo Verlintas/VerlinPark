@@ -7,6 +7,15 @@ use tempfile::TempDir;
 use vp_providers::{EventStream, ProviderError};
 use vp_store::Store;
 
+fn prices(input: f64, output: f64) -> RolePrices {
+    RolePrices {
+        input,
+        output,
+        cache_read: input,
+        cache_write: input,
+    }
+}
+
 struct QueueProvider {
     responses: Mutex<VecDeque<Vec<StreamEvent>>>,
 }
@@ -24,6 +33,31 @@ impl Provider for QueueProvider {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| vec![StreamEvent::TextDelta("done".into())]);
+        Ok(Box::pin(futures_util::stream::iter(
+            events.into_iter().map(Ok),
+        )))
+    }
+}
+
+struct RecordingProvider {
+    requests: Arc<Mutex<Vec<ChatRequest>>>,
+    responses: Mutex<VecDeque<Vec<StreamEvent>>>,
+}
+
+#[async_trait]
+impl Provider for RecordingProvider {
+    fn id(&self) -> &str {
+        "recording"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+        self.requests.lock().unwrap().push(request);
+        let events = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done]);
         Ok(Box::pin(futures_util::stream::iter(
             events.into_iter().map(Ok),
         )))
@@ -3204,6 +3238,58 @@ async fn usage_ledger_groups_by_role_agent_and_task() {
     }));
 }
 
+#[tokio::test]
+async fn provider_cache_usage_reaches_ledger_and_session_totals() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("cached answer".into()),
+            StreamEvent::Usage {
+                input_tokens: 1_000,
+                output_tokens: 100,
+                cache_read_tokens: 600,
+                cache_write_tokens: 100,
+            },
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "cache usage".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "cache usage").await.unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+
+    let ledger = engine.usage_ledger(&session.id).await.unwrap();
+    assert_eq!(ledger.entries.len(), 1);
+    let entry = &ledger.entries[0];
+    assert_eq!(entry.input_tokens, 1_000);
+    assert_eq!(entry.output_tokens, 100);
+    assert_eq!(entry.cache_read_tokens, 600);
+    assert_eq!(entry.cache_write_tokens, 100);
+    assert_eq!(ledger.totals.cache_read_tokens, 600);
+    assert_eq!(ledger.totals.cache_write_tokens, 100);
+
+    let sessions = engine
+        .list_sessions(Some(session.project_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(sessions[0].tokens_in, 1_000);
+    assert_eq!(sessions[0].tokens_out, 100);
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let usage = events
+        .iter()
+        .find(|event| event.kind == "agent.usage")
+        .expect("usage event");
+    assert_eq!(usage.payload["input_tokens"], 1_000);
+    assert_eq!(usage.payload["cache_read_tokens"], 600);
+    assert_eq!(usage.payload["cache_write_tokens"], 100);
+}
+
 #[test]
 fn plan_budget_scope_includes_the_project_pool() {
     let spec = AgentSpec {
@@ -3269,7 +3355,7 @@ fn unlimited_flag_bypasses_budget_gates_and_can_be_revoked() {
     assert!(budget.reserve_tokens(100).is_none());
     assert!(
         budget
-            .reserve_cost(100, 100, 1.0, 1.0)
+            .reserve_cost(100, 100, prices(1.0, 1.0))
             .expect("unlimited cost reservation")
             .is_none()
     );
@@ -3601,7 +3687,38 @@ fn session_budget_tracks_cost_and_time() {
 
     let time_budget = SessionBudget::new(None, 0, caps).with_time(Some(0));
     assert_eq!(time_budget.exceeded_reason(), Some("time"));
-    assert_eq!(usage_cost(1_000_000, 500_000, 2.0, 4.0), 4.0);
+    assert_eq!(usage_cost(1_000_000, 500_000, 0, 0, prices(2.0, 4.0)), 4.0);
+}
+
+#[test]
+fn cache_prices_bill_disjoint_input_subsets_and_fall_back_to_input_price() {
+    let cached = RolePrices {
+        input: 2.0,
+        output: 4.0,
+        cache_read: 0.2,
+        cache_write: 2.5,
+    };
+    // 500k uncached input + 400k cache reads + 100k cache writes + 500k output.
+    let cost = usage_cost(1_000_000, 500_000, 400_000, 100_000, cached);
+    assert!((cost - (1.0 + 0.08 + 0.25 + 2.0)).abs() < 1e-9);
+
+    let fallback = RolePrices {
+        input: 2.0,
+        output: 4.0,
+        cache_read: 2.0,
+        cache_write: 2.0,
+    };
+    assert_eq!(
+        usage_cost(1_000_000, 500_000, 400_000, 100_000, fallback),
+        usage_cost(1_000_000, 500_000, 0, 0, fallback)
+    );
+
+    // Inconsistent provider reports are clamped so cache subsets never
+    // exceed the total input or get billed twice.
+    assert_eq!(
+        usage_cost(1_000_000, 0, 900_000, 900_000, cached),
+        usage_cost(1_000_000, 0, 900_000, 100_000, cached)
+    );
 }
 
 #[test]
@@ -3645,14 +3762,18 @@ fn cost_reservations_bound_concurrent_calls() {
     )
     .with_cost(Some(1.0), 0.0);
     let first = budget
-        .reserve_cost(400_000, 400_000, 1.0, 1.0)
+        .reserve_cost(400_000, 400_000, prices(1.0, 1.0))
         .expect("first cost reservation")
         .expect("cost limit configured");
-    assert!(budget.reserve_cost(200_000, 200_000, 1.0, 1.0).is_err());
+    assert!(
+        budget
+            .reserve_cost(200_000, 200_000, prices(1.0, 1.0))
+            .is_err()
+    );
     assert!(!first.settle(0.6));
     assert!((budget.cost_spent() - 0.6).abs() < 1e-9);
     let second = budget
-        .reserve_cost(100_000, 100_000, 1.0, 1.0)
+        .reserve_cost(100_000, 100_000, prices(1.0, 1.0))
         .expect("remaining cost reservation")
         .expect("cost limit configured");
     assert!(second.settle(0.4));
@@ -4107,7 +4228,13 @@ async fn role_models_override_the_base_model() {
     config.role_models.worker.output_usd_per_million = Some(4.0);
     assert_eq!(model_for(&config, AgentRole::Worker), "worker-model");
     assert_eq!(model_for(&config, AgentRole::Manager), "test");
-    assert_eq!(role_price(&config, AgentRole::Worker), (2.0, 4.0));
+    let worker_prices = role_prices(&config, AgentRole::Worker);
+    assert_eq!(worker_prices, prices(2.0, 4.0));
+    config.role_models.worker.cache_read_usd_per_million = Some(0.2);
+    config.role_models.worker.cache_write_usd_per_million = Some(2.5);
+    let cached = role_prices(&config, AgentRole::Worker);
+    assert_eq!(cached.cache_read, 0.2);
+    assert_eq!(cached.cache_write, 2.5);
 }
 
 #[tokio::test]
@@ -4181,7 +4308,7 @@ async fn runs_a_plan_through_the_openai_http_adapter() {
                 .and_then(|message| message["content"].as_str())
                 .unwrap_or_default();
 
-            if system.contains("You are Verifier") {
+            if system.contains("You are a Verifier") {
                 return tool_sse(
                     "verdict",
                     "submit_verdict",
@@ -4191,7 +4318,7 @@ async fn runs_a_plan_through_the_openai_http_adapter() {
                     }),
                 );
             }
-            if system.contains("You are Worker") {
+            if system.contains("You are a Worker") {
                 if last_role == "tool" {
                     return text_sse("worker done");
                 }
@@ -4355,7 +4482,18 @@ async fn runs_a_plan_through_the_anthropic_http_adapter() {
         .and(path("/v1/messages"))
         .respond_with(move |request: &wiremock::Request| {
             let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
-            let system = body["system"].as_str().unwrap_or_default();
+            let system = body["system"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    body["system"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|block| block["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
             let messages = body["messages"].as_array().cloned().unwrap_or_default();
             let last = messages.last();
             let last_content = last
@@ -4365,7 +4503,7 @@ async fn runs_a_plan_through_the_anthropic_http_adapter() {
                 .map(|message| message["content"].is_array())
                 .unwrap_or(false);
 
-            if system.contains("You are Verifier") {
+            if system.contains("You are a Verifier") {
                 return tool_sse(
                     "verdict",
                     "submit_verdict",
@@ -4375,7 +4513,7 @@ async fn runs_a_plan_through_the_anthropic_http_adapter() {
                     }),
                 );
             }
-            if system.contains("You are Worker") {
+            if system.contains("You are a Worker") {
                 if tool_result {
                     return text_sse("worker done");
                 }
@@ -7180,6 +7318,8 @@ async fn provider_usage_calibrates_future_context_estimates() {
                 StreamEvent::Usage {
                     input_tokens: 20_000,
                     output_tokens: 10,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 },
                 StreamEvent::Done,
             ],
@@ -7188,6 +7328,8 @@ async fn provider_usage_calibrates_future_context_estimates() {
                 StreamEvent::Usage {
                     input_tokens: 20_000,
                     output_tokens: 10,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 },
                 StreamEvent::Done,
             ],
@@ -8101,7 +8243,9 @@ async fn active_skill_narrows_tools_at_execution_time() {
     use vp_protocol::types::SkillCreateParams;
 
     let dir = TempDir::new().unwrap();
-    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
         responses: Mutex::new(VecDeque::from(vec![
             vec![
                 StreamEvent::ToolCall(ToolCall {
@@ -8182,6 +8326,177 @@ async fn active_skill_narrows_tools_at_execution_time() {
     assert!(activations.activations[0].agent_name.is_some());
     assert!(activations.activations[0].agent_id.is_some());
     assert!(!activations.activations[0].activated_at.is_empty());
+
+    // Activating a skill must not change the advertised tool bundle. Policy
+    // enforcement happens when the disallowed call is dispatched.
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 3);
+    let expected = recorded[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    assert!(expected.contains(&"write_file".to_string()));
+    let expected_hash = prompt_prefix_fingerprint("test", &recorded[0].tools, "").tool_bundle_hash;
+    for request in recorded.iter() {
+        let names = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected);
+        assert_eq!(
+            prompt_prefix_fingerprint("test", &request.tools, "").tool_bundle_hash,
+            expected_hash
+        );
+    }
+}
+
+#[tokio::test]
+async fn stable_system_prefix_precedes_run_context_and_is_hashed() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id.clone(), "cache the prefix".into(), None)
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "cache the prefix")
+        .await
+        .unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+
+    {
+        let recorded = requests.lock().unwrap();
+        let request = recorded.first().expect("provider request");
+        let system = request.system.as_deref().expect("system prompt");
+        let stable = request
+            .system_stable_prefix
+            .as_deref()
+            .expect("stable prefix marker");
+        assert!(system.starts_with(stable));
+        let security = system.find("Security and output contract:").unwrap();
+        let goal = system.find("Session goal:").unwrap();
+        let worktree = system.find("Worktree:").unwrap();
+        assert!(security < goal);
+        assert!(security < worktree);
+        assert!(!stable.contains("Session goal:"));
+        assert!(!stable.contains("Worktree:"));
+    }
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let prefix = events
+        .iter()
+        .find(|event| event.kind == "context.prompt_prefix")
+        .expect("prompt prefix event");
+    assert_eq!(prefix.payload["version"], 1);
+    assert_eq!(prefix.payload["model"], "test");
+    assert!(
+        prefix.payload["tool_bundle_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+    );
+    assert_eq!(
+        prefix.payload["cache_generation"],
+        prefix.payload["prefix_hash"]
+    );
+}
+
+#[tokio::test]
+async fn stable_prompt_prefix_is_shared_across_sessions() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![StreamEvent::TextDelta("first".into()), StreamEvent::Done],
+            vec![StreamEvent::TextDelta("second".into()), StreamEvent::Done],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let first = engine
+        .create_session(project.id.clone(), "first session".into(), None)
+        .await
+        .unwrap();
+    service.start(&first.id, "first session").await.unwrap();
+    let _ = wait_until_idle(&engine, &first).await;
+    let second = engine
+        .create_session(project.id.clone(), "second session".into(), None)
+        .await
+        .unwrap();
+    service.start(&second.id, "second session").await.unwrap();
+    let _ = wait_until_idle(&engine, &second).await;
+
+    let prefix_hash = |events: Vec<vp_protocol::types::Event>| {
+        events
+            .into_iter()
+            .find(|event| event.kind == "context.prompt_prefix")
+            .and_then(|event| event.payload["prefix_hash"].as_str().map(str::to_string))
+            .expect("prompt prefix event")
+    };
+    let first_events = engine.list_events(first.id.clone(), 0, 100).await.unwrap();
+    let second_events = engine.list_events(second.id.clone(), 0, 100).await.unwrap();
+    assert_eq!(prefix_hash(first_events), prefix_hash(second_events));
+
+    let recorded = requests.lock().unwrap();
+    let first_stable = recorded[0].system_stable_prefix.as_deref().unwrap();
+    let second_stable = recorded[1].system_stable_prefix.as_deref().unwrap();
+    assert_eq!(first_stable, second_stable);
+    assert_ne!(recorded[0].system, recorded[1].system);
+}
+
+#[test]
+fn dynamic_mcp_tools_sort_deterministically_and_cap_after_sorting() {
+    fn binding(name: &str) -> McpToolBinding {
+        McpToolBinding {
+            exposed_name: name.to_string(),
+            server_id: "server".to_string(),
+            tool_name: name.to_string(),
+            schema: ToolSchema {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
+    }
+    let names = [
+        "mcp_zeta_search",
+        "mcp_alpha_read",
+        "mcp_middle_write",
+        "mcp_beta_list",
+    ];
+    let sorted = sort_and_cap_dynamic_mcp_tools(names.iter().map(|name| binding(name)).collect());
+    assert_eq!(
+        sorted
+            .iter()
+            .map(|binding| binding.exposed_name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "mcp_alpha_read",
+            "mcp_beta_list",
+            "mcp_middle_write",
+            "mcp_zeta_search"
+        ]
+    );
+
+    let many = (0..40)
+        .map(|index| binding(&format!("mcp_tool_{:02}", 39 - index)))
+        .collect::<Vec<_>>();
+    let capped = sort_and_cap_dynamic_mcp_tools(many);
+    assert_eq!(capped.len(), MAX_DYNAMIC_MCP_TOOLS);
+    assert_eq!(capped[0].exposed_name, "mcp_tool_00");
+    assert_eq!(capped[31].exposed_name, "mcp_tool_31");
 }
 
 #[test]

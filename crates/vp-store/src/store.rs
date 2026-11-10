@@ -690,6 +690,8 @@ impl Store {
                 model         TEXT NOT NULL,
                 input_tokens  INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
+                cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                 estimated     INTEGER NOT NULL,
                 cost_usd      REAL NOT NULL,
                 created_at    TEXT NOT NULL
@@ -1277,6 +1279,18 @@ impl Store {
             "TEXT NOT NULL DEFAULT 'none'",
         )?;
         ensure_column(&conn, "usage_ledger", "department", "TEXT")?;
+        ensure_column(
+            &conn,
+            "usage_ledger",
+            "cache_read_tokens",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "usage_ledger",
+            "cache_write_tokens",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(
             &conn,
             "project_shell_policies",
@@ -4331,7 +4345,11 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT s.id, s.goal, s.status, s.tokens_in, s.tokens_out, s.cost_spent_usd,
-                    (SELECT COUNT(*) FROM usage_ledger u WHERE u.session_id = s.id)
+                    (SELECT COUNT(*) FROM usage_ledger u WHERE u.session_id = s.id),
+                    COALESCE((SELECT SUM(cache_read_tokens) FROM usage_ledger u
+                              WHERE u.session_id = s.id), 0),
+                    COALESCE((SELECT SUM(cache_write_tokens) FROM usage_ledger u
+                              WHERE u.session_id = s.id), 0)
              FROM sessions s
              WHERE s.project_id = ?1
              ORDER BY s.created_at DESC",
@@ -4344,6 +4362,8 @@ impl Store {
                 calls: row.get::<_, i64>(6)? as u64,
                 input_tokens: row.get::<_, i64>(3)? as u64,
                 output_tokens: row.get::<_, i64>(4)? as u64,
+                cache_read_tokens: row.get::<_, i64>(7)? as u64,
+                cache_write_tokens: row.get::<_, i64>(8)? as u64,
                 cost_usd: row.get(5)?,
             })
         })?;
@@ -5474,9 +5494,13 @@ impl Store {
         model: &str,
         input: u64,
         output: u64,
+        cache_read: u64,
+        cache_write: u64,
         estimated: bool,
         cost_usd: f64,
     ) -> Result<(UsageEntry, Vec<Event>)> {
+        let cache_read = cache_read.min(input);
+        let cache_write = cache_write.min(input.saturating_sub(cache_read));
         let entry = UsageEntry {
             id: Uuid::now_v7().to_string(),
             session_id: session_id.to_string(),
@@ -5488,6 +5512,8 @@ impl Store {
             model: model.to_string(),
             input_tokens: input,
             output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
             estimated,
             cost_usd,
             created_at: now_rfc3339(),
@@ -5508,8 +5534,9 @@ impl Store {
         tx.execute(
             "INSERT INTO usage_ledger
              (id, session_id, agent_id, agent_name, role, task_id, department, model,
-              input_tokens, output_tokens, estimated, cost_usd, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+              estimated, cost_usd, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 entry.id,
                 entry.session_id,
@@ -5521,6 +5548,8 @@ impl Store {
                 entry.model,
                 entry.input_tokens as i64,
                 entry.output_tokens as i64,
+                entry.cache_read_tokens as i64,
+                entry.cache_write_tokens as i64,
                 if entry.estimated { 1 } else { 0 },
                 entry.cost_usd,
                 entry.created_at
@@ -5533,6 +5562,8 @@ impl Store {
             serde_json::json!({
                 "input_tokens": input,
                 "output_tokens": output,
+                "cache_read_tokens": entry.cache_read_tokens,
+                "cache_write_tokens": entry.cache_write_tokens,
                 "estimated": estimated,
                 "agent_id": agent_id,
                 "agent_name": agent_name,
@@ -5612,7 +5643,8 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, agent_id, agent_name, role, task_id, department,
-                    model, input_tokens, output_tokens, estimated, cost_usd, created_at
+                    model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    estimated, cost_usd, created_at
              FROM usage_ledger
              WHERE session_id = ?1
              ORDER BY created_at ASC, id ASC",
@@ -5629,9 +5661,11 @@ impl Store {
                 model: row.get(7)?,
                 input_tokens: row.get::<_, i64>(8)? as u64,
                 output_tokens: row.get::<_, i64>(9)? as u64,
-                estimated: row.get::<_, i64>(10)? != 0,
-                cost_usd: row.get(11)?,
-                created_at: row.get(12)?,
+                cache_read_tokens: row.get::<_, i64>(10)? as u64,
+                cache_write_tokens: row.get::<_, i64>(11)? as u64,
+                estimated: row.get::<_, i64>(12)? != 0,
+                cost_usd: row.get(13)?,
+                created_at: row.get(14)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -5648,8 +5682,9 @@ impl Store {
             tx.execute(
                 "INSERT INTO usage_ledger
                  (id, session_id, agent_id, agent_name, role, task_id, department, model,
-                  input_tokens, output_tokens, estimated, cost_usd, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                  estimated, cost_usd, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     entry.id,
                     session_id,
@@ -5661,6 +5696,8 @@ impl Store {
                     entry.model,
                     entry.input_tokens as i64,
                     entry.output_tokens as i64,
+                    entry.cache_read_tokens as i64,
+                    entry.cache_write_tokens as i64,
                     if entry.estimated { 1 } else { 0 },
                     entry.cost_usd,
                     entry.created_at
@@ -10071,8 +10108,9 @@ impl Store {
             tx.execute(
                 "INSERT INTO usage_ledger
                  (id, session_id, agent_id, agent_name, role, task_id, department, model,
-                  input_tokens, output_tokens, estimated, cost_usd, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                  estimated, cost_usd, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     entry.id,
                     bundle.session.id,
@@ -10084,6 +10122,8 @@ impl Store {
                     entry.model,
                     entry.input_tokens as i64,
                     entry.output_tokens as i64,
+                    entry.cache_read_tokens as i64,
+                    entry.cache_write_tokens as i64,
                     if entry.estimated { 1 } else { 0 },
                     entry.cost_usd,
                     entry.created_at

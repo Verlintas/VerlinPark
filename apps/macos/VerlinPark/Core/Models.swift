@@ -92,6 +92,8 @@ struct ProjectUsageSession: Codable, Identifiable, Sendable {
     let calls: Int
     let inputTokens: Int
     let outputTokens: Int
+    let cacheReadTokens: Int?
+    let cacheWriteTokens: Int?
     let costUsd: Double
 
     var id: String {
@@ -109,6 +111,8 @@ struct ProjectUsageSession: Codable, Identifiable, Sendable {
         case calls
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
         case costUsd = "cost_usd"
     }
 }
@@ -824,12 +828,23 @@ struct UsageEntry: Codable, Sendable, Identifiable {
     let model: String
     let inputTokens: Int
     let outputTokens: Int
+    let cacheReadTokens: Int?
+    let cacheWriteTokens: Int?
     let estimated: Bool
     let costUsd: Double
     let createdAt: String
 
     var totalTokens: Int {
         inputTokens + outputTokens
+    }
+
+    /// Cached input as a fraction of total provider input. `inputTokens`
+    /// already includes cache reads and writes.
+    var cacheHitRate: Double? {
+        guard let cacheReadTokens, inputTokens > 0 else {
+            return nil
+        }
+        return Double(cacheReadTokens) / Double(inputTokens)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -842,6 +857,8 @@ struct UsageEntry: Codable, Sendable, Identifiable {
         case model
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
         case estimated
         case costUsd = "cost_usd"
         case createdAt = "created_at"
@@ -853,6 +870,8 @@ struct UsageBucket: Codable, Sendable, Identifiable {
     let calls: Int
     let inputTokens: Int
     let outputTokens: Int
+    let cacheReadTokens: Int?
+    let cacheWriteTokens: Int?
     let costUsd: Double
 
     var id: String {
@@ -864,6 +883,8 @@ struct UsageBucket: Codable, Sendable, Identifiable {
         case calls
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
         case costUsd = "cost_usd"
     }
 }
@@ -872,6 +893,8 @@ struct UsageTotals: Codable, Sendable {
     let calls: Int
     let inputTokens: Int
     let outputTokens: Int
+    let cacheReadTokens: Int?
+    let cacheWriteTokens: Int?
     let costUsd: Double
     let byRole: [UsageBucket]
     let byModel: [UsageBucket]
@@ -879,10 +902,19 @@ struct UsageTotals: Codable, Sendable {
     let byTask: [UsageBucket]
     let byDepartment: [UsageBucket]?
 
+    var cacheHitRate: Double? {
+        guard let cacheReadTokens, inputTokens > 0 else {
+            return nil
+        }
+        return Double(cacheReadTokens) / Double(inputTokens)
+    }
+
     enum CodingKeys: String, CodingKey {
         case calls
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
         case costUsd = "cost_usd"
         case byRole = "by_role"
         case byModel = "by_model"
@@ -1303,12 +1335,16 @@ struct RoleModelConfig: Codable, Hashable, Sendable {
     var model: String? = nil
     var inputUsdPerMillion: Double? = nil
     var outputUsdPerMillion: Double? = nil
+    var cacheReadUsdPerMillion: Double? = nil
+    var cacheWriteUsdPerMillion: Double? = nil
     var contextWindow: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case model
         case inputUsdPerMillion = "input_usd_per_million"
         case outputUsdPerMillion = "output_usd_per_million"
+        case cacheReadUsdPerMillion = "cache_read_usd_per_million"
+        case cacheWriteUsdPerMillion = "cache_write_usd_per_million"
         case contextWindow = "context_window"
     }
 }

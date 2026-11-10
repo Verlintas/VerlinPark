@@ -3506,12 +3506,14 @@ fn print_human(value: &Value) {
         && let Some(totals) = value.get("totals")
     {
         println!(
-            "project {}  sessions={}  calls={}  in={}  out={}  cost=${:.4}",
+            "project {}  sessions={}  calls={}  in={}  out={}  cache_read={}  cache_write={}  cost=${:.4}",
             value["project_id"].as_str().unwrap_or("?"),
             sessions.len(),
             totals["calls"].as_u64().unwrap_or(0),
             totals["input_tokens"].as_u64().unwrap_or(0),
             totals["output_tokens"].as_u64().unwrap_or(0),
+            totals["cache_read_tokens"].as_u64().unwrap_or(0),
+            totals["cache_write_tokens"].as_u64().unwrap_or(0),
             totals["cost_usd"].as_f64().unwrap_or(0.0)
         );
         for session in sessions {
@@ -3983,11 +3985,13 @@ fn print_human(value: &Value) {
         && value.get("entries").is_some()
     {
         println!(
-            "session {}  calls={}  in={}  out={}  cost=${:.4}",
+            "session {}  calls={}  in={}  out={}  cache_read={}  cache_write={}  cost=${:.4}",
             value["session_id"].as_str().unwrap_or("?"),
             totals["calls"].as_u64().unwrap_or(0),
             totals["input_tokens"].as_u64().unwrap_or(0),
             totals["output_tokens"].as_u64().unwrap_or(0),
+            totals["cache_read_tokens"].as_u64().unwrap_or(0),
+            totals["cache_write_tokens"].as_u64().unwrap_or(0),
             totals["cost_usd"].as_f64().unwrap_or(0.0)
         );
         for (label, field) in [
@@ -3999,11 +4003,13 @@ fn print_human(value: &Value) {
         ] {
             for bucket in totals[field].as_array().into_iter().flatten() {
                 println!(
-                    "  {label:5} {:<20} calls={:<3} in={:<7} out={:<7} ${:.4}",
+                    "  {label:5} {:<20} calls={:<3} in={:<7} out={:<7} cache={}/{} ${:.4}",
                     bucket["key"].as_str().unwrap_or("?"),
                     bucket["calls"].as_u64().unwrap_or(0),
                     bucket["input_tokens"].as_u64().unwrap_or(0),
                     bucket["output_tokens"].as_u64().unwrap_or(0),
+                    bucket["cache_read_tokens"].as_u64().unwrap_or(0),
+                    bucket["cache_write_tokens"].as_u64().unwrap_or(0),
                     bucket["cost_usd"].as_f64().unwrap_or(0.0)
                 );
             }

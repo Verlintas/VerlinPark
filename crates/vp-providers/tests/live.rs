@@ -38,6 +38,7 @@ fn request(model: String) -> ChatRequest {
         model,
         messages: vec![ChatMessage::user(PROMPT)],
         system: Some("You are a provider connectivity check. Be concise.".to_string()),
+        system_stable_prefix: None,
         max_tokens: Some(256),
         temperature: Some(0.0),
         tools: Vec::new(),
@@ -59,6 +60,7 @@ async fn drain(mut stream: vp_providers::EventStream) -> (String, u32, (u64, u64
             StreamEvent::Usage {
                 input_tokens,
                 output_tokens,
+                ..
             } => {
                 usage.0 = usage.0.saturating_add(input_tokens as u64);
                 usage.1 = usage.1.saturating_add(output_tokens as u64);

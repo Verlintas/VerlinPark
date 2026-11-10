@@ -13,7 +13,7 @@ final class ProtocolCompatibilityTests: XCTestCase {
           "role_models": {
             "leader": {"context_window": 1000000},
             "manager": {},
-            "worker": {"context_window": 8000},
+            "worker": {"context_window": 8000, "cache_read_usd_per_million": 0.2, "cache_write_usd_per_million": 2.5},
             "verifier": {},
             "labour": {}
           },
@@ -26,6 +26,8 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(info.contextWindow, 128_000)
         XCTAssertEqual(info.roleModels.leader.contextWindow, 1_000_000)
         XCTAssertEqual(info.roleModels.worker.contextWindow, 8000)
+        XCTAssertEqual(info.roleModels.worker.cacheReadUsdPerMillion, 0.2)
+        XCTAssertEqual(info.roleModels.worker.cacheWriteUsdPerMillion, 2.5)
     }
 
     func testSessionContextStatusDecodes() throws {
@@ -529,6 +531,57 @@ final class ProtocolCompatibilityTests: XCTestCase {
         let ledger = try JSONDecoder().decode(UsageLedgerResult.self, from: Data(json.utf8))
         XCTAssertEqual(ledger.totals.calls, 0)
         XCTAssertNil(ledger.totals.byDepartment)
+        XCTAssertNil(ledger.totals.cacheReadTokens)
+    }
+
+    func testUsageCacheFieldsDecodeAndDeriveHitRate() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "entries": [{
+            "id": "usage-1",
+            "session_id": "session-1",
+            "agent_id": "agent-1",
+            "agent_name": "Worker",
+            "role": "worker",
+            "task_id": "T1",
+            "model": "test-model",
+            "input_tokens": 1000,
+            "output_tokens": 100,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 100,
+            "estimated": false,
+            "cost_usd": 0.25,
+            "created_at": "2026-11-11T00:00:00Z"
+          }],
+          "totals": {
+            "calls": 1,
+            "input_tokens": 1000,
+            "output_tokens": 100,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 100,
+            "cost_usd": 0.25,
+            "by_role": [{
+              "key": "worker",
+              "calls": 1,
+              "input_tokens": 1000,
+              "output_tokens": 100,
+              "cache_read_tokens": 600,
+              "cache_write_tokens": 100,
+              "cost_usd": 0.25
+            }],
+            "by_model": [],
+            "by_agent": [],
+            "by_task": []
+          }
+        }
+        """
+        let ledger = try JSONDecoder().decode(UsageLedgerResult.self, from: Data(json.utf8))
+        XCTAssertEqual(ledger.entries.first?.cacheReadTokens, 600)
+        XCTAssertEqual(ledger.entries.first?.cacheWriteTokens, 100)
+        XCTAssertEqual(ledger.entries.first?.cacheHitRate ?? 0, 0.6, accuracy: 0.0001)
+        XCTAssertEqual(ledger.totals.cacheReadTokens, 600)
+        XCTAssertEqual(ledger.totals.byRole.first?.cacheReadTokens, 600)
     }
 
     func testSearchHitDecodesEventAndMessageShapes() throws {
@@ -1450,6 +1503,8 @@ final class ProtocolCompatibilityTests: XCTestCase {
               "calls": 2,
               "input_tokens": 10,
               "output_tokens": 5,
+              "cache_read_tokens": 4,
+              "cache_write_tokens": 1,
               "cost_usd": 0.25
             }
           ],
@@ -1457,6 +1512,8 @@ final class ProtocolCompatibilityTests: XCTestCase {
             "calls": 2,
             "input_tokens": 10,
             "output_tokens": 5,
+            "cache_read_tokens": 4,
+            "cache_write_tokens": 1,
             "cost_usd": 0.25,
             "by_role": [],
             "by_model": [],
@@ -1468,7 +1525,9 @@ final class ProtocolCompatibilityTests: XCTestCase {
         let result = try JSONDecoder().decode(ProjectUsageResult.self, from: Data(json.utf8))
         XCTAssertEqual(result.projectId, "project-1")
         XCTAssertEqual(result.sessions.first?.totalTokens, 15)
+        XCTAssertEqual(result.sessions.first?.cacheReadTokens, 4)
         XCTAssertEqual(result.totals.calls, 2)
+        XCTAssertEqual(result.totals.cacheWriteTokens, 1)
     }
 
     func testUsageCsvResultDecodes() throws {
