@@ -7530,7 +7530,17 @@ impl Store {
     /// threshold window, increments `stall_count`, and refreshes the
     /// observation timestamp. It never cancels, retries, or edits the task.
     pub fn sweep_task_stalls(&self, threshold: std::time::Duration) -> Result<Vec<TaskStall>> {
-        self.sweep_task_stalls_at(threshold, time::OffsetDateTime::now_utc())
+        self.sweep_task_stalls_with_events(threshold)
+            .map(|(stalls, _)| stalls)
+    }
+
+    /// Same sweep, but also returns the inserted `orchestration.stall` events
+    /// so the caller can broadcast them to live subscribers.
+    pub fn sweep_task_stalls_with_events(
+        &self,
+        threshold: std::time::Duration,
+    ) -> Result<(Vec<TaskStall>, Vec<Event>)> {
+        self.sweep_task_stalls_with_events_at(threshold, time::OffsetDateTime::now_utc())
     }
 
     pub fn sweep_task_stalls_at(
@@ -7538,8 +7548,17 @@ impl Store {
         threshold: std::time::Duration,
         now: time::OffsetDateTime,
     ) -> Result<Vec<TaskStall>> {
+        self.sweep_task_stalls_with_events_at(threshold, now)
+            .map(|(stalls, _)| stalls)
+    }
+
+    pub fn sweep_task_stalls_with_events_at(
+        &self,
+        threshold: std::time::Duration,
+        now: time::OffsetDateTime,
+    ) -> Result<(Vec<TaskStall>, Vec<Event>)> {
         if threshold.is_zero() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let threshold_nanos = threshold.as_nanos().min(i64::MAX as u128) as i64;
         let threshold = time::Duration::nanoseconds(threshold_nanos);
@@ -7678,7 +7697,7 @@ impl Store {
                 tracing::warn!(%error, "failed to append event mirror");
             }
         }
-        Ok(stalls)
+        Ok((stalls, events))
     }
 
     /// Sessions with retryable DAG tasks that are idle/failed/cancelled and

@@ -4876,8 +4876,12 @@ impl Engine {
             return Ok(0);
         }
         let store = self.store.clone();
-        let stalls =
-            tokio::task::spawn_blocking(move || store.sweep_task_stalls(threshold)).await??;
+        let (stalls, events) =
+            tokio::task::spawn_blocking(move || store.sweep_task_stalls_with_events(threshold))
+                .await??;
+        for event in events {
+            self.broadcast_event(event);
+        }
         Ok(stalls.len())
     }
 

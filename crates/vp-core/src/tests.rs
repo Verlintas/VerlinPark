@@ -4696,9 +4696,22 @@ async fn plan_task_stall_sweep_is_observability_only() {
     assert_eq!(progress[0].stall_count, 0);
 
     let threshold = Duration::from_millis(200);
+    let mut live_events = engine.subscribe();
     assert_eq!(engine.sweep_task_stalls(threshold).await.unwrap(), 0);
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(engine.sweep_task_stalls(threshold).await.unwrap(), 1);
+    let broadcast = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = live_events.recv().await.unwrap();
+            if event.kind == "orchestration.stall" {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("stall event was not broadcast to live subscribers");
+    assert_eq!(broadcast.payload["task_id"], "T1");
+    assert_eq!(broadcast.payload["stall_count"], 1);
     let stalls = engine.session_stalls(&session.id).await.unwrap();
     assert_eq!(stalls.stalls.len(), 1);
     assert_eq!(stalls.stalls[0].task_id, "T1");
