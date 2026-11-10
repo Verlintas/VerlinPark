@@ -9,6 +9,7 @@ This file is for coding agents working in this repository. Read it before changi
 - [docs/DECISIONS.md](docs/DECISIONS.md) — accepted ADRs
 - [docs/PROGRESS.md](docs/PROGRESS.md) — what is actually implemented
 - [docs/AUDIT.md](docs/AUDIT.md) — known enforcement gaps and priority order
+- [docs/TOOLING_ROADMAP.md](docs/TOOLING_ROADMAP.md) — complete agent tooling gap list, prioritized implementation budget, and smart-tool design rules
 - [docs/README.md](docs/README.md) — documentation map
 
 ## Current milestone
