@@ -3695,6 +3695,179 @@ impl Provider for PausingProvider {
     }
 }
 
+struct SteeringProvider {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    calls: std::sync::atomic::AtomicUsize,
+    requests: Mutex<Vec<ChatRequest>>,
+}
+
+#[async_trait]
+impl Provider for SteeringProvider {
+    fn id(&self) -> &str {
+        "steering"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+        self.requests.lock().unwrap().push(request);
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::ToolCall(ToolCall {
+                    id: "steer-read".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                })),
+                Ok(StreamEvent::Done),
+            ])))
+        } else {
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("steering honored".into())),
+                Ok(StreamEvent::Done),
+            ])))
+        }
+    }
+}
+
+struct GatedFinalProvider {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Provider for GatedFinalProvider {
+    fn id(&self) -> &str {
+        "gated-final"
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamEvent::TextDelta("done".into())),
+            Ok(StreamEvent::Done),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn steering_is_delivered_at_the_next_turn_boundary() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(SteeringProvider {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
+    });
+    let provider_trait: Arc<dyn Provider> = provider.clone();
+    let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+    let session = engine
+        .create_session(project.id, "steering".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "steering").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), provider.started.notified())
+        .await
+        .unwrap();
+    let steering = engine
+        .steer_session(&session.id, "inspect the tests first", None, None)
+        .await
+        .unwrap()
+        .steering;
+    provider.release.notify_one();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests.len() >= 2, "expected a second provider call");
+        assert!(requests[1].messages.iter().any(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .starts_with(&format!("[Operator steering #{}]", steering.id))
+                && message.content.contains("inspect the tests first")
+        }));
+    }
+    let listed = engine
+        .session_steering(&session.id, None, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(listed.steering[0].status, "delivered");
+    assert!(listed.steering[0].delivered_at.is_some());
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "steering.delivered")
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.steering_matches, "{replay:?}");
+}
+
+#[tokio::test]
+async fn steering_left_pending_when_a_run_ends_is_cancelled() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(GatedFinalProvider {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let provider_trait: Arc<dyn Provider> = provider.clone();
+    let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+    let session = engine
+        .create_session(project.id, "cleanup".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "cleanup").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), provider.started.notified())
+        .await
+        .unwrap();
+    let steering = engine
+        .steer_session(&session.id, "too late", None, None)
+        .await
+        .unwrap()
+        .steering;
+    provider.release.notify_one();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let listed = engine
+        .session_steering(&session.id, None, Some(10))
+        .await
+        .unwrap();
+    let steering = listed
+        .steering
+        .iter()
+        .find(|message| message.id == steering.id)
+        .unwrap();
+    assert_eq!(steering.status, "cancelled");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "steering.cancelled")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "steering.delivered")
+    );
+}
+
 #[tokio::test]
 async fn mailbox_tools_send_read_and_publish() {
     let dir = TempDir::new().unwrap();

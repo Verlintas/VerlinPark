@@ -15,10 +15,10 @@ use vp_protocol::types::{
     ArtifactVersion, CheckpointRetentionPolicy, Event, IntakeTask, IntegrationPolicy,
     MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryItem, MemoryPolicy,
     MergeQueueEntry, ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
-    Project, ProjectBudget, ProjectUsageSession, Question, ScheduledTask, SearchHit, Session,
-    SessionBundle, ShellPolicy, Skill, Source, SourceChunk, SourceCollection, SourceSearchHit,
-    SourceStats, StoredMessage, TaskSchedulerPolicy, TeamPlan, TodoItem, UsageEntry,
-    WorktreeRetentionPolicy, WriteLease,
+    PlanTaskProgress, Project, ProjectBudget, ProjectUsageSession, Question, ScheduledTask,
+    SearchHit, Session, SessionBundle, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
+    SourceSearchHit, SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall,
+    TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
 };
 
 use crate::paths;
@@ -259,7 +259,17 @@ pub struct SessionRepair {
     pub memories: Option<Vec<MemoryItem>>,
     pub questions: Option<Vec<Question>>,
     pub tasks: Option<Vec<ScheduledTask>>,
+    pub steering: Option<Vec<SteeringMessage>>,
     pub artifact_warnings: Vec<String>,
+}
+
+/// A steering row delivered at a turn boundary, plus the optional persisted
+/// user message used by top-level runs.
+#[derive(Debug, Clone)]
+pub struct DeliveredSteering {
+    pub steering: SteeringMessage,
+    pub message: Option<StoredMessage>,
+    pub content: String,
 }
 
 pub type PendingTaskSessionRow = (String, String, i32, usize, String, i32, u64);
@@ -1042,6 +1052,19 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_approvals_session
                 ON approvals(session_id, created_at);
 
+            CREATE TABLE IF NOT EXISTS steering_messages (
+                id           TEXT PRIMARY KEY,
+                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                agent_id     TEXT NOT NULL,
+                task_id      TEXT,
+                body         TEXT NOT NULL,
+                status       TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                delivered_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_steering_messages_session
+                ON steering_messages(session_id, agent_id, status, created_at);
 
             CREATE TABLE IF NOT EXISTS merge_queue (
                 id          TEXT PRIMARY KEY,
@@ -1093,6 +1116,22 @@ impl Store {
                 ON plan_tasks(status, priority, enqueued_at);
             CREATE INDEX IF NOT EXISTS idx_plan_tasks_session
                 ON plan_tasks(session_id, plan_seq);
+
+            CREATE TABLE IF NOT EXISTS plan_task_progress (
+                session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                plan_seq          INTEGER NOT NULL,
+                task_id           TEXT NOT NULL,
+                project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                last_progress_at  TEXT NOT NULL,
+                stall_count       INTEGER NOT NULL DEFAULT 0,
+                last_turn         INTEGER,
+                last_tool         TEXT,
+                updated_at        TEXT NOT NULL,
+                PRIMARY KEY (session_id, plan_seq, task_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_plan_task_progress_session
+                ON plan_task_progress(session_id, task_id);
 
             CREATE TABLE IF NOT EXISTS write_leases (
                 agent_id    TEXT PRIMARY KEY,
@@ -6615,6 +6654,298 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Persist an operator steering request and its creation event in one
+    /// transaction. The engine validates the target run before calling this.
+    pub fn create_steering_with_event(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        task_id: Option<&str>,
+        body: &str,
+    ) -> Result<(SteeringMessage, Event)> {
+        let steering = SteeringMessage {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.to_string(),
+            task_id: task_id.map(str::to_string),
+            body: body.to_string(),
+            status: "pending".to_string(),
+            created_at: now_rfc3339(),
+            delivered_at: None,
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                params![session_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        tx.execute(
+            "INSERT INTO steering_messages
+             (id, session_id, agent_id, task_id, body, status, created_at, delivered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            params![
+                steering.id,
+                steering.session_id,
+                steering.agent_id,
+                steering.task_id,
+                steering.body,
+                steering.status,
+                steering.created_at
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "steering.created",
+            serde_json::to_value(&steering)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((steering, event))
+    }
+
+    pub fn list_steering(
+        &self,
+        session_id: &str,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<SteeringMessage>> {
+        let conn = self.lock()?;
+        let limit = limit.unwrap_or(500).clamp(1, 2_000) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, agent_id, task_id, body, status, created_at, delivered_at
+             FROM steering_messages
+             WHERE session_id = ?1 AND (?2 IS NULL OR status = ?2)
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![session_id, status, limit], map_steering)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn cancel_steering_with_event(&self, id: &str) -> Result<(SteeringMessage, Event)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let steering = tx
+            .query_row(
+                "SELECT id, session_id, agent_id, task_id, body, status, created_at, delivered_at
+                 FROM steering_messages WHERE id = ?1",
+                params![id],
+                map_steering,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("steering message not found: {id}"))?;
+        if steering.status != "pending" {
+            anyhow::bail!("steering message {id} is already {}", steering.status);
+        }
+        tx.execute(
+            "UPDATE steering_messages SET status = 'cancelled' WHERE id = ?1 AND status = 'pending'",
+            params![id],
+        )?;
+        let mut cancelled = steering;
+        cancelled.status = "cancelled".to_string();
+        let event = insert_event_tx(
+            &tx,
+            &cancelled.session_id,
+            "steering.cancelled",
+            serde_json::to_value(&cancelled)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((cancelled, event))
+    }
+
+    /// Cancel everything still pending for a run that is ending. This is the
+    /// terminal-run cleanup path: an undelivered instruction must not leak to
+    /// a later run that happens to reuse the same agent row.
+    pub fn cancel_pending_steering_for_agent_with_events(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        reason: &str,
+    ) -> Result<Vec<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let pending = {
+            let mut stmt = tx.prepare(
+                "SELECT id, session_id, agent_id, task_id, body, status, created_at, delivered_at
+                 FROM steering_messages
+                 WHERE session_id = ?1 AND agent_id = ?2 AND status = 'pending'
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id, agent_id], map_steering)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut events = Vec::new();
+        for steering in pending {
+            tx.execute(
+                "UPDATE steering_messages SET status = 'cancelled' WHERE id = ?1 AND status = 'pending'",
+                params![steering.id],
+            )?;
+            let mut cancelled = steering;
+            cancelled.status = "cancelled".to_string();
+            let mut payload = serde_json::to_value(&cancelled)?;
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("reason".into(), serde_json::json!(reason));
+            }
+            events.push(insert_event_tx(
+                &tx,
+                &cancelled.session_id,
+                "steering.cancelled",
+                payload,
+            )?);
+        }
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok(events)
+    }
+
+    /// Deliver every pending instruction for the current agent (and task, when
+    /// scoped) in creation order. Row update, optional persisted user message,
+    /// and both audit events commit together.
+    pub fn deliver_pending_steering_with_events(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        task_id: Option<&str>,
+        persist_messages: bool,
+    ) -> Result<(Vec<DeliveredSteering>, Vec<Event>)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let pending = {
+            let mut stmt = tx.prepare(
+                "SELECT id, session_id, agent_id, task_id, body, status, created_at, delivered_at
+                 FROM steering_messages
+                 WHERE session_id = ?1 AND agent_id = ?2 AND status = 'pending'
+                   AND (task_id IS NULL OR task_id = ?3)
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id, agent_id, task_id], map_steering)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut delivered = Vec::new();
+        let mut events = Vec::new();
+        for steering in pending {
+            let delivered_at = now_rfc3339();
+            let changed = tx.execute(
+                "UPDATE steering_messages
+                 SET status = 'delivered', delivered_at = ?1
+                 WHERE id = ?2 AND status = 'pending'",
+                params![delivered_at, steering.id],
+            )?;
+            if changed == 0 {
+                continue;
+            }
+            let mut steering = steering;
+            steering.status = "delivered".to_string();
+            steering.delivered_at = Some(delivered_at);
+            let content = steering_content(&steering);
+            let message = if persist_messages {
+                let message = StoredMessage {
+                    id: Uuid::now_v7().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "user".to_string(),
+                    content: content.clone(),
+                    tool_calls: serde_json::json!([]),
+                    tool_call_id: None,
+                    created_at: now_rfc3339(),
+                };
+                tx.execute(
+                    "INSERT INTO messages
+                     (id, session_id, role, content, tool_calls, tool_call_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                    params![
+                        message.id,
+                        message.session_id,
+                        message.role,
+                        message.content,
+                        serde_json::to_string(&message.tool_calls)?,
+                        message.created_at
+                    ],
+                )?;
+                events.push(insert_event_tx(
+                    &tx,
+                    session_id,
+                    "message.created",
+                    serde_json::to_value(&message)?,
+                )?);
+                Some(message)
+            } else {
+                None
+            };
+            events.push(insert_event_tx(
+                &tx,
+                session_id,
+                "steering.delivered",
+                serde_json::to_value(&steering)?,
+            )?);
+            delivered.push(DeliveredSteering {
+                steering,
+                message,
+                content,
+            });
+        }
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((delivered, events))
+    }
+
+    /// Replace the steering projection from replayed events. Used by
+    /// `session.replay {repair}` and `vp db-rebuild`.
+    pub fn replace_steering_messages(
+        &self,
+        session_id: &str,
+        messages: &[SteeringMessage],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM steering_messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for message in messages {
+            if message.session_id != session_id {
+                return Err(anyhow!("steering message belongs to a different session"));
+            }
+            tx.execute(
+                "INSERT INTO steering_messages
+                 (id, session_id, agent_id, task_id, body, status, created_at, delivered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    message.id,
+                    message.session_id,
+                    message.agent_id,
+                    message.task_id,
+                    message.body,
+                    message.status,
+                    message.created_at,
+                    message.delivered_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn create_approval(
         &self,
         session_id: &str,
@@ -7055,6 +7386,12 @@ impl Store {
             "DELETE FROM plan_tasks WHERE session_id = ?1",
             params![session_id],
         )?;
+        // Progress is operational telemetry for the current revision; rows
+        // from an older plan revision would never match a live task again.
+        tx.execute(
+            "DELETE FROM plan_task_progress WHERE session_id = ?1 AND plan_seq <> ?2",
+            params![session_id, plan_seq as i64],
+        )?;
         for task in &plan.tasks {
             let state = states.get(&task.id);
             let status = state
@@ -7116,6 +7453,232 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![project_id, session_id], map_scheduled_task)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Operational progress rows, joined against the current plan-task
+    /// projection so rows from an older plan revision are not reported.
+    pub fn list_plan_task_progress(
+        &self,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<PlanTaskProgress>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT p.session_id, p.project_id, p.plan_seq, p.task_id,
+                    p.last_progress_at, p.stall_count, p.last_turn, p.last_tool, p.updated_at
+             FROM plan_task_progress p
+             JOIN plan_tasks t
+               ON t.session_id = p.session_id AND t.plan_seq = p.plan_seq AND t.task_id = p.task_id
+             WHERE (?1 IS NULL OR p.project_id = ?1) AND (?2 IS NULL OR p.session_id = ?2)
+             ORDER BY p.session_id ASC, p.plan_seq ASC, p.task_id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id, session_id], map_plan_task_progress)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Record a bounded turn/tool-boundary observation for a task-scoped run.
+    /// Returns false when the task is no longer active, so a late tool result
+    /// cannot resurrect progress for a finished task.
+    pub fn touch_plan_task_progress(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        turn: u32,
+        tool: Option<&str>,
+    ) -> Result<bool> {
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        let active = conn
+            .query_row(
+                "SELECT plan_seq, project_id FROM plan_tasks
+                 WHERE session_id = ?1 AND task_id = ?2
+                   AND status IN ('running', 'claimed')
+                 ORDER BY plan_seq DESC LIMIT 1",
+                params![session_id, task_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((plan_seq, project_id)) = active else {
+            return Ok(false);
+        };
+        conn.execute(
+            "INSERT INTO plan_task_progress
+             (session_id, plan_seq, task_id, project_id, last_progress_at, stall_count,
+              last_turn, last_tool, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?5)
+             ON CONFLICT(session_id, plan_seq, task_id) DO UPDATE SET
+                last_progress_at = excluded.last_progress_at,
+                last_turn = excluded.last_turn,
+                last_tool = COALESCE(excluded.last_tool, plan_task_progress.last_tool),
+                updated_at = excluded.updated_at",
+            params![
+                session_id,
+                plan_seq,
+                task_id,
+                project_id,
+                now,
+                i64::from(turn),
+                tool
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Observability-only stall sweep. It finds running/claimed plan tasks
+    /// whose last observation (progress, attempt start, or enqueue time) is
+    /// older than the threshold, emits one `orchestration.stall` event per
+    /// threshold window, increments `stall_count`, and refreshes the
+    /// observation timestamp. It never cancels, retries, or edits the task.
+    pub fn sweep_task_stalls(&self, threshold: std::time::Duration) -> Result<Vec<TaskStall>> {
+        self.sweep_task_stalls_at(threshold, time::OffsetDateTime::now_utc())
+    }
+
+    pub fn sweep_task_stalls_at(
+        &self,
+        threshold: std::time::Duration,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<TaskStall>> {
+        if threshold.is_zero() {
+            return Ok(Vec::new());
+        }
+        let threshold_nanos = threshold.as_nanos().min(i64::MAX as u128) as i64;
+        let threshold = time::Duration::nanoseconds(threshold_nanos);
+        let cutoff = now - threshold;
+        let now_string = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| now_rfc3339());
+        struct Candidate {
+            session_id: String,
+            project_id: String,
+            plan_seq: i64,
+            task_id: String,
+            department: String,
+            title: String,
+            status: String,
+            attempts: u32,
+            observed_at: String,
+            stall_count: u32,
+            last_turn: Option<u32>,
+            last_tool: Option<String>,
+        }
+        let candidates = {
+            let conn = self.lock()?;
+            let mut stmt = conn.prepare(
+                "SELECT t.session_id, t.project_id, t.plan_seq, t.task_id, t.department,
+                        t.title, t.status, t.attempts,
+                        COALESCE(p.last_progress_at, t.started_at, t.enqueued_at),
+                        COALESCE(p.stall_count, 0), p.last_turn, p.last_tool
+                 FROM plan_tasks t
+                 LEFT JOIN plan_task_progress p
+                   ON p.session_id = t.session_id AND p.plan_seq = t.plan_seq
+                  AND p.task_id = t.task_id
+                 WHERE t.status IN ('running', 'claimed')
+                 ORDER BY t.session_id ASC, t.plan_seq ASC, t.task_id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(Candidate {
+                    session_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    plan_seq: row.get(2)?,
+                    task_id: row.get(3)?,
+                    department: row.get(4)?,
+                    title: row.get(5)?,
+                    status: row.get(6)?,
+                    attempts: row.get::<_, i64>(7)?.max(0) as u32,
+                    observed_at: row.get(8)?,
+                    stall_count: row.get::<_, i64>(9)?.max(0) as u32,
+                    last_turn: row
+                        .get::<_, Option<i64>>(10)?
+                        .and_then(|value| u32::try_from(value).ok()),
+                    last_tool: row.get(11)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut stalls = Vec::new();
+        let mut events = Vec::new();
+        {
+            let mut conn = self.lock()?;
+            let tx = conn.transaction()?;
+            for candidate in candidates {
+                let Ok(observed) = time::OffsetDateTime::parse(
+                    &candidate.observed_at,
+                    &time::format_description::well_known::Rfc3339,
+                ) else {
+                    continue;
+                };
+                if observed > cutoff {
+                    continue;
+                }
+                let still_active: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM plan_tasks
+                         WHERE session_id = ?1 AND plan_seq = ?2 AND task_id = ?3
+                           AND status IN ('running', 'claimed')",
+                        params![candidate.session_id, candidate.plan_seq, candidate.task_id],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if !still_active {
+                    continue;
+                }
+                let age_secs = (now - observed).whole_seconds().max(0) as u64;
+                let stall_count = candidate.stall_count.saturating_add(1);
+                tx.execute(
+                    "INSERT INTO plan_task_progress
+                     (session_id, plan_seq, task_id, project_id, last_progress_at, stall_count,
+                      last_turn, last_tool, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?5)
+                     ON CONFLICT(session_id, plan_seq, task_id) DO UPDATE SET
+                        last_progress_at = excluded.last_progress_at,
+                        stall_count = excluded.stall_count,
+                        last_turn = COALESCE(excluded.last_turn, plan_task_progress.last_turn),
+                        last_tool = COALESCE(excluded.last_tool, plan_task_progress.last_tool),
+                        updated_at = excluded.updated_at",
+                    params![
+                        candidate.session_id,
+                        candidate.plan_seq,
+                        candidate.task_id,
+                        candidate.project_id,
+                        now_string,
+                        i64::from(stall_count),
+                        candidate.last_turn.map(i64::from),
+                        candidate.last_tool
+                    ],
+                )?;
+                let stall = TaskStall {
+                    session_id: candidate.session_id.clone(),
+                    project_id: candidate.project_id,
+                    plan_seq: candidate.plan_seq.max(0) as u64,
+                    task_id: candidate.task_id,
+                    department: candidate.department,
+                    title: candidate.title,
+                    status: candidate.status,
+                    attempts: candidate.attempts,
+                    age_secs,
+                    stall_count,
+                    last_progress_at: candidate.observed_at,
+                    last_turn: candidate.last_turn,
+                    last_tool: candidate.last_tool,
+                    observed_at: now_string.clone(),
+                };
+                events.push(insert_event_tx(
+                    &tx,
+                    &stall.session_id,
+                    "orchestration.stall",
+                    serde_json::to_value(&stall)?,
+                )?);
+                stalls.push(stall);
+            }
+            tx.commit()?;
+        }
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok(stalls)
     }
 
     /// Sessions with retryable DAG tasks that are idle/failed/cancelled and
@@ -7199,6 +7762,20 @@ impl Store {
                 if changed == 0 {
                     continue;
                 }
+                tx.execute(
+                    "INSERT INTO plan_task_progress
+                     (session_id, plan_seq, task_id, project_id, last_progress_at, stall_count,
+                      last_turn, last_tool, updated_at)
+                     SELECT session_id, plan_seq, task_id, project_id, ?1, 0, NULL, NULL, ?1
+                     FROM plan_tasks
+                     WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4
+                     ON CONFLICT(session_id, plan_seq, task_id) DO UPDATE SET
+                        last_progress_at = excluded.last_progress_at,
+                        last_turn = NULL,
+                        last_tool = NULL,
+                        updated_at = excluded.updated_at",
+                    params![now, session_id, plan_seq as i64, task_id],
+                )?;
                 let task = tx.query_row(
                     "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
                             status, deps, write_scope, attempts, enqueued_at, started_at, finished_at,
@@ -8614,6 +9191,19 @@ impl Store {
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let interrupted_steering = {
+            let mut stmt = tx.prepare(
+                "SELECT id, session_id, agent_id, task_id, body, status, created_at, delivered_at
+                 FROM steering_messages WHERE status = 'pending'
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map([], map_steering)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "UPDATE steering_messages SET status = 'cancelled' WHERE status = 'pending'",
+            [],
+        )?;
         tx.execute(
             "UPDATE plan_tasks
              SET status = 'interrupted',
@@ -8704,6 +9294,23 @@ impl Store {
                     "task_status": "interrupted",
                     "reason": "daemon restarted while the task was active",
                 }),
+            )?);
+        }
+        for steering in &interrupted_steering {
+            let mut cancelled = steering.clone();
+            cancelled.status = "cancelled".to_string();
+            let mut payload = serde_json::to_value(&cancelled)?;
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "reason".into(),
+                    serde_json::json!("daemon restarted before delivery"),
+                );
+            }
+            events.push(insert_event_tx(
+                &tx,
+                &cancelled.session_id,
+                "steering.cancelled",
+                payload,
             )?);
         }
         for (approval_id, session_id) in &approvals {
@@ -8979,6 +9586,29 @@ impl Store {
                 )?;
             }
         }
+        if let Some(steering) = &repair.steering {
+            tx.execute(
+                "DELETE FROM steering_messages WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for message in steering {
+                tx.execute(
+                    "INSERT INTO steering_messages
+                     (id, session_id, agent_id, task_id, body, status, created_at, delivered_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        message.id,
+                        message.session_id,
+                        message.agent_id,
+                        message.task_id,
+                        message.body,
+                        message.status,
+                        message.created_at,
+                        message.delivered_at
+                    ],
+                )?;
+            }
+        }
         if let Some(artifacts) = &repair.artifacts {
             tx.execute(
                 "DELETE FROM artifacts WHERE session_id = ?1",
@@ -9192,6 +9822,29 @@ impl Store {
                     serde_json::to_string(&message.tool_calls)?,
                     message.tool_call_id,
                     message.created_at
+                ],
+            )?;
+        }
+        for steering in &bundle.steering {
+            if steering.session_id != bundle.session.id {
+                return Err(anyhow!(
+                    "bundle steering {} belongs to a different session",
+                    steering.id
+                ));
+            }
+            tx.execute(
+                "INSERT INTO steering_messages
+                 (id, session_id, agent_id, task_id, body, status, created_at, delivered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    steering.id,
+                    steering.session_id,
+                    steering.agent_id,
+                    steering.task_id,
+                    steering.body,
+                    steering.status,
+                    steering.created_at,
+                    steering.delivered_at
                 ],
             )?;
         }
@@ -9929,6 +10582,39 @@ fn map_scheduled_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask
         last_error: row.get(14)?,
         next_attempt_at: row.get(15)?,
     })
+}
+
+fn map_plan_task_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanTaskProgress> {
+    Ok(PlanTaskProgress {
+        session_id: row.get(0)?,
+        project_id: row.get(1)?,
+        plan_seq: row.get::<_, i64>(2)?.max(0) as u64,
+        task_id: row.get(3)?,
+        last_progress_at: row.get(4)?,
+        stall_count: row.get::<_, i64>(5)?.max(0) as u32,
+        last_turn: row
+            .get::<_, Option<i64>>(6)?
+            .and_then(|value| u32::try_from(value).ok()),
+        last_tool: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn map_steering(row: &rusqlite::Row<'_>) -> rusqlite::Result<SteeringMessage> {
+    Ok(SteeringMessage {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        task_id: row.get(3)?,
+        body: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        delivered_at: row.get(7)?,
+    })
+}
+
+pub(crate) fn steering_content(message: &SteeringMessage) -> String {
+    format!("[Operator steering #{}] {}", message.id, message.body)
 }
 
 fn insert_event_tx(

@@ -3306,6 +3306,9 @@ pub struct SessionBundle {
     /// Persistent task-DAG rows. Older bundles decode as an empty queue.
     #[serde(default)]
     pub tasks: Vec<ScheduledTask>,
+    /// Operator steering records. Older bundles decode as an empty list.
+    #[serde(default)]
+    pub steering: Vec<SteeringMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3337,6 +3340,8 @@ pub struct SessionReplayReport {
     pub notes_match: bool,
     #[serde(default)]
     pub decisions_match: bool,
+    #[serde(default)]
+    pub steering_matches: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -3468,6 +3473,125 @@ pub struct WriteLease {
     pub acquired_at: String,
 }
 
+/// Runtime progress telemetry for a task-scoped agent run. It is deliberately
+/// separate from `ScheduledTask`: the schedule row is reconstructed from plan
+/// lifecycle events, while these observations are refreshed by live turn/tool
+/// boundaries and by the stall sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanTaskProgress {
+    pub session_id: String,
+    pub project_id: String,
+    pub plan_seq: u64,
+    pub task_id: String,
+    #[serde(default)]
+    pub last_progress_at: Option<String>,
+    #[serde(default)]
+    pub stall_count: u32,
+    #[serde(default)]
+    pub last_turn: Option<u32>,
+    #[serde(default)]
+    pub last_tool: Option<String>,
+    pub updated_at: String,
+}
+
+/// One observability-only stall observation. The sweep never cancels or
+/// retries a running task; operators decide what to do with the signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStall {
+    pub session_id: String,
+    pub project_id: String,
+    pub plan_seq: u64,
+    pub task_id: String,
+    pub department: String,
+    pub title: String,
+    pub status: String,
+    pub attempts: u32,
+    pub age_secs: u64,
+    pub stall_count: u32,
+    pub last_progress_at: String,
+    #[serde(default)]
+    pub last_turn: Option<u32>,
+    #[serde(default)]
+    pub last_tool: Option<String>,
+    pub observed_at: String,
+}
+
+/// Persisted operator steering addressed to one running agent/run. Delivery
+/// is cooperative at the next turn boundary; it is never a hidden prompt
+/// injection and it never broadcasts to every agent implicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteeringMessage {
+    pub id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    pub body: String,
+    pub status: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub delivered_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionSteerParams {
+    pub session_id: String,
+    /// Operator text. `text` is accepted as a compatibility alias.
+    #[serde(alias = "text")]
+    pub body: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionSteeringParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionSteeringCancelParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSteerResult {
+    pub steering: SteeringMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSteeringListResult {
+    pub session_id: String,
+    pub steering: Vec<SteeringMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSteeringCancelResult {
+    pub cancelled: bool,
+    pub steering: SteeringMessage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionStallsParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionStallsResult {
+    pub session_id: String,
+    /// Configured threshold in seconds; 0 means the sweep is disabled.
+    pub threshold_secs: u64,
+    #[serde(default)]
+    pub progress: Vec<PlanTaskProgress>,
+    #[serde(default)]
+    pub stalls: Vec<TaskStall>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TaskQueueParams {
     #[serde(default)]
@@ -3480,6 +3604,10 @@ pub struct TaskQueueParams {
 pub struct TaskQueueResult {
     pub tasks: Vec<ScheduledTask>,
     pub leases: Vec<WriteLease>,
+    /// Operational progress observations joined by session/project. Older
+    /// clients simply ignore the additive field.
+    #[serde(default)]
+    pub progress: Vec<PlanTaskProgress>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3818,6 +3946,18 @@ pub struct OrchestrationTask {
     pub blocked_by: Vec<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    #[serde(default)]
+    pub last_progress_at: Option<String>,
+    #[serde(default)]
+    pub stall_count: u32,
+    #[serde(default)]
+    pub last_turn: Option<u32>,
+    #[serde(default)]
+    pub last_tool: Option<String>,
+    /// True when a running task's last observed progress is older than the
+    /// configured stall threshold.
+    #[serde(default)]
+    pub stalled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3896,6 +4036,8 @@ pub struct OrchestrationMetrics {
     pub merge_queue_depth: usize,
     pub merge_conflicts: usize,
     pub attention_count: usize,
+    #[serde(default)]
+    pub stalled_tasks: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4068,6 +4210,8 @@ pub struct OrchestrationOverviewTotals {
     pub retrying_tasks: usize,
     pub open_blockers: usize,
     pub merge_conflicts: usize,
+    #[serde(default)]
+    pub stalled_tasks: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

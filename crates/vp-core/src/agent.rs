@@ -8153,9 +8153,53 @@ async fn compact_context_if_needed(
     Ok(true)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[async_recursion]
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    control: &RunControl,
+    budget: &SessionBudget,
+    spec: &AgentSpec,
+    objective: &str,
+    conversation: &mut Vec<ChatMessage>,
+    conversation_ids: Option<&mut Vec<Option<String>>>,
+    top_level: bool,
+) -> Result<LoopOutcome> {
+    let result = run_loop_body(
+        engine,
+        config,
+        session,
+        project,
+        control,
+        budget,
+        spec,
+        objective,
+        conversation,
+        conversation_ids,
+        top_level,
+    )
+    .await;
+    // A run boundary is final for steering: anything still pending was not
+    // consumed at a turn boundary and must not leak into a later run that
+    // reuses this agent row.
+    if let Err(error) = engine
+        .cancel_pending_steering_for_agent(
+            &session.id,
+            &spec.id,
+            "agent run ended before the steering message was delivered",
+        )
+        .await
+    {
+        tracing::warn!(%error, agent_id = %spec.id, "failed to cancel pending steering at run end");
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_body(
     engine: &Engine,
     config: &AgentConfig,
     session: &Session,
@@ -8418,6 +8462,21 @@ async fn run_loop(
                     }),
                 )
                 .await?;
+            }
+        }
+        if let Err(error) = engine
+            .touch_task_progress(&session.id, spec.task_id.as_deref(), turn + 1, None)
+            .await
+        {
+            tracing::warn!(%error, "failed to record task turn progress");
+        }
+        let delivered = engine
+            .deliver_pending_steering(&session.id, &spec.id, spec.task_id.as_deref(), top_level)
+            .await?;
+        for steering in delivered {
+            conversation.push(ChatMessage::user(steering.content));
+            if let Some(message) = steering.message {
+                conversation_ids.push(Some(message.id));
             }
         }
         let mut request = ChatRequest {
@@ -8780,6 +8839,17 @@ async fn run_loop(
             }
             if !prepared.is_empty() {
                 for (_, call_id, name, input, _) in &prepared {
+                    if let Err(error) = engine
+                        .touch_task_progress(
+                            &session.id,
+                            spec.task_id.as_deref(),
+                            turn + 1,
+                            Some(name),
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, "failed to record task tool progress");
+                    }
                     emit(
                         engine,
                         &session.id,
@@ -8891,6 +8961,17 @@ async fn run_loop(
             }
             if budget.exhausted() {
                 return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
+            }
+            if let Err(error) = engine
+                .touch_task_progress(
+                    &session.id,
+                    spec.task_id.as_deref(),
+                    turn + 1,
+                    Some(&call.name),
+                )
+                .await
+            {
+                tracing::warn!(%error, "failed to record task tool progress");
             }
             let call_id = if call.id.is_empty() {
                 format!("call_{}_{}", turn, index)
@@ -10521,6 +10602,22 @@ async fn run_task_detail(
         .ok_or_else(|| anyhow!("task {task_id} is not in the stored TeamPlan"))?;
     let queue = engine.task_queue(None, Some(session.id.clone())).await?;
     let scheduled = queue.tasks.iter().find(|task| task.task_id == task_id);
+    let progress = queue.progress.iter().find(|task| task.task_id == task_id);
+    let threshold_secs = crate::task_stall_threshold_secs();
+    let observed_at = progress
+        .and_then(|progress| progress.last_progress_at.as_deref())
+        .or_else(|| scheduled.and_then(|task| task.started_at.as_deref()))
+        .or_else(|| scheduled.map(|task| task.enqueued_at.as_str()));
+    let stalled = threshold_secs > 0
+        && observed_at
+            .and_then(|value| {
+                time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .is_some_and(|observed| {
+                time::OffsetDateTime::now_utc() - observed
+                    >= time::Duration::seconds(threshold_secs.min(i64::MAX as u64) as i64)
+            });
     let (task_tokens, task_cost, _, _) = engine
         .usage_spent(&session.id, Some(&task_id), Some(&plan_task.department))
         .await?;
@@ -10548,6 +10645,12 @@ async fn run_task_detail(
         "next_attempt_at": scheduled.and_then(|task| task.next_attempt_at.clone()),
         "started_at": scheduled.and_then(|task| task.started_at.clone()),
         "finished_at": scheduled.and_then(|task| task.finished_at.clone()),
+        "last_progress_at": progress.and_then(|progress| progress.last_progress_at.clone()),
+        "stall_count": progress.map(|progress| progress.stall_count).unwrap_or(0),
+        "last_turn": progress.and_then(|progress| progress.last_turn),
+        "last_tool": progress.and_then(|progress| progress.last_tool.clone()),
+        "stall_threshold_secs": threshold_secs,
+        "stalled": stalled,
         "changed_paths": changed_paths,
         "current_agent_task": spec.task_id.as_deref() == Some(task_id.as_str()),
     });

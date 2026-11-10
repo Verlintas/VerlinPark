@@ -1,5 +1,6 @@
 use super::*;
 use std::process::Command;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn init_repo(path: &Path) {
@@ -4416,6 +4417,347 @@ async fn mcp_server_transport_configs_are_validated_and_persisted() {
     assert_eq!(updated.transport, vp_protocol::types::McpTransport::Sse);
     assert!(!updated.enabled);
     assert!(engine.remove_mcp_server(&server.id).await.unwrap());
+}
+
+#[tokio::test]
+async fn steering_targets_a_running_leader_orders_and_replays() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("steering".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "steer".into(), None)
+        .await
+        .unwrap();
+    let leader_id = engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .update_agent_status(&leader_id, "idle")
+        .await
+        .unwrap();
+
+    let error = engine
+        .steer_session(&session.id, "too early", None, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("no running Leader"));
+    engine
+        .update_agent_status(&leader_id, "running")
+        .await
+        .unwrap();
+
+    let first = engine
+        .steer_session(&session.id, "first instruction", None, None)
+        .await
+        .unwrap()
+        .steering;
+    let second = engine
+        .steer_session(&session.id, "second instruction", Some(&leader_id), None)
+        .await
+        .unwrap()
+        .steering;
+    let listed = engine
+        .session_steering(&session.id, Some("pending"), Some(100))
+        .await
+        .unwrap();
+    assert_eq!(
+        listed
+            .steering
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>(),
+        vec![first.id.clone(), second.id.clone()]
+    );
+
+    let delivered = engine
+        .deliver_pending_steering(&session.id, &leader_id, None, true)
+        .await
+        .unwrap();
+    assert_eq!(delivered.len(), 2);
+    assert_eq!(delivered[0].steering.id, first.id);
+    assert_eq!(delivered[1].steering.id, second.id);
+    assert!(delivered[0].content.starts_with("[Operator steering #"));
+    assert!(delivered[0].content.contains("first instruction"));
+    assert!(delivered[0].message.is_some());
+    let messages = engine.list_messages(&session.id).await.unwrap();
+    assert!(messages.iter().any(|message| message.role == "user"
+        && message.content.starts_with("[Operator steering #")
+        && message.content.contains("first instruction")));
+    let listed = engine
+        .session_steering(&session.id, None, Some(100))
+        .await
+        .unwrap();
+    assert!(
+        listed
+            .steering
+            .iter()
+            .all(|message| message.status == "delivered")
+    );
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.kind == "steering.delivered")
+            .count()
+            == 2
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.steering_matches);
+    assert!(replay.consistent, "{replay:?}");
+
+    engine
+        .store()
+        .replace_steering_messages(&session.id, &[])
+        .unwrap();
+    let drifted = engine.replay_session(&session.id).await.unwrap();
+    assert!(!drifted.steering_matches);
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(repaired.steering_matches);
+    assert!(repaired.consistent, "{repaired:?}");
+    let bundle = engine.export_session(&session.id).await.unwrap();
+    assert_eq!(bundle.steering.len(), 2);
+}
+
+#[tokio::test]
+async fn steering_rejects_wrong_targets_scopes_tasks_and_cleans_up_runs() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("steering-scope".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "scope".into(), None)
+        .await
+        .unwrap();
+    let other = engine
+        .create_session(project.id.clone(), "other".into(), None)
+        .await
+        .unwrap();
+    let leader_id = engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .update_agent_status(&leader_id, "running")
+        .await
+        .unwrap();
+    let worker = engine
+        .create_agent(&session.id, "worker", "Worker One", None, None, "test")
+        .await
+        .unwrap();
+    engine
+        .set_agent_task(&worker.id, Some("T1".into()), Some("impl".into()))
+        .await
+        .unwrap();
+    engine
+        .update_agent_status(&worker.id, "running")
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &orchestration_test_plan())
+        .await
+        .unwrap();
+
+    let error = engine
+        .steer_session(&other.id, "wrong session", Some(&leader_id), None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not in this session"));
+    let error = engine
+        .steer_session(&session.id, "wrong task", Some(&worker.id), Some("T2"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not working on task T2"));
+
+    let cancelled = engine
+        .steer_session(&session.id, "cancel me", None, None)
+        .await
+        .unwrap()
+        .steering;
+    let cancelled = engine.cancel_steering(&cancelled.id).await.unwrap();
+    assert!(cancelled.cancelled);
+    assert_eq!(cancelled.steering.status, "cancelled");
+    assert!(
+        engine
+            .cancel_steering(&cancelled.steering.id)
+            .await
+            .is_err()
+    );
+
+    let scoped = engine
+        .steer_session(&session.id, "task only", Some(&worker.id), Some("T1"))
+        .await
+        .unwrap()
+        .steering;
+    assert!(
+        engine
+            .deliver_pending_steering(&session.id, &worker.id, Some("T2"), false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let delivered = engine
+        .deliver_pending_steering(&session.id, &worker.id, Some("T1"), false)
+        .await
+        .unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].steering.id, scoped.id);
+    assert!(delivered[0].message.is_none());
+
+    let pending = engine
+        .steer_session(&session.id, "run is ending", None, None)
+        .await
+        .unwrap()
+        .steering;
+    let cancelled = engine
+        .cancel_pending_steering_for_agent(&session.id, &leader_id, "run ended")
+        .await
+        .unwrap();
+    assert_eq!(cancelled, 1);
+    let listed = engine
+        .session_steering(&session.id, None, Some(100))
+        .await
+        .unwrap();
+    let pending = listed
+        .steering
+        .iter()
+        .find(|message| message.id == pending.id)
+        .unwrap();
+    assert_eq!(pending.status, "cancelled");
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.steering_matches, "{replay:?}");
+}
+
+#[tokio::test]
+async fn plan_task_stall_sweep_is_observability_only() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("stalls".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "stall".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &orchestration_test_plan())
+        .await
+        .unwrap();
+    let queue = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap();
+    let task = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T1")
+        .unwrap()
+        .clone();
+    assert_eq!(queue.progress.len(), 0);
+    engine
+        .store()
+        .claim_plan_tasks(
+            &session.id,
+            task.plan_seq,
+            std::slice::from_ref(&task.task_id),
+        )
+        .unwrap();
+    let progress = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].stall_count, 0);
+
+    let threshold = Duration::from_millis(200);
+    assert_eq!(engine.sweep_task_stalls(threshold).await.unwrap(), 0);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(engine.sweep_task_stalls(threshold).await.unwrap(), 1);
+    let stalls = engine.session_stalls(&session.id).await.unwrap();
+    assert_eq!(stalls.stalls.len(), 1);
+    assert_eq!(stalls.stalls[0].task_id, "T1");
+    assert_eq!(stalls.stalls[0].stall_count, 1);
+    assert!(!stalls.stalls[0].last_progress_at.is_empty());
+    // The observation timestamp was refreshed, so the same window is quiet.
+    assert_eq!(engine.sweep_task_stalls(threshold).await.unwrap(), 0);
+
+    // A real progress observation resets the window: no second event yet.
+    engine
+        .touch_task_progress(&session.id, Some("T1"), 2, Some("read_file"))
+        .await
+        .unwrap();
+    assert_eq!(engine.sweep_task_stalls(threshold).await.unwrap(), 0);
+    let progress = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .progress;
+    assert_eq!(progress[0].last_turn, Some(2));
+    assert_eq!(progress[0].last_tool.as_deref(), Some("read_file"));
+    assert_eq!(progress[0].stall_count, 1);
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(engine.sweep_task_stalls(threshold).await.unwrap(), 1);
+    let progress = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .progress;
+    assert_eq!(progress[0].stall_count, 2);
+
+    // Terminal tasks never produce a stall observation.
+    engine
+        .store()
+        .finish_plan_task(&session.id, task.plan_seq, &task.task_id, "completed", None)
+        .unwrap();
+    let before = engine
+        .recent_events(&session.id, 1_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "orchestration.stall")
+        .count();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(engine.sweep_task_stalls(threshold).await.unwrap(), 0);
+    let after = engine
+        .recent_events(&session.id, 1_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "orchestration.stall")
+        .count();
+    assert_eq!(before, after);
+
+    assert_eq!(parse_task_stall_threshold(Some("0")), 0);
+    assert_eq!(parse_task_stall_threshold(Some("bad")), 1_800);
+    assert_eq!(parse_task_stall_threshold(None), 1_800);
+    assert_eq!(engine.sweep_task_stalls(Duration::ZERO).await.unwrap(), 0);
 }
 
 fn orchestration_test_plan() -> TeamPlan {

@@ -4,7 +4,8 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentRecord, Event, MergeQueueEntry, OrchestrationBlocker, OrchestrationDecision,
     OrchestrationDepartment, OrchestrationMetrics, OrchestrationNote, OrchestrationPolicy,
-    OrchestrationSnapshot, OrchestrationTask, Question, ScheduledTask, Session, TeamPlan,
+    OrchestrationSnapshot, OrchestrationTask, PlanTaskProgress, Question, ScheduledTask, Session,
+    TeamPlan,
 };
 
 use super::plan::{
@@ -21,6 +22,9 @@ pub struct OrchestrationInput<'a> {
     pub questions: &'a [Question],
     pub notes: &'a [OrchestrationNote],
     pub decisions: &'a [OrchestrationDecision],
+    pub progress: &'a [PlanTaskProgress],
+    /// `None` means stall observability is disabled.
+    pub stall_threshold_secs: Option<u64>,
     pub policy: &'a OrchestrationPolicy,
 }
 
@@ -36,6 +40,12 @@ pub fn build_snapshot(input: OrchestrationInput<'_>) -> OrchestrationSnapshot {
         .iter()
         .map(|task| (task.task_id.as_str(), task))
         .collect::<HashMap<_, _>>();
+    let progress_by_task = input
+        .progress
+        .iter()
+        .map(|progress| (progress.task_id.as_str(), progress))
+        .collect::<HashMap<_, _>>();
+    let now = time::OffsetDateTime::now_utc();
     let agent_by_task = owner_agents(input.agents);
     let verifier_status = verifier_status_by_task(input.agents, input.events);
     let notes = input.notes;
@@ -54,8 +64,28 @@ pub fn build_snapshot(input: OrchestrationInput<'_>) -> OrchestrationSnapshot {
                         .cloned()
                         .unwrap_or_else(|| "pending".to_string());
                     let scheduled = scheduled_by_task.get(task.id.as_str()).copied();
+                    let progress = progress_by_task.get(task.id.as_str()).copied();
                     let owner = agent_by_task.get(task.id.as_str());
                     let blocked = blocked_by(task, &statuses);
+                    let observed_at = progress
+                        .and_then(|progress| progress.last_progress_at.as_deref())
+                        .or_else(|| scheduled.and_then(|task| task.started_at.as_deref()))
+                        .or_else(|| scheduled.map(|task| task.enqueued_at.as_str()));
+                    let stalled = input.stall_threshold_secs.is_some_and(|threshold| {
+                        matches!(status.as_str(), "running" | "claimed")
+                            && observed_at
+                                .and_then(|value| {
+                                    time::OffsetDateTime::parse(
+                                        value,
+                                        &time::format_description::well_known::Rfc3339,
+                                    )
+                                    .ok()
+                                })
+                                .is_some_and(|observed| {
+                                    let threshold_secs = threshold.min(i64::MAX as u64) as i64;
+                                    now - observed >= time::Duration::seconds(threshold_secs)
+                                })
+                    });
                     let ready = matches!(
                         status.as_str(),
                         "pending" | "interrupted" | "failed" | "cancelled" | "retry_scheduled"
@@ -82,6 +112,12 @@ pub fn build_snapshot(input: OrchestrationInput<'_>) -> OrchestrationSnapshot {
                         blocked_by: blocked,
                         started_at: scheduled.and_then(|task| task.started_at.clone()),
                         finished_at: scheduled.and_then(|task| task.finished_at.clone()),
+                        last_progress_at: progress
+                            .and_then(|progress| progress.last_progress_at.clone()),
+                        stall_count: progress.map(|progress| progress.stall_count).unwrap_or(0),
+                        last_turn: progress.and_then(|progress| progress.last_turn),
+                        last_tool: progress.and_then(|progress| progress.last_tool.clone()),
+                        stalled,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -285,6 +321,7 @@ pub fn build_snapshot(input: OrchestrationInput<'_>) -> OrchestrationSnapshot {
         merge_queue_depth: input.merge_queue.len(),
         merge_conflicts,
         attention_count: attention,
+        stalled_tasks: tasks.iter().filter(|task| task.stalled).count(),
     };
 
     OrchestrationSnapshot {

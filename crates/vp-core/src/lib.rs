@@ -40,21 +40,25 @@ use vp_protocol::types::{
     SessionForkTreeNode, SessionForkTreeResult, SessionImportResult, SessionLandResult,
     SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPriorityResult,
     SessionRehydrateResult, SessionReplayReport, SessionSkillActivationsResult,
-    SessionTranscriptResult, SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation,
-    SkillCreateParams, SkillDeleteResult, SkillEnabledParams, SkillImportParams, SkillListResult,
-    SkillUpdateParams, Source, SourceChunk, SourceCitation, SourceCollectionsResult,
-    SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams, SourceDeleteResult,
-    SourceGetResult, SourceImportError, SourceImportParams, SourceImportResult, SourceListResult,
-    SourceReindexResult, SourceSearchResult, SourceStats, StoredMessage, TaskQueueResult,
-    TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult,
-    TerminalOpenResult, TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem,
-    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageBucket, UsageCsvResult, UsageEntry,
-    UsageLedgerResult, UsageTotals, WorkspaceFileResult, WorkspaceGrepResult, WorkspaceListResult,
-    WorkspaceSearchResult, WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry,
-    WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
+    SessionStallsResult, SessionSteerResult, SessionSteeringCancelResult,
+    SessionSteeringListResult, SessionTranscriptResult, SessionUnlimitedResult, ShellPolicy, Skill,
+    SkillActivation, SkillCreateParams, SkillDeleteResult, SkillEnabledParams, SkillImportParams,
+    SkillListResult, SkillUpdateParams, Source, SourceChunk, SourceCitation,
+    SourceCollectionsResult, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
+    SourceDeleteResult, SourceGetResult, SourceImportError, SourceImportParams, SourceImportResult,
+    SourceListResult, SourceReindexResult, SourceSearchResult, SourceStats, SteeringMessage,
+    StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TaskStall,
+    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    TerminalWriteResult, TodoItem, UpdateModelPresetParams, UpdateSourceMetadataParams,
+    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
+    WorkspaceGrepResult, WorkspaceListResult, WorkspaceSearchResult, WorkspaceTreeResult,
+    WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
+    WorktreeRetentionPolicy, WriteLease,
 };
 use vp_store::Store;
-use vp_store::store::{NewIntakeTask, SessionRepair, SourceSearchQuery, SourceSnapshot};
+use vp_store::store::{
+    DeliveredSteering, NewIntakeTask, SessionRepair, SourceSearchQuery, SourceSnapshot,
+};
 
 use crate::budget::BudgetRegistry;
 
@@ -97,6 +101,7 @@ struct ReplayData {
     memories: Vec<MemoryItem>,
     questions: Vec<Question>,
     tasks: Vec<ScheduledTask>,
+    steering: Vec<SteeringMessage>,
     notes: Vec<OrchestrationNote>,
     decisions: Vec<OrchestrationDecision>,
     events: Vec<Event>,
@@ -4138,10 +4143,13 @@ impl Engine {
             .await??
             .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
         let plan = self.get_team_plan(session_id).await?;
-        let tasks = self
-            .task_queue(None, Some(session_id.to_string()))
-            .await?
-            .tasks;
+        let queue = self.task_queue(None, Some(session_id.to_string())).await?;
+        let tasks = queue.tasks;
+        let progress = queue.progress;
+        let stall_threshold_secs = match task_stall_threshold_secs() {
+            0 => None,
+            secs => Some(secs),
+        };
         let agents = self.list_agents(session_id).await?;
         let merge_queue = self.list_merge_queue(session_id).await?;
         let questions = self
@@ -4163,6 +4171,8 @@ impl Engine {
                 questions: &questions,
                 notes: &notes,
                 decisions: &decisions,
+                progress: &progress,
+                stall_threshold_secs,
                 policy: &policy,
             },
         ))
@@ -4325,6 +4335,10 @@ impl Engine {
             merge_conflicts: summaries
                 .iter()
                 .map(|summary| summary.metrics.merge_conflicts)
+                .sum(),
+            stalled_tasks: summaries
+                .iter()
+                .map(|summary| summary.metrics.stalled_tasks)
                 .sum(),
         };
         Ok(OrchestrationOverviewResult {
@@ -4669,6 +4683,224 @@ impl Engine {
         session_id: Option<String>,
     ) -> Result<TaskQueueResult> {
         self.scheduler.queue(project_id, session_id).await
+    }
+
+    /// Create an operator steering request for one running agent/run. When
+    /// `agent_id` is omitted the session Leader is targeted; there is no
+    /// implicit broadcast to Workers.
+    pub async fn steer_session(
+        &self,
+        session_id: &str,
+        body: &str,
+        agent_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Result<SessionSteerResult> {
+        let body = body.trim();
+        if body.is_empty() || body.chars().count() > 4_000 {
+            anyhow::bail!("steering body must be 1-4000 chars");
+        }
+        let task_id = task_id.map(str::trim).filter(|task| !task.is_empty());
+        if let Some(task_id) = task_id {
+            crate::worktree::validate_task_id(task_id)?;
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let agents = self.list_agents(session_id).await?;
+        let target = match agent_id {
+            Some(agent_id) => agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .ok_or_else(|| anyhow!("target agent is not in this session: {agent_id}"))?,
+            None => agents
+                .iter()
+                .find(|agent| {
+                    agent.role == "leader"
+                        && matches!(agent.status.as_str(), "running" | "waiting_input")
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no running Leader in this session; pass --agent <id> or start the session"
+                    )
+                })?,
+        };
+        if !matches!(target.status.as_str(), "running" | "waiting_input") {
+            anyhow::bail!(
+                "target agent {} is {}; steering requires a running or waiting agent",
+                target.id,
+                target.status
+            );
+        }
+        if let Some(task_id) = task_id {
+            if target.task_id.as_deref() != Some(task_id) {
+                anyhow::bail!(
+                    "target agent {} is not working on task {task_id}",
+                    target.id
+                );
+            }
+            if let Some(plan) = self.get_team_plan(session_id).await?
+                && !plan.tasks.iter().any(|task| task.id == task_id)
+            {
+                anyhow::bail!("task {task_id} is not in the stored TeamPlan");
+            }
+        }
+        let target_id = target.id.clone();
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let body = body.to_string();
+        let task_id = task_id.map(str::to_string);
+        let (steering, event) = tokio::task::spawn_blocking(move || {
+            store.create_steering_with_event(&session_id, &target_id, task_id.as_deref(), &body)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(SessionSteerResult { steering })
+    }
+
+    pub async fn session_steering(
+        &self,
+        session_id: &str,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<SessionSteeringListResult> {
+        if let Some(status) = status
+            && !matches!(status, "pending" | "delivered" | "cancelled")
+        {
+            anyhow::bail!("steering status must be pending, delivered, or cancelled");
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let status = status.map(str::to_string);
+        let steering =
+            tokio::task::spawn_blocking(move || store.list_steering(&id, status.as_deref(), limit))
+                .await??;
+        Ok(SessionSteeringListResult {
+            session_id: session_id.to_string(),
+            steering,
+        })
+    }
+
+    pub async fn cancel_steering(&self, id: &str) -> Result<SessionSteeringCancelResult> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let (steering, event) =
+            tokio::task::spawn_blocking(move || store.cancel_steering_with_event(&id)).await??;
+        let _ = self.events.send(event);
+        Ok(SessionSteeringCancelResult {
+            cancelled: true,
+            steering,
+        })
+    }
+
+    /// Drain pending steering for the current turn. Called by the agent loop
+    /// before the next provider request; top-level runs also persist a visible
+    /// user message while child runs keep the injected turn in memory and the
+    /// event log.
+    pub async fn deliver_pending_steering(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        task_id: Option<&str>,
+        persist_messages: bool,
+    ) -> Result<Vec<DeliveredSteering>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+        let task_id = task_id.map(str::to_string);
+        let (delivered, events) = tokio::task::spawn_blocking(move || {
+            store.deliver_pending_steering_with_events(
+                &session_id,
+                &agent_id,
+                task_id.as_deref(),
+                persist_messages,
+            )
+        })
+        .await??;
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        Ok(delivered)
+    }
+
+    /// Bounded turn/tool progress observation for a task-scoped run.
+    pub async fn touch_task_progress(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        turn: u32,
+        tool: Option<&str>,
+    ) -> Result<bool> {
+        let Some(task_id) = task_id else {
+            return Ok(false);
+        };
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let tool = tool.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            store.touch_plan_task_progress(&session_id, &task_id, turn, tool.as_deref())
+        })
+        .await?
+    }
+
+    /// Terminal-run cleanup: cancel anything still pending for this agent.
+    pub async fn cancel_pending_steering_for_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        reason: &str,
+    ) -> Result<usize> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+        let reason = reason.to_string();
+        let events = tokio::task::spawn_blocking(move || {
+            store.cancel_pending_steering_for_agent_with_events(&session_id, &agent_id, &reason)
+        })
+        .await??;
+        let count = events.len();
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        Ok(count)
+    }
+
+    /// Run one observability-only stall sweep. Zero disables it.
+    pub async fn sweep_task_stalls(&self, threshold: std::time::Duration) -> Result<usize> {
+        if threshold.is_zero() {
+            return Ok(0);
+        }
+        let store = self.store.clone();
+        let stalls =
+            tokio::task::spawn_blocking(move || store.sweep_task_stalls(threshold)).await??;
+        Ok(stalls.len())
+    }
+
+    pub async fn session_stalls(&self, session_id: &str) -> Result<SessionStallsResult> {
+        let threshold_secs = task_stall_threshold_secs();
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let progress =
+            tokio::task::spawn_blocking(move || store.list_plan_task_progress(None, Some(&id)))
+                .await??;
+        let events = self.recent_events(session_id, 5_000).await?;
+        let mut stalls = events
+            .into_iter()
+            .filter(|event| event.kind == "orchestration.stall")
+            .filter_map(|event| serde_json::from_value::<TaskStall>(event.payload).ok())
+            .collect::<Vec<_>>();
+        stalls.truncate(200);
+        Ok(SessionStallsResult {
+            session_id: session_id.to_string(),
+            threshold_secs,
+            progress,
+            stalls,
+        })
     }
 
     pub async fn write_leases(
@@ -6637,6 +6869,7 @@ impl Engine {
             let memories = store.list_session_memories(&id)?;
             let questions = store.list_session_questions(&id)?;
             let tasks = store.list_plan_tasks(None, Some(&id))?;
+            let steering = store.list_steering(&id, None, Some(2_000))?;
             let notes = store.list_coordination_notes(&id, 2_000)?;
             let decisions = store.list_orchestration_decisions(&id, 2_000)?;
             let events = store.list_all_events(&id)?;
@@ -6654,6 +6887,7 @@ impl Engine {
                 memories,
                 questions,
                 tasks,
+                steering,
                 notes,
                 decisions,
                 events,
@@ -7333,6 +7567,24 @@ impl Engine {
                 expected_decision_values.len()
             ));
         }
+        let expected_steering = replay_steering(&data.events);
+        let expected_steering_values = expected_steering
+            .iter()
+            .filter_map(|message| Some((message.id.clone(), serde_json::to_value(message).ok()?)))
+            .collect::<HashMap<_, _>>();
+        let projected_steering_values = data
+            .steering
+            .iter()
+            .filter_map(|message| Some((message.id.clone(), serde_json::to_value(message).ok()?)))
+            .collect::<HashMap<_, _>>();
+        let steering_matches = expected_steering_values == projected_steering_values;
+        if !steering_matches {
+            mismatches.push(format!(
+                "steering: projection={}, replay={}",
+                projected_steering_values.len(),
+                expected_steering_values.len()
+            ));
+        }
 
         let expected_artifacts = Self::expected_artifacts(data);
         let projected_artifacts = data
@@ -7583,7 +7835,8 @@ impl Engine {
             && agents_matches
             && queue_matches
             && notes_match
-            && decisions_match;
+            && decisions_match
+            && steering_matches;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -7603,6 +7856,7 @@ impl Engine {
             task_queue_matches,
             notes_match,
             decisions_match,
+            steering_matches,
             consistent,
             repaired,
             rebuilt: false,
@@ -7886,6 +8140,7 @@ impl Engine {
             memories,
             questions,
             tasks: Self::expected_tasks(data),
+            steering: Some(replay_steering(&data.events)),
             artifact_warnings,
         })
     }
@@ -8170,6 +8425,7 @@ impl Engine {
             memories: data.memories,
             questions: data.questions,
             tasks: data.tasks,
+            steering: data.steering,
         })
     }
 
@@ -10191,6 +10447,40 @@ fn replay_session_unlimited(events: &[Event]) -> bool {
             _ => None,
         })
         .unwrap_or(false)
+}
+
+/// Stall observability threshold. `VERLINPARK_TASK_STALL_SECS=0` disables the
+/// sweep; malformed or absent values fall back to 30 minutes.
+pub fn task_stall_threshold_secs() -> u64 {
+    parse_task_stall_threshold(std::env::var("VERLINPARK_TASK_STALL_SECS").ok().as_deref())
+}
+
+pub fn parse_task_stall_threshold(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1_800)
+}
+
+fn replay_steering(events: &[Event]) -> Vec<SteeringMessage> {
+    let mut latest = HashMap::new();
+    for event in events {
+        if !matches!(
+            event.kind.as_str(),
+            "steering.created" | "steering.delivered" | "steering.cancelled"
+        ) {
+            continue;
+        }
+        if let Ok(message) = serde_json::from_value::<SteeringMessage>(event.payload.clone()) {
+            latest.insert(message.id.clone(), message);
+        }
+    }
+    let mut messages = latest.into_values().collect::<Vec<_>>();
+    messages.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    messages
 }
 
 fn replay_session_cost(events: &[Event]) -> f64 {

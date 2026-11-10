@@ -421,7 +421,13 @@ impl TaskScheduler {
         tokio::task::spawn_blocking(move || {
             let tasks = store.list_plan_tasks(project_id.as_deref(), session_id.as_deref())?;
             let leases = store.list_write_leases(project_id.as_deref(), session_id.as_deref())?;
-            Ok(TaskQueueResult { tasks, leases })
+            let progress =
+                store.list_plan_task_progress(project_id.as_deref(), session_id.as_deref())?;
+            Ok(TaskQueueResult {
+                tasks,
+                leases,
+                progress,
+            })
         })
         .await?
     }

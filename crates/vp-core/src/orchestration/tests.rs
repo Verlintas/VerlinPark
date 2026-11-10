@@ -452,6 +452,8 @@ fn snapshot_reports_metrics_blockers_notes_and_decisions() {
         questions: &[],
         notes: &notes,
         decisions: &decisions,
+        progress: &[],
+        stall_threshold_secs: None,
         policy: &policy(),
     });
     assert_eq!(snapshot.plan_revision, 1);
@@ -500,6 +502,8 @@ fn snapshot_marks_dependents_blocked_by_unmet_dependencies() {
         questions: &[],
         notes: &[],
         decisions: &[],
+        progress: &[],
+        stall_threshold_secs: None,
         policy: &policy(),
     });
     let second = snapshot

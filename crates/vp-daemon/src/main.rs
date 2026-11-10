@@ -55,22 +55,24 @@ use vp_protocol::types::{
     SessionForkTreeParams, SessionImportParams, SessionLineageParams, SessionListResult,
     SessionLogParams, SessionMergeForkParams, SessionPauseParams, SessionPauseResult,
     SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
-    SessionSkillActivationsParams, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
-    SetArtifactPolicyParams, SetCheckpointPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
-    SetSessionPriorityParams, SetSessionUnlimitedParams, SetShellPolicyParams,
-    SetSourceCollectionParams, SetSourceLabelsParams, SetTaskSchedulerPolicyParams,
-    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SkillCreateParams,
-    SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams, SkillUpdateParams,
-    SourceActionParams, SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams,
-    SourceCreateUrlParams, SourceGetParams, SourceImportParams, SourceListParams,
-    SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams,
-    TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
-    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams,
-    UpdateMcpServerParams, UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams,
-    WorkspaceFileParams, WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams,
-    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
+    SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
+    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
+    SetProjectBudgetParams, SetSessionPriorityParams, SetSessionUnlimitedParams,
+    SetShellPolicyParams, SetSourceCollectionParams, SetSourceLabelsParams,
+    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SkillCreateParams, SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams,
+    SkillUpdateParams, SourceActionParams, SourceCollectionsParams, SourceCreateFileParams,
+    SourceCreateNoteParams, SourceCreateUrlParams, SourceGetParams, SourceImportParams,
+    SourceListParams, SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult,
+    TaskDispatchParams, TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams,
+    TeamPlanParams, TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
+    TerminalResizeParams, TerminalWriteParams, UpdateAcpAgentParams, UpdateCheckParams,
+    UpdateDownloadParams, UpdateMcpServerParams, UpdateModelPresetParams,
+    UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceGrepParams,
+    WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams,
+    WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -163,6 +165,7 @@ async fn main() -> Result<()> {
     spawn_memory_sweeper(state.engine.clone());
     spawn_terminal_sweeper(state.engine.clone());
     spawn_browser_sweeper(state.engine.clone());
+    spawn_task_stall_sweeper(state.engine.clone());
     spawn_orchestration_controller(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
@@ -1541,6 +1544,51 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "session.steer" => match parse_params::<SessionSteerParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .steer_session(
+                    &params.session_id,
+                    &params.body,
+                    params.agent_id.as_deref(),
+                    params.task_id.as_deref(),
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.steering" => match parse_params::<SessionSteeringParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_steering(&params.session_id, params.status.as_deref(), params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.steering.cancel" => {
+            match parse_params::<SessionSteeringCancelParams>(request.params) {
+                Ok(params) => match state.engine.cancel_steering(&params.id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.stalls" | "task.stalls" => {
+            match parse_params::<SessionStallsParams>(request.params) {
+                Ok(params) => match state.engine.session_stalls(&params.session_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.context" => match parse_params::<SessionContextParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -2677,6 +2725,38 @@ fn spawn_browser_sweeper(engine: Engine) {
             let browsers = engine.sweep_idle_browsers(idle).await;
             if browsers > 0 {
                 tracing::info!(browsers, "closed idle browser helpers");
+            }
+        }
+    });
+}
+
+/// Observability-only stall sweep. It emits `orchestration.stall` events and
+/// refreshes the observation window; it never cancels or retries a task.
+fn spawn_task_stall_sweeper(engine: Engine) {
+    let threshold_secs = std::env::var("VERLINPARK_TASK_STALL_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1_800);
+    if threshold_secs == 0 {
+        return;
+    }
+    let interval_secs = (threshold_secs / 4).clamp(1, 300);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine
+                .sweep_task_stalls(Duration::from_secs(threshold_secs))
+                .await
+            {
+                Ok(stalled) if stalled > 0 => {
+                    tracing::warn!(stalled, threshold_secs, "plan task stall observed");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "task stall sweep failed");
+                }
             }
         }
     });

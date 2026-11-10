@@ -670,6 +670,29 @@ enum Command {
     TaskPause { session: String, task: String },
     /// Resume a paused plan task.
     TaskResume { session: String, task: String },
+    /// Send operator steering to a running agent (defaults to the Leader).
+    Steer {
+        session: String,
+        text: String,
+        /// Target a specific running agent id.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Require the target agent to be running this plan task.
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// List persisted steering messages for a session.
+    Steering {
+        session: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Cancel a pending steering message before delivery.
+    SteerCancel { id: String },
+    /// Show plan-task progress and stall observations for a session.
+    TaskStalls { session: String },
     /// Create a session for a project.
     SessionNew {
         project: String,
@@ -2162,6 +2185,42 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::Steer {
+            session,
+            text,
+            agent,
+            task,
+        } => {
+            rpc(
+                &discovery,
+                "session.steer",
+                json!({
+                    "session_id": session,
+                    "body": text,
+                    "agent_id": agent,
+                    "task_id": task,
+                }),
+            )
+            .await?
+        }
+        Command::Steering {
+            session,
+            status,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "session.steering",
+                json!({"session_id": session, "status": status, "limit": limit}),
+            )
+            .await?
+        }
+        Command::SteerCancel { id } => {
+            rpc(&discovery, "session.steering.cancel", json!({"id": id})).await?
+        }
+        Command::TaskStalls { session } => {
+            rpc(&discovery, "session.stalls", json!({"session_id": session})).await?
+        }
         Command::SessionNew {
             project,
             goal,
@@ -3131,6 +3190,77 @@ fn print_human(value: &Value) {
         print!("{markdown}");
         return;
     }
+    if let Some(steering) = value.get("steering").and_then(Value::as_object) {
+        println!(
+            "{}  {}  agent={}  task={}",
+            steering["id"].as_str().unwrap_or("?"),
+            steering["status"].as_str().unwrap_or("?"),
+            steering["agent_id"].as_str().unwrap_or("?"),
+            steering["task_id"].as_str().unwrap_or("-")
+        );
+        println!("  {}", steering["body"].as_str().unwrap_or(""));
+        if let Some(delivered_at) = steering["delivered_at"].as_str() {
+            println!("  delivered at {delivered_at}");
+        }
+        return;
+    }
+    if let Some(messages) = value.get("steering").and_then(Value::as_array) {
+        if messages.is_empty() {
+            println!("No steering messages.");
+            return;
+        }
+        for steering in messages {
+            println!(
+                "{}  {:<9}  agent={}  task={}  {}",
+                steering["id"].as_str().unwrap_or("?"),
+                steering["status"].as_str().unwrap_or("?"),
+                steering["agent_id"].as_str().unwrap_or("?"),
+                steering["task_id"].as_str().unwrap_or("-"),
+                steering["created_at"].as_str().unwrap_or("?")
+            );
+            println!("  {}", steering["body"].as_str().unwrap_or(""));
+        }
+        return;
+    }
+    if value.get("stalls").is_some() && value.get("progress").is_some() {
+        println!(
+            "session {}  stall threshold={}s",
+            value["session_id"].as_str().unwrap_or("?"),
+            value["threshold_secs"].as_u64().unwrap_or(0)
+        );
+        let progress = value["progress"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if progress.is_empty() {
+            println!("No task progress recorded.");
+        }
+        for task in progress {
+            println!(
+                "  {}  stalls={}  last={}  turn={}  tool={}",
+                task["task_id"].as_str().unwrap_or("?"),
+                task["stall_count"].as_u64().unwrap_or(0),
+                task["last_progress_at"].as_str().unwrap_or("-"),
+                task["last_turn"].as_u64().unwrap_or(0),
+                task["last_tool"].as_str().unwrap_or("-")
+            );
+        }
+        let stalls = value["stalls"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        if stalls.is_empty() {
+            println!("No stall observations.");
+        }
+        for stall in stalls {
+            println!(
+                "  stall {}  age={}s  attempt={}  status={}  observed={}",
+                stall["task_id"].as_str().unwrap_or("?"),
+                stall["age_secs"].as_u64().unwrap_or(0),
+                stall["attempts"].as_u64().unwrap_or(0),
+                stall["status"].as_str().unwrap_or("?"),
+                stall["observed_at"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
     if let Some(actions) = value.get("actions").and_then(Value::as_array)
         && value.get("session_id").is_some()
         && value.get("snapshot").is_none()
@@ -3154,13 +3284,14 @@ fn print_human(value: &Value) {
         && let Some(totals) = value.get("totals")
     {
         println!(
-            "{} sessions · {} running · {} attention · {} blocked tasks · {} failed · {} retrying · {} conflicts",
+            "{} sessions · {} running · {} attention · {} blocked tasks · {} failed · {} retrying · {} stalled · {} conflicts",
             totals["sessions"].as_u64().unwrap_or(0),
             totals["running"].as_u64().unwrap_or(0),
             totals["attention"].as_u64().unwrap_or(0),
             totals["blocked_tasks"].as_u64().unwrap_or(0),
             totals["failed_tasks"].as_u64().unwrap_or(0),
             totals["retrying_tasks"].as_u64().unwrap_or(0),
+            totals["stalled_tasks"].as_u64().unwrap_or(0),
             totals["merge_conflicts"].as_u64().unwrap_or(0)
         );
         for session in sessions {
@@ -3211,14 +3342,15 @@ fn print_human(value: &Value) {
             metrics["failed_agents"].as_u64().unwrap_or(0)
         );
         println!(
-            "tasks={} completed={} active={} ready={} blocked={} failed={} retrying={}",
+            "tasks={} completed={} active={} ready={} blocked={} failed={} retrying={} stalled={}",
             metrics["total_tasks"].as_u64().unwrap_or(0),
             metrics["completed_tasks"].as_u64().unwrap_or(0),
             metrics["active_tasks"].as_u64().unwrap_or(0),
             metrics["ready_tasks"].as_u64().unwrap_or(0),
             metrics["blocked_tasks"].as_u64().unwrap_or(0),
             metrics["failed_tasks"].as_u64().unwrap_or(0),
-            metrics["retrying_tasks"].as_u64().unwrap_or(0)
+            metrics["retrying_tasks"].as_u64().unwrap_or(0),
+            metrics["stalled_tasks"].as_u64().unwrap_or(0)
         );
         for task in snapshot["tasks"].as_array().into_iter().flatten() {
             println!(
