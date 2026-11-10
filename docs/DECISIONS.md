@@ -1,6 +1,6 @@
 # VerlinPark 决策记录
 
-> 最后更新：2026-11-08
+> 最后更新：2026-11-11
 > 格式：Architecture Decision Record（ADR）  
 > 规则：已接受的决策不删除；如果改变，新增一条“Supersedes”记录。
 
@@ -147,6 +147,8 @@
 | [0135](adr/0135-optional-lsp-search-media-and-runtime-tools.md) | Optional language servers, provider-backed search, PDF/image/data readers, runtime introspection, and deferred browser | Accepted | Runtime/Agent Tools/Knowledge |
 | [0136](adr/0136-office-documents-and-media.md) | Bounded DOCX/PPTX/XLSX/ODF reader, OCR confidence, and PDF metadata/page counts | Accepted | Runtime/Agent Tools/Media |
 | [0137](adr/0137-browser-helper-and-computer-lease.md) | Seatbelt-confined WKWebView browser helper and single-daemon ComputerLease | Accepted | Runtime/Agent Tools/MacOS |
+| [0138](adr/0138-cache-usage-and-stable-prefix.md) | Provider cache usage accounting, per-role cache pricing, stable prompt prefixes, and Anthropic cache breakpoints | Accepted | Runtime/Providers/Budgets |
+| [0139](adr/0139-steering-and-progress-ledger.md) | Operator steering at provider boundaries and operational plan-task progress/stall observations | Accepted | Runtime/Orchestration/CLI |
 
 ---
 

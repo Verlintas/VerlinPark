@@ -580,8 +580,8 @@ just test                  # Rust + xcodebuild test (40 Swift tests)
 - `git` 工具只读；stage/commit/branch 仍由 runtime/merge queue 拥有。
 - Manager 仍是 code read-only；Verifier 仍不能写代码；approval、write scope、
   capacity、budget、Verifier gate 均未放宽。
-- 当前测试：Rust 490（core 402 + 1 ignored / protocol 2 / store 72 /
-  providers 14；另有 3 个 live ignored），Swift 110。此前本文记录的
+- 当前测试：Rust 505（core 412 + 1 browser ignored / protocol 3 / store 72 /
+  providers 18；另有 3 个 live ignored），Swift 111。此前本文记录的
   358/104 是历史基线。
 - 新增 optional LSP、provider search、PDF/image/office-document/data reader、
   runtime budget/task/tool/artifact 工具，以及 sandboxed WKWebView browser +
@@ -595,7 +595,25 @@ just test                  # Rust + xcodebuild test (40 Swift tests)
   page JavaScript 不被网络隔离，snapshot 不是 native AX，screenshot 只截
   viewport，ComputerLease 是单 daemon、fail-fast、无队列/公平调度，且不是
   replay projection。native macOS `computer` 控制仍未交付。
+- Cache telemetry 已交付：provider usage 区分 cache read/write（作为 total
+  input 的子集），usage ledger/CSV/bundle/replay/Preview Cost 和 per-role cache
+  prices 已接入；Anthropic 使用 stable-system + last-tool `cache_control`，
+  OpenAI-compatible 走自动 prefix cache。限制：cache 价格由用户配置，runtime
+  不推断折扣；`context.prompt_prefix` 每个 agent run 只发一次；compaction 仍会
+  重置 conversation head 的 cache generation。
+- Operator steering 已交付：`session.steer` / `vp steer` 持久化到
+  `steering_messages`，默认目标为 running/waiting Leader，显式 agent/task
+  必须匹配；在下一个 provider call 前以可见 user turn 注入，run 结束时取消
+  pending 行。限制：cooperative，仅 turn/tool 边界，不能中断 in-flight
+  provider/tool call；operator-only，无 agent-to-agent steering tool。
+- Plan-task progress/stall 已交付：`plan_task_progress` 记录 turn/tool 进度；
+  `VERLINPARK_TASK_STALL_SECS`（默认 1800，0 关闭）发出阈值窗口化的
+  `orchestration.stall` 并 broadcast；`session.stalls` / `vp task-stalls`、
+  `task_detail`、`task.queue`、orchestration snapshot 可见。限制：仅观测，
+  不自动 cancel/retry/pause/改预算/写作用域；progress 是 operational
+  telemetry，不是 replay projection，daemon restart 可能丢失最近窗口。
 
-仍未解决：native macOS computer、fair/distributed ComputerLease，以及本文
-既有的分布式 scheduler/fencing、完整 shell read/network confinement、默认
-自动冲突解决等。
+仍未解决：native macOS computer、fair/distributed ComputerLease、自动
+stall 恢复/same-agent pin、deferred wake-on continuation、完整 memory v2，
+以及本文既有的分布式 scheduler/fencing、完整 shell read/network
+confinement、默认自动冲突解决等。

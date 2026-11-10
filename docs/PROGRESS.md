@@ -1,10 +1,114 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-10
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease 已跑通
+> 最后更新：2026-11-11
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-11 Long-task cache telemetry, operator steering, and progress ledger
+
+这一轮补上超长任务最缺的三件事：token 成本可解释、运行中可纠偏、卡死可见。
+三项都保持现有 approval、Seatbelt、path jail、write scope、Verifier、merge queue
+和 budget gate 不变。
+
+### Provider cache usage
+
+- `StreamEvent::Usage` 增加 `cache_read_tokens` / `cache_write_tokens`。
+- 语义固定为：`input_tokens` 是 provider 报告的总输入（uncached + cache read +
+  cache write）；cache 字段是 total 的子集，只用于定价和命中率，不会重复加到
+  session tokens。
+- OpenAI-compatible：`input_tokens = prompt_tokens`，读取
+  `prompt_tokens_details.cached_tokens`（fallback `prompt_cache_hit_tokens`）和
+  provider 暴露的 cache write 字段。
+- Anthropic：`input_tokens + cache_read_input_tokens +
+  cache_creation_input_tokens` 组成 total；三个字段分别保留。
+- 不一致的 provider 报告会被 clamp，保证 cache read/write 不超过 total。
+- `usage_ledger` 增加 cache 列；`UsageEntry`、`UsageBucket`、`UsageTotals`、
+  project usage、CSV、bundle/import、replay/repair、`db-rebuild` 全部携带。
+- `RoleModelConfig` 增加 `cache_read_usd_per_million` /
+  `cache_write_usd_per_million`；未配置时回退到 full input price，绝不自动
+  推断折扣。
+- 成本公式：uncached input × input + cache read × cache-read price + cache
+  write × cache-write price + output × output。预算 reservation 仍按 full input
+  预留，结算按 provider 报告的实际 mix。
+- Preview Cost 显示 cache read/write 和 derived hit rate
+  `cache_read_tokens / input_tokens`；Settings 暴露 per-role cache prices。
+
+### Stable prompt prefix
+
+- `role_system_prompt` 拆成稳定前缀和 run context：
+  - 稳定前缀：role charter、security/output contract、稳定项目约定；
+  - run context：agent/department/parent、project root、session goal、
+    worktree、branch、profile、write scope、objective；
+  - goal-dependent memory 放在 run context 之后。
+- `context.prompt_prefix` 每个 agent run 发一次，包含 version、model、
+  `tool_bundle_hash`、`stable_system_hash`、`prefix_hash` / `cache_generation`、
+  tool count 和 stable prefix chars；hash 输入不含 secrets、API keys、
+  worktree path 或 session id。
+- skill 激活不再过滤 advertised tool schema；完整 role tool bundle 在 run
+  内冻结，执行时仍用 `skill_allows_tool` 拒绝并返回精确错误。
+- dynamic MCP tools 按 exposed name 排序后截断到 32 个，并在 run 开始时
+  收集一次。
+- Anthropic：`ChatRequest.system_stable_prefix` 精确匹配时，把 system 拆成
+  稳定 cached block + 非缓存 run-context block，并在最后一个 tool 上加
+  `cache_control: {"type":"ephemeral"}`。OpenAI-compatible 忽略该 marker。
+- 限制：Anthropic 不会自动加 beta header；兼容 proxy 忽略 cache_control 时
+  内容仍然有效；OpenAI 仍走自动 prefix cache；compaction 仍会重置
+  conversation head 的 cache generation。
+
+### Operator steering
+
+- 新增 SQLite `steering_messages`，字段：id、session_id、agent_id、可选
+  task_id、body、status（pending/delivered/cancelled）、created_at、
+  delivered_at。
+- RPC：`session.steer`、`session.steering`、`session.steering.cancel`。
+- CLI：`vp steer <session> "text" [--agent <id>] [--task <id>]`、
+  `vp steering <session>`、`vp steer-cancel <id>`。
+- 默认目标为 session 中 running/waiting_input 的 Leader；显式 agent 必须属于
+  该 session 且处于 running/waiting_input；task scoped steering 要求该 agent
+  正在执行该 plan task。
+- 在下一个 provider call 之前、pause/cancel/budget gate 和 compaction 之后
+  投递；以带 `[Operator steering #<id>]` 的 user turn 进入 conversation，
+  同时写 `steering.delivered`（top-level 还写 `message.created`）。
+- run 结束时仍 pending 的 steering 会被取消并写 `steering.cancelled`；daemon
+  恢复也会取消 pending 行，避免泄漏到下一次 run。
+- 这是 operator-only RPC/CLI，不新增 agent-facing steering tool，不做隐式广播。
+- 限制：cooperative delivery，只在下一个 turn/tool 边界生效；不能中断已经
+  在进行的 provider stream/tool call。
+
+### Task progress / stall ledger
+
+- 新增 `plan_task_progress` 伴生表：
+  `last_progress_at`、`stall_count`、`last_turn`、`last_tool`、`updated_at`。
+- 仅对 task-scoped run 在 turn 开始和 tool 开始时 touch，不按 token/chunk 写。
+- daemon sweep：`VERLINPARK_TASK_STALL_SECS` 默认 1800 秒，0 关闭；
+  只观察 `running`/`claimed` plan tasks；超过阈值时递增 `stall_count`、
+  刷新 observation window，并发出一个 `orchestration.stall` 事件；事件会
+  broadcast 到 live subscribers。
+- 事件包含 task id、plan seq、department、title、status、attempts、
+  `age_secs`、`last_turn`、`last_tool`、`stalled` 等。
+- 可见面：`session.stalls` / alias `task.stalls`、`vp task-stalls <session>`、
+  `task_detail`、`task.queue`、`orchestration.snapshot`、`orchestration.overview`
+  的 `stalled_tasks`。
+- 本轮只做观测，不自动 cancel/retry/pause/改 budget/write scope；自动恢复和
+  same-agent pin 留给后续轮次。
+- `plan_task_progress` 是 operational telemetry，不是 replay projection；
+  `session.replay` 不比较它，daemon restart 可能丢失最近 observation window。
+
+### 测试
+
+- Rust：**505 passed，4 ignored**
+  - core 412 passed + 1 browser ignored
+  - protocol 3
+  - store 72
+  - providers 18 + 3 live ignored
+- Swift：**111 passed**
+- `just lint`、`just test`、`just bundle` 通过。
+- ADR-0138（cache usage / stable prefix）和 ADR-0139（steering / progress
+  ledger）已记录边界。
 
 ---
 

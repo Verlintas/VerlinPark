@@ -1,6 +1,6 @@
 # VerlinPark 文档索引
 
-> 最后更新：2026-11-10
+> 最后更新：2026-11-11
 > 仓库：<https://github.com/Verlintas/VerlinPark>
 
 文档分成三类，避免把“设计目标”误读成“已经实现”：
