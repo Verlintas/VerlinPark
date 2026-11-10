@@ -10,6 +10,7 @@ This file is for coding agents working in this repository. Read it before changi
 - [docs/PROGRESS.md](docs/PROGRESS.md) — what is actually implemented
 - [docs/AUDIT.md](docs/AUDIT.md) — known enforcement gaps and priority order
 - [docs/TOOLING_ROADMAP.md](docs/TOOLING_ROADMAP.md) — complete agent tooling gap list, prioritized implementation budget, and smart-tool design rules
+- [docs/AGENT_ORCHESTRATION_AND_CACHE_RESEARCH.md](docs/AGENT_ORCHESTRATION_AND_CACHE_RESEARCH.md) — prompt/KV cache hit-rate engineering, provider cache behavior, agent-team architecture comparison, and prioritized cache/orchestration improvements
 - [docs/README.md](docs/README.md) — documentation map
 
 ## Current milestone
