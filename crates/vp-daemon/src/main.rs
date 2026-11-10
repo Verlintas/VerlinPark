@@ -58,19 +58,19 @@ use vp_protocol::types::{
     SessionSkillActivationsParams, SessionTodosParams, SessionTodosResult, SessionTranscriptParams,
     SetArtifactPolicyParams, SetCheckpointPolicyParams, SetIntegrationPolicyParams,
     SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
-    SetSessionPriorityParams, SetShellPolicyParams, SetSourceCollectionParams,
-    SetSourceLabelsParams, SetTaskSchedulerPolicyParams, SetWorktreePolicyParams,
-    ShellPolicyParams, ShellPolicyResult, SkillCreateParams, SkillEnabledParams, SkillIdParams,
-    SkillImportParams, SkillListParams, SkillUpdateParams, SourceActionParams,
-    SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
-    SourceGetParams, SourceImportParams, SourceListParams, SourceSearchParams, SubscribeParams,
-    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
-    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
-    WorkspaceWriteParams, WorktreePolicyParams,
+    SetSessionPriorityParams, SetSessionUnlimitedParams, SetShellPolicyParams,
+    SetSourceCollectionParams, SetSourceLabelsParams, SetTaskSchedulerPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SkillCreateParams,
+    SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams, SkillUpdateParams,
+    SourceActionParams, SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams,
+    SourceCreateUrlParams, SourceGetParams, SourceImportParams, SourceListParams,
+    SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams,
+    TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams, UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams,
+    UpdateMcpServerParams, UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams,
+    WorkspaceFileParams, WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams,
+    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
     CoordinationNoteParams, CoordinationNoteResult, OrchestrationAdvanceParams,
@@ -789,13 +789,14 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Ok(params) => {
                 let created = state
                     .engine
-                    .create_session_with_options(
+                    .create_session_with_options_and_unlimited(
                         params.project_id,
                         params.goal.clone(),
                         params.token_budget,
                         params.cost_budget_usd,
                         params.time_budget_secs,
                         params.priority.unwrap_or(0),
+                        params.unlimited,
                     )
                     .await;
                 match created {
@@ -1345,6 +1346,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     params.content,
                     params.expected_sha256,
                 )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.budget.set" => match parse_params::<SetSessionUnlimitedParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_session_unlimited(&params.session_id, params.unlimited)
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),

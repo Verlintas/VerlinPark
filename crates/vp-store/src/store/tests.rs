@@ -2999,3 +2999,40 @@ fn source_search_fuses_mixed_scripts_and_non_cjk_fallback() {
     assert!(degraded);
     assert_eq!(hits[0].source_id, "source-mixed");
 }
+
+#[test]
+fn session_unlimited_flag_round_trips_with_event() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("unlimited"))
+        .unwrap();
+    let session = store
+        .create_session_with_limits_and_priority(
+            &project.id,
+            "large project",
+            Some(100),
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+    assert!(!session.unlimited);
+    let event = store
+        .set_session_unlimited_with_event(&session.id, true)
+        .unwrap();
+    assert_eq!(event.kind, "session.budget_mode_changed");
+    assert_eq!(event.payload["unlimited"], serde_json::json!(true));
+    let loaded = store.get_session(&session.id).unwrap().unwrap();
+    assert!(loaded.unlimited);
+    assert_eq!(loaded.token_budget, Some(100));
+    assert!(store.list_sessions(None).unwrap()[0].unlimited);
+    store
+        .set_session_unlimited_with_event(&session.id, false)
+        .unwrap();
+    assert!(!store.get_session(&session.id).unwrap().unwrap().unlimited);
+    assert!(
+        store
+            .set_session_unlimited_with_event("missing", true)
+            .is_err()
+    );
+}

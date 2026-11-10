@@ -198,6 +198,7 @@ fn map_source_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceChunk> {
 pub struct SessionRepair {
     pub status: String,
     pub priority: Option<i32>,
+    pub unlimited: Option<bool>,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost_spent_usd: f64,
@@ -453,6 +454,7 @@ impl Store {
                 token_budget  INTEGER,
                 cost_budget_usd REAL,
                 time_budget_secs INTEGER,
+                unlimited     INTEGER NOT NULL DEFAULT 0,
                 cost_spent_usd REAL NOT NULL DEFAULT 0,
                 base_commit   TEXT,
                 team_plan     TEXT,
@@ -1143,6 +1145,7 @@ impl Store {
         ensure_column(&conn, "sessions", "token_budget", "INTEGER")?;
         ensure_column(&conn, "sessions", "cost_budget_usd", "REAL")?;
         ensure_column(&conn, "sessions", "time_budget_secs", "INTEGER")?;
+        ensure_column(&conn, "sessions", "unlimited", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(
             &conn,
             "sessions",
@@ -1407,9 +1410,9 @@ impl Store {
         conn.execute(
             "INSERT INTO sessions
              (id, project_id, goal, status, priority, worktree, branch, token_budget,
-              cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit,
+              cost_budget_usd, time_budget_secs, unlimited, cost_spent_usd, base_commit,
               team_plan, tokens_in, tokens_out, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, ?16)",
             params![
                 session.id,
                 session.project_id,
@@ -1421,6 +1424,7 @@ impl Store {
                 session.token_budget,
                 session.cost_budget_usd,
                 session.time_budget_secs,
+                if session.unlimited { 1 } else { 0 },
                 session.cost_spent_usd,
                 session.base_commit,
                 session.tokens_in as i64,
@@ -3200,6 +3204,7 @@ impl Store {
             token_budget,
             cost_budget_usd,
             time_budget_secs,
+            false,
             None,
             priority,
         )
@@ -3216,6 +3221,7 @@ impl Store {
         token_budget: Option<u64>,
         cost_budget_usd: Option<f64>,
         time_budget_secs: Option<u64>,
+        unlimited: bool,
         base_commit: &str,
         priority: i32,
     ) -> Result<Session> {
@@ -3228,6 +3234,7 @@ impl Store {
             token_budget,
             cost_budget_usd,
             time_budget_secs,
+            unlimited,
             Some(base_commit.to_string()),
             priority,
         )
@@ -3244,6 +3251,7 @@ impl Store {
         token_budget: Option<u64>,
         cost_budget_usd: Option<f64>,
         time_budget_secs: Option<u64>,
+        unlimited: bool,
         base_commit: Option<String>,
         priority: i32,
     ) -> Result<Session> {
@@ -3265,6 +3273,7 @@ impl Store {
             token_budget,
             cost_budget_usd,
             time_budget_secs,
+            unlimited,
             cost_spent_usd: 0.0,
             base_commit,
             tokens_in: 0,
@@ -3275,9 +3284,9 @@ impl Store {
         conn.execute(
             "INSERT INTO sessions
              (id, project_id, goal, status, priority, worktree, branch, token_budget,
-              cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit,
+              cost_budget_usd, time_budget_secs, unlimited, cost_spent_usd, base_commit,
               tokens_in, tokens_out, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, 0, 0, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, 0, 0, ?13)",
             params![
                 session.id,
                 session.project_id,
@@ -3289,6 +3298,7 @@ impl Store {
                 session.token_budget,
                 session.cost_budget_usd,
                 session.time_budget_secs,
+                if session.unlimited { 1 } else { 0 },
                 session.base_commit,
                 session.created_at
             ],
@@ -3324,6 +3334,37 @@ impl Store {
             session_id,
             "session.priority",
             serde_json::json!({"priority": priority}),
+        )?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
+    pub fn set_session_unlimited_with_event(
+        &self,
+        session_id: &str,
+        unlimited: bool,
+    ) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET unlimited = ?1 WHERE id = ?2",
+            params![if unlimited { 1 } else { 0 }, session_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "session.budget_mode_changed",
+            serde_json::json!({
+                "unlimited": unlimited,
+                "budget_mode": if unlimited { "unlimited" } else { "limited" },
+            }),
         )?;
         tx.commit()?;
         drop(conn);
@@ -5570,7 +5611,7 @@ impl Store {
         match project_id {
             Some(project_id) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at, priority
+                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, unlimited, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at, priority
                      FROM sessions WHERE project_id = ?1
                      ORDER BY created_at DESC",
                 )?;
@@ -5579,7 +5620,7 @@ impl Store {
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at, priority
+                    "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, unlimited, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at, priority
                      FROM sessions ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map([], map_session)?;
@@ -5592,7 +5633,7 @@ impl Store {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at, priority
+            "SELECT id, project_id, goal, status, worktree, branch, token_budget, cost_budget_usd, time_budget_secs, unlimited, cost_spent_usd, base_commit, tokens_in, tokens_out, created_at, priority
              FROM sessions WHERE id = ?1",
             params![id],
             map_session,
@@ -8358,7 +8399,8 @@ impl Store {
         let changed = tx.execute(
             "UPDATE sessions
              SET status = ?1, priority = COALESCE(?2, priority),
-                 tokens_in = ?3, tokens_out = ?4, cost_spent_usd = ?5
+                 tokens_in = ?3, tokens_out = ?4, cost_spent_usd = ?5,
+                 unlimited = COALESCE(?7, unlimited)
              WHERE id = ?6",
             params![
                 repair.status,
@@ -8366,7 +8408,8 @@ impl Store {
                 repair.tokens_in as i64,
                 repair.tokens_out as i64,
                 repair.cost_spent_usd,
-                session_id
+                session_id,
+                repair.unlimited.map(|value| if value { 1 } else { 0 })
             ],
         )?;
         if changed == 0 {
@@ -8699,9 +8742,9 @@ impl Store {
         tx.execute(
             "INSERT INTO sessions
              (id, project_id, goal, status, priority, worktree, branch, token_budget,
-              cost_budget_usd, time_budget_secs, cost_spent_usd, base_commit,
+              cost_budget_usd, time_budget_secs, unlimited, cost_spent_usd, base_commit,
               team_plan, tokens_in, tokens_out, created_at)
-             VALUES (?1, ?2, ?3, 'imported', ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, 'imported', ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 bundle.session.id,
                 bundle.session.project_id,
@@ -8711,6 +8754,7 @@ impl Store {
                 bundle.session.token_budget,
                 bundle.session.cost_budget_usd,
                 bundle.session.time_budget_secs,
+                if bundle.session.unlimited { 1 } else { 0 },
                 bundle.session.cost_spent_usd,
                 bundle.session.base_commit,
                 plan_json,
@@ -9704,12 +9748,13 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         token_budget: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
         cost_budget_usd: row.get(7)?,
         time_budget_secs: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
-        cost_spent_usd: row.get(9)?,
-        base_commit: row.get(10)?,
-        tokens_in: row.get::<_, i64>(11)? as u64,
-        tokens_out: row.get::<_, i64>(12)? as u64,
-        created_at: row.get(13)?,
-        priority: row.get(14)?,
+        unlimited: row.get::<_, i64>(9)? != 0,
+        cost_spent_usd: row.get(10)?,
+        base_commit: row.get(11)?,
+        tokens_in: row.get::<_, i64>(12)? as u64,
+        tokens_out: row.get::<_, i64>(13)? as u64,
+        created_at: row.get(14)?,
+        priority: row.get(15)?,
     })
 }
 

@@ -543,6 +543,7 @@ impl RunControl {
         let mut finalized = self.finalized.lock().await;
         *finalized = Some(status.to_string());
         engine.budget_registry().clear_session(session_id);
+        engine.clear_unlimited_flag(session_id);
         if let Err(error) = engine.interrupt_running_plan_tasks(session_id).await {
             tracing::warn!(%error, session_id, "failed to clear running plan tasks");
         }
@@ -1056,6 +1057,9 @@ struct SessionBudget {
     limit: Option<u64>,
     cost_limit: Option<f64>,
     time_limit: Option<Duration>,
+    /// Shared with the engine so an explicit unlimited toggle affects a live
+    /// run at the next turn/tool boundary.
+    unlimited: Arc<AtomicBool>,
     started: std::time::Instant,
     caps: AgentCaps,
     worker_cap: AtomicUsize,
@@ -1119,6 +1123,7 @@ impl SessionBudget {
             limit,
             cost_limit: None,
             time_limit: None,
+            unlimited: Arc::new(AtomicBool::new(false)),
             started: std::time::Instant::now(),
             caps,
             worker_cap: AtomicUsize::new(caps.workers),
@@ -1152,17 +1157,31 @@ impl SessionBudget {
         self
     }
 
+    fn with_unlimited_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.unlimited = flag;
+        self
+    }
+
+    fn is_unlimited(&self) -> bool {
+        self.unlimited.load(Ordering::SeqCst)
+    }
+
     fn add_cost(&self, cost: f64) -> bool {
+        let unlimited = self.is_unlimited();
         if let Ok(mut state) = self.state.lock() {
             state.cost_spent += cost.max(0.0);
-            return self
-                .cost_limit
-                .is_some_and(|limit| state.cost_spent >= limit);
+            return !unlimited
+                && self
+                    .cost_limit
+                    .is_some_and(|limit| state.cost_spent >= limit);
         }
         true
     }
 
     fn exceeded_reason(&self) -> Option<&'static str> {
+        if self.is_unlimited() {
+            return None;
+        }
         if self.limit.is_some_and(|limit| self.spent() >= limit) {
             return Some("tokens");
         }
@@ -1183,6 +1202,9 @@ impl SessionBudget {
     }
 
     fn warning(&self) -> Option<&'static str> {
+        if self.is_unlimited() {
+            return None;
+        }
         let mut state = self.state.lock().ok()?;
         if let Some(limit) = self.limit
             && state.spent >= limit.saturating_mul(8) / 10
@@ -1249,6 +1271,9 @@ impl SessionBudget {
     }
 
     fn can_expand_workers(&self) -> bool {
+        if self.is_unlimited() {
+            return true;
+        }
         let Some(limit) = self.limit else {
             return true;
         };
@@ -1257,6 +1282,9 @@ impl SessionBudget {
     }
 
     fn available_tokens(&self) -> Option<u64> {
+        if self.is_unlimited() {
+            return None;
+        }
         let limit = self.limit?;
         let state = self.state.lock().ok()?;
         Some(
@@ -1267,6 +1295,9 @@ impl SessionBudget {
     }
 
     fn reserve_tokens(&self, amount: u64) -> Option<TokenReservation<'_>> {
+        if self.is_unlimited() {
+            return None;
+        }
         let limit = self.limit?;
         let mut state = self.state.lock().ok()?;
         let committed = state.spent.saturating_add(state.reserved_tokens);
@@ -1288,6 +1319,9 @@ impl SessionBudget {
         input_price: f64,
         output_price: f64,
     ) -> std::result::Result<Option<CostReservation<'_>>, ()> {
+        if self.is_unlimited() {
+            return Ok(None);
+        }
         let Some(limit) = self.cost_limit else {
             return Ok(None);
         };
@@ -1363,13 +1397,14 @@ impl TokenReservation<'_> {
     /// Returns true when the limit is now reached.
     fn settle(mut self, actual: u64) -> bool {
         let amount = self.amount;
+        let unlimited = self.budget.is_unlimited();
         self.amount = 0;
         let Ok(mut state) = self.budget.state.lock() else {
             return true;
         };
         state.reserved_tokens = state.reserved_tokens.saturating_sub(amount);
         state.spent = state.spent.saturating_add(actual);
-        self.budget.limit.is_some_and(|limit| state.spent >= limit)
+        !unlimited && self.budget.limit.is_some_and(|limit| state.spent >= limit)
     }
 }
 
@@ -1392,15 +1427,18 @@ struct CostReservation<'a> {
 impl CostReservation<'_> {
     fn settle(mut self, actual: f64) -> bool {
         let amount = self.amount;
+        let unlimited = self.budget.is_unlimited();
         self.amount = 0.0;
         let Ok(mut state) = self.budget.state.lock() else {
             return true;
         };
         state.reserved_cost = (state.reserved_cost - amount).max(0.0);
         state.cost_spent += actual.max(0.0);
-        self.budget
-            .cost_limit
-            .is_some_and(|limit| state.cost_spent >= limit)
+        !unlimited
+            && self
+                .budget
+                .cost_limit
+                .is_some_and(|limit| state.cost_spent >= limit)
     }
 }
 
@@ -1962,7 +2000,8 @@ impl AgentService {
             },
         )
         .with_cost(session.cost_budget_usd, session.cost_spent_usd)
-        .with_time(session.time_budget_secs);
+        .with_time(session.time_budget_secs)
+        .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited));
         let manager_spec = AgentSpec {
             id: agent
                 .parent_id
@@ -2370,7 +2409,8 @@ impl AgentService {
             },
         )
         .with_cost(session.cost_budget_usd, session.cost_spent_usd)
-        .with_time(session.time_budget_secs);
+        .with_time(session.time_budget_secs)
+        .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited));
         let prompt = format!(
             "You are resolving a Git rebase conflict for integration queue entry {}.              The worktree is {} on branch {}. The rebase target is session branch {} at commit {}.              Conflicted paths: {}.              Resolve the conflicts in place, preserving the intent of both sides. Do not abort the rebase.              Do not commit manually; leave the resolved files in the worktree. Run relevant tests if possible.              The runtime will stage resolved files, continue the rebase, verify the result, and merge it.              Reply with a concise summary of the resolution.",
             entry.id,
@@ -4519,7 +4559,8 @@ impl AgentService {
                 },
             )
             .with_cost(session.cost_budget_usd, session.cost_spent_usd)
-            .with_time(session.time_budget_secs);
+            .with_time(session.time_budget_secs)
+            .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited));
             if budget.exhausted() {
                 anyhow::bail!("session budget is exhausted; compaction needs provider tokens");
             }
@@ -4928,7 +4969,8 @@ async fn run_plan_resume(
         },
     )
     .with_cost(session.cost_budget_usd, session.cost_spent_usd)
-    .with_time(session.time_budget_secs);
+    .with_time(session.time_budget_secs)
+    .with_unlimited_flag(engine.unlimited_flag(&session.id, session.unlimited));
     if budget.exhausted() {
         emit(
             &engine,
@@ -5086,7 +5128,8 @@ async fn run_agent(
         },
     )
     .with_cost(session.cost_budget_usd, session.cost_spent_usd)
-    .with_time(session.time_budget_secs);
+    .with_time(session.time_budget_secs)
+    .with_unlimited_flag(engine.unlimited_flag(&session.id, session.unlimited));
     if budget.exhausted() {
         emit(
             &engine,
@@ -7798,7 +7841,7 @@ async fn compact_context_if_needed(
             // When a token limit exists but the reservation cannot be granted,
             // skip the summary call; the rolling trim below still protects the
             // provider context and keeps the run alive.
-            if budget.limit.is_none() || reservation.is_some() {
+            if budget.is_unlimited() || budget.limit.is_none() || reservation.is_some() {
                 let outcome = collect_compaction_completion(
                     config.provider.as_ref(),
                     &request,
@@ -8244,7 +8287,7 @@ async fn run_loop(
         let configured_output = config.max_tokens.unwrap_or(4096).max(1) as u64;
         let input_estimate = estimate_request_tokens(&request);
         let (input_price, output_price) = role_price(config, spec.role);
-        let scope_spent = if plan_budget.active() {
+        let scope_spent = if plan_budget.active() && !budget.is_unlimited() {
             Some(
                 engine
                     .usage_spent(
@@ -8263,12 +8306,15 @@ async fn run_loop(
         let department_spent = scope_spent
             .map(|(_, _, tokens, cost)| (tokens, cost))
             .unwrap_or((0, 0.0));
-        let project_spent = if plan_budget.project_active() {
+        let project_spent = if plan_budget.project_active() && !budget.is_unlimited() {
             engine.project_usage(&project.id).await?
         } else {
             (0, 0.0)
         };
-        if !warned_project && let Some(warning) = plan_budget.project_warning(project_spent) {
+        if !budget.is_unlimited()
+            && !warned_project
+            && let Some(warning) = plan_budget.project_warning(project_spent)
+        {
             emit(
                 engine,
                 &session.id,
@@ -8279,7 +8325,7 @@ async fn run_loop(
             .await?;
             warned_project = true;
         }
-        let desired_output = if budget.limit.is_some() {
+        let desired_output = if !budget.is_unlimited() && budget.limit.is_some() {
             let remaining = budget.available_tokens().unwrap_or(0);
             if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
                 return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session_tokens(
@@ -8290,7 +8336,7 @@ async fn run_loop(
         } else {
             configured_output
         };
-        let scope_lease = if plan_budget.active() {
+        let scope_lease = if plan_budget.active() && !budget.is_unlimited() {
             let requests = plan_budget.requests(
                 &session.id,
                 task_spent,
@@ -8319,7 +8365,7 @@ async fn run_loop(
             .as_ref()
             .map_or(desired_output, |lease| lease.granted_output_tokens());
         let mut token_reservation = None;
-        if budget.limit.is_some() {
+        if !budget.is_unlimited() && budget.limit.is_some() {
             let Some(reservation) =
                 budget.reserve_tokens(input_estimate.saturating_add(output_budget))
             else {
@@ -8453,7 +8499,7 @@ async fn run_loop(
         if budget_exceeded {
             return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
         }
-        if plan_budget.active() {
+        if !budget.is_unlimited() && plan_budget.active() {
             let (task_tokens, task_cost, department_tokens, department_cost) = engine
                 .usage_spent(
                     &session.id,

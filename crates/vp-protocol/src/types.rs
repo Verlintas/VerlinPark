@@ -262,6 +262,11 @@ pub struct Session {
     pub cost_budget_usd: Option<f64>,
     #[serde(default)]
     pub time_budget_secs: Option<u64>,
+    /// Explicit opt-in that bypasses session, plan-task, department, and
+    /// project economic budget gates for this session. Capacity, approvals,
+    /// verification, context, and turn limits still apply.
+    #[serde(default)]
+    pub unlimited: bool,
     #[serde(default)]
     pub cost_spent_usd: f64,
     #[serde(default)]
@@ -360,12 +365,28 @@ pub struct CreateSessionParams {
     pub cost_budget_usd: Option<f64>,
     #[serde(default)]
     pub time_budget_secs: Option<u64>,
+    /// Ignore all economic budget gates for this session. Cannot be combined
+    /// with explicit token/cost/time budgets.
+    #[serde(default)]
+    pub unlimited: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetSessionPriorityParams {
     pub session_id: String,
     pub priority: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSessionUnlimitedParams {
+    pub session_id: String,
+    pub unlimited: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionUnlimitedResult {
+    pub session_id: String,
+    pub unlimited: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

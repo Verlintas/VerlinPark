@@ -326,24 +326,42 @@ actor CoreClient {
         tokenBudget: Int?,
         costBudgetUSD: Double? = nil,
         timeBudgetSecs: Int? = nil,
-        priority: Int = 0
+        priority: Int = 0,
+        unlimited: Bool = false
     ) async throws -> Session {
         var params: [String: JSONValue] = [
             "project_id": .string(projectID),
             "goal": .string(goal),
             "priority": .number(Double(priority)),
+            "unlimited": .bool(unlimited),
         ]
-        if let tokenBudget, tokenBudget > 0 {
-            params["token_budget"] = .number(Double(tokenBudget))
-        }
-        if let costBudgetUSD, costBudgetUSD > 0 {
-            params["cost_budget_usd"] = .number(costBudgetUSD)
-        }
-        if let timeBudgetSecs, timeBudgetSecs > 0 {
-            params["time_budget_secs"] = .number(Double(timeBudgetSecs))
+        if !unlimited {
+            if let tokenBudget, tokenBudget > 0 {
+                params["token_budget"] = .number(Double(tokenBudget))
+            }
+            if let costBudgetUSD, costBudgetUSD > 0 {
+                params["cost_budget_usd"] = .number(costBudgetUSD)
+            }
+            if let timeBudgetSecs, timeBudgetSecs > 0 {
+                params["time_budget_secs"] = .number(Double(timeBudgetSecs))
+            }
         }
         return try await request(method: "session.create", params: params)
             .decode(Session.self)
+    }
+
+    func setSessionUnlimited(
+        sessionID: String,
+        unlimited: Bool
+    ) async throws -> SessionUnlimitedResult {
+        try await request(
+            method: "session.budget.set",
+            params: [
+                "session_id": .string(sessionID),
+                "unlimited": .bool(unlimited),
+            ]
+        )
+        .decode(SessionUnlimitedResult.self)
     }
 
     func checkpointSession(sessionID: String, label: String?) async throws -> SessionCheckpoint {

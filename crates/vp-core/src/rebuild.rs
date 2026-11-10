@@ -178,6 +178,10 @@ fn session_from_created(event: &Event) -> Option<Session> {
         time_budget_secs: payload
             .get("time_budget_secs")
             .and_then(serde_json::Value::as_u64),
+        unlimited: payload
+            .get("unlimited")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         cost_spent_usd: 0.0,
         base_commit: payload
             .get("base_commit")

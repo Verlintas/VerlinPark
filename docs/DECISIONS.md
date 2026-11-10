@@ -142,6 +142,7 @@
 | [0130](adr/0130-project-skill-packs.md) | Project skill packs, SKILL.md import, explicit activation, narrowing tool policy | Accepted | Prompting/Runtime |
 | [0131](adr/0131-artifact-versions-and-idempotent-publication.md) | Inline artifact versions, optimistic restore, session-scoped request-key idempotency | Accepted | Artifacts/Runtime |
 | [0132](adr/0132-bounded-text-diff-and-citation-audit.md) | Bounded Myers text diff, artifact version comparison, event-derived citation audit, source collections, context-limit fix | Accepted | Runtime/Artifacts/Knowledge |
+| [0133](adr/0133-unlimited-session-budget-mode.md) | Explicit, event-backed unlimited session budget mode; bypasses economic gates only | Accepted | Runtime/Budgets |
 
 ---
 

@@ -1318,16 +1318,33 @@ final class ProtocolCompatibilityTests: XCTestCase {
         """
         let session = try JSONDecoder().decode(Session.self, from: Data(json.utf8))
         XCTAssertEqual(session.priority, 25)
+        XCTAssertFalse(session.unlimited)
 
         let legacy = json.replacingOccurrences(of: #""priority": 25,"#, with: "")
         let oldSession = try JSONDecoder().decode(Session.self, from: Data(legacy.utf8))
         XCTAssertNil(oldSession.priority)
+        XCTAssertFalse(oldSession.unlimited)
+
+        let unlimitedJSON = json.replacingOccurrences(
+            of: #""time_budget_secs": null,"#,
+            with: #""time_budget_secs": null, "unlimited": true,"#
+        )
+        let unlimited = try JSONDecoder().decode(
+            Session.self,
+            from: Data(unlimitedJSON.utf8)
+        )
+        XCTAssertTrue(unlimited.unlimited)
 
         let updated = try JSONDecoder().decode(
             SessionPriorityResult.self,
             from: Data(#"{"session_id":"session-1","priority":40}"#.utf8)
         )
         XCTAssertEqual(updated.priority, 40)
+        let mode = try JSONDecoder().decode(
+            SessionUnlimitedResult.self,
+            from: Data(#"{"session_id":"session-1","unlimited":true}"#.utf8)
+        )
+        XCTAssertTrue(mode.unlimited)
     }
 
     func testMemoryListDecodes() throws {

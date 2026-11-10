@@ -8,6 +8,7 @@ struct NewSessionSheet: View {
     @State private var priority = 0
     @State private var costBudget = ""
     @State private var timeBudget = ""
+    @State private var unlimited = false
     @FocusState private var goalFocused: Bool
 
     var body: some View {
@@ -34,6 +35,7 @@ struct NewSessionSheet: View {
         .tint(VPTheme.accent)
         .onAppear {
             budget = model.defaultTokenBudget
+            unlimited = model.defaultUnlimitedBudget
             goalFocused = true
         }
     }
@@ -142,7 +144,16 @@ struct NewSessionSheet: View {
 
     private var budgetSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("Run budgets", detail: "Checked at turn and tool boundaries.")
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                sectionLabel(
+                    "Run budgets",
+                    detail: "Checked at turn and tool boundaries."
+                )
+                Spacer()
+                Toggle(L10n.t("Unlimited budget"), isOn: $unlimited)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
             HStack(alignment: .top, spacing: 10) {
                 budgetCard(
                     icon: "number",
@@ -152,6 +163,7 @@ struct NewSessionSheet: View {
                     TextField("200000", value: $budget, format: .number)
                         .textFieldStyle(.plain)
                         .font(VPTheme.mono(11))
+                        .disabled(unlimited)
                 }
                 budgetCard(
                     icon: "dollarsign.circle",
@@ -161,6 +173,7 @@ struct NewSessionSheet: View {
                     TextField("optional", text: $costBudget)
                         .textFieldStyle(.plain)
                         .font(VPTheme.mono(11))
+                        .disabled(unlimited)
                 }
                 budgetCard(
                     icon: "clock",
@@ -170,6 +183,29 @@ struct NewSessionSheet: View {
                     TextField("optional", text: $timeBudget)
                         .textFieldStyle(.plain)
                         .font(VPTheme.mono(11))
+                        .disabled(unlimited)
+                }
+            }
+            .opacity(unlimited ? 0.45 : 1)
+
+            if unlimited {
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "infinity.circle.fill")
+                        .foregroundStyle(VPTheme.accent)
+                    Text(
+                        L10n.t(
+                            "Unlimited ignores session, plan-task, department, and project budget gates. Capacity, approvals, verification, context compaction, and turn limits still apply."
+                        )
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(9)
+                .background(VPTheme.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9)
+                        .strokeBorder(VPTheme.accent.opacity(0.18), lineWidth: 1)
                 }
             }
         }
@@ -234,10 +270,11 @@ struct NewSessionSheet: View {
                 Task {
                     let created = await model.createSession(
                         goal: goal,
-                        tokenBudget: budget,
-                        costBudgetUSD: Double(costBudget),
-                        timeBudgetSecs: Int(timeBudget),
-                        priority: priority
+                        tokenBudget: unlimited ? nil : budget,
+                        costBudgetUSD: unlimited ? nil : Double(costBudget),
+                        timeBudgetSecs: unlimited ? nil : Int(timeBudget),
+                        priority: priority,
+                        unlimited: unlimited
                     )
                     if created {
                         dismiss()

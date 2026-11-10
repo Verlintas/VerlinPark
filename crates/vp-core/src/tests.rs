@@ -2742,9 +2742,14 @@ async fn replay_checks_critical_projections() {
     assert_eq!(restored.content, "artifact content");
     assert_eq!(restored.mime_type, "text/markdown");
 
+    engine
+        .set_session_unlimited(&session.id, true)
+        .await
+        .unwrap();
     let bundle = engine.export_session(&session.id).await.unwrap();
     assert_eq!(bundle.version, 1);
     assert_eq!(bundle.session.id, session.id);
+    assert!(bundle.session.unlimited);
     assert_eq!(bundle.agents.len(), 1);
     assert_eq!(bundle.messages.len(), 1);
     assert_eq!(bundle.todos.len(), 1);
@@ -2792,6 +2797,14 @@ async fn replay_checks_critical_projections() {
     let imported = imported_engine.import_session(bundle).await.unwrap();
     assert_eq!(imported.session_id, session.id);
     assert_eq!(imported.status, "imported");
+    assert!(
+        imported_engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .unlimited
+    );
     assert_eq!(
         imported_engine
             .list_agent_messages(&session.id, None, false)
@@ -6133,4 +6146,95 @@ async fn citation_audit_exposes_dangling_and_unused_keys() {
     assert_eq!(second.citation_count, 0);
     assert!(second.referenced_keys.is_empty());
     assert!(second.dangling_keys.is_empty());
+}
+
+#[tokio::test]
+async fn unlimited_budget_mode_is_event_backed_and_reversible() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("unlimited".into()),
+        )
+        .await
+        .unwrap();
+    let invalid = engine
+        .create_session_with_options_and_unlimited(
+            project.id.clone(),
+            "conflicting budget".into(),
+            Some(100),
+            None,
+            None,
+            0,
+            true,
+        )
+        .await;
+    assert!(invalid.is_err());
+
+    let session = engine
+        .create_session_with_options_and_unlimited(
+            project.id.clone(),
+            "large project".into(),
+            Some(100),
+            None,
+            None,
+            0,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(!session.unlimited);
+    assert_eq!(session.token_budget, Some(100));
+    let shared_flag = engine.unlimited_flag(&session.id, session.unlimited);
+    assert!(!shared_flag.load(std::sync::atomic::Ordering::SeqCst));
+
+    let toggled = engine
+        .set_session_unlimited(&session.id, true)
+        .await
+        .unwrap();
+    assert!(toggled.unlimited);
+    assert!(
+        shared_flag.load(std::sync::atomic::Ordering::SeqCst),
+        "a live run holding the shared flag must see the toggle"
+    );
+    let loaded = engine.store().get_session(&session.id).unwrap().unwrap();
+    assert!(loaded.unlimited);
+    assert_eq!(
+        loaded.token_budget,
+        Some(100),
+        "unlimited mode preserves stored limits for later restoration"
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.budget_mode_changed"
+            && event.payload["unlimited"] == serde_json::json!(true)
+    }));
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(
+        report.consistent,
+        "replay mismatches: {:?}",
+        report.mismatches
+    );
+
+    let restored = engine
+        .set_session_unlimited(&session.id, false)
+        .await
+        .unwrap();
+    assert!(!restored.unlimited);
+    assert!(!shared_flag.load(std::sync::atomic::Ordering::SeqCst));
+    let loaded = engine.store().get_session(&session.id).unwrap().unwrap();
+    assert!(!loaded.unlimited);
+    assert_eq!(loaded.token_budget, Some(100));
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(
+        report.consistent,
+        "replay mismatches: {:?}",
+        report.mismatches
+    );
 }

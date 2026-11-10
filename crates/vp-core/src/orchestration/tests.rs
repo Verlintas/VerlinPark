@@ -53,6 +53,7 @@ fn session() -> Session {
         token_budget: None,
         cost_budget_usd: None,
         time_budget_secs: None,
+        unlimited: false,
         cost_spent_usd: 0.0,
         base_commit: None,
         tokens_in: 0,

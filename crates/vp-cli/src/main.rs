@@ -674,6 +674,16 @@ enum Command {
         cost_budget_usd: Option<f64>,
         #[arg(long)]
         time_budget_secs: Option<u64>,
+        /// Ignore session, plan, department, and project budget gates.
+        #[arg(long)]
+        unlimited: bool,
+    },
+    /// Enable or disable unlimited budget mode for a session.
+    SessionUnlimited {
+        session: String,
+        /// Omit to enable; pass --enabled false to restore the stored limits.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        enabled: Option<bool>,
     },
     /// Run one command in the session console under the shell sandbox.
     Console { session: String, command: String },
@@ -2136,6 +2146,7 @@ async fn main() -> Result<()> {
             token_budget,
             cost_budget_usd,
             time_budget_secs,
+            unlimited,
         } => {
             rpc(
                 &discovery,
@@ -2147,7 +2158,16 @@ async fn main() -> Result<()> {
                     "token_budget": token_budget,
                     "cost_budget_usd": cost_budget_usd,
                     "time_budget_secs": time_budget_secs,
+                    "unlimited": unlimited,
                 }),
+            )
+            .await?
+        }
+        Command::SessionUnlimited { session, enabled } => {
+            rpc(
+                &discovery,
+                "session.budget.set",
+                json!({"session_id": session, "unlimited": enabled.unwrap_or(true)}),
             )
             .await?
         }
@@ -3064,6 +3084,17 @@ fn read_json_input(file: Option<&std::path::Path>) -> Result<String> {
 }
 
 fn print_human(value: &Value) {
+    if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
+        && value.get("goal").is_none()
+        && let Some(unlimited) = value.get("unlimited").and_then(Value::as_bool)
+    {
+        println!(
+            "session {} budget mode: {}",
+            session_id,
+            if unlimited { "unlimited" } else { "limited" }
+        );
+        return;
+    }
     if value.get("console_streamed").and_then(Value::as_bool) == Some(true)
         || value.get("terminal_streamed").and_then(Value::as_bool) == Some(true)
     {

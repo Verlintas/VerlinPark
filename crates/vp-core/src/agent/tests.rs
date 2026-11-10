@@ -3249,6 +3249,82 @@ fn plan_budget_scope_includes_the_project_pool() {
     assert_eq!(stop.reason, "tokens");
 }
 
+#[test]
+fn unlimited_flag_bypasses_budget_gates_and_can_be_revoked() {
+    let flag = Arc::new(AtomicBool::new(true));
+    let budget = SessionBudget::new(
+        Some(10),
+        10,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    )
+    .with_cost(Some(1.0), 2.0)
+    .with_time(Some(1))
+    .with_unlimited_flag(flag.clone());
+    assert!(!budget.exhausted());
+    assert!(budget.warning().is_none());
+    assert!(budget.reserve_tokens(100).is_none());
+    assert!(
+        budget
+            .reserve_cost(100, 100, 1.0, 1.0)
+            .expect("unlimited cost reservation")
+            .is_none()
+    );
+    assert!(budget.can_expand_workers());
+    flag.store(false, Ordering::SeqCst);
+    assert_eq!(budget.exceeded_reason(), Some("tokens"));
+    assert!(budget.exhausted());
+}
+
+#[tokio::test]
+async fn unlimited_mode_keeps_a_zero_headroom_session_running() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("large project completed".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session_with_limits(
+            project.id,
+            "large engineering project".into(),
+            Some(1),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.token_budget, Some(1));
+    let toggled = engine
+        .set_session_unlimited(&session.id, true)
+        .await
+        .unwrap();
+    assert!(toggled.unlimited);
+    service
+        .start(&session.id, "large engineering project")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.budget_exceeded")
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message" && event.payload["text"] == "large project completed"
+    }));
+}
+
 #[tokio::test]
 async fn warns_once_at_eighty_percent_of_token_budget() {
     let dir = TempDir::new().unwrap();

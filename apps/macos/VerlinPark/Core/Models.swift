@@ -941,6 +941,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
     let tokenBudget: Int?
     let costBudgetUsd: Double?
     let timeBudgetSecs: Int?
+    let unlimited: Bool
     let costSpentUsd: Double
     let baseCommit: String?
     let tokensIn: Int
@@ -958,11 +959,68 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         case tokenBudget = "token_budget"
         case costBudgetUsd = "cost_budget_usd"
         case timeBudgetSecs = "time_budget_secs"
+        case unlimited
         case costSpentUsd = "cost_spent_usd"
         case baseCommit = "base_commit"
         case tokensIn = "tokens_in"
         case tokensOut = "tokens_out"
         case createdAt = "created_at"
+    }
+
+    init(
+        id: String,
+        projectId: String,
+        goal: String,
+        status: String,
+        priority: Int?,
+        worktree: String?,
+        branch: String?,
+        tokenBudget: Int?,
+        costBudgetUsd: Double?,
+        timeBudgetSecs: Int?,
+        unlimited: Bool = false,
+        costSpentUsd: Double,
+        baseCommit: String?,
+        tokensIn: Int,
+        tokensOut: Int,
+        createdAt: String
+    ) {
+        self.id = id
+        self.projectId = projectId
+        self.goal = goal
+        self.status = status
+        self.priority = priority
+        self.worktree = worktree
+        self.branch = branch
+        self.tokenBudget = tokenBudget
+        self.costBudgetUsd = costBudgetUsd
+        self.timeBudgetSecs = timeBudgetSecs
+        self.unlimited = unlimited
+        self.costSpentUsd = costSpentUsd
+        self.baseCommit = baseCommit
+        self.tokensIn = tokensIn
+        self.tokensOut = tokensOut
+        self.createdAt = createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        goal = try container.decode(String.self, forKey: .goal)
+        status = try container.decode(String.self, forKey: .status)
+        priority = try container.decodeIfPresent(Int.self, forKey: .priority)
+        worktree = try container.decodeIfPresent(String.self, forKey: .worktree)
+        branch = try container.decodeIfPresent(String.self, forKey: .branch)
+        tokenBudget = try container.decodeIfPresent(Int.self, forKey: .tokenBudget)
+        costBudgetUsd = try container.decodeIfPresent(Double.self, forKey: .costBudgetUsd)
+        timeBudgetSecs = try container.decodeIfPresent(Int.self, forKey: .timeBudgetSecs)
+        unlimited = try container.decodeIfPresent(Bool.self, forKey: .unlimited) ?? false
+        costSpentUsd = try container.decodeIfPresent(Double.self, forKey: .costSpentUsd) ?? 0
+        baseCommit = try container.decodeIfPresent(String.self, forKey: .baseCommit)
+        tokensIn = try container.decodeIfPresent(Int.self, forKey: .tokensIn) ?? 0
+        tokensOut = try container.decodeIfPresent(Int.self, forKey: .tokensOut) ?? 0
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
     }
 
     var tokensUsed: Int {
@@ -3285,4 +3343,14 @@ struct CitationAudit: Codable, Hashable, Sendable {
 
 struct SessionCitationAuditResult: Codable, Sendable {
     let audit: CitationAudit
+}
+
+struct SessionUnlimitedResult: Codable, Sendable {
+    let sessionID: String
+    let unlimited: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case unlimited
+    }
 }

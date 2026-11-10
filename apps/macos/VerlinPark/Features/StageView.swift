@@ -271,6 +271,14 @@ private struct ProjectStageView: View {
                             Button("High (10)") { Task { await model.setSessionPriority(10) } }
                             Button("Urgent (50)") { Task { await model.setSessionPriority(50) } }
                         }
+                        Button(
+                            session.unlimited
+                                ? L10n.t("Restore Stored Budget Limits")
+                                : L10n.t("Enable Unlimited Budget")
+                        ) {
+                            Task { await model.setSessionUnlimited(!session.unlimited) }
+                        }
+                        .disabled(session.status == "imported")
                         Divider()
                         Button("Fork Session…") { showingFork = true }
                         Button("Export Transcript…") {
@@ -300,6 +308,13 @@ private struct ProjectStageView: View {
     private func tokenUsageLabel(_ session: Session) -> String {
         let used = tokenLabel(session.tokensUsed)
         var parts: [String] = []
+        if session.unlimited {
+            parts.append("\(used) tokens · unlimited budget")
+            if session.costSpentUsd > 0 {
+                parts.append(String(format: "$%.4f", session.costSpentUsd))
+            }
+            return parts.joined(separator: " · ")
+        }
         if let budget = session.tokenBudget, budget > 0 {
             parts.append("\(used) / \(tokenLabel(budget)) tokens")
         } else {

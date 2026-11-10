@@ -104,7 +104,8 @@
 - **citation audit**：`session.citation_audit` 从事件派生 dangling/unused key 与 cited/uncited message；它不验证句子是否被引用内容支持，也不阻止模型写出无依据的陈述。
 - **skill usage**：成功的 `use_skill` 写 `skill.activated` 事件并由 `skill.activations` 派生；激活是 run-scoped，事件历史不表示 skill 永久生效。
 - **context limit**：修复 system/tool token 的双重扣减；手动压缩摘要失败时 trim 到 hard limit 一半。启发式估算、provider calibration 与用户配置的 context window 仍可能导致过早压缩或 provider overflow。
-- **测试/文档**：ADR-0129/0130/0131/0132；Rust/Swift 回归覆盖 source/skill/citation/artifact version/collection/diff/audit；当前 Rust 415（core 330 / protocol 2 / store 69 / providers 14，3 ignored live），Swift 110。
+- **unlimited budget**：显式 `Session.unlimited` 绕过 session/plan/department/project 经济预算门，并在运行中通过共享 atomic flag 生效；数字预算保留以便关闭后恢复。它不绕过 capacity、approvals、sandbox、Verifier、context、max turns 或 provider timeout。项目 shared pool 可被单个 unlimited session 绕过，这是显式用户选择；没有隐藏自动延期或外部硬上限。
+- **测试/文档**：ADR-0129/0130/0131/0132；Rust/Swift 回归覆盖 source/skill/citation/artifact version/collection/diff/audit；当前 Rust 419（core 333 / protocol 2 / store 70 / providers 14，3 ignored live），Swift 110。
 
 ---
 

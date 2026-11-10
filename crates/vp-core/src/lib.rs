@@ -40,11 +40,11 @@ use vp_protocol::types::{
     SessionForkTreeNode, SessionForkTreeResult, SessionImportResult, SessionLandResult,
     SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPriorityResult,
     SessionRehydrateResult, SessionReplayReport, SessionSkillActivationsResult,
-    SessionTranscriptResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
-    SkillDeleteResult, SkillEnabledParams, SkillImportParams, SkillListResult, SkillUpdateParams,
-    Source, SourceChunk, SourceCitation, SourceCollectionsResult, SourceCreateFileParams,
-    SourceCreateNoteParams, SourceCreateUrlParams, SourceDeleteResult, SourceGetResult,
-    SourceImportError, SourceImportParams, SourceImportResult, SourceListResult,
+    SessionTranscriptResult, SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation,
+    SkillCreateParams, SkillDeleteResult, SkillEnabledParams, SkillImportParams, SkillListResult,
+    SkillUpdateParams, Source, SourceChunk, SourceCitation, SourceCollectionsResult,
+    SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams, SourceDeleteResult,
+    SourceGetResult, SourceImportError, SourceImportParams, SourceImportResult, SourceListResult,
     SourceReindexResult, SourceSearchResult, SourceStats, StoredMessage, TaskQueueResult,
     TaskSchedulerPolicy, TaskSchedulerPolicyResult, TeamPlan, TerminalCloseResult,
     TerminalOpenResult, TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem,
@@ -115,6 +115,7 @@ pub struct Engine {
     question_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     git_lock: Arc<Mutex<()>>,
     budget_registry: Arc<BudgetRegistry>,
+    unlimited_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     mcp: Arc<mcp::McpManager>,
     consoles: Arc<console::ConsoleManager>,
     terminals: Arc<terminal::TerminalManager>,
@@ -244,6 +245,9 @@ fn approval_grant_paths(input: &serde_json::Value) -> Vec<String> {
 }
 
 fn session_budget_exhausted(session: &Session) -> bool {
+    if session.unlimited {
+        return false;
+    }
     let token_spent = session.tokens_in.saturating_add(session.tokens_out);
     if let Some(limit) = session.token_budget
         && token_spent >= limit
@@ -427,6 +431,7 @@ impl Engine {
             question_waiters: Arc::new(Mutex::new(HashMap::new())),
             git_lock: Arc::new(Mutex::new(())),
             budget_registry: Arc::new(BudgetRegistry::new()),
+            unlimited_flags: Arc::new(Mutex::new(HashMap::new())),
             mcp: Arc::new(mcp::McpManager::from_env()),
             consoles: Arc::new(console::ConsoleManager::new()),
             terminals: Arc::new(terminal::TerminalManager::new()),
@@ -436,6 +441,39 @@ impl Engine {
 
     pub fn budget_registry(&self) -> &Arc<BudgetRegistry> {
         &self.budget_registry
+    }
+
+    /// Shared runtime flag for a session's budget mode. A running agent loop
+    /// holds the same `Arc<AtomicBool>`, so an explicit toggle takes effect at
+    /// the next turn/tool boundary without restarting the session.
+    pub fn unlimited_flag(&self, session_id: &str, initial: bool) -> Arc<AtomicBool> {
+        let mut flags = match self.unlimited_flags.lock() {
+            Ok(flags) => flags,
+            Err(_) => return Arc::new(AtomicBool::new(initial)),
+        };
+        flags
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(initial)))
+            .clone()
+    }
+
+    pub fn update_unlimited_flag(&self, session_id: &str, unlimited: bool) -> Arc<AtomicBool> {
+        let mut flags = match self.unlimited_flags.lock() {
+            Ok(flags) => flags,
+            Err(_) => return Arc::new(AtomicBool::new(unlimited)),
+        };
+        let flag = flags
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(unlimited)))
+            .clone();
+        flag.store(unlimited, Ordering::SeqCst);
+        flag
+    }
+
+    pub fn clear_unlimited_flag(&self, session_id: &str) {
+        if let Ok(mut flags) = self.unlimited_flags.lock() {
+            flags.remove(session_id);
+        }
     }
 
     pub fn store(&self) -> &Store {
@@ -2026,6 +2064,7 @@ impl Engine {
             cost_budget_usd,
             time_budget_secs,
             0,
+            false,
         )
         .await
     }
@@ -2037,7 +2076,7 @@ impl Engine {
         token_budget: Option<u64>,
         priority: i32,
     ) -> Result<Session> {
-        self.create_session_full(project_id, goal, token_budget, None, None, priority)
+        self.create_session_full(project_id, goal, token_budget, None, None, priority, false)
             .await
     }
 
@@ -2060,10 +2099,36 @@ impl Engine {
             cost_budget_usd,
             time_budget_secs,
             priority,
+            false,
         )
         .await
     }
 
+    /// Full session creation path that can also select unlimited budget mode.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_session_with_options_and_unlimited(
+        &self,
+        project_id: String,
+        goal: String,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+        priority: i32,
+        unlimited: bool,
+    ) -> Result<Session> {
+        self.create_session_full(
+            project_id,
+            goal,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            priority,
+            unlimited,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn create_session_full(
         &self,
         project_id: String,
@@ -2072,9 +2137,15 @@ impl Engine {
         cost_budget_usd: Option<f64>,
         time_budget_secs: Option<u64>,
         priority: i32,
+        unlimited: bool,
     ) -> Result<Session> {
         if !(-100..=100).contains(&priority) {
             anyhow::bail!("session priority must be between -100 and 100");
+        }
+        if unlimited
+            && (token_budget.is_some() || cost_budget_usd.is_some() || time_budget_secs.is_some())
+        {
+            anyhow::bail!("an unlimited session cannot also declare token, cost, or time budgets");
         }
         if token_budget == Some(0) {
             anyhow::bail!("token budget must be greater than zero");
@@ -2131,6 +2202,7 @@ impl Engine {
                     token_budget,
                     cost_budget_usd,
                     time_budget_secs,
+                    unlimited,
                     &base_commit,
                     priority,
                 )
@@ -2167,6 +2239,8 @@ impl Engine {
             "token_budget": session.token_budget,
             "cost_budget_usd": session.cost_budget_usd,
             "time_budget_secs": session.time_budget_secs,
+            "unlimited": session.unlimited,
+            "budget_mode": if session.unlimited { "unlimited" } else { "limited" },
             "base_commit": session.base_commit,
             "created_at": session.created_at,
         });
@@ -2918,6 +2992,7 @@ impl Engine {
                     token_budget,
                     cost_budget,
                     time_budget,
+                    source.unlimited,
                     &base_commit,
                     priority,
                 )
@@ -2941,6 +3016,8 @@ impl Engine {
             "token_budget": new_session.token_budget,
             "cost_budget_usd": new_session.cost_budget_usd,
             "time_budget_secs": new_session.time_budget_secs,
+            "unlimited": new_session.unlimited,
+            "budget_mode": if new_session.unlimited { "unlimited" } else { "limited" },
             "base_commit": new_session.base_commit,
             "created_at": new_session.created_at,
             "forked_from_session_id": source.id,
@@ -6204,6 +6281,9 @@ impl Engine {
             session.tokens_in, session.tokens_out
         );
         let _ = writeln!(out, "- **Cost:** ${:.4}", session.cost_spent_usd);
+        if session.unlimited {
+            let _ = writeln!(out, "- **Budget:** unlimited (economic gates bypassed)");
+        }
 
         if let Some(plan) = &plan {
             let _ = writeln!(out, "\n## Team Plan\n");
@@ -6954,6 +7034,13 @@ impl Engine {
                 data.session.status, replay_status
             ));
         }
+        let replay_unlimited = replay_session_unlimited(&data.events);
+        if replay_unlimited != data.session.unlimited {
+            mismatches.push(format!(
+                "session budget mode: projection={}, replay={}",
+                data.session.unlimited, replay_unlimited
+            ));
+        }
 
         let (replay_in, replay_out) = data
             .events
@@ -7608,6 +7695,7 @@ impl Engine {
         Ok(SessionRepair {
             status,
             priority,
+            unlimited: Some(replay_session_unlimited(&data.events)),
             tokens_in,
             tokens_out,
             cost_spent_usd,
@@ -8220,6 +8308,39 @@ impl Engine {
         Ok(SessionPriorityResult {
             session_id: session_id.to_string(),
             priority,
+        })
+    }
+
+    /// Toggle unlimited budget mode. The persisted budget values are retained,
+    /// so disabling unlimited restores the previous limits. The shared runtime
+    /// flag changes immediately for any active agent loop.
+    pub async fn set_session_unlimited(
+        &self,
+        session_id: &str,
+        unlimited: bool,
+    ) -> Result<SessionUnlimitedResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let id = id.clone();
+            move || store.get_session(&id)
+        })
+        .await??
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let store = self.store.clone();
+        let event = tokio::task::spawn_blocking(move || {
+            store.set_session_unlimited_with_event(&id, unlimited)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        self.update_unlimited_flag(session_id, unlimited);
+        Ok(SessionUnlimitedResult {
+            session_id: session_id.to_string(),
+            unlimited,
         })
     }
 
@@ -9845,6 +9966,24 @@ async fn ensure_session_not_active(store: &Store, session_id: &str, action: &str
 /// Prefer the latest total so both `record_agent_usage` and the legacy
 /// `record_cost` path replay identically; fall back to summing older usage
 /// events that predate `agent.cost`.
+fn replay_session_unlimited(events: &[Event]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event.kind.as_str() {
+            "session.budget_mode_changed" => event
+                .payload
+                .get("unlimited")
+                .and_then(serde_json::Value::as_bool),
+            "session.created" => event
+                .payload
+                .get("unlimited")
+                .and_then(serde_json::Value::as_bool),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 fn replay_session_cost(events: &[Event]) -> f64 {
     if let Some(total) = events.iter().rev().find_map(|event| {
         if event.kind != "agent.cost" {

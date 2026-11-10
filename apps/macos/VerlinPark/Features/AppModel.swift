@@ -1079,12 +1079,17 @@ final class AppModel {
             ?? 200_000
     }
 
+    var defaultUnlimitedBudget: Bool {
+        UserDefaults.standard.bool(forKey: "verlinpark.session.unlimitedBudget")
+    }
+
     func createSession(
         goal: String,
         tokenBudget: Int? = nil,
         costBudgetUSD: Double? = nil,
         timeBudgetSecs: Int? = nil,
-        priority: Int = 0
+        priority: Int = 0,
+        unlimited: Bool? = nil
     ) async -> Bool {
         guard let projectID = selectedProjectID else {
             lastError = "Choose a project first."
@@ -1092,8 +1097,15 @@ final class AppModel {
         }
         let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        let budget = (tokenBudget ?? defaultTokenBudget).clampedTokenBudget
-        UserDefaults.standard.set(budget, forKey: "verlinpark.session.tokenBudget")
+        let isUnlimited = unlimited ?? defaultUnlimitedBudget
+        let budget: Int? = if isUnlimited {
+            nil
+        } else {
+            (tokenBudget ?? defaultTokenBudget).clampedTokenBudget
+        }
+        if let budget {
+            UserDefaults.standard.set(budget, forKey: "verlinpark.session.tokenBudget")
+        }
 
         isBusy = true
         defer { isBusy = false }
@@ -1102,9 +1114,10 @@ final class AppModel {
                 projectID: projectID,
                 goal: trimmed,
                 tokenBudget: budget,
-                costBudgetUSD: costBudgetUSD,
-                timeBudgetSecs: timeBudgetSecs,
-                priority: priority
+                costBudgetUSD: isUnlimited ? nil : costBudgetUSD,
+                timeBudgetSecs: isUnlimited ? nil : timeBudgetSecs,
+                priority: priority,
+                unlimited: isUnlimited
             )
             let loaded = try await core.listSessions(projectID: projectID)
             guard selectedProjectID == projectID else { return false }
@@ -1152,6 +1165,7 @@ final class AppModel {
                     tokenBudget: old.tokenBudget,
                     costBudgetUsd: old.costBudgetUsd,
                     timeBudgetSecs: old.timeBudgetSecs,
+                    unlimited: old.unlimited,
                     costSpentUsd: old.costSpentUsd,
                     baseCommit: old.baseCommit,
                     tokensIn: old.tokensIn,
@@ -1160,6 +1174,46 @@ final class AppModel {
                 )
             }
             lastError = nil
+        } catch {
+            handle(error)
+        }
+    }
+
+    func setSessionUnlimited(_ unlimited: Bool) async {
+        guard let sessionID = selectedSessionID else { return }
+        do {
+            let result = try await core.setSessionUnlimited(
+                sessionID: sessionID,
+                unlimited: unlimited
+            )
+            if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
+                let old = sessions[index]
+                sessions[index] = Session(
+                    id: old.id,
+                    projectId: old.projectId,
+                    goal: old.goal,
+                    status: old.status,
+                    priority: old.priority,
+                    worktree: old.worktree,
+                    branch: old.branch,
+                    tokenBudget: old.tokenBudget,
+                    costBudgetUsd: old.costBudgetUsd,
+                    timeBudgetSecs: old.timeBudgetSecs,
+                    unlimited: result.unlimited,
+                    costSpentUsd: old.costSpentUsd,
+                    baseCommit: old.baseCommit,
+                    tokensIn: old.tokensIn,
+                    tokensOut: old.tokensOut,
+                    createdAt: old.createdAt
+                )
+            }
+            showToast(
+                unlimited ? "Unlimited budget enabled" : "Stored budget limits restored",
+                detail: unlimited
+                    ? "Session, plan, department, and project budget gates are bypassed."
+                    : "Budget gates use the session's stored limits again.",
+                kind: unlimited ? .warning : .success
+            )
         } catch {
             handle(error)
         }
@@ -5477,6 +5531,7 @@ final class AppModel {
                 tokenBudget: old.tokenBudget,
                 costBudgetUsd: old.costBudgetUsd,
                 timeBudgetSecs: old.timeBudgetSecs,
+                unlimited: old.unlimited,
                 costSpentUsd: old.costSpentUsd,
                 baseCommit: old.baseCommit,
                 tokensIn: old.tokensIn + input,
@@ -5505,6 +5560,7 @@ final class AppModel {
                 tokenBudget: old.tokenBudget,
                 costBudgetUsd: old.costBudgetUsd,
                 timeBudgetSecs: old.timeBudgetSecs,
+                unlimited: old.unlimited,
                 costSpentUsd: total,
                 baseCommit: old.baseCommit,
                 tokensIn: old.tokensIn,
@@ -5529,6 +5585,7 @@ final class AppModel {
                 tokenBudget: old.tokenBudget,
                 costBudgetUsd: old.costBudgetUsd,
                 timeBudgetSecs: old.timeBudgetSecs,
+                unlimited: old.unlimited,
                 costSpentUsd: old.costSpentUsd,
                 baseCommit: old.baseCommit,
                 tokensIn: old.tokensIn,
@@ -5538,6 +5595,7 @@ final class AppModel {
         }
 
         if event.type == "session.created"
+            || event.type == "session.budget_mode_changed"
             || event.type == "session.worktree"
             || event.type == "session.imported"
             || event.type == "session.rehydrated"

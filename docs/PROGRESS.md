@@ -105,6 +105,28 @@ artifact 增加版本和幂等发布。参考了 SourceWeft 的能力边界和 a
   audit / skill activation 回归；Swift 新增 collection/activation/diff/audit
   decode 与 UI 状态。
 
+### Unlimited session budget mode
+
+- `Session.unlimited`（默认 false）成为显式、持久、事件驱动的预算模式；创建时
+  `unlimited: true` 不允许同时声明 token/cost/time 数值，避免静默忽略。
+- `session.budget.set` 可在运行中切换；engine 为每个 session 保存共享
+  `Arc<AtomicBool>`，运行中的 `SessionBudget` 在下一个 turn/tool 边界看到变化，
+  daemon 重启后以持久字段为准。
+- unlimited 绕过 session token/cost/time、TeamPlan task/department token/cost、
+  project shared pool、pre-flight reservation 与 budget stop；不绕过 capacity、
+  approvals、sandbox、Verifier、context window、max turns、provider timeout、
+  pause/cancel。数字预算会保留，关闭 unlimited 后恢复原来的限额。
+- 创建事件写 `unlimited` / `budget_mode`；切换写
+  `session.budget_mode_changed`，`session.replay`/repair/rebuild 与 bundle
+  export/import 都覆盖该字段。
+- UI：New Session 的 `Unlimited budget` 开关（开启时禁用三个预算输入并提示
+  bypass 边界）、Settings → Providers → Session defaults 默认开关、Stage
+  session menu 切换、Stage 用量显示 `unlimited budget`。
+- CLI：`vp session-new --unlimited`、`vp session-unlimited <session>
+  [--enabled false]`。
+- 新增 `SessionBudget` 共享 flag 单测、零 headroom 会话端到端测试、store
+  round-trip/event 测试、replay/repair 与 bundle 测试、Swift decode 测试。
+
 ### 验证
 
 - 新增 Rust 测试：source chunking/HTML/query、source store/search/snapshot、
@@ -113,11 +135,11 @@ artifact 增加版本和幂等发布。参考了 SourceWeft 的能力边界和 a
   restore/request-key、rebuild 恢复 source/skill。
 - 新增 Swift 测试：Source/Skill/Citation decode、transcript citation attach、
   settings section count、artifact/citation UI 兼容。
-- 当前测试：Rust 415（core 330 / protocol 2 / store 69 / providers 14；另有
+- 当前测试：Rust 419（core 333 / protocol 2 / store 70 / providers 14；另有
   3 ignored live），Swift 110；以最终 `just test` 输出为准。
 - 文档：ADR-0129（sources/citations）、ADR-0130（skills）、ADR-0131
   （artifact versions/idempotency）、ADR-0132（bounded diff/citation audit/
-  source collections/context-limit fix）。
+  source collections/context-limit fix）、ADR-0133（unlimited budget mode）。
 
 ---
 
