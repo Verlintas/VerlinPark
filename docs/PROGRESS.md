@@ -1,10 +1,91 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-11 Policy-gated stall recovery and deferred continuations
+
+这一轮把“卡死可见”推进到“可选地自动恢复”，并补上“结束后再唤醒”的
+continuation 原语。二者都默认保守：stall recovery 默认 `observe`，
+continuation 必须由 operator 显式创建。
+
+### Policy-gated stall recovery
+
+- `OrchestrationPolicy` 增加：
+  - `stall_recovery`: `observe`（默认）/ `escalate` / `retry`
+  - `stall_min_observations`: 默认 2，范围 1..=10
+  - `stall_max_attempts`: 默认 1，范围 0..=5（0 禁止自动重试）
+  - `stall_grace_secs`: 默认 300，范围 0..=86400
+- `observe` 完全保持 ADR-0139 的观测行为；旧 project policy 通过
+  `serde(default)` 解码为 observe。
+- `escalate`：达到阈值后写一条 critical coordination escalation，不取消任务。
+- `retry`：达到阈值且任务仍 running/claimed 时，先持久化 recovery intent，
+  再走现有协作式 cancel；独立的 `VERLINPARK_STALL_RECOVERY_TICK_SECS`
+  （默认 30，0 关闭）等待 task terminal + session idle/failed/cancelled/draft，
+  然后复用 `retry_plan_task` + `resume_plan` 一次。
+- 事件：
+  `orchestration.recovery_requested` / `waiting_cancel` / `retried` /
+  `escalated` / `failed` / `unnecessary`。
+- `orchestration_recoveries` 是 event-backed projection，支持 replay/repair、
+  bundle/import、db-rebuild。
+- max attempts、grace、budget exhausted、retry 失败都会 fail + escalate，
+  不无限循环；completed/skipped 标记 unnecessary。
+- 这是 **same-task/department** recovery，不是 immutable same-agent pin；
+  重试时会创建新的 Worker。
+- CLI/RPC：`vp recoveries <session>`、`orchestration.recoveries`，
+  policy 字段通过现有 `orchestration.policy.get/set` 和 CLI flags 暴露。
+
+### Deferred session continuations
+
+- 新增 `session_continuations` projection：
+  id、session/project、body、watch_task_ids、watch_mode（all/any）、
+  deadline、status（pending/ready/delivering/delivered/cancelled/failed）、
+  attempts、wake_reason、outcomes、last_error 等。
+- 事件：
+  `session.continuation.created` / `ready` / `delivering` / `retrying` /
+  `delivered` / `cancelled` / `failed`。
+- RPC/CLI：
+  `session.defer` / `session.continuations` / `session.continuation.cancel`
+  `vp defer <session> "prompt" [--watch ...] [--watch-mode all|any] [--after-secs|--at]`
+  `vp continuations <session>`、`vp continuation-cancel <id>`。
+- 语义：
+  - `all` 等所有 watch task terminal；`any` 第一个 terminal；
+  - terminal 不等于 success，`failed/cancelled/skipped/interrupted` 都算 settled；
+  - deadline 是 fallback；watch 和 deadline 同时满足时 watch 有具体 outcome；
+  - plan revision 后消失的 task 视为 `missing` settled，避免永久挂起；
+  - 只有 session 处于 idle/failed/cancelled 才调用正常
+    `AgentService::start`；running/queued/paused/waiting_input 保持 ready；
+  - `ready -> delivering -> delivered`；start 失败按 attempt/backoff 重试，
+    达到 cap 后 failed；
+  - daemon 重启时残留 `delivering` 行标记 failed，fail-closed，不重复启动；
+  - prompt 是普通 user message，前面带 bounded 2,000 字符 context note。
+- operator-only；没有 agent-facing tool；不创建 plan task，不替代 plan DAG。
+
+### 边界
+
+- stall retry 默认关闭；自动 cancel 是协作式的，无法中断不回到 turn/tool
+  boundary 的 provider stream。
+- recovery 不保证 same-agent identity、conversation 或 worktree state。
+- continuation 不是 recurring workflow，不是 cross-process lease；daemon
+  重启窗口采用 fail-closed，可能要求操作者重新 defer。
+- continuation 启动失败会消耗 attempt budget；provider 未配置时最终 failed。
+- 没有 SwiftUI/Manage Dash continuation 管理面；本轮以 RPC/CLI 为主。
+
+### 测试
+
+- Rust：**526 passed，4 ignored**
+  - core 432 passed + 1 browser ignored
+  - protocol 4
+  - store 72
+  - providers 18 + 3 live ignored
+- Swift：**111 passed**
+- `just lint`、`just test`、`just bundle` 通过。
+- ADR-0140（stall recovery）和 ADR-0141（deferred continuations）已记录。
 
 ---
 

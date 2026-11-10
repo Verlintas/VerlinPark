@@ -475,6 +475,20 @@ loop {
 > 四层 Actor 模型、并行只读工具和 compaction checkpoint/resume 仍是设计目标；session checkpoint/fork 已实现（ADR-0101）；上下文压缩第一版已实现（ADR-0097）；session 预算已实现 reservation-based enforcement（输入用保守估算，provider usage 结算）。
 > 见 [ADR-0015](adr/0015-m1-leader-loop.md)、[ADR-0016](adr/0016-session-worktree.md)、[ADR-0019](adr/0019-four-tier-delegation.md)。
 
+### 7.0.1 Long-task control（2026-11-11）
+
+- `plan_task_progress` 记录 turn/tool 边界进度；stall sweep 只在阈值窗口发出
+  `orchestration.stall`，默认观测。
+- `OrchestrationPolicy.stall_recovery` 可选 `observe` / `escalate` / `retry`；
+  retry 先请求协作式 cancel，等 task terminal + session quiescent，再复用
+  `retry_plan_task` + `resume_plan`。它是 same-task/department recovery，不是
+  same-agent identity；失败/超时/预算耗尽会 escalate。
+- `session_continuations` 让 operator 在 watch task settle 或 deadline 后唤醒
+  session；`ready -> delivering -> delivered`，只有 idle/failed/cancelled
+  session 才会 start；daemon 重启时 `delivering` fail closed。
+- 三者都不改变 approval、Seatbelt、path jail、write scope、Verifier、merge、
+  capacity 或 budget gate。
+
 ### 7.1 Actor 命令
 
 ```rust

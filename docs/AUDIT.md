@@ -580,7 +580,7 @@ just test                  # Rust + xcodebuild test (40 Swift tests)
 - `git` 工具只读；stage/commit/branch 仍由 runtime/merge queue 拥有。
 - Manager 仍是 code read-only；Verifier 仍不能写代码；approval、write scope、
   capacity、budget、Verifier gate 均未放宽。
-- 当前测试：Rust 505（core 412 + 1 browser ignored / protocol 3 / store 72 /
+- 当前测试：Rust 526（core 432 + 1 browser ignored / protocol 4 / store 72 /
   providers 18；另有 3 个 live ignored），Swift 111。此前本文记录的
   358/104 是历史基线。
 - 新增 optional LSP、provider search、PDF/image/office-document/data reader、
@@ -609,11 +609,25 @@ just test                  # Rust + xcodebuild test (40 Swift tests)
 - Plan-task progress/stall 已交付：`plan_task_progress` 记录 turn/tool 进度；
   `VERLINPARK_TASK_STALL_SECS`（默认 1800，0 关闭）发出阈值窗口化的
   `orchestration.stall` 并 broadcast；`session.stalls` / `vp task-stalls`、
-  `task_detail`、`task.queue`、orchestration snapshot 可见。限制：仅观测，
-  不自动 cancel/retry/pause/改预算/写作用域；progress 是 operational
-  telemetry，不是 replay projection，daemon restart 可能丢失最近窗口。
+  `task_detail`、`task.queue`、orchestration snapshot 可见。progress 仍是
+  operational telemetry，不是 replay projection，daemon restart 可能丢失
+  最近窗口。
+- Policy-gated stall recovery 已交付：`OrchestrationPolicy` 增加
+  `stall_recovery`（默认 observe）、`stall_min_observations`、
+  `stall_max_attempts`、`stall_grace_secs`；`escalate` 只写 escalation，
+  `retry` 先请求协作式 cancel，等 task terminal + session quiescent 后复用
+  `retry_plan_task` + `resume_plan`。`orchestration_recoveries` event-backed，
+  支持 replay/repair/bundle；失败、grace、attempt cap、budget exhaustion 会
+  escalate，不循环。限制：same-task/department，不是 same-agent identity；
+  provider stream 不回到 turn/tool boundary 时无法中断；默认不自动启用。
+- Deferred session continuations 已交付：`session_continuations` 支持
+  watch task all/any + deadline，`session.defer` / `vp defer` /
+  `vp continuations` / `vp continuation-cancel`；只有 idle/failed/cancelled
+  session 才通过正常 `start` 路径启动；`ready -> delivering -> delivered`，
+  daemon 重启时 `delivering` fail-closed。限制：operator-only，不是 recurring
+  workflow/cross-process lease，启动失败会消耗 attempt budget。
 
-仍未解决：native macOS computer、fair/distributed ComputerLease、自动
-stall 恢复/same-agent pin、deferred wake-on continuation、完整 memory v2，
-以及本文既有的分布式 scheduler/fencing、完整 shell read/network
+仍未解决：native macOS computer、fair/distributed ComputerLease、
+same-agent identity recovery、recurring/cross-process continuation、完整
+memory v2，以及本文既有的分布式 scheduler/fencing、完整 shell read/network
 confinement、默认自动冲突解决等。
