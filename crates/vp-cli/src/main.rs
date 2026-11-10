@@ -691,6 +691,33 @@ enum Command {
     },
     /// Cancel a pending steering message before delivery.
     SteerCancel { id: String },
+    /// Defer a continuation prompt until watched plan tasks settle or a deadline.
+    Defer {
+        session: String,
+        prompt: String,
+        /// Plan task to watch. Repeat for more than one task.
+        #[arg(long = "watch")]
+        watch: Vec<String>,
+        /// Wake when all watched tasks settle, or as soon as any one settles.
+        #[arg(long, default_value = "all", value_parser = ["all", "any"])]
+        watch_mode: String,
+        /// Relative deadline in seconds.
+        #[arg(long, conflicts_with = "at")]
+        after_secs: Option<u64>,
+        /// Absolute RFC3339 deadline.
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// List deferred continuations for a session.
+    Continuations {
+        session: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Cancel a pending or ready deferred continuation.
+    ContinuationCancel { id: String },
     /// Show plan-task progress and stall observations for a session.
     TaskStalls { session: String },
     /// Create a session for a project.
@@ -2217,6 +2244,43 @@ async fn main() -> Result<()> {
         }
         Command::SteerCancel { id } => {
             rpc(&discovery, "session.steering.cancel", json!({"id": id})).await?
+        }
+        Command::Defer {
+            session,
+            prompt,
+            watch,
+            watch_mode,
+            after_secs,
+            at,
+        } => {
+            rpc(
+                &discovery,
+                "session.defer",
+                json!({
+                    "session_id": session,
+                    "body": prompt,
+                    "watch_task_ids": watch,
+                    "watch_mode": watch_mode,
+                    "after_secs": after_secs,
+                    "deadline_at": at,
+                }),
+            )
+            .await?
+        }
+        Command::Continuations {
+            session,
+            status,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "session.continuations",
+                json!({"session_id": session, "status": status, "limit": limit}),
+            )
+            .await?
+        }
+        Command::ContinuationCancel { id } => {
+            rpc(&discovery, "session.continuation.cancel", json!({"id": id})).await?
         }
         Command::TaskStalls { session } => {
             rpc(&discovery, "session.stalls", json!({"session_id": session})).await?

@@ -3335,6 +3335,9 @@ pub struct SessionBundle {
     /// Operator steering records. Older bundles decode as an empty list.
     #[serde(default)]
     pub steering: Vec<SteeringMessage>,
+    /// Deferred continuations. Older bundles decode as an empty list.
+    #[serde(default)]
+    pub continuations: Vec<SessionContinuation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3368,6 +3371,8 @@ pub struct SessionReplayReport {
     pub decisions_match: bool,
     #[serde(default)]
     pub steering_matches: bool,
+    #[serde(default)]
+    pub continuations_match: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -3600,6 +3605,114 @@ pub struct SessionSteeringListResult {
 pub struct SessionSteeringCancelResult {
     pub cancelled: bool,
     pub steering: SteeringMessage,
+}
+
+/// Compact per-task outcome captured when a deferred continuation wakes. It
+/// is frozen at wake time so later plan revisions cannot rewrite the prompt
+/// context that justified the wake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationOutcome {
+    pub task_id: String,
+    #[serde(default)]
+    pub title: String,
+    pub status: String,
+}
+
+/// A deferred operator continuation. It is session-scoped, replaces no plan
+/// dependency, and only starts a normal run through the usual `start` path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContinuation {
+    pub id: String,
+    pub session_id: String,
+    pub project_id: String,
+    pub body: String,
+    #[serde(default)]
+    pub watch_task_ids: Vec<String>,
+    #[serde(default = "default_continuation_watch_mode")]
+    pub watch_mode: String,
+    #[serde(default)]
+    pub deadline_at: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default = "default_continuation_max_attempts")]
+    pub max_attempts: u32,
+    /// `watch` or `deadline`, set when the row becomes ready.
+    #[serde(default)]
+    pub wake_reason: Option<String>,
+    #[serde(default)]
+    pub outcomes: Vec<ContinuationOutcome>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub ready_at: Option<String>,
+    #[serde(default)]
+    pub delivered_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+fn default_continuation_watch_mode() -> String {
+    "all".to_string()
+}
+
+fn default_continuation_max_attempts() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionDeferParams {
+    pub session_id: String,
+    /// Operator prompt. `text` and `prompt` are accepted as compatibility
+    /// aliases so older scripts and alternate clients keep working.
+    #[serde(alias = "text", alias = "prompt")]
+    pub body: String,
+    #[serde(default, alias = "watch")]
+    pub watch_task_ids: Vec<String>,
+    #[serde(default)]
+    pub watch_mode: Option<String>,
+    #[serde(default)]
+    pub deadline_at: Option<String>,
+    /// Relative deadline in seconds. Mutually exclusive with `deadline_at`.
+    #[serde(default)]
+    pub after_secs: Option<u64>,
+    /// Small bounded start-attempt cap. Defaults to 3.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionContinuationsParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionContinuationCancelParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionDeferResult {
+    pub continuation: SessionContinuation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionContinuationsResult {
+    pub session_id: String,
+    pub continuations: Vec<SessionContinuation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionContinuationCancelResult {
+    pub cancelled: bool,
+    pub continuation: SessionContinuation,
 }
 
 #[derive(Debug, Clone, Deserialize)]

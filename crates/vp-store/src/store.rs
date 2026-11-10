@@ -12,13 +12,14 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AgentMessage, AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactPolicy,
-    ArtifactVersion, CheckpointRetentionPolicy, Event, IntakeTask, IntegrationPolicy,
-    MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryItem, MemoryPolicy,
-    MergeQueueEntry, ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
-    PlanTaskProgress, Project, ProjectBudget, ProjectUsageSession, Question, ScheduledTask,
-    SearchHit, Session, SessionBundle, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
-    SourceSearchHit, SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall,
-    TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
+    ArtifactVersion, CheckpointRetentionPolicy, ContinuationOutcome, Event, IntakeTask,
+    IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryItem,
+    MemoryPolicy, MergeQueueEntry, ModelPreset, OrchestrationDecision, OrchestrationNote,
+    OrchestrationPolicy, PlanTaskProgress, Project, ProjectBudget, ProjectUsageSession, Question,
+    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, ShellPolicy, Skill,
+    Source, SourceChunk, SourceCollection, SourceSearchHit, SourceStats, SteeringMessage,
+    StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, UsageEntry,
+    WorktreeRetentionPolicy, WriteLease,
 };
 
 use crate::paths;
@@ -260,6 +261,7 @@ pub struct SessionRepair {
     pub questions: Option<Vec<Question>>,
     pub tasks: Option<Vec<ScheduledTask>>,
     pub steering: Option<Vec<SteeringMessage>>,
+    pub continuations: Option<Vec<SessionContinuation>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -1067,6 +1069,32 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_steering_messages_session
                 ON steering_messages(session_id, agent_id, status, created_at);
+
+            CREATE TABLE IF NOT EXISTS session_continuations (
+                id              TEXT PRIMARY KEY,
+                session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                body            TEXT NOT NULL,
+                watch_task_ids  TEXT NOT NULL DEFAULT '[]',
+                watch_mode      TEXT NOT NULL DEFAULT 'all',
+                deadline_at     TEXT,
+                status          TEXT NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                max_attempts    INTEGER NOT NULL DEFAULT 3,
+                wake_reason     TEXT,
+                outcomes        TEXT NOT NULL DEFAULT '[]',
+                last_error      TEXT,
+                next_attempt_at TEXT,
+                created_at      TEXT NOT NULL,
+                ready_at        TEXT,
+                delivered_at    TEXT,
+                updated_at      TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_continuations_status
+                ON session_continuations(status, next_attempt_at, deadline_at);
+            CREATE INDEX IF NOT EXISTS idx_session_continuations_session
+                ON session_continuations(session_id, status, created_at);
 
             CREATE TABLE IF NOT EXISTS merge_queue (
                 id          TEXT PRIMARY KEY,
@@ -6983,6 +7011,325 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a deferred continuation and its creation event atomically. The
+    /// engine validates body, watch ids, task states, and the deadline before
+    /// calling this.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_continuation_with_event(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        body: &str,
+        watch_task_ids: &[String],
+        watch_mode: &str,
+        deadline_at: Option<&str>,
+        max_attempts: u32,
+    ) -> Result<(SessionContinuation, Event)> {
+        let now = now_rfc3339();
+        let continuation = SessionContinuation {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            project_id: project_id.to_string(),
+            body: body.to_string(),
+            watch_task_ids: watch_task_ids.to_vec(),
+            watch_mode: watch_mode.to_string(),
+            deadline_at: deadline_at.map(str::to_string),
+            status: "pending".to_string(),
+            attempts: 0,
+            max_attempts: max_attempts.max(1),
+            wake_reason: None,
+            outcomes: Vec::new(),
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            ready_at: None,
+            delivered_at: None,
+            updated_at: now,
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let actual_project: String = tx
+            .query_row(
+                "SELECT project_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        if actual_project != project_id {
+            return Err(anyhow!("session {session_id} belongs to {actual_project}"));
+        }
+        tx.execute(
+            "INSERT INTO session_continuations
+             (id, session_id, project_id, body, watch_task_ids, watch_mode, deadline_at,
+              status, attempts, max_attempts, wake_reason, outcomes, last_error,
+              next_attempt_at, created_at, ready_at, delivered_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, '[]', NULL,
+                     NULL, ?11, NULL, NULL, ?11)",
+            params![
+                continuation.id,
+                continuation.session_id,
+                continuation.project_id,
+                continuation.body,
+                serde_json::to_string(&continuation.watch_task_ids)?,
+                continuation.watch_mode,
+                continuation.deadline_at,
+                continuation.status,
+                i64::from(continuation.attempts),
+                i64::from(continuation.max_attempts),
+                continuation.created_at
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "session.continuation.created",
+            serde_json::to_value(&continuation)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((continuation, event))
+    }
+
+    pub fn list_session_continuations(
+        &self,
+        session_id: &str,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<SessionContinuation>> {
+        let conn = self.lock()?;
+        let limit = limit.unwrap_or(500).clamp(1, 2_000) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project_id, body, watch_task_ids, watch_mode,
+                    deadline_at, status, attempts, max_attempts, wake_reason, outcomes,
+                    last_error, next_attempt_at, created_at, ready_at, delivered_at, updated_at
+             FROM session_continuations
+             WHERE session_id = ?1 AND (?2 IS NULL OR status = ?2)
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![session_id, status, limit], map_session_continuation)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// All pending and ready rows across sessions, ordered deterministically.
+    /// The scheduler tick evaluates this snapshot; it never sees terminal rows.
+    pub fn list_open_session_continuations(&self) -> Result<Vec<SessionContinuation>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project_id, body, watch_task_ids, watch_mode,
+                    deadline_at, status, attempts, max_attempts, wake_reason, outcomes,
+                    last_error, next_attempt_at, created_at, ready_at, delivered_at, updated_at
+             FROM session_continuations
+             WHERE status IN ('pending', 'ready')
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_session_continuation)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn mark_session_continuation_ready_with_event(
+        &self,
+        id: &str,
+        reason: &str,
+        outcomes: &[ContinuationOutcome],
+    ) -> Result<Option<(SessionContinuation, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE session_continuations
+             SET status = 'ready', wake_reason = ?1, outcomes = ?2, ready_at = ?3,
+                 next_attempt_at = NULL, updated_at = ?3
+             WHERE id = ?4 AND status = 'pending'",
+            params![reason, serde_json::to_string(outcomes)?, now, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let continuation = query_session_continuation_tx(&tx, id)?
+            .ok_or_else(|| anyhow!("continuation disappeared during ready transition: {id}"))?;
+        let event = insert_event_tx(
+            &tx,
+            &continuation.session_id,
+            "session.continuation.ready",
+            serde_json::to_value(&continuation)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((continuation, event)))
+    }
+
+    pub fn mark_session_continuation_delivered_with_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<(SessionContinuation, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE session_continuations
+             SET status = 'delivered', delivered_at = ?1, next_attempt_at = NULL, updated_at = ?1
+             WHERE id = ?2 AND status = 'ready'",
+            params![now, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let continuation = query_session_continuation_tx(&tx, id)?
+            .ok_or_else(|| anyhow!("continuation disappeared during delivery: {id}"))?;
+        let event = insert_event_tx(
+            &tx,
+            &continuation.session_id,
+            "session.continuation.delivered",
+            serde_json::to_value(&continuation)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((continuation, event)))
+    }
+
+    /// Record a failed start attempt without exhausting the cap. The row stays
+    /// ready and the scheduler waits for `next_attempt_at`.
+    pub fn retry_session_continuation_with_event(
+        &self,
+        id: &str,
+        error: &str,
+        next_attempt_at: &str,
+    ) -> Result<Option<(SessionContinuation, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE session_continuations
+             SET attempts = attempts + 1, last_error = ?1, next_attempt_at = ?2, updated_at = ?3
+             WHERE id = ?4 AND status = 'ready'",
+            params![error, next_attempt_at, now, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let continuation = query_session_continuation_tx(&tx, id)?
+            .ok_or_else(|| anyhow!("continuation disappeared during retry: {id}"))?;
+        let mut payload = serde_json::to_value(&continuation)?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("error".into(), serde_json::json!(error));
+        }
+        let event = insert_event_tx(
+            &tx,
+            &continuation.session_id,
+            "session.continuation.retrying",
+            payload,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((continuation, event)))
+    }
+
+    pub fn fail_session_continuation_with_event(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<Option<(SessionContinuation, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE session_continuations
+             SET status = 'failed', attempts = attempts + 1, last_error = ?1,
+                 next_attempt_at = NULL, updated_at = ?2
+             WHERE id = ?3 AND status IN ('pending', 'ready')",
+            params![error, now, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let continuation = query_session_continuation_tx(&tx, id)?
+            .ok_or_else(|| anyhow!("continuation disappeared during failure: {id}"))?;
+        let mut payload = serde_json::to_value(&continuation)?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("error".into(), serde_json::json!(error));
+        }
+        let event = insert_event_tx(
+            &tx,
+            &continuation.session_id,
+            "session.continuation.failed",
+            payload,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((continuation, event)))
+    }
+
+    pub fn cancel_session_continuation_with_event(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<Option<(SessionContinuation, Event)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE session_continuations
+             SET status = 'cancelled', last_error = ?1, next_attempt_at = NULL, updated_at = ?2
+             WHERE id = ?3 AND status IN ('pending', 'ready')",
+            params![reason, now, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let continuation = query_session_continuation_tx(&tx, id)?
+            .ok_or_else(|| anyhow!("continuation disappeared during cancellation: {id}"))?;
+        let mut payload = serde_json::to_value(&continuation)?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("reason".into(), serde_json::json!(reason));
+        }
+        let event = insert_event_tx(
+            &tx,
+            &continuation.session_id,
+            "session.continuation.cancelled",
+            payload,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((continuation, event)))
+    }
+
+    /// Replace the continuation projection from replayed events. Used by
+    /// `session.replay {repair}` and `vp db-rebuild`.
+    pub fn replace_session_continuations(
+        &self,
+        session_id: &str,
+        continuations: &[SessionContinuation],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM session_continuations WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for continuation in continuations {
+            if continuation.session_id != session_id {
+                return Err(anyhow!("continuation belongs to a different session"));
+            }
+            insert_session_continuation_tx(&tx, continuation)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn create_approval(
         &self,
         session_id: &str,
@@ -9665,6 +10012,15 @@ impl Store {
                 )?;
             }
         }
+        if let Some(continuations) = &repair.continuations {
+            tx.execute(
+                "DELETE FROM session_continuations WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for continuation in continuations {
+                insert_session_continuation_tx(&tx, continuation)?;
+            }
+        }
         if let Some(artifacts) = &repair.artifacts {
             tx.execute(
                 "DELETE FROM artifacts WHERE session_id = ?1",
@@ -9903,6 +10259,21 @@ impl Store {
                     steering.delivered_at
                 ],
             )?;
+        }
+        for continuation in &bundle.continuations {
+            if continuation.session_id != bundle.session.id {
+                return Err(anyhow!(
+                    "bundle continuation {} belongs to a different session",
+                    continuation.id
+                ));
+            }
+            if continuation.project_id != bundle.project.id {
+                return Err(anyhow!(
+                    "bundle continuation {} belongs to a different project",
+                    continuation.id
+                ));
+            }
+            insert_session_continuation_tx(&tx, continuation)?;
         }
         for (position, item) in bundle.todos.iter().enumerate() {
             tx.execute(
@@ -10670,6 +11041,85 @@ fn map_steering(row: &rusqlite::Row<'_>) -> rusqlite::Result<SteeringMessage> {
         created_at: row.get(6)?,
         delivered_at: row.get(7)?,
     })
+}
+
+const SESSION_CONTINUATION_COLUMNS: &str = "id, session_id, project_id, body, watch_task_ids,
+    watch_mode, deadline_at, status, attempts, max_attempts, wake_reason, outcomes,
+    last_error, next_attempt_at, created_at, ready_at, delivered_at, updated_at";
+
+fn map_session_continuation(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionContinuation> {
+    let watch_task_ids = row.get::<_, String>(4)?;
+    let outcomes = row.get::<_, String>(11)?;
+    Ok(SessionContinuation {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        project_id: row.get(2)?,
+        body: row.get(3)?,
+        watch_task_ids: serde_json::from_str(&watch_task_ids).unwrap_or_default(),
+        watch_mode: row.get(5)?,
+        deadline_at: row.get(6)?,
+        status: row.get(7)?,
+        attempts: row.get::<_, i64>(8)?.max(0) as u32,
+        max_attempts: row.get::<_, i64>(9)?.max(1) as u32,
+        wake_reason: row.get(10)?,
+        outcomes: serde_json::from_str(&outcomes).unwrap_or_default(),
+        last_error: row.get(12)?,
+        next_attempt_at: row.get(13)?,
+        created_at: row.get(14)?,
+        ready_at: row.get(15)?,
+        delivered_at: row.get(16)?,
+        updated_at: row.get(17)?,
+    })
+}
+
+fn query_session_continuation_tx(
+    tx: &Transaction<'_>,
+    id: &str,
+) -> Result<Option<SessionContinuation>> {
+    Ok(tx
+        .query_row(
+            &format!(
+                "SELECT {SESSION_CONTINUATION_COLUMNS} FROM session_continuations WHERE id = ?1"
+            ),
+            params![id],
+            map_session_continuation,
+        )
+        .optional()?)
+}
+
+fn insert_session_continuation_tx(
+    tx: &Transaction<'_>,
+    continuation: &SessionContinuation,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO session_continuations
+         (id, session_id, project_id, body, watch_task_ids, watch_mode, deadline_at,
+          status, attempts, max_attempts, wake_reason, outcomes, last_error,
+          next_attempt_at, created_at, ready_at, delivered_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, ?15, ?16, ?17, ?18)",
+        params![
+            continuation.id,
+            continuation.session_id,
+            continuation.project_id,
+            continuation.body,
+            serde_json::to_string(&continuation.watch_task_ids)?,
+            continuation.watch_mode,
+            continuation.deadline_at,
+            continuation.status,
+            i64::from(continuation.attempts),
+            i64::from(continuation.max_attempts),
+            continuation.wake_reason,
+            serde_json::to_string(&continuation.outcomes)?,
+            continuation.last_error,
+            continuation.next_attempt_at,
+            continuation.created_at,
+            continuation.ready_at,
+            continuation.delivered_at,
+            continuation.updated_at
+        ],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn steering_content(message: &SteeringMessage) -> String {

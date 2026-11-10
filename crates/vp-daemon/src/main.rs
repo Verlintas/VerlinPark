@@ -51,7 +51,8 @@ use vp_protocol::types::{
     SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
     SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
     SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
-    SessionContextParams, SessionDiffParams, SessionExportParams, SessionForkParams,
+    SessionContextParams, SessionContinuationCancelParams, SessionContinuationsParams,
+    SessionDeferParams, SessionDiffParams, SessionExportParams, SessionForkParams,
     SessionForkTreeParams, SessionImportParams, SessionLineageParams, SessionListResult,
     SessionLogParams, SessionMergeForkParams, SessionPauseParams, SessionPauseResult,
     SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
@@ -1574,6 +1575,46 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.steering.cancel" => {
             match parse_params::<SessionSteeringCancelParams>(request.params) {
                 Ok(params) => match state.engine.cancel_steering(&params.id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.defer" => match parse_params::<SessionDeferParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .defer_session(
+                    &params.session_id,
+                    &params.body,
+                    params.watch_task_ids,
+                    params.watch_mode.as_deref(),
+                    params.deadline_at.as_deref(),
+                    params.after_secs,
+                    params.max_attempts,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.continuations" => match parse_params::<SessionContinuationsParams>(request.params)
+        {
+            Ok(params) => match state
+                .engine
+                .session_continuations(&params.session_id, params.status.as_deref(), params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.continuation.cancel" => {
+            match parse_params::<SessionContinuationCancelParams>(request.params) {
+                Ok(params) => match state.engine.cancel_session_continuation(&params.id).await {
                     Ok(result) => RpcResponse::success(id, result),
                     Err(error) => internal_error(id, error),
                 },

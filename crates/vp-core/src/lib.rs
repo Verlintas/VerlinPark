@@ -21,34 +21,36 @@ use vp_protocol::types::{
     CheckpointPolicyResult, CheckpointRetentionPolicy, CitationAudit, CitationAuditMessage,
     ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
     ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement, ContextUsage,
-    CreateModelPresetParams, DoctorCheck, Event, GitLogResult, GitShowResult, IntakeCreateParams,
-    IntakeListResult, IntakeTask, IntakeUpdateParams, IntegrationPolicy, MailboxGcResult,
-    MailboxPolicy, McpCallResult, McpGetPromptResult, McpProbeResult, McpPromptListResult,
-    McpReadResourceResult, McpResourceListResult, McpServer, McpServerConfig, McpServerListResult,
-    McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult, MemoryPolicy,
-    MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, MessageCitation, ModelPreset,
-    ModelPresetListResult, OrchestrationDecision, OrchestrationNote, OrchestrationOverviewResult,
-    OrchestrationOverviewTotals, OrchestrationPolicy, OrchestrationPreviewAction,
-    OrchestrationPreviewResult, OrchestrationSessionSummary, OrchestrationSnapshot,
-    PlanRevisionDetailResult, PlanRevisionInfo, Project, ProjectBudget, ProjectBudgetResult,
-    ProjectUsageResult, PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult,
-    ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
+    ContinuationOutcome, CreateModelPresetParams, DoctorCheck, Event, GitLogResult, GitShowResult,
+    IntakeCreateParams, IntakeListResult, IntakeTask, IntakeUpdateParams, IntegrationPolicy,
+    MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult, McpProbeResult,
+    McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer, McpServerConfig,
+    McpServerListResult, McpToolListResult, MemoryDeleteResult, MemoryItem, MemoryListResult,
+    MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, MessageCitation,
+    ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
+    OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
+    OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationSessionSummary,
+    OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo, Project, ProjectBudget,
+    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
+    ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
     SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
     SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
     SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
-    SessionCompareResult, SessionContextStatus, SessionDiff, SessionForkResult,
-    SessionForkTreeNode, SessionForkTreeResult, SessionImportResult, SessionLandResult,
-    SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPriorityResult,
-    SessionRehydrateResult, SessionReplayReport, SessionSkillActivationsResult,
-    SessionStallsResult, SessionSteerResult, SessionSteeringCancelResult,
-    SessionSteeringListResult, SessionTranscriptResult, SessionUnlimitedResult, ShellPolicy, Skill,
-    SkillActivation, SkillCreateParams, SkillDeleteResult, SkillEnabledParams, SkillImportParams,
-    SkillListResult, SkillUpdateParams, Source, SourceChunk, SourceCitation,
-    SourceCollectionsResult, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
-    SourceDeleteResult, SourceGetResult, SourceImportError, SourceImportParams, SourceImportResult,
-    SourceListResult, SourceReindexResult, SourceSearchResult, SourceStats, SteeringMessage,
-    StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TaskStall,
-    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    SessionCompareResult, SessionContextStatus, SessionContinuation,
+    SessionContinuationCancelResult, SessionContinuationsResult, SessionDeferResult, SessionDiff,
+    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
+    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
+    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
+    SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
+    SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
+    SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
+    SkillDeleteResult, SkillEnabledParams, SkillImportParams, SkillListResult, SkillUpdateParams,
+    Source, SourceChunk, SourceCitation, SourceCollectionsResult, SourceCreateFileParams,
+    SourceCreateNoteParams, SourceCreateUrlParams, SourceDeleteResult, SourceGetResult,
+    SourceImportError, SourceImportParams, SourceImportResult, SourceListResult,
+    SourceReindexResult, SourceSearchResult, SourceStats, SteeringMessage, StoredMessage,
+    TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TaskStall, TeamPlan,
+    TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
     TerminalWriteResult, TodoItem, UpdateModelPresetParams, UpdateSourceMetadataParams,
     UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
     WorkspaceGrepResult, WorkspaceListResult, WorkspaceSearchResult, WorkspaceTreeResult,
@@ -67,6 +69,7 @@ pub mod agent;
 pub mod browser;
 pub mod budget;
 pub mod console;
+pub mod continuation;
 mod dashboard;
 pub mod history;
 pub mod mcp;
@@ -102,6 +105,7 @@ struct ReplayData {
     questions: Vec<Question>,
     tasks: Vec<ScheduledTask>,
     steering: Vec<SteeringMessage>,
+    continuations: Vec<SessionContinuation>,
     notes: Vec<OrchestrationNote>,
     decisions: Vec<OrchestrationDecision>,
     events: Vec<Event>,
@@ -4803,6 +4807,266 @@ impl Engine {
         })
     }
 
+    /// Defer an operator prompt until watched plan tasks settle or a deadline
+    /// arrives. This is a persisted session-level continuation, not a plan
+    /// dependency: it never changes task ordering, approvals, budgets, or
+    /// write scopes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn defer_session(
+        &self,
+        session_id: &str,
+        body: &str,
+        watch_task_ids: Vec<String>,
+        watch_mode: Option<&str>,
+        deadline_at: Option<&str>,
+        after_secs: Option<u64>,
+        max_attempts: Option<u32>,
+    ) -> Result<SessionDeferResult> {
+        let body = crate::continuation::validate_body(body)?;
+        let watch_mode = crate::continuation::normalize_watch_mode(watch_mode)?;
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        if session.status == "landed" {
+            anyhow::bail!("landed sessions are final; create a new session or fork to continue");
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut watch_task_ids = watch_task_ids
+            .into_iter()
+            .map(|task_id| task_id.trim().to_string())
+            .filter(|task_id| !task_id.is_empty())
+            .collect::<Vec<_>>();
+        watch_task_ids.retain(|task_id| seen.insert(task_id.clone()));
+        if watch_task_ids.len() > crate::continuation::MAX_WATCH_TASKS {
+            anyhow::bail!(
+                "a continuation may watch at most {} tasks",
+                crate::continuation::MAX_WATCH_TASKS
+            );
+        }
+        for task_id in &watch_task_ids {
+            crate::worktree::validate_task_id(task_id)?;
+        }
+        let deadline_at = crate::continuation::resolve_deadline(
+            after_secs,
+            deadline_at,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        if watch_task_ids.is_empty() && deadline_at.is_none() {
+            anyhow::bail!("a continuation needs at least one watch task or a deadline");
+        }
+
+        if !watch_task_ids.is_empty() {
+            let plan = self.get_team_plan(session_id).await?;
+            let Some(plan) = plan else {
+                anyhow::bail!("session has no stored TeamPlan to watch");
+            };
+            let plan_ids = plan
+                .tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            if let Some(missing) = watch_task_ids
+                .iter()
+                .find(|task_id| !plan_ids.contains(task_id.as_str()))
+            {
+                anyhow::bail!("task {missing} is not in the stored TeamPlan");
+            }
+            let store = self.store.clone();
+            let id = session_id.to_string();
+            let tasks = tokio::task::spawn_blocking(move || store.list_plan_tasks(None, Some(&id)))
+                .await??;
+            for task_id in &watch_task_ids {
+                let Some(task) = tasks
+                    .iter()
+                    .filter(|task| &task.task_id == task_id)
+                    .max_by_key(|task| task.plan_seq)
+                else {
+                    anyhow::bail!("task {task_id} has no scheduling state yet");
+                };
+                if crate::continuation::is_terminal_task_status(&task.status) {
+                    anyhow::bail!(
+                        "task {task_id} is already {}; read its outcome instead of watching it",
+                        task.status
+                    );
+                }
+            }
+        }
+
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let project_id = session.project_id.clone();
+        let max_attempts = crate::continuation::normalize_max_attempts(max_attempts);
+        let (continuation, event) = tokio::task::spawn_blocking(move || {
+            store.create_session_continuation_with_event(
+                &session_id,
+                &project_id,
+                &body,
+                &watch_task_ids,
+                &watch_mode,
+                deadline_at.as_deref(),
+                max_attempts,
+            )
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(SessionDeferResult { continuation })
+    }
+
+    pub async fn session_continuations(
+        &self,
+        session_id: &str,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<SessionContinuationsResult> {
+        if let Some(status) = status
+            && !matches!(
+                status,
+                "pending" | "ready" | "delivered" | "cancelled" | "failed"
+            )
+        {
+            anyhow::bail!(
+                "continuation status must be pending, ready, delivered, cancelled, or failed"
+            );
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let status = status.map(str::to_string);
+        let continuations = tokio::task::spawn_blocking(move || {
+            store.list_session_continuations(&id, status.as_deref(), limit)
+        })
+        .await??;
+        Ok(SessionContinuationsResult {
+            session_id: session_id.to_string(),
+            continuations,
+        })
+    }
+
+    pub async fn cancel_session_continuation(
+        &self,
+        id: &str,
+    ) -> Result<SessionContinuationCancelResult> {
+        let store = self.store.clone();
+        let continuation_id = id.to_string();
+        let reason = "cancelled by operator".to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.cancel_session_continuation_with_event(&continuation_id, &reason)
+        })
+        .await??;
+        let Some((continuation, event)) = result else {
+            anyhow::bail!("continuation {id} is not pending or ready");
+        };
+        let _ = self.events.send(event);
+        Ok(SessionContinuationCancelResult {
+            cancelled: true,
+            continuation,
+        })
+    }
+
+    /// Transition a pending row to ready and broadcast the event. Scheduler
+    /// internals use this; replay reconstructs the same row from the payload.
+    pub async fn mark_session_continuation_ready(
+        &self,
+        id: &str,
+        reason: &str,
+        outcomes: &[ContinuationOutcome],
+    ) -> Result<Option<SessionContinuation>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let reason = reason.to_string();
+        let outcomes = outcomes.to_vec();
+        let result = tokio::task::spawn_blocking(move || {
+            store.mark_session_continuation_ready_with_event(&id, &reason, &outcomes)
+        })
+        .await??;
+        let Some((continuation, event)) = result else {
+            return Ok(None);
+        };
+        let _ = self.events.send(event);
+        Ok(Some(continuation))
+    }
+
+    pub async fn mark_session_continuation_delivered(
+        &self,
+        id: &str,
+    ) -> Result<Option<SessionContinuation>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.mark_session_continuation_delivered_with_event(&id)
+        })
+        .await??;
+        let Some((continuation, event)) = result else {
+            return Ok(None);
+        };
+        let _ = self.events.send(event);
+        Ok(Some(continuation))
+    }
+
+    pub async fn retry_session_continuation(
+        &self,
+        id: &str,
+        error: &str,
+        next_attempt_at: &str,
+    ) -> Result<Option<SessionContinuation>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let error = error.to_string();
+        let next_attempt_at = next_attempt_at.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.retry_session_continuation_with_event(&id, &error, &next_attempt_at)
+        })
+        .await??;
+        let Some((continuation, event)) = result else {
+            return Ok(None);
+        };
+        let _ = self.events.send(event);
+        Ok(Some(continuation))
+    }
+
+    pub async fn fail_session_continuation(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<Option<SessionContinuation>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let error = error.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.fail_session_continuation_with_event(&id, &error)
+        })
+        .await??;
+        let Some((continuation, event)) = result else {
+            return Ok(None);
+        };
+        let _ = self.events.send(event);
+        Ok(Some(continuation))
+    }
+
+    pub async fn cancel_session_continuation_with_reason(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<Option<SessionContinuation>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let reason = reason.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.cancel_session_continuation_with_event(&id, &reason)
+        })
+        .await??;
+        let Some((continuation, event)) = result else {
+            return Ok(None);
+        };
+        let _ = self.events.send(event);
+        Ok(Some(continuation))
+    }
+
     /// Drain pending steering for the current turn. Called by the agent loop
     /// before the next provider request; top-level runs also persist a visible
     /// user message while child runs keep the injected turn in memory and the
@@ -6920,6 +7184,7 @@ impl Engine {
             let questions = store.list_session_questions(&id)?;
             let tasks = store.list_plan_tasks(None, Some(&id))?;
             let steering = store.list_steering(&id, None, Some(2_000))?;
+            let continuations = store.list_session_continuations(&id, None, Some(2_000))?;
             let notes = store.list_coordination_notes(&id, 2_000)?;
             let decisions = store.list_orchestration_decisions(&id, 2_000)?;
             let events = store.list_all_events(&id)?;
@@ -6938,6 +7203,7 @@ impl Engine {
                 questions,
                 tasks,
                 steering,
+                continuations,
                 notes,
                 decisions,
                 events,
@@ -7647,6 +7913,34 @@ impl Engine {
                 expected_steering_values.len()
             ));
         }
+        let expected_continuations = replay_continuations(&data.events);
+        let expected_continuation_values = expected_continuations
+            .iter()
+            .filter_map(|continuation| {
+                Some((
+                    continuation.id.clone(),
+                    serde_json::to_value(continuation).ok()?,
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_continuation_values = data
+            .continuations
+            .iter()
+            .filter_map(|continuation| {
+                Some((
+                    continuation.id.clone(),
+                    serde_json::to_value(continuation).ok()?,
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let continuations_match = expected_continuation_values == projected_continuation_values;
+        if !continuations_match {
+            mismatches.push(format!(
+                "continuations: projection={}, replay={}",
+                projected_continuation_values.len(),
+                expected_continuation_values.len()
+            ));
+        }
 
         let expected_artifacts = Self::expected_artifacts(data);
         let projected_artifacts = data
@@ -7898,7 +8192,8 @@ impl Engine {
             && queue_matches
             && notes_match
             && decisions_match
-            && steering_matches;
+            && steering_matches
+            && continuations_match;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -7919,6 +8214,7 @@ impl Engine {
             notes_match,
             decisions_match,
             steering_matches,
+            continuations_match,
             consistent,
             repaired,
             rebuilt: false,
@@ -8203,6 +8499,7 @@ impl Engine {
             questions,
             tasks: Self::expected_tasks(data),
             steering: Some(replay_steering(&data.events)),
+            continuations: Some(replay_continuations(&data.events)),
             artifact_warnings,
         })
     }
@@ -8488,6 +8785,7 @@ impl Engine {
             questions: data.questions,
             tasks: data.tasks,
             steering: data.steering,
+            continuations: data.continuations,
         })
     }
 
@@ -10543,6 +10841,35 @@ fn replay_steering(events: &[Event]) -> Vec<SteeringMessage> {
             .then_with(|| left.id.cmp(&right.id))
     });
     messages
+}
+
+fn replay_continuations(events: &[Event]) -> Vec<SessionContinuation> {
+    let mut latest = HashMap::new();
+    for event in events {
+        if !matches!(
+            event.kind.as_str(),
+            "session.continuation.created"
+                | "session.continuation.ready"
+                | "session.continuation.retrying"
+                | "session.continuation.delivered"
+                | "session.continuation.cancelled"
+                | "session.continuation.failed"
+        ) {
+            continue;
+        }
+        if let Ok(continuation) =
+            serde_json::from_value::<SessionContinuation>(event.payload.clone())
+        {
+            latest.insert(continuation.id.clone(), continuation);
+        }
+    }
+    let mut continuations = latest.into_values().collect::<Vec<_>>();
+    continuations.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    continuations
 }
 
 fn replay_session_cost(events: &[Event]) -> f64 {

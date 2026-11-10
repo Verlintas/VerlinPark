@@ -501,6 +501,15 @@ pub struct AgentService {
     capacity: Arc<CapacityController>,
 }
 
+fn continuation_retry_backoff_secs(attempts: u32) -> i64 {
+    let base = env::var("VERLINPARK_CONTINUATION_RETRY_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(15)
+        .clamp(1, 300);
+    base.saturating_mul(i64::from(attempts.max(1))).min(900)
+}
+
 struct RunControl {
     cancelled: watch::Sender<bool>,
     paused: watch::Sender<bool>,
@@ -3622,6 +3631,142 @@ impl AgentService {
             .ok()
     }
 
+    /// Evaluate deferred continuations and start at most one normal session
+    /// run per session in this pass. The scheduler loop calls this on every
+    /// tick; it shares the same `AgentService` and `start` path as operator
+    /// prompts, so approvals, sandboxing, capacity, and budgets are unchanged.
+    pub async fn reconcile_session_continuations(&self) -> Result<usize> {
+        let store = self.engine.store().clone();
+        let open =
+            tokio::task::spawn_blocking(move || store.list_open_session_continuations()).await??;
+        let now = time::OffsetDateTime::now_utc();
+        let mut started = 0usize;
+        let mut attempted_sessions = HashSet::new();
+        let mut task_cache: HashMap<String, Vec<ScheduledTask>> = HashMap::new();
+
+        for continuation in open {
+            if attempted_sessions.contains(&continuation.session_id) {
+                continue;
+            }
+            let store = self.engine.store().clone();
+            let session_id = continuation.session_id.clone();
+            let session =
+                tokio::task::spawn_blocking(move || store.get_session(&session_id)).await??;
+            let Some(session) = session else {
+                self.engine
+                    .fail_session_continuation(&continuation.id, "session not found")
+                    .await?;
+                continue;
+            };
+            match session.status.as_str() {
+                "imported" => {
+                    self.engine
+                        .cancel_session_continuation_with_reason(
+                            &continuation.id,
+                            "session is an imported read-only archive",
+                        )
+                        .await?;
+                    continue;
+                }
+                "landed" => {
+                    self.engine
+                        .cancel_session_continuation_with_reason(
+                            &continuation.id,
+                            "session is landed and final",
+                        )
+                        .await?;
+                    continue;
+                }
+                _ => {}
+            }
+            let mut continuation = continuation;
+            if continuation.status == "pending" {
+                let tasks = if let Some(tasks) = task_cache.get(&continuation.session_id) {
+                    tasks.clone()
+                } else {
+                    let tasks = self
+                        .engine
+                        .task_queue(None, Some(continuation.session_id.clone()))
+                        .await?
+                        .tasks;
+                    task_cache.insert(continuation.session_id.clone(), tasks.clone());
+                    tasks
+                };
+                let Some(wake) = crate::continuation::evaluate_wake(
+                    &continuation.watch_task_ids,
+                    &continuation.watch_mode,
+                    continuation.deadline_at.as_deref(),
+                    &tasks,
+                    now,
+                ) else {
+                    continue;
+                };
+                let Some(ready) = self
+                    .engine
+                    .mark_session_continuation_ready(&continuation.id, &wake.reason, &wake.outcomes)
+                    .await?
+                else {
+                    continue;
+                };
+                continuation = ready;
+            }
+            if continuation.status != "ready" {
+                continue;
+            }
+            if let Some(next_attempt_at) = continuation.next_attempt_at.as_deref()
+                && time::OffsetDateTime::parse(
+                    next_attempt_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .is_ok_and(|next| next > now)
+            {
+                continue;
+            }
+
+            match session.status.as_str() {
+                "queued" | "running" | "paused" | "waiting_input" => continue,
+                "idle" | "failed" | "cancelled" => {}
+                _ => continue,
+            }
+
+            let reason = continuation.wake_reason.as_deref().unwrap_or("watch");
+            let prompt = crate::continuation::render_prompt(
+                &continuation.id,
+                &continuation.body,
+                reason,
+                &continuation.outcomes,
+            );
+            attempted_sessions.insert(continuation.session_id.clone());
+            match self.start(&continuation.session_id, &prompt).await {
+                Ok(()) => {
+                    self.engine
+                        .mark_session_continuation_delivered(&continuation.id)
+                        .await?;
+                    started = started.saturating_add(1);
+                }
+                Err(error) => {
+                    let error = format!("start failed: {error}");
+                    let attempts = continuation.attempts.saturating_add(1);
+                    if attempts >= continuation.max_attempts.max(1) {
+                        self.engine
+                            .fail_session_continuation(&continuation.id, &error)
+                            .await?;
+                    } else {
+                        let next = now
+                            + time::Duration::seconds(continuation_retry_backoff_secs(attempts));
+                        let next_attempt_at = next
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .map_err(|error| anyhow!("formatting retry time: {error}"))?;
+                        self.engine
+                            .retry_session_continuation(&continuation.id, &error, &next_attempt_at)
+                            .await?;
+                    }
+                }
+            }
+        }
+        Ok(started)
+    }
+
     pub fn start_task_scheduler(&self) {
         if self.task_scheduler_started.swap(true, Ordering::SeqCst) {
             return;
@@ -3636,6 +3781,9 @@ impl AgentService {
             if let Err(error) = service.reconcile_intake_tasks().await {
                 tracing::warn!(%error, "intake reconciler failed at startup");
             }
+            if let Err(error) = service.reconcile_session_continuations().await {
+                tracing::warn!(%error, "continuation reconciler failed at startup");
+            }
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
             ticker.tick().await;
             let mut last_session: Option<String> = None;
@@ -3644,6 +3792,9 @@ impl AgentService {
             let mut intake_cooldowns: HashMap<String, Instant> = HashMap::new();
             loop {
                 ticker.tick().await;
+                if let Err(error) = service.reconcile_session_continuations().await {
+                    tracing::warn!(%error, "global task scheduler could not reconcile continuations");
+                }
                 if let Err(error) = service.reconcile_intake_tasks().await {
                     tracing::warn!(%error, "global task scheduler could not reconcile intake tasks");
                 }

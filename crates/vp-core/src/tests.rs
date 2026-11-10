@@ -6936,3 +6936,346 @@ async fn unlimited_budget_mode_is_event_backed_and_reversible() {
         report.mismatches
     );
 }
+
+#[tokio::test]
+async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("continuations".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "defer work".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &orchestration_test_plan())
+        .await
+        .unwrap();
+
+    assert!(
+        engine
+            .defer_session(&session.id, "   ", Vec::new(), None, None, None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .defer_session(
+                &session.id,
+                &"x".repeat(4_001),
+                vec!["T1".into()],
+                None,
+                None,
+                None,
+                None
+            )
+            .await
+            .is_err()
+    );
+    let no_trigger = engine
+        .defer_session(&session.id, "later", Vec::new(), None, None, None, None)
+        .await
+        .unwrap_err();
+    assert!(no_trigger.to_string().contains("watch task or a deadline"));
+    let missing = engine
+        .defer_session(
+            &session.id,
+            "later",
+            vec!["T9".into()],
+            Some("all"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(missing.to_string().contains("not in the stored TeamPlan"));
+    let bad_mode = engine
+        .defer_session(
+            &session.id,
+            "later",
+            vec!["T1".into()],
+            Some("most"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(bad_mode.to_string().contains("watch mode"));
+    let past = (time::OffsetDateTime::now_utc() - time::Duration::hours(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    assert!(
+        engine
+            .defer_session(
+                &session.id,
+                "later",
+                Vec::new(),
+                None,
+                Some(&past),
+                None,
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .defer_session(
+                &session.id,
+                "later",
+                Vec::new(),
+                None,
+                None,
+                Some(31 * 24 * 60 * 60),
+                None
+            )
+            .await
+            .is_err()
+    );
+    let tomorrow = (time::OffsetDateTime::now_utc() + time::Duration::days(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    assert!(
+        engine
+            .defer_session(
+                &session.id,
+                "later",
+                Vec::new(),
+                None,
+                Some(&tomorrow),
+                Some(5),
+                None
+            )
+            .await
+            .is_err()
+    );
+
+    let created = engine
+        .defer_session(
+            &session.id,
+            "summarize T1 when it lands",
+            vec!["T1".into(), "T1".into()],
+            Some("all"),
+            Some(&tomorrow),
+            None,
+            Some(9),
+        )
+        .await
+        .unwrap()
+        .continuation;
+    assert_eq!(created.status, "pending");
+    assert_eq!(created.watch_task_ids, vec!["T1".to_string()]);
+    assert_eq!(created.watch_mode, "all");
+    assert_eq!(created.max_attempts, 3);
+    assert_eq!(created.deadline_at.as_deref(), Some(tomorrow.as_str()));
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "session.continuation.created")
+    );
+
+    engine.skip_plan_task(&session.id, "T2").await.unwrap();
+    let terminal = engine
+        .defer_session(
+            &session.id,
+            "use the T2 result",
+            vec!["T2".into()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(terminal.to_string().contains("already skipped"));
+
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+
+    engine
+        .store()
+        .replace_session_continuations(&session.id, &[])
+        .unwrap();
+    let drifted = engine.replay_session(&session.id).await.unwrap();
+    assert!(!drifted.continuations_match);
+    assert!(!drifted.consistent);
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(repaired.continuations_match, "{:?}", repaired.mismatches);
+    assert!(repaired.consistent, "{:?}", repaired.mismatches);
+    let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
+    assert!(rebuilt.rebuilt);
+    assert!(rebuilt.continuations_match, "{:?}", rebuilt.mismatches);
+    assert!(rebuilt.consistent, "{:?}", rebuilt.mismatches);
+
+    let bundle = engine.export_session(&session.id).await.unwrap();
+    assert_eq!(bundle.continuations.len(), 1);
+    assert_eq!(bundle.continuations[0].id, created.id);
+    assert_eq!(bundle.continuations[0].body, "summarize T1 when it lands");
+    let import_data = TempDir::new().unwrap();
+    let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
+    imported_engine.import_session(bundle).await.unwrap();
+    let imported = imported_engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(imported.continuations.len(), 1);
+    assert_eq!(imported.continuations[0].id, created.id);
+    assert_eq!(imported.continuations[0].watch_task_ids, vec!["T1"]);
+}
+
+#[test]
+fn deferred_continuation_wake_rules_cover_all_any_deadline_and_missing() {
+    use vp_protocol::types::{ContinuationOutcome, ScheduledTask};
+    fn task(task_id: &str, status: &str) -> ScheduledTask {
+        ScheduledTask {
+            session_id: "session".into(),
+            project_id: "project".into(),
+            plan_seq: 1,
+            task_id: task_id.into(),
+            department: "impl".into(),
+            title: format!("Task {task_id}"),
+            priority: 0,
+            status: status.into(),
+            deps: Vec::new(),
+            write_scope: Vec::new(),
+            attempts: 0,
+            enqueued_at: "2026-01-01T00:00:00Z".into(),
+            started_at: None,
+            finished_at: None,
+            last_error: None,
+            next_attempt_at: None,
+        }
+    }
+    let now = time::OffsetDateTime::parse(
+        "2026-01-01T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let deadline = Some("2026-01-02T00:00:00Z");
+    let pending = vec![task("T1", "pending"), task("T2", "failed")];
+    assert!(
+        crate::continuation::evaluate_wake(
+            &["T1".into(), "T2".into()],
+            "all",
+            deadline,
+            &pending,
+            now
+        )
+        .is_none()
+    );
+    let any = crate::continuation::evaluate_wake(
+        &["T1".into(), "T2".into()],
+        "any",
+        deadline,
+        &pending,
+        now,
+    )
+    .unwrap();
+    assert_eq!(any.reason, "watch");
+    assert_eq!(
+        any.outcomes,
+        vec![
+            ContinuationOutcome {
+                task_id: "T1".into(),
+                title: "Task T1".into(),
+                status: "pending".into()
+            },
+            ContinuationOutcome {
+                task_id: "T2".into(),
+                title: "Task T2".into(),
+                status: "failed".into()
+            }
+        ]
+    );
+
+    let settled = vec![task("T1", "completed"), task("T2", "interrupted")];
+    assert_eq!(
+        crate::continuation::evaluate_wake(
+            &["T1".into(), "T2".into()],
+            "all",
+            deadline,
+            &settled,
+            now
+        )
+        .unwrap()
+        .reason,
+        "watch"
+    );
+
+    let deadline_wake =
+        crate::continuation::evaluate_wake(&[], "all", Some("2025-12-31T23:59:59Z"), &[], now)
+            .unwrap();
+    assert_eq!(deadline_wake.reason, "deadline");
+    assert!(deadline_wake.outcomes.is_empty());
+    assert!(crate::continuation::evaluate_wake(&[], "all", deadline, &[], now).is_none());
+
+    let missing =
+        crate::continuation::evaluate_wake(&["T9".into()], "all", deadline, &settled, now).unwrap();
+    assert_eq!(missing.reason, "watch");
+    assert_eq!(missing.outcomes[0].status, "missing");
+}
+
+#[tokio::test]
+async fn deferred_continuations_can_be_cancelled_once() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("continuation cancel".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "cancel continuation".into(), None)
+        .await
+        .unwrap();
+    let continuation = engine
+        .defer_session(
+            &session.id,
+            "wait for a deadline",
+            Vec::new(),
+            None,
+            None,
+            Some(60),
+            None,
+        )
+        .await
+        .unwrap()
+        .continuation;
+    let cancelled = engine
+        .cancel_session_continuation(&continuation.id)
+        .await
+        .unwrap();
+    assert!(cancelled.cancelled);
+    assert_eq!(cancelled.continuation.status, "cancelled");
+    assert_eq!(
+        cancelled.continuation.last_error.as_deref(),
+        Some("cancelled by operator")
+    );
+    assert!(
+        engine
+            .cancel_session_continuation(&continuation.id)
+            .await
+            .is_err()
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+}
