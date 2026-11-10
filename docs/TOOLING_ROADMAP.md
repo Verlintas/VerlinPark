@@ -1,6 +1,6 @@
 # VerlinPark Agent Tooling Roadmap
 
-> **Status:** Wave A/B/C, optional LSP, provider search, document readers, and runtime introspection implemented on 2026-11-10; office documents, browser, and computer tools remain deferred.<br>
+> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, and runtime introspection implemented on 2026-11-10; browser and computer tools remain deferred.<br>
 > **Date:** 2026-11-10<br>
 > **Code baseline:** working tree after `c64e1b8`; see ADR-0134.<br>
 > **Implementation budget:** ~10,000–30,000 code lines, target core ~24k, hard planning cap 30k<br>
@@ -46,9 +46,11 @@ Implemented in this wave (see ADR-0134 and PROGRESS):
   for JSON/YAML/TOML/CSV;
 - runtime `budget_status`, `task_detail`, `task_control`, `tool_search`, and
   `publish_artifact_file` with role-aware dispatch;
+- `read_document` for DOCX/PPTX/XLSX and ODT/ODS/ODP with ZIP/XML hardening,
+  OCR confidence, and PDF metadata/page counts;
 - role/permission matrix, tests, UI tool labels.
 
-Still open: office documents (`read_document`), browser, and computer control.
+Still open: browser and computer control.
 Browser was spiked with headless Chrome/CDP but deferred: Chrome's network
 service and nested sandbox do not work reliably under the daemon's Seatbelt
 profile, and running it unsandboxed would violate the worktree write boundary.
@@ -1031,7 +1033,7 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 
 [–] U-01 browser (stretch; deferred after sandbox spike)
 [–] U-02 computer (stretch)
-[–] M-03 read_document (stretch)
+[x] M-03 read_document
 ```
 
 ---

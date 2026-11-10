@@ -1,10 +1,58 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-10
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/data readers/runtime introspection 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-10 Office documents, OCR confidence, PDF metadata
+
+### `read_document`
+
+- 支持 DOCX/ODT：按文档顺序提取标题、段落、表格。
+- 支持 PPTX/ODP：按 presentation relationship 顺序逐页提取文本，支持
+  `pages=1-3,5` 过滤。
+- 支持 XLSX/ODS：sharedStrings、文本/数字/布尔/错误 cell、sheet 名称，
+  支持 `sheets` 过滤和 `max_rows`/`max_cols` 上限。
+- ZIP 安全：
+  - 128 MiB 容器上限
+  - 64 MiB 单 entry 解压上限
+  - 256 MiB 总声明解压上限
+  - 10,000 entries
+  - 拒绝重复/加密/NUL/反斜杠/绝对路径/`..`/越界 entry
+  - 实际读取再次用 `Read::take` 限界，不把 archive member 解压到磁盘
+- XML 安全：
+  - `quick-xml` tokenizer
+  - 拒绝 DTD
+  - XML 嵌套深度 512
+  - 只解析 predefined/numeric entities；unknown entity 原样保留并 warning
+  - 支持 UTF-8 和 BOM UTF-16，其它编码显式拒绝
+  - 输出 200k chars、block/cell/sheet/slide 多级 cap
+- 结构化输出包含 `format`、`entries`、`archive_entries`、`chars`、
+  `extracted_chars`、`truncated`、`warnings`、`tables`/`slides`/`sheets`；
+  `pages` 对非演示文稿显式 warning，不假装有页码。
+
+### Media improvements
+
+- `read_image` 的 tesseract OCR 改为 TSV 解析，返回 text、word count、
+  mean/min/max confidence；缺失 tesseract 仍显式 warning。
+- `read_pdf` 用 `lopdf` 读取 metadata 和真实 page count，返回
+  `page_count_source`（`pdf-metadata` / `text-boundaries` / `unknown`）；
+  page range 仍只在真实 form-feed 页边界存在时生效，否则 warning。
+- 修复共享 `truncate` helper 的 UTF-8 边界截断，避免截断多字节字符 panic。
+
+### 边界
+
+- Office 提取保留可读的段落/表格/slide/sheet 结构，不重建页面布局、栏、
+  脚注、批注、浮动文本框、speaker notes、动画、图片、chart、宏、公式或
+  日期/数字格式。
+- 加密文档拒绝；超大文档需要外部转换。
+- Office 输出仍受 40 KB tool-content cap 限制；structured data 受 32 KiB
+  event cap 限制。
+- 不触碰 browser/ComputerLease。
 
 ---
 
@@ -74,7 +122,7 @@ Chrome 自身 sandbox 并扩大 temp/crashpad 写权限仍只能加载 data URL�
 - 新增 LSP framing/UTF-16/symbol mapping、SearXNG mock、PDF page selection、
   image metadata（sandboxed sips）、data query path/CSV、runtime budget/
   tool_search/artifact 事件测试。
-- 当前 Rust 测试 470（core 384 / protocol 2 / store 70 / providers 14；3 个
+- 当前 Rust 测试 482（core 396 / protocol 2 / store 70 / providers 14；3 个
   live ignored），Swift 110；`just lint` 与 `just test` 通过。
 
 剩余：office documents、browser、computer、完整 ComputerLease、跨进程
