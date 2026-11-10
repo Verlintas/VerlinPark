@@ -1,10 +1,110 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-11 Evidence-backed project memory v2 and long-task operator console
+
+这一轮没有照搬 Agent Swarm 的 chat memory + embedding + LLM 自评。VerlinPark 的
+持久真相在事件、task result、commit 和 Verifier 结论里，所以 memory 被做成
+「带 provenance 的 claim」，检索和生命周期都保持 deterministic Rust。
+
+### Evidence-backed memory
+
+- `MemoryItem` 新增：
+  - `status`（active/stale/superseded/archived）
+  - `source`（agent/task_result/operator/orchestrator/import）
+  - `evidence`（commit/path/task/session/event/url）
+  - `supersedes` / `superseded_by`
+  - `pinned`
+  - `use_count` / `last_used_at`
+  - `last_verified_at` / `verify_after` / `stale_reason`
+- 旧 events、bundle、客户端通过 `serde(default)` 继续解码。
+- 检索是 lexical + structural + behavioral：
+  - FTS5 bm25（或 LIKE fallback）× 0.60
+  - exact task evidence/tag +0.60
+  - path prefix overlap，每项 +0.15，上限 0.45
+  - department +0.20
+  - kind/source 权重
+  - 30 天 half-life recency
+  - observed usage，`ln(1+use_count)`
+  - pinned +0.50
+  - stale ×0.25，且只有显式 `include_stale` 才参与
+- `MemoryMatch` 返回 score 和 reasons（`fts`、`task:T3`、`path:src/api`、
+  `department:eng`、`pinned` 等），可解释、可测试；没有 embedding、provider
+  call 或 hidden routing。
+- 去重/替代按 project + normalized kind/title：
+  - 完全相同 body/evidence/source → 幂等返回，不写新 event
+  - 同 key 不同内容 → 一个事务内插入新 active row，旧 row 标 `superseded`，
+    写 `memory.superseded` + `memory.created`
+  - `dedupe=false` 是显式逃生口；`auto_supersede` 可项目级关闭
+- 任务完成时自动写 `task_result` memory，evidence 包含 task、session、
+  最新 merged commit，以及最多 20 个 changed path；重试后再次完成会替代旧结果，
+  不再因为 title 已存在而跳过。
+- `memory.brief` 用 session goal + task title/acceptance/department/write scope
+  检索，按 project `brief_max_chars`（默认 4000）做字符预算；被注入的 memory
+  每个 session 只记一次 `memory.used`。
+- `memory.verify` 只做本地证据检查：
+  - commit：`git cat-file -e` + `git merge-base --is-ancestor`
+  - path：项目根内存在
+  - task/session/event：存在性检查
+  - url/unsupported：明确返回 `unchecked`，不会假装已 fact-check
+- `memory.sweep` 只把过期 active、非 pinned 行标 stale，不删除、不自动恢复；
+  daemon sweep 由项目 `MemoryPolicy.sweep_stale` opt-in，
+  `VERLINPARK_MEMORY_STALE_SECS` 默认 3600，0 关闭。
+- `memory.prune` 现在明确跳过 pinned；`keep_latest` 只计算 unpinned 行。
+- Events：`memory.created` / `updated` / `verified` / `stale` / `superseded` /
+  `used` / `deleted`，每个都携带完整 `MemoryItem`，replay/repair 为
+  last-write-wins；bundle 和 db-rebuild 覆盖新字段。
+- RPC/CLI：`memory.search`、`memory.brief`、`memory.update`、
+  `memory.verify`、`memory.sweep`、`memory.stats`；
+  `vp memory-search`、`vp memory-brief`、`vp memory-update`、
+  `vp memory-verify`、`vp memory-sweep`、`vp memory-stats`。
+- 没有新增 agent-facing tool；`remember`/`recall` 仍以 source=agent 工作。
+
+### Long-task operator console
+
+- Manage Dash → Team & Tasks 新增：
+  - `RecoveryCard`：stall recovery intent/status/attempts/grace/error，只读
+  - `ContinuationCard`：watch task/mode/deadline/wake reason/outcomes，可取消/新建
+  - `SteeringCard`：pending/delivered/cancelled，可取消 pending
+  - `TaskStallCard`：progress + stall 观测，只读
+- Stage：
+  - running/paused 时显示 `Steer`
+  - 会话菜单增加 `Defer Continuation…`
+  - 顶部显示 continuation/recovery 提示
+- 所有动作走真实 RPC，错误内联；steering 明确说明只在下一个 provider
+  boundary 交付，continuation 明确说明不会立即运行。
+- Manifest 增加证据型 memory 的 pin/verify/sweep UI，并把
+  `auto_supersede`、verify TTL、brief 字符预算、stale sweep 暴露到
+  Memory retention 卡片；保存 policy 时完整回传 v2 字段，避免静默重置。
+
+### 边界
+
+- 没有 semantic recall / embedding；CJK 走 LIKE fallback。
+- verify 不是 fact-check；URL evidence 不抓取。
+- memory 仍是 project-scoped，不跨项目。
+- `memory_usage` 是 operational 表，不进入 bundle；`use_count` 会保留。
+- brief 是字符预算，不是 tokenizer 精确计数。
+- continuation 是 operator-only、非 recurring；recovery 是 same-task/department，
+  不是 same-agent identity。
+- 没有 recovery cancel RPC，因此 UI 不提供该动作。
+
+### 测试
+
+- Rust：**539 passed，4 ignored**
+  - core 439 passed + 1 browser ignored
+  - protocol 6
+  - store 76
+  - providers 18 + 3 live ignored
+- Swift：**132 passed**
+- `just lint`、`just test`、`just bundle` 通过。
+- ADR-0142（evidence-backed memory）和 ADR-0143（long-task console）已记录。
 
 ---
 

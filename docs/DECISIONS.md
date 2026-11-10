@@ -151,6 +151,8 @@
 | [0139](adr/0139-steering-and-progress-ledger.md) | Operator steering at provider boundaries and operational plan-task progress/stall observations | Accepted | Runtime/Orchestration/CLI |
 | [0140](adr/0140-stall-recovery.md) | Policy-gated escalation or same-task retry after repeated plan-task stall observations | Accepted | Runtime/Orchestration |
 | [0141](adr/0141-deferred-session-continuations.md) | Persisted operator continuations that wake on watched tasks or a deadline and start through the normal run path | Accepted | Runtime/Scheduler/CLI |
+| [0142](adr/0142-evidence-backed-memory.md) | Evidence-backed project memory with deterministic lexical/structural ranking, TTL verification, and atomic supersede | Accepted | Runtime/Storage |
+| [0143](adr/0143-long-task-operator-console.md) | macOS surfaces for steering, continuations, stall recovery, and task progress, backed only by real RPCs | Accepted | macOS/Runtime |
 
 ---
 

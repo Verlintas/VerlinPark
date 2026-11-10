@@ -489,6 +489,28 @@ loop {
 - 三者都不改变 approval、Seatbelt、path jail、write scope、Verifier、merge、
   capacity 或 budget gate。
 
+### 7.0.2 Evidence-backed memory（2026-11-11）
+
+- `MemoryItem` 是带 provenance 的 claim：`status` / `source` / `evidence`
+  （commit/path/task/session/event/url）/ `supersedes` / `pinned` /
+  `use_count` / `verify_after` / `stale_reason`，全部 additive + `serde(default)`。
+- 检索由 `vp-core::memory` 的纯函数完成：FTS5 bm25（或 LIKE）× lexical、
+  task/path/department 结构 boost、kind/source 权重、30 天 recency half-life、
+  observed usage、pinned；stale 只在 `include_stale` 时以 ×0.25 参与。
+  没有 embedding、provider call 或 hidden routing；每个结果返回 reasons。
+- 生命周期：project + normalized kind/title 只允许一个 active row；新内容在
+  单事务内插入并 supersede 旧 row。任务完成写入 `task_result` memory，带
+  task/session/merged commit/changed paths，重试后再次完成会替代旧结果。
+- `memory.brief` 按 session goal + task context 检索并做字符预算；被注入的
+  memory 每个 session 只记一次 `memory.used`。
+- `memory.verify` 只检查本地证据（commit ancestry、path 存在、id 存在），
+  URL/unsupported 明确 `unchecked`；`memory.sweep` 只把过期 active、非 pinned
+  行标 stale，不删除；daemon sweep 需项目 `MemoryPolicy.sweep_stale` opt-in。
+- 事件：`memory.created/updated/verified/stale/superseded/used/deleted`，每个
+  携带完整 row；replay/repair/bundle/db-rebuild 覆盖。
+- 不改变任何 approval、sandbox、write scope、Verifier、merge、capacity 或
+  budget gate；`remember`/`recall` 仍以 source=agent 工作。
+
 ### 7.1 Actor 命令
 
 ```rust
