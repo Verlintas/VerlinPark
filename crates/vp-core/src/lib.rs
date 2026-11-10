@@ -29,10 +29,11 @@ use vp_protocol::types::{
     MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MergeQueueEntry, MessageCitation,
     ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
     OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
-    OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationSessionSummary,
-    OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
-    ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
+    OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
+    OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
+    PlanRevisionDetailResult, PlanRevisionInfo, Project, ProjectBudget, ProjectBudgetResult,
+    ProjectUsageResult, PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult,
+    ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
     SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
     SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
     SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
@@ -106,6 +107,7 @@ struct ReplayData {
     tasks: Vec<ScheduledTask>,
     steering: Vec<SteeringMessage>,
     continuations: Vec<SessionContinuation>,
+    recoveries: Vec<OrchestrationRecovery>,
     notes: Vec<OrchestrationNote>,
     decisions: Vec<OrchestrationDecision>,
     events: Vec<Event>,
@@ -304,7 +306,7 @@ fn approval_grant_paths(input: &serde_json::Value) -> Vec<String> {
     paths
 }
 
-fn session_budget_exhausted(session: &Session) -> bool {
+pub(crate) fn session_budget_exhausted(session: &Session) -> bool {
     if session.unlimited {
         return false;
     }
@@ -4156,6 +4158,12 @@ impl Engine {
         let queue = self.task_queue(None, Some(session_id.to_string())).await?;
         let tasks = queue.tasks;
         let progress = queue.progress;
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let recoveries = tokio::task::spawn_blocking(move || {
+            store.list_current_orchestration_recoveries(None, Some(&id))
+        })
+        .await??;
         let stall_threshold_secs = match task_stall_threshold_secs() {
             0 => None,
             secs => Some(secs),
@@ -4182,6 +4190,7 @@ impl Engine {
                 notes: &notes,
                 decisions: &decisions,
                 progress: &progress,
+                recoveries: &recoveries,
                 stall_threshold_secs,
                 policy: &policy,
             },
@@ -4285,6 +4294,33 @@ impl Engine {
                 .map(|blocker| format!("{}: {}", blocker.kind, blocker.message))
                 .collect::<Vec<_>>();
             let last = snapshot.decisions.last().cloned();
+            let active_recoveries = snapshot
+                .recoveries
+                .iter()
+                .filter(|recovery| {
+                    matches!(recovery.status.as_str(), "requested" | "waiting_cancel")
+                })
+                .count();
+            let failed_recoveries = snapshot
+                .recoveries
+                .iter()
+                .filter(|recovery| recovery.status == "failed")
+                .count();
+            let last_recovery = snapshot
+                .recoveries
+                .iter()
+                .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
+                .map(|recovery| {
+                    format!(
+                        "{}: {} ({})",
+                        recovery.task_id,
+                        recovery.status,
+                        recovery
+                            .last_error
+                            .as_deref()
+                            .unwrap_or(recovery.action.as_str())
+                    )
+                });
             summaries.push(OrchestrationSessionSummary {
                 session_id: session.id.clone(),
                 project_id: session.project_id.clone(),
@@ -4300,6 +4336,10 @@ impl Engine {
                 blockers,
                 last_decision: last.as_ref().map(|decision| decision.detail.clone()),
                 last_decision_at: last.map(|decision| decision.created_at),
+                recoveries: snapshot.recoveries.len(),
+                active_recoveries,
+                failed_recoveries,
+                last_recovery,
             });
         }
         summaries.sort_by(|lhs, rhs| {
@@ -4349,6 +4389,15 @@ impl Engine {
             stalled_tasks: summaries
                 .iter()
                 .map(|summary| summary.metrics.stalled_tasks)
+                .sum(),
+            recoveries: summaries.iter().map(|summary| summary.recoveries).sum(),
+            active_recoveries: summaries
+                .iter()
+                .map(|summary| summary.active_recoveries)
+                .sum(),
+            failed_recoveries: summaries
+                .iter()
+                .map(|summary| summary.failed_recoveries)
                 .sum(),
         };
         Ok(OrchestrationOverviewResult {
@@ -5158,19 +5207,256 @@ impl Engine {
         Ok(count)
     }
 
-    /// Run one observability-only stall sweep. Zero disables it.
+    /// Run one stall sweep. Observation is always recorded; when the project
+    /// policy opts into `escalate` or `retry`, the same fresh observations may
+    /// advance a bounded recovery. Zero disables the sweep and recovery.
     pub async fn sweep_task_stalls(&self, threshold: std::time::Duration) -> Result<usize> {
+        self.sweep_task_stalls_at(threshold, time::OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// Deterministic-time variant used by tests and replay repairs.
+    pub async fn sweep_task_stalls_at(
+        &self,
+        threshold: std::time::Duration,
+        now: time::OffsetDateTime,
+    ) -> Result<usize> {
         if threshold.is_zero() {
             return Ok(0);
         }
         let store = self.store.clone();
-        let (stalls, events) =
-            tokio::task::spawn_blocking(move || store.sweep_task_stalls_with_events(threshold))
-                .await??;
+        let (stalls, events) = tokio::task::spawn_blocking(move || {
+            store.sweep_task_stalls_with_events_at(threshold, now)
+        })
+        .await??;
         for event in events {
             self.broadcast_event(event);
         }
+        self.evaluate_stall_recoveries(&stalls).await?;
         Ok(stalls.len())
+    }
+
+    async fn evaluate_stall_recoveries(&self, stalls: &[TaskStall]) -> Result<()> {
+        for stall in stalls {
+            let policy = self.orchestration_policy(&stall.project_id).await?;
+            let store = self.store.clone();
+            let session_id = stall.session_id.clone();
+            let plan_seq = stall.plan_seq;
+            let task_id = stall.task_id.clone();
+            let recovery = tokio::task::spawn_blocking(move || {
+                store.get_orchestration_recovery(&session_id, plan_seq, &task_id)
+            })
+            .await??;
+            let decision =
+                crate::orchestration::decide_stall_recovery(&policy, recovery.as_ref(), stall);
+            match decision {
+                crate::orchestration::StallRecoveryDecision::None => {}
+                crate::orchestration::StallRecoveryDecision::Escalate => {
+                    let reason = format!(
+                        "{} produced {} stall observation(s); latest observation was {}s old",
+                        stall.task_id, stall.stall_count, stall.age_secs
+                    );
+                    let session_id = stall.session_id.clone();
+                    let task_id = stall.task_id.clone();
+                    let store = self.store.clone();
+                    let owned_stall = stall.clone();
+                    let reason_for_store = reason.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        store.escalate_stall_recovery(&owned_stall, &reason_for_store)
+                    })
+                    .await??;
+                    let Some((_recovery, event)) = result else {
+                        continue;
+                    };
+                    self.broadcast_event(event);
+                    self.record_stall_escalation(&session_id, &task_id, &reason)
+                        .await?;
+                }
+                crate::orchestration::StallRecoveryDecision::Retry => {
+                    self.request_stall_recovery_retry(stall, &policy).await?;
+                }
+                crate::orchestration::StallRecoveryDecision::Exhausted { reason } => {
+                    self.record_stall_recovery_failure(stall, &reason).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn request_stall_recovery_retry(
+        &self,
+        stall: &TaskStall,
+        policy: &OrchestrationPolicy,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let session_id = stall.session_id.clone();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&session_id))
+            .await??
+            .ok_or_else(|| anyhow!("session not found: {}", stall.session_id))?;
+        if session_budget_exhausted(&session) {
+            self.record_stall_recovery_failure(
+                stall,
+                "session budget is exhausted; automatic stall recovery did not start",
+            )
+            .await?;
+            return Ok(());
+        }
+        let reason = format!(
+            "{} produced {} stall observation(s); latest observation was {}s old",
+            stall.task_id, stall.stall_count, stall.age_secs
+        );
+        let store = self.store.clone();
+        let owned = stall.clone();
+        let reason_for_store = reason.clone();
+        let max_attempts = policy.stall_max_attempts;
+        let grace_secs = policy.stall_grace_secs;
+        let requested = tokio::task::spawn_blocking(move || {
+            store.begin_stall_retry_recovery(&owned, max_attempts, grace_secs, &reason_for_store)
+        })
+        .await??;
+        let Some((_recovery, event)) = requested else {
+            return Ok(());
+        };
+        self.broadcast_event(event);
+        match self
+            .request_plan_task_cancel(&stall.session_id, &stall.task_id)
+            .await
+        {
+            Ok(_) => {
+                self.finish_stall_recovery_cancel(
+                    stall,
+                    "cancellation requested; waiting for the task and session to settle",
+                )
+                .await?;
+            }
+            Err(error) => {
+                let store = self.store.clone();
+                let session_id = stall.session_id.clone();
+                let task_id = stall.task_id.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    store.plan_task_status(&session_id, &task_id)
+                })
+                .await??;
+                match status.as_deref() {
+                    Some("completed" | "skipped") | None => {
+                        self.finish_stall_recovery_unnecessary(
+                            stall,
+                            "task completed before the cancellation request took effect",
+                        )
+                        .await?;
+                    }
+                    Some("cancelled" | "interrupted" | "failed" | "cancelling") => {
+                        self.finish_stall_recovery_cancel(
+                            stall,
+                            "the task ended before cancellation was delivered; waiting for the session to settle",
+                        )
+                        .await?;
+                    }
+                    Some(_) => {
+                        self.record_stall_recovery_failure(
+                            stall,
+                            &format!("cooperative cancellation failed: {error:#}"),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_stall_recovery_cancel(&self, stall: &TaskStall, reason: &str) -> Result<()> {
+        let store = self.store.clone();
+        let session_id = stall.session_id.clone();
+        let task_id = stall.task_id.clone();
+        let plan_seq = stall.plan_seq;
+        let reason = reason.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.mark_stall_recovery_waiting_cancel(&session_id, plan_seq, &task_id, &reason)
+        })
+        .await??;
+        if let Some((_recovery, event)) = result {
+            self.broadcast_event(event);
+        }
+        Ok(())
+    }
+
+    async fn finish_stall_recovery_unnecessary(
+        &self,
+        stall: &TaskStall,
+        reason: &str,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let session_id = stall.session_id.clone();
+        let task_id = stall.task_id.clone();
+        let plan_seq = stall.plan_seq;
+        let reason = reason.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.finish_stall_recovery_unnecessary(&session_id, plan_seq, &task_id, &reason)
+        })
+        .await??;
+        if let Some((_recovery, event)) = result {
+            self.broadcast_event(event);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn record_stall_recovery_failure(
+        &self,
+        stall: &TaskStall,
+        reason: &str,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let owned = stall.clone();
+        let reason_for_store = reason.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.fail_stall_recovery_for_stall(&owned, &reason_for_store)
+        })
+        .await??;
+        if let Some((_recovery, event)) = result {
+            self.broadcast_event(event);
+            self.record_stall_escalation(&stall.session_id, &stall.task_id, reason)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn record_stall_escalation(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.record_coordination_note(
+            session_id,
+            "escalate",
+            "critical",
+            Some(task_id),
+            None,
+            None,
+            "orchestrator",
+            "Orchestrator",
+            Some("orchestrator"),
+            &format!("Automatic stall recovery escalation for {task_id}: {reason}"),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn orchestration_recoveries(
+        &self,
+        session_id: &str,
+    ) -> Result<OrchestrationRecoveriesResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let recoveries = tokio::task::spawn_blocking(move || {
+            store.list_current_orchestration_recoveries(None, Some(&id))
+        })
+        .await??;
+        Ok(OrchestrationRecoveriesResult {
+            session_id: session_id.to_string(),
+            recoveries,
+        })
     }
 
     pub async fn session_stalls(&self, session_id: &str) -> Result<SessionStallsResult> {
@@ -7203,6 +7489,7 @@ impl Engine {
             let tasks = store.list_plan_tasks(None, Some(&id))?;
             let steering = store.list_steering(&id, None, Some(2_000))?;
             let continuations = store.list_session_continuations(&id, None, Some(2_000))?;
+            let recoveries = store.list_orchestration_recoveries(None, Some(&id))?;
             let notes = store.list_coordination_notes(&id, 2_000)?;
             let decisions = store.list_orchestration_decisions(&id, 2_000)?;
             let events = store.list_all_events(&id)?;
@@ -7222,6 +7509,7 @@ impl Engine {
                 tasks,
                 steering,
                 continuations,
+                recoveries,
                 notes,
                 decisions,
                 events,
@@ -7913,6 +8201,28 @@ impl Engine {
                 expected_decision_values.len()
             ));
         }
+        let expected_recoveries = crate::orchestration::recoveries_from_events(&data.events);
+        let expected_recovery_values = expected_recoveries
+            .iter()
+            .filter_map(|recovery| {
+                Some((recovery_key(recovery), serde_json::to_value(recovery).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_recovery_values = data
+            .recoveries
+            .iter()
+            .filter_map(|recovery| {
+                Some((recovery_key(recovery), serde_json::to_value(recovery).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let recoveries_match = expected_recovery_values == projected_recovery_values;
+        if !recoveries_match {
+            mismatches.push(format!(
+                "orchestration recoveries: projection={}, replay={}",
+                projected_recovery_values.len(),
+                expected_recovery_values.len()
+            ));
+        }
         let expected_steering = replay_steering(&data.events);
         let expected_steering_values = expected_steering
             .iter()
@@ -8210,6 +8520,7 @@ impl Engine {
             && queue_matches
             && notes_match
             && decisions_match
+            && recoveries_match
             && steering_matches
             && continuations_match;
         Ok(SessionReplayReport {
@@ -8231,6 +8542,7 @@ impl Engine {
             task_queue_matches,
             notes_match,
             decisions_match,
+            recoveries_match,
             steering_matches,
             continuations_match,
             consistent,
@@ -8518,6 +8830,7 @@ impl Engine {
             tasks: Self::expected_tasks(data),
             steering: Some(replay_steering(&data.events)),
             continuations: Some(replay_continuations(&data.events)),
+            recoveries: Some(crate::orchestration::recoveries_from_events(&data.events)),
             artifact_warnings,
         })
     }
@@ -8716,6 +9029,7 @@ impl Engine {
         };
         let notes = crate::orchestration::coordination_notes(&events);
         let decisions = crate::orchestration::decisions_from_events(&events);
+        let recoveries = crate::orchestration::recoveries_from_events(&events);
         tokio::task::spawn_blocking(move || -> Result<()> {
             projection_store.replace_coordination_notes(&projection_id, &notes, &events)?;
             projection_store.replace_orchestration_decisions(
@@ -8723,6 +9037,7 @@ impl Engine {
                 &decisions,
                 &events,
             )?;
+            projection_store.replace_orchestration_recoveries(&projection_id, &recoveries)?;
             Ok(())
         })
         .await??;
@@ -8804,6 +9119,7 @@ impl Engine {
             tasks: data.tasks,
             steering: data.steering,
             continuations: data.continuations,
+            recoveries: data.recoveries,
         })
     }
 
@@ -8827,6 +9143,7 @@ impl Engine {
         .await??;
         let expected_notes = crate::orchestration::coordination_notes(&data.events);
         let expected_decisions = crate::orchestration::decisions_from_events(&data.events);
+        let expected_recoveries = crate::orchestration::recoveries_from_events(&data.events);
         let projection_store = self.store.clone();
         let projection_id = session_id.to_string();
         let projection_events = data.events.clone();
@@ -8841,6 +9158,8 @@ impl Engine {
                 &expected_decisions,
                 &projection_events,
             )?;
+            projection_store
+                .replace_orchestration_recoveries(&projection_id, &expected_recoveries)?;
             Ok(())
         })
         .await??;
@@ -9070,6 +9389,7 @@ impl Engine {
         .await??;
         let expected_notes = crate::orchestration::coordination_notes(&data.events);
         let expected_decisions = crate::orchestration::decisions_from_events(&data.events);
+        let expected_recoveries = crate::orchestration::recoveries_from_events(&data.events);
         let projection_store = self.store.clone();
         let projection_id = session_id.to_string();
         let projection_events = data.events.clone();
@@ -9084,6 +9404,8 @@ impl Engine {
                 &expected_decisions,
                 &projection_events,
             )?;
+            projection_store
+                .replace_orchestration_recoveries(&projection_id, &expected_recoveries)?;
             Ok(())
         })
         .await??;
@@ -10889,6 +11211,14 @@ fn replay_continuations(events: &[Event]) -> Vec<SessionContinuation> {
             .then_with(|| left.id.cmp(&right.id))
     });
     continuations
+}
+
+fn recovery_key(recovery: &OrchestrationRecovery) -> (String, u64, String) {
+    (
+        recovery.session_id.clone(),
+        recovery.plan_seq,
+        recovery.task_id.clone(),
+    )
 }
 
 fn replay_session_cost(events: &[Event]) -> f64 {

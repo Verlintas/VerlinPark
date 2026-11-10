@@ -3338,6 +3338,10 @@ pub struct SessionBundle {
     /// Deferred continuations. Older bundles decode as an empty list.
     #[serde(default)]
     pub continuations: Vec<SessionContinuation>,
+    /// Event-backed stall recovery rows. Older bundles decode as an empty
+    /// list; importing the archive replays the recovery events it carries.
+    #[serde(default)]
+    pub recoveries: Vec<OrchestrationRecovery>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3369,6 +3373,8 @@ pub struct SessionReplayReport {
     pub notes_match: bool,
     #[serde(default)]
     pub decisions_match: bool,
+    #[serde(default)]
+    pub recoveries_match: bool,
     #[serde(default)]
     pub steering_matches: bool,
     #[serde(default)]
@@ -3545,6 +3551,47 @@ pub struct TaskStall {
     #[serde(default)]
     pub last_tool: Option<String>,
     pub observed_at: String,
+}
+
+/// Persisted, event-backed stall recovery intent and outcome for one plan
+/// task revision. A row is created only after the project policy opts into
+/// `escalate` or `retry`; `observe` never writes one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationRecovery {
+    pub session_id: String,
+    pub project_id: String,
+    pub plan_seq: u64,
+    pub task_id: String,
+    pub department: String,
+    /// `escalate` or `retry`.
+    pub action: String,
+    /// `requested`, `waiting_cancel`, `retried`, `escalated`, `failed`, or
+    /// `unnecessary`.
+    pub status: String,
+    /// Automatic recovery retries issued for this task revision.
+    pub attempts: u32,
+    /// Stall observation count that triggered the latest transition.
+    pub last_stall_count: u32,
+    pub requested_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Deadline for cooperative cancellation and session quiescence. `None`
+    /// once the recovery reaches a terminal state.
+    #[serde(default)]
+    pub next_action_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestrationRecoveriesParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrchestrationRecoveriesResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub recoveries: Vec<OrchestrationRecovery>,
 }
 
 /// Persisted operator steering addressed to one running agent/run. Delivery
@@ -3932,6 +3979,18 @@ pub enum DependencyFailurePolicy {
     Retry,
 }
 
+/// What the daemon may do after a plan task produces repeated stall
+/// observations. `Observe` is the default and preserves the telemetry-only
+/// behavior: no task, session, retry, or coordination state is mutated.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StallRecoveryMode {
+    #[default]
+    Observe,
+    Escalate,
+    Retry,
+}
+
 /// Project-level orchestration policy. It is intentionally declarative and
 /// deterministic: the runtime applies it without model routing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3946,6 +4005,18 @@ pub struct OrchestrationPolicy {
     pub escalate_after_retries: bool,
     /// Close coordination blockers automatically when their task completes.
     pub auto_resolve_blockers: bool,
+    /// What to do after repeated stall observations. The default keeps the
+    /// telemetry-only behavior from ADR-0139.
+    pub stall_recovery: StallRecoveryMode,
+    /// Consecutive `orchestration.stall` observations required before an
+    /// escalation or recovery request is considered.
+    pub stall_min_observations: u32,
+    /// Maximum automatic stall-recovery retries per task/plan revision.
+    /// `0` disables recovery retries even when `stall_recovery` is `retry`.
+    pub stall_max_attempts: u32,
+    /// Time a recovery request may wait for cooperative cancellation and for
+    /// the session to become idle before it fails and escalates.
+    pub stall_grace_secs: u64,
 }
 
 impl Default for OrchestrationPolicy {
@@ -3958,6 +4029,10 @@ impl Default for OrchestrationPolicy {
             dependency_failure: DependencyFailurePolicy::Block,
             escalate_after_retries: true,
             auto_resolve_blockers: true,
+            stall_recovery: StallRecoveryMode::Observe,
+            stall_min_observations: 2,
+            stall_max_attempts: 1,
+            stall_grace_secs: 300,
         }
     }
 }
@@ -4097,6 +4172,10 @@ pub struct OrchestrationTask {
     /// configured stall threshold.
     #[serde(default)]
     pub stalled: bool,
+    /// Event-backed stall recovery state for this task revision, when the
+    /// project policy opted into escalation or retry.
+    #[serde(default)]
+    pub recovery: Option<OrchestrationRecovery>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4177,6 +4256,8 @@ pub struct OrchestrationMetrics {
     pub attention_count: usize,
     #[serde(default)]
     pub stalled_tasks: usize,
+    #[serde(default)]
+    pub recoveries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4203,6 +4284,9 @@ pub struct OrchestrationSnapshot {
     pub revisions: Vec<PlanRevisionInfo>,
     #[serde(default)]
     pub blockers: Vec<OrchestrationBlocker>,
+    /// Event-backed stall recovery rows for the current plan revision.
+    #[serde(default)]
+    pub recoveries: Vec<OrchestrationRecovery>,
     pub metrics: OrchestrationMetrics,
     pub generated_at: String,
 }
@@ -4337,6 +4421,15 @@ pub struct OrchestrationSessionSummary {
     pub last_decision: Option<String>,
     #[serde(default)]
     pub last_decision_at: Option<String>,
+    /// Stall recovery rows for this session's current plan revision.
+    #[serde(default)]
+    pub recoveries: usize,
+    #[serde(default)]
+    pub active_recoveries: usize,
+    #[serde(default)]
+    pub failed_recoveries: usize,
+    #[serde(default)]
+    pub last_recovery: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -4351,6 +4444,12 @@ pub struct OrchestrationOverviewTotals {
     pub merge_conflicts: usize,
     #[serde(default)]
     pub stalled_tasks: usize,
+    #[serde(default)]
+    pub recoveries: usize,
+    #[serde(default)]
+    pub active_recoveries: usize,
+    #[serde(default)]
+    pub failed_recoveries: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4383,6 +4482,42 @@ mod tests {
         let current: AuthParams =
             serde_json::from_value(json!({"token": "abc", "protocol": 2})).unwrap();
         assert_eq!(current.protocol, Some(2));
+    }
+
+    #[test]
+    fn orchestration_policy_stall_recovery_defaults_and_backcompat() {
+        let legacy: OrchestrationPolicy = serde_json::from_value(json!({
+            "auto_retry_failed": true,
+            "max_attempts": 2,
+            "retry_backoff_secs": 30,
+            "retry_priority_boost": 10,
+            "dependency_failure": "block",
+            "escalate_after_retries": true,
+            "auto_resolve_blockers": true
+        }))
+        .unwrap();
+        assert_eq!(legacy.stall_recovery, StallRecoveryMode::Observe);
+        assert_eq!(legacy.stall_min_observations, 2);
+        assert_eq!(legacy.stall_max_attempts, 1);
+        assert_eq!(legacy.stall_grace_secs, 300);
+
+        let current: OrchestrationPolicy = serde_json::from_value(json!({
+            "stall_recovery": "retry",
+            "stall_min_observations": 4,
+            "stall_max_attempts": 3,
+            "stall_grace_secs": 45
+        }))
+        .unwrap();
+        assert_eq!(current.stall_recovery, StallRecoveryMode::Retry);
+        assert_eq!(current.stall_min_observations, 4);
+        assert_eq!(current.stall_max_attempts, 3);
+        assert_eq!(current.stall_grace_secs, 45);
+
+        let encoded = serde_json::to_value(OrchestrationPolicy::default()).unwrap();
+        assert_eq!(encoded["stall_recovery"], "observe");
+        assert_eq!(encoded["stall_min_observations"], 2);
+        assert_eq!(encoded["stall_max_attempts"], 1);
+        assert_eq!(encoded["stall_grace_secs"], 300);
     }
 
     #[test]

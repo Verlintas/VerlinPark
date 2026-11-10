@@ -4780,6 +4780,426 @@ async fn plan_task_stall_sweep_is_observability_only() {
     assert_eq!(engine.sweep_task_stalls(Duration::ZERO).await.unwrap(), 0);
 }
 
+async fn stall_recovery_fixture(
+    policy: OrchestrationPolicy,
+    token_budget: Option<u64>,
+) -> (
+    TempDir,
+    TempDir,
+    Engine,
+    vp_protocol::types::Project,
+    Session,
+    ScheduledTask,
+) {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("stall recovery".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "recover stalls".into(), token_budget)
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &orchestration_test_plan())
+        .await
+        .unwrap();
+    engine
+        .set_orchestration_policy(&project.id, &policy)
+        .await
+        .unwrap();
+    let queue = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap();
+    let task = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T1")
+        .unwrap()
+        .clone();
+    let (claimed, _events) = engine
+        .scheduler()
+        .claim(
+            &session.id,
+            task.plan_seq,
+            std::slice::from_ref(&task.task_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    (data, repo, engine, project, session, task)
+}
+
+fn recovery_policy(mode: vp_protocol::types::StallRecoveryMode) -> OrchestrationPolicy {
+    OrchestrationPolicy {
+        stall_recovery: mode,
+        stall_min_observations: 1,
+        stall_max_attempts: 1,
+        stall_grace_secs: 300,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn stall_recovery_observe_mutates_no_recovery_state() {
+    let (_data, _repo, engine, _project, session, task) =
+        stall_recovery_fixture(OrchestrationPolicy::default(), None).await;
+    let now = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    assert_eq!(
+        engine
+            .sweep_task_stalls_at(Duration::from_secs(60), now)
+            .await
+            .unwrap(),
+        1
+    );
+    let recoveries = engine.orchestration_recoveries(&session.id).await.unwrap();
+    assert!(recoveries.recoveries.is_empty());
+    let events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.kind.starts_with("orchestration.recovery_"))
+    );
+    assert!(
+        engine
+            .coordination_notes(&session.id, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|note| note.action != "escalate")
+    );
+    assert_eq!(
+        engine
+            .store()
+            .plan_task_status(&session.id, &task.task_id)
+            .unwrap()
+            .as_deref(),
+        Some("running")
+    );
+}
+
+#[tokio::test]
+async fn stall_recovery_escalate_is_once_per_stall_window() {
+    let (_data, _repo, engine, project, session, _task) = stall_recovery_fixture(
+        recovery_policy(vp_protocol::types::StallRecoveryMode::Escalate),
+        None,
+    )
+    .await;
+    let now = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    assert_eq!(
+        engine
+            .sweep_task_stalls_at(Duration::from_secs(60), now)
+            .await
+            .unwrap(),
+        1
+    );
+    let recovered = engine
+        .orchestration_recoveries(&session.id)
+        .await
+        .unwrap()
+        .recoveries;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, "escalated");
+    assert_eq!(recovered[0].action, "escalate");
+    assert_eq!(recovered[0].last_stall_count, 1);
+
+    let stall = engine
+        .session_stalls(&session.id)
+        .await
+        .unwrap()
+        .stalls
+        .into_iter()
+        .find(|stall| stall.task_id == "T1")
+        .unwrap();
+    assert!(
+        engine
+            .store()
+            .escalate_stall_recovery(&stall, "duplicate same window")
+            .unwrap()
+            .is_none()
+    );
+
+    let later = now + time::Duration::hours(1);
+    assert_eq!(
+        engine
+            .sweep_task_stalls_at(Duration::from_secs(60), later)
+            .await
+            .unwrap(),
+        1
+    );
+    let recovered = engine
+        .orchestration_recoveries(&session.id)
+        .await
+        .unwrap()
+        .recoveries;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].last_stall_count, 2);
+    let events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "orchestration.recovery_escalated")
+            .count(),
+        2
+    );
+    assert_eq!(
+        engine
+            .coordination_notes(&session.id, 100)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|note| note.action == "escalate")
+            .count(),
+        2
+    );
+    assert_eq!(
+        engine
+            .store()
+            .plan_task_status(&session.id, "T1")
+            .unwrap()
+            .as_deref(),
+        Some("running")
+    );
+    let overview = engine
+        .orchestration_overview(Some(&project.id), 10)
+        .await
+        .unwrap();
+    assert_eq!(overview.totals.recoveries, 1);
+    assert_eq!(overview.sessions[0].recoveries, 1);
+    assert!(
+        overview.sessions[0]
+            .last_recovery
+            .as_deref()
+            .is_some_and(|detail| detail.contains("escalated"))
+    );
+    let snapshot = engine.orchestration_snapshot(&session.id).await.unwrap();
+    assert_eq!(snapshot.recoveries.len(), 1);
+    assert_eq!(
+        snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "T1")
+            .and_then(|task| task.recovery.as_ref())
+            .map(|recovery| recovery.status.as_str()),
+        Some("escalated")
+    );
+}
+
+#[tokio::test]
+async fn stall_recovery_retry_persists_intent_and_requests_cooperative_cancel() {
+    let (_data, _repo, engine, _project, session, task) = stall_recovery_fixture(
+        recovery_policy(vp_protocol::types::StallRecoveryMode::Retry),
+        None,
+    )
+    .await;
+    let now = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    assert_eq!(
+        engine
+            .sweep_task_stalls_at(Duration::from_secs(60), now)
+            .await
+            .unwrap(),
+        1
+    );
+    let recovered = engine
+        .orchestration_recoveries(&session.id)
+        .await
+        .unwrap()
+        .recoveries;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, "waiting_cancel");
+    assert_eq!(recovered[0].action, "retry");
+    assert_eq!(recovered[0].attempts, 1);
+    assert!(recovered[0].next_action_at.is_some());
+    assert_eq!(
+        engine
+            .store()
+            .plan_task_status(&session.id, &task.task_id)
+            .unwrap()
+            .as_deref(),
+        Some("cancelling")
+    );
+    let events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "orchestration.recovery_requested")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "orchestration.recovery_waiting_cancel")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "plan_task.cancelling")
+            .count(),
+        1
+    );
+
+    let stall = engine
+        .session_stalls(&session.id)
+        .await
+        .unwrap()
+        .stalls
+        .into_iter()
+        .find(|stall| stall.task_id == "T1")
+        .unwrap();
+    assert!(
+        engine
+            .store()
+            .begin_stall_retry_recovery(&stall, 1, 300, "duplicate")
+            .unwrap()
+            .is_none()
+    );
+    let recovered = engine
+        .orchestration_recoveries(&session.id)
+        .await
+        .unwrap()
+        .recoveries;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].attempts, 1);
+}
+
+#[tokio::test]
+async fn stall_recovery_exhaustion_fails_instead_of_looping() {
+    let (_data, _repo, engine, _project, session, task) = stall_recovery_fixture(
+        recovery_policy(vp_protocol::types::StallRecoveryMode::Retry),
+        None,
+    )
+    .await;
+    let seed = TaskStall {
+        session_id: session.id.clone(),
+        project_id: session.project_id.clone(),
+        plan_seq: task.plan_seq,
+        task_id: task.task_id.clone(),
+        department: task.department.clone(),
+        title: task.title.clone(),
+        status: "running".to_string(),
+        attempts: task.attempts,
+        age_secs: 600,
+        stall_count: 0,
+        last_progress_at: task.started_at.clone().unwrap_or_default(),
+        last_turn: None,
+        last_tool: None,
+        observed_at: now_rfc3339(),
+    };
+    assert!(
+        engine
+            .store()
+            .begin_stall_retry_recovery(&seed, 1, 300, "seed recovery attempt")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        engine
+            .store()
+            .complete_stall_recovery_retry(&session.id, task.plan_seq, &task.task_id)
+            .unwrap()
+            .is_some()
+    );
+    let now = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    assert_eq!(
+        engine
+            .sweep_task_stalls_at(Duration::from_secs(60), now)
+            .await
+            .unwrap(),
+        1
+    );
+    let recoveries = engine
+        .orchestration_recoveries(&session.id)
+        .await
+        .unwrap()
+        .recoveries;
+    assert_eq!(recoveries.len(), 1);
+    assert_eq!(recoveries[0].status, "failed");
+    assert_eq!(recoveries[0].attempts, 1);
+    let events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "orchestration.recovery_failed")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "plan_task.cancelling")
+            .count(),
+        0
+    );
+    assert!(
+        engine
+            .coordination_notes(&session.id, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|note| note.action == "escalate")
+    );
+}
+
+#[tokio::test]
+async fn stall_recovery_replay_repair_and_bundle_round_trip() {
+    let (_data, _repo, engine, _project, session, _task) = stall_recovery_fixture(
+        recovery_policy(vp_protocol::types::StallRecoveryMode::Escalate),
+        None,
+    )
+    .await;
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    let now = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    assert_eq!(
+        engine
+            .sweep_task_stalls_at(Duration::from_secs(60), now)
+            .await
+            .unwrap(),
+        1
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.recoveries_match, "{replay:?}");
+
+    engine
+        .store()
+        .replace_orchestration_recoveries(&session.id, &[])
+        .unwrap();
+    let drifted = engine.replay_session(&session.id).await.unwrap();
+    assert!(!drifted.recoveries_match, "{drifted:?}");
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(repaired.recoveries_match, "{repaired:?}");
+
+    let mut bundle = engine.export_session(&session.id).await.unwrap();
+    assert_eq!(bundle.recoveries.len(), 1);
+    assert_eq!(bundle.recoveries[0].status, "escalated");
+    // Import rebuilds the projection from the event stream even when an
+    // archive carries an empty recovery list.
+    bundle.recoveries.clear();
+
+    let imported_data = TempDir::new().unwrap();
+    let imported_engine = Engine::new(Store::open(imported_data.path()).unwrap());
+    let imported = imported_engine.import_session(bundle).await.unwrap();
+    assert_eq!(imported.session_id, session.id);
+    let imported_recoveries = imported_engine
+        .orchestration_recoveries(&session.id)
+        .await
+        .unwrap();
+    assert_eq!(imported_recoveries.recoveries.len(), 1);
+    assert_eq!(imported_recoveries.recoveries[0].status, "escalated");
+    let imported_replay = imported_engine.replay_session(&session.id).await.unwrap();
+    assert!(imported_replay.recoveries_match, "{imported_replay:?}");
+}
+
 fn orchestration_test_plan() -> TeamPlan {
     use vp_protocol::types::{PlanDepartment, PlanTask};
     TeamPlan {

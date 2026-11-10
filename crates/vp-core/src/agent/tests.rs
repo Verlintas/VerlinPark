@@ -9284,3 +9284,319 @@ async fn deferred_continuation_claim_has_one_winner_and_recovery_fails_closed() 
     assert!(replay.continuations_match, "{:?}", replay.mismatches);
     assert!(replay.consistent, "{:?}", replay.mismatches);
 }
+
+fn stall_recovery_plan() -> TeamPlan {
+    TeamPlan {
+        goal: "recover a stalled task".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "build".into(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![PlanTask {
+            id: "T1".into(),
+            department: "impl".into(),
+            title: "Stalled task".into(),
+            kind: "coding".into(),
+            priority: 10,
+            profile: None,
+            deps: Vec::new(),
+            write_scope: vec!["src/t1".into()],
+            acceptance: vec!["done".into()],
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+    }
+}
+
+async fn stage_stalled_task(
+    engine: &Engine,
+    session: &Session,
+    mode: vp_protocol::types::StallRecoveryMode,
+) -> (u64, String) {
+    engine
+        .set_team_plan(&session.id, &stall_recovery_plan())
+        .await
+        .unwrap();
+    let policy = vp_protocol::types::OrchestrationPolicy {
+        stall_recovery: mode,
+        stall_min_observations: 1,
+        stall_max_attempts: 1,
+        stall_grace_secs: 300,
+        ..Default::default()
+    };
+    engine
+        .set_orchestration_policy(&session.project_id, &policy)
+        .await
+        .unwrap();
+    let queue = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap();
+    let task = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T1")
+        .unwrap()
+        .clone();
+    let (claimed, _events) = engine
+        .scheduler()
+        .claim(
+            &session.id,
+            task.plan_seq,
+            std::slice::from_ref(&task.task_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let now = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    assert_eq!(
+        engine
+            .sweep_task_stalls_at(Duration::from_secs(60), now)
+            .await
+            .unwrap(),
+        1
+    );
+    (task.plan_seq, task.task_id)
+}
+
+#[tokio::test]
+async fn stall_recovery_waits_for_idle_then_retries_and_resumes_once() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let provider_trait: Arc<dyn Provider> = provider;
+    let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+    let session = engine
+        .create_session(project.id, "recover".into(), None)
+        .await
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    let (plan_seq, task_id) = stage_stalled_task(
+        &engine,
+        &session,
+        vp_protocol::types::StallRecoveryMode::Retry,
+    )
+    .await;
+    engine
+        .store()
+        .finish_plan_task(
+            &session.id,
+            plan_seq,
+            &task_id,
+            "cancelled",
+            Some("cancelled"),
+        )
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "plan_task.finished",
+            json!({"task_id": task_id, "task_status": "cancelled"}),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(service.reconcile_stall_recoveries().await.unwrap(), 0);
+    let events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    assert!(events.iter().all(|event| event.kind != "plan_task.retried"));
+
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    assert_eq!(service.reconcile_stall_recoveries().await.unwrap(), 1);
+    let events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "plan_task.retried")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "orchestration.recovery_retried")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "agent.plan_resume_queued")
+            .count(),
+        1
+    );
+    let stalled = service.reconcile_stall_recoveries().await.unwrap();
+    assert_eq!(stalled, 0);
+
+    let settled = wait_until_idle(&engine, &session).await;
+    assert_eq!(settled.status, "idle");
+    let recoveries = engine
+        .orchestration_recoveries(&session.id)
+        .await
+        .unwrap()
+        .recoveries;
+    assert_eq!(recoveries.len(), 1);
+    assert_eq!(recoveries[0].status, "retried");
+    assert_eq!(recoveries[0].attempts, 1);
+}
+
+#[tokio::test]
+async fn stall_recovery_completed_before_cancel_is_unnecessary() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let provider_trait: Arc<dyn Provider> = provider;
+    let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+    let session = engine
+        .create_session(project.id, "recover".into(), None)
+        .await
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    let (plan_seq, task_id) = stage_stalled_task(
+        &engine,
+        &session,
+        vp_protocol::types::StallRecoveryMode::Retry,
+    )
+    .await;
+    engine
+        .store()
+        .finish_plan_task(&session.id, plan_seq, &task_id, "completed", None)
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "plan_task.finished",
+            json!({"task_id": task_id, "task_status": "completed"}),
+        )
+        .await
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+
+    assert_eq!(service.reconcile_stall_recoveries().await.unwrap(), 1);
+    let recoveries = engine
+        .orchestration_recoveries(&session.id)
+        .await
+        .unwrap()
+        .recoveries;
+    assert_eq!(recoveries[0].status, "unnecessary");
+    let events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    assert!(events.iter().all(|event| event.kind != "plan_task.retried"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != "agent.plan_resume_queued")
+    );
+}
+
+#[tokio::test]
+async fn stall_recovery_budget_exhaustion_does_not_resume() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let provider_trait: Arc<dyn Provider> = provider;
+    let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+    let session = engine
+        .create_session(project.id, "recover".into(), Some(10))
+        .await
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    let (plan_seq, task_id) = stage_stalled_task(
+        &engine,
+        &session,
+        vp_protocol::types::StallRecoveryMode::Retry,
+    )
+    .await;
+    engine
+        .store()
+        .finish_plan_task(
+            &session.id,
+            plan_seq,
+            &task_id,
+            "cancelled",
+            Some("cancelled"),
+        )
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "plan_task.finished",
+            json!({"task_id": task_id, "task_status": "cancelled"}),
+        )
+        .await
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .record_agent_usage(
+            &session.id,
+            "worker-1",
+            "Worker",
+            "worker",
+            Some("T1".into()),
+            Some("impl".into()),
+            "test",
+            20,
+            0,
+            false,
+            0.0,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(service.reconcile_stall_recoveries().await.unwrap(), 1);
+    let recoveries = engine
+        .orchestration_recoveries(&session.id)
+        .await
+        .unwrap()
+        .recoveries;
+    assert_eq!(recoveries[0].status, "failed");
+    assert!(
+        recoveries[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("budget"))
+    );
+    let events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    assert!(events.iter().all(|event| event.kind != "plan_task.retried"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != "agent.plan_resume_queued")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "orchestration.recovery_failed")
+    );
+    assert!(
+        engine
+            .coordination_notes(&session.id, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|note| note.action == "escalate")
+    );
+}

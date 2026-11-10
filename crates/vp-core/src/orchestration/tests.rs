@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use vp_protocol::types::{
-    DependencyFailurePolicy, Event, OrchestrationPolicy, PlanDepartment, PlanTask, ScheduledTask,
-    Session, TeamPlan,
+    DependencyFailurePolicy, Event, OrchestrationPolicy, OrchestrationRecovery, PlanDepartment,
+    PlanTask, ScheduledTask, Session, StallRecoveryMode, TaskStall, TeamPlan,
 };
 
 use super::controller::{ControllerAction, ControllerInput, plan_actions};
 use super::plan::{diff_plan, ensure_revision_safe, status_map};
 use super::policy::{retry_delay, validate_policy};
+use super::recovery::{StallRecoveryDecision, decide_stall_recovery, recoveries_from_events};
 use super::snapshot::{OrchestrationInput, build_snapshot};
 
 fn task(id: &str, deps: &[&str]) -> PlanTask {
@@ -102,6 +103,10 @@ fn policy() -> OrchestrationPolicy {
         dependency_failure: DependencyFailurePolicy::Block,
         escalate_after_retries: true,
         auto_resolve_blockers: true,
+        stall_recovery: vp_protocol::types::StallRecoveryMode::Observe,
+        stall_min_observations: 2,
+        stall_max_attempts: 1,
+        stall_grace_secs: 300,
     }
 }
 
@@ -119,6 +124,160 @@ fn policy_validation_bounds_attempts_and_backoff() {
     policy.retry_backoff_secs = 10;
     policy.retry_priority_boost = 101;
     assert!(validate_policy(&policy).is_err());
+    policy.retry_priority_boost = 10;
+    policy.stall_min_observations = 0;
+    assert!(validate_policy(&policy).is_err());
+    policy.stall_min_observations = 11;
+    assert!(validate_policy(&policy).is_err());
+    policy.stall_min_observations = 2;
+    policy.stall_max_attempts = super::policy::MAX_STALL_ATTEMPTS + 1;
+    assert!(validate_policy(&policy).is_err());
+    policy.stall_max_attempts = 1;
+    policy.stall_grace_secs = super::policy::MAX_STALL_GRACE_SECS + 1;
+    assert!(validate_policy(&policy).is_err());
+    policy.stall_grace_secs = 300;
+    assert!(validate_policy(&policy).is_ok());
+}
+
+fn stall(count: u32, status: &str) -> TaskStall {
+    TaskStall {
+        session_id: "session-1".to_string(),
+        project_id: "project-1".to_string(),
+        plan_seq: 1,
+        task_id: "a".to_string(),
+        department: "engineering".to_string(),
+        title: "Task a".to_string(),
+        status: status.to_string(),
+        attempts: 1,
+        age_secs: 600,
+        stall_count: count,
+        last_progress_at: "2026-01-01T00:00:00Z".to_string(),
+        last_turn: None,
+        last_tool: None,
+        observed_at: "2026-01-01T00:10:00Z".to_string(),
+    }
+}
+
+fn recovery_row(status: &str, attempts: u32, last_stall_count: u32) -> OrchestrationRecovery {
+    OrchestrationRecovery {
+        session_id: "session-1".to_string(),
+        project_id: "project-1".to_string(),
+        plan_seq: 1,
+        task_id: "a".to_string(),
+        department: "engineering".to_string(),
+        action: "retry".to_string(),
+        status: status.to_string(),
+        attempts,
+        last_stall_count,
+        requested_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+        last_error: None,
+        next_action_at: None,
+    }
+}
+
+#[test]
+fn stall_recovery_observe_is_the_default_no_op() {
+    let policy = OrchestrationPolicy::default();
+    assert_eq!(
+        decide_stall_recovery(&policy, None, &stall(5, "running")),
+        StallRecoveryDecision::None
+    );
+}
+
+#[test]
+fn stall_recovery_escalates_once_per_window() {
+    let mut policy = policy();
+    policy.stall_recovery = StallRecoveryMode::Escalate;
+    policy.stall_min_observations = 2;
+    assert_eq!(
+        decide_stall_recovery(&policy, None, &stall(1, "running")),
+        StallRecoveryDecision::None
+    );
+    assert_eq!(
+        decide_stall_recovery(&policy, None, &stall(2, "running")),
+        StallRecoveryDecision::Escalate
+    );
+    let existing = recovery_row("escalated", 0, 2);
+    assert_eq!(
+        decide_stall_recovery(&policy, Some(&existing), &stall(2, "running")),
+        StallRecoveryDecision::None
+    );
+    assert_eq!(
+        decide_stall_recovery(&policy, Some(&existing), &stall(3, "running")),
+        StallRecoveryDecision::Escalate
+    );
+    assert_eq!(
+        decide_stall_recovery(&policy, Some(&existing), &stall(3, "completed")),
+        StallRecoveryDecision::None
+    );
+}
+
+#[test]
+fn stall_recovery_retry_requests_once_and_respects_attempts() {
+    let mut policy = policy();
+    policy.stall_recovery = StallRecoveryMode::Retry;
+    policy.stall_min_observations = 2;
+    policy.stall_max_attempts = 2;
+    assert_eq!(
+        decide_stall_recovery(&policy, None, &stall(2, "running")),
+        StallRecoveryDecision::Retry
+    );
+    let active = recovery_row("waiting_cancel", 1, 2);
+    assert_eq!(
+        decide_stall_recovery(&policy, Some(&active), &stall(2, "running")),
+        StallRecoveryDecision::None
+    );
+    assert_eq!(
+        decide_stall_recovery(&policy, Some(&active), &stall(3, "running")),
+        StallRecoveryDecision::None
+    );
+    let retried = recovery_row("retried", 1, 2);
+    assert_eq!(
+        decide_stall_recovery(&policy, Some(&retried), &stall(3, "running")),
+        StallRecoveryDecision::Retry
+    );
+    let exhausted = recovery_row("retried", 2, 2);
+    assert!(matches!(
+        decide_stall_recovery(&policy, Some(&exhausted), &stall(3, "running")),
+        StallRecoveryDecision::Exhausted { .. }
+    ));
+    let failed = recovery_row("failed", 2, 3);
+    assert_eq!(
+        decide_stall_recovery(&policy, Some(&failed), &stall(4, "running")),
+        StallRecoveryDecision::None
+    );
+    policy.stall_max_attempts = 0;
+    assert!(matches!(
+        decide_stall_recovery(&policy, None, &stall(2, "running")),
+        StallRecoveryDecision::Exhausted { .. }
+    ));
+}
+
+#[test]
+fn stall_recovery_projection_uses_the_latest_event_per_task() {
+    let first = recovery_row("requested", 1, 2);
+    let second = OrchestrationRecovery {
+        status: "waiting_cancel".to_string(),
+        updated_at: "2026-01-01T00:00:05Z".to_string(),
+        ..first.clone()
+    };
+    let events = vec![
+        event(
+            1,
+            "orchestration.recovery_requested",
+            serde_json::to_value(&first).unwrap(),
+        ),
+        event(
+            2,
+            "orchestration.recovery_waiting_cancel",
+            serde_json::to_value(&second).unwrap(),
+        ),
+    ];
+    let recovered = recoveries_from_events(&events);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, "waiting_cancel");
+    assert_eq!(recovered[0].attempts, 1);
 }
 
 #[test]
@@ -453,6 +612,7 @@ fn snapshot_reports_metrics_blockers_notes_and_decisions() {
         notes: &notes,
         decisions: &decisions,
         progress: &[],
+        recoveries: &[],
         stall_threshold_secs: None,
         policy: &policy(),
     });
@@ -503,6 +663,7 @@ fn snapshot_marks_dependents_blocked_by_unmet_dependencies() {
         notes: &[],
         decisions: &[],
         progress: &[],
+        recoveries: &[],
         stall_threshold_secs: None,
         policy: &policy(),
     });

@@ -83,10 +83,10 @@ use vp_protocol::types::{
 use vp_protocol::types::{
     CoordinationNoteParams, CoordinationNoteResult, OrchestrationAdvanceParams,
     OrchestrationAdvanceResult, OrchestrationOverviewParams, OrchestrationPolicyParams,
-    OrchestrationPolicyResult, OrchestrationPreviewParams, OrchestrationSnapshotParams,
-    OrchestrationSnapshotResult, PlanRevisionGetParams, PlanRevisionListParams,
-    PlanRevisionListResult, PlanRevisionRestoreParams, ReviseTeamPlanParams,
-    SetOrchestrationPolicyParams, TaskEditParams,
+    OrchestrationPolicyResult, OrchestrationPreviewParams, OrchestrationRecoveriesParams,
+    OrchestrationSnapshotParams, OrchestrationSnapshotResult, PlanRevisionGetParams,
+    PlanRevisionListParams, PlanRevisionListResult, PlanRevisionRestoreParams,
+    ReviseTeamPlanParams, SetOrchestrationPolicyParams, TaskEditParams,
 };
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
@@ -167,6 +167,7 @@ async fn main() -> Result<()> {
     spawn_terminal_sweeper(state.engine.clone());
     spawn_browser_sweeper(state.engine.clone());
     spawn_task_stall_sweeper(state.engine.clone());
+    spawn_stall_recovery_reconciler(state.agent.clone());
     spawn_orchestration_controller(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
@@ -684,6 +685,19 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     Ok(snapshot) => {
                         RpcResponse::success(id, OrchestrationSnapshotResult { snapshot })
                     }
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "orchestration.recoveries" => {
+            match parse_params::<OrchestrationRecoveriesParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .orchestration_recoveries(&params.session_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
                     Err(error) => internal_error(id, error),
                 },
                 Err(response) => response_with_id(id, response),
@@ -2771,8 +2785,10 @@ fn spawn_browser_sweeper(engine: Engine) {
     });
 }
 
-/// Observability-only stall sweep. It emits `orchestration.stall` events and
-/// refreshes the observation window; it never cancels or retries a task.
+/// Stall observation sweep. It always emits `orchestration.stall` events and
+/// refreshes the observation window. When a project opts into `escalate` or
+/// `retry`, the same call may record one bounded recovery transition; the
+/// default `observe` mode remains telemetry-only.
 fn spawn_task_stall_sweeper(engine: Engine) {
     let threshold_secs = std::env::var("VERLINPARK_TASK_STALL_SECS")
         .ok()
@@ -2797,6 +2813,35 @@ fn spawn_task_stall_sweeper(engine: Engine) {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%error, "task stall sweep failed");
+                }
+            }
+        }
+    });
+}
+
+/// Advance pending stall-recovery requests separately from the task scheduler.
+/// A request waits for cooperative cancellation and session quiescence, then
+/// reuses the normal retry + plan-resume path at most once per attempt.
+fn spawn_stall_recovery_reconciler(agent: AgentService) {
+    let seconds = std::env::var("VERLINPARK_STALL_RECOVERY_TICK_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds.max(5)));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match agent.reconcile_stall_recoveries().await {
+                Ok(advanced) if advanced > 0 => {
+                    tracing::info!(advanced, "stall recovery reconciler advanced");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "stall recovery reconciler failed");
                 }
             }
         }

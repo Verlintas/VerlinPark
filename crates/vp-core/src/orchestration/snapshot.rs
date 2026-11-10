@@ -4,8 +4,8 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AgentRecord, Event, MergeQueueEntry, OrchestrationBlocker, OrchestrationDecision,
     OrchestrationDepartment, OrchestrationMetrics, OrchestrationNote, OrchestrationPolicy,
-    OrchestrationSnapshot, OrchestrationTask, PlanTaskProgress, Question, ScheduledTask, Session,
-    TeamPlan,
+    OrchestrationRecovery, OrchestrationSnapshot, OrchestrationTask, PlanTaskProgress, Question,
+    ScheduledTask, Session, TeamPlan,
 };
 
 use super::plan::{
@@ -23,6 +23,7 @@ pub struct OrchestrationInput<'a> {
     pub notes: &'a [OrchestrationNote],
     pub decisions: &'a [OrchestrationDecision],
     pub progress: &'a [PlanTaskProgress],
+    pub recoveries: &'a [OrchestrationRecovery],
     /// `None` means stall observability is disabled.
     pub stall_threshold_secs: Option<u64>,
     pub policy: &'a OrchestrationPolicy,
@@ -45,6 +46,11 @@ pub fn build_snapshot(input: OrchestrationInput<'_>) -> OrchestrationSnapshot {
         .iter()
         .map(|progress| (progress.task_id.as_str(), progress))
         .collect::<HashMap<_, _>>();
+    let recovery_by_task = input
+        .recoveries
+        .iter()
+        .map(|recovery| (recovery.task_id.as_str(), recovery))
+        .collect::<HashMap<_, _>>();
     let now = time::OffsetDateTime::now_utc();
     let agent_by_task = owner_agents(input.agents);
     let verifier_status = verifier_status_by_task(input.agents, input.events);
@@ -65,6 +71,7 @@ pub fn build_snapshot(input: OrchestrationInput<'_>) -> OrchestrationSnapshot {
                         .unwrap_or_else(|| "pending".to_string());
                     let scheduled = scheduled_by_task.get(task.id.as_str()).copied();
                     let progress = progress_by_task.get(task.id.as_str()).copied();
+                    let recovery = recovery_by_task.get(task.id.as_str()).copied();
                     let owner = agent_by_task.get(task.id.as_str());
                     let blocked = blocked_by(task, &statuses);
                     let observed_at = progress
@@ -118,6 +125,7 @@ pub fn build_snapshot(input: OrchestrationInput<'_>) -> OrchestrationSnapshot {
                         last_turn: progress.and_then(|progress| progress.last_turn),
                         last_tool: progress.and_then(|progress| progress.last_tool.clone()),
                         stalled,
+                        recovery: recovery.cloned(),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -322,6 +330,7 @@ pub fn build_snapshot(input: OrchestrationInput<'_>) -> OrchestrationSnapshot {
         merge_conflicts,
         attention_count: attention,
         stalled_tasks: tasks.iter().filter(|task| task.stalled).count(),
+        recoveries: input.recoveries.len(),
     };
 
     OrchestrationSnapshot {
@@ -339,6 +348,7 @@ pub fn build_snapshot(input: OrchestrationInput<'_>) -> OrchestrationSnapshot {
         decisions: input.decisions.to_vec(),
         revisions,
         blockers,
+        recoveries: input.recoveries.to_vec(),
         metrics,
         generated_at: now_rfc3339(),
     }

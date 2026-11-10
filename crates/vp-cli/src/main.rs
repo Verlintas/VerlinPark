@@ -366,6 +366,18 @@ enum Command {
         escalate_after_retries: Option<bool>,
         #[arg(long)]
         auto_resolve_blockers: Option<bool>,
+        /// Stall recovery mode: observe, escalate, or retry.
+        #[arg(long)]
+        stall_recovery: Option<String>,
+        /// Consecutive stall observations before recovery (1–10).
+        #[arg(long)]
+        stall_min_observations: Option<u32>,
+        /// Maximum automatic recovery retries per task (0–5).
+        #[arg(long)]
+        stall_max_attempts: Option<u32>,
+        /// Seconds to wait for cancellation and an idle session (0–86400).
+        #[arg(long)]
+        stall_grace_secs: Option<u64>,
     },
     /// Show the live orchestration snapshot for a session.
     Orchestration { session: String },
@@ -720,6 +732,8 @@ enum Command {
     ContinuationCancel { id: String },
     /// Show plan-task progress and stall observations for a session.
     TaskStalls { session: String },
+    /// Show automatic stall recovery state for a session.
+    Recoveries { session: String },
     /// Create a session for a project.
     SessionNew {
         project: String,
@@ -1665,6 +1679,10 @@ async fn main() -> Result<()> {
             dependency_failure,
             escalate_after_retries,
             auto_resolve_blockers,
+            stall_recovery,
+            stall_min_observations,
+            stall_max_attempts,
+            stall_grace_secs,
         } => {
             let current = rpc(
                 &discovery,
@@ -1693,6 +1711,18 @@ async fn main() -> Result<()> {
             }
             if let Some(value) = auto_resolve_blockers {
                 policy["auto_resolve_blockers"] = json!(value);
+            }
+            if let Some(value) = stall_recovery {
+                policy["stall_recovery"] = json!(value);
+            }
+            if let Some(value) = stall_min_observations {
+                policy["stall_min_observations"] = json!(value);
+            }
+            if let Some(value) = stall_max_attempts {
+                policy["stall_max_attempts"] = json!(value);
+            }
+            if let Some(value) = stall_grace_secs {
+                policy["stall_grace_secs"] = json!(value);
             }
             rpc(
                 &discovery,
@@ -2284,6 +2314,14 @@ async fn main() -> Result<()> {
         }
         Command::TaskStalls { session } => {
             rpc(&discovery, "session.stalls", json!({"session_id": session})).await?
+        }
+        Command::Recoveries { session } => {
+            rpc(
+                &discovery,
+                "orchestration.recoveries",
+                json!({"session_id": session}),
+            )
+            .await?
         }
         Command::SessionNew {
             project,
@@ -3283,6 +3321,39 @@ fn print_human(value: &Value) {
                 steering["created_at"].as_str().unwrap_or("?")
             );
             println!("  {}", steering["body"].as_str().unwrap_or(""));
+        }
+        return;
+    }
+    if value.get("session_id").is_some()
+        && let Some(recoveries) = value.get("recoveries").and_then(Value::as_array)
+    {
+        println!(
+            "session {}  recoveries={}",
+            value["session_id"].as_str().unwrap_or("?"),
+            recoveries.len()
+        );
+        if recoveries.is_empty() {
+            println!("No stall recovery records.");
+            return;
+        }
+        for recovery in recoveries {
+            println!(
+                "{}  {:<14}  action={}  attempts={}  last_stall={}",
+                recovery["task_id"].as_str().unwrap_or("?"),
+                recovery["status"].as_str().unwrap_or("?"),
+                recovery["action"].as_str().unwrap_or("?"),
+                recovery["attempts"].as_u64().unwrap_or(0),
+                recovery["last_stall_count"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  requested={}  updated={}  next={}",
+                recovery["requested_at"].as_str().unwrap_or("-"),
+                recovery["updated_at"].as_str().unwrap_or("-"),
+                recovery["next_action_at"].as_str().unwrap_or("-")
+            );
+            if let Some(error) = recovery["last_error"].as_str() {
+                println!("  {error}");
+            }
         }
         return;
     }

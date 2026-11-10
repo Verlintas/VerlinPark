@@ -8,6 +8,9 @@ use vp_protocol::types::OrchestrationPolicy;
 pub const MAX_ATTEMPTS_LIMIT: u32 = 10;
 pub const MAX_RETRY_BACKOFF_SECS: u64 = 86_400;
 pub const MAX_RETRY_PRIORITY_BOOST: i32 = 100;
+pub const MAX_STALL_OBSERVATIONS: u32 = 10;
+pub const MAX_STALL_ATTEMPTS: u32 = 5;
+pub const MAX_STALL_GRACE_SECS: u64 = 86_400;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestrationPolicyError {
@@ -19,6 +22,12 @@ pub enum OrchestrationPolicyError {
     PriorityBoost,
     #[error("auto_retry_failed requires a non-zero max_attempts")]
     AutoRetryAttempts,
+    #[error("stall_min_observations must be between 1 and {MAX_STALL_OBSERVATIONS}")]
+    StallMinObservations,
+    #[error("stall_max_attempts must be between 0 and {MAX_STALL_ATTEMPTS}")]
+    StallMaxAttempts,
+    #[error("stall_grace_secs must be between 0 and {MAX_STALL_GRACE_SECS}")]
+    StallGrace,
 }
 
 pub fn validate_policy(policy: &OrchestrationPolicy) -> Result<()> {
@@ -33,6 +42,15 @@ pub fn validate_policy(policy: &OrchestrationPolicy) -> Result<()> {
     }
     if policy.auto_retry_failed && policy.max_attempts == 0 {
         return Err(anyhow!(OrchestrationPolicyError::AutoRetryAttempts));
+    }
+    if !(1..=MAX_STALL_OBSERVATIONS).contains(&policy.stall_min_observations) {
+        return Err(anyhow!(OrchestrationPolicyError::StallMinObservations));
+    }
+    if policy.stall_max_attempts > MAX_STALL_ATTEMPTS {
+        return Err(anyhow!(OrchestrationPolicyError::StallMaxAttempts));
+    }
+    if policy.stall_grace_secs > MAX_STALL_GRACE_SECS {
+        return Err(anyhow!(OrchestrationPolicyError::StallGrace));
     }
     Ok(())
 }

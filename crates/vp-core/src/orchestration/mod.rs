@@ -7,6 +7,7 @@
 pub mod controller;
 pub mod plan;
 pub mod policy;
+pub mod recovery;
 pub mod snapshot;
 
 pub use controller::{
@@ -17,6 +18,7 @@ pub use plan::{
     ready_tasks, revisions_from_events, status_map,
 };
 pub use policy::{OrchestrationPolicyError, retry_delay, should_auto_retry, validate_policy};
+pub use recovery::{StallRecoveryDecision, decide_stall_recovery, recoveries_from_events};
 pub use snapshot::{OrchestrationInput, build_snapshot, coordination_notes, decisions_from_events};
 
 #[cfg(test)]

@@ -1851,6 +1851,10 @@ fn orchestration_policy_round_trips_in_the_manifest() {
         dependency_failure: vp_protocol::types::DependencyFailurePolicy::Cancel,
         escalate_after_retries: false,
         auto_resolve_blockers: false,
+        stall_recovery: vp_protocol::types::StallRecoveryMode::Escalate,
+        stall_min_observations: 3,
+        stall_max_attempts: 2,
+        stall_grace_secs: 60,
     };
     store
         .set_orchestration_policy(&project.id, &policy)
