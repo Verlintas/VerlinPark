@@ -168,6 +168,11 @@
 | [0156](adr/0156-remote-workspaces.md) | Explicit SSH/stdio remote workspaces with path jail, atomic writes, bounded exec, and remote worktrees | Accepted | Runtime/Protocol/Security |
 | [0157](adr/0157-project-programs-and-milestones.md) | Project-scoped programs, deterministic milestone controller, dependency/budget/retry policy, Manage Dash ledger | Accepted | Runtime/Store/macOS |
 | [0158](adr/0158-native-macos-computer-control.md) | Accessibility/CGEvent/ScreenCaptureKit helper and risk-classified `computer` tool under ComputerLease | Accepted | Runtime/macOS |
+| [0159](adr/0159-tool-output-paging-and-store.md) | Spilled tool outputs with provider-facing markers, `read_tool_output` paging, bounds, and GC | Accepted | Runtime/Store/Protocol |
+| [0160](adr/0160-compaction-budget-and-prepared-summaries.md) | Keep-token compaction, structured plan state, prepared summaries, and fallback metrics | Accepted | Runtime/Observability |
+| [0161](adr/0161-cross-process-lease-fencing.md) | Fenced runtime leases, continuation claim/ack, and integration effect-boundary ownership | Accepted | Runtime/Store |
+| [0162](adr/0162-optional-hybrid-memory.md) | Explicit per-project embedding policy, derived hybrid recall, lexical fallback, and health | Accepted | Runtime/Store/Protocol |
+| [0163](adr/0163-cost-per-solved-task-benchmark.md) | Deterministic solved-task benchmark harness, metrics, reports, and comparison rules | Accepted | Tooling/Benchmark |
 
 ---
 

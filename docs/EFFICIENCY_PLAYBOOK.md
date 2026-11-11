@@ -109,7 +109,7 @@ Steps:
 - [ ] Add a namespace-scoped `ContextCacheStatus` RPC:
       `session.cache` → input, cache read/write, hit ratio, last call, prompt
       prefix hash, estimated preamble tokens.
-- [ ] Emit `context.cache` after provider usage settlement (operational:
+- [x] Emit `context.cache` after provider usage settlement (operational:
       cache read/write, hit ratio, prefix hash; no prompt text).
 - [ ] Add Prometheus metrics:
       `verlinpark_cache_read_tokens_total`,
@@ -144,7 +144,7 @@ Steps:
       - no delegation, no merge-queue entry, no worktree
 - [ ] Add a `scout` tool for Leader/Manager:
       `{ objective, files?, max_steps? }` → bounded findings + evidence refs.
-- [ ] Enforce:
+- [x] Enforce:
       - per-session Scout concurrency cap (default 3)
       - token/step cap
       - cancellation on session cancel
@@ -180,7 +180,7 @@ Steps:
       `(session_id, operation_id)` PK, `method`, `fingerprint`, `status`
       (`pending/completed/failed/unknown`), `result_json`, `error`,
       `created_at`, `updated_at`.
-- [ ] Engine helper:
+- [x] Engine helper:
       - same ID + same fingerprint + completed → replay stored result
       - same ID + same fingerprint + pending → return “in progress”
       - same ID + different fingerprint → conflict
@@ -225,12 +225,12 @@ Steps:
 
 Steps:
 
-- [ ] Define per-tool caps (lines/bytes) for shell/read/grep; keep the full
+- [x] Define per-tool caps (lines/bytes) for shell/read/grep; keep the full
       result in a content-addressed tool-output store (or artifact-like file).
-- [ ] Tool result includes `output_ref`, `truncated`, `total_bytes`.
-- [ ] Add `read_tool_output` with offset/limit and a hard cap.
-- [ ] Emit `tool.output_truncated` with sizes, no content.
-- [ ] Tests: cap boundaries, paging, ref retention/GC, no path escape.
+- [x] Tool result includes `output_ref`, `truncated`, `total_bytes`.
+- [x] Add `read_tool_output` with offset/limit and a hard cap.
+- [x] Emit `tool.output_truncated`/`tool.output_spilled` with sizes, no content.
+- [x] Tests: cap boundaries, paging, ref retention/GC, no path escape.
 
 **Non-goals:** replacing shell output with an LLM summary; compressing away
 diagnostics silently.
@@ -243,12 +243,14 @@ diagnostics silently.
 
 Steps:
 
-- [ ] Add `keep_tokens` (default 15k) alongside keep-messages.
-- [ ] Add optional background summary generation before the threshold; hold the
-      summary in memory, swap at threshold; discard on model/instruction change.
-- [ ] Preserve current task/plan/acceptance as structured state in the summary.
-- [ ] Metrics: compactions, compaction latency, tokens before/after.
-- [ ] Tests: threshold math, background summary reuse, model switch invalidation,
+- [x] Add `keep_tokens` (default 15k) alongside keep-messages.
+- [x] Add optional prepared summary generation before the threshold; hold the
+      summary in memory, swap at threshold; discard on model/instruction/plan
+      change.
+- [x] Preserve current task/plan/acceptance as structured state in the summary.
+- [x] Metrics: compactions, compaction latency, tokens before/after, reuse,
+      fallback.
+- [x] Tests: threshold math, prepared summary reuse, model switch invalidation,
       fallback to synchronous compaction.
 
 **Non-goals:** infinite context, lossless compaction, relying on summaries for
@@ -263,10 +265,12 @@ multi-daemon/remote setups.
 
 Steps:
 
-- [ ] Durable lease per continuation series; fencing token.
-- [ ] Claim/ack protocol with expiry and recovery.
-- [ ] Reconcile orphaned series after daemon restart.
-- [ ] Tests: two daemons cannot deliver the same child; stale owner rejected.
+- [x] Durable lease per continuation series; fencing token.
+- [x] Claim/ack protocol with expiry and recovery.
+- [x] Reconcile orphaned series after daemon restart.
+- [x] Tests: two daemons cannot deliver the same child; stale owner rejected.
+      Scope: processes sharing one SQLite data directory, not cross-host
+      consensus.
 
 **Non-goals:** distributed scheduler for all sessions; cross-host clock trust.
 
@@ -278,12 +282,13 @@ Steps:
 
 Steps:
 
-- [ ] Fixture tasks with deterministic acceptance (tests/patches).
-- [ ] Run N repetitions per configuration; record wall-clock, tokens, cost,
+- [x] Fixture tasks with deterministic acceptance (tests/patches).
+- [x] Run N repetitions per configuration; record wall-clock, tokens, cost,
       verifier pass, merge success, human interventions.
-- [ ] A/B cache stability, scout vs root, 1 vs N worktrees, orchestrator vs
+- [x] A/B cache stability, scout vs root, 1 vs N worktrees, orchestrator vs
       subagents.
-- [ ] Publish a local report; do not claim universal rankings from one run.
+- [x] Publish a local JSON/Markdown/CSV report; do not claim universal rankings
+      from one run.
 
 **Non-goals:** public leaderboard, model quality claims.
 
@@ -351,13 +356,19 @@ Efficiency acceptance for the round:
   `session_operations` receipts, replay/in-progress/conflict/unknown.
 - [x] E4 efficiency dashboard — Manage Dash Efficiency card, Stage cache-hit
   pill, Collab Scout node.
-- [ ] E5 tool output paging.
-- [ ] E6 background compaction / keep-token budget.
-- [ ] E7 cross-process continuation/lease.
-- [ ] E8 cost-per-solved-task benchmark harness.
+- [x] E5 tool output paging — `tool_outputs` store, per-turn shaping,
+  `read_tool_output`, status/list/prune/audit, GC.
+- [x] E6 background compaction / keep-token budget — `compact_keep_tokens`,
+  structured plan state, prepared summaries, metrics/fallback.
+- [x] E7 cross-process continuation/lease — fenced runtime leases,
+  continuation claim/ack, integration effect boundary. Same-host SQLite scope.
+- [x] E8 cost-per-solved-task benchmark harness — `vp-bench` scenarios,
+  deterministic acceptance, JSON/Markdown/CSV, compare rules.
 
-Implementation commits: `32b449b` (E3), `97fdeb2` (E1), `3fc2bed` (E4),
-`71544fb` (E2). Test baseline after E1–E4: **618 Rust / 163 Swift**.
+Round 1 commits: `32b449b` (E3), `97fdeb2` (E1), `3fc2bed` (E4),
+`71544fb` (E2). Round 2 commits: `b0adba1` (C4), `26256ed` (C2),
+`93a991a` (C3), `bef841a` (C1). Test baseline after round 2: **1,330 Rust /
+311 Swift**. Limits are recorded in ADR-0159–0163 and `PROGRESS.md`.
 
 Update the checkboxes as work lands, and keep this file as the durable index for
 the next round.

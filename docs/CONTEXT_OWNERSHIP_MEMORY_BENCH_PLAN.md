@@ -1,12 +1,20 @@
 # Context, Ownership, Memory, and Bench Plan — long-task round 2
 
-> **Status:** active implementation plan.
+> **Status:** implemented (2026-11-11); this file remains the design record.
 > **Created:** 2026-11-11
 > **Goal:** make long-running sessions cheaper and safer under context pressure,
 > make ownership durable across processes, add an explicit optional semantic
 > memory lane, and measure cost per solved task instead of only tokens.
 > **Budget:** one large round, target +30,000 net lines of production code and
 > tests. No filler; every module must operate, fail closed, and be auditable.
+>
+> **Result:** C1–C4 landed as four commits on `main` (`b0adba1`, `26256ed`,
+> `93a991a`, `bef841a`) plus this plan commit (`beaefae`). `git diff --stat
+> a5f57c8..HEAD` shows **38,436 insertions / 2,153 deletions** before the
+> documentation close-out. Rust is **1,330 passing tests with 6 ignored**;
+> Swift is **195 app tests plus 116 computer-helper tests**. `just lint`,
+> `xcodebuild test`, and `just bundle` pass. The implementation and remaining
+> limits are recorded in ADR-0159–0163 and `PROGRESS.md`.
 
 ---
 
@@ -254,6 +262,20 @@ New `crates/vp-bench`; workspace `Cargo.toml`; CLI optional; fixtures/tests;
 ADR-0163.
 
 ---
+
+## 4.1 Implementation record (2026-11-11)
+
+| Workstream | Landed code | Operator surface | Limits that remain |
+|---|---|---|---|
+| C1 context | `vp-core/src/tool_output.rs`, `tool-outputs/<sha256>.txt` blobs + `tool_outputs` metadata, per-turn shaping, `read_tool_output`, keep-token compaction, structured plan state, prepared summaries | `tool_output.policy.get/set`, `tool_output.status/list/prune/audit`, CLI `vp tool-output-*`; `read_tool_output`; `session.context` compaction metrics | Output bodies are operational, not replay/bundle state; no encryption or compression; prepared summaries are per-run memory only; compaction stays lossy |
+| C2 ownership | Daemon instance identity, fenced `runtime_leases` + `runtime_lease_fences`, continuation claim/ack fields, integration effect-boundary assertion | `runtime.leases`, `runtime.leases.history`, `session.continuation.status/reclaim`, `vp leases` / `lease-history` / `continuation-*` | Same-host SQLite coordination only; TTL is the liveness bound; external effects are not exactly-once; write leases are not process-scoped yet |
+| C3 memory | `memory_embedding.rs`, `memory_embeddings` / `memory_embedding_jobs` / `memory_embedding_usage`, hybrid recall + RRF, fake-server tests | `memory.embeddings.status/rebuild/test`, policy fields, CLI flags, Manage Dash health | SQLite vector scan, no ANN/distributed index; bodies go to the configured endpoint; embedding cost is separate from session budgets; provider token counts may be estimated |
+| C4 bench | New `vp-bench` crate, deterministic fixtures/scenarios, scripted provider, metrics/reports/compare | `vp bench list/run/report/compare`, standalone `vp-bench` | Fake usage is simulated from request size; paging metrics depend on C1 (now present); single-host/sequential; no universal ranking |
+
+C1–C4 preserve the existing approval, Seatbelt, path-jail, write-scope,
+Verifier, merge, capacity, and budget gates. Derived tool outputs, embeddings,
+and benchmark reports are explicitly operational state, not session replay
+projections.
 
 ## 5. Parallelization and integration order
 

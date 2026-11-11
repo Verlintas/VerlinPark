@@ -1,10 +1,120 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-11 Long-task round 2: context economy, fencing, hybrid memory, benchmark
+
+这一轮处理长任务的上下文成本、跨进程所有权、可选语义记忆和可度量基准。四条线
+全部保持 deterministic Rust、事件先行、不绕过 approval / Seatbelt / path jail /
+write scope / Verifier / merge / capacity / budget gate。计划与验收见
+[CONTEXT_OWNERSHIP_MEMORY_BENCH_PLAN.md](CONTEXT_OWNERSHIP_MEMORY_BENCH_PLAN.md)，
+决策见 ADR-0159–0163。
+
+### C1 tool-output paging + compaction budget
+
+- 新 `ToolOutputPolicy`（enabled、spill_threshold_bytes 16 KiB、preview_bytes
+  4 KiB、max_total_bytes_per_turn 64 KiB、retention 7 天、max_entries 2000、
+  可选 per-tool 阈值）；RPC `tool_output.policy.get/set`，CLI
+  `vp tool-output-policy*`。
+- 完整 tool output 写入 daemon data dir 的 `tool-outputs/<sha256>.txt`（原子
+  写、0600、拒绝 symlink/non-regular），SQLite 只存 metadata；同内容共享 blob。
+- 单个结果超过阈值或单 turn 聚合超预算时，确定性 spill：先强制 per-tool，再按
+  largest-first/原始顺序；provider-facing 文本带
+  `[output truncated: ... use read_tool_output handle=...]`，UTF-8 安全。
+- 新只读工具 `read_tool_output`：`offset`/`limit`/`max_bytes`/`from_end`/
+  字面量 `pattern`；handle 只对当前 session 有效；返回值带行号和 continuation
+  hint。Leader/Manager/Verifier/Scout/Worker/Labour 可用。
+- 事件 `tool.output_spilled` / `tool.output_truncated`；RPC
+  `tool_output.status/list/prune/audit`，CLI `vp tool-outputs` /
+  `tool-output-status` / `tool-output-prune` / `tool-output-audit`；prune
+  保护未过期 active session 行，audit 检查缺失/大小/hash/孤儿 blob。
+- compaction：新增 `compact_keep_tokens`（默认 15k）与
+  `compact_prepare_ratio`（默认 0.6）；tail 同时满足 keep messages/tokens，
+  只从 user/assistant 边界切。summary 带 deterministic
+  `ContextStructuredState`（goal、plan revision、active task/acceptance/write
+  scope、recent completed tasks），rolling trim fallback 仍保留。
+- prepared summary 在阈值前生成，按 provider/model/prefix hash/plan
+  revision/cut cursor 校验复用；失效则 `fallback_to_sync`。swap 仍在阈值处
+  同步执行，不创建第二个 run，不绕过 budget；prepared summary 只存在于当前
+  run 内存，不跨 restart/fork。
+- `session.context` 与 `context.compaction` 增加 compaction count/latency/
+  tokens before/after/background reuse/fallback；manage dash 与 Stage
+  context 显示。tool output 是 operational state，不进 replay/bundle。
+
+### C2 cross-process lease fencing / continuation ownership
+
+- daemon 持久化 instance identity（`store_meta`），lease owner 由
+  instance/pid/nonce 组成；`runtime_leases` 增加 owner_instance、lease_token、
+  fencing_token、renewed_at、released_at；`runtime_lease_fences` 保存跨
+  release/expiry 的 monotonic generation。
+- acquire/renew/release/assert 使用 `BEGIN IMMEDIATE` 与条件更新；stale owner
+  得到 typed `RuntimeLeaseError::{Busy,Lost,Internal}`，token 不进入 RPC/CLI/
+  events/log。
+- `RuntimeLeaseGuard` 携带 token/generation，heartbeat 失败会标记 lost；
+  Integrator 在 `git merge` 前、后和 finalize 前 assert fence；stale 在触碰
+  分支前中止，post-merge 丢失回滚到 pre-merge HEAD。
+- `session_continuations` 增加 lease_owner/lease_token/lease_expires_at/
+  delivery_attempt；claim 原子化，delivered/retry/failed ack 必须 owner+token+
+  unexpired；过期 claim 可 reclaim，stale owner 不能写终态。reconciler 用
+  `continuation-delivery:<id>` receipt 防止重复启动。
+- RPC `runtime.leases.history`、`session.continuation.status/reclaim`；CLI
+  `vp lease-history` / `continuation-status` / `continuation-reclaim`。限制：
+  同一 SQLite data dir 的进程协调，不是跨主机共识；外部副作用不是 exactly-once。
+
+### C3 optional hybrid memory
+
+- `MemoryPolicy.embedding`（显式 opt-in）：endpoint/model/dimensions(1536)/
+  batch_size/timeout/candidates/min_similarity/api_key_env；endpoint 校验
+  scheme/host/no-userinfo/no-query/fragment，key 只存环境变量名。
+- 派生表 `memory_embeddings` / `memory_embedding_jobs` /
+  `memory_embedding_usage`；memory 写入/导入只入队，不因 embedding 失败而失败；
+  reconciler 有 batch、5 次 attempt、指数 backoff、4xx 非重试、partial batch。
+- 向量 `VPEM` 小端 f32 编码，校验维度/有限值/zero-norm；不通过任何 RPC/tool/UI
+  返回原始向量。内容 hash 变化、model/dimension 变化会重建覆盖。
+- `recall` 在有配置且健康时做 lexical FTS + cosine candidates，deterministic
+  RRF 后叠加既有 task/scope/recency/status/pinned 权重；失败/禁用回退 lexical
+  并报告 `semantic_unavailable`。`MemoryMatch` 增加 lexical_score/
+  semantic_score/source 可选字段。
+- RPC `memory.embeddings.status/rebuild/test`；CLI `memory-embeddings*`；
+  Manage Dash memory health 显示 model/coverage/last error，可 probe/rebuild。
+- 限制：SQLite 全量 vector scan，无 ANN/分布式索引；memory body/tags 会发送到
+  显式配置的 endpoint；embedding 用量单独记账，不自动计入 session/task budget。
+
+### C4 cost-per-solved-task benchmark
+
+- 新 crate `vp-bench` + `vp-bench` binary + `vp bench` CLI：
+  `list` / `run` / `report` / `compare`。
+- 9 个 deterministic scenarios：baseline、plan/Worker、Scout、paging off/on、
+  compaction off/on、worktree parallelism 1/4；有 deterministic acceptance，
+  失败/Verifier 拒绝/merge 失败都算 unsolved，不伪造 solved。
+- 指标：solved、acceptance、Verifier pass、merge、wall clock、input/output/
+  cache tokens、USD cost、tool output bytes/spills、compactions、retries、
+  human interventions；派生 cost_per_solved_task / tokens_per_solved_task。
+- 报告 JSON/Markdown/CSV，包含 commit/host/provider/pricing/caveat；8 MiB 上限、
+  原子写；`compare` 拒绝 fixture/acceptance/model/pricing/schema 不匹配，除非
+  `--allow-mismatch`。真实 provider 需要三重显式开关，默认 fake provider。
+- 限制：fake usage 是 request-size 模拟，不评价模型质量；单机顺序重复；不是
+  universal ranking；不绕过任何 Verifier/merge/approval/sandbox gate。
+
+### 验证与集成
+
+- 合并顺序：C4 `b0adba1` → C2 `26256ed` → C3 `93a991a` → C1 `bef841a`；
+  计划 `beaefae`。
+- `git diff --stat a5f57c8..HEAD`：**38,436 insertions / 2,153 deletions**。
+- Rust：**1,330 passed，6 ignored**；Swift：**195 app + 116 computer-helper**。
+- `just lint`、`xcodebuild test`、`just bundle` 通过；bundle 包含 verlinpadd、
+  browser helper、computer helper、remote agent。
+- C1 的 paging 指标在 C4 的 bench 报告中现在可记录；C4 的 paging-on scenario
+  不再标记 unavailable。
+- 仍然不要声称：跨主机 consensus、provider-call exactly-once、完整无损
+  compaction、ANN/分布式向量索引、embedding 自动计入 session 预算、单次 benchmark
+  的普适排名。
 
 ---
 
@@ -538,10 +648,11 @@ continuation 必须由 operator 显式创建。
 - stall retry 默认关闭；自动 cancel 是协作式的，无法中断不回到 turn/tool
   boundary 的 provider stream。
 - recovery 不保证 same-agent identity、conversation 或 worktree state。
-- continuation 不是 recurring workflow，不是 cross-process lease；daemon
-  重启窗口采用 fail-closed，可能要求操作者重新 defer。
+- 本轮 continuation 不是 recurring workflow，也不是 cross-process lease；后续
+  round 2 已加入 recurring series、same-host lease fencing 与 Manage Dash
+  管理面，跨主机仍不支持。
 - continuation 启动失败会消耗 attempt budget；provider 未配置时最终 failed。
-- 没有 SwiftUI/Manage Dash continuation 管理面；本轮以 RPC/CLI 为主。
+- 本轮没有 SwiftUI/Manage Dash continuation 管理面；后续 round 2 已补齐。
 
 ### 测试
 

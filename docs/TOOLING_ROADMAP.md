@@ -1,6 +1,6 @@
 # VerlinPark Agent Tooling Roadmap
 
-> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, sandboxed WKWebView browser + ComputerLease, runtime introspection, native macOS computer control, and explicit SSH/stdio remote workspaces implemented on 2026-11-11; see ADR-0134/0136/0137/0155–0158.<br>
+> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, sandboxed WKWebView browser + ComputerLease, runtime introspection, native macOS computer control, explicit SSH/stdio remote workspaces, tool-output paging, compaction budgets, fenced leases, hybrid memory, and a cost-per-solved-task harness implemented on 2026-11-11; see ADR-0134/0136/0137/0155–0163.<br>
 > **Date:** 2026-11-11<br>
 > **Code baseline:** 2026-11-11 tooling + long-task runtime wave; see ADR-0134/0136/0137/0155–0158.<br>
 > **Implementation budget:** ~10,000–30,000 code lines, target core ~24k, hard planning cap 30k<br>
@@ -48,7 +48,11 @@ Implemented in this wave (see ADR-0134/0136/0137 and PROGRESS):
   `publish_artifact_file` with role-aware dispatch;
 - `read_document` for DOCX/PPTX/XLSX and ODT/ODS/ODP with ZIP/XML hardening,
   OCR confidence, and PDF metadata/page counts;
-- role/permission matrix, tests, UI tool labels.
+- role/permission matrix, tests, UI tool labels;
+- `read_tool_output` with bounded line/byte paging over daemon-owned spilled
+  tool outputs, plus `tool_output.*` policy/status/prune/audit;
+- optional explicit project-memory embeddings and hybrid `recall`;
+- fenced runtime leases and continuation ownership (not a new agent tool).
 
 Implemented browser: a daemon-launched WKWebView helper under its own Seatbelt
 profile, with localhost/worktree navigation, DOM snapshots, input, console,
@@ -1074,6 +1078,7 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 [x] U-01 browser (WKWebView helper + ComputerLease; see ADR-0137)
 [x] U-02 computer (native macOS AX/CGEvent/ScreenCaptureKit; ADR-0158)
 [x] remote_read/write/list/exec/git/worktree (SSH/stdio; ADR-0156)
+[x] read_tool_output (spilled tool output paging; ADR-0159)
 [x] M-03 read_document
 ```
 
@@ -1087,6 +1092,7 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 | `project_profile`, `repo_map`, `find_*`, `git`, `build_context`, `file_info`, `find_files`, `read_files` | yes | yes | yes | yes | yes | yes | yes |
 | `run_project_task` | yes | no | yes (test/build/check) | yes | test/check only | test/check only | no |
 | `process`, `wait_for` | yes | no | yes (test/build) | yes | no | yes | no |
+| `read_tool_output` | yes | yes | yes | yes | yes (read-only) | yes | yes |
 | `local_http` | yes | no | yes | yes | yes (localhost) | yes | no |
 | `web_search`, `read_url` | yes | research only | research only | research/coding | yes | research only | no |
 | `browser` | yes | no | no | coding/frontend | no | no | no |
