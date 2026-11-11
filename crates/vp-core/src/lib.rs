@@ -37,24 +37,24 @@ use vp_protocol::types::{
     OrchestrationSessionSummary, OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo,
     Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
     QuestionListResult, ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle,
-    SessionCheckpoint, SessionCheckpointDeleteResult, SessionCheckpointDiffResult,
-    SessionCheckpointListResult, SessionCheckpointPruneResult, SessionCheckpointRestoreResult,
-    SessionCheckpointStatsResult, SessionCitationAuditResult, SessionCitationsResult,
-    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus,
-    SessionContinuation, SessionContinuationCancelResult, SessionContinuationsResult,
-    SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode, SessionForkTreeResult,
-    SessionImportResult, SessionLandResult, SessionLineageEntry, SessionLineageResult,
-    SessionLogStatus, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
-    SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
-    SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
-    SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
-    SkillDeleteResult, SkillEnabledParams, SkillImportParams, SkillListResult, SkillUpdateParams,
-    Source, SourceChunk, SourceCitation, SourceCollectionsResult, SourceCreateFileParams,
-    SourceCreateNoteParams, SourceCreateUrlParams, SourceDeleteResult, SourceGetResult,
-    SourceImportError, SourceImportParams, SourceImportResult, SourceListResult,
-    SourceReindexResult, SourceSearchResult, SourceStats, SteeringMessage, StoredMessage,
-    TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TaskStall, TeamPlan,
-    TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    SessionCacheStatus, SessionCheckpoint, SessionCheckpointDeleteResult,
+    SessionCheckpointDiffResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
+    SessionCheckpointRestoreResult, SessionCheckpointStatsResult, SessionCitationAuditResult,
+    SessionCitationsResult, SessionCommit, SessionCompareFile, SessionCompareResult,
+    SessionContextStatus, SessionContinuation, SessionContinuationCancelResult,
+    SessionContinuationsResult, SessionDeferResult, SessionDiff, SessionForkResult,
+    SessionForkTreeNode, SessionForkTreeResult, SessionImportResult, SessionLandResult,
+    SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPriorityResult,
+    SessionRehydrateResult, SessionReplayReport, SessionSkillActivationsResult,
+    SessionStallsResult, SessionSteerResult, SessionSteeringCancelResult,
+    SessionSteeringListResult, SessionTranscriptResult, SessionUnlimitedResult, ShellPolicy, Skill,
+    SkillActivation, SkillCreateParams, SkillDeleteResult, SkillEnabledParams, SkillImportParams,
+    SkillListResult, SkillUpdateParams, Source, SourceChunk, SourceCitation,
+    SourceCollectionsResult, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
+    SourceDeleteResult, SourceGetResult, SourceImportError, SourceImportParams, SourceImportResult,
+    SourceListResult, SourceReindexResult, SourceSearchResult, SourceStats, SteeringMessage,
+    StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TaskStall,
+    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
     TerminalWriteResult, TodoItem, UpdateModelPresetParams, UpdateSourceMetadataParams,
     UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
     WorkspaceGrepResult, WorkspaceListResult, WorkspaceSearchResult, WorkspaceTreeResult,
@@ -348,6 +348,11 @@ fn add_usage_bucket(buckets: &mut HashMap<String, UsageBucket>, key: &str, entry
     bucket.cache_write_tokens = bucket
         .cache_write_tokens
         .saturating_add(entry.cache_write_tokens);
+    bucket.cache_hit_ratio = vp_protocol::types::cache_hit_ratio(
+        bucket.input_tokens,
+        bucket.cache_read_tokens,
+        bucket.cache_write_tokens,
+    );
     bucket.cost_usd += entry.cost_usd;
 }
 
@@ -6421,6 +6426,11 @@ impl Engine {
         totals.by_agent = sorted_usage_buckets(by_agent);
         totals.by_task = sorted_usage_buckets(by_task);
         totals.by_department = sorted_usage_buckets(by_department);
+        totals.cache_hit_ratio = vp_protocol::types::cache_hit_ratio(
+            totals.input_tokens,
+            totals.cache_read_tokens,
+            totals.cache_write_tokens,
+        );
         Ok(UsageLedgerResult {
             session_id: session_id.to_string(),
             entries,
@@ -6431,9 +6441,14 @@ impl Engine {
     pub async fn usage_csv(&self, session_id: &str) -> Result<UsageCsvResult> {
         let ledger = self.usage_ledger(session_id).await?;
         let mut csv = String::from(
-            "created_at,agent_name,role,task_id,department,model,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,total_tokens,estimated,cost_usd\n",
+            "created_at,agent_name,role,task_id,department,model,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,total_tokens,estimated,cost_usd,cache_hit_ratio\n",
         );
         for entry in ledger.entries {
+            let ratio = vp_protocol::types::cache_hit_ratio(
+                entry.input_tokens,
+                entry.cache_read_tokens,
+                entry.cache_write_tokens,
+            );
             let fields = [
                 entry.created_at,
                 entry.agent_name,
@@ -6448,6 +6463,7 @@ impl Engine {
                 (entry.input_tokens + entry.output_tokens).to_string(),
                 entry.estimated.to_string(),
                 format!("{:.6}", entry.cost_usd),
+                format!("{ratio:.6}"),
             ];
             csv.push_str(
                 &fields
@@ -6461,6 +6477,61 @@ impl Engine {
         Ok(UsageCsvResult {
             session_id: session_id.to_string(),
             csv,
+        })
+    }
+
+    /// Bounded cache telemetry derived from the usage ledger and the latest
+    /// context prompt-prefix/measurement events. Never returns prompt text.
+    pub async fn session_cache_status(&self, session_id: &str) -> Result<SessionCacheStatus> {
+        let ledger = self.usage_ledger(session_id).await?;
+        let prefix_event = self
+            .latest_event_of_kind(session_id, "context.prompt_prefix")
+            .await?;
+        let measured_event = self
+            .latest_event_of_kind(session_id, "context.measured")
+            .await?;
+
+        let prompt_prefix = prefix_event
+            .as_ref()
+            .and_then(|event| event.payload.get("prefix_hash"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                measured_event
+                    .as_ref()
+                    .and_then(|event| event.payload.get("prompt_prefix_hash"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        let preamble_tokens_estimate = prefix_event.as_ref().and_then(|event| {
+            event
+                .payload
+                .get("preamble_tokens_estimate")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("stable_prefix_chars")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|chars| chars / 4)
+                })
+        });
+        let last_call_at = ledger
+            .entries
+            .last()
+            .map(|entry| entry.created_at.clone())
+            .or_else(|| measured_event.map(|event| event.created_at));
+
+        Ok(SessionCacheStatus {
+            session_id: session_id.to_string(),
+            input_tokens: ledger.totals.input_tokens,
+            cache_read_tokens: ledger.totals.cache_read_tokens,
+            cache_write_tokens: ledger.totals.cache_write_tokens,
+            output_tokens: ledger.totals.output_tokens,
+            cache_hit_ratio: ledger.totals.cache_hit_ratio,
+            prompt_prefix,
+            preamble_tokens_estimate,
+            last_call_at,
         })
     }
 
@@ -6974,6 +7045,11 @@ impl Engine {
                 .saturating_add(session.cache_write_tokens);
             totals.cost_usd += session.cost_usd;
         }
+        totals.cache_hit_ratio = vp_protocol::types::cache_hit_ratio(
+            totals.input_tokens,
+            totals.cache_read_tokens,
+            totals.cache_write_tokens,
+        );
         Ok(ProjectUsageResult {
             project_id: project_id.to_string(),
             sessions,

@@ -9013,6 +9013,12 @@ async fn run_loop_body(
             "cache_generation": prompt_prefix.prefix_hash,
             "tool_count": tools.len(),
             "stable_prefix_chars": stable_prefix.chars().count(),
+            // Heuristic estimate of the system-prompt and tool-schema preamble.
+            // This is the same estimate already used for context-limit checks,
+            // not provider-reported usage.
+            "preamble_tokens_estimate": system_tokens.saturating_add(tool_tokens),
+            "system_tokens_estimate": system_tokens,
+            "tool_tokens_estimate": tool_tokens,
         }),
     )
     .await?;
@@ -9269,6 +9275,11 @@ async fn run_loop_body(
                     "actual_output_tokens": stream_turn.usage.output,
                     "cache_read_tokens": stream_turn.usage.cache_read,
                     "cache_write_tokens": stream_turn.usage.cache_write,
+                    "cache_hit_ratio": vp_protocol::types::cache_hit_ratio(
+                        stream_turn.usage.input,
+                        stream_turn.usage.cache_read,
+                        stream_turn.usage.cache_write,
+                    ),
                     "ratio": ratio,
                     "calibration": calibration.factor,
                     "samples": calibration.samples,
@@ -9331,6 +9342,33 @@ async fn run_loop_body(
                     cost,
                 )
                 .await?;
+            // Operational cache telemetry after settlement. No prompt text or
+            // provider secrets; failures must not discard the accounting.
+            if input_tokens > 0
+                && let Err(error) = emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "context.cache",
+                    serde_json::json!({
+                        "input_tokens": input_tokens,
+                        "cache_read_tokens": cache_read_tokens,
+                        "cache_write_tokens": cache_write_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_hit_ratio": vp_protocol::types::cache_hit_ratio(
+                            input_tokens,
+                            cache_read_tokens,
+                            cache_write_tokens,
+                        ),
+                        "prompt_prefix_hash": prompt_prefix.prefix_hash,
+                        "estimated": estimated,
+                        "model": request.model,
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(%error, "could not persist context cache telemetry");
+            }
             let actual_usage = input_tokens.saturating_add(output_tokens);
             let cost_exceeded = if let Some(reservation) = cost_reservation.take() {
                 reservation.settle(cost)

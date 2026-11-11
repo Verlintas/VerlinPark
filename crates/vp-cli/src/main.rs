@@ -922,6 +922,8 @@ enum Command {
         #[arg(long)]
         csv: bool,
     },
+    /// Show session cache-read telemetry and the prompt-prefix generation.
+    Cache { session: String },
     /// Show the validated team plan.
     TeamPlan { session: String },
     /// Print a Markdown transcript of the session's plan and messages.
@@ -2977,6 +2979,9 @@ async fn main() -> Result<()> {
             };
             rpc(&discovery, method, json!({"session_id": session})).await?
         }
+        Command::Cache { session } => {
+            rpc(&discovery, "session.cache", json!({"session_id": session})).await?
+        }
         Command::Agents { session } => {
             rpc(&discovery, "agent.list", json!({"session_id": session})).await?
         }
@@ -3645,6 +3650,40 @@ fn print_human(value: &Value) {
     if value.get("console_streamed").and_then(Value::as_bool) == Some(true)
         || value.get("terminal_streamed").and_then(Value::as_bool) == Some(true)
     {
+        return;
+    }
+    if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
+        && value
+            .get("cache_hit_ratio")
+            .and_then(Value::as_f64)
+            .is_some()
+        && value.get("input_tokens").is_some()
+    {
+        let ratio = value["cache_hit_ratio"].as_f64().unwrap_or(0.0);
+        println!("cache  {session_id}");
+        println!(
+            "  hit ratio        {:.2}%  (cache read / ledger input buckets)",
+            ratio * 100.0
+        );
+        println!(
+            "  tokens           input {} · cache read {} · cache write {} · output {}",
+            value["input_tokens"].as_u64().unwrap_or(0),
+            value["cache_read_tokens"].as_u64().unwrap_or(0),
+            value["cache_write_tokens"].as_u64().unwrap_or(0),
+            value["output_tokens"].as_u64().unwrap_or(0)
+        );
+        match value["preamble_tokens_estimate"].as_u64() {
+            Some(tokens) => println!("  preamble         ~{tokens} tokens (estimate)"),
+            None => println!("  preamble         unknown"),
+        }
+        match value["prompt_prefix"].as_str() {
+            Some(prefix) => println!("  prompt prefix    {prefix}"),
+            None => println!("  prompt prefix    unknown"),
+        }
+        match value["last_call_at"].as_str() {
+            Some(last_call) => println!("  last call        {last_call}"),
+            None => println!("  last call        never"),
+        }
         return;
     }
     if let Some(csv) = value.get("csv").and_then(Value::as_str) {
@@ -5874,6 +5913,23 @@ mod tests {
                 match cli.command {
                     Command::Metrics { prometheus } => assert!(prometheus),
                     other => panic!("expected metrics command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_command_parses_session_and_json_flag() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "cache", "ses-123", "--json"]).unwrap();
+                assert!(cli.json);
+                match cli.command {
+                    Command::Cache { session } => assert_eq!(session, "ses-123"),
+                    other => panic!("expected cache command, got {other:?}"),
                 }
             })
             .unwrap()

@@ -3302,6 +3302,7 @@ async fn provider_cache_usage_reaches_ledger_and_session_totals() {
     assert_eq!(entry.cache_write_tokens, 100);
     assert_eq!(ledger.totals.cache_read_tokens, 600);
     assert_eq!(ledger.totals.cache_write_tokens, 100);
+    assert!((ledger.totals.cache_hit_ratio - 0.6).abs() < 1e-9);
 
     let sessions = engine
         .list_sessions(Some(session.project_id.clone()))
@@ -3320,6 +3321,35 @@ async fn provider_cache_usage_reaches_ledger_and_session_totals() {
     assert_eq!(usage.payload["input_tokens"], 1_000);
     assert_eq!(usage.payload["cache_read_tokens"], 600);
     assert_eq!(usage.payload["cache_write_tokens"], 100);
+
+    let cache_event = events
+        .iter()
+        .find(|event| event.kind == "context.cache")
+        .expect("context.cache event");
+    assert_eq!(cache_event.payload["cache_read_tokens"], 600);
+    assert_eq!(cache_event.payload["cache_write_tokens"], 100);
+    assert_eq!(cache_event.payload["cache_hit_ratio"], 0.6);
+    assert!(cache_event.payload["prompt_prefix_hash"].is_string());
+    assert!(cache_event.payload.get("prompt").is_none());
+
+    let prefix = events
+        .iter()
+        .find(|event| event.kind == "context.prompt_prefix")
+        .expect("prompt prefix event");
+    assert!(
+        prefix.payload["preamble_tokens_estimate"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+
+    let status = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(status.input_tokens, 1_000);
+    assert_eq!(status.cache_read_tokens, 600);
+    assert!((status.cache_hit_ratio - 0.6).abs() < 1e-9);
+    assert!(status.prompt_prefix.is_some());
+    assert!(status.preamble_tokens_estimate.is_some());
+    assert!(status.last_call_at.is_some());
 }
 
 #[test]

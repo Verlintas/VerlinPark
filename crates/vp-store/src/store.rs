@@ -20,7 +20,7 @@ use vp_protocol::types::{
     ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, ShellPolicy, Skill,
     Source, SourceChunk, SourceCollection, SourceSearchHit, SourceStats, SteeringMessage,
     StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, UsageEntry,
-    WorktreeRetentionPolicy, WriteLease,
+    WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
 use crate::paths;
@@ -484,6 +484,9 @@ pub struct DaemonMetricsSnapshot {
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Latest prompt-prefix estimate observed across sessions, if any run has
+    /// emitted the field (or the legacy character count fallback).
+    pub preamble_tokens_estimate: Option<u64>,
     pub cost_spent_usd: f64,
 }
 
@@ -737,6 +740,8 @@ impl Store {
                 ON events(session_id, seq);
             CREATE INDEX IF NOT EXISTS idx_events_session_type_seq
                 ON events(session_id, type, seq);
+            CREATE INDEX IF NOT EXISTS idx_events_type_created
+                ON events(type, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_sessions_project
                 ON sessions(project_id);
 
@@ -4795,15 +4800,23 @@ impl Store {
              ORDER BY s.created_at DESC",
         )?;
         let rows = stmt.query_map(params![project_id], |row| {
+            let input_tokens = row.get::<_, i64>(3)? as u64;
+            let cache_read_tokens = row.get::<_, i64>(7)? as u64;
+            let cache_write_tokens = row.get::<_, i64>(8)? as u64;
             Ok(ProjectUsageSession {
                 session_id: row.get(0)?,
                 goal: row.get(1)?,
                 status: row.get(2)?,
                 calls: row.get::<_, i64>(6)? as u64,
-                input_tokens: row.get::<_, i64>(3)? as u64,
+                input_tokens,
                 output_tokens: row.get::<_, i64>(4)? as u64,
-                cache_read_tokens: row.get::<_, i64>(7)? as u64,
-                cache_write_tokens: row.get::<_, i64>(8)? as u64,
+                cache_read_tokens,
+                cache_write_tokens,
+                cache_hit_ratio: cache_hit_ratio(
+                    input_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                ),
                 cost_usd: row.get(5)?,
             })
         })?;
@@ -7469,6 +7482,28 @@ impl Store {
             },
         )?;
         let (tokens_in, tokens_out, cache_read_tokens, cache_write_tokens, cost_spent_usd) = usage;
+        let preamble_payload = conn
+            .query_row(
+                "SELECT payload FROM events
+                 WHERE type = 'context.prompt_prefix'
+                 ORDER BY created_at DESC, seq DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let preamble_tokens_estimate = preamble_payload
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+            .and_then(|payload| {
+                payload
+                    .get("preamble_tokens_estimate")
+                    .and_then(serde_json::Value::as_u64)
+                    .or_else(|| {
+                        payload
+                            .get("stable_prefix_chars")
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|chars| chars / 4)
+                    })
+            });
         Ok(DaemonMetricsSnapshot {
             projects: projects.max(0) as u64,
             sessions: bounded_metric_counts(&conn, "sessions", "status")?,
@@ -7484,6 +7519,7 @@ impl Store {
             tokens_out,
             cache_read_tokens,
             cache_write_tokens,
+            preamble_tokens_estimate,
             cost_spent_usd: if cost_spent_usd.is_finite() {
                 cost_spent_usd.max(0.0)
             } else {

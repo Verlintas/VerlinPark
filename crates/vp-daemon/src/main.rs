@@ -50,15 +50,16 @@ use vp_protocol::types::{
     ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
     RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
     ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult,
-    SchedulerStatusParams, SearchParams, ServerInfo, SessionCheckpointDeleteParams,
-    SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
-    SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
-    SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
-    SessionContextParams, SessionContinuationCancelParams, SessionContinuationsParams,
-    SessionDeferParams, SessionDiffParams, SessionExportParams, SessionForkParams,
-    SessionForkTreeParams, SessionImportParams, SessionLineageParams, SessionListResult,
-    SessionLogParams, SessionMergeForkParams, SessionPauseParams, SessionPauseResult,
-    SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
+    SchedulerStatusParams, SearchParams, ServerInfo, SessionCacheParams,
+    SessionCheckpointDeleteParams, SessionCheckpointDiffParams, SessionCheckpointListParams,
+    SessionCheckpointParams, SessionCheckpointPruneParams, SessionCheckpointRestoreParams,
+    SessionCheckpointStatsParams, SessionCitationAuditParams, SessionCitationsParams,
+    SessionCompactParams, SessionCompareParams, SessionContextParams,
+    SessionContinuationCancelParams, SessionContinuationsParams, SessionDeferParams,
+    SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
+    SessionImportParams, SessionLineageParams, SessionListResult, SessionLogParams,
+    SessionMergeForkParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
+    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
     SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
     SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
@@ -266,6 +267,12 @@ async fn collect_daemon_metrics(state: &AppState) -> Result<DaemonMetrics> {
         tokens_out: snapshot.tokens_out,
         cache_read_tokens: snapshot.cache_read_tokens,
         cache_write_tokens: snapshot.cache_write_tokens,
+        cache_hit_ratio: vp_protocol::types::cache_hit_ratio(
+            snapshot.tokens_in,
+            snapshot.cache_read_tokens,
+            snapshot.cache_write_tokens,
+        ),
+        preamble_tokens_estimate: snapshot.preamble_tokens_estimate,
         cost_spent_usd: snapshot.cost_spent_usd,
     })
 }
@@ -1728,6 +1735,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .session_context_status(&params.session_id)
                 .await
             {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.cache" => match parse_params::<SessionCacheParams>(request.params) {
+            Ok(params) => match state.engine.session_cache_status(&params.session_id).await {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },

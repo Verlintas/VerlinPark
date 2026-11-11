@@ -129,6 +129,24 @@ pub fn render_prometheus(metrics: &DaemonMetrics) -> String {
     );
     let _ = writeln!(
         out,
+        "# HELP verlinpark_cache_hit_ratio Cache-read share over ledger input buckets (0..1)."
+    );
+    let _ = writeln!(out, "# TYPE verlinpark_cache_hit_ratio gauge");
+    let _ = writeln!(
+        out,
+        "verlinpark_cache_hit_ratio {}",
+        format_ratio(metrics.cache_hit_ratio)
+    );
+    if let Some(tokens) = metrics.preamble_tokens_estimate {
+        let _ = writeln!(
+            out,
+            "# HELP verlinpark_preamble_tokens_estimate Estimated stable system + tool-schema preamble tokens of the latest agent run."
+        );
+        let _ = writeln!(out, "# TYPE verlinpark_preamble_tokens_estimate gauge");
+        let _ = writeln!(out, "verlinpark_preamble_tokens_estimate {tokens}");
+    }
+    let _ = writeln!(
+        out,
         "# HELP verlinpark_cost_usd_total Recorded provider spend in USD."
     );
     let _ = writeln!(out, "# TYPE verlinpark_cost_usd_total counter");
@@ -180,6 +198,14 @@ fn format_non_negative(value: f64) -> String {
     }
 }
 
+fn format_ratio(value: f64) -> String {
+    if value.is_finite() {
+        format!("{}", value.clamp(0.0, 1.0))
+    } else {
+        "0".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +236,8 @@ mod tests {
             tokens_out: 250,
             cache_read_tokens: 400,
             cache_write_tokens: 100,
+            cache_hit_ratio: 0.4,
+            preamble_tokens_estimate: Some(7000),
             cost_spent_usd: 0.125,
         }
     }
@@ -235,6 +263,8 @@ mod tests {
             "verlinpark_runtime_leases",
             "verlinpark_tokens_total",
             "verlinpark_cache_tokens_total",
+            "verlinpark_cache_hit_ratio",
+            "verlinpark_preamble_tokens_estimate",
             "verlinpark_cost_usd_total",
         ] {
             assert!(
@@ -258,6 +288,8 @@ mod tests {
         assert!(rendered.contains("verlinpark_tokens_total{direction=\"out\"} 250\n"));
         assert!(rendered.contains("verlinpark_cache_tokens_total{direction=\"read\"} 400\n"));
         assert!(rendered.contains("verlinpark_cache_tokens_total{direction=\"write\"} 100\n"));
+        assert!(rendered.contains("verlinpark_cache_hit_ratio 0.4\n"));
+        assert!(rendered.contains("verlinpark_preamble_tokens_estimate 7000\n"));
         assert!(rendered.contains("verlinpark_cost_usd_total 0.125\n"));
         assert!(rendered.ends_with('\n'));
 
@@ -306,5 +338,22 @@ mod tests {
             render_prometheus(&metrics).contains("verlinpark_cost_usd_total 0\n"),
             "negative cost must be clamped"
         );
+    }
+
+    #[test]
+    fn clamps_ratio_and_omits_unavailable_preamble() {
+        let mut metrics = sample_metrics();
+        metrics.cache_hit_ratio = 7.5;
+        metrics.preamble_tokens_estimate = None;
+
+        let rendered = render_prometheus(&metrics);
+        assert!(rendered.contains("verlinpark_cache_hit_ratio 1\n"));
+        assert!(
+            !rendered.contains("verlinpark_preamble_tokens_estimate"),
+            "unavailable preamble must be omitted entirely: {rendered}"
+        );
+
+        metrics.cache_hit_ratio = f64::NAN;
+        assert!(render_prometheus(&metrics).contains("verlinpark_cache_hit_ratio 0\n"));
     }
 }

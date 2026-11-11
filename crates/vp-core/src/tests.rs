@@ -678,8 +678,124 @@ async fn exports_usage_as_escaped_csv() {
     assert!(
         result
             .csv
-            .contains(",worker,T1,impl,test-model,10,4,1,5,15,true,0.250000")
+            .contains(",worker,T1,impl,test-model,10,4,1,5,15,true,0.250000,0.400000")
     );
+}
+
+#[tokio::test]
+async fn cache_status_is_empty_then_populated_and_survives_replay() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("cache status".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "measure cache".into(), None)
+        .await
+        .unwrap();
+
+    let empty = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(empty.input_tokens, 0);
+    assert_eq!(empty.cache_read_tokens, 0);
+    assert_eq!(empty.cache_write_tokens, 0);
+    assert_eq!(empty.output_tokens, 0);
+    assert_eq!(empty.cache_hit_ratio, 0.0);
+    assert!(empty.prompt_prefix.is_none());
+    assert!(empty.preamble_tokens_estimate.is_none());
+    assert!(empty.last_call_at.is_none());
+
+    engine
+        .record_agent_usage_with_cache(
+            &session.id,
+            "agent-1",
+            "Worker One",
+            "worker",
+            Some("T1".into()),
+            Some("impl".into()),
+            "test-model",
+            1_000,
+            100,
+            600,
+            100,
+            false,
+            0.25,
+        )
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "context.prompt_prefix",
+            serde_json::json!({
+                "version": 1,
+                "model": "test-model",
+                "prefix_hash": "prefix-abc",
+                "stable_prefix_chars": 4_000,
+                "preamble_tokens_estimate": 7_000_u64,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let status = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(status.input_tokens, 1_000);
+    assert_eq!(status.output_tokens, 100);
+    assert_eq!(status.cache_read_tokens, 600);
+    assert_eq!(status.cache_write_tokens, 100);
+    assert!((status.cache_hit_ratio - 0.6).abs() < 1e-9);
+    assert_eq!(status.prompt_prefix.as_deref(), Some("prefix-abc"));
+    assert_eq!(status.preamble_tokens_estimate, Some(7_000));
+    assert!(status.last_call_at.is_some());
+
+    let report = engine.project_usage_report(&project.id).await.unwrap();
+    assert_eq!(report.sessions.len(), 1);
+    assert!((report.sessions[0].cache_hit_ratio - 0.6).abs() < 1e-9);
+    assert!((report.totals.cache_hit_ratio - 0.6).abs() < 1e-9);
+
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.consistent, "cache usage replay drifted: {replay:?}");
+    let derived = engine.usage_ledger(&session.id).await.unwrap();
+    assert!((derived.totals.cache_hit_ratio - 0.6).abs() < 1e-9);
+    assert!((derived.totals.by_role[0].cache_hit_ratio - 0.6).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn cache_status_falls_back_to_legacy_prefix_character_estimate() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("legacy prefix".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "legacy prefix".into(), None)
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "context.prompt_prefix",
+            serde_json::json!({
+                "prefix_hash": "legacy-prefix",
+                "stable_prefix_chars": 4_000,
+            }),
+        )
+        .await
+        .unwrap();
+    let status = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(status.prompt_prefix.as_deref(), Some("legacy-prefix"));
+    assert_eq!(status.preamble_tokens_estimate, Some(1_000));
 }
 
 #[tokio::test]

@@ -4268,7 +4268,52 @@ fn daemon_metrics_snapshot_is_empty_for_a_fresh_store() {
     assert_eq!(snapshot.tokens_out, 0);
     assert_eq!(snapshot.cache_read_tokens, 0);
     assert_eq!(snapshot.cache_write_tokens, 0);
+    assert!(snapshot.preamble_tokens_estimate.is_none());
     assert_eq!(snapshot.cost_spent_usd, 0.0);
+}
+
+#[test]
+fn daemon_metrics_snapshot_reads_latest_preamble_estimate() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let session = store.create_session(&project.id, "cache").unwrap();
+    store
+        .append_event(
+            &session.id,
+            "context.prompt_prefix",
+            serde_json::json!({
+                "prefix_hash": "hash-1",
+                "preamble_tokens_estimate": 7_000_u64,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .daemon_metrics_snapshot()
+            .unwrap()
+            .preamble_tokens_estimate,
+        Some(7_000)
+    );
+
+    store
+        .append_event(
+            &session.id,
+            "context.prompt_prefix",
+            serde_json::json!({
+                "prefix_hash": "hash-2",
+                "stable_prefix_chars": 4_000_u64,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .daemon_metrics_snapshot()
+            .unwrap()
+            .preamble_tokens_estimate,
+        Some(1_000)
+    );
 }
 
 #[test]

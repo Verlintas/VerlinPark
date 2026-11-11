@@ -345,6 +345,14 @@ pub struct DaemonMetrics {
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Derived cache-read share over the ledger buckets; see
+    /// [`cache_hit_ratio`]. Never persisted separately.
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
+    /// Most recent agent-run preamble estimate (system prompt + tool schemas).
+    /// `None` when no run has emitted a prompt-prefix event yet.
+    #[serde(default)]
+    pub preamble_tokens_estimate: Option<u64>,
     pub cost_spent_usd: f64,
 }
 
@@ -2455,6 +2463,35 @@ pub struct Approval {
     pub approval_reason: Option<String>,
 }
 
+/// Cache-read share of the provider input buckets.
+///
+/// Provider-normalized `input_tokens` is the total input and already contains
+/// the cache read/write subsets (ADR-0138). The E1 formula treats the
+/// denominator as disjoint buckets:
+///
+/// ```text
+/// uncached = input - cache_read - cache_write
+/// ratio    = cache_read / (uncached + cache_read + cache_write)
+/// ```
+///
+/// which simplifies to `cache_read / input` for a consistent provider report.
+/// A report where the cache buckets exceed input is clamped to `1.0`, and a
+/// zero denominator yields `0.0`. The value is observational only; it is not a
+/// billing reconstruction.
+pub fn cache_hit_ratio(input_tokens: u64, cache_read_tokens: u64, cache_write_tokens: u64) -> f64 {
+    let uncached = input_tokens
+        .saturating_sub(cache_read_tokens)
+        .saturating_sub(cache_write_tokens);
+    let denominator = uncached
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_write_tokens);
+    if denominator == 0 {
+        0.0
+    } else {
+        (cache_read_tokens as f64 / denominator as f64).clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageEntry {
     pub id: String,
@@ -2492,6 +2529,9 @@ pub struct UsageBucket {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_write_tokens: u64,
+    /// Derived cache-read share for this bucket; see [`cache_hit_ratio`].
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
     pub cost_usd: f64,
 }
 
@@ -2504,6 +2544,10 @@ pub struct UsageTotals {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_write_tokens: u64,
+    /// Derived cache-read share over all ledger entries; see
+    /// [`cache_hit_ratio`]. Not persisted separately.
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
     pub cost_usd: f64,
     pub by_role: Vec<UsageBucket>,
     pub by_model: Vec<UsageBucket>,
@@ -2566,6 +2610,9 @@ pub struct ProjectUsageSession {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_write_tokens: u64,
+    /// Derived cache-read share for this session; see [`cache_hit_ratio`].
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
     pub cost_usd: f64,
 }
 
@@ -2747,6 +2794,39 @@ pub struct SessionContextStatus {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionContextParams {
+    pub session_id: String,
+}
+
+/// Bounded cache telemetry for one session. Token values come from the usage
+/// ledger; `prompt_prefix` is a hash, never prompt text.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheStatus {
+    pub session_id: String,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Derived cache-read share; see [`cache_hit_ratio`].
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
+    /// Latest prompt-prefix hash emitted by `context.prompt_prefix` (or the
+    /// `prompt_prefix_hash` recorded on `context.measured`).
+    #[serde(default)]
+    pub prompt_prefix: Option<String>,
+    /// Best-effort estimate of the system-prompt and tool-schema preamble.
+    /// Heuristic, not provider-reported usage.
+    #[serde(default)]
+    pub preamble_tokens_estimate: Option<u64>,
+    #[serde(default)]
+    pub last_call_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCacheParams {
     pub session_id: String,
 }
 
@@ -5368,6 +5448,8 @@ mod tests {
             tokens_out: 250,
             cache_read_tokens: 400,
             cache_write_tokens: 100,
+            cache_hit_ratio: 0.4,
+            preamble_tokens_estimate: Some(7000),
             cost_spent_usd: 0.125,
         };
         let result = DaemonMetricsResult {
@@ -5380,5 +5462,101 @@ mod tests {
         assert_eq!(encoded["metrics"]["cost_spent_usd"], 0.125);
         let decoded: DaemonMetricsResult = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn cache_hit_ratio_is_zero_safe_and_clamped() {
+        assert_eq!(cache_hit_ratio(0, 0, 0), 0.0);
+        assert_eq!(cache_hit_ratio(0, 0, 10), 0.0);
+        assert_eq!(cache_hit_ratio(0, 10, 0), 1.0);
+        assert_eq!(cache_hit_ratio(100, 200, 0), 1.0);
+        assert_eq!(cache_hit_ratio(500, 0, 0), 0.0);
+        let normal = cache_hit_ratio(1_000, 600, 100);
+        assert!((normal - 0.6).abs() < 1e-9, "unexpected ratio: {normal}");
+    }
+
+    #[test]
+    fn legacy_usage_payloads_decode_derived_cache_fields_as_default() {
+        let totals = UsageTotals {
+            calls: 1,
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cache_read_tokens: 600,
+            cache_write_tokens: 100,
+            cache_hit_ratio: 0.6,
+            cost_usd: 0.25,
+            ..UsageTotals::default()
+        };
+        let mut value = serde_json::to_value(&totals).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_hit_ratio")
+            .expect("new field was serialized");
+        let legacy: UsageTotals = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.cache_hit_ratio, 0.0);
+        assert_eq!(legacy.cache_read_tokens, 600);
+
+        let bucket = UsageBucket {
+            key: "worker".into(),
+            calls: 1,
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 40,
+            cache_write_tokens: 10,
+            cache_hit_ratio: 0.4,
+            cost_usd: 0.01,
+        };
+        let mut value = serde_json::to_value(&bucket).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_hit_ratio")
+            .expect("new field was serialized");
+        let legacy: UsageBucket = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.cache_hit_ratio, 0.0);
+
+        let status: SessionCacheStatus = serde_json::from_value(json!({
+            "session_id": "ses-legacy"
+        }))
+        .unwrap();
+        assert_eq!(status.input_tokens, 0);
+        assert_eq!(status.cache_hit_ratio, 0.0);
+        assert!(status.prompt_prefix.is_none());
+        assert!(status.preamble_tokens_estimate.is_none());
+        assert!(status.last_call_at.is_none());
+    }
+
+    #[test]
+    fn legacy_daemon_metrics_decode_without_cache_ratio_or_preamble() {
+        let metrics = DaemonMetrics {
+            version: "0.1.0-dev".to_string(),
+            protocol: 1,
+            uptime_secs: 1,
+            projects: 1,
+            sessions: Vec::new(),
+            plan_tasks: Vec::new(),
+            merge_queue: Vec::new(),
+            intake: Vec::new(),
+            continuations: Vec::new(),
+            recoveries: Vec::new(),
+            memories: Vec::new(),
+            memory_conflicts: Vec::new(),
+            runtime_leases: Vec::new(),
+            tokens_in: 10,
+            tokens_out: 2,
+            cache_read_tokens: 4,
+            cache_write_tokens: 1,
+            cache_hit_ratio: 0.4,
+            preamble_tokens_estimate: Some(7000),
+            cost_spent_usd: 0.0,
+        };
+        let mut value = serde_json::to_value(&metrics).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("cache_hit_ratio");
+        object.remove("preamble_tokens_estimate");
+        let legacy: DaemonMetrics = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.cache_hit_ratio, 0.0);
+        assert!(legacy.preamble_tokens_estimate.is_none());
     }
 }
