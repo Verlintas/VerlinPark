@@ -4200,3 +4200,305 @@ fn memory_health_counts_lifecycle_evidence_and_verification_due() {
     );
     assert!(!active.id.is_empty());
 }
+
+#[test]
+fn daemon_metrics_snapshot_is_empty_for_a_fresh_store() {
+    let (_data, store, _repo) = test_store();
+    let snapshot = store.daemon_metrics_snapshot().unwrap();
+    assert_eq!(snapshot.projects, 0);
+    assert!(snapshot.sessions.is_empty());
+    assert!(snapshot.plan_tasks.is_empty());
+    assert!(snapshot.merge_queue.is_empty());
+    assert!(snapshot.intake.is_empty());
+    assert!(snapshot.continuations.is_empty());
+    assert!(snapshot.recoveries.is_empty());
+    assert!(snapshot.memories.is_empty());
+    assert!(snapshot.memory_conflicts.is_empty());
+    assert!(snapshot.runtime_leases.is_empty());
+    assert_eq!(snapshot.tokens_in, 0);
+    assert_eq!(snapshot.tokens_out, 0);
+    assert_eq!(snapshot.cache_read_tokens, 0);
+    assert_eq!(snapshot.cache_write_tokens, 0);
+    assert_eq!(snapshot.cost_spent_usd, 0.0);
+}
+
+#[test]
+fn daemon_metrics_snapshot_counts_statuses_and_usage_totals() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let draft = store.create_session(&project.id, "draft").unwrap();
+    let running_a = store.create_session(&project.id, "running a").unwrap();
+    let running_b = store.create_session(&project.id, "running b").unwrap();
+    store
+        .update_session_status(&running_a.id, "running")
+        .unwrap();
+    store
+        .update_session_status(&running_b.id, "running")
+        .unwrap();
+
+    store
+        .add_usage_entry_with_events(
+            &draft.id,
+            "agent-1",
+            "Leader",
+            "leader",
+            None,
+            None,
+            "provider-model",
+            100,
+            50,
+            20,
+            10,
+            false,
+            0.25,
+        )
+        .unwrap();
+    store
+        .add_usage_entry_with_events(
+            &running_a.id,
+            "agent-2",
+            "Worker",
+            "worker",
+            Some("T1"),
+            Some("engineering"),
+            "provider-model",
+            200,
+            100,
+            0,
+            0,
+            false,
+            0.5,
+        )
+        .unwrap();
+
+    {
+        let conn = store.lock().unwrap();
+        let now = "2026-11-11T00:00:00Z";
+        for (task_id, status) in [("T1", "pending"), ("T2", "completed"), ("T3", "pending")] {
+            conn.execute(
+                "INSERT INTO plan_tasks
+                 (session_id, plan_seq, task_id, project_id, department, title, status,
+                  enqueued_at, updated_at)
+                 VALUES (?1, 1, ?2, ?3, 'engineering', ?2, ?4, ?5, ?5)",
+                params![draft.id, task_id, project.id, status, now],
+            )
+            .unwrap();
+        }
+        for (id, status) in [
+            ("merge-1", "queued"),
+            ("merge-2", "merged"),
+            ("merge-3", "failed"),
+            ("merge-4", "merged"),
+        ] {
+            conn.execute(
+                "INSERT INTO merge_queue
+                 (id, session_id, agent_id, agent_name, task_id, branch, commit_hash,
+                  base_commit, status, created_at, updated_at)
+                 VALUES (?1, ?2, 'agent-1', 'Worker', NULL, ?1, 'commit', 'base', ?3, ?4, ?4)",
+                params![id, draft.id, status, now],
+            )
+            .unwrap();
+        }
+        for (id, status) in [
+            ("intake-1", "queued"),
+            ("intake-2", "failed"),
+            ("intake-3", "queued"),
+        ] {
+            conn.execute(
+                "INSERT INTO intake_tasks
+                 (id, project_id, title, instructions, profile, kind, status,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?1, 'do it', 'coding', 'task', ?3, ?4, ?4)",
+                params![id, project.id, status, now],
+            )
+            .unwrap();
+        }
+        for (id, status) in [("cont-1", "pending"), ("cont-2", "delivered")] {
+            conn.execute(
+                "INSERT INTO session_continuations
+                 (id, session_id, project_id, body, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'continue', ?4, ?5, ?5)",
+                params![id, draft.id, project.id, status, now],
+            )
+            .unwrap();
+        }
+        for (task_id, status) in [("T1", "waiting_cancel"), ("T2", "retry_requested")] {
+            conn.execute(
+                "INSERT INTO orchestration_recoveries
+                 (session_id, plan_seq, task_id, project_id, department, action,
+                  status, requested_at, updated_at)
+                 VALUES (?1, 1, ?2, ?3, 'engineering', 'retry', ?4, ?5, ?5)",
+                params![draft.id, task_id, project.id, status, now],
+            )
+            .unwrap();
+        }
+        for (id, status) in [("mem-a", "active"), ("mem-b", "active"), ("mem-c", "stale")] {
+            conn.execute(
+                "INSERT INTO memories
+                 (id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                  tags, created_at, status)
+                 VALUES (?1, ?2, ?3, 'agent-1', 'Leader', 'fact', ?1, 'body',
+                         '[]', ?4, ?5)",
+                params![id, draft.id, project.id, now, status],
+            )
+            .unwrap();
+        }
+        for (id, status) in [("conflict-1", "open"), ("conflict-2", "resolved")] {
+            conn.execute(
+                "INSERT INTO memory_conflicts
+                 (id, project_id, session_id, memory_a_id, memory_b_id, memory_a_title,
+                  memory_b_title, memory_a_kind, memory_b_kind, memory_a_excerpt,
+                  memory_b_excerpt, scope_kind, scope_value, reason, status, detected_at)
+                 VALUES (?1, ?2, ?3, 'mem-a', 'mem-b', 'A', 'B', 'fact', 'fact',
+                         'a', 'b', 'path', 'src/lib.rs', 'different', ?4, ?5)",
+                params![id, project.id, draft.id, status, now],
+            )
+            .unwrap();
+        }
+        for (key, kind) in [
+            ("lease-tool", "tool"),
+            ("lease-session-a", "session"),
+            ("lease-session-b", "session"),
+        ] {
+            conn.execute(
+                "INSERT INTO runtime_leases
+                 (lease_key, owner_id, kind, session_id, acquired_at, heartbeat_at,
+                  expires_at)
+                 VALUES (?1, 'owner', ?2, ?3, ?4, ?4, ?4)",
+                params![key, kind, draft.id, now],
+            )
+            .unwrap();
+        }
+    }
+
+    let snapshot = store.daemon_metrics_snapshot().unwrap();
+    assert_eq!(snapshot.projects, 1);
+    assert_eq!(
+        snapshot.sessions,
+        vec![
+            MetricCount {
+                key: "draft".to_string(),
+                count: 1,
+            },
+            MetricCount {
+                key: "running".to_string(),
+                count: 2,
+            },
+        ]
+    );
+    assert_eq!(
+        snapshot.plan_tasks,
+        vec![
+            MetricCount {
+                key: "completed".to_string(),
+                count: 1,
+            },
+            MetricCount {
+                key: "pending".to_string(),
+                count: 2,
+            },
+        ]
+    );
+    assert_eq!(
+        snapshot.merge_queue,
+        vec![
+            MetricCount {
+                key: "failed".to_string(),
+                count: 1,
+            },
+            MetricCount {
+                key: "merged".to_string(),
+                count: 2,
+            },
+            MetricCount {
+                key: "queued".to_string(),
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        snapshot.intake,
+        vec![
+            MetricCount {
+                key: "failed".to_string(),
+                count: 1,
+            },
+            MetricCount {
+                key: "queued".to_string(),
+                count: 2,
+            },
+        ]
+    );
+    assert_eq!(
+        snapshot.continuations,
+        vec![
+            MetricCount {
+                key: "delivered".to_string(),
+                count: 1,
+            },
+            MetricCount {
+                key: "pending".to_string(),
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        snapshot.recoveries,
+        vec![
+            MetricCount {
+                key: "retry_requested".to_string(),
+                count: 1,
+            },
+            MetricCount {
+                key: "waiting_cancel".to_string(),
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        snapshot.memories,
+        vec![
+            MetricCount {
+                key: "active".to_string(),
+                count: 2,
+            },
+            MetricCount {
+                key: "stale".to_string(),
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        snapshot.memory_conflicts,
+        vec![
+            MetricCount {
+                key: "open".to_string(),
+                count: 1,
+            },
+            MetricCount {
+                key: "resolved".to_string(),
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        snapshot.runtime_leases,
+        vec![
+            MetricCount {
+                key: "session".to_string(),
+                count: 2,
+            },
+            MetricCount {
+                key: "tool".to_string(),
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(snapshot.tokens_in, 300);
+    assert_eq!(snapshot.tokens_out, 150);
+    assert_eq!(snapshot.cache_read_tokens, 20);
+    assert_eq!(snapshot.cache_write_tokens, 10);
+    assert!((snapshot.cost_spent_usd - 0.75).abs() < 1e-9);
+}

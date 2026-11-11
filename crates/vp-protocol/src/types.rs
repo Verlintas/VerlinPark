@@ -315,6 +315,45 @@ pub struct PingResult {
     pub uptime_secs: u64,
 }
 
+/// One bounded low-cardinality count, grouped by a status or kind label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricCount {
+    pub key: String,
+    pub count: u64,
+}
+
+/// Daemon metrics exposed through `daemon.metrics` and the Prometheus
+/// `/metrics` endpoint. No session/task ids, prompts, paths, model names, or
+/// provider secrets are included; the only labels are bounded status/kind
+/// vocabularies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonMetrics {
+    pub version: String,
+    pub protocol: u32,
+    pub uptime_secs: u64,
+    pub projects: u64,
+    pub sessions: Vec<MetricCount>,
+    pub plan_tasks: Vec<MetricCount>,
+    pub merge_queue: Vec<MetricCount>,
+    pub intake: Vec<MetricCount>,
+    pub continuations: Vec<MetricCount>,
+    pub recoveries: Vec<MetricCount>,
+    pub memories: Vec<MetricCount>,
+    pub memory_conflicts: Vec<MetricCount>,
+    pub runtime_leases: Vec<MetricCount>,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_spent_usd: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonMetricsResult {
+    pub metrics: DaemonMetrics,
+    pub prometheus: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddProjectParams {
     pub root: String,
@@ -5099,5 +5138,63 @@ mod tests {
         assert_eq!(legacy.config.command, "npx");
         assert!(legacy.config.enabled);
         assert!(legacy.config.url.is_none());
+    }
+
+    #[test]
+    fn daemon_metrics_round_trip_preserves_bounded_counts() {
+        let metrics = DaemonMetrics {
+            version: "0.1.0-dev".to_string(),
+            protocol: 1,
+            uptime_secs: 42,
+            projects: 3,
+            sessions: vec![
+                MetricCount {
+                    key: "draft".to_string(),
+                    count: 1,
+                },
+                MetricCount {
+                    key: "running".to_string(),
+                    count: 2,
+                },
+            ],
+            plan_tasks: vec![MetricCount {
+                key: "completed".to_string(),
+                count: 5,
+            }],
+            merge_queue: vec![MetricCount {
+                key: "merged".to_string(),
+                count: 2,
+            }],
+            intake: Vec::new(),
+            continuations: Vec::new(),
+            recoveries: Vec::new(),
+            memories: vec![MetricCount {
+                key: "active".to_string(),
+                count: 7,
+            }],
+            memory_conflicts: vec![MetricCount {
+                key: "open".to_string(),
+                count: 1,
+            }],
+            runtime_leases: vec![MetricCount {
+                key: "session".to_string(),
+                count: 1,
+            }],
+            tokens_in: 1000,
+            tokens_out: 250,
+            cache_read_tokens: 400,
+            cache_write_tokens: 100,
+            cost_spent_usd: 0.125,
+        };
+        let result = DaemonMetricsResult {
+            metrics: metrics.clone(),
+            prometheus: "# HELP verlinpark_up Daemon liveness.\nverlinpark_up 1\n".to_string(),
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["metrics"]["sessions"][1]["key"], "running");
+        assert_eq!(encoded["metrics"]["tokens_in"], 1000);
+        assert_eq!(encoded["metrics"]["cost_spent_usd"], 0.125);
+        let decoded: DaemonMetricsResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, result);
     }
 }

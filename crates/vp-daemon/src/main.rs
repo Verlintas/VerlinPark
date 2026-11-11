@@ -34,31 +34,31 @@ use vp_protocol::types::{
     CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams, CommitSessionParams,
     ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams, ConsoleReadParams,
     ConsoleSignalParams, ConsoleWriteParams, CreateModelPresetParams, CreateSessionParams,
-    DashboardParams, DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport,
-    EventListResult, ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams,
-    IntakeCreateParams, IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
-    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
-    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
-    McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
-    MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
-    MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
-    MemoryHealthParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
-    MemorySearchParams, MemoryStatsParams, MemorySweepParams, MemoryUpdateParams,
-    MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
-    PingResult, ProjectBudgetParams, ProjectForkForestParams, ProjectListResult,
-    ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
-    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
-    ResolveMergeResult, RetryMergeParams, RetryMergeResult, SchedulerStatusParams, SearchParams,
-    ServerInfo, SessionCheckpointDeleteParams, SessionCheckpointDiffParams,
-    SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
-    SessionCheckpointRestoreParams, SessionCheckpointStatsParams, SessionCitationAuditParams,
-    SessionCitationsParams, SessionCompactParams, SessionCompareParams, SessionContextParams,
-    SessionContinuationCancelParams, SessionContinuationsParams, SessionDeferParams,
-    SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
-    SessionImportParams, SessionLineageParams, SessionListResult, SessionLogParams,
-    SessionMergeForkParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
-    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
+    DaemonMetrics, DaemonMetricsResult, DashboardParams, DeleteModelPresetParams,
+    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, ForkAuditParams,
+    ForkRepairParams, GitLogParams, GitShowParams, IntakeCreateParams, IntakeDeleteResult,
+    IntakeListParams, IntakeTaskParams, IntakeUpdateParams, IntegrationPolicyParams,
+    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
+    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
+    MailboxPolicyResult, MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpProbeParams,
+    McpReadResourceParams, McpServerIdParams, MemoryBriefParams, MemoryConflictResolveParams,
+    MemoryConflictScanParams, MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult,
+    MemoryDeleteParams, MemoryHealthParams, MemoryListParams, MemoryPolicyParams,
+    MemoryPruneParams, MemorySearchParams, MemoryStatsParams, MemorySweepParams,
+    MemoryUpdateParams, MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult,
+    OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectForkForestParams,
+    ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
+    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
+    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult,
+    SchedulerStatusParams, SearchParams, ServerInfo, SessionCheckpointDeleteParams,
+    SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
+    SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
+    SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
+    SessionContextParams, SessionContinuationCancelParams, SessionContinuationsParams,
+    SessionDeferParams, SessionDiffParams, SessionExportParams, SessionForkParams,
+    SessionForkTreeParams, SessionImportParams, SessionLineageParams, SessionListResult,
+    SessionLogParams, SessionMergeForkParams, SessionPauseParams, SessionPauseResult,
+    SessionPlanResumeParams, SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
     SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
     SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
@@ -94,6 +94,8 @@ use vp_protocol::types::{
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
 use vp_store::paths;
+
+mod metrics;
 
 #[derive(Debug, Parser)]
 #[command(name = "verlinpadd", about = "VerlinPark local agent daemon")]
@@ -189,6 +191,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_http))
         .route(
             "/rpc",
             post(rpc_http).layer(axum::extract::DefaultBodyLimit::disable()),
@@ -212,6 +215,59 @@ async fn main() -> Result<()> {
 
 async fn health() -> Json<Value> {
     Json(json!({"ok": true, "version": APP_VERSION, "protocol": PROTOCOL_VERSION}))
+}
+
+/// Prometheus scrape endpoint. It uses the same loopback Bearer token as
+/// `/rpc`; Prometheus can send it through `authorization` in its scrape config.
+async fn metrics_http(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, &state.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "unauthorized\n",
+        )
+            .into_response();
+    }
+    match collect_daemon_metrics(&state).await {
+        Ok(metrics) => {
+            let body = metrics::render_prometheus(&metrics);
+            ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
+        }
+        Err(error) => {
+            warn!(%error, "failed to collect daemon metrics");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "metrics unavailable\n",
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn collect_daemon_metrics(state: &AppState) -> Result<DaemonMetrics> {
+    let store = state.engine.store().clone();
+    let snapshot = tokio::task::spawn_blocking(move || store.daemon_metrics_snapshot()).await??;
+    Ok(DaemonMetrics {
+        version: APP_VERSION.to_string(),
+        protocol: PROTOCOL_VERSION,
+        uptime_secs: state.started.elapsed().as_secs(),
+        projects: snapshot.projects,
+        sessions: snapshot.sessions,
+        plan_tasks: snapshot.plan_tasks,
+        merge_queue: snapshot.merge_queue,
+        intake: snapshot.intake,
+        continuations: snapshot.continuations,
+        recoveries: snapshot.recoveries,
+        memories: snapshot.memories,
+        memory_conflicts: snapshot.memory_conflicts,
+        runtime_leases: snapshot.runtime_leases,
+        tokens_in: snapshot.tokens_in,
+        tokens_out: snapshot.tokens_out,
+        cache_read_tokens: snapshot.cache_read_tokens,
+        cache_write_tokens: snapshot.cache_write_tokens,
+        cost_spent_usd: snapshot.cost_spent_usd,
+    })
 }
 
 const MAX_RPC_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -464,6 +520,19 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         ),
         "server.info" => match server_info(state).await {
             Ok(info) => RpcResponse::success(id, info),
+            Err(error) => internal_error(id, error),
+        },
+        "daemon.metrics" => match collect_daemon_metrics(state).await {
+            Ok(metrics) => {
+                let prometheus = metrics::render_prometheus(&metrics);
+                RpcResponse::success(
+                    id,
+                    DaemonMetricsResult {
+                        metrics,
+                        prometheus,
+                    },
+                )
+            }
             Err(error) => internal_error(id, error),
         },
         "project.add" => match parse_params::<AddProjectParams>(request.params) {

@@ -48,6 +48,12 @@ enum Command {
     Ping,
     /// Show daemon information.
     Info,
+    /// Show daemon metrics as JSON, or Prometheus text with --prometheus.
+    Metrics {
+        /// Print Prometheus text exposition format instead of JSON.
+        #[arg(long)]
+        prometheus: bool,
+    },
     /// List configured external ACP agents.
     AcpAgents,
     /// Add an external Agent Client Protocol (ACP) agent.
@@ -1195,6 +1201,22 @@ async fn main() -> Result<()> {
                     result["protocol"].as_u64().unwrap_or(0),
                     result["uptime_secs"].as_u64().unwrap_or(0)
                 );
+            }
+            return Ok(());
+        }
+        Command::Metrics { prometheus } => {
+            let result = rpc(&discovery, "daemon.metrics", json!({})).await?;
+            if prometheus {
+                let text = result
+                    .get("prometheus")
+                    .and_then(Value::as_str)
+                    .context("daemon.metrics returned no Prometheus text")?;
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+            } else {
+                print_json(result.get("metrics").unwrap_or(&result))?;
             }
             return Ok(());
         }
@@ -5647,4 +5669,27 @@ fn print_human(value: &Value) {
         "{}",
         serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_command_parses_prometheus_flag() {
+        // The full CLI command tree is large; parse on a test thread with more
+        // stack than libtest's default rather than relying on runner defaults.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "metrics", "--prometheus"]).unwrap();
+                match cli.command {
+                    Command::Metrics { prometheus } => assert!(prometheus),
+                    other => panic!("expected metrics command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

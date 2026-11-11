@@ -15,7 +15,7 @@ use vp_protocol::types::{
     ArtifactVersion, CheckpointRetentionPolicy, ContinuationOutcome, Event, IntakeTask,
     IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryConflict,
     MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry,
-    ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
+    MetricCount, ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
     OrchestrationRecovery, PlanTaskProgress, Project, ProjectBudget, ProjectUsageSession, Question,
     ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, ShellPolicy, Skill,
     Source, SourceChunk, SourceCollection, SourceSearchHit, SourceStats, SteeringMessage,
@@ -414,6 +414,28 @@ pub fn read_project_manifest(data_dir: &Path) -> Result<Vec<ProjectManifestSnaps
     let mut snapshots = latest.into_values().collect::<Vec<_>>();
     snapshots.sort_by(|left, right| left.project.created_at.cmp(&right.project.created_at));
     Ok(snapshots)
+}
+
+/// A read-only, low-cardinality snapshot for daemon metrics. Status/kind
+/// vectors are ordered lexicographically and capped so no export can grow with
+/// the number of sessions or tasks.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DaemonMetricsSnapshot {
+    pub projects: u64,
+    pub sessions: Vec<MetricCount>,
+    pub plan_tasks: Vec<MetricCount>,
+    pub merge_queue: Vec<MetricCount>,
+    pub intake: Vec<MetricCount>,
+    pub continuations: Vec<MetricCount>,
+    pub recoveries: Vec<MetricCount>,
+    pub memories: Vec<MetricCount>,
+    pub memory_conflicts: Vec<MetricCount>,
+    pub runtime_leases: Vec<MetricCount>,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_spent_usd: f64,
 }
 
 /// SQLite-backed metadata store plus an append-only JSONL event mirror.
@@ -7285,6 +7307,55 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// Read-only aggregate counts for daemon metrics. This deliberately returns
+    /// only bounded status/kind label sets and numeric totals: no session ids,
+    /// task ids, goals, paths, model names, or agent names.
+    pub fn daemon_metrics_snapshot(&self) -> Result<DaemonMetricsSnapshot> {
+        let conn = self.lock()?;
+        let projects: i64 =
+            conn.query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?;
+        let usage = conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0)
+             FROM usage_ledger",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, f64>(4)?,
+                ))
+            },
+        )?;
+        let (tokens_in, tokens_out, cache_read_tokens, cache_write_tokens, cost_spent_usd) = usage;
+        Ok(DaemonMetricsSnapshot {
+            projects: projects.max(0) as u64,
+            sessions: bounded_metric_counts(&conn, "sessions", "status")?,
+            plan_tasks: bounded_metric_counts(&conn, "plan_tasks", "status")?,
+            merge_queue: bounded_metric_counts(&conn, "merge_queue", "status")?,
+            intake: bounded_metric_counts(&conn, "intake_tasks", "status")?,
+            continuations: bounded_metric_counts(&conn, "session_continuations", "status")?,
+            recoveries: bounded_metric_counts(&conn, "orchestration_recoveries", "status")?,
+            memories: bounded_metric_counts(&conn, "memories", "status")?,
+            memory_conflicts: bounded_metric_counts(&conn, "memory_conflicts", "status")?,
+            runtime_leases: bounded_metric_counts(&conn, "runtime_leases", "kind")?,
+            tokens_in,
+            tokens_out,
+            cache_read_tokens,
+            cache_write_tokens,
+            cost_spent_usd: if cost_spent_usd.is_finite() {
+                cost_spent_usd.max(0.0)
+            } else {
+                0.0
+            },
+        })
+    }
+
     pub fn create_leader_agent(&self, session_id: &str, model: &str) -> Result<String> {
         Ok(self
             .create_agent(session_id, "leader", "Leader", None, None, model)?
@@ -13529,6 +13600,26 @@ fn like_memory_lexical(memory: &MemoryItem, query: &str) -> f64 {
         }
     }
     score.min(1.0)
+}
+
+/// Status/kind vocabularies are application-controlled, but cap the number of
+/// groups anyway so a corrupted or imported database cannot create unbounded
+/// metric cardinality. `table` and `column` are fixed call-site literals.
+const MAX_METRIC_GROUPS: usize = 64;
+
+fn bounded_metric_counts(conn: &Connection, table: &str, column: &str) -> Result<Vec<MetricCount>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {column}, COUNT(*) FROM {table}
+         GROUP BY {column} ORDER BY {column} ASC LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map(params![MAX_METRIC_GROUPS as i64], |row| {
+        let count: i64 = row.get(1)?;
+        Ok(MetricCount {
+            key: row.get(0)?,
+            count: count.max(0) as u64,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 fn memory_count_group(
