@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -436,6 +436,42 @@ pub struct DaemonMetricsSnapshot {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub cost_spent_usd: f64,
+}
+
+/// Copy a SQLite database with `VACUUM INTO`.
+///
+/// The source is opened read-only and the copy is a consistent point-in-time
+/// snapshot, including committed pages still living in the WAL. Only the
+/// database file is created at `destination`; no `-wal`/`-shm` sidecars are
+/// copied. The caller owns the destination and must ensure it does not exist.
+pub fn snapshot_database(database: &Path, destination: &Path) -> Result<()> {
+    if !database.is_file() {
+        return Err(anyhow!("database not found at {}", database.display()));
+    }
+    if destination.exists() {
+        return Err(anyhow!(
+            "refusing to overwrite existing database snapshot {}",
+            destination.display()
+        ));
+    }
+    let database_str = database
+        .to_str()
+        .ok_or_else(|| anyhow!("database path is not valid UTF-8: {}", database.display()))?;
+    let destination_str = destination.to_str().ok_or_else(|| {
+        anyhow!(
+            "snapshot path is not valid UTF-8: {}",
+            destination.display()
+        )
+    })?;
+    let conn = Connection::open_with_flags(database_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {} for snapshot", database.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    conn.execute("VACUUM INTO ?1", params![destination_str])
+        .with_context(|| format!("snapshotting {} with VACUUM INTO", database.display()))?;
+    drop(conn);
+    paths::ensure_private_file(destination)
+        .with_context(|| format!("setting permissions on {}", destination.display()))?;
+    Ok(())
 }
 
 /// SQLite-backed metadata store plus an append-only JSONL event mirror.

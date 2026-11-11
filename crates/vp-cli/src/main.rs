@@ -158,6 +158,24 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Back up the local data directory to a checksummed ZIP archive.
+    Backup {
+        /// Destination ZIP path.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Include content-addressed artifact blobs.
+        #[arg(long)]
+        include_artifacts: bool,
+    },
+    /// Restore a data-directory backup. The daemon must be stopped.
+    Restore {
+        /// Backup ZIP path.
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Replace an existing database, instance lock, or non-empty target.
+        #[arg(long)]
+        force: bool,
+    },
     /// Send a tiny live request to the configured provider.
     ProviderTest,
     /// List projects.
@@ -1187,9 +1205,37 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Command::Backup {
+        output,
+        include_artifacts,
+    } = &cli.command
+    {
+        let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
+        let report = vp_core::backup::create_backup(&data_dir, output, *include_artifacts)?;
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_human(&value);
+        }
+        return Ok(());
+    }
+    if let Command::Restore { input, force } = &cli.command {
+        let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
+        let report = vp_core::backup::restore_backup(input, &data_dir, *force)?;
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_human(&value);
+        }
+        return Ok(());
+    }
     let discovery = read_discovery(cli.data_dir.as_deref())?;
     let value = match cli.command {
         Command::DbRebuild { .. } => unreachable!("db rebuild is handled before discovery"),
+        Command::Backup { .. } => unreachable!("backup is handled before discovery"),
+        Command::Restore { .. } => unreachable!("restore is handled before discovery"),
         Command::Ping => {
             let result = rpc(&discovery, "ping", json!({})).await?;
             if cli.json {

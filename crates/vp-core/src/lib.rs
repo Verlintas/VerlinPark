@@ -71,6 +71,7 @@ use crate::budget::BudgetRegistry;
 
 pub mod acp;
 pub mod agent;
+pub mod backup;
 pub mod browser;
 pub mod budget;
 pub mod console;
