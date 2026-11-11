@@ -1486,10 +1486,41 @@ async fn auto_resolves_a_conflicted_merge_with_an_agent() {
             .any(|agent| { agent.name == "Conflict Resolver" && agent.status == "idle" })
     );
     let sessions = engine
-        .list_sessions(Some(session.project_id))
+        .list_sessions(Some(session.project_id.clone()))
         .await
         .unwrap();
     assert_eq!(sessions[0].status, "idle");
+    let integration_memories = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("integration"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(integration_memories.len(), 1);
+    assert_eq!(
+        integration_memories[0].title,
+        format!("Integration {} resolution", queue[0].id)
+    );
+    assert_eq!(integration_memories[0].source, "orchestrator");
+    assert!(integration_memories[0].body.starts_with("resolved: true"));
+    assert!(integration_memories[0].body.contains("outcome: merged;"));
+    assert!(
+        integration_memories[0]
+            .evidence
+            .iter()
+            .any(|evidence| { evidence.kind == "commit" && evidence.reference == resolved.commit })
+    );
+    assert!(
+        integration_memories[0]
+            .evidence
+            .iter()
+            .any(|evidence| { evidence.kind == "task" && evidence.reference == "T1" })
+    );
 }
 
 #[tokio::test]
@@ -9768,5 +9799,502 @@ async fn task_result_memory_carries_evidence_and_retries_supersede() {
     assert_eq!(
         superseded[0].superseded_by.as_deref(),
         Some(active[0].id.as_str())
+    );
+}
+
+async fn memory_capture_fixture() -> (TempDir, TempDir, Engine, Session) {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    std::fs::write(repo.path().join("README.md"), "memory\n").unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("capture".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "verification work".into(), None)
+        .await
+        .unwrap();
+    (data, repo, engine, session)
+}
+
+fn capture_verdict(approved: bool, summary: &str) -> super::VerifierVerdict {
+    super::VerifierVerdict {
+        approved,
+        summary: summary.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn verification_memory_captures_approved_verdict_with_evidence() {
+    let (_data, _repo, engine, session) = memory_capture_fixture().await;
+    let policy = vp_protocol::types::MemoryPolicy {
+        default_verify_days: Some(7),
+        ..vp_protocol::types::MemoryPolicy::default()
+    };
+    engine
+        .set_memory_policy(&session.project_id, policy)
+        .await
+        .unwrap();
+    super::record_verification_memory(
+        &engine,
+        &session.id,
+        Some("T1"),
+        "Worker 1",
+        "abcdef1234567890",
+        &capture_verdict(true, "Tests pass and the diff matches the task."),
+        Some("merged; integration checks passed"),
+    )
+    .await;
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("verification"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    let memory = &active[0];
+    assert_eq!(memory.title, "Task T1 verification");
+    assert_eq!(memory.kind, "verification");
+    assert_eq!(memory.source, "verifier");
+    assert!(memory.tags.contains(&"T1".to_string()));
+    assert!(memory.tags.contains(&"verification".to_string()));
+    assert!(memory.body.contains("approved: true"));
+    assert!(memory.body.contains("verdict: Tests pass"));
+    assert!(memory.body.contains("integration: merged;"));
+    assert!(memory.body.contains("commit: abcdef1234567890"));
+    assert!(
+        memory
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == "task" && evidence.reference == "T1")
+    );
+    assert!(
+        memory
+            .evidence
+            .iter()
+            .any(|evidence| { evidence.kind == "session" && evidence.reference == session.id })
+    );
+    assert!(
+        memory.evidence.iter().any(|evidence| {
+            evidence.kind == "commit" && evidence.reference == "abcdef1234567890"
+        })
+    );
+    let verify_after = memory.verify_after.as_deref().expect("verify_after");
+    let when =
+        time::OffsetDateTime::parse(verify_after, &time::format_description::well_known::Rfc3339)
+            .unwrap();
+    let days = (when - time::OffsetDateTime::now_utc()).whole_days();
+    assert!((6..=7).contains(&days), "unexpected TTL: {days} days");
+}
+
+#[tokio::test]
+async fn verification_memory_never_claims_success_for_a_rejection() {
+    let (_data, _repo, engine, session) = memory_capture_fixture().await;
+    super::record_verification_memory(
+        &engine,
+        &session.id,
+        Some("T2"),
+        "Worker 2",
+        "deadbeefdeadbeef",
+        &capture_verdict(false, "Acceptance criteria are not met."),
+        None,
+    )
+    .await;
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("verification"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    let body = &active[0].body;
+    assert!(body.contains("approved: false"));
+    assert!(!body.contains("approved: true"));
+    assert!(!body.contains("merged"));
+    assert!(!body.contains("integration:"));
+    assert!(body.contains("verdict: Acceptance criteria are not met."));
+    assert!(body.contains("commit: deadbeefdeadbeef"));
+}
+
+#[tokio::test]
+async fn changed_verification_verdict_supersedes_the_previous_memory() {
+    let (_data, _repo, engine, session) = memory_capture_fixture().await;
+    super::record_verification_memory(
+        &engine,
+        &session.id,
+        Some("T3"),
+        "Worker 3",
+        "1111111111111111",
+        &capture_verdict(true, "Initial verdict."),
+        Some("merged; ok"),
+    )
+    .await;
+    super::record_verification_memory(
+        &engine,
+        &session.id,
+        Some("T3"),
+        "Worker 3",
+        "2222222222222222",
+        &capture_verdict(false, "Re-verification found a regression."),
+        None,
+    )
+    .await;
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("verification"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(
+        active[0]
+            .body
+            .contains("Re-verification found a regression.")
+    );
+    assert_eq!(active[0].supersedes.len(), 1);
+    let superseded = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("verification"),
+            Some("superseded"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(superseded.len(), 1);
+    assert!(superseded[0].body.contains("Initial verdict."));
+    assert_eq!(
+        superseded[0].superseded_by.as_deref(),
+        Some(active[0].id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn identical_verification_capture_is_idempotent() {
+    let (_data, _repo, engine, session) = memory_capture_fixture().await;
+    let verdict = capture_verdict(true, "Same verdict.");
+    for _ in 0..2 {
+        super::record_verification_memory(
+            &engine,
+            &session.id,
+            Some("T4"),
+            "Worker 4",
+            "3333333333333333",
+            &verdict,
+            Some("merged; stable"),
+        )
+        .await;
+    }
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("verification"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    let events = engine
+        .list_events(session.id.clone(), 0, 1_000)
+        .await
+        .unwrap();
+    let created = events
+        .iter()
+        .filter(|event| {
+            event.kind == "memory.created" && event.payload["title"] == "Task T4 verification"
+        })
+        .count();
+    assert_eq!(created, 1);
+    assert!(!events.iter().any(|event| event.kind == "memory.superseded"));
+}
+
+#[tokio::test]
+async fn integration_resolution_memory_carries_evidence_and_supersedes() {
+    let (_data, _repo, engine, session) = memory_capture_fixture().await;
+    super::record_integration_resolution_memory(
+        &engine,
+        &session.id,
+        "entry-1",
+        Some("T5"),
+        "4444444444444444",
+        "Resolution verified.",
+        "2 path(s): src/lib.rs, src/main.rs; resolver: kept both sides",
+        "merged; integration checks passed",
+    )
+    .await;
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("integration"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    let memory = &active[0];
+    assert_eq!(memory.title, "Integration entry-1 resolution");
+    assert_eq!(memory.source, "orchestrator");
+    assert!(memory.body.starts_with("resolved: true"));
+    assert!(memory.body.contains("verifier: Resolution verified."));
+    assert!(memory.body.contains("commit: 4444444444444444"));
+    assert!(memory.body.contains("conflict: 2 path(s)"));
+    assert!(memory.body.contains("outcome: merged;"));
+    assert!(
+        memory
+            .evidence
+            .iter()
+            .any(|evidence| { evidence.kind == "session" && evidence.reference == session.id })
+    );
+    assert!(
+        memory.evidence.iter().any(|evidence| {
+            evidence.kind == "commit" && evidence.reference == "4444444444444444"
+        })
+    );
+    assert!(
+        memory
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == "task" && evidence.reference == "T5")
+    );
+
+    super::record_integration_resolution_memory(
+        &engine,
+        &session.id,
+        "entry-1",
+        Some("T5"),
+        "5555555555555555",
+        "Resolution verified again.",
+        "2 path(s): src/lib.rs, src/main.rs; resolver: retried resolution",
+        "integration failed: session worktree is dirty",
+    )
+    .await;
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("integration"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(active[0].body.contains("Resolution verified again."));
+    assert!(active[0].body.contains("integration failed"));
+    assert_eq!(active[0].supersedes.len(), 1);
+    let superseded = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("integration"),
+            Some("superseded"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(superseded.len(), 1);
+    assert!(superseded[0].body.contains("outcome: merged;"));
+}
+
+#[tokio::test]
+async fn failed_integration_is_not_described_as_merged() {
+    let (_data, _repo, engine, session) = memory_capture_fixture().await;
+    super::record_verification_memory(
+        &engine,
+        &session.id,
+        None,
+        "ACP Resolver",
+        "9999999999999999",
+        &capture_verdict(true, "Approved but the merge preflight failed."),
+        Some("integration failed: session worktree is dirty"),
+    )
+    .await;
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("verification"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    let memory = &active[0];
+    assert_eq!(memory.title, "Worker ACP Resolver verification 99999999");
+    assert!(memory.body.contains("approved: true"));
+    assert!(memory.body.contains("integration: integration failed:"));
+    assert!(!memory.body.contains("merged"));
+    assert!(
+        !memory
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == "task")
+    );
+    assert!(
+        memory.evidence.iter().any(|evidence| {
+            evidence.kind == "commit" && evidence.reference == "9999999999999999"
+        })
+    );
+}
+
+#[tokio::test]
+async fn task_scoped_verification_memory_appears_in_the_brief_once() {
+    let (_data, _repo, engine, session) = memory_capture_fixture().await;
+    super::record_verification_memory(
+        &engine,
+        &session.id,
+        Some("T6"),
+        "Worker 6",
+        "6666666666666666",
+        &capture_verdict(true, "Task-scoped verification passed."),
+        Some("merged; checks passed"),
+    )
+    .await;
+    let active = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("verification"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    let memory_id = active[0].id.clone();
+    let brief = engine.memory_brief(&session.id, Some("T6")).await.unwrap();
+    assert!(brief.text.contains("Task T6 verification"));
+    assert!(
+        brief
+            .memories
+            .iter()
+            .any(|memory| memory.memory.id == memory_id)
+    );
+    let used = engine.store().get_memory(&memory_id).unwrap().unwrap();
+    assert_eq!(used.use_count, 1);
+    engine.memory_brief(&session.id, Some("T6")).await.unwrap();
+    let used_again = engine.store().get_memory(&memory_id).unwrap().unwrap();
+    assert_eq!(used_again.use_count, 1);
+    let events = engine
+        .list_events(session.id.clone(), 0, 1_000)
+        .await
+        .unwrap();
+    let used_events = events
+        .iter()
+        .filter(|event| {
+            event.kind == "memory.used" && event.payload["title"] == "Task T6 verification"
+        })
+        .count();
+    assert_eq!(used_events, 1);
+}
+
+#[tokio::test]
+async fn unrelated_verification_does_not_outrank_a_same_task_result() {
+    let (_data, _repo, engine, session) = memory_capture_fixture().await;
+    super::record_verification_memory(
+        &engine,
+        &session.id,
+        Some("T8"),
+        "Worker 8",
+        "8888888888888888",
+        &capture_verdict(true, "Unrelated verification passed."),
+        Some("merged; checks passed"),
+    )
+    .await;
+    let unrelated = engine
+        .store()
+        .list_memories_filtered(
+            &session.project_id,
+            None,
+            Some("verification"),
+            Some("active"),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(unrelated.len(), 1);
+    let task_result = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "worker-7",
+            "Worker",
+            "task_result",
+            "Task T7 result",
+            "Task T7 completed with deterministic tests.",
+            vec!["T7".to_string(), "task_result".to_string()],
+            "task_result",
+            vec![
+                vp_protocol::types::MemoryEvidence {
+                    kind: "task".to_string(),
+                    reference: "T7".to_string(),
+                    note: None,
+                },
+                vp_protocol::types::MemoryEvidence {
+                    kind: "session".to_string(),
+                    reference: session.id.clone(),
+                    note: None,
+                },
+            ],
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let search = engine
+        .memory_search(vp_protocol::types::MemorySearchParams {
+            project_id: session.project_id.clone(),
+            query: "verification T7".to_string(),
+            kind: None,
+            kinds: Vec::new(),
+            task_id: Some("T7".to_string()),
+            department: None,
+            paths: Vec::new(),
+            limit: Some(10),
+            include_stale: false,
+            max_chars: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(search.memories[0].memory.id, task_result.id);
+    let unrelated_position = search
+        .memories
+        .iter()
+        .position(|memory| memory.memory.id == unrelated[0].id);
+    assert!(
+        unrelated_position.is_none_or(|position| position > 0),
+        "unrelated verification outranked the same-task result"
     );
 }

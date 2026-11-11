@@ -9,8 +9,8 @@
 //! - exact task evidence/tag match ................... 0.60
 //! - path evidence/tag prefix overlap ................ 0.15 each, cap 0.45
 //! - department tag/evidence match ................... 0.20
-//! - kind weight .................................... 0.02–0.30
-//! - source weight .................................. 0.00–0.20
+//! - kind weight (verification 0.24, integration 0.22) 0.02–0.30
+//! - source weight (verifier 0.18) .................. 0.00–0.20
 //! - recency (30-day half-life) ...................... 0.00–0.25
 //! - observed usage (`ln(1+use_count)`) .............. 0.03 each, cap 0.15
 //! - pinned ......................................... 0.50
@@ -362,6 +362,8 @@ fn kind_weight(kind: &str) -> f64 {
         "decision" => 0.30,
         "convention" => 0.28,
         "handoff" => 0.26,
+        "verification" => 0.24,
+        "integration" => 0.22,
         "fact" => 0.20,
         "task_result" => 0.15,
         "scratch" => 0.02,
@@ -373,6 +375,7 @@ fn kind_weight(kind: &str) -> f64 {
 fn source_weight(source: &str) -> f64 {
     match source {
         "operator" => 0.20,
+        "verifier" => 0.18,
         "task_result" => 0.15,
         "orchestrator" => 0.12,
         "agent" => 0.05,
@@ -439,6 +442,14 @@ mod tests {
             memory,
             lexical,
             fts: true,
+        }
+    }
+
+    fn evidence(kind: &str, reference: &str) -> MemoryEvidence {
+        MemoryEvidence {
+            kind: kind.to_string(),
+            reference: reference.to_string(),
+            note: None,
         }
     }
 
@@ -587,5 +598,191 @@ mod tests {
         let ranked = rank_candidates(vec![candidate(used, 0.0)], &query, now(), false);
         assert!(ranked[0].reasons.iter().any(|reason| reason == "used:9"));
         assert!(ranked[0].score > 0.0);
+    }
+
+    #[test]
+    fn exact_task_evidence_beats_a_recent_generic_fact() {
+        let mut task = memory("m-task", "fact", "Task fact", "2026-01-01T00:00:00Z");
+        task.evidence = vec![evidence("task", "T3")];
+        let generic = memory("m-generic", "fact", "Generic fact", "2026-11-10T00:00:00Z");
+        let query = MemoryQuery {
+            text: "fact".to_string(),
+            task_id: Some("T3".to_string()),
+            ..MemoryQuery::default()
+        };
+        // Equal lexical relevance: the exact task evidence must beat the much
+        // fresher generic fact.
+        let ranked = rank_candidates(
+            vec![
+                candidate(generic, LEXICAL_WEIGHT),
+                candidate(task, LEXICAL_WEIGHT),
+            ],
+            &query,
+            now(),
+            false,
+        );
+        assert_eq!(ranked[0].memory.id, "m-task");
+        assert!(ranked[0].reasons.iter().any(|reason| reason == "task:T3"));
+        assert!(ranked[1].reasons.iter().any(|reason| reason == "recent"));
+    }
+
+    #[test]
+    fn path_prefix_overlap_boosts_a_task_write_scope_match() {
+        let mut scoped = memory("m-scoped", "fact", "Scoped", "2026-11-10T00:00:00Z");
+        scoped.evidence = vec![evidence("path", "src/api")];
+        let other = memory("m-other", "fact", "Other", "2026-11-10T00:00:00Z");
+        let query = MemoryQuery {
+            paths: vec!["src/api/handlers".to_string()],
+            ..MemoryQuery::default()
+        };
+        let ranked = rank_candidates(
+            vec![candidate(other, 0.2), candidate(scoped, 0.2)],
+            &query,
+            now(),
+            false,
+        );
+        assert_eq!(ranked[0].memory.id, "m-scoped");
+        assert!(
+            ranked[0]
+                .reasons
+                .iter()
+                .any(|reason| reason == "path:src/api/handlers")
+        );
+        assert!(ranked[1].score < ranked[0].score);
+    }
+
+    #[test]
+    fn pinned_beats_an_otherwise_equal_unpinned_memory() {
+        let mut pinned = memory("m-pinned", "fact", "Pinned", "2026-01-01T00:00:00Z");
+        pinned.pinned = true;
+        let unpinned = memory("m-unpinned", "fact", "Unpinned", "2026-11-10T00:00:00Z");
+        let query = MemoryQuery::default();
+        let ranked = rank_candidates(
+            vec![candidate(unpinned, 0.3), candidate(pinned, 0.3)],
+            &query,
+            now(),
+            false,
+        );
+        assert_eq!(ranked[0].memory.id, "m-pinned");
+        assert!(ranked[0].reasons.iter().any(|reason| reason == "pinned"));
+        assert!(!ranked[1].reasons.iter().any(|reason| reason == "pinned"));
+    }
+
+    #[test]
+    fn stale_memories_are_excluded_by_default_and_penalized_when_included() {
+        let fresh = memory("m-fresh", "fact", "Fresh", "2026-11-10T00:00:00Z");
+        let mut stale = fresh.clone();
+        stale.id = "m-stale".to_string();
+        stale.status = "stale".to_string();
+        let query = MemoryQuery::default();
+
+        let excluded = rank_candidates(vec![candidate(stale.clone(), 0.5)], &query, now(), false);
+        assert!(excluded.is_empty());
+
+        let ranked = rank_candidates(
+            vec![candidate(fresh, 0.5), candidate(stale, 0.5)],
+            &query,
+            now(),
+            true,
+        );
+        assert_eq!(ranked[0].memory.id, "m-fresh");
+        assert_eq!(ranked[1].memory.id, "m-stale");
+        assert!(ranked[1].reasons.iter().any(|reason| reason == "stale"));
+        let expected = ranked[0].score * STALE_PENALTY;
+        assert!((ranked[1].score - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn usage_boost_is_capped() {
+        let mut low = memory("m-low", "fact", "Low", "2026-11-10T00:00:00Z");
+        low.use_count = 10_000;
+        let mut high = memory("m-high", "fact", "High", "2026-11-10T00:00:00Z");
+        high.use_count = 10_000_000;
+        let ranked = rank_candidates(
+            vec![candidate(low, 0.4), candidate(high, 0.4)],
+            &MemoryQuery::default(),
+            now(),
+            false,
+        );
+        assert!(ranked.iter().all(|matched| {
+            matched
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("used:"))
+        }));
+        // Both usage contributions saturate at USAGE_CAP, so the scores tie
+        // despite the wildly different counts.
+        assert!((ranked[0].score - ranked[1].score).abs() < 1e-12);
+        assert_eq!(ranked[0].memory.id, "m-high");
+        assert_eq!(ranked[1].memory.id, "m-low");
+    }
+
+    #[test]
+    fn deterministic_tie_break_uses_score_created_at_and_id() {
+        let mut pinned = memory("m-z", "fact", "Pinned", "2026-01-01T00:00:00Z");
+        pinned.pinned = true;
+        let a = memory("m-a", "fact", "A", "2026-11-10T00:00:00Z");
+        let b = memory("m-b", "fact", "B", "2026-11-10T00:00:00Z");
+        let c = memory("m-c", "fact", "C", "2026-09-01T00:00:00Z");
+        let query = MemoryQuery::default();
+        let ranked = rank_candidates(
+            vec![
+                candidate(c.clone(), 0.2),
+                candidate(b.clone(), 0.2),
+                candidate(a.clone(), 0.2),
+                candidate(pinned, 0.2),
+            ],
+            &query,
+            now(),
+            false,
+        );
+        let ids = ranked
+            .iter()
+            .map(|matched| matched.memory.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["m-z", "m-a", "m-b", "m-c"]);
+
+        let mut again_matches = vec![
+            candidate(c, 0.2),
+            candidate(b, 0.2),
+            candidate(a, 0.2),
+            candidate(memory("m-z", "fact", "Pinned", "2026-01-01T00:00:00Z"), 0.2),
+        ];
+        for matched in &mut again_matches {
+            if matched.memory.id == "m-z" {
+                matched.memory.pinned = true;
+            }
+        }
+        let again = rank_candidates(again_matches, &query, now(), false);
+        assert_eq!(ranked, again);
+    }
+
+    #[test]
+    fn brief_drops_an_item_instead_of_truncating_its_prefix() {
+        let mut first = memory("m-first", "fact", "First", "2026-11-10T00:00:00Z");
+        first.body = "A".repeat(80);
+        let second = memory(
+            "m-second",
+            "fact",
+            "Second title that should be dropped",
+            "2026-11-10T00:00:00Z",
+        );
+        let matches = vec![
+            MemoryMatch {
+                memory: first,
+                score: 2.0,
+                reasons: Vec::new(),
+            },
+            MemoryMatch {
+                memory: second,
+                score: 1.0,
+                reasons: Vec::new(),
+            },
+        ];
+        let selection = select_brief(&matches, 130);
+        assert_eq!(selection.memories.len(), 1);
+        assert!(selection.text.contains("[fact·agent] First"));
+        assert!(!selection.text.contains("Second"));
+        assert!(selection.text.chars().count() <= 130);
     }
 }
