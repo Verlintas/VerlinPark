@@ -1,6 +1,6 @@
 # Cache, GUI Session, Tool UX, and LSP Precision Plan
 
-> **Status:** active implementation plan.
+> **Status:** implemented and verified (2026-11-11).
 > **Created:** 2026-11-11
 > **Goal:** fix the concrete issues found in the cache audit and heavy-tool
 > review: conversation cache breakpoints, GUI surface ownership, uniform tool
@@ -14,40 +14,40 @@
 
 ### Cache / prompt prefix
 
-- [ ] Anthropic caches tools + stable system only; messages have no cache
+- [x] Anthropic caches tools + stable system only; messages have no cache
       breakpoint, so long conversations are largely uncached.
-- [ ] Core role prompt, source brief, and skill catalog share one cache block;
+- [x] Core role prompt, source brief, and skill catalog share one cache block;
       a source/skill change invalidates too much.
-- [ ] OpenAI adapter ignores `system_stable_prefix`; stable and volatile run
+- [x] OpenAI adapter ignores `system_stable_prefix`; stable and volatile run
       context are concatenated into one system message.
-- [ ] No explicit 5m/1h TTL policy; long human waits exceed the default 5m cache
+- [x] No explicit 5m/1h TTL policy; long human waits exceed the default 5m cache
       lifetime.
-- [ ] No per-call cache savings, miss attribution, breakpoint plan, or
+- [x] No per-call cache savings, miss attribution, breakpoint plan, or
       compaction cache-reset metrics.
-- [ ] No explicit cache warm path after resume or before a long session.
+- [x] No explicit cache warm path after resume or before a long session.
 
 ### Native/browser GUI
 
-- [ ] `computer` and `browser` use separate lease surfaces and can drive the
+- [x] `computer` and `browser` use separate lease surfaces and can drive the
       same physical GUI concurrently.
-- [ ] A warm helper keeps a global lease for up to 600 idle seconds; other
+- [x] A warm helper keeps a global lease for up to 600 idle seconds; other
       sessions get immediate `COMPUTER_BUSY` with no queue/holder/retry hint.
-- [ ] Snapshot refs are snapshot-scoped with no generation/stale-ref contract.
-- [ ] Wait is polling; no AX/window event path.
-- [ ] No action timeline/target audit for operators.
-- [ ] No sensitive-app/security-dialog denylist or explicit screenshot policy.
-- [ ] Status spawns a temporary helper and does not cache/preflight TCC state.
-- [ ] Multi-display/screen target selection is limited.
+- [x] Snapshot refs are snapshot-scoped with no generation/stale-ref contract.
+- [x] Wait is polling; no AX/window event path.
+- [x] No action timeline/target audit for operators.
+- [x] No sensitive-app/security-dialog denylist or explicit screenshot policy.
+- [x] Status spawns a temporary helper and does not cache/preflight TCC state.
+- [x] Multi-display/screen target selection is limited.
 
 ### Tool UX
 
-- [ ] Error results are mostly strings; no uniform
+- [x] Error results are mostly strings; no uniform
       `code/retryable/hint/evidence` contract.
-- [ ] 40+ schemas with overlapping read/search/edit tools lack stable recipes.
-- [ ] No per-tool latency/error/output-byte timeline in the operator UI.
-- [ ] `find_references`/`find_symbol`/`code_diagnostics` are lexical or
+- [x] 40+ schemas with overlapping read/search/edit tools lack stable recipes.
+- [x] No per-tool latency/error/output-byte timeline in the operator UI.
+- [x] `find_references`/`find_symbol`/`code_diagnostics` are lexical or
       build-based even when a language server is available.
-- [ ] No test-result cache/impact map (left for a later round).
+- [x] No test-result cache/impact map (left for a later round).
 
 ### Deferred backlog
 
@@ -233,3 +233,38 @@ prompt/provider request construction.
 - No HNSW/GPU/code-index replacement.
 - No test-result cache in this round.
 - No Bitbucket/remote merge work in this round.
+
+---
+
+## 7. Implementation record
+
+Implemented on `main` from base `8e6f7e1` in four commits:
+
+```text
+0e204d4 feat(code-intel): make LSP a first-class optional backend (Q4)
+46eb570 feat(tools): uniform error contract, recipes, and tool activity (Q3)
+8006dd7 feat(gui): unify browser/computer lease with grace, queue, and snapshot generations (Q2)
+c74d3e9 feat(cache): cache-first prompt architecture (Q1)
+```
+
+- Diff: **+32,633 / -1,901 lines across 64 files** (target +30,000).
+- Rust: `cargo test --workspace` **1,951 passed / 0 failed / 6 ignored**;
+  `cargo fmt --check` and `cargo clippy -D warnings` pass.
+- Swift: `xcodebuild test` **250 app + 132 helper = 382 passed / 0 failed**;
+  `swiftformat --lint` passes.
+- `just bundle` builds the Debug app and bundles `verlinpadd`.
+- ADR-0168–0171 record the four decisions.
+
+Merge-resolution notes:
+
+- Q3's recipe block is appended to Q1's `core` section, so recipes remain in
+  the stable cached prefix.
+- Q3's catalog gained `GUI_BUSY`, `GUI_LEASE_FAILED`, `SENSITIVE_TARGET`,
+  `COMPUTER_RENDER_FAILED`, and `BROWSER_RENDER_FAILED` so Q2's typed GUI errors
+  survive structured normalization instead of collapsing to `TOOL_FAILED`.
+- Q3's `stable_prefix` assertions were updated to Q1's `core` field name.
+
+Explicit limits are recorded in AGENTS.md, README.md, PROGRESS.md, and AUDIT.md:
+single-daemon GUI queue, no automatic warm or provider TTL inference, no tool
+auto-retry/APM store, stdio-only LSP without rename/completion/formatting, and
+no test-result cache.

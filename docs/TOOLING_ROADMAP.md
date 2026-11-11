@@ -1,6 +1,6 @@
 # VerlinPark Agent Tooling Roadmap
 
-> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, sandboxed WKWebView browser + ComputerLease, runtime introspection, native macOS computer control, explicit SSH/stdio remote workspaces, tool-output paging, compaction budgets, fenced leases, hybrid memory, a cost-per-solved-task harness, ACP Streamable HTTP/WebSocket, IVF ANN memory, and encrypted incremental backups implemented on 2026-11-11; see ADR-0134/0136/0137/0155–0167.<br>
+> **Status:** Wave A/B/C, optional LSP and LSP-first symbol/reference/diagnostic tools, provider search, document/data readers, office documents, sandboxed WKWebView browser + unified GUI lease, runtime introspection, native macOS computer control, explicit SSH/stdio remote workspaces, tool-output paging, compaction budgets, fenced leases, hybrid memory, a cost-per-solved-task harness, ACP Streamable HTTP/WebSocket, IVF ANN memory, encrypted incremental backups, cache-first prompt sections/TTL/warm-plan-audit, and uniform tool errors/recipes/activity implemented on 2026-11-11; see ADR-0134/0136/0137/0155–0171.<br>
 > **Date:** 2026-11-11<br>
 > **Code baseline:** 2026-11-11 tooling + long-task runtime wave; see ADR-0134/0136/0137/0155–0158.<br>
 > **Implementation budget:** ~10,000–30,000 code lines, target core ~24k, hard planning cap 30k<br>
@@ -56,18 +56,21 @@ Implemented in this wave (see ADR-0134/0136/0137 and PROGRESS):
 
 Implemented browser: a daemon-launched WKWebView helper under its own Seatbelt
 profile, with localhost/worktree navigation, DOM snapshots, input, console,
-approval-gated `evaluate`, viewport screenshots, and a daemon-wide
-`ComputerLease`. See ADR-0137 for the exact boundaries: page JavaScript is not
-network-isolated, the browser requires a GUI session, and the lease is
-single-daemon, fail-fast, and not a distributed fencing token.
+approval-gated `evaluate`, viewport screenshots, and a daemon-wide `gui` lease
+shared with native computer. See ADR-0137 for the exact boundaries: page
+JavaScript is not network-isolated, the browser requires a GUI session, and the
+lease is single-daemon with a bounded FIFO wait, post-action grace, and
+snapshot generations, not a distributed fencing token.
 
 Implemented native computer control: a packaged Accessibility/CGEvent/
 ScreenCaptureKit helper, bounded AX snapshots with secure-field redaction,
 input actions, artifact screenshots, and a risk-classified `computer` tool under
-the same daemon-wide `ComputerLease`. See ADR-0158. The helper is not a
+the same daemon-wide `gui` lease. See ADR-0158 and ADR-0169. The helper is not a
 sandbox: it runs with the logged-in user's TCC/CGEvent authority, requires
-manual Accessibility and Screen Recording grants, AX trees/refs vary by app, and
-GUI/TCC behavior is manual-smoke tested rather than CI-covered.
+manual Accessibility and Screen Recording grants, AX trees vary by app, refs are
+bound to a snapshot generation and stale refs fail closed, sensitive targets are
+denied or approval-gated, and GUI/TCC behavior is manual-smoke tested rather
+than CI-covered.
 
 Implemented remote workspaces: the `vp-remote` crate and `vp-remote-agent`
 helper provide bounded NDJSON JSON-RPC over stdio or SSH, a canonical-root path
@@ -668,15 +671,20 @@ architecture" loop.
 - Prefer an already-running LSP; otherwise resolve a project task (`check` or
   `lint`) and parse errors. Return a clear "no diagnostics available" state.
 
-`lsp_query` (P2, optional):
+`lsp_query` (shipped, optional):
 
-- Actions: `definition`, `references`, `hover`, `symbols`, `rename` (write,
-  approval-gated), `code_action` (write, approval-gated).
-- Manage one LSP server per language/worktree/session with idle shutdown.
+- Actions: `definition`, `references`, `hover`, `symbols`, `workspace_symbols`,
+  `diagnostics`, `capabilities`, `status`.
+- `find_symbol`, `find_references`, and `code_diagnostics` can use the same
+  backend; every result labels `source: lsp|lexical|build`, confidence, backend
+  method, and fallback reason.
+- Manage one LSP server per language/worktree/session with idle shutdown,
+  bounded frames, timeout/cancel, crash restart, and cooldown.
 - Discover common servers (`rust-analyzer`, `sourcekit-lsp`,
   `typescript-language-server`, `pyright-langserver`, `gopls`, `clangd`) from
-  PATH; never auto-install.
-- LSP is an optimization; tree-sitter/regex is the fallback.
+  PATH; never auto-install. Missing servers return `LSP_UNAVAILABLE` with hints.
+- LSP is an optimization; lexical/build fallback is explicit. Rename,
+  completion, formatting, code actions, and signature help are not implemented.
 
 **LOC:** 1,200–2,200 combined, depending on LSP scope.
 
@@ -844,12 +852,12 @@ inspection/close are read-only.)
 - `screenshot` stores an artifact, returns dimensions and optional OCR text.
 - `console` returns bounded logs; network inspection is opt-in.
 - `evaluate` JavaScript is an explicit approval-gated action, not the default.
-- ComputerLease serializes browser use per machine/session.
+- The shared GUI lease serializes browser and native computer use per daemon.
 - Local URLs only by default; external navigation requires policy.
 
 **Decision:** WKWebView helper selected over Chrome/CDP or a Playwright sidecar;
 see ADR-0137. The helper runs under a write-confined Seatbelt profile and is
-serialized by `ComputerLease`.
+serialized by the shared `gui` lease with a bounded wait queue and post-action grace.
 
 **Implemented boundaries:** localhost/worktree `file:` navigation only; DOM
 snapshot rather than native AX; synthetic input; viewport-only screenshots;
@@ -871,7 +879,7 @@ single-daemon fail-fast lease with no queue or fairness policy.
   `ax-…` refs; secure/password fields are redacted.
 - Screenshots are bounded PNG artifacts under daemon scratch, never unbounded
   inline model data.
-- `ComputerLease` serializes native GUI and browser access on this daemon.
+- The shared `gui` lease serializes native GUI and browser access on this daemon, with snapshot generations and stale-ref rejection.
 - Never type secrets into arbitrary apps without approval.
 - Destructive key combinations (cmd+q, cmd+shift+delete, …) are classified
   Destructive; focus/input is HostState; read-only inspection is External.
@@ -1014,7 +1022,7 @@ Exit criteria:
 
 ### Wave D — "UI/computer" (shipped)
 
-The browser slice shipped with a WKWebView helper and `ComputerLease`; native
+The browser slice shipped with a WKWebView helper and a daemon lease (now the unified `gui` lease); native
 `computer` control and remote SSH workspaces shipped in the 2026-11-11 long-task
 runtime round (ADR-0156/0158). Both remain bounded by the documented trust
 model: browser page JavaScript is not network-isolated, and native GUI control
@@ -1060,6 +1068,7 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 [x] C-07 dependency_graph
 [x] C-08 build_context
 [x] C-05 lsp_query
+[x] C-05b LSP backend for find_symbol/find_references/code_diagnostics with `lsp`/`lexical`/`build` labels
 
 [x] S-01 process
 [x] S-02 wait_for
@@ -1075,7 +1084,7 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 [x] T-04 task_control
 [x] D-01 data_query
 
-[x] U-01 browser (WKWebView helper + ComputerLease; see ADR-0137)
+[x] U-01 browser (WKWebView helper + shared GUI lease; see ADR-0137/0169)
 [x] U-02 computer (native macOS AX/CGEvent/ScreenCaptureKit; ADR-0158)
 [x] remote_read/write/list/exec/git/worktree (SSH/stdio; ADR-0156)
 [x] read_tool_output (spilled tool output paging; ADR-0159)

@@ -1,12 +1,156 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
 
 ---
+
+## 2026-11-11 Quality round: cache-first prompt, GUI session, tool errors, LSP intelligence
+
+这一轮针对缓存审计和重型工具审查发现的具体问题，交付 Q1–Q4 四条线；
+全部保持 deterministic Rust、事件先行，不绕过 approval / Seatbelt / path jail /
+write scope / Verifier / merge / capacity / budget gate。计划与验收清单见
+[QUALITY_CACHE_GUI_TOOLING_PLAN.md](QUALITY_CACHE_GUI_TOOLING_PLAN.md)，
+决策见 ADR-0168–0171。基线 `8e6f7e1`，本轮 **+32,633 / -1,901 行，64 个文件**。
+
+### Q1 cache-first prompt architecture
+
+- Prompt 拆成 `core`（role charter、security/output contract、稳定 convention）、
+  `project`（source brief + skill catalog）、`volatile`（run context、objective、
+  memory brief）三段；保留合并 `system` 兼容，同时把分段边界传给 provider。
+- `context.prompt_prefix` v2 与 cache 事件携带 `core_hash`、`project_hash`、
+  `tools_hash`、`volatile_hash`、`stable_system_hash`、`prefix_hash`；memory
+  变化只移动 volatile，source/skill 变化只移动 project。
+- Anthropic：顶层 automatic caching + tools/core/project 显式 breakpoints，
+  最多 4 槽，automatic 与 tail 互斥；默认 5m，显式 `ttl: "1h"`；1h 被 provider
+  拒绝时返回 actionable error，不静默降级。
+- OpenAI-compatible：stable core/project system messages 在前，volatile 在后，
+  tool 定义稳定排序；只依赖 provider 自动 prefix caching，不伪造 Anthropic
+  标记，streaming/usage 行为不变。
+- 项目 `CachePolicy`：`enabled`、`ttl`、`automatic_caching`、`warm_on_resume`
+  （默认 false）、`compact_aware`（默认 true）、per-role TTL；SQLite + manifest +
+  `db-rebuild` 持久化。
+- `session.cache.warm` / `vp cache warm`（别名 `cache-warm`）只 warm
+  core/project/tools，记录自己的 usage/cost，绝不自动触发；journaled resume
+  仅在该策略显式开启时增加一次 warm call。
+- compaction 记录 before/after generation、reset reason、invalidation tokens、
+  估算丢失的 cache-read USD；不因缓存而延迟 compaction。
+- 每 call 记录 cache read/write、ratios、breakpoints、TTL、first-token latency、
+  component hashes、estimated savings、miss reason（`first_call`、
+  `prefix_changed`、`tools_changed`、`project_changed`、
+  `ttl_or_provider_miss`、`compaction_reset`、`unknown`）。
+- `session.cache` 增加 savings、bounded 20 条 recent calls、miss/TTL/breakpoint
+  buckets、per-role savings、p50/p95 first-token latency、compaction 失效统计；
+  `session.cache.plan` 无 provider call 预览每角色计划；`session.cache.audit`
+  检查 breakpoint 上限、只写不读、低命中、churn、缺失 hash、1h 无读、
+  trailing warm、compaction reset、policy disabled、plan mismatch。
+- RPC `session.cache.warm/plan/audit`、`project.cache_policy.get/set`；
+  CLI `cache-warm/cache-plan/cache-audit/cache-policy/cache-policy-set`；
+  Swift Efficiency/Stage 显示 savings、TTL、breakpoints、last miss、recent calls。
+- 限制：不推断 provider TTL；OpenAI-compatible 报告 `cache_breakpoints=0`；
+  cache 读取仍然计费，savings 使用用户配置价格且可能为负；不保证命中。
+
+### Q2 GUI session layer
+
+- `browser` 与 native `computer` 统一使用一个逻辑 `gui` SQLite lease；旧
+  `browser`/`computer` 行仍可读，会阻塞新 GUI 工作直到过期/人工释放，daemon
+  启动时以 `computer.lease.expired` 审计事件退役。
+- lease generation 持久化在 `store_meta` + lease row，跨 daemon restart 单调；
+  默认 grace 45s（0–600），1s sweeper 在 grace 到期后释放 lease，但 helper
+  保持自己的 warm idle 窗口，下一次 action 再 acquire。
+- `close`、session cleanup、`session.run.cancel_requested` 立即释放。
+- 有界 FIFO：最多 64 waiters，默认等待 15s；超时返回 typed `GUI_BUSY`，带
+  holder session/agent/surface/expiry、`retry_after_ms`、`waited_ms`、
+  `wait_ms`、queue position；不做无限隐藏等待。
+- Snapshot generation：helper snapshot 返回 `snapshot_generation`，ref 格式
+  `ax-<8 hex generation>-<16 hex hash>`；旧 generation 或不在最新 snapshot 集合
+  的 ref 返回 typed `STALE_REF`（当前 generation、ref generation、hint、
+  `auto_retry: false`）；click/type/key/scroll/drag 绝不自动重试。
+- AX observer 驱动的 `wait`，带 interval polling fallback 和有界 deadline；
+  `computer displays` 与 screenshot `display_id`/`display_index` 支持多显示器。
+- 敏感目标策略：System Settings、SecurityAgent、Keychain、Passwords、主流
+  password managers 默认 deny，可 opt-in require_approval；静态 permission
+  assessment + helper-side target resolution 双层执行；full-screen screenshot
+  归类 HostState。
+- 有界 `gui.action` timeline：action、target app/window、generation、latency、
+  result/error code、lease generation；不记录 typed text、AX value、page text
+  或 screenshot bytes；敏感窗口标题省略。
+- Computer/TCC `status` 缓存 30s（5–600），`refresh: true` 绕过；browser status
+  不再 spawn helper。
+- RPC `gui.status/timeline/policy.get/policy.set`；CLI `vp gui`、
+  `vp gui-policy`、`vp gui-policy-set`、`vp computer --status --refresh`；
+  Manage Dash GUI surface/policy 卡片、Stage GUI pill + popover/operator release。
+- 限制：FIFO 与 lease 仍是单 daemon SQLite，不是跨进程/跨主机队列或分布式
+  fencing；helper 仍不 sandbox、受 TCC 约束；preflight 与 input 之间屏幕变化
+  仍可能使 coordinate click 落空；AX observer best-effort；敏感列表不穷尽；
+  timeline 与 session event stream 共用保留策略。
+
+### Q3 uniform tool errors and recipes
+
+- 新增有界 `ToolFailure`：`{ code, message, retryable, hint, evidence?, tool?,
+  action? }`；`ToolOutput::error_coded/error_failure/from_tool_error/
+  mark_failure/normalize_failure`，legacy `ToolOutput::error` 保持可调用并映射
+  `TOOL_FAILED`。
+- 137 个稳定错误码，带 category、默认 hint、保守 retryability；覆盖
+  file/write/edit/patch、git、shell、process、LSP、browser/computer、
+  remote、tool_output、MCP、fetch。本次合入另补 `GUI_BUSY`、
+  `GUI_LEASE_FAILED`、`SENSITIVE_TARGET`、`COMPUTER_RENDER_FAILED`、
+  `BROWSER_RENDER_FAILED`。
+- Structured failure 会剥离 command/stdout/stderr/content/header/credential
+  字段，截断所有字段，并 redact bearer token、常见 token 形状、secret 赋值和
+  URL userinfo；provider 文本使用稳定前缀 `error[CODE] …`。
+- 23 个静态 `ToolRecipe`：批量读、符号导航、安全编辑、test/check、长输出
+  分页、GUI 验证、remote、memory recall、Git 检查、artifact、diagnostics、
+  sandbox denial、handoff、error recovery；按 role/profile 确定性过滤且可缓存。
+- 只读 `tool_help` 返回 recipe、稳定错误码和 canonical examples；稳定
+  recipe block 注入 system prompt；tool schema 不随 turn 改变。
+- `tool.finished` additive 字段：`duration_ms`、`output_bytes`、`truncated`、
+  `error_code`、`retryable`、`error_hint`、`approval_risk`、`approval_mode`、
+  `approval_wait_ms`；`session.tool_activity` bounded 50/200 行、per-tool stats、
+  error buckets；CLI `vp tool-activity`、`vp tool-codes`；Manage Dash
+  ToolActivityCard/Sheet 与 Stage 入口。
+- 限制：tool activity 是事件派生的 bounded window，不是持久 APM/时序库；
+  未知 code 在客户端原样显示但 runtime structured 折叠为 `TOOL_FAILED`；
+  retryability 只是静态提示，没有自动 tool retry 或隐藏 routing；redaction
+  best-effort；recipes 是静态全局目录，不可按项目配置。
+
+### Q4 LSP-first code intelligence
+
+- 复用已有的 per-worktree/language persistent LSP server 生命周期：Seatbelt
+  sandbox、initialize bound、idle reap、process-group cleanup、worktree teardown。
+- `find_symbol` 使用 `workspace/symbol`，回退 scoped `documentSymbol`；
+  `find_references` 使用 `textDocument/references` + definition；
+  `code_diagnostics` 优先 LSP pull/push diagnostics，再回退 build；
+  `repo_map`/`build_context` 可选 bounded LSP symbol enrichment。
+- 支持 `definition`、`references`、`hover`、`documentSymbol`、
+  `workspace/symbol`、pull diagnostics、push diagnostics、capabilities/status；
+  UTF-16/UTF-8/UTF-32 position encoding 协商与转换。
+- 每个结果携带 `source: "lsp" | "lexical" | "build"`、status、confidence、
+  confidence_score、backend/server/method、fallback reason、install hint、
+  attempts、range、kind；确定性去重/排序/截断。显式 `source=lsp` 是
+  exact-or-error，不静默降级。
+- 缺失 server 返回 structured `LSP_UNAVAILABLE`（搜索过的 program + install
+  hint），不自动安装；timeout 发送 best-effort `$/cancelRequest`；crash 重启
+  一次，连续失败进入有界指数 cooldown。
+- `lsp.status` RPC、`vp lsp <project>` 与 Swift `LSP`/`Lexical`/`Build` badge。
+- 限制：仅 stdio language server；不支持 rename/completion/formatting/code
+  action/signature help；不保证 server 已完成 indexing；没有跨 restart 的
+  diagnostic cache；language server 是受信任的用户安装程序，sandbox 限制
+  写入而非全部读取/网络。
+
+### 验收
+
+- `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings` 通过。
+- `cargo test --workspace`：**1,951 passed / 0 failed / 6 ignored**。
+- `swiftformat --lint`：0/87 文件需要格式化。
+- `xcodegen generate` + `xcodebuild test`：**250 app + 132 helper = 382 passed / 0 failed**。
+- `just bundle` 通过，`verlinpadd` 已打包。
+- 新增 ADR-0168（cache-first prompt）、ADR-0169（GUI session lease/snapshot
+  generations）、ADR-0170（tool error contract/recipes）、ADR-0171
+  （LSP-first code intelligence）。
 
 ## 2026-11-11 Long-task round 3: context checkpoints, ACP remote, IVF ANN, encrypted backups
 

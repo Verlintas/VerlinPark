@@ -177,6 +177,10 @@
 | [0165](adr/0165-acp-http-and-websocket-transport.md) | ACP Streamable HTTP and WebSocket remote transport with explicit remote trust | Accepted | Runtime/Protocol |
 | [0166](adr/0166-ivf-ann-memory-index.md) | Opt-in deterministic IVF index for hybrid memory with exact-scan fallback | Accepted | Runtime/Store |
 | [0167](adr/0167-encrypted-incremental-backup-repository.md) | Argon2id + ChaCha20-Poly1305 incremental backup repository with v1 ZIP compatibility | Accepted | Runtime/CLI/Security |
+| [0168](adr/0168-cache-first-prompt-architecture.md) | Cache-first prompt sections, Anthropic automatic/explicit breakpoints and TTL, opt-in warm | Accepted | Runtime/Providers |
+| [0169](adr/0169-gui-session-lease-and-snapshot-generations.md) | Unified GUI lease with grace/queue, snapshot generations, stale refs, and sensitive-target policy | Accepted | Runtime/GUI/Security |
+| [0170](adr/0170-tool-error-contract-and-recipes.md) | Uniform tool failure contract, static recipes, and bounded tool activity metrics | Accepted | Runtime/Agent UX |
+| [0171](adr/0171-lsp-first-code-intelligence.md) | Optional LSP backend for symbol/reference/diagnostic tools with labeled lexical/build fallback | Accepted | Runtime/Code Intelligence |
 
 ---
 

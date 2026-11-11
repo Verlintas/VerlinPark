@@ -770,3 +770,50 @@ sandboxing、分布式 semantic memory、不同 scope 的语义冲突检测、Bi
 artifact archive extraction/media transcoding、signed backups/key rotation，
 以及本文既有的分布式 scheduler/fencing、完整 shell read/network confinement、
 默认自动冲突解决等。
+
+## 8. 2026-11-11 Cache / GUI session / tool UX / LSP round
+
+这一轮修复的是审计中“可用性与成本”层面的具体问题，不放宽任何安全或合并
+gate。四条线都已合入 `main`（`0e204d4` Q4 → `46eb570` Q3 → `8006dd7` Q2 →
+`c74d3e9` Q1，基线 `8e6f7e1`），新增 +32,633 / -1,901 行。
+
+- **Cache-first prompt 已交付**：core/project/volatile 分段与 component hash；
+  Anthropic 顶层 automatic caching + tools/core/project 显式 breakpoints
+  （4 槽上限）+ 5m 默认/显式 1h；OpenAI-compatible stable/volatile system
+  message 分离；`CachePolicy`、显式 warm、plan/audit、compaction invalidation、
+  per-call savings 与 miss reason；Swift Efficiency/Stage 可见。限制：不推断
+  provider TTL；1h 被拒绝时返回错误而不是静默降级；OpenAI-compatible 的
+  breakpoint 数为 0（provider-managed）；savings 使用用户配置价格，cache
+  reads 仍计费，且不保证命中；warm 只在显式调用或 opt-in journaled resume
+  时发生；plan/audit 基于 bounded event window。
+- **GUI session layer 已交付**：browser/computer 统一 `gui` SQLite lease，
+  45s grace 与 1s sweeper，64 个 FIFO waiters / 默认 15s 等待，typed
+  `GUI_BUSY`（holder + retry hint），persisted monotonic lease generation，
+  snapshot generation + `STALE_REF` + `auto_retry: false`，AX-observer wait
+  与 polling fallback，敏感 app/window deny/approval 双层执行，bounded
+  `gui.action` timeline，status TTL cache，多显示器选择。限制：仍是单 daemon
+  SQLite lease/queue，不是跨进程/跨主机队列或分布式 fencing；helper 仍不
+  sandbox、受 TCC 约束；coordinate click 仍可能受 preflight 后屏幕变化影响；
+  AX observer 是 best-effort；敏感列表不穷尽；timeline 无独立保留策略。
+- **Tool error contract / recipes 已交付**：137 个稳定错误码，保守
+  retryability，provider 文本与 structured failure 分离，敏感字段剥离和
+  redaction，23 个静态 recipe + `tool_help`，`tool.finished` 延迟/字节/错误码
+  指标，`session.tool_activity` / `vp tool-activity` / `vp tool-codes`，
+  Manage Dash/Stage timeline。限制：tool activity 是 bounded event window，
+  不是持久 APM；未知 code 在 runtime 折叠为 `TOOL_FAILED`；没有自动 retry；
+  redaction 是 best-effort；recipes 不可按项目配置。
+- **LSP-first code intelligence 已交付**：`find_symbol`/`find_references`/
+  `code_diagnostics` 可选 LSP backend，结果明确标注 `lsp`/`lexical`/`build`、
+  confidence、backend/method、fallback reason；UTF-16/8/32 position encoding；
+  pull/push diagnostics；timeout cancel、crash restart + cooldown；缺失 server
+  返回 `LSP_UNAVAILABLE`，不自动安装。限制：仅 stdio；不支持
+  rename/completion/formatting/code action/signature help；不保证 indexing
+  完成；language server 是受信任的用户程序，sandbox 限制写入而非全部读取/
+  网络。
+- **验证**：Rust 1,951 passed / 0 failed / 6 ignored；Swift 382 passed
+  （250 app + 132 helper）；`just lint` / `xcodebuild test` / `just bundle` 通过。
+- **仍未解决**：跨进程/跨主机 GUI lease 队列与公平调度、GUI action 独立
+  保留策略、自动 cache warming（默认关闭）、provider TTL/capability 探测、
+  跨 host cache 共享、测试结果缓存/impact map、工具 timeline 的持久时序库，
+  以及本文既有的分布式 scheduler/fencing、完整 shell read/network
+  confinement、默认自动冲突解决等。
