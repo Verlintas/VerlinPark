@@ -522,6 +522,8 @@ impl ProgramController {
         reason: &str,
     ) -> Result<()> {
         let reason = bounded_reason(reason);
+        // Session exhaustion is per attempt; aggregate milestone exhaustion is
+        // permanent for the milestone. Both stop automatic retries.
         let session_budget_exhausted = milestone
             .session_id
             .as_deref()
@@ -530,8 +532,14 @@ impl ProgramController {
                 crate::session_budget_exhausted(&session)
                     || milestone_budget_exhausted_for_program(program, milestone, &session)
             });
+        let milestone_budget_exhausted = self
+            .store
+            .program_milestone_usage(&milestone.id)
+            .map(|usage| milestone_aggregate_budget_exhausted(program, milestone, &usage))
+            .unwrap_or(true);
+        let budget_exhausted = session_budget_exhausted || milestone_budget_exhausted;
         let retryable = !program_budget_exhausted(program, usage)
-            && !session_budget_exhausted
+            && !budget_exhausted
             && milestone.attempts < milestone.max_attempts;
         if retryable {
             let next = retry_deadline(program, milestone.attempts.max(1))?;
@@ -542,7 +550,7 @@ impl ProgramController {
             {
                 return Ok(());
             }
-        } else if session_budget_exhausted {
+        } else if budget_exhausted {
             self.store
                 .fail_program_milestone(&milestone.id, &reason, None)?;
             self.store.block_program_milestone(
@@ -792,8 +800,10 @@ impl ProgramController {
         program: &Program,
         milestone: &ProgramMilestone,
     ) -> Result<ProgramLaunchBudget> {
-        let usage = self.store.program_usage(&program.id)?;
-        let (token_budget, cost_budget_usd) = effective_budget(program, milestone, &usage)?;
+        let program_usage = self.store.program_usage(&program.id)?;
+        let milestone_usage = self.store.program_milestone_usage(&milestone.id)?;
+        let (token_budget, cost_budget_usd) =
+            effective_budget(program, milestone, &program_usage, &milestone_usage)?;
         Ok(ProgramLaunchBudget {
             token_budget,
             cost_budget_usd,
@@ -840,14 +850,29 @@ impl ProgramController {
 /// public so tests and future import tooling can inspect exactly what the
 /// launcher will submit.
 pub fn milestone_plan(program: &Program, milestone: &ProgramMilestone) -> TeamPlan {
+    milestone_plan_with_budget(
+        program,
+        milestone,
+        milestone.token_budget.or(program.policy.token_budget),
+        milestone.cost_budget_usd.or(program.policy.cost_budget_usd),
+    )
+}
+
+/// Build the milestone plan with explicit per-attempt budgets. Dispatch uses
+/// this form so a retry receives only the milestone's remaining allowance;
+/// `milestone_plan` keeps the declared budgets for inspection and tests.
+pub fn milestone_plan_with_budget(
+    program: &Program,
+    milestone: &ProgramMilestone,
+    token_budget: Option<u64>,
+    cost_budget_usd: Option<f64>,
+) -> TeamPlan {
     let (department, manager_title, kind) = match milestone.profile.as_str() {
         "research" => ("research", "Research Manager", "research"),
         "verification" => ("verification", "Verification Manager", "review"),
         "generic" => ("delivery", "Delivery Manager", "task"),
         _ => ("delivery", "Delivery Manager", "coding"),
     };
-    let token_budget = milestone.token_budget.or(program.policy.token_budget);
-    let cost_budget_usd = milestone.cost_budget_usd.or(program.policy.cost_budget_usd);
     let acceptance = if milestone.acceptance.is_empty() {
         vec!["the milestone objective is demonstrably complete".to_string()]
     } else {
@@ -1153,25 +1178,64 @@ fn milestone_budget_exhausted_for_program(
 fn effective_budget(
     program: &Program,
     milestone: &ProgramMilestone,
-    usage: &ProgramUsage,
+    program_usage: &ProgramUsage,
+    milestone_usage: &ProgramUsage,
 ) -> Result<(Option<u64>, Option<f64>)> {
-    let mut token_budget = milestone.token_budget.or(program.policy.token_budget);
+    // Milestone budgets are per milestone, not per attempt. Retries inherit
+    // only the unused remainder so a bounded milestone cannot spend its full
+    // allowance again on every automatic attempt.
+    let mut token_budget = match milestone.token_budget.or(program.policy.token_budget) {
+        Some(budget) => {
+            let remaining = budget.saturating_sub(milestone_usage.token_spent);
+            if remaining == 0 {
+                anyhow::bail!(
+                    "milestone token budget is exhausted after {} tokens",
+                    milestone_usage.token_spent
+                );
+            }
+            Some(remaining)
+        }
+        None => None,
+    };
     if let Some(program_budget) = program.token_budget {
-        let remaining = program_budget.saturating_sub(usage.token_spent);
+        let remaining = program_budget.saturating_sub(program_usage.token_spent);
         if remaining == 0 {
             anyhow::bail!("program token budget is exhausted");
         }
         token_budget = Some(token_budget.map_or(remaining, |budget| budget.min(remaining)));
     }
-    let mut cost_budget = milestone.cost_budget_usd.or(program.policy.cost_budget_usd);
+    let mut cost_budget = match milestone.cost_budget_usd.or(program.policy.cost_budget_usd) {
+        Some(budget) => {
+            let remaining = budget - milestone_usage.cost_spent_usd;
+            if remaining <= f64::EPSILON {
+                anyhow::bail!(
+                    "milestone cost budget is exhausted after ${:.4}",
+                    milestone_usage.cost_spent_usd
+                );
+            }
+            Some(remaining)
+        }
+        None => None,
+    };
     if let Some(program_budget) = program.cost_budget_usd {
-        let remaining = (program_budget - usage.cost_spent_usd).max(0.0);
+        let remaining = (program_budget - program_usage.cost_spent_usd).max(0.0);
         if remaining <= f64::EPSILON {
             anyhow::bail!("program cost budget is exhausted");
         }
         cost_budget = Some(cost_budget.map_or(remaining, |budget| budget.min(remaining)));
     }
     Ok((token_budget, cost_budget))
+}
+
+fn milestone_aggregate_budget_exhausted(
+    program: &Program,
+    milestone: &ProgramMilestone,
+    usage: &ProgramUsage,
+) -> bool {
+    let token_budget = milestone.token_budget.or(program.policy.token_budget);
+    let cost_budget = milestone.cost_budget_usd.or(program.policy.cost_budget_usd);
+    token_budget.is_some_and(|budget| usage.token_spent >= budget)
+        || cost_budget.is_some_and(|budget| usage.cost_spent_usd >= budget)
 }
 
 fn milestone_effective_priority(
@@ -3408,5 +3472,49 @@ mod plan_tests {
         assert_eq!(plan.departments[0].token_budget, Some(1_000));
         assert_eq!(plan.departments[0].cost_budget_usd, Some(0.5));
         crate::agent::validate_team_plan(&plan, 5).unwrap();
+    }
+
+    #[test]
+    fn retries_receive_only_the_remaining_milestone_budget() {
+        let program = program(Some(90_000), Some(4.5));
+        let mut milestone = milestone("coding");
+        milestone.token_budget = Some(10_000);
+        milestone.cost_budget_usd = Some(1.0);
+        let program_usage = ProgramUsage {
+            token_spent: 2_000,
+            cost_spent_usd: 0.2,
+        };
+        let milestone_usage = ProgramUsage {
+            token_spent: 7_500,
+            cost_spent_usd: 0.8,
+        };
+        let (tokens, cost) =
+            effective_budget(&program, &milestone, &program_usage, &milestone_usage).unwrap();
+        assert_eq!(tokens, Some(2_500));
+        assert!((cost.unwrap() - 0.2).abs() < 1e-9);
+        let plan = milestone_plan_with_budget(&program, &milestone, tokens, cost);
+        assert_eq!(plan.tasks[0].token_budget, Some(2_500));
+        crate::agent::validate_team_plan(&plan, 5).unwrap();
+    }
+
+    #[test]
+    fn exhausted_milestone_budget_refuses_another_attempt() {
+        let program = program(None, None);
+        let mut milestone = milestone("coding");
+        milestone.token_budget = Some(1_000);
+        let usage = ProgramUsage {
+            token_spent: 1_000,
+            cost_spent_usd: 0.0,
+        };
+        let error = effective_budget(&program, &milestone, &usage, &usage).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("milestone token budget is exhausted"),
+            "unexpected error: {error}"
+        );
+        assert!(milestone_aggregate_budget_exhausted(
+            &program, &milestone, &usage
+        ));
     }
 }

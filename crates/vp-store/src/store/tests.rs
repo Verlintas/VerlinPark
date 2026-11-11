@@ -4989,6 +4989,8 @@ fn program_usage_keeps_retried_attempts_in_the_budget() {
     let usage = store.program_usage(&program.id).unwrap();
     assert_eq!(usage.token_spent, 375);
     assert!((usage.cost_spent_usd - 1.25).abs() < 1e-9);
+    let milestone_usage = store.program_milestone_usage(&milestone.id).unwrap();
+    assert_eq!(milestone_usage.token_spent, 375);
 
     // Historical sessions still resolve to their program once the milestone
     // moved on to another session.

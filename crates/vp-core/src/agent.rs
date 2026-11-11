@@ -3139,7 +3139,12 @@ impl AgentService {
                     return Err(error);
                 }
             };
-        let plan = crate::program::milestone_plan(&program, &milestone);
+        let plan = crate::program::milestone_plan_with_budget(
+            &program,
+            &milestone,
+            token_budget,
+            cost_budget_usd,
+        );
         if let Err(error) = validate_team_plan(&plan, config.max_managers) {
             controller.fail_start(
                 &program,

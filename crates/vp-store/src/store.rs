@@ -4102,6 +4102,31 @@ impl Store {
         Ok(inserted)
     }
 
+    /// Aggregate spend for one milestone across every attempt. The current
+    /// `program_milestones.session_id` is included as a fallback so legacy rows
+    /// created before the dispatch ledger are still counted once.
+    pub fn program_milestone_usage(&self, milestone_id: &str) -> Result<ProgramUsage> {
+        let conn = self.lock()?;
+        let (tokens, cost) = conn.query_row(
+            "SELECT COALESCE(SUM(s.tokens_in + s.tokens_out), 0),
+                    COALESCE(SUM(s.cost_spent_usd), 0.0)
+             FROM sessions s
+             WHERE s.id IN (
+                 SELECT session_id FROM program_milestone_sessions
+                 WHERE milestone_id = ?1
+                 UNION
+                 SELECT session_id FROM program_milestones
+                 WHERE id = ?1 AND session_id IS NOT NULL
+             )",
+            params![milestone_id],
+            |row| Ok((row.get::<_, i64>(0)?.max(0) as u64, row.get::<_, f64>(1)?)),
+        )?;
+        Ok(ProgramUsage {
+            token_spent: tokens,
+            cost_spent_usd: cost,
+        })
+    }
+
     pub fn count_active_program_milestones(&self, program_id: &str) -> Result<u32> {
         let conn = self.lock()?;
         let count = conn.query_row(
