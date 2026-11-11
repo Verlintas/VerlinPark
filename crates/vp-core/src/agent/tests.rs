@@ -18013,3 +18013,58 @@ async fn context_checkpoint_list_limit_is_clamped_to_the_protocol_ceiling() {
         .unwrap();
     assert_eq!(listed.limit, 200);
 }
+
+#[test]
+fn citation_registry_only_keys_returned_chunks_and_deduplicates() {
+    let mut registry = CitationRegistry::default();
+    let first = SourceSearchHit {
+        source_id: "src-1".into(),
+        source_title: "Runtime".into(),
+        chunk_id: "src-1:0001:aaa".into(),
+        chunk_no: 1,
+        content: "Deterministic leases.".into(),
+        score: 0.8,
+        source: "hybrid".into(),
+        confidence: 0.8,
+        origins: vec!["lexical".into(), "semantic".into()],
+        lexical_score: Some(1.2),
+        semantic_score: Some(0.7),
+        ..SourceSearchHit::default()
+    };
+    let same_chunk = SourceSearchHit {
+        score: 0.9,
+        confidence: 0.9,
+        ..first.clone()
+    };
+    let second = SourceSearchHit {
+        chunk_id: "src-1:0002:bbb".into(),
+        chunk_no: 2,
+        content: "Integration evidence.".into(),
+        score: 0.6,
+        ..first.clone()
+    };
+    assert_eq!(registry.add_hit(&first, "search"), "c1");
+    assert_eq!(
+        registry.add_hit(&same_chunk, "search"),
+        "c1",
+        "a chunk keeps one key across lanes"
+    );
+    assert_eq!(registry.add_hit(&second, "read"), "c2");
+    let citations = registry.list();
+    assert_eq!(citations.len(), 2);
+    assert_eq!(citations[0].key, "c1");
+    assert_eq!(citations[0].origin, "search");
+    assert_eq!(citations[0].score, 0.8, "first citation snapshot is stable");
+    assert_eq!(citations[1].key, "c2");
+    assert_eq!(citations[1].origin, "read");
+    // There is no API that mints a key for a chunk that was not returned; the
+    // only keys in the list are the two registered hits.
+    assert!(citations.iter().all(
+        |citation| citation.chunk_id == first.chunk_id || citation.chunk_id == second.chunk_id
+    ));
+    assert!(
+        citations
+            .iter()
+            .all(|citation| citation.key == "c1" || citation.key == "c2")
+    );
+}

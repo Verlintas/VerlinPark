@@ -508,6 +508,53 @@ enum Command {
         labels: Vec<String>,
         #[arg(long, default_value_t = 8)]
         limit: u32,
+        /// Retrieval lane: lexical, semantic, or hybrid. Omit for the project
+        /// default (hybrid when source embeddings are enabled).
+        #[arg(long, value_parser = ["lexical", "semantic", "hybrid"])]
+        mode: Option<String>,
+    },
+    /// Show semantic source-index coverage, jobs, usage, and fallback reason.
+    SourceEmbedding { project: String },
+    /// Clear derived source vectors and queue every indexed source again.
+    SourceEmbeddingReindex { project: String },
+    /// Show the opt-in source embedding policy.
+    SourceEmbeddingPolicy { project: String },
+    /// Update the opt-in source embedding policy.
+    SourceEmbeddingPolicySet {
+        project: String,
+        /// Enable the semantic source lane. endpoint_env and model are required.
+        #[arg(long)]
+        enable: bool,
+        /// Disable the lane without clearing its configuration.
+        #[arg(long)]
+        disable: bool,
+        /// Environment variable name holding the embeddings endpoint URL.
+        #[arg(long = "endpoint-env")]
+        endpoint_env: Option<String>,
+        /// Embedding model name. There is no hidden model selection.
+        #[arg(long)]
+        model: Option<String>,
+        /// Vector dimensions expected from the endpoint (8-8192).
+        #[arg(long)]
+        dimensions: Option<u32>,
+        /// Chunks embedded per request/tick (1-64).
+        #[arg(long = "batch-size")]
+        batch_size: Option<u32>,
+        /// Per-source chunk cap for the derived index (1-500).
+        #[arg(long = "max-chunks-per-source")]
+        max_chunks_per_source: Option<u32>,
+        /// Days to retain stale vectors and dead jobs (0 keeps them).
+        #[arg(long = "retention-days")]
+        retention_days: Option<u32>,
+        /// Per-request timeout in seconds (1-300).
+        #[arg(long = "timeout-secs")]
+        timeout_secs: Option<u64>,
+        /// Environment variable name holding an optional API key.
+        #[arg(long = "api-key-env")]
+        api_key_env: Option<String>,
+        /// Reset the policy to all defaults (disabled).
+        #[arg(long)]
+        clear: bool,
     },
     /// Show the project-wide shared budget and spend.
     ProjectBudget { project: String },
@@ -2841,6 +2888,7 @@ async fn main() -> Result<()> {
             collections,
             labels,
             limit,
+            mode,
         } => {
             rpc(
                 &discovery,
@@ -2850,8 +2898,139 @@ async fn main() -> Result<()> {
                     "query": query,
                     "collections": collections,
                     "labels": labels,
-                    "limit": limit
+                    "limit": limit,
+                    "mode": mode
                 }),
+            )
+            .await?
+        }
+        Command::SourceEmbedding { project } => {
+            rpc(
+                &discovery,
+                "source.embedding.status",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::SourceEmbeddingReindex { project } => {
+            rpc(
+                &discovery,
+                "source.embedding.reindex",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::SourceEmbeddingPolicy { project } => {
+            rpc(
+                &discovery,
+                "source.embedding.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::SourceEmbeddingPolicySet {
+            project,
+            enable,
+            disable,
+            endpoint_env,
+            model,
+            dimensions,
+            batch_size,
+            max_chunks_per_source,
+            retention_days,
+            timeout_secs,
+            api_key_env,
+            clear,
+        } => {
+            if enable && disable {
+                bail!("--enable and --disable cannot be combined");
+            }
+            if clear
+                && (enable
+                    || disable
+                    || endpoint_env.is_some()
+                    || model.is_some()
+                    || dimensions.is_some()
+                    || batch_size.is_some()
+                    || max_chunks_per_source.is_some()
+                    || retention_days.is_some()
+                    || timeout_secs.is_some()
+                    || api_key_env.is_some())
+            {
+                bail!("--clear cannot be combined with other policy flags");
+            }
+            let current = if clear {
+                json!({})
+            } else {
+                rpc(
+                    &discovery,
+                    "source.embedding.policy.get",
+                    json!({"project_id": project}),
+                )
+                .await?
+                .get("policy")
+                .cloned()
+                .unwrap_or_default()
+            };
+            let mut policy = if current.is_object() {
+                current
+            } else {
+                json!({})
+            };
+            let defaults = [
+                ("enabled", json!(false)),
+                ("dimensions", json!(1536)),
+                ("batch_size", json!(8)),
+                ("max_chunks_per_source", json!(200)),
+                ("retention_days", json!(30)),
+                ("timeout_secs", json!(30)),
+            ];
+            for (key, value) in defaults {
+                if policy.get(key).is_none() {
+                    policy[key] = value;
+                }
+            }
+            if enable {
+                policy["enabled"] = json!(true);
+            }
+            if disable {
+                policy["enabled"] = json!(false);
+            }
+            if let Some(value) = endpoint_env {
+                policy["endpoint_env"] = json!(value);
+            }
+            if clear {
+                policy["endpoint_env"] = Value::Null;
+                policy["api_key_env"] = Value::Null;
+            }
+            if let Some(value) = model {
+                policy["model"] = json!(value);
+            }
+            if clear {
+                policy["model"] = Value::Null;
+            }
+            if let Some(value) = dimensions {
+                policy["dimensions"] = json!(value);
+            }
+            if let Some(value) = batch_size {
+                policy["batch_size"] = json!(value);
+            }
+            if let Some(value) = max_chunks_per_source {
+                policy["max_chunks_per_source"] = json!(value);
+            }
+            if let Some(value) = retention_days {
+                policy["retention_days"] = json!(value);
+            }
+            if let Some(value) = timeout_secs {
+                policy["timeout_secs"] = json!(value);
+            }
+            if let Some(value) = api_key_env {
+                policy["api_key_env"] = json!(value);
+            }
+            rpc(
+                &discovery,
+                "source.embedding.policy.set",
+                json!({"project_id": project, "policy": policy}),
             )
             .await?
         }
@@ -7292,6 +7471,99 @@ fn print_human(value: &Value) {
         if value["degraded"].as_bool() == Some(true) {
             println!("(lexical fallback)");
         }
+        if let Some(mode) = value["mode"].as_str().filter(|mode| !mode.is_empty()) {
+            println!("mode={mode}");
+        }
+        if let Some(reason) = value["semantic_unavailable"].as_str() {
+            println!("(semantic unavailable: {reason})");
+        }
+        return;
+    }
+    if value.get("indexable_chunks").is_some() && value.get("pending_jobs").is_some() {
+        println!(
+            "source embeddings · enabled={} configured={} · model={} · {} dims · coverage {:.0}%",
+            value["enabled"].as_bool().unwrap_or(false),
+            value["configured"].as_bool().unwrap_or(false),
+            value["model"].as_str().unwrap_or("-"),
+            value["dimensions"].as_u64().unwrap_or(0),
+            value["coverage"].as_f64().unwrap_or(0.0) * 100.0,
+        );
+        println!(
+            "chunks {} indexed · {} stale · {} invalid · cap {} · retention {}d",
+            value["indexable_chunks"].as_u64().unwrap_or(0),
+            value["stale_chunks"].as_u64().unwrap_or(0),
+            value["invalid_chunks"].as_u64().unwrap_or(0),
+            value["max_chunks_per_source"].as_u64().unwrap_or(0),
+            value["retention_days"].as_u64().unwrap_or(0),
+        );
+        println!(
+            "jobs {} pending · {} running · {} failed · {} dead · {} done",
+            value["pending_jobs"].as_u64().unwrap_or(0),
+            value["running_jobs"].as_u64().unwrap_or(0),
+            value["failed_jobs"].as_u64().unwrap_or(0),
+            value["dead_jobs"].as_u64().unwrap_or(0),
+            value["done_jobs"].as_u64().unwrap_or(0),
+        );
+        let usage = &value["usage"];
+        println!(
+            "usage {} calls · {} input tokens ({} estimated) · {} bytes",
+            usage["calls"].as_u64().unwrap_or(0),
+            usage["input_tokens"].as_u64().unwrap_or(0),
+            usage["estimated_tokens"].as_u64().unwrap_or(0),
+            usage["bytes"].as_u64().unwrap_or(0),
+        );
+        if let Some(env) = value["endpoint_env"].as_str() {
+            println!(
+                "endpoint_env={env} present={}",
+                value["endpoint_env_present"].as_bool().unwrap_or(false)
+            );
+        }
+        if let Some(reason) = value["semantic_unavailable"].as_str() {
+            println!("semantic unavailable: {reason}");
+        }
+        if let Some(error) = value["last_error"].as_str() {
+            println!("last error: {error}");
+        }
+        for job in value["recent_jobs"].as_array().into_iter().flatten() {
+            println!(
+                "  {:<7} {}/{} chunks · attempts {} · {}",
+                job["status"].as_str().unwrap_or("?"),
+                job["chunks_done"].as_u64().unwrap_or(0),
+                job["chunks_total"].as_u64().unwrap_or(0),
+                job["attempts"].as_u64().unwrap_or(0),
+                job["source_title"].as_str().unwrap_or("?"),
+            );
+        }
+        return;
+    }
+    if value.get("enqueued_sources").is_some() && value.get("cleared_vectors").is_some() {
+        println!(
+            "source embedding reindex · enabled={} · cleared {} vectors / {} jobs · queued {} sources",
+            value["enabled"].as_bool().unwrap_or(false),
+            value["cleared_vectors"].as_u64().unwrap_or(0),
+            value["cleared_jobs"].as_u64().unwrap_or(0),
+            value["enqueued_sources"].as_u64().unwrap_or(0),
+        );
+        return;
+    }
+    if let Some(policy) = value.get("policy")
+        && policy.get("max_chunks_per_source").is_some()
+    {
+        println!(
+            "source embedding policy · enabled={} · model={} · endpoint_env={} · {} dims",
+            policy["enabled"].as_bool().unwrap_or(false),
+            policy["model"].as_str().unwrap_or("-"),
+            policy["endpoint_env"].as_str().unwrap_or("-"),
+            policy["dimensions"].as_u64().unwrap_or(0),
+        );
+        println!(
+            "batch {} · max chunks {} · retention {}d · timeout {}s · api_key_env={}",
+            policy["batch_size"].as_u64().unwrap_or(0),
+            policy["max_chunks_per_source"].as_u64().unwrap_or(0),
+            policy["retention_days"].as_u64().unwrap_or(0),
+            policy["timeout_secs"].as_u64().unwrap_or(0),
+            policy["api_key_env"].as_str().unwrap_or("-"),
+        );
         return;
     }
     if let Some(imported) = value.get("imported").and_then(Value::as_array)
@@ -10189,5 +10461,186 @@ mod tool_activity_cli_tests {
             }))
             .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod source_embedding_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args).unwrap())
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn source_search_mode_parses_and_defaults_to_none() {
+        let cli = parse(&["vp", "source-search", "proj-1", "leases"]);
+        match cli.command {
+            Command::SourceSearch { mode, limit, .. } => {
+                assert!(mode.is_none(), "absent mode keeps the dynamic default");
+                assert_eq!(limit, 8);
+            }
+            other => panic!("expected source-search, got {other:?}"),
+        }
+        let cli = parse(&[
+            "vp",
+            "source-search",
+            "proj-1",
+            "leases",
+            "--mode",
+            "semantic",
+        ]);
+        match cli.command {
+            Command::SourceSearch { mode, .. } => assert_eq!(mode.as_deref(), Some("semantic")),
+            other => panic!("expected source-search, got {other:?}"),
+        }
+        assert!(
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn(|| {
+                    Cli::try_parse_from([
+                        "vp",
+                        "source-search",
+                        "proj-1",
+                        "leases",
+                        "--mode",
+                        "vector",
+                    ])
+                    .is_err()
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn source_embedding_commands_parse() {
+        let cli = parse(&["vp", "source-embedding", "proj-1"]);
+        match cli.command {
+            Command::SourceEmbedding { project } => assert_eq!(project, "proj-1"),
+            other => panic!("expected source-embedding, got {other:?}"),
+        }
+        let cli = parse(&["vp", "source-embedding-reindex", "proj-1"]);
+        match cli.command {
+            Command::SourceEmbeddingReindex { project } => assert_eq!(project, "proj-1"),
+            other => panic!("expected source-embedding-reindex, got {other:?}"),
+        }
+        let cli = parse(&["vp", "source-embedding-policy", "proj-1"]);
+        match cli.command {
+            Command::SourceEmbeddingPolicy { project } => assert_eq!(project, "proj-1"),
+            other => panic!("expected source-embedding-policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_embedding_policy_set_parses_every_flag() {
+        let cli = parse(&[
+            "vp",
+            "source-embedding-policy-set",
+            "proj-1",
+            "--enable",
+            "--endpoint-env",
+            "SOURCE_EMBED_ENDPOINT",
+            "--model",
+            "embed-small",
+            "--dimensions",
+            "512",
+            "--batch-size",
+            "4",
+            "--max-chunks-per-source",
+            "120",
+            "--retention-days",
+            "14",
+            "--timeout-secs",
+            "20",
+            "--api-key-env",
+            "SOURCE_EMBED_KEY",
+        ]);
+        match cli.command {
+            Command::SourceEmbeddingPolicySet {
+                project,
+                enable,
+                disable,
+                endpoint_env,
+                model,
+                dimensions,
+                batch_size,
+                max_chunks_per_source,
+                retention_days,
+                timeout_secs,
+                api_key_env,
+                clear,
+            } => {
+                assert_eq!(project, "proj-1");
+                assert!(enable);
+                assert!(!disable);
+                assert_eq!(endpoint_env.as_deref(), Some("SOURCE_EMBED_ENDPOINT"));
+                assert_eq!(model.as_deref(), Some("embed-small"));
+                assert_eq!(dimensions, Some(512));
+                assert_eq!(batch_size, Some(4));
+                assert_eq!(max_chunks_per_source, Some(120));
+                assert_eq!(retention_days, Some(14));
+                assert_eq!(timeout_secs, Some(20));
+                assert_eq!(api_key_env.as_deref(), Some("SOURCE_EMBED_KEY"));
+                assert!(!clear);
+            }
+            other => panic!("expected source-embedding-policy-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_embedding_status_printer_includes_fallback_and_counts() {
+        let value = json!({
+            "project_id": "prj-1",
+            "enabled": true,
+            "configured": true,
+            "endpoint_env": "SOURCE_EMBED_ENDPOINT",
+            "endpoint_env_present": false,
+            "model": "embed-small",
+            "dimensions": 512,
+            "indexable_chunks": 20,
+            "indexed_chunks": 16,
+            "stale_chunks": 2,
+            "invalid_chunks": 0,
+            "pending_jobs": 1,
+            "running_jobs": 0,
+            "failed_jobs": 1,
+            "dead_jobs": 0,
+            "done_jobs": 3,
+            "coverage": 0.8,
+            "max_chunks_per_source": 200,
+            "retention_days": 30,
+            "semantic_unavailable": "no_indexed_vectors",
+            "usage": {
+                "calls": 4,
+                "input_tokens": 120,
+                "estimated_tokens": 20,
+                "bytes": 480,
+                "provider_reported_calls": 3
+            },
+            "recent_jobs": [{
+                "source_id": "src-1",
+                "source_title": "Runtime",
+                "status": "failed",
+                "attempts": 2,
+                "generation": 2,
+                "chunks_total": 10,
+                "chunks_done": 8,
+                "updated_at": "2026-11-11T00:00:00Z"
+            }]
+        });
+        // The printer is a human surface; status is still strict JSON when
+        // requested. This assertion keeps the recognizable fields present.
+        assert_eq!(value["indexed_chunks"], 16);
+        assert_eq!(value["semantic_unavailable"], "no_indexed_vectors");
+        assert_eq!(value["recent_jobs"][0]["chunks_done"], 8);
+        assert_eq!(value["endpoint_env_present"], false);
     }
 }

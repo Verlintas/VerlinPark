@@ -5866,6 +5866,13 @@ struct SourceSearchHit: Codable, Identifiable, Hashable, Sendable {
     let heading: String?
     let content: String
     let score: Double
+    /// Effective lane: lexical, semantic, or hybrid. Legacy payloads decode as
+    /// lexical because that is the only lane they could have come from.
+    let source: String
+    let confidence: Double
+    let origins: [String]
+    let lexicalScore: Double?
+    let semanticScore: Double?
 
     var id: String {
         chunkID
@@ -5881,6 +5888,11 @@ struct SourceSearchHit: Codable, Identifiable, Hashable, Sendable {
         case heading
         case content
         case score
+        case source
+        case confidence
+        case origins
+        case lexicalScore = "lexical_score"
+        case semanticScore = "semantic_score"
     }
 
     init(from decoder: Decoder) throws {
@@ -5894,12 +5906,531 @@ struct SourceSearchHit: Codable, Identifiable, Hashable, Sendable {
         heading = try container.decodeIfPresent(String.self, forKey: .heading)
         content = try container.decode(String.self, forKey: .content)
         score = try container.decode(Double.self, forKey: .score)
+        source = try container.decodeIfPresent(String.self, forKey: .source) ?? "lexical"
+        confidence = try container.decodeIfPresent(Double.self, forKey: .confidence) ?? score
+        origins = try container.decodeIfPresent([String].self, forKey: .origins) ?? ["lexical"]
+        lexicalScore = try container.decodeIfPresent(Double.self, forKey: .lexicalScore)
+        semanticScore = try container.decodeIfPresent(Double.self, forKey: .semanticScore)
+    }
+
+    init(
+        sourceID: String,
+        sourceTitle: String,
+        collection: String? = nil,
+        labels: [String] = [],
+        chunkID: String,
+        chunkNo: UInt32,
+        heading: String? = nil,
+        content: String,
+        score: Double,
+        source: String = "lexical",
+        confidence: Double? = nil,
+        origins: [String] = ["lexical"],
+        lexicalScore: Double? = nil,
+        semanticScore: Double? = nil
+    ) {
+        self.sourceID = sourceID
+        self.sourceTitle = sourceTitle
+        self.collection = collection
+        self.labels = labels
+        self.chunkID = chunkID
+        self.chunkNo = chunkNo
+        self.heading = heading
+        self.content = content
+        self.score = score
+        self.source = source
+        self.confidence = confidence ?? score
+        self.origins = origins
+        self.lexicalScore = lexicalScore
+        self.semanticScore = semanticScore
+    }
+}
+
+/// Retrieval lane chosen by the Sources UI. `automatic` sends no mode and lets
+/// the daemon pick hybrid when source embeddings are enabled, otherwise
+/// lexical. The daemon still owns fallback: `semantic`/`hybrid` returns lexical
+/// hits with a reason when unavailable.
+enum SourceSearchMode: String, CaseIterable, Identifiable, Codable, Sendable {
+    case automatic
+    case lexical
+    case semantic
+    case hybrid
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .automatic: L10n.t("Auto")
+        case .lexical: L10n.t("Lexical")
+        case .semantic: L10n.t("Semantic")
+        case .hybrid: L10n.t("Hybrid")
+        }
+    }
+
+    /// `automatic` is UI-only; the protocol keeps the three explicit lanes.
+    var protocolValue: SourceSearchMode? {
+        self == .automatic ? nil : self
     }
 }
 
 struct SourceSearchResult: Codable, Sendable {
     let hits: [SourceSearchHit]
     let degraded: Bool
+    let mode: String
+    let requestedMode: String
+    let semanticUnavailable: String?
+    let candidatesScanned: Int
+
+    enum CodingKeys: String, CodingKey {
+        case hits
+        case degraded
+        case mode
+        case requestedMode = "requested_mode"
+        case semanticUnavailable = "semantic_unavailable"
+        case candidatesScanned = "candidates_scanned"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hits = try container.decode([SourceSearchHit].self, forKey: .hits)
+        degraded = try container.decodeIfPresent(Bool.self, forKey: .degraded) ?? false
+        mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "lexical"
+        requestedMode = try container.decodeIfPresent(String.self, forKey: .requestedMode) ?? mode
+        semanticUnavailable = try container.decodeIfPresent(
+            String.self,
+            forKey: .semanticUnavailable
+        )
+        candidatesScanned = try container.decodeIfPresent(Int.self, forKey: .candidatesScanned) ?? 0
+    }
+
+    init(
+        hits: [SourceSearchHit],
+        degraded: Bool = false,
+        mode: String = "lexical",
+        requestedMode: String = "lexical",
+        semanticUnavailable: String? = nil,
+        candidatesScanned: Int = 0
+    ) {
+        self.hits = hits
+        self.degraded = degraded
+        self.mode = mode
+        self.requestedMode = requestedMode
+        self.semanticUnavailable = semanticUnavailable
+        self.candidatesScanned = candidatesScanned
+    }
+}
+
+struct SourceEmbeddingPolicy: Codable, Equatable, Sendable {
+    var enabled: Bool
+    var endpointEnv: String?
+    var model: String?
+    var dimensions: Int
+    var batchSize: Int
+    var maxChunksPerSource: Int
+    var retentionDays: Int
+    var timeoutSecs: Int
+    var apiKeyEnv: String?
+
+    static let defaults = SourceEmbeddingPolicy(
+        enabled: false,
+        endpointEnv: nil,
+        model: nil,
+        dimensions: 1536,
+        batchSize: 8,
+        maxChunksPerSource: 200,
+        retentionDays: 30,
+        timeoutSecs: 30,
+        apiKeyEnv: nil
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case endpointEnv = "endpoint_env"
+        case model
+        case dimensions
+        case batchSize = "batch_size"
+        case maxChunksPerSource = "max_chunks_per_source"
+        case retentionDays = "retention_days"
+        case timeoutSecs = "timeout_secs"
+        case apiKeyEnv = "api_key_env"
+    }
+
+    init(
+        enabled: Bool,
+        endpointEnv: String?,
+        model: String?,
+        dimensions: Int,
+        batchSize: Int,
+        maxChunksPerSource: Int,
+        retentionDays: Int,
+        timeoutSecs: Int,
+        apiKeyEnv: String?
+    ) {
+        self.enabled = enabled
+        self.endpointEnv = endpointEnv
+        self.model = model
+        self.dimensions = dimensions
+        self.batchSize = batchSize
+        self.maxChunksPerSource = maxChunksPerSource
+        self.retentionDays = retentionDays
+        self.timeoutSecs = timeoutSecs
+        self.apiKeyEnv = apiKeyEnv
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        endpointEnv = try container.decodeIfPresent(String.self, forKey: .endpointEnv)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        dimensions = try container.decodeIfPresent(Int.self, forKey: .dimensions) ?? 1536
+        batchSize = try container.decodeIfPresent(Int.self, forKey: .batchSize) ?? 8
+        maxChunksPerSource = try container.decodeIfPresent(Int.self, forKey: .maxChunksPerSource)
+            ?? 200
+        retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 30
+        timeoutSecs = try container.decodeIfPresent(Int.self, forKey: .timeoutSecs) ?? 30
+        apiKeyEnv = try container.decodeIfPresent(String.self, forKey: .apiKeyEnv)
+    }
+
+    var isConfigured: Bool {
+        !(endpointEnv?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            && !(model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
+
+    func jsonObject() -> [String: JSONValue] {
+        [
+            "enabled": .bool(enabled),
+            "endpoint_env": endpointEnv.flatMap { value in
+                value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? nil
+                    : JSONValue.string(value)
+            } ?? .null,
+            "model": model.flatMap { value in
+                value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? nil
+                    : JSONValue.string(value)
+            } ?? .null,
+            "dimensions": .number(Double(dimensions)),
+            "batch_size": .number(Double(batchSize)),
+            "max_chunks_per_source": .number(Double(maxChunksPerSource)),
+            "retention_days": .number(Double(retentionDays)),
+            "timeout_secs": .number(Double(timeoutSecs)),
+            "api_key_env": apiKeyEnv.flatMap { value in
+                value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? nil
+                    : JSONValue.string(value)
+            } ?? .null,
+        ]
+    }
+}
+
+struct SourceEmbeddingPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: SourceEmbeddingPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
+struct SourceEmbeddingUsage: Codable, Sendable {
+    let calls: UInt64
+    let inputTokens: UInt64
+    let estimatedTokens: UInt64
+    let bytes: UInt64
+    let providerReportedCalls: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case calls
+        case inputTokens = "input_tokens"
+        case estimatedTokens = "estimated_tokens"
+        case bytes
+        case providerReportedCalls = "provider_reported_calls"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        calls = try container.decodeIfPresent(UInt64.self, forKey: .calls) ?? 0
+        inputTokens = try container.decodeIfPresent(UInt64.self, forKey: .inputTokens) ?? 0
+        estimatedTokens = try container.decodeIfPresent(UInt64.self, forKey: .estimatedTokens) ?? 0
+        bytes = try container.decodeIfPresent(UInt64.self, forKey: .bytes) ?? 0
+        providerReportedCalls = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .providerReportedCalls
+        ) ?? 0
+    }
+}
+
+struct SourceEmbeddingJobStatus: Codable, Identifiable, Hashable, Sendable {
+    let sourceID: String
+    let sourceTitle: String
+    let status: String
+    let attempts: UInt32
+    let generation: UInt64
+    let chunksTotal: UInt32
+    let chunksDone: UInt32
+    let lastError: String?
+    let nextAttemptAt: String?
+    let updatedAt: String
+
+    var id: String {
+        sourceID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sourceID = "source_id"
+        case sourceTitle = "source_title"
+        case status
+        case attempts
+        case generation
+        case chunksTotal = "chunks_total"
+        case chunksDone = "chunks_done"
+        case lastError = "last_error"
+        case nextAttemptAt = "next_attempt_at"
+        case updatedAt = "updated_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sourceID = try container.decode(String.self, forKey: .sourceID)
+        sourceTitle = try container.decodeIfPresent(String.self, forKey: .sourceTitle) ?? ""
+        status = try container.decodeIfPresent(String.self, forKey: .status) ?? "pending"
+        attempts = try container.decodeIfPresent(UInt32.self, forKey: .attempts) ?? 0
+        generation = try container.decodeIfPresent(UInt64.self, forKey: .generation) ?? 0
+        chunksTotal = try container.decodeIfPresent(UInt32.self, forKey: .chunksTotal) ?? 0
+        chunksDone = try container.decodeIfPresent(UInt32.self, forKey: .chunksDone) ?? 0
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        nextAttemptAt = try container.decodeIfPresent(String.self, forKey: .nextAttemptAt)
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt) ?? ""
+    }
+}
+
+struct SourceEmbeddingIntegrity: Codable, Hashable, Sendable {
+    let validVectors: UInt32
+    let invalidVectors: UInt32
+    let staleVectors: UInt32
+    let orphanVectors: UInt32
+    let generationMismatched: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case validVectors = "valid_vectors"
+        case invalidVectors = "invalid_vectors"
+        case staleVectors = "stale_vectors"
+        case orphanVectors = "orphan_vectors"
+        case generationMismatched = "generation_mismatched"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        validVectors = try container.decodeIfPresent(UInt32.self, forKey: .validVectors) ?? 0
+        invalidVectors = try container.decodeIfPresent(UInt32.self, forKey: .invalidVectors) ?? 0
+        staleVectors = try container.decodeIfPresent(UInt32.self, forKey: .staleVectors) ?? 0
+        orphanVectors = try container.decodeIfPresent(UInt32.self, forKey: .orphanVectors) ?? 0
+        generationMismatched = try container.decodeIfPresent(
+            UInt32.self,
+            forKey: .generationMismatched
+        ) ?? 0
+    }
+}
+
+struct SourceEmbeddingStatusResult: Codable, Sendable {
+    let projectId: String
+    let enabled: Bool
+    let configured: Bool
+    let endpointEnv: String?
+    let endpointEnvPresent: Bool
+    let apiKeyEnv: String?
+    let apiKeyEnvPresent: Bool
+    let model: String?
+    let dimensions: Int
+    let batchSize: Int
+    let maxChunksPerSource: Int
+    let retentionDays: Int
+    let indexableChunks: UInt32
+    let indexedChunks: UInt32
+    let staleChunks: UInt32
+    let invalidChunks: UInt32
+    let pendingJobs: UInt32
+    let runningJobs: UInt32
+    let failedJobs: UInt32
+    let deadJobs: UInt32
+    let doneJobs: UInt32
+    let coverage: Double
+    let semanticUnavailable: String?
+    let lastError: String?
+    let usage: SourceEmbeddingUsage
+    let recentJobs: [SourceEmbeddingJobStatus]
+    let integrity: SourceEmbeddingIntegrity
+
+    var activeJobs: UInt32 {
+        pendingJobs + runningJobs
+    }
+
+    var attentionJobs: UInt32 {
+        failedJobs + deadJobs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case enabled
+        case configured
+        case endpointEnv = "endpoint_env"
+        case endpointEnvPresent = "endpoint_env_present"
+        case apiKeyEnv = "api_key_env"
+        case apiKeyEnvPresent = "api_key_env_present"
+        case model
+        case dimensions
+        case batchSize = "batch_size"
+        case maxChunksPerSource = "max_chunks_per_source"
+        case retentionDays = "retention_days"
+        case indexableChunks = "indexable_chunks"
+        case indexedChunks = "indexed_chunks"
+        case staleChunks = "stale_chunks"
+        case invalidChunks = "invalid_chunks"
+        case pendingJobs = "pending_jobs"
+        case runningJobs = "running_jobs"
+        case failedJobs = "failed_jobs"
+        case deadJobs = "dead_jobs"
+        case doneJobs = "done_jobs"
+        case coverage
+        case semanticUnavailable = "semantic_unavailable"
+        case lastError = "last_error"
+        case usage
+        case recentJobs = "recent_jobs"
+        case integrity
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        configured = try container.decodeIfPresent(Bool.self, forKey: .configured) ?? false
+        endpointEnv = try container.decodeIfPresent(String.self, forKey: .endpointEnv)
+        endpointEnvPresent = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .endpointEnvPresent
+        ) ?? false
+        apiKeyEnv = try container.decodeIfPresent(String.self, forKey: .apiKeyEnv)
+        apiKeyEnvPresent = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .apiKeyEnvPresent
+        ) ?? true
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        dimensions = try container.decodeIfPresent(Int.self, forKey: .dimensions) ?? 0
+        batchSize = try container.decodeIfPresent(Int.self, forKey: .batchSize) ?? 0
+        maxChunksPerSource = try container.decodeIfPresent(Int.self, forKey: .maxChunksPerSource)
+            ?? 0
+        retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 0
+        indexableChunks = try container.decodeIfPresent(UInt32.self, forKey: .indexableChunks) ?? 0
+        indexedChunks = try container.decodeIfPresent(UInt32.self, forKey: .indexedChunks) ?? 0
+        staleChunks = try container.decodeIfPresent(UInt32.self, forKey: .staleChunks) ?? 0
+        invalidChunks = try container.decodeIfPresent(UInt32.self, forKey: .invalidChunks) ?? 0
+        pendingJobs = try container.decodeIfPresent(UInt32.self, forKey: .pendingJobs) ?? 0
+        runningJobs = try container.decodeIfPresent(UInt32.self, forKey: .runningJobs) ?? 0
+        failedJobs = try container.decodeIfPresent(UInt32.self, forKey: .failedJobs) ?? 0
+        deadJobs = try container.decodeIfPresent(UInt32.self, forKey: .deadJobs) ?? 0
+        doneJobs = try container.decodeIfPresent(UInt32.self, forKey: .doneJobs) ?? 0
+        coverage = try container.decodeIfPresent(Double.self, forKey: .coverage) ?? 0
+        semanticUnavailable = try container.decodeIfPresent(
+            String.self,
+            forKey: .semanticUnavailable
+        )
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        usage = try container.decodeIfPresent(SourceEmbeddingUsage.self, forKey: .usage)
+            ?? SourceEmbeddingUsage.empty
+        recentJobs = try container.decodeIfPresent(
+            [SourceEmbeddingJobStatus].self,
+            forKey: .recentJobs
+        ) ?? []
+        integrity = try container.decodeIfPresent(
+            SourceEmbeddingIntegrity.self,
+            forKey: .integrity
+        ) ?? SourceEmbeddingIntegrity.empty
+    }
+}
+
+struct SourceEmbeddingReindexResult: Codable, Sendable {
+    let projectId: String
+    let enabled: Bool
+    let model: String?
+    let clearedVectors: UInt32
+    let clearedJobs: UInt32
+    let enqueuedSources: UInt32
+    let maxChunksPerSource: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case enabled
+        case model
+        case clearedVectors = "cleared_vectors"
+        case clearedJobs = "cleared_jobs"
+        case enqueuedSources = "enqueued_sources"
+        case maxChunksPerSource = "max_chunks_per_source"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        clearedVectors = try container.decodeIfPresent(UInt32.self, forKey: .clearedVectors) ?? 0
+        clearedJobs = try container.decodeIfPresent(UInt32.self, forKey: .clearedJobs) ?? 0
+        enqueuedSources = try container.decodeIfPresent(UInt32.self, forKey: .enqueuedSources) ?? 0
+        maxChunksPerSource = try container.decodeIfPresent(
+            UInt32.self,
+            forKey: .maxChunksPerSource
+        ) ?? 0
+    }
+}
+
+extension SourceEmbeddingUsage {
+    static let empty = SourceEmbeddingUsage(
+        calls: 0,
+        inputTokens: 0,
+        estimatedTokens: 0,
+        bytes: 0,
+        providerReportedCalls: 0
+    )
+
+    init(
+        calls: UInt64,
+        inputTokens: UInt64,
+        estimatedTokens: UInt64,
+        bytes: UInt64,
+        providerReportedCalls: UInt64
+    ) {
+        self.calls = calls
+        self.inputTokens = inputTokens
+        self.estimatedTokens = estimatedTokens
+        self.bytes = bytes
+        self.providerReportedCalls = providerReportedCalls
+    }
+}
+
+extension SourceEmbeddingIntegrity {
+    static let empty = SourceEmbeddingIntegrity(
+        validVectors: 0,
+        invalidVectors: 0,
+        staleVectors: 0,
+        orphanVectors: 0,
+        generationMismatched: 0
+    )
+
+    init(
+        validVectors: UInt32,
+        invalidVectors: UInt32,
+        staleVectors: UInt32,
+        orphanVectors: UInt32,
+        generationMismatched: UInt32
+    ) {
+        self.validVectors = validVectors
+        self.invalidVectors = invalidVectors
+        self.staleVectors = staleVectors
+        self.orphanVectors = orphanVectors
+        self.generationMismatched = generationMismatched
+    }
 }
 
 struct SourceCitation: Codable, Identifiable, Hashable, Sendable {

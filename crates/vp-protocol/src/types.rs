@@ -1268,9 +1268,64 @@ pub struct SourceSearchParams {
     pub labels: Vec<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// `lexical`, `semantic`, or `hybrid`. Absent keeps the backward-compatible
+    /// dynamic default: hybrid when the project opted into source embeddings,
+    /// otherwise lexical. An unavailable semantic lane always falls back to
+    /// lexical with a documented reason.
+    #[serde(default)]
+    pub mode: Option<SourceSearchMode>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Source retrieval lane. This is deliberately not a model selector: it only
+/// chooses whether the deterministic lexical lane, the configured embedding
+/// lane, or their RRF fusion is used.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceSearchMode {
+    #[default]
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+impl SourceSearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+impl std::str::FromStr for SourceSearchMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "lexical" => Ok(Self::Lexical),
+            "semantic" => Ok(Self::Semantic),
+            "hybrid" => Ok(Self::Hybrid),
+            other => Err(format!(
+                "source search mode must be lexical, semantic, or hybrid (got {other})"
+            )),
+        }
+    }
+}
+
+fn default_source_label() -> String {
+    "lexical".to_string()
+}
+
+fn default_source_origins() -> Vec<String> {
+    vec!["lexical".to_string()]
+}
+
+/// One ranked source chunk. Additive semantic fields keep older clients
+/// decoding: `source` defaults to `lexical`, confidence/origins default to a
+/// plain lexical result, and both per-lane scores are optional. Vectors are
+/// never serialized through this type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SourceSearchHit {
     pub source_id: String,
     pub source_title: String,
@@ -1284,12 +1339,281 @@ pub struct SourceSearchHit {
     pub heading: Option<String>,
     pub content: String,
     pub score: f64,
+    /// Effective per-candidate origin label: `lexical`, `semantic`, or
+    /// `hybrid`. Legacy payloads had only the lexical path.
+    #[serde(default = "default_source_label")]
+    pub source: String,
+    /// Calibrated 0..=1 confidence derived from the effective lane. It never
+    /// changes lexical ordering and never invents semantic evidence.
+    #[serde(default)]
+    pub confidence: f64,
+    /// Deterministic lane membership, ordered `lexical, semantic`.
+    #[serde(default = "default_source_origins")]
+    pub origins: Vec<String>,
+    /// Raw lexical relevance retained for audit/debugging. Never a vector.
+    #[serde(default)]
+    pub lexical_score: Option<f64>,
+    /// Cosine similarity in 0..=1 retained for audit/debugging. Never a
+    /// vector or embedded text.
+    #[serde(default)]
+    pub semantic_score: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SourceSearchResult {
     pub hits: Vec<SourceSearchHit>,
     pub degraded: bool,
+    /// Effective lane after fallback. This can differ from `requested_mode`.
+    #[serde(default = "default_source_label")]
+    pub mode: String,
+    /// Lane requested by the caller or selected by the dynamic default.
+    #[serde(default = "default_source_label")]
+    pub requested_mode: String,
+    /// Present only when semantic retrieval was requested/selected but could
+    /// not contribute. Lexical hits are still returned.
+    #[serde(default)]
+    pub semantic_unavailable: Option<String>,
+    /// Bounded count of candidates examined by the semantic scan. Operational
+    /// telemetry only; no chunk text is duplicated here.
+    #[serde(default)]
+    pub candidates_scanned: usize,
+}
+
+/// Opt-in embedding lane for project knowledge sources.
+///
+/// This is deliberately separate from [`MemoryEmbeddingPolicy`]: source
+/// embeddings index bounded chunks of immutable snapshots, have their own job
+/// queue, retention, usage table, and generation-invalidated vectors. The
+/// endpoint is named by `endpoint_env`, never stored as a URL value, so an
+/// operator can point one daemon at a different endpoint without rewriting
+/// project state. `api_key_env` follows the same name-only rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceEmbeddingPolicy {
+    /// Off by default. A disabled policy performs no automatic indexing and no
+    /// query embedding calls.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Environment variable name containing the OpenAI-compatible embeddings
+    /// base URL (or full `/embeddings` URL). The value is read at call time.
+    #[serde(default)]
+    pub endpoint_env: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_source_embedding_dimensions")]
+    pub dimensions: u32,
+    /// Chunks embedded per HTTP batch and per reconciler tick.
+    #[serde(default = "default_source_embedding_batch_size")]
+    pub batch_size: u32,
+    /// Hard per-source chunk cap for the derived index. Chunks above this cap
+    /// remain lexically searchable and are counted as not indexed.
+    #[serde(default = "default_source_embedding_max_chunks")]
+    pub max_chunks_per_source: u32,
+    /// Older-generation vectors and dead jobs are pruned after this many days.
+    /// `0` keeps derived rows until an explicit reindex/clear.
+    #[serde(default = "default_source_embedding_retention_days")]
+    pub retention_days: u32,
+    #[serde(default = "default_source_embedding_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Environment variable name for the bearer token, if the endpoint needs
+    /// one. The value is never persisted, returned, or logged.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+fn default_source_embedding_dimensions() -> u32 {
+    1536
+}
+
+fn default_source_embedding_batch_size() -> u32 {
+    8
+}
+
+fn default_source_embedding_max_chunks() -> u32 {
+    200
+}
+
+fn default_source_embedding_retention_days() -> u32 {
+    30
+}
+
+fn default_source_embedding_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for SourceEmbeddingPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint_env: None,
+            model: None,
+            dimensions: default_source_embedding_dimensions(),
+            batch_size: default_source_embedding_batch_size(),
+            max_chunks_per_source: default_source_embedding_max_chunks(),
+            retention_days: default_source_embedding_retention_days(),
+            timeout_secs: default_source_embedding_timeout_secs(),
+            api_key_env: None,
+        }
+    }
+}
+
+impl SourceEmbeddingPolicy {
+    /// Both endpoint and model are required before any request can be made.
+    /// An object may be configured but disabled.
+    pub fn is_configured(&self) -> bool {
+        self.endpoint_env
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty())
+            && self
+                .model
+                .as_deref()
+                .is_some_and(|model| !model.trim().is_empty())
+    }
+
+    /// True only when the lane is both enabled and configured. This is the
+    /// single gate for daemon indexing and query embedding calls.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.is_configured()
+    }
+
+    pub fn endpoint_env_name(&self) -> Option<&str> {
+        self.endpoint_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    pub fn api_key_env_name(&self) -> Option<&str> {
+        self.api_key_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceEmbeddingPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSourceEmbeddingPolicyParams {
+    pub project_id: String,
+    pub policy: SourceEmbeddingPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceEmbeddingPolicyResult {
+    pub project_id: String,
+    pub policy: SourceEmbeddingPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceEmbeddingStatusParams {
+    pub project_id: String,
+}
+
+/// Bounded operational state for one source embedding job. Contains no
+/// vectors, embedded text, endpoint URL values, or credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SourceEmbeddingJobStatus {
+    pub source_id: String,
+    pub source_title: String,
+    /// `pending`, `running`, `done`, `failed`, or `dead`.
+    pub status: String,
+    pub attempts: u32,
+    pub generation: u64,
+    pub chunks_total: u32,
+    pub chunks_done: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+    pub updated_at: String,
+}
+
+/// Source embedding spend is project infrastructure accounting, separate from
+/// memory embeddings and session usage. Nothing here is charged to a session
+/// token or USD budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SourceEmbeddingUsage {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub estimated_tokens: u64,
+    pub bytes: u64,
+    pub provider_reported_calls: u64,
+}
+
+/// Structural health of derived source vectors. These counts are operational,
+/// rebuildable metadata, not an audit projection. The engine re-checks the
+/// exact embedding-text hash during retrieval, so a stale row is skipped even
+/// when its structural header is valid.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SourceEmbeddingIntegrity {
+    pub valid_vectors: u32,
+    pub invalid_vectors: u32,
+    pub stale_vectors: u32,
+    pub orphan_vectors: u32,
+    pub generation_mismatched: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceEmbeddingStatusResult {
+    pub project_id: String,
+    pub enabled: bool,
+    pub configured: bool,
+    /// Environment variable *names* only. Booleans describe whether a value is
+    /// currently present; values are never returned.
+    pub endpoint_env: Option<String>,
+    pub endpoint_env_present: bool,
+    pub api_key_env: Option<String>,
+    pub api_key_env_present: bool,
+    pub model: Option<String>,
+    pub dimensions: u32,
+    pub batch_size: u32,
+    pub max_chunks_per_source: u32,
+    pub retention_days: u32,
+    /// Chunks eligible under `max_chunks_per_source`.
+    pub indexable_chunks: u32,
+    /// Current-generation, structurally valid vectors.
+    pub indexed_chunks: u32,
+    /// Older-generation vectors retained until retention pruning.
+    pub stale_chunks: u32,
+    pub invalid_chunks: u32,
+    pub pending_jobs: u32,
+    pub running_jobs: u32,
+    pub failed_jobs: u32,
+    pub dead_jobs: u32,
+    pub done_jobs: u32,
+    /// `indexed_chunks / indexable_chunks`, zero when nothing is indexable.
+    pub coverage: f64,
+    /// Why semantic retrieval cannot contribute right now, if applicable.
+    pub semantic_unavailable: Option<String>,
+    pub last_error: Option<String>,
+    pub usage: SourceEmbeddingUsage,
+    pub recent_jobs: Vec<SourceEmbeddingJobStatus>,
+    pub integrity: SourceEmbeddingIntegrity,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceEmbeddingReindexParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceEmbeddingReindexResult {
+    pub project_id: String,
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub cleared_vectors: u32,
+    pub cleared_jobs: u32,
+    pub enqueued_sources: u32,
+    pub max_chunks_per_source: u32,
 }
 
 /// Citation evidence attached to an assistant message. The excerpt is a
@@ -10887,5 +11211,249 @@ mod context_checkpoint_bundle_tests {
         }))
         .unwrap();
         assert_eq!(status.project_id.as_deref(), Some("prj-1"));
+    }
+
+    #[test]
+    fn source_search_mode_defaults_and_serializes_lowercase() {
+        let params: SourceSearchParams = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "query": "leases"
+        }))
+        .unwrap();
+        assert!(
+            params.mode.is_none(),
+            "absent mode keeps the dynamic default"
+        );
+        let semantic: SourceSearchParams = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "query": "leases",
+            "mode": "semantic"
+        }))
+        .unwrap();
+        assert_eq!(semantic.mode, Some(SourceSearchMode::Semantic));
+        assert_eq!(SourceSearchMode::Hybrid.as_str(), "hybrid");
+        assert_eq!(
+            serde_json::to_value(SourceSearchMode::Hybrid).unwrap(),
+            json!("hybrid")
+        );
+        assert_eq!(
+            "lexical"
+                .parse::<SourceSearchMode>()
+                .expect("lexical mode parses"),
+            SourceSearchMode::Lexical
+        );
+        assert!("vector".parse::<SourceSearchMode>().is_err());
+    }
+
+    #[test]
+    fn legacy_source_search_hit_decodes_without_semantic_fields() {
+        let hit: SourceSearchHit = serde_json::from_value(json!({
+            "source_id": "src-1",
+            "source_title": "Runtime",
+            "chunk_id": "src-1:0001:abcdef",
+            "chunk_no": 1,
+            "content": "Deterministic leases.",
+            "score": 1.25
+        }))
+        .unwrap();
+        assert_eq!(hit.source, "lexical");
+        assert_eq!(hit.confidence, 0.0);
+        assert_eq!(hit.origins, vec!["lexical"]);
+        assert!(hit.lexical_score.is_none());
+        assert!(hit.semantic_score.is_none());
+        let result: SourceSearchResult = serde_json::from_value(json!({
+            "hits": [{
+                "source_id": "src-1",
+                "source_title": "Runtime",
+                "chunk_id": "src-1:0001:abcdef",
+                "chunk_no": 1,
+                "content": "Deterministic leases.",
+                "score": 1.25
+            }],
+            "degraded": false
+        }))
+        .unwrap();
+        assert!(!result.degraded);
+        assert_eq!(result.mode, "lexical");
+        assert!(result.semantic_unavailable.is_none());
+        assert_eq!(result.candidates_scanned, 0);
+    }
+
+    #[test]
+    fn source_search_result_serializes_semantic_lineage() {
+        let hit = SourceSearchHit {
+            source_id: "src-1".into(),
+            source_title: "Runtime".into(),
+            chunk_id: "src-1:0001:abcdef".into(),
+            chunk_no: 1,
+            content: "Deterministic leases.".into(),
+            score: 0.87,
+            source: "hybrid".into(),
+            confidence: 0.87,
+            origins: vec!["lexical".into(), "semantic".into()],
+            lexical_score: Some(1.4),
+            semantic_score: Some(0.81),
+            ..SourceSearchHit::default()
+        };
+        let result = SourceSearchResult {
+            hits: vec![hit],
+            degraded: false,
+            mode: "hybrid".into(),
+            requested_mode: "hybrid".into(),
+            semantic_unavailable: Some("no_indexed_vectors".into()),
+            candidates_scanned: 12,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["mode"], "hybrid");
+        assert_eq!(value["hits"][0]["source"], "hybrid");
+        assert_eq!(value["hits"][0]["origins"][0], "lexical");
+        assert_eq!(value["candidates_scanned"], 12);
+        assert!(value["hits"][0].get("vector").is_none());
+        assert!(value["hits"][0].get("embedding").is_none());
+    }
+
+    #[test]
+    fn source_embedding_policy_defaults_are_off_and_bounded() {
+        let policy = SourceEmbeddingPolicy::default();
+        assert!(!policy.enabled);
+        assert!(!policy.is_configured());
+        assert!(!policy.is_active());
+        assert_eq!(policy.dimensions, 1536);
+        assert_eq!(policy.batch_size, 8);
+        assert_eq!(policy.max_chunks_per_source, 200);
+        assert_eq!(policy.retention_days, 30);
+        assert_eq!(policy.timeout_secs, 30);
+        assert!(policy.endpoint_env.is_none());
+        assert!(policy.api_key_env.is_none());
+
+        let decoded: SourceEmbeddingPolicy = serde_json::from_value(json!({
+            "enabled": true,
+            "endpoint_env": "SOURCE_EMBED_ENDPOINT",
+            "model": "embed-small"
+        }))
+        .unwrap();
+        assert!(decoded.is_active());
+        assert_eq!(decoded.batch_size, 8);
+        assert_eq!(decoded.max_chunks_per_source, 200);
+        assert_eq!(decoded.endpoint_env_name(), Some("SOURCE_EMBED_ENDPOINT"));
+        assert_eq!(decoded.api_key_env_name(), None);
+        assert_eq!(decoded.endpoint_env_name(), Some("SOURCE_EMBED_ENDPOINT"));
+    }
+
+    #[test]
+    fn source_embedding_status_decodes_counts_and_jobs_without_vectors() {
+        let status: SourceEmbeddingStatusResult = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "enabled": true,
+            "configured": true,
+            "endpoint_env": "SOURCE_EMBED_ENDPOINT",
+            "endpoint_env_present": true,
+            "model": "embed-small",
+            "dimensions": 512,
+            "indexable_chunks": 20,
+            "indexed_chunks": 16,
+            "stale_chunks": 2,
+            "pending_jobs": 1,
+            "failed_jobs": 1,
+            "coverage": 0.8,
+            "semantic_unavailable": "no_indexed_vectors",
+            "usage": {
+                "calls": 3,
+                "input_tokens": 90,
+                "estimated_tokens": 10,
+                "bytes": 360,
+                "provider_reported_calls": 2
+            },
+            "recent_jobs": [{
+                "source_id": "src-1",
+                "source_title": "Runtime",
+                "status": "failed",
+                "attempts": 2,
+                "generation": 4,
+                "chunks_total": 10,
+                "chunks_done": 8,
+                "last_error": "HTTP 503: busy",
+                "next_attempt_at": "2026-11-11T00:10:00Z",
+                "updated_at": "2026-11-11T00:00:00Z"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(status.dimensions, 512);
+        assert_eq!(status.indexed_chunks, 16);
+        assert_eq!(status.pending_jobs, 1);
+        assert_eq!(status.failed_jobs, 1);
+        assert_eq!(status.coverage, 0.8);
+        assert_eq!(status.recent_jobs[0].generation, 4);
+        assert_eq!(status.recent_jobs[0].chunks_done, 8);
+        assert_eq!(status.usage.provider_reported_calls, 2);
+        assert_eq!(status.batch_size, 0, "absent additive fields default");
+        assert_eq!(status.integrity.valid_vectors, 0);
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert!(encoded.get("vectors").is_none());
+        assert!(encoded.get("endpoint").is_none());
+    }
+
+    #[test]
+    fn source_embedding_reindex_result_round_trips() {
+        let result = SourceEmbeddingReindexResult {
+            project_id: "prj-1".into(),
+            enabled: true,
+            model: Some("embed-small".into()),
+            cleared_vectors: 8,
+            cleared_jobs: 2,
+            enqueued_sources: 3,
+            max_chunks_per_source: 200,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        let decoded: SourceEmbeddingReindexResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, result);
+        let legacy: SourceEmbeddingReindexResult = serde_json::from_value(json!({
+            "project_id": "prj-1"
+        }))
+        .unwrap();
+        assert!(!legacy.enabled);
+        assert_eq!(legacy.enqueued_sources, 0);
+    }
+
+    #[test]
+    fn source_embedding_policy_round_trips_without_a_secret() {
+        let policy = SourceEmbeddingPolicy {
+            enabled: true,
+            endpoint_env: Some("SOURCE_EMBED_ENDPOINT".into()),
+            model: Some("embed-small".into()),
+            dimensions: 512,
+            batch_size: 4,
+            max_chunks_per_source: 120,
+            retention_days: 14,
+            timeout_secs: 20,
+            api_key_env: Some("SOURCE_EMBED_KEY".into()),
+        };
+        let value = serde_json::to_value(&policy).unwrap();
+        assert_eq!(value["endpoint_env"], "SOURCE_EMBED_ENDPOINT");
+        assert_eq!(value["api_key_env"], "SOURCE_EMBED_KEY");
+        assert!(value.get("endpoint").is_none());
+        assert!(value.get("api_key").is_none());
+        let decoded: SourceEmbeddingPolicy = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, policy);
+        assert!(decoded.is_active());
+        assert_eq!(decoded.endpoint_env_name(), Some("SOURCE_EMBED_ENDPOINT"));
+        assert_eq!(decoded.api_key_env_name(), Some("SOURCE_EMBED_KEY"));
+    }
+
+    #[test]
+    fn legacy_source_embedding_status_decodes_additive_defaults() {
+        let status: SourceEmbeddingStatusResult = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "enabled": false,
+            "configured": false
+        }))
+        .unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.indexable_chunks, 0);
+        assert_eq!(status.pending_jobs, 0);
+        assert_eq!(status.usage.calls, 0);
+        assert!(status.recent_jobs.is_empty());
+        assert_eq!(status.integrity, SourceEmbeddingIntegrity::default());
+        assert!(status.semantic_unavailable.is_none());
     }
 }

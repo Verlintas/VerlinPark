@@ -11468,3 +11468,904 @@ async fn dashboard_alerts_surface_gui_contention_and_out_of_scope_holders() {
             .any(|alert| alert.kind == "gui_queue" || alert.kind == "gui_stale_holder")
     );
 }
+
+// ---- Semantic source index ------------------------------------------------
+
+fn source_embedding_policy_for(env_name: &str) -> vp_protocol::types::SourceEmbeddingPolicy {
+    vp_protocol::types::SourceEmbeddingPolicy {
+        enabled: true,
+        endpoint_env: Some(env_name.to_string()),
+        model: Some("source-embed-test".to_string()),
+        dimensions: 8,
+        batch_size: 8,
+        max_chunks_per_source: 50,
+        retention_days: 30,
+        timeout_secs: 5,
+        api_key_env: None,
+    }
+}
+
+fn source_embedding_response_vector(seed: f32) -> serde_json::Value {
+    serde_json::json!([
+        seed,
+        seed + 0.01,
+        seed + 0.02,
+        seed + 0.03,
+        seed + 0.04,
+        seed + 0.05,
+        seed + 0.06,
+        seed + 0.07
+    ])
+}
+
+async fn source_embedding_success_server() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            let inputs = body
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let data = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    serde_json::json!({
+                        "object": "embedding",
+                        "index": index,
+                        "embedding": source_embedding_response_vector(0.5),
+                    })
+                })
+                .collect::<Vec<_>>();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "model": "source-embed-test",
+                "data": data,
+                "usage": {"prompt_tokens": inputs.len().max(1) * 4}
+            }))
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn source_embedding_dimension_mismatch_server() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            let count = body
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(1);
+            let data = (0..count)
+                .map(|index| {
+                    serde_json::json!({
+                        "index": index,
+                        "embedding": [0.1, 0.2, 0.3, 0.4],
+                    })
+                })
+                .collect::<Vec<_>>();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": data}))
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+fn set_source_embedding_env(name: &str, value: &str) {
+    // SAFETY: test-local unique variable names; no concurrent test reads this
+    // exact name.
+    unsafe { std::env::set_var(name, value) };
+}
+
+fn remove_source_embedding_env(name: &str) {
+    // SAFETY: test-local unique variable names.
+    unsafe { std::env::remove_var(name) };
+}
+
+async fn source_embedding_engine(
+    label: &str,
+) -> (TempDir, TempDir, Engine, vp_protocol::types::Project) {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some(label.into()),
+        )
+        .await
+        .unwrap();
+    (data, repo, engine, project)
+}
+
+#[tokio::test]
+async fn source_semantic_index_and_hybrid_search_end_to_end() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_SEMANTIC_SUCCESS";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("semantic").await;
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: Some("engineering".into()),
+            title: "Scheduler notes".into(),
+            content: "The scheduler uses deterministic leases for integration and evidence.".into(),
+            labels: vec!["runtime".into()],
+        })
+        .await
+        .unwrap();
+    let (projects, indexed, failed, done) = engine.reconcile_source_embeddings().await.unwrap();
+    assert_eq!(projects, 1);
+    assert!(indexed >= 1, "at least one chunk was embedded");
+    assert_eq!(failed, 0);
+    assert!(done >= 1);
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert!(status.enabled);
+    assert!(status.configured);
+    assert!(status.endpoint_env_present);
+    assert_eq!(status.endpoint_env.as_deref(), Some(env_name));
+    assert!(status.indexed_chunks >= 1);
+    assert_eq!(status.pending_jobs, 0);
+    assert_eq!(status.failed_jobs, 0);
+    assert!(status.coverage > 0.999);
+    assert!(status.semantic_unavailable.is_none());
+    assert!(status.indexed_chunks <= status.indexable_chunks);
+
+    let semantic = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "lease coordination evidence".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Semantic),
+        )
+        .await
+        .unwrap();
+    assert_eq!(semantic.mode, "semantic");
+    assert_eq!(semantic.requested_mode, "semantic");
+    assert!(!semantic.hits.is_empty());
+    assert!(semantic.semantic_unavailable.is_none());
+    assert_eq!(semantic.candidates_scanned, 1);
+    for hit in &semantic.hits {
+        assert_eq!(hit.source_id, source.id);
+        assert_eq!(hit.source, "semantic");
+        assert_eq!(hit.origins, vec!["semantic"]);
+        assert!(hit.semantic_score.is_some());
+        assert!(hit.lexical_score.is_none());
+    }
+
+    let hybrid = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "deterministic leases".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(4),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(hybrid.mode, "hybrid", "enabled lane is the dynamic default");
+    assert_eq!(hybrid.requested_mode, "hybrid");
+    assert!(hybrid.hits.len() <= 4);
+    assert!(hybrid.hits.iter().any(|hit| {
+        hit.source == "hybrid"
+            && hit.origins == vec!["lexical", "semantic"]
+            && hit.lexical_score.is_some()
+            && hit.semantic_score.is_some()
+    }));
+    let value = serde_json::to_value(&hybrid).unwrap();
+    assert!(value.get("vectors").is_none());
+    assert!(value["hits"][0].get("vector").is_none());
+    assert!(value["hits"][0].get("embedding").is_none());
+
+    // An explicit lexical request must not embed the query, even after the
+    // project has indexed vectors.
+    let calls_before = server.received_requests().await.unwrap().len();
+    let lexical = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "deterministic leases".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Lexical),
+        )
+        .await
+        .unwrap();
+    let calls_after = server.received_requests().await.unwrap().len();
+    assert_eq!(calls_before, calls_after);
+    assert_eq!(lexical.mode, "lexical");
+    assert!(lexical.semantic_unavailable.is_none());
+    assert!(!lexical.hits.is_empty());
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_search_lexical_compatibility_and_fallbacks() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let env_name = "VERLINPARK_TEST_SOURCE_LEXICAL_COMPAT";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("lexical").await;
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Compatibility".into(),
+            content: "Deterministic retrieval supports exact citations.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let before = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "deterministic citations".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Lexical),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before.mode, "lexical");
+    assert!(!before.hits.is_empty());
+
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    let after = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "deterministic citations".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Lexical),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before.hits, after.hits,
+        "lexical scores and order are unchanged"
+    );
+    assert_eq!(after.hits[0].source, "lexical");
+    assert_eq!(after.hits[0].origins, vec!["lexical"]);
+    assert!(after.hits[0].confidence > 0.0);
+
+    // No vectors exist yet, so semantic/hybrid must fall back before any
+    // request. The broken mock would fail the test if a call were made.
+    for mode in [
+        vp_protocol::types::SourceSearchMode::Semantic,
+        vp_protocol::types::SourceSearchMode::Hybrid,
+    ] {
+        let fallback = engine
+            .search_sources_with_mode(
+                project.id.clone(),
+                "deterministic citations".into(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(5),
+                Some(mode),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback.mode, "lexical");
+        assert_eq!(fallback.requested_mode, mode.as_str());
+        assert_eq!(
+            fallback.semantic_unavailable.as_deref(),
+            Some("no_indexed_vectors")
+        );
+        assert!(!fallback.hits.is_empty());
+        assert_eq!(fallback.hits[0].source_id, source.id);
+    }
+    let dynamic_default = engine
+        .search_sources(
+            project.id.clone(),
+            "deterministic".into(),
+            Vec::new(),
+            Some(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dynamic_default.mode, "lexical");
+    assert_eq!(
+        dynamic_default.semantic_unavailable.as_deref(),
+        Some("no_indexed_vectors")
+    );
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_refresh_invalidates_semantic_vectors_and_recovers() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_GENERATION";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("generation").await;
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Generation".into(),
+            content: "A deterministic generation invalidates old vectors.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    engine.reconcile_source_embeddings().await.unwrap();
+    let ready = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "generation".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Semantic),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready.mode, "semantic");
+    assert!(!ready.hits.is_empty());
+
+    // Re-index the same source: a new snapshot generation marks the previous
+    // vectors stale. Before the reconciler catches up, search must fall back.
+    engine.reindex_source(source.id.clone()).await.unwrap();
+    let stale = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "generation".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Semantic),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.mode, "lexical");
+    assert_eq!(stale.semantic_unavailable.as_deref(), Some("stale_vectors"));
+    assert!(!stale.hits.is_empty(), "lexical search still works");
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert!(status.stale_chunks >= 1);
+    assert_eq!(status.indexed_chunks, 0);
+    assert_eq!(
+        status.semantic_unavailable.as_deref(),
+        Some("stale_vectors")
+    );
+
+    engine.reconcile_source_embeddings().await.unwrap();
+    let recovered = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "generation".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Semantic),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.mode, "semantic");
+    assert!(recovered.semantic_unavailable.is_none());
+    assert!(!recovered.hits.is_empty());
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_embedding_failure_never_breaks_source_writes_or_lexical_search() {
+    let server = source_embedding_dimension_mismatch_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_DIM_MISMATCH";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("mismatch").await;
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Mismatch".into(),
+            content: "The source write must survive a bad embedding endpoint.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(source.status, "indexed");
+    let (_projects, indexed, failed, _done) = engine.reconcile_source_embeddings().await.unwrap();
+    assert_eq!(indexed, 0);
+    assert!(failed >= 1);
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert_eq!(status.indexed_chunks, 0);
+    assert_eq!(status.dead_jobs, 1);
+    assert_eq!(
+        status.semantic_unavailable.as_deref(),
+        Some("no_indexed_vectors")
+    );
+    assert!(status.last_error.as_deref().is_some_and(|error| {
+        error.contains("dimension") || error.contains("invalid_embedding")
+    }));
+
+    // The source remains listed and lexically searchable.
+    let list = engine
+        .list_sources(project.id.clone(), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(list.sources.len(), 1);
+    let lexical = engine
+        .search_sources(project.id.clone(), "endpoint".into(), Vec::new(), Some(5))
+        .await
+        .unwrap();
+    assert_eq!(lexical.mode, "lexical");
+    assert!(!lexical.hits.is_empty());
+    assert_eq!(
+        lexical.semantic_unavailable.as_deref(),
+        Some("no_indexed_vectors")
+    );
+    let value = serde_json::to_value(&status).unwrap();
+    assert!(value.get("vectors").is_none());
+    assert!(value.get("embedded_text").is_none());
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_embedding_chunk_cap_bounds_jobs_and_indexable_chunks() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_CHUNK_CAP";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("chunk-cap").await;
+    let mut policy = source_embedding_policy_for(env_name);
+    policy.max_chunks_per_source = 1;
+    engine
+        .set_source_embedding_policy(&project.id, policy)
+        .await
+        .unwrap();
+    let content = format!(
+        "# One\n\n{}\n\n# Two\n\n{}",
+        "alpha ".repeat(900),
+        "zebra ".repeat(120)
+    );
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Long source".into(),
+            content,
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        source.chunk_count > 1,
+        "fixture must produce multiple chunks"
+    );
+    let (_projects, indexed, failed, done) = engine.reconcile_source_embeddings().await.unwrap();
+    assert_eq!(indexed, 1, "the chunk cap bounds vector work");
+    assert_eq!(failed, 0);
+    assert_eq!(done, 1);
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert_eq!(status.indexable_chunks, 1);
+    assert_eq!(status.indexed_chunks, 1);
+    assert_eq!(status.coverage, 1.0);
+    assert_eq!(status.recent_jobs[0].chunks_total, 1);
+    assert_eq!(status.recent_jobs[0].chunks_done, 1);
+
+    // The remaining chunks are still lexically searchable even though they
+    // carry no vector.
+    let lexical = engine
+        .search_sources(project.id.clone(), "zebra".into(), Vec::new(), Some(5))
+        .await
+        .unwrap();
+    assert!(!lexical.hits.is_empty());
+    let semantic = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "zebra".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Semantic),
+        )
+        .await
+        .unwrap();
+    assert_eq!(semantic.candidates_scanned, 1);
+    assert_eq!(semantic.mode, "semantic");
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_embedding_policy_status_and_reindex_surface() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_POLICY_SURFACE";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("policy").await;
+    let mut policy = source_embedding_policy_for(env_name);
+    policy.endpoint_env = Some(format!("  {env_name}  "));
+    policy.model = Some("  source-embed-test  ".to_string());
+    policy.api_key_env = Some("   ".to_string());
+    let stored = engine
+        .set_source_embedding_policy(&project.id, policy)
+        .await
+        .unwrap();
+    assert_eq!(stored.policy.endpoint_env.as_deref(), Some(env_name));
+    assert_eq!(stored.policy.model.as_deref(), Some("source-embed-test"));
+    assert!(stored.policy.api_key_env.is_none());
+    let read = engine
+        .get_source_embedding_policy(&project.id)
+        .await
+        .unwrap();
+    assert_eq!(read.policy, stored.policy);
+
+    let mut invalid = stored.policy.clone();
+    invalid.enabled = true;
+    invalid.endpoint_env = None;
+    assert!(
+        engine
+            .set_source_embedding_policy(&project.id, invalid)
+            .await
+            .is_err(),
+        "enabled requires an endpoint env name"
+    );
+    let mut invalid = stored.policy.clone();
+    invalid.dimensions = 1;
+    assert!(
+        engine
+            .set_source_embedding_policy(&project.id, invalid)
+            .await
+            .is_err()
+    );
+
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Reindex".into(),
+            content: "Explicit reindex clears derived state and queues work.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    engine.reconcile_source_embeddings().await.unwrap();
+    let reindex = engine.reindex_source_embeddings(&project.id).await.unwrap();
+    assert!(reindex.enabled);
+    assert!(reindex.cleared_vectors >= 1);
+    assert!(reindex.cleared_jobs >= 1);
+    assert_eq!(reindex.enqueued_sources, 1);
+    assert_eq!(reindex.max_chunks_per_source, 50);
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert_eq!(status.indexed_chunks, 0);
+    assert_eq!(status.pending_jobs, 1);
+
+    // Disabling does not delete derived state implicitly, but reindex is the
+    // documented cleanup path and queues nothing while disabled.
+    let mut disabled = stored.policy.clone();
+    disabled.enabled = false;
+    engine
+        .set_source_embedding_policy(&project.id, disabled)
+        .await
+        .unwrap();
+    let cleanup = engine.reindex_source_embeddings(&project.id).await.unwrap();
+    assert!(!cleanup.enabled);
+    assert_eq!(cleanup.enqueued_sources, 0);
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert!(!status.enabled);
+    assert_eq!(status.semantic_unavailable.as_deref(), Some("disabled"));
+    let search = engine
+        .search_sources(project.id.clone(), "reindex".into(), Vec::new(), Some(5))
+        .await
+        .unwrap();
+    assert_eq!(search.mode, "lexical");
+    assert_eq!(search.semantic_unavailable.as_deref(), Some("disabled"));
+    assert_eq!(search.hits.len(), 1);
+    assert_eq!(search.hits[0].source_id, source.id);
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_embedding_missing_endpoint_env_reports_a_stable_reason() {
+    let (_data, _repo, engine, project) = source_embedding_engine("missing-env").await;
+    let env_name = "VERLINPARK_TEST_SOURCE_MISSING_ENV_9911";
+    remove_source_embedding_env(env_name);
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Missing env".into(),
+            content: "This source stays lexical until configuration is fixed.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert!(!status.endpoint_env_present);
+    assert_eq!(
+        status.semantic_unavailable.as_deref(),
+        Some(format!("endpoint_env_missing:{env_name}").as_str())
+    );
+    let search = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "configuration".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Hybrid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search.mode, "lexical");
+    assert_eq!(
+        search.semantic_unavailable.as_deref(),
+        Some(format!("endpoint_env_missing:{env_name}").as_str())
+    );
+    assert!(!search.hits.is_empty());
+}
+
+#[tokio::test]
+async fn source_embedding_reconciler_resumes_bounded_partial_batches() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_PARTIAL_BATCH";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("partial").await;
+    let mut policy = source_embedding_policy_for(env_name);
+    policy.batch_size = 1;
+    policy.max_chunks_per_source = 20;
+    engine
+        .set_source_embedding_policy(&project.id, policy)
+        .await
+        .unwrap();
+    let content = format!(
+        "# One\n\n{}\n\n# Two\n\n{}\n\n# Three\n\n{}",
+        "alpha ".repeat(700),
+        "beta ".repeat(700),
+        "gamma ".repeat(700)
+    );
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Partial".into(),
+            content,
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(source.chunk_count > 2, "fixture must span several ticks");
+    let indexable = engine
+        .source_embedding_status(&project.id)
+        .await
+        .unwrap()
+        .indexable_chunks as usize;
+    assert_eq!(indexable, source.chunk_count);
+
+    let mut total_indexed = 0usize;
+    let mut ticks = 0usize;
+    loop {
+        ticks += 1;
+        assert!(
+            ticks <= indexable + 2,
+            "tick guard prevents an infinite loop"
+        );
+        let (_projects, indexed, failed, done) =
+            engine.reconcile_source_embeddings().await.unwrap();
+        assert_eq!(failed, 0);
+        total_indexed += indexed;
+        let status = engine.source_embedding_status(&project.id).await.unwrap();
+        if done > 0 {
+            assert_eq!(status.done_jobs, 1);
+            assert_eq!(status.pending_jobs, 0);
+            assert_eq!(status.indexed_chunks as usize, indexable);
+            break;
+        }
+        assert_eq!(indexed, 1, "one bounded batch per tick");
+        assert_eq!(status.pending_jobs, 1);
+        assert_eq!(status.done_jobs, 0);
+        assert!(status.recent_jobs[0].chunks_done >= 1);
+    }
+    assert_eq!(total_indexed, indexable);
+    assert_eq!(ticks, indexable);
+    // A completed job is not selected again.
+    let (_projects, indexed, failed, done) = engine.reconcile_source_embeddings().await.unwrap();
+    assert_eq!((indexed, failed, done), (0, 0, 0));
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert_eq!(status.indexed_chunks as usize, indexable);
+    assert_eq!(status.coverage, 1.0);
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_query_embedding_failure_falls_back_to_lexical_hits() {
+    let success = source_embedding_success_server().await;
+    let failing = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/embeddings"))
+        .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("provider outage"))
+        .mount(&failing)
+        .await;
+    let env_name = "VERLINPARK_TEST_SOURCE_QUERY_FAILURE";
+    set_source_embedding_env(env_name, &success.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("query-failure").await;
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Query failure".into(),
+            content: "Lexical hits survive a query embedding outage.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    engine.reconcile_source_embeddings().await.unwrap();
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert!(status.indexed_chunks >= 1);
+    assert!(status.semantic_unavailable.is_none());
+
+    // Indexing succeeded with the first endpoint. Repoint the environment at a
+    // persistent 500 so only the query call fails.
+    set_source_embedding_env(env_name, &failing.uri());
+    let failed = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "lexical outage".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Semantic),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.mode, "lexical");
+    assert!(
+        failed
+            .semantic_unavailable
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("request_failed:http_500")),
+        "stable failure reason: {:?}",
+        failed.semantic_unavailable
+    );
+    assert!(!failed.hits.is_empty());
+    assert_eq!(failed.hits[0].source, "lexical");
+    assert!(failed.hits[0].confidence > 0.0);
+    assert_eq!(failed.candidates_scanned, 0);
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_embedding_status_without_policy_is_disabled_and_cheap() {
+    let (_data, _repo, engine, project) = source_embedding_engine("disabled-status").await;
+    engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Lexical only".into(),
+            content: "A source with no semantic policy remains lexical.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let status = engine.source_embedding_status(&project.id).await.unwrap();
+    assert!(!status.enabled);
+    assert!(!status.configured);
+    assert_eq!(status.semantic_unavailable.as_deref(), Some("disabled"));
+    assert_eq!(status.indexable_chunks, 1);
+    assert_eq!(status.indexed_chunks, 0);
+    assert_eq!(status.coverage, 0.0);
+    assert_eq!(status.usage.calls, 0);
+    assert!(status.recent_jobs.is_empty());
+    let policy = engine
+        .get_source_embedding_policy(&project.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        policy.policy,
+        vp_protocol::types::SourceEmbeddingPolicy::default()
+    );
+    let lexical = engine
+        .search_sources(project.id.clone(), "semantic".into(), Vec::new(), Some(5))
+        .await
+        .unwrap();
+    assert_eq!(lexical.mode, "lexical");
+    assert_eq!(lexical.semantic_unavailable.as_deref(), Some("disabled"));
+    assert!(!lexical.hits.is_empty());
+}
+
+#[tokio::test]
+async fn db_rebuild_restores_source_embedding_policy_and_queues_generations() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("rebuild-sources".into()),
+        )
+        .await
+        .unwrap();
+    let policy = source_embedding_policy_for("VERLINPARK_TEST_SOURCE_REBUILD_ENV");
+    engine
+        .set_source_embedding_policy(&project.id, policy.clone())
+        .await
+        .unwrap();
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: Some("rebuild".into()),
+            title: "Rebuild source".into(),
+            content: "The source snapshot survives a database rebuild.".into(),
+            labels: vec!["rebuild".into()],
+        })
+        .await
+        .unwrap();
+    engine.record_project_manifest().await.unwrap();
+    drop(engine);
+
+    let report = crate::rebuild::rebuild_database(data.path(), false)
+        .await
+        .unwrap();
+    assert!(report.projects >= 1);
+    let store = Store::open(data.path()).unwrap();
+    assert_eq!(
+        store.get_source_embedding_policy(&project.id).unwrap(),
+        policy
+    );
+    let restored = store.get_source(&source.id).unwrap().expect("source");
+    assert_eq!(restored.title, "Rebuild source");
+    assert_eq!(restored.collection.as_deref(), Some("rebuild"));
+    assert_eq!(restored.labels, vec!["rebuild"]);
+    let status = store
+        .source_embedding_status(&project.id, Some(&policy))
+        .unwrap();
+    assert_eq!(status.indexed_chunks, 0);
+    assert_eq!(status.pending_jobs, 1, "restore queues a derived job");
+    assert_eq!(status.indexable_chunks, 1);
+}

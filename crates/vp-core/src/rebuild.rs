@@ -106,6 +106,19 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 .set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
             store.set_session_run_policy(&snapshot.project.id, &snapshot.session_run_policy)?;
             store.set_memory_policy(&snapshot.project.id, &snapshot.memory_policy)?;
+            crate::source_embedding::validate_source_embedding_policy(
+                &snapshot.source_embedding_policy,
+            )
+            .with_context(|| {
+                format!(
+                    "source embedding policy for project {} is invalid",
+                    snapshot.project.id
+                )
+            })?;
+            store.set_source_embedding_policy(
+                &snapshot.project.id,
+                &snapshot.source_embedding_policy,
+            )?;
             store.set_orchestration_policy(&snapshot.project.id, &snapshot.orchestration_policy)?;
             store.restore_approval_grants(&snapshot.project.id, &snapshot.approval_grants)?;
             for skill in &snapshot.skills {

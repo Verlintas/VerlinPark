@@ -61,11 +61,12 @@ use vp_protocol::types::{
     SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
     SkillDeleteResult, SkillEnabledParams, SkillImportParams, SkillListResult, SkillUpdateParams,
     Source, SourceChunk, SourceCitation, SourceCollectionsResult, SourceCreateFileParams,
-    SourceCreateNoteParams, SourceCreateUrlParams, SourceDeleteResult, SourceGetResult,
-    SourceImportError, SourceImportParams, SourceImportResult, SourceListResult,
-    SourceReindexResult, SourceSearchResult, SourceStats, SteeringMessage, StoredMessage,
-    TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TaskStall, TeamPlan,
-    TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
+    SourceCreateNoteParams, SourceCreateUrlParams, SourceDeleteResult, SourceEmbeddingPolicy,
+    SourceEmbeddingPolicyResult, SourceEmbeddingReindexResult, SourceEmbeddingStatusResult,
+    SourceGetResult, SourceImportError, SourceImportParams, SourceImportResult, SourceListResult,
+    SourceReindexResult, SourceSearchMode, SourceSearchResult, SourceStats, SteeringMessage,
+    StoredMessage, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TaskStall,
+    TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
     TerminalWriteResult, TodoItem, ToolActivityCodeStat, ToolActivityEntry, ToolActivityResult,
     ToolActivitySummary, ToolActivityToolStat, ToolOutputAuditParams, ToolOutputAuditResult,
     ToolOutputListParams, ToolOutputListResult, ToolOutputPolicy, ToolOutputPolicyResult,
@@ -79,7 +80,8 @@ use vp_store::Store;
 use vp_store::store::{
     DeliveredSteering, MemoryCandidate, NewIntakeTask, NewMemory, NewSessionContinuation,
     RuntimeLeaseAcquisition, RuntimeLeaseToken, SessionContinuationAckError,
-    SessionContinuationClaim, SessionRepair, SourceSearchQuery, SourceSnapshot,
+    SessionContinuationClaim, SessionRepair, SourceEmbeddingChunkRow, SourceSearchQuery,
+    SourceSemanticCandidate, SourceSnapshot,
 };
 
 use crate::budget::BudgetRegistry;
@@ -112,6 +114,7 @@ pub mod run_journal;
 pub mod scheduler;
 mod session_graph;
 pub mod skills;
+pub mod source_embedding;
 pub mod sources;
 pub mod terminal;
 pub mod textdiff;
@@ -2759,8 +2762,16 @@ impl Engine {
         source_ids: Vec<String>,
         limit: Option<u32>,
     ) -> Result<SourceSearchResult> {
-        self.search_sources_scoped(project_id, query, source_ids, Vec::new(), Vec::new(), limit)
-            .await
+        self.search_sources_with_mode(
+            project_id,
+            query,
+            source_ids,
+            Vec::new(),
+            Vec::new(),
+            limit,
+            None,
+        )
+        .await
     }
 
     /// Search with explicit collection/label filters. An empty collection list
@@ -2774,32 +2785,819 @@ impl Engine {
         labels: Vec<String>,
         limit: Option<u32>,
     ) -> Result<SourceSearchResult> {
-        let Some(query) = crate::sources::source_query(&query) else {
+        self.search_sources_with_mode(
+            project_id,
+            query,
+            source_ids,
+            collections,
+            labels,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    /// Source retrieval with an explicit lane. `None` selects the
+    /// backward-compatible dynamic default: hybrid when the project opted into
+    /// source embeddings, otherwise lexical. The semantic lane performs at most
+    /// one bounded embedding request per search; any unavailability falls back
+    /// to the unchanged lexical path and reports a stable reason.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_sources_with_mode(
+        &self,
+        project_id: String,
+        query: String,
+        source_ids: Vec<String>,
+        collections: Vec<String>,
+        labels: Vec<String>,
+        limit: Option<u32>,
+        mode: Option<SourceSearchMode>,
+    ) -> Result<SourceSearchResult> {
+        let store = self.store.clone();
+        let policy_project = project_id.clone();
+        let policy =
+            tokio::task::spawn_blocking(move || store.get_source_embedding_policy(&policy_project))
+                .await??;
+        let (requested, wants_semantic) =
+            crate::source_embedding::effective_mode(mode, Some(&policy));
+        let requested_was_default = mode.is_none();
+        let requested_label = requested.as_str().to_string();
+        let Some(parsed) = crate::sources::source_query(&query) else {
             return Ok(SourceSearchResult {
                 hits: Vec::new(),
                 degraded: false,
+                mode: SourceSearchMode::Lexical.as_str().to_string(),
+                requested_mode: requested_label,
+                semantic_unavailable: wants_semantic.then(|| "empty_query".to_string()),
+                candidates_scanned: 0,
             });
         };
-        let store = self.store.clone();
         let search = SourceSearchQuery {
-            all: query.all,
-            any: query.any,
-            terms: query.terms,
-            raw: query.raw,
-            prefer_like: query.prefer_like,
+            all: parsed.all,
+            any: parsed.any,
+            terms: parsed.terms,
+            raw: parsed.raw.clone(),
+            prefer_like: parsed.prefer_like,
             collections: normalize_source_filters(collections, 24, 80, "collection")?,
             labels: normalize_source_filters(labels, 24, 40, "label")?,
         };
-        let (hits, degraded) = tokio::task::spawn_blocking(move || {
-            store.search_source_chunks(&project_id, &source_ids, &search, limit)
+        let final_limit = limit.unwrap_or(8).clamp(1, 50);
+        if !wants_semantic {
+            let (hits, degraded) = self
+                .lexical_source_hits(&project_id, &source_ids, &search, final_limit)
+                .await?;
+            let semantic_unavailable = if requested_was_default && !policy.is_active() {
+                crate::source_embedding::source_semantic_unavailable(Some(&policy), 0, 0)
+            } else {
+                None
+            };
+            return Ok(SourceSearchResult {
+                hits: crate::source_embedding::label_lexical_hits(hits),
+                degraded,
+                mode: SourceSearchMode::Lexical.as_str().to_string(),
+                requested_mode: requested_label,
+                semantic_unavailable,
+                candidates_scanned: 0,
+            });
+        }
+
+        // The dynamic default asks for hybrid only when the lane is active;
+        // an explicit semantic/hybrid request still reports why it fell back.
+        if !policy.is_active() {
+            let reason = crate::source_embedding::source_semantic_unavailable(Some(&policy), 0, 0)
+                .unwrap_or_else(|| "disabled".to_string());
+            let (hits, degraded) = self
+                .lexical_source_hits(&project_id, &source_ids, &search, final_limit)
+                .await?;
+            return Ok(SourceSearchResult {
+                hits: crate::source_embedding::label_lexical_hits(hits),
+                degraded,
+                mode: SourceSearchMode::Lexical.as_str().to_string(),
+                requested_mode: requested_label,
+                semantic_unavailable: Some(reason),
+                candidates_scanned: 0,
+            });
+        }
+        let client = match crate::source_embedding::SourceEmbeddingClient::from_policy(&policy) {
+            Ok(client) => client,
+            Err(error) => {
+                let (hits, degraded) = self
+                    .lexical_source_hits(&project_id, &source_ids, &search, final_limit)
+                    .await?;
+                return Ok(SourceSearchResult {
+                    hits: crate::source_embedding::label_lexical_hits(hits),
+                    degraded,
+                    mode: SourceSearchMode::Lexical.as_str().to_string(),
+                    requested_mode: requested_label,
+                    semantic_unavailable: Some(error.reason),
+                    candidates_scanned: 0,
+                });
+            }
+        };
+        let store = self.store.clone();
+        let project = project_id.clone();
+        let model = client.model().to_string();
+        let dimensions = client.dimensions();
+        let max_chunks = policy.max_chunks_per_source;
+        let ready = tokio::task::spawn_blocking(move || {
+            store.source_embedding_ready_count(&project, &model, dimensions, max_chunks)
         })
         .await??;
-        Ok(SourceSearchResult { hits, degraded })
+        if ready == 0 {
+            let store = self.store.clone();
+            let project = project_id.clone();
+            let stale =
+                tokio::task::spawn_blocking(move || store.source_embedding_stale_count(&project))
+                    .await??;
+            let reason =
+                crate::source_embedding::source_semantic_unavailable(Some(&policy), ready, stale)
+                    .unwrap_or_else(|| "no_indexed_vectors".to_string());
+            let (hits, degraded) = self
+                .lexical_source_hits(&project_id, &source_ids, &search, final_limit)
+                .await?;
+            return Ok(SourceSearchResult {
+                hits: crate::source_embedding::label_lexical_hits(hits),
+                degraded,
+                mode: SourceSearchMode::Lexical.as_str().to_string(),
+                requested_mode: requested_label,
+                semantic_unavailable: Some(reason),
+                candidates_scanned: 0,
+            });
+        }
+
+        let query_text = crate::source_embedding::source_embedding_query_text(&parsed.raw);
+        let query_vector = match client.embed_one(query_text).await {
+            Ok(vector) => vector,
+            Err(code) => {
+                let (hits, degraded) = self
+                    .lexical_source_hits(&project_id, &source_ids, &search, final_limit)
+                    .await?;
+                return Ok(SourceSearchResult {
+                    hits: crate::source_embedding::label_lexical_hits(hits),
+                    degraded,
+                    mode: SourceSearchMode::Lexical.as_str().to_string(),
+                    requested_mode: requested_label,
+                    semantic_unavailable: Some(format!("request_failed:{code}")),
+                    candidates_scanned: 0,
+                });
+            }
+        };
+
+        let (_, semantic_limit) = crate::source_embedding::candidate_limit(final_limit, true);
+        let store = self.store.clone();
+        let project = project_id.clone();
+        let model = client.model().to_string();
+        let dimensions = client.dimensions();
+        let source_ids_for_scan = source_ids.clone();
+        let collections_for_scan = search.collections.clone();
+        let labels_for_scan = search.labels.clone();
+        let semantic_candidates = tokio::task::spawn_blocking(move || {
+            store.source_semantic_candidates(
+                &project,
+                &model,
+                dimensions,
+                max_chunks,
+                &source_ids_for_scan,
+                &collections_for_scan,
+                &labels_for_scan,
+                semantic_limit,
+            )
+        })
+        .await??;
+        let mut semantic_inputs = Vec::new();
+        let mut hit_by_chunk: HashMap<String, vp_protocol::types::SourceSearchHit> = HashMap::new();
+        let mut stale_skips = 0usize;
+        for candidate in &semantic_candidates {
+            let text = crate::source_embedding::source_chunk_embedding_text(
+                &candidate.source_title,
+                &SourceChunk {
+                    id: candidate.chunk_id.clone(),
+                    source_id: candidate.source_id.clone(),
+                    chunk_no: candidate.chunk_no,
+                    heading: candidate.heading.clone(),
+                    content: candidate.content.clone(),
+                    start_offset: 0,
+                    end_offset: 0,
+                    token_count: 0,
+                },
+            );
+            let hash_matches = crate::source_embedding::source_chunk_embedding_hash(&text)
+                == candidate.content_hash;
+            let similarity = crate::source_embedding::semantic_similarity(
+                &candidate.vector,
+                candidate.dimensions,
+                &query_vector,
+                hash_matches,
+            );
+            if !hash_matches {
+                stale_skips += 1;
+            }
+            let Some(similarity) = similarity else {
+                continue;
+            };
+            hit_by_chunk.insert(
+                candidate.chunk_id.clone(),
+                semantic_candidate_hit(candidate),
+            );
+            semantic_inputs.push(crate::source_embedding::SourceRankInput {
+                chunk_id: candidate.chunk_id.clone(),
+                lexical: None,
+                semantic: Some(similarity),
+            });
+        }
+        if semantic_inputs.is_empty() && stale_skips > 0 {
+            let (hits, degraded) = self
+                .lexical_source_hits(&project_id, &source_ids, &search, final_limit)
+                .await?;
+            return Ok(SourceSearchResult {
+                hits: crate::source_embedding::label_lexical_hits(hits),
+                degraded,
+                mode: SourceSearchMode::Lexical.as_str().to_string(),
+                requested_mode: requested_label,
+                semantic_unavailable: Some("stale_vectors".to_string()),
+                candidates_scanned: semantic_candidates.len(),
+            });
+        }
+
+        if requested == SourceSearchMode::Semantic {
+            let ranked = crate::source_embedding::rank_semantic_candidates(semantic_inputs);
+            let hits = ranked
+                .into_iter()
+                .take(final_limit as usize)
+                .filter_map(|candidate| {
+                    hit_by_chunk
+                        .get(&candidate.chunk_id)
+                        .map(|hit| fused_hit(hit, &candidate))
+                })
+                .collect::<Vec<_>>();
+            return Ok(SourceSearchResult {
+                hits,
+                degraded: false,
+                mode: SourceSearchMode::Semantic.as_str().to_string(),
+                requested_mode: requested_label,
+                semantic_unavailable: None,
+                candidates_scanned: semantic_candidates.len(),
+            });
+        }
+
+        // Hybrid fusion sees a bounded wider lexical window so a lower-ranked
+        // lexical candidate can still win after semantic fusion. The final
+        // result set remains bounded by the caller's limit.
+        let (lexical_hits, lexical_degraded) = self
+            .lexical_source_hits(
+                &project_id,
+                &source_ids,
+                &search,
+                crate::source_embedding::MAX_SOURCE_LEXICAL_CANDIDATES,
+            )
+            .await?;
+        let mut inputs = semantic_inputs;
+        for hit in &lexical_hits {
+            // Lexical hits carry content; semantic hits already have the same
+            // fields from the store, so either map is safe.
+            hit_by_chunk
+                .entry(hit.chunk_id.clone())
+                .or_insert_with(|| hit.clone());
+            inputs.push(crate::source_embedding::SourceRankInput {
+                chunk_id: hit.chunk_id.clone(),
+                lexical: Some(hit.score),
+                semantic: None,
+            });
+        }
+        let fused = crate::source_embedding::fuse_source_candidates(inputs);
+        let hits = fused
+            .into_iter()
+            .take(final_limit as usize)
+            .filter_map(|candidate| {
+                hit_by_chunk
+                    .get(&candidate.chunk_id)
+                    .map(|hit| fused_hit(hit, &candidate))
+            })
+            .collect::<Vec<_>>();
+        Ok(SourceSearchResult {
+            hits,
+            degraded: lexical_degraded,
+            mode: SourceSearchMode::Hybrid.as_str().to_string(),
+            requested_mode: requested_label,
+            semantic_unavailable: None,
+            candidates_scanned: semantic_candidates.len(),
+        })
+    }
+
+    async fn lexical_source_hits(
+        &self,
+        project_id: &str,
+        source_ids: &[String],
+        search: &SourceSearchQuery,
+        limit: u32,
+    ) -> Result<(Vec<vp_protocol::types::SourceSearchHit>, bool)> {
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let source_ids = source_ids.to_vec();
+        let search = SourceSearchQuery {
+            all: search.all.clone(),
+            any: search.any.clone(),
+            terms: search.terms.clone(),
+            raw: search.raw.clone(),
+            prefer_like: search.prefer_like,
+            collections: search.collections.clone(),
+            labels: search.labels.clone(),
+        };
+        tokio::task::spawn_blocking(move || {
+            store.search_source_chunks(&project, &source_ids, &search, Some(limit))
+        })
+        .await?
     }
 
     pub async fn source_stats(&self, project_id: String) -> Result<SourceStats> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.source_stats(&project_id)).await?
+    }
+
+    // ---- Semantic source index -----------------------------------------
+
+    /// Read the opt-in source embedding policy. No request is made.
+    pub async fn get_source_embedding_policy(
+        &self,
+        project_id: &str,
+    ) -> Result<SourceEmbeddingPolicyResult> {
+        self.ensure_project_exists(project_id).await?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let policy =
+            tokio::task::spawn_blocking(move || store.get_source_embedding_policy(&project))
+                .await??;
+        Ok(SourceEmbeddingPolicyResult {
+            project_id: project_id.to_string(),
+            policy,
+        })
+    }
+
+    /// Persist a validated policy. Enabling is explicit: this never makes a
+    /// network call and never queues a backlog. Operators call
+    /// `source_embedding_reindex` after enabling to index existing sources.
+    pub async fn set_source_embedding_policy(
+        &self,
+        project_id: &str,
+        mut policy: SourceEmbeddingPolicy,
+    ) -> Result<SourceEmbeddingPolicyResult> {
+        self.ensure_project_exists(project_id).await?;
+        crate::source_embedding::normalize_source_embedding_policy(&mut policy);
+        crate::source_embedding::validate_source_embedding_policy(&policy)?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let stored = policy.clone();
+        tokio::task::spawn_blocking(move || store.set_source_embedding_policy(&project, &stored))
+            .await??;
+        Ok(SourceEmbeddingPolicyResult {
+            project_id: project_id.to_string(),
+            policy,
+        })
+    }
+
+    /// Bounded operational status for the source semantic lane. It contains
+    /// counts, stable fallback reasons, and environment *names*, never vectors,
+    /// embedded text, endpoint values, or credentials.
+    pub async fn source_embedding_status(
+        &self,
+        project_id: &str,
+    ) -> Result<SourceEmbeddingStatusResult> {
+        self.ensure_project_exists(project_id).await?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let policy =
+            tokio::task::spawn_blocking(move || store.get_source_embedding_policy(&project))
+                .await??;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let policy_for_store = policy.clone();
+        let mut status = tokio::task::spawn_blocking(move || {
+            store.source_embedding_status(&project, Some(&policy_for_store))
+        })
+        .await??;
+        status.endpoint_env_present = policy.endpoint_env_name().is_some_and(|name| {
+            std::env::var(name)
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+        status.api_key_env_present = policy
+            .api_key_env_name()
+            .map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+            .unwrap_or(true);
+        status.semantic_unavailable = crate::source_embedding::source_semantic_unavailable(
+            Some(&policy),
+            status.indexed_chunks,
+            status.stale_chunks,
+        );
+        Ok(status)
+    }
+
+    /// Explicit operator reindex. Derived vectors/jobs are cleared first. When
+    /// the lane is active, every indexed source is queued for a fresh
+    /// generation; when it is disabled or incomplete this is a cleanup action.
+    /// No embedding request is made here.
+    pub async fn reindex_source_embeddings(
+        &self,
+        project_id: &str,
+    ) -> Result<SourceEmbeddingReindexResult> {
+        self.ensure_project_exists(project_id).await?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let mut policy =
+            tokio::task::spawn_blocking(move || store.get_source_embedding_policy(&project))
+                .await??;
+        crate::source_embedding::normalize_source_embedding_policy(&mut policy);
+        if policy.is_configured() {
+            crate::source_embedding::validate_source_embedding_policy(&policy)?;
+        }
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let (cleared_vectors, cleared_jobs) =
+            tokio::task::spawn_blocking(move || store.clear_source_embeddings(&project)).await??;
+        let enabled = policy.is_active();
+        let model = policy.model.clone();
+        let max_chunks = policy
+            .max_chunks_per_source
+            .clamp(1, crate::source_embedding::MAX_SOURCE_EMBEDDING_CHUNKS);
+        let enqueued = if let (true, Some(model)) = (enabled, model.as_deref()) {
+            let store = self.store.clone();
+            let project = project_id.to_string();
+            let model = model.to_string();
+            tokio::task::spawn_blocking(move || {
+                store.enqueue_source_embedding_backlog(&project, &model, max_chunks)
+            })
+            .await??
+        } else {
+            0
+        };
+        Ok(SourceEmbeddingReindexResult {
+            project_id: project_id.to_string(),
+            enabled,
+            model,
+            cleared_vectors,
+            cleared_jobs,
+            enqueued_sources: enqueued,
+            max_chunks_per_source: max_chunks,
+        })
+    }
+
+    /// Daemon reconciler over every explicitly enabled project. Returns
+    /// `(projects, indexed_chunks, failed_chunks, completed_jobs)`.
+    pub async fn reconcile_source_embeddings(&self) -> Result<(usize, usize, usize, usize)> {
+        let store = self.store.clone();
+        let policies =
+            tokio::task::spawn_blocking(move || store.list_enabled_source_embedding_policies())
+                .await??;
+        let mut projects = 0usize;
+        let mut indexed = 0usize;
+        let mut failed = 0usize;
+        let mut done = 0usize;
+        for (project_id, policy) in policies {
+            match self
+                .reconcile_project_source_embeddings(&project_id, policy)
+                .await
+            {
+                Ok((did_index, did_fail, did_done)) => {
+                    projects += 1;
+                    indexed += did_index;
+                    failed += did_fail;
+                    done += did_done;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %project_id, "source embedding reconciliation failed");
+                }
+            }
+        }
+        Ok((projects, indexed, failed, done))
+    }
+
+    /// One bounded project tick. Configuration failures (missing env vars) are
+    /// returned without burning a job's retry budget. Content/network failures
+    /// advance the job with exponential backoff up to a dead letter.
+    pub async fn reconcile_project_source_embeddings(
+        &self,
+        project_id: &str,
+        policy: SourceEmbeddingPolicy,
+    ) -> Result<(usize, usize, usize)> {
+        if !policy.is_active() {
+            return Ok((0, 0, 0));
+        }
+        let client = crate::source_embedding::SourceEmbeddingClient::from_policy(&policy)
+            .map_err(|error| anyhow!("source embedding unavailable: {}", error.reason))?;
+        let model = client.model().to_string();
+        let dimensions = client.dimensions();
+        let max_chunks = policy
+            .max_chunks_per_source
+            .clamp(1, crate::source_embedding::MAX_SOURCE_EMBEDDING_CHUNKS);
+        let batch_size = policy
+            .batch_size
+            .clamp(1, crate::source_embedding::MAX_SOURCE_EMBEDDING_BATCH);
+        let now = now_rfc3339();
+        let stale_before = crate::source_embedding::SOURCE_EMBEDDING_JOB_STALE_SECS;
+        let stale_before = source_embedding_time_before(stale_before);
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let model_for_jobs = model.clone();
+        let jobs = tokio::task::spawn_blocking(move || {
+            store.due_source_embedding_jobs(
+                &project,
+                &model_for_jobs,
+                crate::source_embedding::MAX_SOURCE_EMBEDDING_ATTEMPTS,
+                &now,
+                &stale_before,
+                crate::source_embedding::MAX_SOURCE_EMBEDDING_JOBS_PER_TICK,
+            )
+        })
+        .await??;
+        let mut indexed = 0usize;
+        let mut failed = 0usize;
+        let mut done = 0usize;
+        for job in jobs {
+            let store = self.store.clone();
+            let source_id = job.source_id.clone();
+            let chunks = tokio::task::spawn_blocking(move || {
+                store.source_embedding_chunks(&source_id, max_chunks)
+            })
+            .await??;
+            if chunks.is_empty() {
+                let store = self.store.clone();
+                let source_id = job.source_id.clone();
+                let generation = job.generation;
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.record_source_embedding_job_done(&source_id, generation, 0)
+                })
+                .await?;
+                done += 1;
+                continue;
+            }
+            let mut current = 0u32;
+            let mut missing: Vec<(SourceEmbeddingChunkRow, String, String)> = Vec::new();
+            for row in &chunks {
+                let text = crate::source_embedding::source_chunk_embedding_text(
+                    &row.source_title,
+                    &SourceChunk {
+                        id: row.chunk_id.clone(),
+                        source_id: row.source_id.clone(),
+                        chunk_no: row.chunk_no,
+                        heading: row.heading.clone(),
+                        content: row.content.clone(),
+                        start_offset: 0,
+                        end_offset: 0,
+                        token_count: row.token_count,
+                    },
+                );
+                let hash = crate::source_embedding::source_chunk_embedding_hash(&text);
+                let valid = row.generation == job.generation
+                    && row.vector_model.as_deref() == Some(model.as_str())
+                    && row.vector_dimensions == Some(dimensions)
+                    && row.vector_generation == Some(job.generation)
+                    && row.vector_status.as_deref() == Some("current")
+                    && row.vector_content_hash.as_deref() == Some(hash.as_str());
+                if valid {
+                    current += 1;
+                } else {
+                    missing.push((row.clone(), text, hash));
+                }
+            }
+            let chunks_total = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
+            if missing.is_empty() {
+                let store = self.store.clone();
+                let source_id = job.source_id.clone();
+                let generation = job.generation;
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.record_source_embedding_job_done(&source_id, generation, chunks_total)
+                })
+                .await?;
+                done += 1;
+                continue;
+            }
+            let batch_len = missing.len().min(batch_size as usize);
+            let has_more = missing.len() > batch_len;
+            let batch = missing.into_iter().take(batch_len).collect::<Vec<_>>();
+            let texts = batch
+                .iter()
+                .map(|(_, text, _)| text.clone())
+                .collect::<Vec<_>>();
+            let store = self.store.clone();
+            let source_id = job.source_id.clone();
+            let generation = job.generation;
+            let marked_running = tokio::task::spawn_blocking(move || {
+                store.mark_source_embedding_job_running(&source_id, generation)
+            })
+            .await??;
+            if !marked_running {
+                continue;
+            }
+            let result = client.embed(&texts).await;
+            let mut chunks_done = current;
+            let mut item_failures: Vec<(bool, String)> = Vec::new();
+            let mut obsolete = false;
+            match result {
+                Ok(batch_result) => {
+                    let store = self.store.clone();
+                    let project = project_id.to_string();
+                    let usage = batch_result.usage.clone();
+                    let model_for_usage = model.clone();
+                    if usage.calls > 0 {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            store.record_source_embedding_usage(
+                                &project,
+                                &model_for_usage,
+                                usage.calls,
+                                usage.input_tokens,
+                                usage.estimated_tokens,
+                                usage.bytes,
+                                usage.provider_reported,
+                            )
+                        })
+                        .await;
+                    }
+                    for (index, (row, _text, hash)) in batch.iter().enumerate() {
+                        let item = batch_result.items.get(index);
+                        let vector = item.and_then(|item| item.vector.as_ref());
+                        let item_error = item.and_then(|item| item.error.clone());
+                        match vector {
+                            Some(vector) => {
+                                match crate::source_embedding::encode_source_vector(vector) {
+                                    Ok(encoded) => {
+                                        let store = self.store.clone();
+                                        let source_id = row.source_id.clone();
+                                        let chunk_id = row.chunk_id.clone();
+                                        let chunk_no = row.chunk_no;
+                                        let generation = job.generation;
+                                        let model = model.clone();
+                                        let hash = hash.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            store.record_source_embedding_success(
+                                                &source_id, &chunk_id, chunk_no, generation,
+                                                &model, dimensions, &hash, &encoded,
+                                            )
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(true)) => {
+                                                chunks_done = chunks_done.saturating_add(1);
+                                                indexed += 1;
+                                            }
+                                            Ok(Ok(false)) => {
+                                                obsolete = true;
+                                                break;
+                                            }
+                                            Ok(Err(error)) => {
+                                                item_failures.push((
+                                                    false,
+                                                    format!("storage_failed: {error}"),
+                                                ));
+                                            }
+                                            Err(error) => {
+                                                item_failures.push((
+                                                    false,
+                                                    format!("storage_task_failed: {error}"),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Err(error) => item_failures.push((
+                                        false,
+                                        crate::source_embedding::source_embedding_item_error_code(
+                                            &error.to_string(),
+                                        ),
+                                    )),
+                                }
+                            }
+                            None => {
+                                let error = item_error
+                                    .unwrap_or_else(|| "endpoint returned no vector".to_string());
+                                item_failures.push((
+                                    crate::source_embedding::source_embedding_item_error_retryable(
+                                        &error,
+                                    ),
+                                    crate::source_embedding::source_embedding_item_error_code(
+                                        &error,
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if obsolete {
+                        continue;
+                    }
+                    let store = self.store.clone();
+                    let source_id = job.source_id.clone();
+                    let generation = job.generation;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        store.record_source_embedding_progress(&source_id, generation, chunks_done)
+                    })
+                    .await;
+                    if item_failures.is_empty() {
+                        if has_more {
+                            let store = self.store.clone();
+                            let source_id = job.source_id.clone();
+                            let generation = job.generation;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                store.mark_source_embedding_job_pending(
+                                    &source_id,
+                                    generation,
+                                    chunks_done,
+                                )
+                            })
+                            .await;
+                        } else {
+                            let store = self.store.clone();
+                            let source_id = job.source_id.clone();
+                            let generation = job.generation;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                store.record_source_embedding_job_done(
+                                    &source_id,
+                                    generation,
+                                    chunks_total,
+                                )
+                            })
+                            .await;
+                            done += 1;
+                        }
+                    } else {
+                        failed += item_failures.len();
+                        let attempts = job.attempts.saturating_add(1);
+                        let terminal = item_failures.iter().any(|(retryable, _)| !retryable)
+                            || attempts >= crate::source_embedding::MAX_SOURCE_EMBEDDING_ATTEMPTS;
+                        let next_attempt_at = if terminal {
+                            None
+                        } else {
+                            Some(source_embedding_retry_at(attempts))
+                        };
+                        let error = item_failures
+                            .iter()
+                            .take(3)
+                            .map(|(_, code)| code.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        let store = self.store.clone();
+                        let source_id = job.source_id.clone();
+                        let generation = job.generation;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            store.record_source_embedding_failure(
+                                &source_id,
+                                generation,
+                                attempts,
+                                &error,
+                                next_attempt_at.as_deref(),
+                                terminal,
+                            )
+                        })
+                        .await;
+                    }
+                }
+                Err(error) => {
+                    let attempts = job.attempts.saturating_add(1);
+                    let terminal = !error.retryable_http()
+                        || attempts >= crate::source_embedding::MAX_SOURCE_EMBEDDING_ATTEMPTS;
+                    let next_attempt_at = if terminal {
+                        None
+                    } else {
+                        Some(source_embedding_retry_at(attempts))
+                    };
+                    let code = crate::source_embedding::source_embedding_error_code(&error);
+                    let store = self.store.clone();
+                    let source_id = job.source_id.clone();
+                    let generation = job.generation;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        store.record_source_embedding_failure(
+                            &source_id,
+                            generation,
+                            attempts,
+                            &code,
+                            next_attempt_at.as_deref(),
+                            terminal,
+                        )
+                    })
+                    .await;
+                    failed += batch_len;
+                }
+            }
+        }
+        // Retention is cheap metadata cleanup and intentionally best-effort.
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let retention = policy.retention_days;
+        if let Ok(Ok((vectors, jobs))) = tokio::task::spawn_blocking(move || {
+            store.sweep_source_embedding_retention(&project, retention)
+        })
+        .await
+            && (vectors > 0 || jobs > 0)
+        {
+            tracing::debug!(
+                vectors,
+                jobs,
+                %project_id,
+                "pruned stale source embedding metadata"
+            );
+        }
+        Ok((indexed, failed, done))
     }
 
     pub async fn source_collections(&self, project_id: String) -> Result<SourceCollectionsResult> {
@@ -15955,6 +16753,49 @@ fn normalize_source_collection(value: Option<&str>) -> Result<Option<String>> {
         anyhow::bail!("source collection must be at most 80 characters without control characters");
     }
     Ok(Some(value.to_string()))
+}
+
+fn semantic_candidate_hit(
+    candidate: &SourceSemanticCandidate,
+) -> vp_protocol::types::SourceSearchHit {
+    vp_protocol::types::SourceSearchHit {
+        source_id: candidate.source_id.clone(),
+        source_title: candidate.source_title.clone(),
+        collection: candidate.collection.clone(),
+        labels: candidate.labels.clone(),
+        chunk_id: candidate.chunk_id.clone(),
+        chunk_no: candidate.chunk_no,
+        heading: candidate.heading.clone(),
+        content: candidate.content.clone(),
+        score: 0.0,
+        source: "semantic".to_string(),
+        confidence: 0.0,
+        origins: vec!["semantic".to_string()],
+        lexical_score: None,
+        semantic_score: None,
+    }
+}
+
+fn fused_hit(
+    hit: &vp_protocol::types::SourceSearchHit,
+    candidate: &crate::source_embedding::FusedSourceCandidate,
+) -> vp_protocol::types::SourceSearchHit {
+    crate::source_embedding::fused_source_hit(hit.clone(), candidate)
+}
+
+fn source_embedding_retry_at(attempts: u32) -> String {
+    let delay = crate::memory_embedding::index_retry_delay(attempts);
+    (time::OffsetDateTime::now_utc()
+        + time::Duration::seconds(i64::try_from(delay.as_secs()).unwrap_or(3_600)))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap_or_else(|_| now_rfc3339())
+}
+
+fn source_embedding_time_before(seconds: u64) -> String {
+    (time::OffsetDateTime::now_utc()
+        - time::Duration::seconds(i64::try_from(seconds).unwrap_or(900)))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap_or_else(|_| now_rfc3339())
 }
 
 fn source_title_from_url(url: &str) -> String {

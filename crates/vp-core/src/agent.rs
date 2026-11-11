@@ -15603,20 +15603,32 @@ async fn run_source_tool(
                 .and_then(Value::as_u64)
                 .unwrap_or(6)
                 .clamp(1, 20) as u32;
+            let mode = input
+                .get("mode")
+                .and_then(Value::as_str)
+                .map(str::parse::<vp_protocol::types::SourceSearchMode>)
+                .transpose()
+                .map_err(|error| anyhow!("{error}"))?;
             let result = engine
-                .search_sources_scoped(
+                .search_sources_with_mode(
                     project.id.clone(),
                     query.to_string(),
                     source_ids,
                     collections,
                     labels,
                     Some(limit),
+                    mode,
                 )
                 .await?;
             if result.hits.is_empty() {
-                return Ok(ToolOutput::ok(
-                    "No matching source chunks. Try a shorter query or list_sources.",
-                ));
+                let reason = result
+                    .semantic_unavailable
+                    .as_deref()
+                    .map(|reason| format!(" Semantic retrieval was unavailable ({reason})."))
+                    .unwrap_or_default();
+                return Ok(ToolOutput::ok(format!(
+                    "No matching source chunks. Try a shorter query or list_sources.{reason}"
+                )));
             }
             let mut output = String::new();
             for hit in &result.hits {
@@ -15629,6 +15641,16 @@ async fn run_source_tool(
                     hit.chunk_no,
                     hit.score,
                     truncate_to(&hit.content, 1_400),
+                ));
+            }
+            if let Some(reason) = &result.semantic_unavailable {
+                output.push_str(&format!(
+                    "Semantic retrieval was unavailable ({reason}); results are lexical.\n"
+                ));
+            } else if result.mode != "lexical" {
+                output.push_str(&format!(
+                    "Retrieval mode: {} (each chunk is labeled with its origin).\n",
+                    result.mode
                 ));
             }
             if result.degraded {
@@ -15671,6 +15693,11 @@ async fn run_source_tool(
                 heading: chunk.heading.clone(),
                 content: chunk.content.clone(),
                 score: 1.0,
+                source: "lexical".to_string(),
+                confidence: 1.0,
+                origins: vec!["read".to_string()],
+                lexical_score: Some(1.0),
+                semantic_score: None,
             };
             let key = citations.add_hit(&hit, "read");
             let heading = chunk.heading.as_deref().unwrap_or("untitled section");
@@ -16254,7 +16281,7 @@ fn source_tool_schemas() -> Vec<ToolSchema> {
     vec![
         ToolSchema {
             name: "search_sources".to_string(),
-            description: "Search the project's indexed knowledge sources. Returns ranked chunks with citation keys such as [c1]. Cite every used chunk with its exact key.".to_string(),
+            description: "Search the project's indexed knowledge sources. Returns ranked chunks with citation keys such as [c1]. Cite every used chunk with its exact key. Mode defaults to hybrid when the project enabled semantic source embeddings, otherwise lexical; unavailable semantic retrieval falls back to lexical with a reason.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -16275,6 +16302,11 @@ fn source_tool_schemas() -> Vec<ToolSchema> {
                         "maxItems": 20,
                         "items": {"type": "string"},
                         "description": "Restrict to sources with any of these labels"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["lexical", "semantic", "hybrid"],
+                        "description": "Retrieval lane. Omit for the project default (hybrid when source embeddings are enabled, otherwise lexical)."
                     },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20}
                 },

@@ -25,10 +25,11 @@ use vp_protocol::types::{
     ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession,
     Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit,
     Session, SessionBundle, SessionContinuation, SessionRun, SessionRunPolicy, ShellPolicy, Skill,
-    Source, SourceChunk, SourceCollection, SourceSearchHit, SourceStats, SteeringMessage,
-    StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, ToolOutputAuditResult,
-    ToolOutputPolicy, ToolOutputToolStat, UsageEntry, WorktreeRetentionPolicy, WriteLease,
-    cache_hit_ratio,
+    Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity, SourceEmbeddingJobStatus,
+    SourceEmbeddingPolicy, SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceSearchHit,
+    SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan,
+    TodoItem, ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
+    WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
 use vp_protocol::remote::ExecutionHost;
@@ -462,6 +463,62 @@ pub struct SourceSearchQuery {
     pub labels: Vec<String>,
 }
 
+/// One source embedding job row. The job represents a whole source snapshot
+/// generation; `chunks_done` is persisted progress across bounded ticks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceEmbeddingJobRow {
+    pub source_id: String,
+    pub source_title: String,
+    pub project_id: String,
+    pub generation: u64,
+    pub model: String,
+    pub status: String,
+    pub attempts: u32,
+    pub chunks_total: u32,
+    pub chunks_done: u32,
+    pub last_error: Option<String>,
+    pub next_attempt_at: Option<String>,
+    pub updated_at: String,
+}
+
+/// One source chunk with its current derived-vector metadata. The store never
+/// computes the embedding text hash; the engine owns that exact string and
+/// filters stale vectors with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceEmbeddingChunkRow {
+    pub source_id: String,
+    pub source_title: String,
+    pub chunk_id: String,
+    pub chunk_no: u32,
+    pub heading: Option<String>,
+    pub content: String,
+    pub token_count: u32,
+    pub generation: u64,
+    pub vector_model: Option<String>,
+    pub vector_dimensions: Option<u32>,
+    pub vector_generation: Option<u64>,
+    pub vector_status: Option<String>,
+    pub vector_content_hash: Option<String>,
+}
+
+/// One exact-scan semantic candidate. `vector` is decoded by `vp-core`; it is
+/// never copied into an RPC, event, log, or UI payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceSemanticCandidate {
+    pub source_id: String,
+    pub source_title: String,
+    pub collection: Option<String>,
+    pub labels: Vec<String>,
+    pub chunk_id: String,
+    pub chunk_no: u32,
+    pub heading: Option<String>,
+    pub content: String,
+    pub model: String,
+    pub dimensions: u32,
+    pub content_hash: String,
+    pub vector: Vec<u8>,
+}
+
 fn map_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
     let labels: String = row.get(14)?;
     Ok(Source {
@@ -791,6 +848,10 @@ pub struct ProjectManifestSnapshot {
     pub session_run_policy: SessionRunPolicy,
     #[serde(default)]
     pub memory_policy: MemoryPolicy,
+    /// Opt-in derived source embedding policy. Older manifests decode as
+    /// disabled, and no policy is ever enabled implicitly.
+    #[serde(default)]
+    pub source_embedding_policy: SourceEmbeddingPolicy,
     #[serde(default)]
     pub orchestration_policy: OrchestrationPolicy,
     #[serde(default)]
@@ -1670,6 +1731,77 @@ impl Store {
                 INSERT INTO source_chunks_fts(rowid, content, heading)
                 VALUES (new.rowid, new.content, new.heading);
             END;
+
+            CREATE TABLE IF NOT EXISTS project_source_embedding_policies (
+                project_id  TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy      TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+
+            -- One current snapshot generation per source. Vectors from an older
+            -- generation remain on disk as `stale` until retention pruning, but
+            -- retrieval only joins the current generation.
+            CREATE TABLE IF NOT EXISTS source_embedding_state (
+                source_id   TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+                project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                generation  INTEGER NOT NULL DEFAULT 1,
+                updated_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_embedding_state_project
+                ON source_embedding_state(project_id);
+
+            CREATE TABLE IF NOT EXISTS source_embeddings (
+                chunk_id      TEXT PRIMARY KEY,
+                project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                source_id     TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                chunk_no      INTEGER NOT NULL,
+                generation    INTEGER NOT NULL,
+                model         TEXT NOT NULL,
+                dimensions    INTEGER NOT NULL,
+                content_hash  TEXT NOT NULL,
+                vector        BLOB NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'current',
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_embeddings_project
+                ON source_embeddings(project_id, source_id, generation);
+            CREATE INDEX IF NOT EXISTS idx_source_embeddings_model
+                ON source_embeddings(project_id, model, dimensions, status);
+
+            CREATE TABLE IF NOT EXISTS source_embedding_jobs (
+                source_id      TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+                project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                generation     INTEGER NOT NULL,
+                model          TEXT NOT NULL,
+                status         TEXT NOT NULL,
+                attempts       INTEGER NOT NULL DEFAULT 0,
+                chunks_total   INTEGER NOT NULL DEFAULT 0,
+                chunks_done    INTEGER NOT NULL DEFAULT 0,
+                last_error     TEXT,
+                next_attempt_at TEXT,
+                updated_at     TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_embedding_jobs_status
+                ON source_embedding_jobs(project_id, status, next_attempt_at, updated_at);
+
+            CREATE TABLE IF NOT EXISTS source_embedding_usage (
+                id                    TEXT PRIMARY KEY,
+                project_id            TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                model                 TEXT NOT NULL,
+                calls                 INTEGER NOT NULL DEFAULT 0,
+                input_tokens          INTEGER NOT NULL DEFAULT 0,
+                estimated_tokens      INTEGER NOT NULL DEFAULT 0,
+                bytes                 INTEGER NOT NULL DEFAULT 0,
+                provider_reported     INTEGER NOT NULL DEFAULT 0,
+                created_at            TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_embedding_usage_project
+                ON source_embedding_usage(project_id, model, created_at);
 
             CREATE TABLE IF NOT EXISTS skills (
                 id          TEXT PRIMARY KEY,
@@ -2933,6 +3065,7 @@ impl Store {
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 session_run_policy: self.get_session_run_policy(&project.id)?,
                 memory_policy: self.get_memory_policy(&project.id)?,
+                source_embedding_policy: self.get_source_embedding_policy(&project.id)?,
                 orchestration_policy: self.get_orchestration_policy(&project.id)?,
                 approval_grants: self.list_approval_grants(&project.id)?,
                 intake_tasks: self.list_intake_tasks(Some(&project.id), None, None)?,
@@ -5184,6 +5317,25 @@ impl Store {
                 ],
             )?;
         }
+        // A new snapshot always advances the derived embedding generation. This
+        // happens even while the lane is disabled so a later enable/reindex
+        // cannot accidentally serve vectors from superseded chunk text. When
+        // the project has an active policy, one bounded job is queued for the
+        // new generation; a job failure never fails this source write.
+        let policy = configured_source_embedding_policy_tx(&tx, &source.project_id)?;
+        let queue = policy.as_ref().and_then(|policy| {
+            policy
+                .model
+                .as_deref()
+                .map(|model| (model, policy.max_chunks_per_source))
+        });
+        begin_source_embedding_generation_tx(
+            &tx,
+            &source.id,
+            &source.project_id,
+            chunks.len(),
+            queue,
+        )?;
         tx.commit()?;
         drop(conn);
         self.get_source(&source.id)?
@@ -5363,11 +5515,21 @@ impl Store {
     }
 
     /// Update source metadata without touching chunks or the FTS index. The
-    /// caller is responsible for keeping the durable snapshot in sync.
+    /// caller is responsible for keeping the durable snapshot in sync. A title
+    /// change is part of the exact embedding text, so it advances the derived
+    /// generation and queues a fresh bounded job when the lane is active.
     pub fn update_source_metadata(&self, source: &Source) -> Result<Source> {
         let labels = serde_json::to_string(&source.labels)?;
-        let conn = self.lock()?;
-        let changed = conn.execute(
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let previous_title: Option<String> = tx
+            .query_row(
+                "SELECT title FROM sources WHERE id = ?1",
+                params![source.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let changed = tx.execute(
             "UPDATE sources
              SET title = ?2, collection = ?3, labels = ?4, updated_at = ?5
              WHERE id = ?1",
@@ -5382,6 +5544,28 @@ impl Store {
         if changed == 0 {
             anyhow::bail!("source not found: {}", source.id);
         }
+        if previous_title.as_deref() != Some(source.title.as_str()) {
+            let chunk_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM source_chunks WHERE source_id = ?1",
+                params![source.id],
+                |row| row.get(0),
+            )?;
+            let policy = configured_source_embedding_policy_tx(&tx, &source.project_id)?;
+            let queue = policy.as_ref().and_then(|policy| {
+                policy
+                    .model
+                    .as_deref()
+                    .map(|model| (model, policy.max_chunks_per_source))
+            });
+            begin_source_embedding_generation_tx(
+                &tx,
+                &source.id,
+                &source.project_id,
+                usize::try_from(chunk_count).unwrap_or(usize::MAX),
+                queue,
+            )?;
+        }
+        tx.commit()?;
         drop(conn);
         self.get_source(&source.id)?
             .ok_or_else(|| anyhow!("source disappeared after metadata update"))
@@ -5452,6 +5636,7 @@ impl Store {
                         heading: row.get(6)?,
                         content: row.get(7)?,
                         score: (-rank).max(0.0),
+                        ..SourceSearchHit::default()
                     })
                 },
             );
@@ -5549,6 +5734,7 @@ impl Store {
                     heading: row.get(6)?,
                     content: row.get(7)?,
                     score: 0.0,
+                    ..SourceSearchHit::default()
                 })
             },
         )?;
@@ -5584,6 +5770,920 @@ impl Store {
         });
         hits.truncate(limit);
         Ok((hits, degraded))
+    }
+
+    /// Opt-in source embedding policy. Absence means disabled with defaults;
+    /// a malformed JSON row is ignored rather than enabling network access.
+    pub fn get_source_embedding_policy(&self, project_id: &str) -> Result<SourceEmbeddingPolicy> {
+        let conn = self.lock()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT policy FROM project_source_embedding_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .and_then(|raw| decode_source_embedding_policy(&raw))
+            .unwrap_or_default())
+    }
+
+    pub fn set_source_embedding_policy(
+        &self,
+        project_id: &str,
+        policy: &SourceEmbeddingPolicy,
+    ) -> Result<()> {
+        let raw = serde_json::to_string(policy)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_source_embedding_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, raw, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Projects whose source embedding lane is explicitly enabled and fully
+    /// configured. A configured-but-disabled policy is never returned.
+    pub fn list_enabled_source_embedding_policies(
+        &self,
+    ) -> Result<Vec<(String, SourceEmbeddingPolicy)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT project_id, policy FROM project_source_embedding_policies
+             ORDER BY project_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut policies = Vec::new();
+        for row in rows {
+            let (project_id, raw) = row?;
+            let Some(policy) = decode_source_embedding_policy(&raw) else {
+                continue;
+            };
+            if policy.is_active() {
+                policies.push((project_id, policy));
+            }
+        }
+        Ok(policies)
+    }
+
+    /// Current derived source embedding generation for one source. Missing
+    /// state is generation zero so the first insert becomes generation one.
+    pub fn source_embedding_generation(&self, source_id: &str) -> Result<u64> {
+        let conn = self.lock()?;
+        let generation: Option<i64> = conn
+            .query_row(
+                "SELECT generation FROM source_embedding_state WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(generation.unwrap_or(0).max(0) as u64)
+    }
+
+    /// One bounded chunk plan for a source generation. Returns every chunk in
+    /// the cap plus its existing vector metadata; the engine filters by the
+    /// exact embedding-text hash before making a request.
+    pub fn source_embedding_chunks(
+        &self,
+        source_id: &str,
+        max_chunks: u32,
+    ) -> Result<Vec<SourceEmbeddingChunkRow>> {
+        let conn = self.lock()?;
+        let max_chunks = max_chunks.clamp(1, 500) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT c.source_id, s.title, c.id, c.chunk_no, c.heading, c.content,
+                    c.token_count,
+                    COALESCE(st.generation, 1),
+                    v.model, v.dimensions, v.generation, v.status, v.content_hash
+             FROM source_chunks c
+             JOIN sources s ON s.id = c.source_id
+             LEFT JOIN source_embedding_state st ON st.source_id = c.source_id
+             LEFT JOIN source_embeddings v ON v.chunk_id = c.id
+             WHERE c.source_id = ?1
+               AND c.chunk_no <= ?2
+             ORDER BY c.chunk_no ASC",
+        )?;
+        let rows = stmt.query_map(params![source_id, max_chunks], |row| {
+            Ok(SourceEmbeddingChunkRow {
+                source_id: row.get(0)?,
+                source_title: row.get(1)?,
+                chunk_id: row.get(2)?,
+                chunk_no: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(u32::MAX),
+                heading: row.get(4)?,
+                content: row.get(5)?,
+                token_count: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX),
+                generation: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                vector_model: row.get(8)?,
+                vector_dimensions: row
+                    .get::<_, Option<i64>>(9)?
+                    .and_then(|value| u32::try_from(value).ok()),
+                vector_generation: row
+                    .get::<_, Option<i64>>(10)?
+                    .and_then(|value| u64::try_from(value).ok()),
+                vector_status: row.get(11)?,
+                vector_content_hash: row.get(12)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Jobs that are due now. A running job is reclaimed only when its
+    /// heartbeat is older than the supplied cutoff, so a crashed reconciler
+    /// cannot strand a source forever.
+    pub fn due_source_embedding_jobs(
+        &self,
+        project_id: &str,
+        model: &str,
+        max_attempts: u32,
+        now: &str,
+        stale_running_before: &str,
+        limit: u32,
+    ) -> Result<Vec<SourceEmbeddingJobRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT j.source_id, s.title, j.project_id, j.generation, j.model, j.status,
+                    j.attempts, j.chunks_total, j.chunks_done, j.last_error,
+                    j.next_attempt_at, j.updated_at
+             FROM source_embedding_jobs j
+             JOIN sources s ON s.id = j.source_id
+             JOIN source_embedding_state st ON st.source_id = j.source_id
+             WHERE j.project_id = ?1
+               AND j.model = ?2
+               AND j.generation = st.generation
+               AND (
+                    j.status = 'pending'
+                    OR (
+                        j.status = 'failed'
+                        AND j.attempts < ?3
+                        AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ?4)
+                    )
+                    OR (j.status = 'running' AND j.updated_at <= ?5)
+               )
+             ORDER BY COALESCE(j.next_attempt_at, j.updated_at) ASC, j.source_id ASC
+             LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                model,
+                i64::from(max_attempts),
+                now,
+                stale_running_before,
+                i64::from(limit.clamp(1, 16))
+            ],
+            |row| {
+                Ok(SourceEmbeddingJobRow {
+                    source_id: row.get(0)?,
+                    source_title: row.get(1)?,
+                    project_id: row.get(2)?,
+                    generation: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                    model: row.get(4)?,
+                    status: row.get(5)?,
+                    attempts: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX),
+                    chunks_total: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(u32::MAX),
+                    chunks_done: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(u32::MAX),
+                    last_error: row.get(9)?,
+                    next_attempt_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Mark a due job as running before the network call. The generation guard
+    /// prevents a stale job from overwriting a newer snapshot's state.
+    pub fn mark_source_embedding_job_running(
+        &self,
+        source_id: &str,
+        generation: u64,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE source_embedding_jobs
+             SET status = 'running', updated_at = ?3
+             WHERE source_id = ?1 AND generation = ?2 AND status != 'dead'",
+            params![
+                source_id,
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                now_rfc3339()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn record_source_embedding_progress(
+        &self,
+        source_id: &str,
+        generation: u64,
+        chunks_done: u32,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE source_embedding_jobs
+             SET chunks_done = MAX(chunks_done, ?3), updated_at = ?4
+             WHERE source_id = ?1 AND generation = ?2",
+            params![
+                source_id,
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                i64::from(chunks_done),
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Return a job to `pending` after a successful partial batch. This is not
+    /// a failure: the next tick continues with the remaining chunks without
+    /// consuming a retry attempt.
+    pub fn mark_source_embedding_job_pending(
+        &self,
+        source_id: &str,
+        generation: u64,
+        chunks_done: u32,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE source_embedding_jobs
+             SET status = 'pending',
+                 chunks_done = MAX(chunks_done, ?3),
+                 last_error = NULL,
+                 next_attempt_at = NULL,
+                 updated_at = ?4
+             WHERE source_id = ?1 AND generation = ?2 AND status != 'dead'",
+            params![
+                source_id,
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                i64::from(chunks_done),
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist one successful vector only while its generation is still the
+    /// current snapshot. A concurrent refresh advances the state first, so a
+    /// late response is ignored instead of resurrecting superseded content.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_source_embedding_success(
+        &self,
+        source_id: &str,
+        chunk_id: &str,
+        chunk_no: u32,
+        generation: u64,
+        model: &str,
+        dimensions: u32,
+        content_hash: &str,
+        vector: &[u8],
+    ) -> Result<bool> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM source_embedding_state WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.map(|value| value.max(0) as u64) != Some(generation) {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let project_id: String = tx.query_row(
+            "SELECT project_id FROM sources WHERE id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )?;
+        let now = now_rfc3339();
+        let changed = tx.execute(
+            "INSERT INTO source_embeddings
+             (chunk_id, project_id, source_id, chunk_no, generation, model, dimensions,
+              content_hash, vector, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'current', ?10, ?10)
+             ON CONFLICT(chunk_id) DO UPDATE SET
+                project_id = excluded.project_id,
+                source_id = excluded.source_id,
+                chunk_no = excluded.chunk_no,
+                generation = excluded.generation,
+                model = excluded.model,
+                dimensions = excluded.dimensions,
+                content_hash = excluded.content_hash,
+                vector = excluded.vector,
+                status = 'current',
+                updated_at = excluded.updated_at
+             WHERE excluded.generation >= source_embeddings.generation",
+            params![
+                chunk_id,
+                project_id,
+                source_id,
+                i64::from(chunk_no),
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                model,
+                i64::from(dimensions),
+                content_hash,
+                vector,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// Record a failed tick. `next_attempt_at = None` or `dead = true` marks a
+    /// dead-letter row that stays visible until reindex/retention pruning.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_source_embedding_failure(
+        &self,
+        source_id: &str,
+        generation: u64,
+        attempts: u32,
+        error: &str,
+        next_attempt_at: Option<&str>,
+        dead: bool,
+    ) -> Result<()> {
+        let error = truncate_chars(error.trim(), 2_000);
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE source_embedding_jobs
+             SET status = ?3,
+                 attempts = ?4,
+                 last_error = ?5,
+                 next_attempt_at = ?6,
+                 updated_at = ?7
+             WHERE source_id = ?1 AND generation = ?2",
+            params![
+                source_id,
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                if dead { "dead" } else { "failed" },
+                i64::from(attempts),
+                error,
+                if dead { None } else { next_attempt_at },
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_source_embedding_job_done(
+        &self,
+        source_id: &str,
+        generation: u64,
+        chunks_done: u32,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE source_embedding_jobs
+             SET status = 'done',
+                 chunks_done = MAX(chunks_done, ?3),
+                 last_error = NULL,
+                 next_attempt_at = NULL,
+                 updated_at = ?4
+             WHERE source_id = ?1 AND generation = ?2",
+            params![
+                source_id,
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                i64::from(chunks_done),
+                now_rfc3339()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Older-generation or status-stale vectors retained for retention. Used
+    /// only to distinguish an empty corpus from an out-of-date one.
+    pub fn source_embedding_stale_count(&self, project_id: &str) -> Result<u32> {
+        let conn = self.lock()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM source_embeddings v
+             JOIN source_embedding_state st ON st.source_id = v.source_id
+             WHERE v.project_id = ?1
+               AND (v.status = 'stale' OR v.generation != st.generation)",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Count current-generation vectors that can serve an exact cosine scan.
+    /// Used to distinguish "no semantic evidence" from "the lane is not ready"
+    /// without decoding vectors in status/search preflight.
+    pub fn source_embedding_ready_count(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        max_chunks: u32,
+    ) -> Result<u32> {
+        let conn = self.lock()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM source_embeddings v
+             JOIN source_chunks c ON c.id = v.chunk_id
+             JOIN sources s ON s.id = v.source_id
+             JOIN source_embedding_state st ON st.source_id = v.source_id
+             WHERE v.project_id = ?1
+               AND s.status = 'indexed'
+               AND c.chunk_no <= ?2
+               AND v.status = 'current'
+               AND v.generation = st.generation
+               AND v.model = ?3
+               AND v.dimensions = ?4
+               AND substr(v.vector, 1, 4) = x'5650454d'
+               AND substr(v.vector, 5, 1) = x'01'
+               AND length(v.vector) = 9 + 4 * ?4",
+            params![
+                project_id,
+                i64::from(max_chunks.clamp(1, 500)),
+                model,
+                i64::from(dimensions)
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Exact, bounded cosine-scan candidate set. Rows are ordered by source and
+    /// chunk so the engine's tie-breaking is deterministic. No vector is
+    /// serialized outside this internal struct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn source_semantic_candidates(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        max_chunks: u32,
+        source_ids: &[String],
+        collections: &[String],
+        labels: &[String],
+        limit: u32,
+    ) -> Result<Vec<SourceSemanticCandidate>> {
+        let source_ids = serde_json::to_string(source_ids)?;
+        let collections = serde_json::to_string(collections)?;
+        let labels = serde_json::to_string(labels)?;
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT c.source_id, s.title, s.collection, s.labels, c.id, c.chunk_no,
+                    c.heading, c.content, v.model, v.dimensions, v.content_hash, v.vector
+             FROM source_embeddings v
+             JOIN source_chunks c ON c.id = v.chunk_id
+             JOIN sources s ON s.id = v.source_id
+             JOIN source_embedding_state st ON st.source_id = v.source_id
+             WHERE v.project_id = ?1
+               AND s.status = 'indexed'
+               AND c.chunk_no <= ?4
+               AND v.status = 'current'
+               AND v.generation = st.generation
+               AND v.model = ?2
+               AND v.dimensions = ?3
+               AND substr(v.vector, 1, 4) = x'5650454d'
+               AND substr(v.vector, 5, 1) = x'01'
+               AND length(v.vector) = 9 + 4 * ?3
+               AND (?5 = '[]' OR c.source_id IN (SELECT value FROM json_each(?5)))
+               AND (?6 = '[]' OR COALESCE(s.collection, '') IN (SELECT value FROM json_each(?6)))
+               AND (?7 = '[]' OR EXISTS (
+                   SELECT 1 FROM json_each(s.labels) requested
+                   WHERE requested.value IN (SELECT value FROM json_each(?7))
+               ))
+             ORDER BY c.source_id ASC, c.chunk_no ASC
+             LIMIT ?8",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                i64::from(max_chunks.clamp(1, 500)),
+                source_ids,
+                collections,
+                labels,
+                i64::from(limit.clamp(1, 512))
+            ],
+            |row| {
+                let labels_blob: String = row.get(3)?;
+                Ok(SourceSemanticCandidate {
+                    source_id: row.get(0)?,
+                    source_title: row.get(1)?,
+                    collection: row.get(2)?,
+                    labels: serde_json::from_str(&labels_blob).unwrap_or_default(),
+                    chunk_id: row.get(4)?,
+                    chunk_no: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(u32::MAX),
+                    heading: row.get(6)?,
+                    content: row.get(7)?,
+                    model: row.get(8)?,
+                    dimensions: u32::try_from(row.get::<_, i64>(9)?).unwrap_or(u32::MAX),
+                    content_hash: row.get(10)?,
+                    vector: row.get(11)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Separate source embedding accounting. This is project infrastructure,
+    /// not session task spend, and is never charged to a session budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_source_embedding_usage(
+        &self,
+        project_id: &str,
+        model: &str,
+        calls: u64,
+        input_tokens: u64,
+        estimated_tokens: u64,
+        bytes: u64,
+        provider_reported: bool,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO source_embedding_usage
+             (id, project_id, model, calls, input_tokens, estimated_tokens, bytes,
+              provider_reported, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                Uuid::now_v7().to_string(),
+                project_id,
+                model,
+                i64::try_from(calls).unwrap_or(i64::MAX),
+                i64::try_from(input_tokens).unwrap_or(i64::MAX),
+                i64::try_from(estimated_tokens).unwrap_or(i64::MAX),
+                i64::try_from(bytes).unwrap_or(i64::MAX),
+                if provider_reported { 1 } else { 0 },
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn source_embedding_integrity(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+    ) -> Result<SourceEmbeddingIntegrity> {
+        let conn = self.lock()?;
+        let structurally_valid = "substr(v.vector, 1, 4) = x'5650454d'
+             AND substr(v.vector, 5, 1) = x'01'
+             AND length(v.vector) = 9 + 4 * ?3";
+        let valid: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*)
+                 FROM source_embeddings v
+                 JOIN source_chunks c ON c.id = v.chunk_id
+                 JOIN sources s ON s.id = v.source_id
+                 JOIN source_embedding_state st ON st.source_id = v.source_id
+                 WHERE v.project_id = ?1 AND v.model = ?2 AND v.dimensions = ?3
+                   AND s.status = 'indexed'
+                   AND v.status = 'current' AND v.generation = st.generation
+                   AND {structurally_valid}"
+            ),
+            params![project_id, model, i64::from(dimensions)],
+            |row| row.get(0),
+        )?;
+        let invalid: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*)
+                 FROM source_embeddings v
+                 JOIN sources s ON s.id = v.source_id
+                 JOIN source_embedding_state st ON st.source_id = v.source_id
+                 WHERE v.project_id = ?1 AND v.model = ?2 AND v.dimensions = ?3
+                   AND s.status = 'indexed'
+                   AND v.status = 'current' AND v.generation = st.generation
+                   AND NOT ({structurally_valid})"
+            ),
+            params![project_id, model, i64::from(dimensions)],
+            |row| row.get(0),
+        )?;
+        let stale: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM source_embeddings v
+             JOIN source_embedding_state st ON st.source_id = v.source_id
+             WHERE v.project_id = ?1
+               AND (v.status = 'stale' OR v.generation != st.generation)",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let orphan: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM source_embeddings v
+             LEFT JOIN source_chunks c ON c.id = v.chunk_id
+             WHERE v.project_id = ?1 AND c.id IS NULL",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let generation_mismatched: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM source_embeddings v
+             JOIN source_embedding_state st ON st.source_id = v.source_id
+             WHERE v.project_id = ?1 AND v.generation != st.generation",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        Ok(SourceEmbeddingIntegrity {
+            valid_vectors: u32::try_from(valid).unwrap_or(u32::MAX),
+            invalid_vectors: u32::try_from(invalid).unwrap_or(u32::MAX),
+            stale_vectors: u32::try_from(stale).unwrap_or(u32::MAX),
+            orphan_vectors: u32::try_from(orphan).unwrap_or(u32::MAX),
+            generation_mismatched: u32::try_from(generation_mismatched).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Health snapshot for the source semantic lane. Counts are bounded SQL
+    /// aggregates; recent jobs are capped at 20 and no vector, embedded text,
+    /// endpoint value, or credential is included.
+    pub fn source_embedding_status(
+        &self,
+        project_id: &str,
+        policy: Option<&SourceEmbeddingPolicy>,
+    ) -> Result<SourceEmbeddingStatusResult> {
+        let enabled = policy.is_some_and(|policy| policy.enabled);
+        let configured = policy.is_some_and(SourceEmbeddingPolicy::is_configured);
+        let model = policy.and_then(|policy| policy.model.clone());
+        let dimensions = policy.map_or(1536, |policy| policy.dimensions);
+        let batch_size = policy.map_or(8, |policy| policy.batch_size);
+        let max_chunks = policy.map_or(200, |policy| policy.max_chunks_per_source);
+        let retention_days = policy.map_or(30, |policy| policy.retention_days);
+        let endpoint_env = policy.and_then(SourceEmbeddingPolicy::endpoint_env_name);
+        let api_key_env = policy.and_then(SourceEmbeddingPolicy::api_key_env_name);
+        let conn = self.lock()?;
+        let indexable: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM source_chunks c
+             JOIN sources s ON s.id = c.source_id
+             WHERE c.project_id = ?1 AND s.status = 'indexed' AND c.chunk_no <= ?2",
+            params![project_id, i64::from(max_chunks.clamp(1, 500))],
+            |row| row.get(0),
+        )?;
+        let model_for_counts = model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        let (indexed, invalid) = match model_for_counts {
+            Some(model) => conn.query_row(
+                "SELECT
+                     COALESCE(SUM(CASE WHEN
+                         v.status = 'current' AND v.generation = st.generation
+                         AND substr(v.vector, 1, 4) = x'5650454d'
+                         AND substr(v.vector, 5, 1) = x'01'
+                         AND length(v.vector) = 9 + 4 * ?3
+                     THEN 1 ELSE 0 END), 0),
+                     COALESCE(SUM(CASE WHEN
+                         v.status = 'current' AND v.generation = st.generation
+                         AND (
+                             substr(v.vector, 1, 4) != x'5650454d'
+                             OR substr(v.vector, 5, 1) != x'01'
+                             OR length(v.vector) != 9 + 4 * ?3
+                         )
+                     THEN 1 ELSE 0 END), 0)
+                 FROM source_embeddings v
+                 JOIN source_chunks c ON c.id = v.chunk_id
+                 JOIN sources s ON s.id = v.source_id
+                 JOIN source_embedding_state st ON st.source_id = v.source_id
+                 WHERE v.project_id = ?1
+                   AND s.status = 'indexed'
+                   AND c.chunk_no <= ?4
+                   AND v.model = ?2
+                   AND v.dimensions = ?3",
+                params![
+                    project_id,
+                    model,
+                    i64::from(dimensions),
+                    i64::from(max_chunks.clamp(1, 500))
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?,
+            None => (0, 0),
+        };
+        let stale: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM source_embeddings v
+             JOIN source_embedding_state st ON st.source_id = v.source_id
+             WHERE v.project_id = ?1
+               AND (v.status = 'stale' OR v.generation != st.generation)",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let count_jobs = |status: &str| -> Result<u32> {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM source_embedding_jobs
+                 WHERE project_id = ?1 AND status = ?2
+                   AND (?3 IS NULL OR model = ?3)",
+                params![project_id, status, model_for_counts],
+                |row| row.get(0),
+            )?;
+            Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        };
+        let pending_jobs = count_jobs("pending")?;
+        let running_jobs = count_jobs("running")?;
+        let failed_jobs = count_jobs("failed")?;
+        let dead_jobs = count_jobs("dead")?;
+        let done_jobs = count_jobs("done")?;
+        let last_error: Option<String> = conn
+            .query_row(
+                "SELECT last_error FROM source_embedding_jobs
+                 WHERE project_id = ?1 AND status IN ('failed', 'dead')
+                   AND last_error IS NOT NULL
+                   AND (?2 IS NULL OR model = ?2)
+                 ORDER BY updated_at DESC, source_id ASC LIMIT 1",
+                params![project_id, model_for_counts],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let usage = conn.query_row(
+            "SELECT COALESCE(SUM(calls), 0), COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(estimated_tokens), 0), COALESCE(SUM(bytes), 0),
+                    COALESCE(SUM(provider_reported), 0)
+             FROM source_embedding_usage WHERE project_id = ?1",
+            params![project_id],
+            |row| {
+                Ok(SourceEmbeddingUsage {
+                    calls: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(u64::MAX),
+                    input_tokens: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(u64::MAX),
+                    estimated_tokens: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(u64::MAX),
+                    bytes: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(u64::MAX),
+                    provider_reported_calls: u64::try_from(row.get::<_, i64>(4)?)
+                        .unwrap_or(u64::MAX),
+                })
+            },
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT j.source_id, s.title, j.status, j.attempts, j.generation,
+                    j.chunks_total, j.chunks_done, j.last_error, j.next_attempt_at,
+                    j.updated_at
+             FROM source_embedding_jobs j
+             JOIN sources s ON s.id = j.source_id
+             WHERE j.project_id = ?1
+               AND (?2 IS NULL OR j.model = ?2)
+             ORDER BY j.updated_at DESC, j.source_id ASC
+             LIMIT 20",
+        )?;
+        let recent_jobs = stmt
+            .query_map(params![project_id, model_for_counts], |row| {
+                Ok(SourceEmbeddingJobStatus {
+                    source_id: row.get(0)?,
+                    source_title: row.get(1)?,
+                    status: row.get(2)?,
+                    attempts: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(u32::MAX),
+                    generation: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                    chunks_total: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(u32::MAX),
+                    chunks_done: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX),
+                    last_error: row.get(7)?,
+                    next_attempt_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
+        let integrity = self.source_embedding_integrity(
+            project_id,
+            model_for_counts.unwrap_or(""),
+            dimensions,
+        )?;
+        let indexable_chunks = u32::try_from(indexable).unwrap_or(u32::MAX);
+        let indexed_chunks = u32::try_from(indexed).unwrap_or(u32::MAX);
+        let invalid_chunks = u32::try_from(invalid).unwrap_or(u32::MAX);
+        Ok(SourceEmbeddingStatusResult {
+            project_id: project_id.to_string(),
+            enabled,
+            configured,
+            endpoint_env: endpoint_env.map(str::to_string),
+            endpoint_env_present: false,
+            api_key_env: api_key_env.map(str::to_string),
+            api_key_env_present: false,
+            model,
+            dimensions,
+            batch_size,
+            max_chunks_per_source: max_chunks,
+            retention_days,
+            indexable_chunks,
+            indexed_chunks,
+            stale_chunks: u32::try_from(stale).unwrap_or(u32::MAX),
+            invalid_chunks,
+            pending_jobs,
+            running_jobs,
+            failed_jobs,
+            dead_jobs,
+            done_jobs,
+            coverage: if indexable_chunks == 0 {
+                0.0
+            } else {
+                f64::from(indexed_chunks) / f64::from(indexable_chunks)
+            },
+            semantic_unavailable: None,
+            last_error: last_error.map(|error| truncate_chars(&error, 2_000)),
+            usage,
+            recent_jobs,
+            integrity,
+        })
+    }
+
+    /// Remove every derived source vector, job, and generation row for a
+    /// project. Usage history is accounting, not derived content, and is kept.
+    pub fn clear_source_embeddings(&self, project_id: &str) -> Result<(u32, u32)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let vectors = tx.execute(
+            "DELETE FROM source_embeddings WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        let jobs = tx.execute(
+            "DELETE FROM source_embedding_jobs WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM source_embedding_state WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.commit()?;
+        Ok((
+            u32::try_from(vectors).unwrap_or(u32::MAX),
+            u32::try_from(jobs).unwrap_or(u32::MAX),
+        ))
+    }
+
+    /// Queue every indexed source for a fresh generation. Explicit operator
+    /// action only; enabling a policy does not call this automatically.
+    pub fn enqueue_source_embedding_backlog(
+        &self,
+        project_id: &str,
+        model: &str,
+        max_chunks: u32,
+    ) -> Result<u32> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT id, chunk_count FROM sources
+             WHERE project_id = ?1 AND status = 'indexed'
+             ORDER BY id ASC LIMIT 1000",
+        )?;
+        let rows = stmt
+            .query_map(params![project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    u32::try_from(row.get::<_, i64>(1)?).unwrap_or(u32::MAX),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut enqueued = 0u32;
+        for (source_id, chunk_count) in rows {
+            begin_source_embedding_generation_tx(
+                &tx,
+                &source_id,
+                project_id,
+                chunk_count as usize,
+                Some((model, max_chunks)),
+            )?;
+            enqueued = enqueued.saturating_add(1);
+        }
+        tx.commit()?;
+        Ok(enqueued)
+    }
+
+    /// Retention sweep for derived source rows. Zero retention disables the
+    /// sweep. Usage history is never pruned here.
+    pub fn sweep_source_embedding_retention(
+        &self,
+        project_id: &str,
+        retention_days: u32,
+    ) -> Result<(u32, u32)> {
+        if retention_days == 0 {
+            return Ok((0, 0));
+        }
+        let cutoff = (OffsetDateTime::now_utc()
+            - time::Duration::days(i64::from(retention_days.min(3_650))))
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| now_rfc3339());
+        let conn = self.lock()?;
+        let vectors = conn.execute(
+            "DELETE FROM source_embeddings
+             WHERE project_id = ?1
+               AND updated_at < ?2
+               AND (
+                    status = 'stale'
+                    OR NOT EXISTS (SELECT 1 FROM source_chunks c WHERE c.id = chunk_id)
+                    OR generation < COALESCE(
+                        (SELECT generation FROM source_embedding_state st
+                         WHERE st.source_id = source_embeddings.source_id), 1)
+               )",
+            params![project_id, cutoff],
+        )?;
+        let jobs = conn.execute(
+            "DELETE FROM source_embedding_jobs
+             WHERE project_id = ?1 AND status = 'dead' AND updated_at < ?2",
+            params![project_id, cutoff],
+        )?;
+        Ok((
+            u32::try_from(vectors).unwrap_or(u32::MAX),
+            u32::try_from(jobs).unwrap_or(u32::MAX),
+        ))
     }
 
     fn source_dir(&self, project_id: &str) -> PathBuf {
@@ -20174,6 +21274,118 @@ fn decode_memory_embedding_policy(value: Option<String>) -> Option<MemoryEmbeddi
             None
         }
     }
+}
+
+fn decode_source_embedding_policy(value: &str) -> Option<SourceEmbeddingPolicy> {
+    match serde_json::from_str::<SourceEmbeddingPolicy>(value) {
+        Ok(policy) => Some(policy),
+        Err(error) => {
+            // Same fail-closed rule as memory embeddings: a malformed row is
+            // treated as disabled rather than enabling an unreviewed request.
+            tracing::warn!(%error, "ignoring malformed project source embedding policy");
+            None
+        }
+    }
+}
+
+fn configured_source_embedding_policy_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+) -> Result<Option<SourceEmbeddingPolicy>> {
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT policy FROM project_source_embedding_policies WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .as_deref()
+        .and_then(decode_source_embedding_policy)
+        .filter(SourceEmbeddingPolicy::is_active))
+}
+
+/// Advance one source snapshot generation and, when a model is supplied, queue
+/// a bounded pending job. Callers inside `insert_source` pass the active
+/// project policy; explicit reindex passes its own model/cap. Older vectors are
+/// marked stale rather than deleted so retention is observable.
+fn begin_source_embedding_generation_tx(
+    tx: &Transaction<'_>,
+    source_id: &str,
+    project_id: &str,
+    chunk_count: usize,
+    queue: Option<(&str, u32)>,
+) -> Result<u64> {
+    let current: Option<i64> = tx
+        .query_row(
+            "SELECT generation FROM source_embedding_state WHERE source_id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let generation = u64::try_from(current.unwrap_or(0).max(0))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let now = now_rfc3339();
+    tx.execute(
+        "INSERT INTO source_embedding_state (source_id, project_id, generation, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(source_id) DO UPDATE SET
+            project_id = excluded.project_id,
+            generation = excluded.generation,
+            updated_at = excluded.updated_at",
+        params![
+            source_id,
+            project_id,
+            i64::try_from(generation).unwrap_or(i64::MAX),
+            now
+        ],
+    )?;
+    tx.execute(
+        "UPDATE source_embeddings
+         SET status = 'stale', updated_at = ?2
+         WHERE source_id = ?1 AND status = 'current'",
+        params![source_id, now],
+    )?;
+    match queue {
+        Some((model, max_chunks)) => {
+            let total = u32::try_from(chunk_count)
+                .unwrap_or(u32::MAX)
+                .min(max_chunks.clamp(1, 500));
+            tx.execute(
+                "INSERT INTO source_embedding_jobs
+                 (source_id, project_id, generation, model, status, attempts,
+                  chunks_total, chunks_done, last_error, next_attempt_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, 0, NULL, NULL, ?6)
+                 ON CONFLICT(source_id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    generation = excluded.generation,
+                    model = excluded.model,
+                    status = 'pending',
+                    attempts = 0,
+                    chunks_total = excluded.chunks_total,
+                    chunks_done = 0,
+                    last_error = NULL,
+                    next_attempt_at = NULL,
+                    updated_at = excluded.updated_at",
+                params![
+                    source_id,
+                    project_id,
+                    i64::try_from(generation).unwrap_or(i64::MAX),
+                    model,
+                    i64::from(total),
+                    now
+                ],
+            )?;
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM source_embedding_jobs WHERE source_id = ?1",
+                params![source_id],
+            )?;
+        }
+    }
+    Ok(generation)
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {

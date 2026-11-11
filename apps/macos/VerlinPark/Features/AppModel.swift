@@ -370,6 +370,12 @@ final class AppModel {
     var sourceSearchDegraded = false
     var sourceSearchBusy = false
     var sourceSearchError: String?
+    var sourceSearchMode: SourceSearchMode = .automatic
+    var sourceSearchEffectiveMode = ""
+    var sourceSearchFallbackReason: String?
+    var sourceEmbeddingStatus: SourceEmbeddingStatusResult?
+    var sourceEmbeddingBusy = false
+    var sourceEmbeddingMessage: String?
     var sourceDraftTitle = ""
     var sourceDraftContent = ""
     var sourceDraftCollection = ""
@@ -966,6 +972,11 @@ final class AppModel {
         sourceSearchResults = []
         sourceSearchDegraded = false
         sourceSearchError = nil
+        sourceSearchEffectiveMode = ""
+        sourceSearchFallbackReason = nil
+        sourceEmbeddingStatus = nil
+        sourceEmbeddingBusy = false
+        sourceEmbeddingMessage = nil
         sourceDraftTitle = ""
         sourceDraftContent = ""
         sourceDraftCollection = ""
@@ -5153,13 +5164,19 @@ final class AppModel {
                 limit: 200
             )
             async let collectionsTask = core.sourceCollections(projectID: projectID)
-            let (result, collections) = try await (sourcesTask, collectionsTask)
+            async let embeddingStatusTask = try? core.sourceEmbeddingStatus(projectID: projectID)
+            let (result, collections, embeddingStatus) = try await (
+                sourcesTask,
+                collectionsTask,
+                embeddingStatusTask
+            )
             guard generation == selectionGeneration, projectID == selectedProjectID else {
                 return
             }
             sources = result.sources
             sourceStats = result.stats
             sourceCollections = collections.collections
+            sourceEmbeddingStatus = embeddingStatus
             if let filter = sourceCollectionFilter,
                !filter.isEmpty,
                !collections.collections.contains(where: { $0.name == filter })
@@ -5218,6 +5235,8 @@ final class AppModel {
         if query.isEmpty {
             sourceSearchResults = []
             sourceSearchDegraded = false
+            sourceSearchEffectiveMode = ""
+            sourceSearchFallbackReason = nil
             sourceSearchBusy = false
             return
         }
@@ -5229,13 +5248,16 @@ final class AppModel {
                 projectID: projectID,
                 query: query,
                 collections: filters,
-                limit: 12
+                limit: 12,
+                mode: sourceSearchMode
             )
             guard generation == selectionGeneration,
                   sourceSearchQuery == query
             else { return }
             sourceSearchResults = result.hits
             sourceSearchDegraded = result.degraded
+            sourceSearchEffectiveMode = result.mode
+            sourceSearchFallbackReason = result.semanticUnavailable
             sourceSearchBusy = false
         } catch {
             guard generation == selectionGeneration,
@@ -5243,6 +5265,64 @@ final class AppModel {
             else { return }
             sourceSearchError = error.localizedDescription
             sourceSearchBusy = false
+        }
+    }
+
+    /// Reload the bounded source embedding status card. A status failure never
+    /// hides the lexical source library; it is surfaced on the card only.
+    func loadSourceEmbeddingStatus(silent: Bool = false) async {
+        guard let projectID = selectedProjectID else {
+            sourceEmbeddingStatus = nil
+            return
+        }
+        if !silent {
+            sourceEmbeddingBusy = true
+        }
+        defer {
+            if !silent {
+                sourceEmbeddingBusy = false
+            }
+        }
+        do {
+            let status = try await core.sourceEmbeddingStatus(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            sourceEmbeddingStatus = status
+            if !silent {
+                sourceEmbeddingMessage = nil
+            }
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            if !silent {
+                sourceEmbeddingMessage = error.localizedDescription
+            }
+        }
+    }
+
+    /// Explicit derived-index rebuild. No embedding request is made by this
+    /// call; the daemon clears vectors/jobs and queues enabled sources.
+    func reindexSourceEmbeddings() async {
+        guard let projectID = selectedProjectID else {
+            sourceEmbeddingMessage = "Select a project first."
+            return
+        }
+        guard !sourceEmbeddingBusy else { return }
+        sourceEmbeddingBusy = true
+        defer { sourceEmbeddingBusy = false }
+        do {
+            let result = try await core.reindexSourceEmbeddings(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            if result.enabled {
+                sourceEmbeddingMessage =
+                    "Cleared \(result.clearedVectors) vectors and queued \(result.enqueuedSources) sources."
+            } else {
+                sourceEmbeddingMessage =
+                    "Cleared \(result.clearedVectors) derived vectors; the lane is disabled."
+            }
+            await loadSourceEmbeddingStatus(silent: true)
+            await loadSources(silent: true)
+        } catch {
+            sourceEmbeddingMessage = error.localizedDescription
+            handle(error)
         }
     }
 

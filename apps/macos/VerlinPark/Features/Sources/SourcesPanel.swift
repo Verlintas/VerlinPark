@@ -215,7 +215,39 @@ struct SourcesPanel: View {
                 .padding(.vertical, 6)
                 .background(VPTheme.surface.opacity(0.45), in: RoundedRectangle(cornerRadius: 7))
                 .padding(.horizontal, 8)
-                .padding(.bottom, 7)
+                .padding(.bottom, 4)
+
+                HStack(spacing: 5) {
+                    Picker("", selection: $model.sourceSearchMode) {
+                        ForEach(SourceSearchMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .controlSize(.mini)
+                    .onChange(of: model.sourceSearchMode) { _, _ in
+                        guard !query.isEmpty else { return }
+                        Task { await model.searchSourceContents(query) }
+                    }
+                    if let fallback = model.sourceSearchFallbackReason {
+                        Text(fallback)
+                            .font(VPTheme.mono(6.4))
+                            .foregroundStyle(VPTheme.warning.opacity(0.9))
+                            .lineLimit(1)
+                            .help(fallback)
+                    } else if !model.sourceSearchEffectiveMode.isEmpty {
+                        Text(model.sourceSearchEffectiveMode)
+                            .font(VPTheme.mono(6.4))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 6)
+            }
+
+            if pane == .library {
+                sourceEmbeddingCard
             }
 
             VPHairline()
@@ -243,6 +275,90 @@ struct SourcesPanel: View {
             return L10n.t("Project knowledge")
         }
         return "\(stats.indexed) indexed · \(stats.chunks) chunks"
+    }
+
+    /// Bounded semantic index status. This card intentionally exposes counts
+    /// and a stable fallback reason only: vectors, embedded text, endpoint
+    /// values, and credentials never reach the client.
+    private var sourceEmbeddingCard: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Image(systemName: "sparkle.magnifyingglass")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(
+                        model.sourceEmbeddingStatus?.enabled == true
+                            ? VPTheme.accent
+                            : VPTheme.textTertiary
+                    )
+                Text(L10n.t("Semantic index"))
+                    .font(VPTheme.mono(7.4, weight: .semibold))
+                    .foregroundStyle(VPTheme.textSecondary)
+                Spacer(minLength: 0)
+                if model.sourceEmbeddingBusy {
+                    ProgressView().controlSize(.mini)
+                }
+                Button {
+                    Task { await model.reindexSourceEmbeddings() }
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 8, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(VPTheme.textTertiary)
+                .help(L10n.t("Clear derived vectors and queue enabled sources"))
+            }
+            if let status = model.sourceEmbeddingStatus {
+                HStack(spacing: 4) {
+                    auditChip(
+                        "\(status.indexedChunks)/\(status.indexableChunks) \(L10n.t("indexed"))",
+                        tint: status.coverage >= 0.999 ? VPTheme.success : VPTheme.accent
+                    )
+                    auditChip(
+                        "\(status.activeJobs) \(L10n.t("pending"))",
+                        tint: status.activeJobs > 0 ? VPTheme.warning : VPTheme.textTertiary
+                    )
+                    auditChip(
+                        "\(status.attentionJobs) \(L10n.t("failed"))",
+                        tint: status.attentionJobs > 0 ? VPTheme.danger : VPTheme.textTertiary
+                    )
+                    Spacer(minLength: 0)
+                }
+                if let reason = status.semanticUnavailable {
+                    Text(reason)
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.warning.opacity(0.9))
+                        .lineLimit(1)
+                        .help(reason)
+                } else if let modelName = status.model {
+                    Text("\(modelName) · \(status.dimensions) dims · \(status.staleChunks) stale")
+                        .font(VPTheme.mono(6.4))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(1)
+                }
+                if let error = status.lastError {
+                    Text(error)
+                        .font(VPTheme.mono(6.2))
+                        .foregroundStyle(VPTheme.danger.opacity(0.85))
+                        .lineLimit(1)
+                        .help(error)
+                }
+            } else {
+                Text(L10n.t("Lexical only until a source embedding policy is enabled."))
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            if let message = model.sourceEmbeddingMessage {
+                Text(message)
+                    .font(VPTheme.mono(6.3))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(VPTheme.surface.opacity(0.32), in: RoundedRectangle(cornerRadius: 6))
+        .padding(.horizontal, 8)
+        .padding(.bottom, 6)
     }
 
     private var citationList: some View {

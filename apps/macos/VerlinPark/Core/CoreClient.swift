@@ -2100,7 +2100,8 @@ actor CoreClient {
         sourceIDs: [String] = [],
         collections: [String] = [],
         labels: [String] = [],
-        limit: Int = 8
+        limit: Int = 8,
+        mode: SourceSearchMode? = nil
     ) async throws -> SourceSearchResult {
         try await request(
             method: "source.search",
@@ -2111,9 +2112,48 @@ actor CoreClient {
                 "collections": .array(collections.map(JSONValue.string)),
                 "labels": .array(labels.map(JSONValue.string)),
                 "limit": .number(Double(limit)),
+                "mode": mode?.protocolValue.map { .string($0.rawValue) } ?? .null,
             ]
         )
         .decode(SourceSearchResult.self)
+    }
+
+    func sourceEmbeddingStatus(projectID: String) async throws -> SourceEmbeddingStatusResult {
+        try await request(
+            method: "source.embedding.status",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(SourceEmbeddingStatusResult.self)
+    }
+
+    func reindexSourceEmbeddings(projectID: String) async throws -> SourceEmbeddingReindexResult {
+        try await request(
+            method: "source.embedding.reindex",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(SourceEmbeddingReindexResult.self)
+    }
+
+    func sourceEmbeddingPolicy(projectID: String) async throws -> SourceEmbeddingPolicyResult {
+        try await request(
+            method: "source.embedding.policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(SourceEmbeddingPolicyResult.self)
+    }
+
+    func setSourceEmbeddingPolicy(
+        projectID: String,
+        policy: SourceEmbeddingPolicy
+    ) async throws -> SourceEmbeddingPolicyResult {
+        try await request(
+            method: "source.embedding.policy.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": .object(policy.jsonObject()),
+            ]
+        )
+        .decode(SourceEmbeddingPolicyResult.self)
     }
 
     func sourceCollections(projectID: String) async throws -> SourceCollectionsResult {

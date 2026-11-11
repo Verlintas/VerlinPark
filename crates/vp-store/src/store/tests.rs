@@ -12437,3 +12437,628 @@ fn gui_lease_holder_reports_the_oldest_legacy_surface() {
     assert_eq!(removed, 2);
     assert!(store.gui_lease_holder().unwrap().is_none());
 }
+
+fn source_embedding_vector(dimensions: u32, seed: f32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(9 + dimensions as usize * 4);
+    bytes.extend_from_slice(b"VPEM");
+    bytes.push(1);
+    bytes.extend_from_slice(&dimensions.to_le_bytes());
+    for index in 0..dimensions {
+        bytes.extend_from_slice(&(seed + index as f32 * 0.01).to_le_bytes());
+    }
+    bytes
+}
+
+fn active_source_policy(model: &str) -> SourceEmbeddingPolicy {
+    SourceEmbeddingPolicy {
+        enabled: true,
+        endpoint_env: Some("VERLINPARK_TEST_SOURCE_ENDPOINT".to_string()),
+        model: Some(model.to_string()),
+        dimensions: 8,
+        batch_size: 2,
+        max_chunks_per_source: 2,
+        retention_days: 1,
+        timeout_secs: 5,
+        api_key_env: None,
+    }
+}
+
+fn source_job(store: &Store, source_id: &str) -> Option<SourceEmbeddingJobRow> {
+    let conn = store.lock().unwrap();
+    conn.query_row(
+        "SELECT j.source_id, s.title, j.project_id, j.generation, j.model, j.status,
+                j.attempts, j.chunks_total, j.chunks_done, j.last_error,
+                j.next_attempt_at, j.updated_at
+         FROM source_embedding_jobs j
+         JOIN sources s ON s.id = j.source_id
+         WHERE j.source_id = ?1",
+        params![source_id],
+        |row| {
+            Ok(SourceEmbeddingJobRow {
+                source_id: row.get(0)?,
+                source_title: row.get(1)?,
+                project_id: row.get(2)?,
+                generation: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                model: row.get(4)?,
+                status: row.get(5)?,
+                attempts: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                chunks_total: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                chunks_done: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
+                last_error: row.get(9)?,
+                next_attempt_at: row.get(10)?,
+                updated_at: row.get(11)?,
+            })
+        },
+    )
+    .optional()
+    .unwrap()
+}
+
+#[test]
+fn source_embedding_generation_and_jobs_follow_snapshot_refresh() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sources"))
+        .unwrap();
+    store
+        .set_source_embedding_policy(&project.id, &active_source_policy("embed-small"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-gen",
+        "Runtime",
+        "The runtime uses deterministic leases.",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    assert_eq!(store.source_embedding_generation("source-gen").unwrap(), 1);
+    let job = source_job(&store, "source-gen").expect("pending job");
+    assert_eq!(job.status, "pending");
+    assert_eq!(job.generation, 1);
+    assert_eq!(job.chunks_total, 1);
+    assert_eq!(job.model, "embed-small");
+    assert_eq!(
+        store
+            .due_source_embedding_jobs(
+                &project.id,
+                "embed-small",
+                5,
+                &now_rfc3339(),
+                "2099-01-01T00:00:00Z",
+                4
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .mark_source_embedding_job_running("source-gen", 1)
+            .unwrap()
+    );
+    assert!(
+        store
+            .record_source_embedding_success(
+                "source-gen",
+                &chunks[0].id,
+                1,
+                1,
+                "embed-small",
+                8,
+                "hash-one",
+                &source_embedding_vector(8, 0.2),
+            )
+            .unwrap()
+    );
+    store
+        .record_source_embedding_job_done("source-gen", 1, 1)
+        .unwrap();
+    assert_eq!(
+        store
+            .source_embedding_ready_count(&project.id, "embed-small", 8, 2)
+            .unwrap(),
+        1
+    );
+
+    // Refresh replaces chunks and advances the generation. The old vector is
+    // retained as stale metadata but cannot serve retrieval.
+    store.insert_source(&source, &chunks).unwrap();
+    assert_eq!(store.source_embedding_generation("source-gen").unwrap(), 2);
+    assert_eq!(
+        store
+            .source_embedding_ready_count(&project.id, "embed-small", 8, 2)
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.source_embedding_stale_count(&project.id).unwrap(), 1);
+    assert_eq!(source_job(&store, "source-gen").unwrap().generation, 2);
+    // A late response for the superseded generation is ignored.
+    assert!(
+        !store
+            .record_source_embedding_success(
+                "source-gen",
+                &chunks[0].id,
+                1,
+                1,
+                "embed-small",
+                8,
+                "hash-one",
+                &source_embedding_vector(8, 0.2),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .source_embedding_ready_count(&project.id, "embed-small", 8, 2)
+            .unwrap(),
+        0
+    );
+    assert!(
+        store
+            .record_source_embedding_success(
+                "source-gen",
+                &chunks[0].id,
+                1,
+                2,
+                "embed-small",
+                8,
+                "hash-two",
+                &source_embedding_vector(8, 0.4),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .source_embedding_ready_count(&project.id, "embed-small", 8, 2)
+            .unwrap(),
+        1
+    );
+
+    // A title edit changes the exact embedding text, so it advances too.
+    let mut renamed = source.clone();
+    renamed.title = "Runtime renamed".to_string();
+    renamed.updated_at = now_rfc3339();
+    store.update_source_metadata(&renamed).unwrap();
+    assert_eq!(store.source_embedding_generation("source-gen").unwrap(), 3);
+    assert_eq!(source_job(&store, "source-gen").unwrap().status, "pending");
+
+    let (vectors, jobs) = store.clear_source_embeddings(&project.id).unwrap();
+    assert_eq!(vectors, 1);
+    assert_eq!(jobs, 1);
+    assert_eq!(store.source_embedding_generation("source-gen").unwrap(), 0);
+}
+
+#[test]
+fn source_embedding_jobs_retry_backoff_dead_letter_and_retention() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sources"))
+        .unwrap();
+    store
+        .set_source_embedding_policy(&project.id, &active_source_policy("embed-small"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-retry",
+        "Retry",
+        "Retry semantics are bounded and deterministic.",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    store
+        .mark_source_embedding_job_running("source-retry", 1)
+        .unwrap();
+    let future = "2099-01-01T00:00:00Z";
+    store
+        .record_source_embedding_failure("source-retry", 1, 1, "http_503", Some(future), false)
+        .unwrap();
+    let job = source_job(&store, "source-retry").unwrap();
+    assert_eq!(job.status, "failed");
+    assert_eq!(job.attempts, 1);
+    assert_eq!(job.next_attempt_at.as_deref(), Some(future));
+    assert!(
+        store
+            .due_source_embedding_jobs(
+                &project.id,
+                "embed-small",
+                5,
+                &now_rfc3339(),
+                "2099-01-01T00:00:00Z",
+                4
+            )
+            .unwrap()
+            .is_empty(),
+        "backoff protects the next tick"
+    );
+    assert_eq!(
+        store
+            .due_source_embedding_jobs(
+                &project.id,
+                "embed-small",
+                5,
+                "2100-01-01T00:00:00Z",
+                "2099-01-01T00:00:00Z",
+                4
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    store
+        .record_source_embedding_failure("source-retry", 1, 5, "http_503", None, true)
+        .unwrap();
+    let job = source_job(&store, "source-retry").unwrap();
+    assert_eq!(job.status, "dead");
+    assert_eq!(job.attempts, 5);
+    assert!(job.next_attempt_at.is_none());
+    assert!(
+        store
+            .due_source_embedding_jobs(
+                &project.id,
+                "embed-small",
+                5,
+                "2100-01-01T00:00:00Z",
+                "2099-01-01T00:00:00Z",
+                4
+            )
+            .unwrap()
+            .is_empty()
+    );
+
+    // Retention prunes dead metadata and stale vectors only after the cutoff.
+    let conn = store.lock().unwrap();
+    conn.execute(
+        "UPDATE source_embedding_jobs SET updated_at = '2000-01-01T00:00:00Z'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE source_embedding_state SET generation = 2 WHERE source_id = 'source-retry'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO source_embeddings
+         (chunk_id, project_id, source_id, chunk_no, generation, model, dimensions,
+          content_hash, vector, status, created_at, updated_at)
+         VALUES ('old-chunk', ?1, 'source-retry', 1, 1, 'embed-small', 8, 'old-hash',
+                 x'00', 'stale', '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z')",
+        params![project.id],
+    )
+    .unwrap();
+    drop(conn);
+    let (vectors, jobs) = store
+        .sweep_source_embedding_retention(&project.id, 1)
+        .unwrap();
+    assert_eq!(vectors, 1);
+    assert_eq!(jobs, 1);
+    assert!(source_job(&store, "source-retry").is_none());
+    assert_eq!(store.source_embedding_stale_count(&project.id).unwrap(), 0);
+}
+
+#[test]
+fn source_semantic_candidates_are_bounded_filtered_and_structural() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sources"))
+        .unwrap();
+    store
+        .set_source_embedding_policy(&project.id, &active_source_policy("embed-small"))
+        .unwrap();
+    let (mut first, first_chunks) = source_fixture(
+        &project.id,
+        "source-a",
+        "Alpha",
+        "Deterministic leases and integration.",
+    );
+    first.collection = Some("engineering".to_string());
+    first.labels = vec!["runtime".to_string()];
+    let (mut second, second_chunks) = source_fixture(
+        &project.id,
+        "source-b",
+        "Beta",
+        "Retrieval citations and evidence.",
+    );
+    second.collection = Some("research".to_string());
+    second.labels = vec!["citation".to_string()];
+    store.insert_source(&first, &first_chunks).unwrap();
+    store.insert_source(&second, &second_chunks).unwrap();
+    for (source, chunks) in [(&first, &first_chunks), (&second, &second_chunks)] {
+        let generation = store.source_embedding_generation(&source.id).unwrap();
+        store
+            .record_source_embedding_success(
+                &source.id,
+                &chunks[0].id,
+                1,
+                generation,
+                "embed-small",
+                8,
+                "hash",
+                &source_embedding_vector(8, 0.1),
+            )
+            .unwrap();
+        store
+            .record_source_embedding_job_done(&source.id, generation, 1)
+            .unwrap();
+    }
+    let all = store
+        .source_semantic_candidates(&project.id, "embed-small", 8, 200, &[], &[], &[], 512)
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    let engineering = store
+        .source_semantic_candidates(
+            &project.id,
+            "embed-small",
+            8,
+            200,
+            &[],
+            &["engineering".to_string()],
+            &[],
+            512,
+        )
+        .unwrap();
+    assert_eq!(engineering.len(), 1);
+    assert_eq!(engineering[0].source_id, "source-a");
+    let labels = store
+        .source_semantic_candidates(
+            &project.id,
+            "embed-small",
+            8,
+            200,
+            &[],
+            &[],
+            &["citation".to_string()],
+            512,
+        )
+        .unwrap();
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].source_id, "source-b");
+    let source_scoped = store
+        .source_semantic_candidates(
+            &project.id,
+            "embed-small",
+            8,
+            200,
+            &["source-a".to_string()],
+            &[],
+            &[],
+            512,
+        )
+        .unwrap();
+    assert_eq!(source_scoped.len(), 1);
+    let capped = store
+        .source_semantic_candidates(&project.id, "embed-small", 8, 200, &[], &[], &[], 1)
+        .unwrap();
+    assert_eq!(capped.len(), 1);
+
+    // A hand-corrupted header is counted as invalid and never returned.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE source_embeddings SET vector = x'00' WHERE source_id = 'source-a'",
+            [],
+        )
+        .unwrap();
+    }
+    let integrity = store
+        .source_embedding_integrity(&project.id, "embed-small", 8)
+        .unwrap();
+    assert_eq!(integrity.valid_vectors, 1);
+    assert_eq!(integrity.invalid_vectors, 1);
+    let all = store
+        .source_semantic_candidates(&project.id, "embed-small", 8, 200, &[], &[], &[], 512)
+        .unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].source_id, "source-b");
+
+    let status = store
+        .source_embedding_status(&project.id, Some(&active_source_policy("embed-small")))
+        .unwrap();
+    assert_eq!(status.indexable_chunks, 2);
+    assert_eq!(status.indexed_chunks, 1);
+    assert_eq!(status.invalid_chunks, 1);
+    assert_eq!(status.done_jobs, 2);
+    assert_eq!(status.coverage, 0.5);
+    let encoded = serde_json::to_value(&status).unwrap();
+    assert!(encoded.get("vectors").is_none());
+    assert!(encoded.get("endpoint").is_none());
+}
+
+#[test]
+fn source_embedding_policy_manifest_and_backlog_round_trip() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sources"))
+        .unwrap();
+    let policy = active_source_policy("embed-manifest");
+    store
+        .set_source_embedding_policy(&project.id, &policy)
+        .unwrap();
+    store.record_project_manifest().unwrap();
+    let snapshots = crate::read_project_manifest(data.path()).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].source_embedding_policy, policy);
+    assert!(
+        store
+            .list_enabled_source_embedding_policies()
+            .unwrap()
+            .len()
+            == 1
+    );
+
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-backlog",
+        "Backlog",
+        "Backlog source content.",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    let generation = store.source_embedding_generation("source-backlog").unwrap();
+    let enqueued = store
+        .enqueue_source_embedding_backlog(&project.id, "embed-manifest", 200)
+        .unwrap();
+    assert_eq!(enqueued, 1);
+    let job = source_job(&store, "source-backlog").unwrap();
+    assert_eq!(job.generation, generation + 1);
+    assert_eq!(job.status, "pending");
+    assert_eq!(job.chunks_done, 0);
+
+    // A malformed stored policy fails closed as disabled instead of enabling
+    // an unreviewed endpoint variable.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE project_source_embedding_policies SET policy = '{not-json' WHERE project_id = ?1",
+            params![project.id],
+        )
+        .unwrap();
+    }
+    let recovered = store.get_source_embedding_policy(&project.id).unwrap();
+    assert!(!recovered.enabled);
+    assert!(!recovered.is_configured());
+    assert!(
+        store
+            .list_enabled_source_embedding_policies()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn source_embedding_jobs_survive_source_delete_cascade() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sources"))
+        .unwrap();
+    store
+        .set_source_embedding_policy(&project.id, &active_source_policy("embed-small"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-delete",
+        "Delete",
+        "A source slated for deletion.",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    let generation = store.source_embedding_generation("source-delete").unwrap();
+    store
+        .record_source_embedding_success(
+            "source-delete",
+            &chunks[0].id,
+            1,
+            generation,
+            "embed-small",
+            8,
+            "hash",
+            &source_embedding_vector(8, 0.3),
+        )
+        .unwrap();
+    assert!(store.delete_source("source-delete").unwrap());
+    assert!(source_job(&store, "source-delete").is_none());
+    assert_eq!(
+        store.source_embedding_generation("source-delete").unwrap(),
+        0
+    );
+    let status = store
+        .source_embedding_status(&project.id, Some(&active_source_policy("embed-small")))
+        .unwrap();
+    assert_eq!(status.indexed_chunks, 0);
+    assert_eq!(status.pending_jobs, 0);
+    assert_eq!(status.stale_chunks, 0);
+}
+
+#[test]
+fn source_embedding_usage_and_ready_counts_are_model_scoped() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sources"))
+        .unwrap();
+    let policy = active_source_policy("embed-small");
+    store
+        .set_source_embedding_policy(&project.id, &policy)
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-usage",
+        "Usage",
+        "Usage accounting is separate from memory embedding usage.",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    let generation = store.source_embedding_generation(&source.id).unwrap();
+    store
+        .record_source_embedding_success(
+            &source.id,
+            &chunks[0].id,
+            1,
+            generation,
+            "embed-small",
+            8,
+            "hash",
+            &source_embedding_vector(8, 0.5),
+        )
+        .unwrap();
+    store
+        .record_source_embedding_job_done(&source.id, generation, 1)
+        .unwrap();
+    store
+        .record_source_embedding_usage(&project.id, "embed-small", 2, 40, 10, 160, true)
+        .unwrap();
+    store
+        .record_source_embedding_usage(&project.id, "embed-small", 1, 20, 20, 80, false)
+        .unwrap();
+    let status = store
+        .source_embedding_status(&project.id, Some(&policy))
+        .unwrap();
+    assert_eq!(status.usage.calls, 3);
+    assert_eq!(status.usage.input_tokens, 60);
+    assert_eq!(status.usage.estimated_tokens, 30);
+    assert_eq!(status.usage.bytes, 240);
+    assert_eq!(status.usage.provider_reported_calls, 1);
+    assert_eq!(status.done_jobs, 1);
+    assert_eq!(status.indexed_chunks, 1);
+    assert_eq!(status.coverage, 1.0);
+    assert!(status.last_error.is_none());
+
+    // Ready counts are scoped by model, dimensions, and the chunk cap.
+    assert_eq!(
+        store
+            .source_embedding_ready_count(&project.id, "embed-small", 8, 200)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .source_embedding_ready_count(&project.id, "other-model", 8, 200)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .source_embedding_ready_count(&project.id, "embed-small", 16, 200)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .source_embedding_ready_count(&project.id, "embed-small", 8, 0)
+            .unwrap(),
+        1,
+        "a zero cap clamps to one chunk and chunk 1 is still counted"
+    );
+    assert_eq!(
+        store.source_embedding_chunks(&source.id, 0).unwrap().len(),
+        1
+    );
+    assert!(
+        store.source_embedding_chunks(&source.id, 1).unwrap()[0]
+            .vector_status
+            .as_deref()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .source_semantic_candidates(&project.id, "embed-small", 8, 200, &[], &[], &[], 0)
+            .unwrap()
+            .len(),
+        1,
+        "limit clamps to at least one"
+    );
+}

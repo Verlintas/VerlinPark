@@ -78,21 +78,22 @@ use vp_protocol::types::{
     SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetIntegrationPolicyParams,
     SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
     SetSessionPriorityParams, SetSessionRunPolicyParams, SetSessionUnlimitedParams,
-    SetShellPolicyParams, SetSourceCollectionParams, SetSourceLabelsParams,
-    SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams, SetWorktreePolicyParams,
-    ShellPolicyParams, ShellPolicyResult, SkillCreateParams, SkillEnabledParams, SkillIdParams,
-    SkillImportParams, SkillListParams, SkillUpdateParams, SourceActionParams,
-    SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
-    SourceGetParams, SourceImportParams, SourceListParams, SourceSearchParams, SubscribeParams,
-    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams, ToolOutputPolicyParams,
-    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams, UpdateAcpAgentParams,
-    UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams, UpdateModelPresetParams,
-    UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceGrepParams,
-    WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams,
-    WorktreePolicyParams,
+    SetShellPolicyParams, SetSourceCollectionParams, SetSourceEmbeddingPolicyParams,
+    SetSourceLabelsParams, SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SkillCreateParams,
+    SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams, SkillUpdateParams,
+    SourceActionParams, SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams,
+    SourceCreateUrlParams, SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams,
+    SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams, SourceListParams,
+    SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams,
+    TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams, ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams,
+    ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams,
+    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
+    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
+    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
+    WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -206,6 +207,7 @@ async fn main() -> Result<()> {
     spawn_memory_stale_sweeper(state.engine.clone());
     spawn_memory_conflict_scanner(state.engine.clone());
     spawn_memory_embedding_reconciler(state.engine.clone());
+    spawn_source_embedding_reconciler(state.engine.clone());
     spawn_terminal_sweeper(state.engine.clone());
     spawn_browser_sweeper(state.engine.clone());
     spawn_computer_sweeper(state.engine.clone());
@@ -1323,13 +1325,14 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "source.search" => match parse_params::<SourceSearchParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .search_sources_scoped(
+                .search_sources_with_mode(
                     params.project_id,
                     params.query,
                     params.source_ids,
                     params.collections,
                     params.labels,
                     params.limit,
+                    params.mode,
                 )
                 .await
             {
@@ -1338,6 +1341,58 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "source.embedding.status" => {
+            match parse_params::<SourceEmbeddingStatusParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .source_embedding_status(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "source.embedding.reindex" => {
+            match parse_params::<SourceEmbeddingReindexParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .reindex_source_embeddings(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "source.embedding.policy.get" => {
+            match parse_params::<SourceEmbeddingPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .get_source_embedding_policy(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "source.embedding.policy.set" => {
+            match parse_params::<SetSourceEmbeddingPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_source_embedding_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "scheduler.status" => match parse_params::<SchedulerStatusParams>(request.params) {
             Ok(params) => match state.agent.scheduler_status(params.project_id).await {
                 Ok(result) => RpcResponse::success(id, result),
@@ -3633,6 +3688,8 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "host.remove"
             | "orchestration.policy.set"
             | "memory.policy.set"
+            | "source.embedding.policy.set"
+            | "source.embedding.reindex"
             | "mailbox.policy.set"
             | "artifact.policy.set"
             | "tool_output.policy.set"
@@ -4039,6 +4096,40 @@ fn spawn_memory_embedding_reconciler(engine: Engine) {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%error, "memory embedding reconciler failed");
+                }
+            }
+        }
+    });
+}
+
+/// Bounded semantic source indexing. One batch per enabled project per tick;
+/// no request is made while no project opted in, and embedding failures never
+/// touch source writes, lexical search, or session budgets.
+fn spawn_source_embedding_reconciler(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_SOURCE_EMBEDDING_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(45);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine.reconcile_source_embeddings().await {
+                Ok((_projects, indexed, failed, done)) if indexed > 0 || failed > 0 || done > 0 => {
+                    tracing::info!(
+                        indexed,
+                        failed,
+                        done,
+                        "source embedding reconciler processed a batch"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "source embedding reconciler failed");
                 }
             }
         }
