@@ -1,10 +1,97 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-11 Efficiency playbook E1-E4: cache telemetry, Scout, idempotency, dashboard
+
+这一轮把 OpenCode + Orca 的研究转成 VerlinPark 内部可执行的 E1-E4，全部保持
+deterministic Rust、无隐藏模型路由、不削弱 approval/sandbox/Verifier/merge/
+capacity/budget gate。
+
+### E1 cache telemetry
+
+- `UsageTotals` / `UsageBucket` / `ProjectUsageSession` / `DaemonMetrics`
+  增加派生 `cache_hit_ratio`（不持久化）。
+- 公式：`uncached = input - cache_read - cache_write`，
+  `ratio = cache_read / (uncached + cache_read + cache_write)`，clamp 0..1；
+  input 为 provider total 时等价于 `cache_read / input`。
+- 新 RPC `session.cache` → input/output/cache read/write、ratio、prefix hash、
+  `preamble_tokens_estimate`、last call。
+- 新事件 `context.cache`；`context.measured` / `context.prompt_prefix` 扩展
+  cache ratio 与 preamble estimate。
+- Prometheus：`verlinpark_cache_hit_ratio`、
+  `verlinpark_preamble_tokens_estimate`（无数据时省略）。
+- CLI `vp cache <session>`；usage CSV 增加 ratio 列。
+- 不做自动 warming、不推断 provider TTL、不产生额外 provider call。
+
+### E2 read-only Scout
+
+- 新结构角色 `scout`，只读工具集：
+  read/list/read_files/find_files/file_info/grep/repo_map/find_symbol/
+  find_references/dependency_graph/affected_tests/code_diagnostics/
+  build_context/git-read/list_sources/search_sources/read_source/recall/
+  team_status。
+- 没有 shell/write/edit/apply_patch/process/delegate/MCP/browser/coordinate。
+- Leader/Manager 可调用 `scout` 工具：
+  `{objective, files?, max_steps?}`，返回 bounded summary + usage + evidence。
+- 每个 session run 最多 3 个 Scout，占 Worker capacity lane；共享 session
+  budget / RunControl；parent cancel 会取消 Scout。
+- 无 task worktree、无 commit、无 Verifier、无 merge_queue；post-run
+  `git status --porcelain --untracked-files=all` 守卫拒绝新变化。
+- 事件：`agent.spawned(read_only: true)`、`agent.started`、role scout 的
+  turn/tool/message、`agent.finished`、`scout.completed`。
+- 明确边界：不是安全沙箱；`code_diagnostics` 可能跑项目 check task；没有
+  网络研究/MCP/嵌套 Scout。
+
+### E3 idempotent session operations
+
+- `session.prompt` / `session.defer` / `session.steer` 增加可选
+  `operation_id`。
+- 新表 `session_operations`：
+  `(session_id, operation_id)`、method、fingerprint、status、result/error。
+- 同 ID + 同 payload + completed → replay；pending → in-progress；
+  different fingerprint → conflict；failed → safe retry；unknown → fail closed。
+- daemon 启动把残留 pending 标 unknown。
+- CLI `--operation-id`。
+- `/provider` 调用不是 exactly-once；receipt 是 operational state，不是
+  replay projection。
+
+### E4 efficiency dashboard
+
+- Manage Dash → Usage & Budget 新增 `EfficiencyCard`：
+  cache hit ratio、cached/uncached input、output、cache write、cost、
+  cost/session、context usage、compaction count、preamble estimate。
+- Stage context popover 增加 cache hit pill + prefix hash。
+- `EfficiencyMetrics` 纯函数负责 ratio/clamp/format/compaction 统计。
+- 所有值来自真实 RPC；`session.cache` 不可用时从 `session.usage` 派生。
+- Collab graph 增加 `scout` 节点颜色/图标/布局。
+
+### 测试
+
+- Rust：**618 passed，4 ignored**
+  - core 490 + 1 GUI ignored
+  - protocol 14
+  - store 89
+  - providers 18 + 3 live ignored
+  - daemon 4
+  - cli 3
+- Swift：**163 passed**
+- ADR-0151（idempotent operations）、0152（Scout）、0153（cache telemetry）、
+  0154（efficiency dashboard）已记录。
+
+### 边界
+
+- cache ratio 是 observational cache share，不是账单折扣；cache read 仍计费。
+- preamble 是 system+tools 的启发式估算，不是 provider tokenizer。
+- Scout 不是安全沙箱；只依赖工具 schema + 执行时 backstop + post-run guard。
+- idempotency 不覆盖 `session.create`，也没有跨 daemon fencing 或 receipt GC。
+- efficiency dashboard 不推断 provider 价格，不声称 cost per solved task。
 
 ---
 

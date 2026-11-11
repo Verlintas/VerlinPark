@@ -547,6 +547,29 @@ loop {
 - `runtime_leases` / `computer_leases` 使用 `julianday()` 比较 RFC3339
   到期时间，避免 fractional seconds 字符串排序问题。
 
+### 7.0.4 Efficiency controls（2026-11-11）
+
+见 [EFFICIENCY_PLAYBOOK.md](EFFICIENCY_PLAYBOOK.md)。本轮落地 E1–E4：
+
+- `UsageTotals` / `UsageBucket` / project usage / daemon metrics 暴露派生
+  `cache_hit_ratio`；`session.cache` 返回 input/cache tokens、ratio、最新
+  prompt prefix、启发式 preamble estimate；`context.cache` 事件记录同一
+  telemetry。ratio 是观测值，不是账单折扣。
+- `scout` 是 Leader/Manager 可调用的只读子 agent：read/grep/code-intel/
+  git-read/source-read 工具，无 shell/write/edit/process/delegate/MCP；
+  不用 task worktree、不进入 Verifier/merge queue；每 run 最多 3 个，占
+  Worker capacity 和共享预算；post-run `git status` guard 拒绝新变化。
+- `session.prompt` / `session.defer` / `session.steer` 支持 optional
+  `operation_id`，由 `session_operations` receipt 记录 method/fingerprint/
+  status/result；同 id+payload replay，pending 为 in-progress，不同 payload
+  冲突，重启后 pending 变 unknown 并 fail closed。receipt 是 operational
+  state，不是 replay projection，provider call 不是 exactly-once。
+- Manage Dash Usage & Budget 增加 Efficiency card（cache ratio、cached/
+  uncached input、cost、context usage、preamble）；Stage context popover
+  增加 cache-hit pill；Collab graph 增加 Scout 节点。
+- 不改变 approval、sandbox、write scope、Verifier、merge、capacity 或
+  budget gate。
+
 ### 7.1 Actor 命令
 
 ```rust

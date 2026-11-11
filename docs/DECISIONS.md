@@ -160,6 +160,10 @@
 | [0148](adr/0148-gitea-forgejo-pull-requests.md) | Explicit Gitea/Forgejo PR provider through the `tea` CLI | Accepted | Runtime/CLI |
 | [0149](adr/0149-rich-artifact-preview.md) | Local rich artifact previews with PDFKit, AVKit, QuickLook, and paged hex | Accepted | macOS |
 | [0150](adr/0150-data-directory-backup-restore.md) | Checksummed offline data-directory backup and atomic restore | Accepted | Runtime/CLI |
+| [0151](adr/0151-idempotent-session-operations.md) | Operation receipts for prompt/defer/steer replay, conflict, and fail-closed unknown outcomes | Accepted | Runtime/Protocol |
+| [0152](adr/0152-read-only-scout-agent.md) | Read-only Scout agent for fresh-context exploration with no worktree or merge | Accepted | Runtime/Agent |
+| [0153](adr/0153-cache-and-preamble-telemetry.md) | Derived cache hit ratio, session cache status, and heuristic preamble telemetry | Accepted | Runtime/Observability |
+| [0154](adr/0154-efficiency-dashboard.md) | macOS Efficiency card and Stage cache-hit surface | Accepted | macOS |
 
 ---
 

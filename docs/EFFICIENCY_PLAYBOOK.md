@@ -342,10 +342,22 @@ Efficiency acceptance for the round:
 ## 6. Current round status
 
 - [x] Playbook archived.
-- [ ] E1 cache telemetry.
-- [ ] E2 scout agent.
-- [ ] E3 idempotent session operations.
-- [ ] E4 efficiency dashboard.
+- [x] E1 cache telemetry — `UsageTotals`/`UsageBucket`/project/daemon
+  `cache_hit_ratio`, `session.cache` / `vp cache`, `context.cache`,
+  Prometheus cache-hit/preamble metrics. No warming/TTL inference.
+- [x] E2 scout agent — read-only `scout` tool, no shell/write/merge/worktree,
+  per-run cap 3, shared budget, post-run guard, `scout.completed`.
+- [x] E3 idempotent session operations — `operation_id` on prompt/defer/steer,
+  `session_operations` receipts, replay/in-progress/conflict/unknown.
+- [x] E4 efficiency dashboard — Manage Dash Efficiency card, Stage cache-hit
+  pill, Collab Scout node.
+- [ ] E5 tool output paging.
+- [ ] E6 background compaction / keep-token budget.
+- [ ] E7 cross-process continuation/lease.
+- [ ] E8 cost-per-solved-task benchmark harness.
+
+Implementation commits: `32b449b` (E3), `97fdeb2` (E1), `3fc2bed` (E4),
+`71544fb` (E2). Test baseline after E1–E4: **618 Rust / 163 Swift**.
 
 Update the checkboxes as work lands, and keep this file as the durable index for
 the next round.
