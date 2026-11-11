@@ -19,6 +19,7 @@
 | **Current** | [EFFICIENCY_PLAYBOOK.md](EFFICIENCY_PLAYBOOK.md) | OpenCode + Orca 效率研究的本地基线、E1–E8 实现清单、验收与并行边界；防止上下文压缩丢失计划 |
 | **Current** | [LONG_TASK_RUNTIME_PLAN.md](LONG_TASK_RUNTIME_PLAN.md) | R1–R4 长任务 runtime 计划与实现记录：durable run journal、remote workspace、program/milestone、native computer；已完成 +42k 行验收 |
 | **Current** | [CONTEXT_OWNERSHIP_MEMORY_BENCH_PLAN.md](CONTEXT_OWNERSHIP_MEMORY_BENCH_PLAN.md) | C1–C4 长任务第二轮计划与实现记录：tool-output paging/compaction、cross-process fencing、hybrid memory、cost-per-solved-task harness；已完成 +38k 行验收 |
+| **Current** | [CONTEXT_CHECKPOINT_ACP_ANN_BACKUP_PLAN.md](CONTEXT_CHECKPOINT_ACP_ANN_BACKUP_PLAN.md) | D1–D4 第三轮计划：context checkpoint/restore、ACP HTTP/WS、IVF ANN memory、encrypted incremental backup；本轮 30k 行验收 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |
 | **Contributing** | [../CONTRIBUTING.md](../CONTRIBUTING.md) | 构建、测试、提交约定 |
