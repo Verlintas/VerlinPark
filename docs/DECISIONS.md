@@ -153,6 +153,8 @@
 | [0141](adr/0141-deferred-session-continuations.md) | Persisted operator continuations that wake on watched tasks or a deadline and start through the normal run path | Accepted | Runtime/Scheduler/CLI |
 | [0142](adr/0142-evidence-backed-memory.md) | Evidence-backed project memory with deterministic lexical/structural ranking, TTL verification, and atomic supersede | Accepted | Runtime/Storage |
 | [0143](adr/0143-long-task-operator-console.md) | macOS surfaces for steering, continuations, stall recovery, and task progress, backed only by real RPCs | Accepted | macOS/Runtime |
+| [0144](adr/0144-memory-conflicts-and-health.md) | Deterministic same-scope memory conflict review with explicit resolution and project memory health | Accepted | Runtime/Storage/macOS |
+| [0145](adr/0145-verifier-and-integration-knowledge-capture.md) | Capture Verifier verdicts and successful conflict resolutions as evidence-backed project memories | Accepted | Runtime/Orchestration |
 
 ---
 

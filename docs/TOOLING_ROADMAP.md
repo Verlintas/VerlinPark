@@ -1139,7 +1139,7 @@ Stable error codes (examples): `PATH_ESCAPE`, `HASH_MISMATCH`, `PATCH_CONFLICT`,
 - Performance: `repo_map`, `grep`, `find_files`, `run_project_task` on the 10k-file
   fixture; enforce bounded latency and output.
 - UI: structured tool cards, truncation, artifact links.
-- Regression: all existing 539 Rust / 132 Swift tests remain green.
+- Regression: all existing 562 Rust / 136 Swift tests remain green.
 
 ### Acceptance for the whole program
 

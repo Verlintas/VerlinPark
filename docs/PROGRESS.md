@@ -1,10 +1,89 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-11 Memory quality: conflict review, health, and verdict capture
+
+这一轮把 memory 从“可检索、可验证”推进到“可审查、可沉淀”。仍然没有
+embedding、LLM 判断或隐藏路由；冲突检测只做同 scope、不同 body 的确定性
+review signal，是否解决由 operator 显式决定。
+
+### Same-scope conflict review
+
+- 两条 active memory 共享同一 evidence reference 且 body 不同时，产生
+  potential conflict：
+  - `decision` / `convention` / `fact` 按 exact `path` evidence 分组
+  - `verification` / `task_result` 按 exact `task` evidence 分组
+- stale / superseded / archived 不参与；检测上限 5,000 条 memory、每组 50
+  对、总共 500 对，排序确定。
+- conflict id 是 project + scope + sorted memory ids + normalized body hashes
+  的 SHA-256 前 32 位；内容不变时 resolved 状态保持，内容变化才产生新 row。
+- 检测只插入 `open` row 并写 `memory.conflict.detected`，**从不修改 memory**。
+- 显式 resolution：
+  - `keep_a` / `keep_b`：loser → superseded，`superseded_by = winner`
+  - `archive_both`：两条 → archived
+  - `keep_both`：不改 memory
+  - conflict → resolved，写 `memory.conflict.resolved`
+  - memory mutation、conflict row、events 在同一事务提交
+- 默认每小时扫描（`VERLINPARK_MEMORY_CONFLICT_SECS`，0 关闭），只检测、
+  不自动解决。
+- `memory.conflicts` / `memory.conflict.scan` / `memory.conflict.resolve` /
+  `memory.health`；CLI `vp memory-conflicts` / `memory-conflict-scan` /
+  `memory-conflict-resolve` / `memory-health`。
+- Manage Dash → Storage & Memory 新增 Memory Health 卡片：active/stale/pinned、
+  evidence coverage、verification due、open conflicts、by-kind，以及逐条
+  Keep A / Keep B / Keep Both / Archive Both。
+
+### Verifier and integration capture
+
+- Verifier approved/rejected 自动写 `verification` memory：
+  - source `verifier`
+  - evidence task/session/commit
+  - TTL `default_verify_days`（fallback 365）
+  - body 包含 approved、verdict、commit；approved 额外包含真实 integration 结果
+- rejected 永远写 `approved: false`，不会出现 merged 声明。
+- 冲突解决在 re-verify 通过并成功 requeue 后写 `integration` memory：
+  - source `orchestrator`
+  - evidence task/session/commit
+  - 后续 Integrator 失败会如实写 `integration failed: ...`
+- 两种 capture 都是 best-effort：失败只记 warning，不改变 Verifier / merge /
+  approval / sandbox / write scope / capacity / budget 结果。
+- 重试后重新验证会 supersede 旧结论，event history 保留旧 claim。
+- 新 ranking 权重：`verification` 0.24、`integration` 0.22、
+  `verifier` source 0.18；exact task 0.60 仍是主导结构信号。
+
+### Lease comparison fix
+
+- RFC3339 可能包含 fractional seconds；用字符串直接比较到期时间会把
+  `...00.500Z` 排在 `...00Z` 之后，导致过期 lease 卡住。
+- runtime/computer lease 的到期比较改为 SQLite `julianday()`，并新增
+  fractional-second 回归测试。
+
+### 测试
+
+- Rust：**562 passed，4 ignored**
+  - core 455 passed + 1 browser ignored
+  - protocol 7
+  - store 82
+  - providers 18 + 3 live ignored
+- Swift：**136 passed**
+- `just lint`、`just test`、`just bundle` 通过。
+- ADR-0144（conflicts/health）和 ADR-0145（verdict/integration capture）已记录。
+
+### 边界
+
+- 只检测同 scope 冲突；不同 scope 的矛盾不在本轮范围。
+- 不是 semantic contradiction detection，不做 LLM/embedding 判断。
+- URL evidence 不抓取、不验证。
+- open conflict 不会自动消失，必须 operator 显式解决。
+- capture 不写失败诊断，只复述 Verifier 自己的 summary。
+- memory 仍 project-scoped。
 
 ---
 

@@ -508,6 +508,18 @@ loop {
   行标 stale，不删除；daemon sweep 需项目 `MemoryPolicy.sweep_stale` opt-in。
 - 事件：`memory.created/updated/verified/stale/superseded/used/deleted`，每个
   携带完整 row；replay/repair/bundle/db-rebuild 覆盖。
+- Verifier approved/rejected 和成功 re-verify 的冲突解决分别写
+  `verification` / `integration` memory，带 task/session/commit evidence；
+  capture 是 best-effort，不能改变 Verifier/merge 结果。
+- `memory_conflicts` 只做同 scope、不同 body 的确定性检测：
+  `decision/convention/fact` 按 path，`verification/task_result` 按 task；
+  id 由 project/scope/ids/body hashes 决定；检测不修改 memory。operator 通过
+  `keep_a` / `keep_b` / `keep_both` / `archive_both` 显式解决，事件
+  `memory.conflict.detected/resolved` 支持 replay/bundle。
+- `memory.health` 报告 active/stale/superseded/archived、pinned、evidence
+  coverage、verified、verification due、open conflicts 和 by-kind。
+- `runtime_leases` / `computer_leases` 的到期比较使用 SQLite `julianday()`，
+  避免 RFC3339 fractional seconds 的字符串排序问题。
 - 不改变任何 approval、sandbox、write scope、Verifier、merge、capacity 或
   budget gate；`remember`/`recall` 仍以 source=agent 工作。
 
