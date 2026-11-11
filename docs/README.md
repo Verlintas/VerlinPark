@@ -16,6 +16,7 @@
 | **Reference** | [DECISIONS.md](DECISIONS.md) | Accepted ADR 索引；改架构先加 ADR |
 | **Reference** | [RESEARCH.md](RESEARCH.md) | 2026-10 的竞品/技术调研；历史背景，不是当前状态 |
 | **Reference** | [AGENT_ORCHESTRATION_AND_CACHE_RESEARCH.md](AGENT_ORCHESTRATION_AND_CACHE_RESEARCH.md) | Prompt/KV cache 命中率、Codex/Claude Code/OpenHands/Aider/Magentic-One 等架构对比与 VerlinPark 改进建议 |
+| **Current** | [EFFICIENCY_PLAYBOOK.md](EFFICIENCY_PLAYBOOK.md) | OpenCode + Orca 效率研究的本地基线、E1–E8 实现清单、验收与并行边界；防止上下文压缩丢失计划 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |
 | **Contributing** | [../CONTRIBUTING.md](../CONTRIBUTING.md) | 构建、测试、提交约定 |
