@@ -4580,6 +4580,369 @@ struct TaskSchedulerPolicy: Codable, Hashable, Sendable {
     }
 }
 
+struct ScalingPolicy: Codable, Hashable, Sendable {
+    var enabled: Bool
+    var minWorkers: Int
+    var maxWorkers: Int
+    var minLabour: Int
+    var maxLabour: Int
+    var expandReadyThreshold: Int
+    var expandCriticalDelaySecs: UInt64
+    var scaleDownIdleSecs: UInt64
+    var cooldownSecs: UInt64
+    var maxStep: Int
+    var budgetHeadroomRatio: Double?
+
+    static let disabled = ScalingPolicy(
+        enabled: false,
+        minWorkers: 1,
+        maxWorkers: 4,
+        minLabour: 1,
+        maxLabour: 8,
+        expandReadyThreshold: 2,
+        expandCriticalDelaySecs: 120,
+        scaleDownIdleSecs: 600,
+        cooldownSecs: 120,
+        maxStep: 2,
+        budgetHeadroomRatio: nil
+    )
+
+    init(
+        enabled: Bool,
+        minWorkers: Int,
+        maxWorkers: Int,
+        minLabour: Int,
+        maxLabour: Int,
+        expandReadyThreshold: Int,
+        expandCriticalDelaySecs: UInt64,
+        scaleDownIdleSecs: UInt64,
+        cooldownSecs: UInt64,
+        maxStep: Int,
+        budgetHeadroomRatio: Double?
+    ) {
+        self.enabled = enabled
+        self.minWorkers = minWorkers
+        self.maxWorkers = maxWorkers
+        self.minLabour = minLabour
+        self.maxLabour = maxLabour
+        self.expandReadyThreshold = expandReadyThreshold
+        self.expandCriticalDelaySecs = expandCriticalDelaySecs
+        self.scaleDownIdleSecs = scaleDownIdleSecs
+        self.cooldownSecs = cooldownSecs
+        self.maxStep = maxStep
+        self.budgetHeadroomRatio = budgetHeadroomRatio
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case minWorkers = "min_workers"
+        case maxWorkers = "max_workers"
+        case minLabour = "min_labour"
+        case maxLabour = "max_labour"
+        case expandReadyThreshold = "expand_ready_threshold"
+        case expandCriticalDelaySecs = "expand_critical_delay_secs"
+        case scaleDownIdleSecs = "scale_down_idle_secs"
+        case cooldownSecs = "cooldown_secs"
+        case maxStep = "max_step"
+        case budgetHeadroomRatio = "budget_headroom_ratio"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        minWorkers = try container.decodeIfPresent(Int.self, forKey: .minWorkers) ?? 1
+        maxWorkers = try container.decodeIfPresent(Int.self, forKey: .maxWorkers) ?? 4
+        minLabour = try container.decodeIfPresent(Int.self, forKey: .minLabour) ?? 1
+        maxLabour = try container.decodeIfPresent(Int.self, forKey: .maxLabour) ?? 8
+        expandReadyThreshold = try container.decodeIfPresent(
+            Int.self,
+            forKey: .expandReadyThreshold
+        ) ?? 2
+        expandCriticalDelaySecs = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .expandCriticalDelaySecs
+        ) ?? 120
+        scaleDownIdleSecs = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .scaleDownIdleSecs
+        ) ?? 600
+        cooldownSecs = try container.decodeIfPresent(UInt64.self, forKey: .cooldownSecs) ?? 120
+        maxStep = try container.decodeIfPresent(Int.self, forKey: .maxStep) ?? 2
+        budgetHeadroomRatio = try container.decodeIfPresent(
+            Double.self,
+            forKey: .budgetHeadroomRatio
+        )
+    }
+
+    var summary: String {
+        let state = enabled ? "enabled" : "disabled"
+        return "\(state) · Workers \(minWorkers)-\(maxWorkers) · Labour \(minLabour)-\(maxLabour) · threshold \(expandReadyThreshold) · step \(maxStep)"
+    }
+
+    var jsonValue: JSONValue {
+        .object([
+            "enabled": .bool(enabled),
+            "min_workers": .number(Double(minWorkers)),
+            "max_workers": .number(Double(maxWorkers)),
+            "min_labour": .number(Double(minLabour)),
+            "max_labour": .number(Double(maxLabour)),
+            "expand_ready_threshold": .number(Double(expandReadyThreshold)),
+            "expand_critical_delay_secs": .number(Double(expandCriticalDelaySecs)),
+            "scale_down_idle_secs": .number(Double(scaleDownIdleSecs)),
+            "cooldown_secs": .number(Double(cooldownSecs)),
+            "max_step": .number(Double(maxStep)),
+            "budget_headroom_ratio": budgetHeadroomRatio.map { .number($0) } ?? .null,
+        ])
+    }
+}
+
+struct ScalingDecision: Codable, Identifiable, Hashable, Sendable {
+    var id: String {
+        decisionID.isEmpty ? decisionKey : decisionID
+    }
+
+    let decisionID: String
+    let decisionKey: String
+    let sessionID: String
+    let projectID: String
+    let planRevision: UInt64
+    let action: String
+    let currentWorkers: Int
+    let currentLabour: Int
+    let targetWorkers: Int
+    let targetLabour: Int
+    let activeWorkers: Int
+    let activeLabour: Int
+    let readyTasks: Int
+    let runningTasks: Int
+    let inputsHash: String
+    let reasons: [String]
+    let managerRecommended: Bool
+    let managerEvidence: String?
+    let applied: Bool
+    let idleSinceWorkers: String?
+    let idleSinceLabour: String?
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case decisionID = "decision_id"
+        case decisionKey = "decision_key"
+        case sessionID = "session_id"
+        case projectID = "project_id"
+        case planRevision = "plan_revision"
+        case action
+        case currentWorkers = "current_workers"
+        case currentLabour = "current_labour"
+        case targetWorkers = "target_workers"
+        case targetLabour = "target_labour"
+        case activeWorkers = "active_workers"
+        case activeLabour = "active_labour"
+        case readyTasks = "ready_tasks"
+        case runningTasks = "running_tasks"
+        case inputsHash = "inputs_hash"
+        case reasons
+        case managerRecommended = "manager_recommended"
+        case managerEvidence = "manager_evidence"
+        case applied
+        case idleSinceWorkers = "idle_since_workers"
+        case idleSinceLabour = "idle_since_labour"
+        case createdAt = "created_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        decisionID = try container.decodeIfPresent(String.self, forKey: .decisionID) ?? ""
+        decisionKey = try container.decodeIfPresent(String.self, forKey: .decisionKey) ?? ""
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        projectID = try container.decodeIfPresent(String.self, forKey: .projectID) ?? ""
+        planRevision = try container.decodeIfPresent(UInt64.self, forKey: .planRevision) ?? 0
+        action = try container.decodeIfPresent(String.self, forKey: .action) ?? "hold"
+        currentWorkers = try container.decodeIfPresent(Int.self, forKey: .currentWorkers) ?? 0
+        currentLabour = try container.decodeIfPresent(Int.self, forKey: .currentLabour) ?? 0
+        targetWorkers = try container.decodeIfPresent(Int.self, forKey: .targetWorkers) ?? 0
+        targetLabour = try container.decodeIfPresent(Int.self, forKey: .targetLabour) ?? 0
+        activeWorkers = try container.decodeIfPresent(Int.self, forKey: .activeWorkers) ?? 0
+        activeLabour = try container.decodeIfPresent(Int.self, forKey: .activeLabour) ?? 0
+        readyTasks = try container.decodeIfPresent(Int.self, forKey: .readyTasks) ?? 0
+        runningTasks = try container.decodeIfPresent(Int.self, forKey: .runningTasks) ?? 0
+        inputsHash = try container.decodeIfPresent(String.self, forKey: .inputsHash) ?? ""
+        reasons = try container.decodeIfPresent([String].self, forKey: .reasons) ?? []
+        managerRecommended = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .managerRecommended
+        ) ?? false
+        managerEvidence = try container.decodeIfPresent(String.self, forKey: .managerEvidence)
+        applied = try container.decodeIfPresent(Bool.self, forKey: .applied) ?? false
+        idleSinceWorkers = try container.decodeIfPresent(
+            String.self,
+            forKey: .idleSinceWorkers
+        )
+        idleSinceLabour = try container.decodeIfPresent(String.self, forKey: .idleSinceLabour)
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+    }
+
+    var isExpansion: Bool {
+        action == "expand_workers" || action == "expand_labour"
+            || action == "expand_workers_and_labour"
+    }
+
+    var isScaleDown: Bool {
+        action == "scale_down_labour" || action == "scale_down_workers"
+    }
+
+    var summary: String {
+        "\(action) · Workers \(currentWorkers)→\(targetWorkers) · Labour \(currentLabour)→\(targetLabour)"
+    }
+}
+
+struct ScalingPolicyResult: Codable, Sendable {
+    let projectID: String
+    let policy: ScalingPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case policy
+    }
+}
+
+struct ScalingPreviewResult: Codable, Sendable {
+    let sessionID: String
+    let projectID: String
+    let policy: ScalingPolicy
+    let decision: ScalingDecision
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case projectID = "project_id"
+        case policy
+        case decision
+    }
+}
+
+struct ScalingSessionStatus: Codable, Identifiable, Hashable, Sendable {
+    var id: String {
+        sessionID
+    }
+
+    let sessionID: String
+    let projectID: String
+    let goal: String
+    let status: String
+    let planRevision: UInt64
+    let planTasks: Int
+    let readyTasks: Int
+    let runningTasks: Int
+    let completedTasks: Int
+    let currentWorkers: Int
+    let currentLabour: Int
+    let activeWorkers: Int
+    let activeLabour: Int
+    let latest: ScalingDecision?
+    let idleSinceWorkers: String?
+    let idleSinceLabour: String?
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case projectID = "project_id"
+        case goal
+        case status
+        case planRevision = "plan_revision"
+        case planTasks = "plan_tasks"
+        case readyTasks = "ready_tasks"
+        case runningTasks = "running_tasks"
+        case completedTasks = "completed_tasks"
+        case currentWorkers = "current_workers"
+        case currentLabour = "current_labour"
+        case activeWorkers = "active_workers"
+        case activeLabour = "active_labour"
+        case latest
+        case idleSinceWorkers = "idle_since_workers"
+        case idleSinceLabour = "idle_since_labour"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decode(String.self, forKey: .sessionID)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        goal = try container.decodeIfPresent(String.self, forKey: .goal) ?? ""
+        status = try container.decodeIfPresent(String.self, forKey: .status) ?? "idle"
+        planRevision = try container.decodeIfPresent(UInt64.self, forKey: .planRevision) ?? 0
+        planTasks = try container.decodeIfPresent(Int.self, forKey: .planTasks) ?? 0
+        readyTasks = try container.decodeIfPresent(Int.self, forKey: .readyTasks) ?? 0
+        runningTasks = try container.decodeIfPresent(Int.self, forKey: .runningTasks) ?? 0
+        completedTasks = try container.decodeIfPresent(Int.self, forKey: .completedTasks) ?? 0
+        currentWorkers = try container.decodeIfPresent(Int.self, forKey: .currentWorkers) ?? 0
+        currentLabour = try container.decodeIfPresent(Int.self, forKey: .currentLabour) ?? 0
+        activeWorkers = try container.decodeIfPresent(Int.self, forKey: .activeWorkers) ?? 0
+        activeLabour = try container.decodeIfPresent(Int.self, forKey: .activeLabour) ?? 0
+        latest = try container.decodeIfPresent(ScalingDecision.self, forKey: .latest)
+        idleSinceWorkers = try container.decodeIfPresent(
+            String.self,
+            forKey: .idleSinceWorkers
+        )
+        idleSinceLabour = try container.decodeIfPresent(String.self, forKey: .idleSinceLabour)
+    }
+}
+
+struct ScalingProjectStatus: Codable, Identifiable, Hashable, Sendable {
+    var id: String {
+        projectID
+    }
+
+    let projectID: String
+    let projectName: String
+    let policy: ScalingPolicy
+    let sessions: [ScalingSessionStatus]
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case projectName = "project_name"
+        case policy
+        case sessions
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        projectName = try container.decodeIfPresent(String.self, forKey: .projectName) ?? ""
+        policy = try container.decodeIfPresent(ScalingPolicy.self, forKey: .policy) ?? .disabled
+        sessions = try container.decodeIfPresent([ScalingSessionStatus].self, forKey: .sessions)
+            ?? []
+    }
+}
+
+struct ScalingStatusResult: Codable, Sendable {
+    let globalWorkerCap: Int
+    let globalLabourCap: Int
+    let globalWorkerAvailable: Int
+    let globalLabourAvailable: Int
+    let projects: [ScalingProjectStatus]
+
+    enum CodingKeys: String, CodingKey {
+        case globalWorkerCap = "global_worker_cap"
+        case globalLabourCap = "global_labour_cap"
+        case globalWorkerAvailable = "global_worker_available"
+        case globalLabourAvailable = "global_labour_available"
+        case projects
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        globalWorkerCap = try container.decodeIfPresent(Int.self, forKey: .globalWorkerCap) ?? 0
+        globalLabourCap = try container.decodeIfPresent(Int.self, forKey: .globalLabourCap) ?? 0
+        globalWorkerAvailable = try container.decodeIfPresent(
+            Int.self,
+            forKey: .globalWorkerAvailable
+        ) ?? 0
+        globalLabourAvailable = try container.decodeIfPresent(
+            Int.self,
+            forKey: .globalLabourAvailable
+        ) ?? 0
+        projects = try container.decodeIfPresent([ScalingProjectStatus].self, forKey: .projects)
+            ?? []
+    }
+}
+
 struct IntakeTask: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let projectID: String

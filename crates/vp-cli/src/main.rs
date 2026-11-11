@@ -588,6 +588,59 @@ enum Command {
     },
     /// Show the project's automatic task-resume policy.
     TaskScheduler { project: String },
+    /// Show deterministic Worker/Labour scaling status.
+    Scaling {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Preview the deterministic scaling decision for one session.
+    ScalingPreview { session: String },
+    /// Show the project's deterministic org-scaling policy.
+    ScalingPolicy { project: String },
+    /// Update the project's deterministic org-scaling policy.
+    ScalingPolicySet {
+        project: String,
+        /// Enable or disable automatic Worker/Labour scaling.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        enabled: Option<bool>,
+        /// Scale-down floor for Worker slots (1–10).
+        #[arg(long)]
+        min_workers: Option<u32>,
+        /// Hard ceiling for Worker slots (1–10).
+        #[arg(long)]
+        max_workers: Option<u32>,
+        /// Scale-down floor for Labour slots (1–40).
+        #[arg(long)]
+        min_labour: Option<u32>,
+        /// Hard ceiling for Labour slots (1–40).
+        #[arg(long)]
+        max_labour: Option<u32>,
+        /// Ready tasks required before an expansion (1–100).
+        #[arg(long)]
+        expand_ready_threshold: Option<u32>,
+        /// Critical-delay hysteresis for idle-plan pre-expansion (0–86400s).
+        #[arg(long)]
+        expand_critical_delay_secs: Option<u64>,
+        /// Continuous idle window before scale-down (0–604800s).
+        #[arg(long)]
+        scale_down_idle_secs: Option<u64>,
+        /// Minimum seconds between applied decisions (0–86400).
+        #[arg(long)]
+        cooldown_secs: Option<u64>,
+        /// Maximum slots moved per decision (1–10).
+        #[arg(long)]
+        max_step: Option<u32>,
+        /// Optional budget headroom ratio required for expansion (0.0–1.0).
+        #[arg(long)]
+        budget_headroom_ratio: Option<f64>,
+        /// Disable the budget headroom check.
+        #[arg(long = "no-budget-check")]
+        no_budget_check: bool,
+    },
     /// Update the project's automatic task-resume policy.
     TaskSchedulerSet {
         project: String,
@@ -3175,6 +3228,108 @@ async fn main() -> Result<()> {
                             .unwrap_or_else(|| {
                                 policy["max_intake_parallel"].as_u64().unwrap_or(2) as u32
                             }),
+                    }
+                }),
+            )
+            .await?
+        }
+        Command::Scaling {
+            project,
+            session,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "scaling.status",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::ScalingPreview { session } => {
+            rpc(
+                &discovery,
+                "scaling.preview",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::ScalingPolicy { project } => {
+            rpc(
+                &discovery,
+                "scaling.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ScalingPolicySet {
+            project,
+            enabled,
+            min_workers,
+            max_workers,
+            min_labour,
+            max_labour,
+            expand_ready_threshold,
+            expand_critical_delay_secs,
+            scale_down_idle_secs,
+            cooldown_secs,
+            max_step,
+            budget_headroom_ratio,
+            no_budget_check,
+        } => {
+            // Merge with the stored policy so a one-field edit does not reset
+            // the rest to defaults.
+            let current = rpc(
+                &discovery,
+                "scaling.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            let budget_headroom_ratio = if no_budget_check {
+                Value::Null
+            } else if let Some(ratio) = budget_headroom_ratio {
+                json!(ratio)
+            } else {
+                policy
+                    .get("budget_headroom_ratio")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            rpc(
+                &discovery,
+                "scaling.policy.set",
+                json!({
+                    "project_id": project,
+                    "policy": {
+                        "enabled": enabled
+                            .unwrap_or_else(|| policy["enabled"].as_bool().unwrap_or(false)),
+                        "min_workers": min_workers
+                            .unwrap_or_else(|| policy["min_workers"].as_u64().unwrap_or(1) as u32),
+                        "max_workers": max_workers
+                            .unwrap_or_else(|| policy["max_workers"].as_u64().unwrap_or(4) as u32),
+                        "min_labour": min_labour
+                            .unwrap_or_else(|| policy["min_labour"].as_u64().unwrap_or(1) as u32),
+                        "max_labour": max_labour
+                            .unwrap_or_else(|| policy["max_labour"].as_u64().unwrap_or(8) as u32),
+                        "expand_ready_threshold": expand_ready_threshold.unwrap_or_else(|| {
+                            policy["expand_ready_threshold"].as_u64().unwrap_or(2) as u32
+                        }),
+                        "expand_critical_delay_secs": expand_critical_delay_secs.unwrap_or_else(
+                            || policy["expand_critical_delay_secs"].as_u64().unwrap_or(120),
+                        ),
+                        "scale_down_idle_secs": scale_down_idle_secs.unwrap_or_else(|| {
+                            policy["scale_down_idle_secs"].as_u64().unwrap_or(600)
+                        }),
+                        "cooldown_secs": cooldown_secs.unwrap_or_else(|| {
+                            policy["cooldown_secs"].as_u64().unwrap_or(120)
+                        }),
+                        "max_step": max_step
+                            .unwrap_or_else(|| policy["max_step"].as_u64().unwrap_or(2) as u32),
+                        "budget_headroom_ratio": budget_headroom_ratio,
                     }
                 }),
             )
@@ -6693,6 +6848,303 @@ fn process_console_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn scaling_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(decision) = value
+        .get("decision")
+        .filter(|decision| decision.is_object())
+    {
+        let mut lines = Vec::new();
+        let session = value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .or_else(|| decision.get("session_id").and_then(Value::as_str))
+            .unwrap_or("?");
+        lines.push(format!(
+            "scaling preview  {session}  action={}  Workers {}→{}  Labour {}→{}",
+            decision
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("hold"),
+            decision
+                .get("current_workers")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            decision
+                .get("target_workers")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            decision
+                .get("current_labour")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            decision
+                .get("target_labour")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        ));
+        lines.push(format!(
+            "  ready {} · running {} · active Workers {} · active Labour {} · revision {} · applied {}",
+            decision
+                .get("ready_tasks")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            decision
+                .get("running_tasks")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            decision
+                .get("active_workers")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            decision
+                .get("active_labour")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            decision
+                .get("plan_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            decision
+                .get("applied")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        ));
+        if let Some(reasons) = decision.get("reasons").and_then(Value::as_array) {
+            lines.push(format!(
+                "  reasons: {}",
+                reasons
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+        }
+        if let Some(hash) = decision.get("inputs_hash").and_then(Value::as_str) {
+            let prefix = hash.get(..12).unwrap_or(hash);
+            lines.push(format!("  inputs {prefix}…"));
+        }
+        if let Some(evidence) = decision.get("manager_evidence").and_then(Value::as_str) {
+            lines.push(format!("  manager evidence: {evidence}"));
+        }
+        return Some(lines);
+    }
+    if value.get("global_worker_cap").is_some()
+        && let Some(projects) = value.get("projects").and_then(Value::as_array)
+    {
+        let mut lines = vec![format!(
+            "scaling  global Workers {}/{} available · Labour {}/{} available",
+            value
+                .get("global_worker_available")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            value
+                .get("global_worker_cap")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            value
+                .get("global_labour_available")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            value
+                .get("global_labour_cap")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )];
+        if projects.is_empty() {
+            lines.push("  no projects".to_string());
+            return Some(lines);
+        }
+        for project in projects {
+            let name = project
+                .get("project_name")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let policy = project.get("policy").unwrap_or(&Value::Null);
+            lines.push(format!(
+                "{name}  scaling={}  Workers {}-{}  Labour {}-{}  threshold {}  cooldown {}s  step {}  budget {}",
+                if policy
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "on"
+                } else {
+                    "off"
+                },
+                policy
+                    .get("min_workers")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                policy
+                    .get("max_workers")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                policy
+                    .get("min_labour")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                policy
+                    .get("max_labour")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                policy
+                    .get("expand_ready_threshold")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                policy
+                    .get("cooldown_secs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                policy
+                    .get("max_step")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                policy
+                    .get("budget_headroom_ratio")
+                    .and_then(Value::as_f64)
+                    .map(|ratio| format!("≥{:.0}%", ratio * 100.0))
+                    .unwrap_or_else(|| "off".to_string())
+            ));
+            for session in project
+                .get("sessions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let latest = session.get("latest").unwrap_or(&Value::Null);
+                let action = latest
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("none");
+                lines.push(format!(
+                    "  {}  {:<10}  rev {}  tasks {}/{} ready  slots {}W/{}L  active {}W/{}L  latest {}  {}",
+                    session
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
+                    session
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
+                    session
+                        .get("plan_revision")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    session
+                        .get("ready_tasks")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    session
+                        .get("plan_tasks")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    session
+                        .get("current_workers")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    session
+                        .get("current_labour")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    session
+                        .get("active_workers")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    session
+                        .get("active_labour")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    action,
+                    session
+                        .get("goal")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                ));
+                if latest.is_object()
+                    && let Some(reasons) = latest.get("reasons").and_then(Value::as_array)
+                    && !reasons.is_empty()
+                {
+                    lines.push(format!(
+                        "    {}",
+                        reasons
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .take(6)
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    ));
+                }
+            }
+        }
+        return Some(lines);
+    }
+    if let Some(policy) = value
+        .get("policy")
+        .filter(|policy| policy.get("max_workers").is_some() && policy.get("max_labour").is_some())
+    {
+        let mut lines = vec![format!(
+            "scaling policy  {}  enabled={}",
+            value
+                .get("project_id")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            policy
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        )];
+        lines.push(format!(
+            "  Workers {}-{}  Labour {}-{}  threshold {}  critical delay {}s  idle {}s  cooldown {}s  step {}",
+            policy
+                .get("min_workers")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            policy
+                .get("max_workers")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            policy
+                .get("min_labour")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            policy
+                .get("max_labour")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            policy
+                .get("expand_ready_threshold")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            policy
+                .get("expand_critical_delay_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            policy
+                .get("scale_down_idle_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            policy
+                .get("cooldown_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            policy
+                .get("max_step")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ));
+        lines.push(format!(
+            "  budget headroom: {}",
+            policy
+                .get("budget_headroom_ratio")
+                .and_then(Value::as_f64)
+                .map(|ratio| format!("≥{:.0}%", ratio * 100.0))
+                .unwrap_or_else(|| "check disabled".to_string())
+        ));
+        return Some(lines);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
     if let Some(lines) = process_console_lines(value) {
         for line in lines {
@@ -6701,6 +7153,12 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(lines) = lsp_status_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = scaling_lines(value) {
         for line in lines {
             println!("{line}");
         }
@@ -11158,5 +11616,127 @@ mod process_command_tests {
         let lines = process_console_lines(&stop).unwrap();
         assert!(lines[0].contains("stopped"));
         assert!(lines[0].contains("signal 15"));
+    }
+}
+
+#[cfg(test)]
+mod scaling_cli_tests {
+    use super::*;
+
+    #[test]
+    fn preview_lines_include_action_targets_reasons_and_hash() {
+        let lines = scaling_lines(&json!({
+            "session_id": "ses-1",
+            "project_id": "proj-1",
+            "policy": {"enabled": true},
+            "decision": {
+                "session_id": "ses-1",
+                "action": "expand_workers",
+                "current_workers": 2,
+                "target_workers": 4,
+                "current_labour": 2,
+                "target_labour": 2,
+                "ready_tasks": 5,
+                "running_tasks": 2,
+                "active_workers": 2,
+                "active_labour": 1,
+                "plan_revision": 3,
+                "applied": false,
+                "inputs_hash": "0123456789abcdef",
+                "reasons": ["ready_tasks:5", "expand_workers:2->4"],
+                "manager_evidence": "two departments would help"
+            }
+        }))
+        .expect("preview lines");
+        let text = lines.join("\n");
+        assert!(text.contains("action=expand_workers"));
+        assert!(text.contains("Workers 2→4"));
+        assert!(text.contains("ready 5"));
+        assert!(text.contains("inputs 0123456789ab"));
+        assert!(text.contains("manager evidence: two departments would help"));
+    }
+
+    #[test]
+    fn status_lines_report_policy_targets_and_latest_reasons() {
+        let lines = scaling_lines(&json!({
+            "global_worker_cap": 12,
+            "global_labour_cap": 24,
+            "global_worker_available": 9,
+            "global_labour_available": 20,
+            "projects": [{
+                "project_id": "proj-1",
+                "project_name": "demo",
+                "policy": {
+                    "enabled": true,
+                    "min_workers": 1,
+                    "max_workers": 4,
+                    "min_labour": 1,
+                    "max_labour": 8,
+                    "expand_ready_threshold": 2,
+                    "cooldown_secs": 120,
+                    "max_step": 2,
+                    "budget_headroom_ratio": 0.25
+                },
+                "sessions": [{
+                    "session_id": "ses-1",
+                    "goal": "ship",
+                    "status": "idle",
+                    "plan_revision": 2,
+                    "plan_tasks": 6,
+                    "ready_tasks": 3,
+                    "running_tasks": 0,
+                    "completed_tasks": 2,
+                    "current_workers": 2,
+                    "current_labour": 4,
+                    "active_workers": 0,
+                    "active_labour": 0,
+                    "latest": {
+                        "action": "scale_down_labour",
+                        "reasons": ["scale_down_labour:4->2", "idle 900s"]
+                    }
+                }]
+            }]
+        }))
+        .expect("status lines");
+        let text = lines.join("\n");
+        assert!(text.contains("global Workers 9/12"));
+        assert!(text.contains("demo  scaling=on"));
+        assert!(text.contains("budget ≥25%"));
+        assert!(text.contains("slots 2W/4L"));
+        assert!(text.contains("latest scale_down_labour"));
+        assert!(text.contains("scale_down_labour:4->2"));
+    }
+
+    #[test]
+    fn policy_lines_show_disabled_budget_check_and_bounds() {
+        let lines = scaling_lines(&json!({
+            "project_id": "proj-1",
+            "policy": {
+                "enabled": false,
+                "min_workers": 1,
+                "max_workers": 3,
+                "min_labour": 1,
+                "max_labour": 6,
+                "expand_ready_threshold": 2,
+                "expand_critical_delay_secs": 60,
+                "scale_down_idle_secs": 300,
+                "cooldown_secs": 90,
+                "max_step": 1,
+                "budget_headroom_ratio": null
+            }
+        }))
+        .expect("policy lines");
+        let text = lines.join("\n");
+        assert!(text.contains("enabled=false"));
+        assert!(text.contains("Workers 1-3"));
+        assert!(text.contains("Labour 1-6"));
+        assert!(text.contains("budget headroom: check disabled"));
+    }
+
+    #[test]
+    fn unrelated_payload_is_not_misformatted() {
+        assert!(scaling_lines(&json!({"session_id": "ses-1"})).is_none());
+        assert!(scaling_lines(&json!({"projects": []})).is_none());
+        assert!(scaling_lines(&json!({"policy": {"max_workers": 4}})).is_none());
     }
 }

@@ -2013,7 +2013,18 @@ async fn blocks_integration_when_the_verifier_rejects() {
         }
     });
     service.start(&session.id, "verify").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    // Poll for the terminal worker state instead of sleeping for a fixed
+    // interval; the full workspace suite runs many concurrent provider tests.
+    for _ in 0..100 {
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        if agents
+            .iter()
+            .any(|agent| agent.role == "worker" && agent.status == "changes_requested")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     approver.abort();
 
     let worktree = session.worktree.clone().unwrap();
@@ -18067,4 +18078,65 @@ fn citation_registry_only_keys_returned_chunks_and_deduplicates() {
             .iter()
             .all(|citation| citation.key == "c1" || citation.key == "c2")
     );
+}
+
+#[test]
+fn session_budget_reserves_worker_and_labour_through_scaling_slots() {
+    let slots = Arc::new(crate::scaling::ScalingSlots::new(2, 1));
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 2,
+            labour: 1,
+        },
+    )
+    .with_scaling_slots(slots.clone());
+    let (_, first) = budget.reserve_slot(AgentRole::Worker).expect("worker 1");
+    let (_, second) = budget.reserve_slot(AgentRole::Worker).expect("worker 2");
+    assert!(budget.reserve_slot(AgentRole::Worker).is_none());
+    let (_, labour) = budget.reserve_slot(AgentRole::Labour).expect("labour 1");
+    assert!(budget.reserve_slot(AgentRole::Labour).is_none());
+    assert_eq!(slots.active(), (2, 1));
+    assert_eq!(budget.available(AgentRole::Worker), 0);
+
+    slots.apply(3, 2);
+    assert_eq!(budget.worker_cap(), 3);
+    assert_eq!(budget.available(AgentRole::Worker), 1);
+    assert_eq!(budget.available(AgentRole::Labour), 1);
+    let (_, third) = budget.reserve_slot(AgentRole::Worker).expect("worker 3");
+    assert!(budget.reserve_slot(AgentRole::Worker).is_none());
+
+    drop(first);
+    drop(second);
+    drop(third);
+    drop(labour);
+    assert_eq!(slots.active(), (0, 0));
+}
+
+#[test]
+fn session_budget_legacy_expansion_yields_to_managed_scaling() {
+    let slots = Arc::new(crate::scaling::ScalingSlots::new(2, 2));
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 2,
+            labour: 2,
+        },
+    )
+    .with_scaling_slots(slots.clone());
+    budget.expand_workers(4);
+    assert_eq!(budget.worker_cap(), 4);
+    assert_eq!(slots.targets().0, 4);
+
+    slots.enable_managed();
+    budget.expand_workers(8);
+    assert_eq!(budget.worker_cap(), 4);
+    assert_eq!(slots.targets().0, 4);
+    budget.set_worker_cap(1);
+    assert_eq!(budget.worker_cap(), 4);
+    assert_eq!(slots.targets().0, 4);
 }

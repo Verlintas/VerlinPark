@@ -27,6 +27,9 @@ use vp_protocol::remote::{
     RemoteLedgerParams, RemoteStatusParams, RemoteWorktreeListParams,
 };
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
+use vp_protocol::scaling::{
+    ScalingPolicyParams, ScalingPreviewParams, ScalingStatusParams, SetScalingPolicyParams,
+};
 use vp_protocol::types::{
     AcpAgentConfig, AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams,
     AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
@@ -219,6 +222,7 @@ async fn main() -> Result<()> {
     };
     state.agent.start_auto_resolver();
     state.agent.start_task_scheduler();
+    state.agent.start_scaling_controller();
     spawn_worktree_sweeper(state.engine.clone());
     spawn_checkpoint_sweeper(state.engine.clone());
     spawn_tool_output_sweeper(state.engine.clone());
@@ -728,6 +732,46 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "scaling.policy.get" => match parse_params::<ScalingPolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_scaling_policy(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "scaling.policy.set" => match parse_params::<SetScalingPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_scaling_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "scaling.preview" => match parse_params::<ScalingPreviewParams>(request.params) {
+            Ok(params) => match state.agent.scaling_preview(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "scaling.status" => match parse_params::<ScalingStatusParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .scaling_status(
+                    params.project_id.as_deref(),
+                    params.session_id.as_deref(),
+                    params.limit,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "orchestration.policy.get" => {
             match parse_params::<OrchestrationPolicyParams>(request.params) {
                 Ok(params) => match state.engine.orchestration_policy(&params.project_id).await {
@@ -3780,6 +3824,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "project.worktree_policy.set"
             | "project.checkpoint_policy.set"
             | "project.task_scheduler.set"
+            | "scaling.policy.set"
             | "host.add"
             | "host.update"
             | "host.remove"

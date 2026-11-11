@@ -242,6 +242,17 @@ private struct ProjectStageView: View {
                         if model.hasLongTaskAttention {
                             longTaskAttentionPill
                         }
+                        if let label = model.scalingStageLabel {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.up.right.circle")
+                                    .font(.system(size: 8, weight: .semibold))
+                                Text(label)
+                            }
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .help(
+                                "Deterministic organization scaling: current Worker/Labour slots, ready tasks, and the latest bounded decision. Managers remain plan-owned."
+                            )
+                        }
                         if let label = model.guiStageLabel {
                             Button {
                                 showingGui.toggle()

@@ -465,6 +465,8 @@ tool_error_codes! {
     QUESTION_TIMEOUT => "QUESTION_TIMEOUT", false, "session", "Proceed with the safest assumption or ask again; do not block forever.";
     VERDICT_INVALID => "VERDICT_INVALID", false, "session", "Submit a verdict with approved plus a concrete summary.";
     TODO_INVALID => "TODO_INVALID", false, "session", "Use 1-50 bounded todo items with valid statuses.";
+    SCALING_POLICY_INVALID => "SCALING_POLICY_INVALID", false, "scaling", "Use bounded Worker/Labour minimums and maximums, a cooldown, and an optional 0.0-1.0 budget headroom ratio.";
+    SCALING_STATE_CONFLICT => "SCALING_STATE_CONFLICT", false, "scaling", "Re-read the plan revision and scaling status before retrying; do not create Managers or rewrite the plan.";
     ACP_AGENT_FAILED => "ACP_AGENT_FAILED", false, "acp", "Inspect the external agent stderr/report; do not retry an unchanged session.";
     ACP_TOOL_FAILED => "ACP_TOOL_FAILED", false, "acp", "Inspect the external tool result; the ACP agent owns its own tools.";
     SUBAGENT_FAILED => "SUBAGENT_FAILED", false, "acp", "Inspect the child agent summary and task state before delegating again.";

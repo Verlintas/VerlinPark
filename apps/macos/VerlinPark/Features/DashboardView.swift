@@ -414,6 +414,7 @@ struct DashboardView: View {
             SteeringCard()
             TaskStallCard()
             TaskSchedulerCard()
+            ScalingCard()
             OrchestrationPolicyCard()
             RuntimeLeaseCard()
         case .usage:

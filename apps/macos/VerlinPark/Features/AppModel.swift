@@ -362,6 +362,25 @@ final class AppModel {
     var schedulerStatus: SchedulerStatusResult?
     var schedulerStatusBusy = false
     var schedulerStatusError: String?
+    var scalingPolicy = ScalingPolicy.disabled
+    var scalingEnabled = false
+    var scalingMinWorkersText = "1"
+    var scalingMaxWorkersText = "4"
+    var scalingMinLabourText = "1"
+    var scalingMaxLabourText = "8"
+    var scalingReadyThresholdText = "2"
+    var scalingCriticalDelayText = "120"
+    var scalingIdleSecsText = "600"
+    var scalingCooldownText = "120"
+    var scalingMaxStepText = "2"
+    var scalingBudgetRatioText = ""
+    var scalingPolicyBusy = false
+    var scalingPolicyStatus: String?
+    var scalingStatus: ScalingStatusResult?
+    var scalingStatusBusy = false
+    var scalingStatusError: String?
+    var scalingPreview: ScalingPreviewResult?
+    var scalingPreviewBusy = false
     var sources: [ProjectSource] = []
     var sourceStats: SourceStats?
     var sourceCollections: [SourceCollection] = []
@@ -5070,6 +5089,187 @@ final class AppModel {
         }
     }
 
+    func loadScalingPolicy() async {
+        scalingPreview = nil
+        guard let projectID = selectedProjectID else {
+            scalingPolicy = .disabled
+            applyScalingPolicyFields(.disabled)
+            return
+        }
+        do {
+            let policy = try await core.scalingPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            scalingPolicy = policy
+            applyScalingPolicyFields(policy)
+            scalingPolicyStatus = nil
+        } catch {
+            scalingPolicyStatus = error.localizedDescription
+        }
+    }
+
+    private func applyScalingPolicyFields(_ policy: ScalingPolicy) {
+        scalingEnabled = policy.enabled
+        scalingMinWorkersText = String(policy.minWorkers)
+        scalingMaxWorkersText = String(policy.maxWorkers)
+        scalingMinLabourText = String(policy.minLabour)
+        scalingMaxLabourText = String(policy.maxLabour)
+        scalingReadyThresholdText = String(policy.expandReadyThreshold)
+        scalingCriticalDelayText = String(policy.expandCriticalDelaySecs)
+        scalingIdleSecsText = String(policy.scaleDownIdleSecs)
+        scalingCooldownText = String(policy.cooldownSecs)
+        scalingMaxStepText = String(policy.maxStep)
+        scalingBudgetRatioText = policy.budgetHeadroomRatio.map {
+            String(format: "%.2f", $0)
+        } ?? ""
+    }
+
+    func saveScalingPolicy() async {
+        guard let projectID = selectedProjectID else {
+            scalingPolicyStatus = "Select a project first."
+            return
+        }
+        guard let minWorkers = Int(scalingMinWorkersText.trimmingCharacters(in: .whitespaces)),
+              let maxWorkers = Int(scalingMaxWorkersText.trimmingCharacters(in: .whitespaces)),
+              let minLabour = Int(scalingMinLabourText.trimmingCharacters(in: .whitespaces)),
+              let maxLabour = Int(scalingMaxLabourText.trimmingCharacters(in: .whitespaces)),
+              let threshold = Int(scalingReadyThresholdText.trimmingCharacters(in: .whitespaces)),
+              let criticalDelay = UInt64(
+                  scalingCriticalDelayText.trimmingCharacters(in: .whitespaces)
+              ),
+              let idleSecs = UInt64(scalingIdleSecsText.trimmingCharacters(in: .whitespaces)),
+              let cooldown = UInt64(scalingCooldownText.trimmingCharacters(in: .whitespaces)),
+              let maxStep = Int(scalingMaxStepText.trimmingCharacters(in: .whitespaces))
+        else {
+            scalingPolicyStatus = "All scaling fields except the budget ratio must be integers."
+            return
+        }
+        guard (1 ... 10).contains(minWorkers), (minWorkers ... 10).contains(maxWorkers) else {
+            scalingPolicyStatus = "Worker bounds must satisfy 1 ≤ min ≤ max ≤ 10."
+            return
+        }
+        guard (1 ... 40).contains(minLabour), (minLabour ... 40).contains(maxLabour) else {
+            scalingPolicyStatus = "Labour bounds must satisfy 1 ≤ min ≤ max ≤ 40."
+            return
+        }
+        guard (1 ... 100).contains(threshold) else {
+            scalingPolicyStatus = "Ready threshold must be between 1 and 100."
+            return
+        }
+        guard criticalDelay <= 86400 else {
+            scalingPolicyStatus = "Critical delay must be at most 86400 seconds."
+            return
+        }
+        guard idleSecs <= 604_800 else {
+            scalingPolicyStatus = "Scale-down idle must be at most 604800 seconds."
+            return
+        }
+        guard cooldown <= 86400 else {
+            scalingPolicyStatus = "Cooldown must be at most 86400 seconds."
+            return
+        }
+        guard (1 ... 10).contains(maxStep) else {
+            scalingPolicyStatus = "Max step must be between 1 and 10."
+            return
+        }
+        let ratioText = scalingBudgetRatioText.trimmingCharacters(in: .whitespaces)
+        let ratio: Double?
+        if ratioText.isEmpty {
+            ratio = nil
+        } else if let parsed = Double(ratioText), (0.0 ... 1.0).contains(parsed) {
+            ratio = parsed
+        } else {
+            scalingPolicyStatus = "Budget headroom ratio must be between 0.0 and 1.0, or empty."
+            return
+        }
+        let policy = ScalingPolicy(
+            enabled: scalingEnabled,
+            minWorkers: minWorkers,
+            maxWorkers: maxWorkers,
+            minLabour: minLabour,
+            maxLabour: maxLabour,
+            expandReadyThreshold: threshold,
+            expandCriticalDelaySecs: criticalDelay,
+            scaleDownIdleSecs: idleSecs,
+            cooldownSecs: cooldown,
+            maxStep: maxStep,
+            budgetHeadroomRatio: ratio
+        )
+        scalingPolicyBusy = true
+        defer { scalingPolicyBusy = false }
+        do {
+            let saved = try await core.setScalingPolicy(projectID: projectID, policy: policy)
+            guard projectID == selectedProjectID else { return }
+            scalingPolicy = saved
+            applyScalingPolicyFields(saved)
+            scalingPolicyStatus = saved.enabled
+                ? "Scaling enabled · Workers \(saved.minWorkers)-\(saved.maxWorkers) · Labour \(saved.minLabour)-\(saved.maxLabour)"
+                : "Scaling disabled; no automatic team-size changes"
+            await loadScalingStatus()
+        } catch {
+            scalingPolicyStatus = error.localizedDescription
+        }
+    }
+
+    func loadScalingStatus(silent: Bool = false) async {
+        let projectID = selectedProjectID
+        let generation = selectionGeneration
+        if !silent {
+            scalingStatusBusy = true
+        }
+        defer {
+            if !silent {
+                scalingStatusBusy = false
+            }
+        }
+        do {
+            let status = try await core.scalingStatus(projectID: projectID)
+            guard generation == selectionGeneration, projectID == selectedProjectID else {
+                return
+            }
+            scalingStatus = status
+            scalingStatusError = nil
+        } catch {
+            guard generation == selectionGeneration, projectID == selectedProjectID else {
+                return
+            }
+            if !silent {
+                scalingStatusError = error.localizedDescription
+            }
+        }
+    }
+
+    func previewScalingNow() async {
+        guard let sessionID = selectedSessionID else {
+            scalingPolicyStatus = "Select a session first."
+            return
+        }
+        scalingPreviewBusy = true
+        defer { scalingPreviewBusy = false }
+        do {
+            scalingPreview = try await core.scalingPreview(sessionID: sessionID)
+            scalingPolicyStatus = "Preview: \(scalingPreview?.decision.summary ?? "hold")"
+        } catch {
+            scalingPolicyStatus = error.localizedDescription
+        }
+    }
+
+    var scalingSelectedSession: ScalingSessionStatus? {
+        guard let sessionID = selectedSessionID, let status = scalingStatus else {
+            return nil
+        }
+        return status.projects.flatMap(\.sessions).first { $0.sessionID == sessionID }
+    }
+
+    var scalingStageLabel: String? {
+        guard let entry = scalingSelectedSession else { return nil }
+        let latest = entry.latest?.action
+        let label = "team \(entry.currentWorkers)W/\(entry.currentLabour)L · \(entry.readyTasks) ready"
+        if let latest, latest != "hold" {
+            return "\(label) · \(latest)"
+        }
+        return label
+    }
+
     func loadSkills(silent: Bool = false) async {
         guard let projectID = selectedProjectID else {
             skills = []
@@ -7952,6 +8152,10 @@ final class AppModel {
                 await self.loadIntakeTasks(silent: true)
                 await self.loadSchedulerStatus(silent: true)
             }
+        }
+
+        if event.type == "scaling.decision" {
+            Task { await self.loadScalingStatus(silent: true) }
         }
 
         if event.sessionId == selectedSessionID,

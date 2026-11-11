@@ -34,6 +34,7 @@ use vp_protocol::types::{
 };
 
 use vp_protocol::remote::ExecutionHost;
+use vp_protocol::scaling::{ScalingDecision, ScalingPolicy};
 
 use crate::paths;
 
@@ -852,6 +853,10 @@ pub struct ProjectManifestSnapshot {
     pub budget: ProjectBudget,
     #[serde(default)]
     pub task_scheduler_policy: TaskSchedulerPolicy,
+    /// Deterministic Worker/Labour scaling policy. Older manifests decode as
+    /// disabled, so no existing project starts scaling after an upgrade.
+    #[serde(default)]
+    pub scaling_policy: ScalingPolicy,
     #[serde(default)]
     pub session_run_policy: SessionRunPolicy,
     #[serde(default)]
@@ -2012,6 +2017,46 @@ impl Store {
                 updated_at          TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS project_scaling_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- Event-backed deterministic scaling decisions. `decision_key` is
+            -- the plan-revision/tick idempotency key, unique per session.
+            CREATE TABLE IF NOT EXISTS scaling_decisions (
+                decision_id          TEXT PRIMARY KEY,
+                session_id           TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                project_id           TEXT NOT NULL,
+                seq                  INTEGER NOT NULL DEFAULT 0,
+                decision_key         TEXT NOT NULL,
+                plan_revision        INTEGER NOT NULL DEFAULT 0,
+                action               TEXT NOT NULL,
+                current_workers      INTEGER NOT NULL DEFAULT 0,
+                current_labour       INTEGER NOT NULL DEFAULT 0,
+                target_workers       INTEGER NOT NULL DEFAULT 0,
+                target_labour        INTEGER NOT NULL DEFAULT 0,
+                active_workers       INTEGER NOT NULL DEFAULT 0,
+                active_labour        INTEGER NOT NULL DEFAULT 0,
+                ready_tasks          INTEGER NOT NULL DEFAULT 0,
+                running_tasks        INTEGER NOT NULL DEFAULT 0,
+                inputs_hash          TEXT NOT NULL,
+                reasons              TEXT NOT NULL DEFAULT '[]',
+                manager_recommended  INTEGER NOT NULL DEFAULT 0,
+                manager_evidence     TEXT,
+                applied              INTEGER NOT NULL DEFAULT 0,
+                idle_since_workers   TEXT,
+                idle_since_labour    TEXT,
+                created_at           TEXT NOT NULL,
+                UNIQUE(session_id, decision_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scaling_decisions_session
+                ON scaling_decisions(session_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_scaling_decisions_project
+                ON scaling_decisions(project_id, created_at);
+
             CREATE TABLE IF NOT EXISTS intake_tasks (
                 id              TEXT PRIMARY KEY,
                 project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -3143,6 +3188,7 @@ impl Store {
                 process_policy: self.get_process_policy(&project.id)?,
                 budget: self.get_project_budget(&project.id)?,
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
+                scaling_policy: self.get_scaling_policy(&project.id)?,
                 session_run_policy: self.get_session_run_policy(&project.id)?,
                 memory_policy: self.get_memory_policy(&project.id)?,
                 source_embedding_policy: self.get_source_embedding_policy(&project.id)?,
@@ -3479,6 +3525,46 @@ impl Store {
                 policy.max_intake_parallel.clamp(1, 10) as i64,
                 now_rfc3339()
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_scaling_policy(&self, project_id: &str) -> Result<ScalingPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT policy FROM project_scaling_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(stored
+            .and_then(|raw| serde_json::from_str::<ScalingPolicy>(&raw).ok())
+            .unwrap_or_default()
+            .normalized())
+    }
+
+    pub fn has_scaling_policy(&self, project_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM project_scaling_policies WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn set_scaling_policy(&self, project_id: &str, policy: &ScalingPolicy) -> Result<()> {
+        let encoded = serde_json::to_string(&policy.clone().normalized())
+            .context("serializing scaling policy")?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_scaling_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, encoded, now_rfc3339()],
         )?;
         Ok(())
     }
@@ -7384,6 +7470,144 @@ impl Store {
                     decision.agent_id,
                     decision.created_at
                 ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist one deterministic scaling decision and its `scaling.decision`
+    /// event atomically. The unique `(session_id, decision_key)` constraint makes
+    /// a repeated daemon tick idempotent: the second call returns `None` and
+    /// appends no event.
+    pub fn record_scaling_decision_with_event(
+        &self,
+        decision: &ScalingDecision,
+    ) -> Result<Option<(ScalingDecision, Event)>> {
+        if decision.session_id.is_empty() || decision.decision_key.is_empty() {
+            anyhow::bail!("scaling decision needs a session id and decision key");
+        }
+        let mut stored = decision.clone();
+        if stored.decision_id.is_empty() {
+            stored.decision_id = Uuid::now_v7().to_string();
+        }
+        if stored.created_at.is_empty() {
+            stored.created_at = now_rfc3339();
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let exists = tx.query_row(
+            "SELECT COUNT(*) FROM scaling_decisions
+             WHERE session_id = ?1 AND decision_key = ?2",
+            params![stored.session_id, stored.decision_key],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+        if exists {
+            return Ok(None);
+        }
+        let event = insert_event_tx(
+            &tx,
+            &stored.session_id,
+            "scaling.decision",
+            serde_json::to_value(&stored)?,
+        )?;
+        insert_scaling_decision_tx(&tx, &stored, event.seq)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((stored, event)))
+    }
+
+    pub fn list_scaling_decisions(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ScalingDecision>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT decision_id, decision_key, project_id, session_id, seq, plan_revision, action,
+                    current_workers, current_labour, target_workers, target_labour,
+                    active_workers, active_labour, ready_tasks, running_tasks, inputs_hash,
+                    reasons, manager_recommended, manager_evidence, applied,
+                    idle_since_workers, idle_since_labour, created_at
+             FROM scaling_decisions
+             WHERE session_id = ?1
+             ORDER BY seq DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, i64::from(limit.clamp(1, 10_000))],
+            map_scaling_decision,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn latest_scaling_decision(&self, session_id: &str) -> Result<Option<ScalingDecision>> {
+        Ok(self
+            .list_scaling_decisions(session_id, 1)?
+            .into_iter()
+            .next())
+    }
+
+    pub fn has_scaling_decision(&self, session_id: &str, decision_key: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM scaling_decisions
+             WHERE session_id = ?1 AND decision_key = ?2",
+            params![session_id, decision_key],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Replay/export path without an arbitrary limit. A decision is a bounded
+    /// row and the tick suppresses repeated Holds, so this stays bounded by
+    /// real state transitions rather than wall-clock ticks.
+    pub fn list_all_scaling_decisions(&self, session_id: &str) -> Result<Vec<ScalingDecision>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT decision_id, decision_key, project_id, session_id, seq, plan_revision, action,
+                    current_workers, current_labour, target_workers, target_labour,
+                    active_workers, active_labour, ready_tasks, running_tasks, inputs_hash,
+                    reasons, manager_recommended, manager_evidence, applied,
+                    idle_since_workers, idle_since_labour, created_at
+             FROM scaling_decisions
+             WHERE session_id = ?1
+             ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map(params![session_id], map_scaling_decision)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn replace_scaling_decisions(
+        &self,
+        session_id: &str,
+        decisions: &[ScalingDecision],
+        events: &[Event],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM scaling_decisions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let seq_by_decision = events
+            .iter()
+            .filter(|event| event.kind == "scaling.decision")
+            .filter_map(|event| {
+                let decision_id = event.payload.get("decision_id")?.as_str()?;
+                Some((decision_id.to_string(), event.seq))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for decision in decisions {
+            if decision.decision_id.is_empty() {
+                continue;
+            }
+            insert_scaling_decision_tx(
+                &tx,
+                decision,
+                *seq_by_decision.get(&decision.decision_id).unwrap_or(&0),
             )?;
         }
         tx.commit()?;
@@ -20692,6 +20916,78 @@ fn map_plan_task_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanTaskP
         last_tool: row.get(7)?,
         updated_at: row.get(8)?,
     })
+}
+
+fn map_scaling_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScalingDecision> {
+    let reasons = row.get::<_, String>(16)?;
+    let action = row.get::<_, String>(6)?;
+    Ok(ScalingDecision {
+        decision_id: row.get(0)?,
+        decision_key: row.get(1)?,
+        project_id: row.get(2)?,
+        session_id: row.get(3)?,
+        plan_revision: row.get::<_, i64>(5)?.max(0) as u64,
+        action: vp_protocol::scaling::ScalingAction::parse(&action).unwrap_or_default(),
+        current_workers: row.get::<_, i64>(7)?.clamp(0, 10) as u32,
+        current_labour: row.get::<_, i64>(8)?.clamp(0, 40) as u32,
+        target_workers: row.get::<_, i64>(9)?.clamp(0, 10) as u32,
+        target_labour: row.get::<_, i64>(10)?.clamp(0, 40) as u32,
+        active_workers: row.get::<_, i64>(11)?.clamp(0, 10) as u32,
+        active_labour: row.get::<_, i64>(12)?.clamp(0, 40) as u32,
+        ready_tasks: row.get::<_, i64>(13)?.max(0) as u32,
+        running_tasks: row.get::<_, i64>(14)?.max(0) as u32,
+        inputs_hash: row.get(15)?,
+        reasons: serde_json::from_str(&reasons).unwrap_or_default(),
+        manager_recommended: row.get::<_, i64>(17)? != 0,
+        manager_evidence: row.get(18)?,
+        applied: row.get::<_, i64>(19)? != 0,
+        idle_since_workers: row.get(20)?,
+        idle_since_labour: row.get(21)?,
+        created_at: row.get(22)?,
+    })
+}
+
+fn insert_scaling_decision_tx(
+    tx: &Transaction<'_>,
+    decision: &ScalingDecision,
+    seq: u64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO scaling_decisions
+         (decision_id, session_id, project_id, seq, decision_key, plan_revision, action,
+          current_workers, current_labour, target_workers, target_labour, active_workers,
+          active_labour, ready_tasks, running_tasks, inputs_hash, reasons,
+          manager_recommended, manager_evidence, applied, idle_since_workers,
+          idle_since_labour, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+        params![
+            decision.decision_id,
+            decision.session_id,
+            decision.project_id,
+            seq as i64,
+            decision.decision_key,
+            decision.plan_revision as i64,
+            decision.action.as_str(),
+            i64::from(decision.current_workers),
+            i64::from(decision.current_labour),
+            i64::from(decision.target_workers),
+            i64::from(decision.target_labour),
+            i64::from(decision.active_workers),
+            i64::from(decision.active_labour),
+            i64::from(decision.ready_tasks),
+            i64::from(decision.running_tasks),
+            decision.inputs_hash,
+            serde_json::to_string(&decision.reasons)?,
+            if decision.manager_recommended { 1 } else { 0 },
+            decision.manager_evidence,
+            if decision.applied { 1 } else { 0 },
+            decision.idle_since_workers,
+            decision.idle_since_labour,
+            decision.created_at,
+        ],
+    )?;
+    Ok(())
 }
 
 fn map_orchestration_recovery(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrchestrationRecovery> {

@@ -39,6 +39,7 @@ use crate::budget::{BudgetReason, Rejection, ScopeRequest, Spend};
 use crate::permissions::{
     ApprovalDecision, RiskLevel, assess_acp_permission, assess_remote_acp_delegation, decide,
 };
+use crate::scaling::ScalingSlots;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::worktree;
 
@@ -538,6 +539,7 @@ pub struct AgentService {
     runs: Arc<Mutex<HashMap<String, Arc<RunControl>>>>,
     auto_resolver_started: Arc<AtomicBool>,
     task_scheduler_started: Arc<AtomicBool>,
+    scaling_started: Arc<AtomicBool>,
     global_slots: Arc<AdmissionGate>,
     capacity: Arc<CapacityController>,
 }
@@ -914,7 +916,7 @@ async fn wait_for_cancel(control: &RunControl) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum AgentRole {
+pub(crate) enum AgentRole {
     Leader,
     Manager,
     Worker,
@@ -1344,6 +1346,9 @@ struct SessionBudget {
     started: std::time::Instant,
     caps: AgentCaps,
     worker_cap: AtomicUsize,
+    /// Shared Worker/Labour targets and live reservation counters. The tick
+    /// updates this object; reservations see a target change atomically.
+    scaling_slots: Option<Arc<ScalingSlots>>,
     state: Mutex<BudgetState>,
 }
 
@@ -1409,6 +1414,7 @@ impl SessionBudget {
             started: std::time::Instant::now(),
             caps,
             worker_cap: AtomicUsize::new(caps.workers),
+            scaling_slots: None,
             state: Mutex::new(BudgetState {
                 spent,
                 reserved_tokens: 0,
@@ -1431,6 +1437,11 @@ impl SessionBudget {
         if let Ok(mut state) = self.state.lock() {
             state.cost_spent = spent;
         }
+        self
+    }
+
+    fn with_scaling_slots(mut self, slots: Arc<ScalingSlots>) -> Self {
+        self.scaling_slots = Some(slots);
         self
     }
 
@@ -1552,17 +1563,38 @@ impl SessionBudget {
     }
 
     fn worker_cap(&self) -> usize {
+        if let Some(slots) = &self.scaling_slots {
+            return slots.targets().0;
+        }
         self.worker_cap.load(Ordering::SeqCst)
     }
 
     fn set_worker_cap(&self, cap: usize) {
+        if let Some(slots) = &self.scaling_slots {
+            slots.restore_target_if_unmanaged(AgentRole::Worker, cap);
+            if slots.managed() {
+                return;
+            }
+        }
         self.worker_cap
             .store(cap.clamp(1, HARD_WORKER_CAP), Ordering::SeqCst);
     }
 
     fn expand_workers(&self, target: usize) {
         let target = target.clamp(1, HARD_WORKER_CAP);
+        if let Some(slots) = &self.scaling_slots {
+            if slots.managed() {
+                return;
+            }
+            slots.raise_target(AgentRole::Worker, target);
+        }
         self.worker_cap.fetch_max(target, Ordering::SeqCst);
+    }
+
+    fn scaling_managed(&self) -> bool {
+        self.scaling_slots
+            .as_ref()
+            .is_some_and(|slots| slots.managed())
     }
 
     fn can_expand_workers(&self) -> bool {
@@ -1651,6 +1683,11 @@ impl SessionBudget {
     }
 
     fn reserve(&self, role: AgentRole) -> Option<usize> {
+        if let Some(slots) = &self.scaling_slots
+            && matches!(role, AgentRole::Worker | AgentRole::Labour)
+        {
+            return slots.try_reserve(role);
+        }
         let mut state = self.state.lock().ok()?;
         let (counter, cap) = match role {
             AgentRole::Manager => (&mut state.managers, self.caps.managers),
@@ -1673,6 +1710,12 @@ impl SessionBudget {
     }
 
     fn release(&self, role: AgentRole) {
+        if let Some(slots) = &self.scaling_slots
+            && matches!(role, AgentRole::Worker | AgentRole::Labour)
+        {
+            slots.release(role);
+            return;
+        }
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -1688,6 +1731,11 @@ impl SessionBudget {
     }
 
     fn available(&self, role: AgentRole) -> usize {
+        if let Some(slots) = &self.scaling_slots
+            && matches!(role, AgentRole::Worker | AgentRole::Labour)
+        {
+            return slots.available(role);
+        }
         let Ok(state) = self.state.lock() else {
             return 0;
         };
@@ -2031,6 +2079,7 @@ impl AgentService {
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
             task_scheduler_started: Arc::new(AtomicBool::new(false)),
+            scaling_started: Arc::new(AtomicBool::new(false)),
             global_slots: Arc::new(AdmissionGate::new(global_session_cap())),
             capacity: Arc::new(CapacityController::new(
                 global_worker_cap(),
@@ -2048,6 +2097,7 @@ impl AgentService {
             runs: Arc::new(Mutex::new(HashMap::new())),
             auto_resolver_started: Arc::new(AtomicBool::new(false)),
             task_scheduler_started: Arc::new(AtomicBool::new(false)),
+            scaling_started: Arc::new(AtomicBool::new(false)),
             global_slots: Arc::new(AdmissionGate::new(global_cap)),
             capacity,
         }
@@ -2356,7 +2406,13 @@ impl AgentService {
         )
         .with_cost(session.cost_budget_usd, session.cost_spent_usd)
         .with_time(session.time_budget_secs)
-        .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited));
+        .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited))
+        .with_scaling_slots(self.engine.scaling_slots(
+            &session.id,
+            &session.project_id,
+            config.max_workers,
+            config.max_labour,
+        ));
         let manager_spec = AgentSpec {
             id: agent
                 .parent_id
@@ -2765,7 +2821,13 @@ impl AgentService {
         )
         .with_cost(session.cost_budget_usd, session.cost_spent_usd)
         .with_time(session.time_budget_secs)
-        .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited));
+        .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited))
+        .with_scaling_slots(self.engine.scaling_slots(
+            &session.id,
+            &session.project_id,
+            config.max_workers,
+            config.max_labour,
+        ));
         let prompt = format!(
             "You are resolving a Git rebase conflict for integration queue entry {}.              The worktree is {} on branch {}. The rebase target is session branch {} at commit {}.              Conflicted paths: {}.              Resolve the conflicts in place, preserving the intent of both sides. Do not abort the rebase.              Do not commit manually; leave the resolved files in the worktree. Run relevant tests if possible.              The runtime will stage resolved files, continue the rebase, verify the result, and merge it.              Reply with a concise summary of the resolution.",
             entry.id,
@@ -4314,6 +4376,107 @@ impl AgentService {
             }
         }
         Ok(started)
+    }
+
+    fn scaling_base_caps(&self) -> (usize, usize) {
+        self.config
+            .read()
+            .ok()
+            .and_then(|config| {
+                config
+                    .as_ref()
+                    .map(|config| (config.max_workers, config.max_labour))
+            })
+            .unwrap_or((crate::scaling::HARD_WORKERS, crate::scaling::HARD_LABOUR))
+    }
+
+    fn capacity_snapshot(&self) -> CapacityInfo {
+        self.capacity.snapshot()
+    }
+
+    /// Evaluate one project/session without persisting or applying anything.
+    pub async fn scaling_preview(
+        &self,
+        session_id: &str,
+    ) -> Result<vp_protocol::scaling::ScalingPreviewResult> {
+        let (workers, labour) = self.scaling_base_caps();
+        let capacity = self.capacity_snapshot();
+        crate::scaling::preview(&self.engine, session_id, &capacity, workers, labour).await
+    }
+
+    /// Read-only scaling status. It reports durable targets and live agent
+    /// counts; it never evaluates or applies a decision.
+    pub async fn scaling_status(
+        &self,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<vp_protocol::scaling::ScalingStatusResult> {
+        let (workers, labour) = self.scaling_base_caps();
+        let engine = self.engine.clone();
+        let capacity = self.capacity_snapshot();
+        let project_id = project_id.map(ToOwned::to_owned);
+        let session_id = session_id.map(ToOwned::to_owned);
+        tokio::task::spawn_blocking(move || {
+            crate::scaling::status(
+                &engine,
+                project_id.as_deref(),
+                session_id.as_deref(),
+                limit,
+                &capacity,
+                workers,
+                labour,
+            )
+        })
+        .await?
+    }
+
+    /// One deterministic controller pass over every enabled project. It only
+    /// moves Worker/Labour slot ceilings; all admission, approval, write-scope,
+    /// Verifier, and merge gates remain in the existing run paths.
+    pub async fn scaling_tick(&self) -> Result<vp_protocol::scaling::ScalingTickResult> {
+        let (workers, labour) = self.scaling_base_caps();
+        let capacity = self.capacity_snapshot();
+        crate::scaling::run_tick(&self.engine, &capacity, workers, labour, None, None, true).await
+    }
+
+    pub fn start_scaling_controller(&self) {
+        if self.scaling_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let seconds = env::var("VERLINPARK_SCALING_TICK_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30);
+        if seconds == 0 {
+            return;
+        }
+        let seconds = seconds.clamp(5, 3_600);
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(seconds));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match service.scaling_tick().await {
+                    Ok(result) if result.evaluated > 0 => {
+                        tracing::debug!(
+                            projects = result.projects,
+                            sessions = result.sessions,
+                            evaluated = result.evaluated,
+                            applied = result.applied,
+                            expanded = result.expanded,
+                            scaled_down = result.scaled_down,
+                            "deterministic scaling tick"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "deterministic scaling tick failed");
+                    }
+                }
+            }
+        });
     }
 
     /// Opt-in global task-DAG resume scheduler. Every tick it picks one
@@ -6167,7 +6330,13 @@ impl AgentService {
             )
             .with_cost(session.cost_budget_usd, session.cost_spent_usd)
             .with_time(session.time_budget_secs)
-            .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited));
+            .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited))
+            .with_scaling_slots(self.engine.scaling_slots(
+                &session.id,
+                &session.project_id,
+                config.max_workers,
+                config.max_labour,
+            ));
             if budget.exhausted() {
                 anyhow::bail!("session budget is exhausted; cache warm needs provider tokens");
             }
@@ -6289,7 +6458,13 @@ impl AgentService {
             )
             .with_cost(session.cost_budget_usd, session.cost_spent_usd)
             .with_time(session.time_budget_secs)
-            .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited));
+            .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited))
+            .with_scaling_slots(self.engine.scaling_slots(
+                &session.id,
+                &session.project_id,
+                config.max_workers,
+                config.max_labour,
+            ));
             if budget.exhausted() {
                 anyhow::bail!("session budget is exhausted; compaction needs provider tokens");
             }
@@ -7279,7 +7454,13 @@ async fn run_plan_resume(
     )
     .with_cost(session.cost_budget_usd, session.cost_spent_usd)
     .with_time(session.time_budget_secs)
-    .with_unlimited_flag(engine.unlimited_flag(&session.id, session.unlimited));
+    .with_unlimited_flag(engine.unlimited_flag(&session.id, session.unlimited))
+    .with_scaling_slots(engine.scaling_slots(
+        &session.id,
+        &session.project_id,
+        config.max_workers,
+        config.max_labour,
+    ));
     if budget.exhausted() {
         emit(
             &engine,
@@ -7447,7 +7628,13 @@ async fn run_agent(
     )
     .with_cost(session.cost_budget_usd, session.cost_spent_usd)
     .with_time(session.time_budget_secs)
-    .with_unlimited_flag(engine.unlimited_flag(&session.id, session.unlimited));
+    .with_unlimited_flag(engine.unlimited_flag(&session.id, session.unlimited))
+    .with_scaling_slots(engine.scaling_slots(
+        &session.id,
+        &session.project_id,
+        config.max_workers,
+        config.max_labour,
+    ));
     let load_from_events = resume_journal.is_some();
     let journal = match resume_journal {
         Some(journal) => journal,
@@ -7816,7 +8003,7 @@ fn estimate_request_tokens(request: &ChatRequest) -> u64 {
     (bytes as u64).div_ceil(2).saturating_add(64)
 }
 
-fn normalize_scope(scope: &str) -> String {
+pub(crate) fn normalize_scope(scope: &str) -> String {
     scope
         .trim()
         .trim_start_matches("./")
@@ -7835,7 +8022,7 @@ fn path_in_scope(path: &str, scopes: &[String]) -> bool {
     })
 }
 
-fn scopes_overlap(left: &[String], right: &[String]) -> bool {
+pub(crate) fn scopes_overlap(left: &[String], right: &[String]) -> bool {
     if left.is_empty() || right.is_empty() {
         return true;
     }
@@ -19301,7 +19488,11 @@ async fn execute_team_plan(
             }
             break;
         }
-        if !limited && config.auto_expand_workers && ready.len() > budget.worker_cap() {
+        if !limited
+            && config.auto_expand_workers
+            && !budget.scaling_managed()
+            && ready.len() > budget.worker_cap()
+        {
             let target = ready.len().min(HARD_WORKER_CAP);
             if budget.can_expand_workers() {
                 budget.expand_workers(target);

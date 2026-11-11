@@ -105,6 +105,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             store.set_project_budget(&snapshot.project.id, &snapshot.budget)?;
             store
                 .set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
+            store.set_scaling_policy(&snapshot.project.id, &snapshot.scaling_policy)?;
             store.set_session_run_policy(&snapshot.project.id, &snapshot.session_run_policy)?;
             store.set_memory_policy(&snapshot.project.id, &snapshot.memory_policy)?;
             crate::source_embedding::validate_source_embedding_policy(

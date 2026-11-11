@@ -138,6 +138,54 @@ actor CoreClient {
         .policy
     }
 
+    func scalingPolicy(projectID: String) async throws -> ScalingPolicy {
+        try await request(
+            method: "scaling.policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ScalingPolicyResult.self)
+        .policy
+    }
+
+    func setScalingPolicy(
+        projectID: String,
+        policy: ScalingPolicy
+    ) async throws -> ScalingPolicy {
+        try await request(
+            method: "scaling.policy.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": policy.jsonValue,
+            ]
+        )
+        .decode(ScalingPolicyResult.self)
+        .policy
+    }
+
+    func scalingStatus(
+        projectID: String?,
+        sessionID: String? = nil,
+        limit: Int = 100
+    ) async throws -> ScalingStatusResult {
+        try await request(
+            method: "scaling.status",
+            params: [
+                "project_id": projectID.map(JSONValue.string) ?? .null,
+                "session_id": sessionID.map(JSONValue.string) ?? .null,
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(ScalingStatusResult.self)
+    }
+
+    func scalingPreview(sessionID: String) async throws -> ScalingPreviewResult {
+        try await request(
+            method: "scaling.preview",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(ScalingPreviewResult.self)
+    }
+
     func intakeTasks(
         projectID: String?,
         status: String? = nil,

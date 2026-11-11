@@ -114,6 +114,7 @@ pub mod prompt_cache;
 pub mod rebuild;
 pub mod remote;
 pub mod run_journal;
+pub mod scaling;
 pub mod scheduler;
 mod session_graph;
 pub mod skills;
@@ -150,6 +151,7 @@ struct ReplayData {
     recoveries: Vec<OrchestrationRecovery>,
     notes: Vec<OrchestrationNote>,
     decisions: Vec<OrchestrationDecision>,
+    scaling_decisions: Vec<vp_protocol::scaling::ScalingDecision>,
     runs: Vec<vp_protocol::types::SessionRun>,
     run_steps: Vec<vp_protocol::types::RunStep>,
     run_checkpoints: Vec<vp_protocol::types::RunCheckpoint>,
@@ -183,6 +185,7 @@ pub struct Engine {
     gui: Arc<gui::GuiCoordinator>,
     scheduler: Arc<scheduler::TaskScheduler>,
     process_supervisor: Arc<process_supervisor::ProcessSupervisor>,
+    scaling: Arc<scaling::ScalingCoordinator>,
     runtime_id: String,
     continuation_claims: Arc<Mutex<HashMap<String, SessionContinuationClaim>>>,
 }
@@ -745,6 +748,7 @@ impl Engine {
         Self {
             scheduler: Arc::new(scheduler::TaskScheduler::new(store.clone())),
             process_supervisor: Arc::new(process_supervisor::ProcessSupervisor::new(store.clone())),
+            scaling: Arc::new(scaling::ScalingCoordinator::default()),
             store,
             events,
             approval_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -12128,6 +12132,7 @@ impl Engine {
             let recoveries = store.list_orchestration_recoveries(None, Some(&id))?;
             let notes = store.list_coordination_notes(&id, 2_000)?;
             let decisions = store.list_orchestration_decisions(&id, 2_000)?;
+            let scaling_decisions = store.list_all_scaling_decisions(&id)?;
             let runs = store.list_all_session_runs(&id)?;
             let run_steps = store.list_session_run_steps(&id)?;
             let run_checkpoints = store.list_session_run_checkpoints(&id)?;
@@ -12154,6 +12159,7 @@ impl Engine {
                 recoveries,
                 notes,
                 decisions,
+                scaling_decisions,
                 runs,
                 run_steps,
                 run_checkpoints,
@@ -12848,6 +12854,16 @@ impl Engine {
                 expected_decision_values.len()
             ));
         }
+        let expected_scaling = crate::scaling::decisions_from_events(&data.events);
+        let scaling_decisions_match =
+            crate::scaling::decisions_match(&data.scaling_decisions, &expected_scaling);
+        if !scaling_decisions_match {
+            mismatches.push(format!(
+                "scaling decisions: projection={}, replay={}",
+                data.scaling_decisions.len(),
+                expected_scaling.len()
+            ));
+        }
         let expected_recoveries = crate::orchestration::recoveries_from_events(&data.events);
         let expected_recovery_values = expected_recoveries
             .iter()
@@ -13255,6 +13271,7 @@ impl Engine {
             && queue_matches
             && notes_match
             && decisions_match
+            && scaling_decisions_match
             && recoveries_match
             && steering_matches
             && continuations_match
@@ -13283,6 +13300,7 @@ impl Engine {
             task_queue_matches,
             notes_match,
             decisions_match,
+            scaling_decisions_match,
             recoveries_match,
             steering_matches,
             continuations_match,
@@ -13793,12 +13811,18 @@ impl Engine {
         };
         let notes = crate::orchestration::coordination_notes(&events);
         let decisions = crate::orchestration::decisions_from_events(&events);
+        let scaling_decisions = crate::scaling::decisions_from_events(&events);
         let recoveries = crate::orchestration::recoveries_from_events(&events);
         tokio::task::spawn_blocking(move || -> Result<()> {
             projection_store.replace_coordination_notes(&projection_id, &notes, &events)?;
             projection_store.replace_orchestration_decisions(
                 &projection_id,
                 &decisions,
+                &events,
+            )?;
+            projection_store.replace_scaling_decisions(
+                &projection_id,
+                &scaling_decisions,
                 &events,
             )?;
             projection_store.replace_orchestration_recoveries(&projection_id, &recoveries)?;
@@ -13968,6 +13992,7 @@ impl Engine {
         .await??;
         let expected_notes = crate::orchestration::coordination_notes(&data.events);
         let expected_decisions = crate::orchestration::decisions_from_events(&data.events);
+        let expected_scaling = crate::scaling::decisions_from_events(&data.events);
         let expected_recoveries = crate::orchestration::recoveries_from_events(&data.events);
         let projection_store = self.store.clone();
         let projection_id = session_id.to_string();
@@ -13981,6 +14006,11 @@ impl Engine {
             projection_store.replace_orchestration_decisions(
                 &projection_id,
                 &expected_decisions,
+                &projection_events,
+            )?;
+            projection_store.replace_scaling_decisions(
+                &projection_id,
+                &expected_scaling,
                 &projection_events,
             )?;
             projection_store
@@ -14214,6 +14244,7 @@ impl Engine {
         .await??;
         let expected_notes = crate::orchestration::coordination_notes(&data.events);
         let expected_decisions = crate::orchestration::decisions_from_events(&data.events);
+        let expected_scaling = crate::scaling::decisions_from_events(&data.events);
         let expected_recoveries = crate::orchestration::recoveries_from_events(&data.events);
         let projection_store = self.store.clone();
         let projection_id = session_id.to_string();
@@ -14227,6 +14258,11 @@ impl Engine {
             projection_store.replace_orchestration_decisions(
                 &projection_id,
                 &expected_decisions,
+                &projection_events,
+            )?;
+            projection_store.replace_scaling_decisions(
+                &projection_id,
+                &expected_scaling,
                 &projection_events,
             )?;
             projection_store

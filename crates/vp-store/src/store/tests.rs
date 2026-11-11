@@ -13441,3 +13441,128 @@ fn process_policy_manifest_defaults_for_older_projects() {
     let decoded: ProjectManifestSnapshot = serde_json::from_value(value).unwrap();
     assert_eq!(decoded.process_policy, ProcessPolicy::default());
 }
+
+#[test]
+fn scaling_policy_defaults_disabled_and_round_trips() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("scale"))
+        .unwrap();
+    assert!(!store.has_scaling_policy(&project.id).unwrap());
+    assert!(!store.get_scaling_policy(&project.id).unwrap().enabled);
+
+    let policy = ScalingPolicy {
+        enabled: true,
+        min_workers: 2,
+        max_workers: 6,
+        min_labour: 3,
+        max_labour: 12,
+        expand_ready_threshold: 4,
+        expand_critical_delay_secs: 30,
+        scale_down_idle_secs: 900,
+        cooldown_secs: 45,
+        max_step: 3,
+        budget_headroom_ratio: Some(0.25),
+    };
+    store.set_scaling_policy(&project.id, &policy).unwrap();
+    assert!(store.has_scaling_policy(&project.id).unwrap());
+    assert_eq!(store.get_scaling_policy(&project.id).unwrap(), policy);
+
+    // Stored values are normalized even if a caller bypasses validation.
+    let clamped = ScalingPolicy {
+        min_workers: 0,
+        max_workers: 99,
+        max_step: 99,
+        ..policy
+    };
+    store.set_scaling_policy(&project.id, &clamped).unwrap();
+    let read = store.get_scaling_policy(&project.id).unwrap();
+    assert_eq!(read.min_workers, 1);
+    assert_eq!(read.max_workers, 10);
+    assert_eq!(read.max_step, 10);
+}
+
+#[test]
+fn scaling_decisions_are_idempotent_and_rebuildable() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("scale"))
+        .unwrap();
+    let session = store.create_session(&project.id, "decide").unwrap();
+    store
+        .append_event(
+            &session.id,
+            "note",
+            serde_json::json!({"text": "before scaling"}),
+        )
+        .unwrap();
+    let decision = ScalingDecision {
+        decision_id: String::new(),
+        decision_key: "rev1:tick1".into(),
+        session_id: session.id.clone(),
+        project_id: project.id.clone(),
+        plan_revision: 1,
+        action: vp_protocol::scaling::ScalingAction::ExpandWorkers,
+        current_workers: 2,
+        current_labour: 4,
+        target_workers: 4,
+        target_labour: 4,
+        active_workers: 2,
+        active_labour: 2,
+        ready_tasks: 3,
+        running_tasks: 2,
+        inputs_hash: "abc".into(),
+        reasons: vec!["expand_workers:2->4".into()],
+        manager_recommended: false,
+        manager_evidence: None,
+        applied: true,
+        idle_since_workers: None,
+        idle_since_labour: None,
+        created_at: "2026-11-11T00:00:00Z".into(),
+    };
+    let (stored, event) = store
+        .record_scaling_decision_with_event(&decision)
+        .unwrap()
+        .expect("insert");
+    assert_eq!(event.kind, "scaling.decision");
+    assert_eq!(event.payload["decision_id"], stored.decision_id);
+    assert!(!stored.decision_id.is_empty());
+    assert!(
+        store
+            .record_scaling_decision_with_event(&decision)
+            .unwrap()
+            .is_none()
+    );
+    let decisions = store.list_scaling_decisions(&session.id, 10).unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(
+        decisions[0].action,
+        vp_protocol::scaling::ScalingAction::ExpandWorkers
+    );
+    assert_eq!(
+        store
+            .latest_scaling_decision(&session.id)
+            .unwrap()
+            .unwrap()
+            .decision_id,
+        stored.decision_id
+    );
+
+    let events = store.list_all_events(&session.id).unwrap();
+    store
+        .replace_scaling_decisions(&session.id, &[], &events)
+        .unwrap();
+    assert!(
+        store
+            .list_scaling_decisions(&session.id, 10)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .replace_scaling_decisions(&session.id, &decisions, &events)
+        .unwrap();
+    assert_eq!(
+        store.list_scaling_decisions(&session.id, 10).unwrap(),
+        decisions
+    );
+}

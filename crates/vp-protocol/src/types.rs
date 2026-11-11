@@ -6717,6 +6717,9 @@ pub struct SessionReplayReport {
     pub notes_match: bool,
     #[serde(default)]
     pub decisions_match: bool,
+    /// Event-backed deterministic scaling decision projection.
+    #[serde(default)]
+    pub scaling_decisions_match: bool,
     #[serde(default)]
     pub recoveries_match: bool,
     #[serde(default)]

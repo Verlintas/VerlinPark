@@ -1935,9 +1935,208 @@ struct TaskSchedulerCard: View {
     }
 }
 
-struct AgentsCard: View {
+struct ScalingCard: View {
     @Environment(AppModel.self) private var model
 
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Deterministic scaling")
+                    Text("Bounded Worker/Labour slots · Managers stay plan-owned")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.scalingPolicyBusy || model.scalingStatusBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task {
+                        await model.loadScalingPolicy()
+                        await model.loadScalingStatus()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Toggle("Enabled", isOn: $model.scalingEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Button("Save policy") {
+                    Task { await model.saveScalingPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.scalingPolicyBusy)
+            }
+
+            HStack(spacing: 10) {
+                scalingField("min W", text: $model.scalingMinWorkersText, width: 46)
+                scalingField("max W", text: $model.scalingMaxWorkersText, width: 46)
+                scalingField("min L", text: $model.scalingMinLabourText, width: 46)
+                scalingField("max L", text: $model.scalingMaxLabourText, width: 46)
+                scalingField("threshold", text: $model.scalingReadyThresholdText, width: 62)
+                scalingField("critical s", text: $model.scalingCriticalDelayText, width: 72)
+                scalingField("idle s", text: $model.scalingIdleSecsText, width: 64)
+                scalingField("cooldown s", text: $model.scalingCooldownText, width: 76)
+                scalingField("step", text: $model.scalingMaxStepText, width: 46)
+                scalingField("budget ≥", text: $model.scalingBudgetRatioText, width: 58)
+            }
+
+            if let status = model.scalingPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(
+                "Scaling is opt-in and evaluated by a deterministic daemon tick. Expansion needs ready work, saturated slots, the ready threshold, cooldown, plan demand, global capacity, and the optional budget headroom. Scale-down waits for the idle window, reduces Labour before Workers, and never goes below active agents, plan demand, or the minimums. A Manager recommendation is evidence only: the controller never creates Managers or rewrites the plan."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 12) {
+                Button("Preview selected session") {
+                    Task { await model.previewScalingNow() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.scalingPreviewBusy || model.selectedSessionID == nil)
+                if model.scalingPreviewBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Spacer()
+                if let status = model.scalingStatus {
+                    scalingMetric("worker cap", status.globalWorkerCap)
+                    scalingMetric("worker free", status.globalWorkerAvailable)
+                    scalingMetric("labour cap", status.globalLabourCap)
+                    scalingMetric("labour free", status.globalLabourAvailable)
+                }
+            }
+
+            if let preview = model.scalingPreview {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Preview · \(preview.decision.summary)")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    Text(scalingPreviewDetails(preview.decision))
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    if !preview.decision.reasons.isEmpty {
+                        Text(preview.decision.reasons.joined(separator: " | "))
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                    }
+                    if let evidence = preview.decision.managerEvidence {
+                        Text(evidence)
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .padding(8)
+                .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            if let status = model.scalingStatus {
+                if status.projects.allSatisfy({ !$0.policy.enabled }) {
+                    Text("Scaling is disabled for the selected project.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                ForEach(status.projects) { project in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(project.projectName) · \(project.policy.summary)")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        ForEach(project.sessions.prefix(8)) { session in
+                            HStack(spacing: 7) {
+                                Circle()
+                                    .fill(scalingActionColor(session.latest))
+                                    .frame(width: 6, height: 6)
+                                Text(session.goal.isEmpty ? session.sessionID : session.goal)
+                                    .font(.system(size: 9))
+                                    .lineLimit(1)
+                                Spacer()
+                                Text("\(session.currentWorkers)W/\(session.currentLabour)L")
+                                    .font(.system(size: 8, design: .monospaced))
+                                Text("\(session.readyTasks) ready")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                Text(session.latest?.action ?? "none")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(scalingActionColor(session.latest))
+                            }
+                        }
+                    }
+                }
+            } else if let error = model.scalingStatusError {
+                Text(error)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .task(id: model.selectedProjectID) {
+            await model.loadScalingPolicy()
+            await model.loadScalingStatus()
+        }
+    }
+
+    private func scalingField(
+        _ title: String,
+        text: Binding<String>,
+        width: CGFloat
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title)
+                .font(.system(size: 7, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            TextField(title, text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 9, design: .monospaced))
+                .frame(width: width)
+        }
+    }
+
+    private func scalingPreviewDetails(_ decision: ScalingDecision) -> String {
+        let hash = String(decision.inputsHash.prefix(12))
+        let ready = decision.readyTasks
+        let running = decision.runningTasks
+        let revision = decision.planRevision
+        return "ready \(ready) · running \(running) · revision \(revision) · hash \(hash)"
+    }
+
+    private func scalingActionColor(_ decision: ScalingDecision?) -> Color {
+        if decision?.isExpansion == true {
+            return .cyan
+        }
+        if decision?.isScaleDown == true {
+            return .orange
+        }
+        return .secondary
+    }
+
+    private func scalingMetric(_ title: String, _ value: Int) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("\(value)")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text(title)
+                .font(.system(size: 7, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct AgentsCard: View {
+    @Environment(AppModel.self) private var model
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
