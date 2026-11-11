@@ -860,3 +860,44 @@ gate。四条线都已合入 `main`（`0e204d4` Q4 → `46eb570` Q3 → `8006dd7
   scheduling/remote test reproduction；多路径 budget fairness；F6 approval/
   attention optimizer；test-result cache；以及本文既有的完整 shell read/
   network confinement、默认自动冲突解决等。
+
+## 10. 2026-11-12 Long-run operations round
+
+这一轮收紧多小时 session 的操作成本与备份真实性，不放宽任何安全或合并 gate。
+五条线已合入 `main`（基线 `c6dca15`；`03b4890` H2 → `4e51c48` H1 →
+`7afa818` H4 → `199016b` H5 → `c535ab7` H3），新增 +38,453 / -2,392 行。
+
+- **Approval/attention 已交付**：项目模板、严格优先级、使用/过期上限、
+  Destructive/HostState/remote/sensitive 永不自动批准、相同 pending 合并、
+  stale 过期、批量 per-id 决议、通知合并、RPC/CLI/Manage Dash。限制：tool path
+  有界同步 SQLite；模板不匹配 shell 命令文本；无跨主机审批队列/分布式 waiter
+  fencing/模型生成规则。
+- **Test-result cache/impact map 已交付**：版本化内容寻址 key、失败短 TTL、
+  `cache=auto|bypass|refresh`、profile/lexical/LSP/history impact map、
+  spill 输出、统计/prune/clear、Integrator 默认排除。限制：外部输入/固定子集
+  外 env 不参与 key；hash 有界；impact map 是启发式；单项目单 daemon。
+- **Precise preemption/deadlines 已交付**：RunDeadline/PreemptToken、provider
+  流中断、shell 进程组、HTTP/browser/LSP/MCP 取消、typed
+  `PREEMPTED`/`DEADLINE_EXCEEDED`、partial usage 诚实记账、checkpoint 不 merge
+  未完成工作、policy/events/metrics/UI。限制：单 daemon signal；不是
+  exactly-once；无 unknown side-effect rollback；无 mid-stream resume。
+- **Multi-path budget fairness 已交付**：single/multi 模式、有界路径枚举、
+  observed token 混合、部门 floors、water-filling、starvation aging、
+  preview/RPC/CLI/UI。限制：单 daemon/单项目；枚举截断；不混价格；aging 非硬
+  保证；top-K 之外不保护。
+- **Signed backups/key rotation/anti-rollback 已交付**：v3 Ed25519 manifest +
+  snapshot 签名、0600 keyring、私钥 env/文件、轮换旧公钥保留、
+  `backup-verify`、本地 generation anchor、`BACKUP_ROLLBACK_DETECTED`、
+  v2/v1 兼容、公开状态 UI。限制：本地 anchor 不防同用户/root；新主机可重放；
+  丢 keyring fail closed；轮换不追溯重签；无 escrow/KMS/远程证明。
+- **栈修复**：合并后用完整测试发现递归四层 delegation 超过默认 2 MiB 栈；
+  daemon runtime 使用 16 MiB worker stack，测试 `RUST_MIN_STACK=16 MiB`，
+  CLI 解析/dispatch 使用 32 MiB 专用线程。不是放宽测试，而是显式栈预算。
+- **验证**：Rust 2,584 passed / 0 failed / 6 ignored；Swift 444 passed
+  （312 app + 132 helper）；`cargo fmt/clippy`、`swiftformat --lint`、
+  `xcodebuild test`、`just bundle` 通过。
+- **仍未解决**：跨主机审批/取消/fair-share、分布式 waiter/lease fencing、
+  host-reboot 进程持久化、外部输入感知的测试缓存、多路径全局最优与价格混合、
+  key escrow/KMS/远程 attestation/密钥撤销、Source ANN/rerank、artifact
+  archive extraction/media transcoding、Bitbucket adapter，以及本文既有的完整
+  shell read/network confinement、默认自动冲突解决等。

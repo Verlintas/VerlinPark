@@ -1,12 +1,129 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
 
 ---
+
+## 2026-11-12 Long-run operations: approvals, test cache, preemption, fairness, signed backups
+
+这一轮把多小时/多天 session 的操作成本和安全边界再收紧一层：审批注意力控制、
+测试结果复用、精确抢占、可轮换签名备份、多路径预算公平。全部保持
+deterministic Rust、事件先行，不绕过 approval / Seatbelt / path jail /
+write scope / Verifier / merge / capacity / budget gate。计划与验收见
+[LONG_RUN_OPERATIONS_HARDENING_PLAN.md](LONG_RUN_OPERATIONS_HARDENING_PLAN.md)，
+决策见 ADR-0177–0181。基线 `c6dca15`，本轮 **+38,453 / -2,392 行，94 个文件**。
+
+### H1 approval / attention optimizer
+
+- 项目 `ApprovalTemplate`：tool pattern、risk levels、path globs、
+  action allow/deny/escalate、expiry、max uses；SQLite + manifest + db-rebuild。
+- 严格优先级：explicit deny > template deny > exact `ApprovalGrant` >
+  template allow/escalate > risk policy；unknown risk/tool/path fail closed。
+- Allow 模板永不覆盖 Destructive、HostState、`remote_*`、MCP execution、
+  sensitive GUI 或未知风险；deny 永远优先；每次匹配写
+  `approval.template.matched` 审计。
+- 相同 pending approval 按 session+agent+tool+canonical input+risk 合并为
+  一行，waiter 计数；一次决策释放所有当前 waiter；dedup 不产生自动批准。
+- `AttentionPolicy`：pending 排序（risk → blocked criticality → age → id）、
+  stale 过期（expired/deny，绝不 approve）、每 session 上限、通知合并窗口。
+- `approval.batch.resolve` 只接受显式 per-id 决策；空/重复/>100 拒绝；
+  逐项报告 `APPROVAL_NOT_FOUND` / `APPROVAL_NOT_PENDING`。
+- RPC/CLI/Manage Dash 多选、模板创建、policy 编辑器、审计事件。
+- 限制：tool path 上有界同步 SQLite 读取；模板只匹配 tool/path 不匹配 shell
+  命令文本；模板/策略审计是项目配置，不进 session bundle；无跨主机审批队列/
+  分布式 waiter fencing/模型生成规则。
+
+### H2 test-result cache / impact map
+
+- `TestCachePolicy`：enabled（显式 tool run 默认 true，Integrator 默认 false）、
+  max entries/retention/output bound、lint reuse、failed TTL、include_integration。
+- 版本化 key：kind + command + argv + cwd + normalized env + profile hash +
+  tool/runtime version + input hash + dependency closure + impact generation；
+  输入 hash 有界，超限/unreadable fail closed。
+- `test_results` 行 + 输出走 spilled-output store；failed 结果短 TTL 且绝不
+  报成 pass。
+- `run_project_task` 支持 `cache=auto|bypass|refresh`，命中返回 `cache_hit`、
+  `cached_at`、`inputs_hash`、`impact_generation` 和“未运行命令”说明。
+- `affected_tests` 支持 `mode=lexical|impact`；impact map 来源
+  profile/lexical/lsp/history，带 confidence，最多 32 targets，不执行测试；
+  LSP 只用已运行 server，不 spawn。
+- RPC/CLI/Swift Tests panel、统计/prune/clear、replay/bundle 元数据。
+- 限制：外部网络/时钟/随机/服务/工作区外文件/固定子集外 env 不参与 key；
+  hash 有界（30k files / 512 MiB / 8 MiB per file）；输出正文是 operational
+  state；impact map 是启发式，不声称覆盖率/完整性；单项目单 daemon。
+
+### H3 precise preemption / deadlines
+
+- `PreemptToken` / `RunDeadline`，触发：wall-clock 预算耗尽、显式
+  `session.preempt`、可选 per-tool deadline；不是隐藏 scheduler。
+- 阶段：provider、tool、queue（admission/write lease/approval wait）。
+- Typed `PREEMPTED` / `DEADLINE_EXCEEDED`，带 reason、phase、elapsed、
+  partial usage、`side_effects_unknown`。
+- Provider 适配器在 chunk 间 abort HTTP/SSE；不重试/不退避穿过 preemption；
+  不 resume/replay partial turn；partial output 标 partial，usage 缺失时估算并
+  标记。
+- Tool：shell 进程组 SIGTERM → bounded kill escalation → SIGKILL；HTTP abort；
+  browser/computer cancel RPC + release GUI lease；LSP best-effort
+  `$/cancelRequest`；MCP cancel 或 bounded abandon。
+- 安全边界 checkpoint；Worker/Labour task worktree snapshot 到 daemon ref，
+  不移动 branch；preempted work 不进 merge queue。
+- `PreemptionPolicy` 持久化；RPC/CLI/Swift Stage banner/Manage Dash、metrics。
+- 限制：单 daemon signal，不是分布式取消/fencing；无 exactly-once external
+  effects、无 unknown side-effect rollback、无 mid-stream resume；parallel
+  read-only batch 只看 run token 不看 per-tool deadline。
+
+### H4 multi-path budget fairness
+
+- `CriticalPathPolicy` additive：mode single|multi（默认 single）、max_paths
+  2–16、department_min_ratio、observed_weight_ratio、starvation_after_secs。
+- 有界 root-to-leaf 路径枚举（4,096 enumerated / 16 selected）；声明权重或
+  priority，可混 observed usage tokens（clamp 2× declared）。
+- `protected = min(remaining, sum(selected weights) + ceil(remaining ×
+  reserve_ratio))`；部门 floors 先分配，剩余 water-filling，capped path 释放
+  余量；hard budget/min_task_budget/throttle/pre-flight clamp 不变。
+- Admission：critical union → path deficit → priority + starvation credit →
+  enqueue time → task id；每满 starvation 窗口 +5 priority，最高 +100。
+- Preview 返回 path table/floors/allocations/deferred order；RPC/CLI/Swift。
+- 限制：单 daemon/单项目；枚举截断不是全局最重 K 条证明；observed 只混
+  token 不混价格；aging 是优先级信用不是硬保证；top-K 之外不保护。
+
+### H5 signed backups / key rotation / anti-rollback
+
+- v3 仅在显式签名时创建；Argon2id + ChaCha20-Poly1305 加密不变；Ed25519 签
+  `repository.json` 元数据和每个 snapshot manifest；v2 仍可读且明确
+  `signed=false / authenticity="unsigned"`，v1 ZIP 仍 unauthenticated。
+- keyring 0600 存 key ids/public keys/secret references/active key；私钥只来自
+  0600 文件或 env，zeroize/redact，不进 SQLite/事件/日志/错误。
+- 轮换保留旧公钥验证旧 snapshot；仓库下次 signed backup/prune 采用新 key。
+- `backup-verify` 校验签名/entries/tombstones/chain/generation，无需 restore；
+  本地 0600 anchor 记录 highest/last-verified；旧 generation 返回
+  `BACKUP_ROLLBACK_DETECTED`，`--allow-rollback` 只降 last-verified，不降
+  high-water mark；restore 跨 data-dir swap 保留 anchor。
+- CLI `vp backup --sign`、`backup-verify`、`backup-key-*`、`backup-anchor`；
+  daemon `backup.status` 只暴露公开状态；Swift Settings 完整性卡片。
+- 限制：本地 anchor 不防同用户/admin/root 篡改，不是远程证明/KMS/escrow；
+  新主机无更新 anchor 时可能接受旧仓库；丢 keyring 会 fail closed；轮换不追溯
+  重签旧 snapshot；v3 backup/prune 必须有签名材料。
+
+### 合并修复
+
+- H1+H2 合并后递归四层 delegation 超过默认 2 MiB 栈：daemon runtime 显式
+  16 MiB worker stack，`.cargo/config.toml` 设 `RUST_MIN_STACK=16 MiB`，
+  CLI 解析/dispatch 移到 32 MiB 专用线程（clap parser + command future 增长）。
+- H3 的 provider/tool cancellation 与 H1 审批、H2 测试缓存组合后全量测试通过，
+  未放宽任何 gate。
+
+### 验收
+
+- `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings` 通过。
+- `cargo test --workspace`：**2,584 passed / 0 failed / 6 ignored**。
+- `swiftformat --lint`：0/101 文件需要格式化。
+- `xcodegen generate` + `xcodebuild test`：**312 app + 132 helper = 444 passed / 0 failed**。
+- `just bundle` 通过，`verlinpadd` 已打包。
 
 ## 2026-11-12 Scaling, process supervision, semantic sources, remote integration, and budget governance
 

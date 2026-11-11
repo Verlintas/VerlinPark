@@ -1,6 +1,6 @@
 # Long-Run Operations and Hardening Plan
 
-> **Status:** active implementation plan.
+> **Status:** implemented and verified (2026-11-12).
 > **Created:** 2026-11-12
 > **Base:** `c344bf9` (scaling/process/source/remote/budget round complete).
 > **Goal:** make multi-hour/multi-day sessions operationally cheaper and safer:
@@ -15,49 +15,49 @@
 
 ### Approval attention
 
-- [ ] Every similar permission request prompts again; there is no project
+- [x] Every similar permission request prompts again; there is no project
       template or bounded auto-approval rule beyond exact file/folder grants.
-- [ ] Identical pending approvals are separate rows, so one operator decision
+- [x] Identical pending approvals are separate rows, so one operator decision
       cannot release several waiting agents.
-- [ ] No batch review surface; Manage Dash resolves one approval at a time.
-- [ ] No approval queue priority, deduplication window, or stale-expiry policy.
-- [ ] Notification noise is not coalesced per session/tool/risk.
+- [x] No batch review surface; Manage Dash resolves one approval at a time.
+- [x] No approval queue priority, deduplication window, or stale-expiry policy.
+- [x] Notification noise is not coalesced per session/tool/risk.
 
 ### Test results
 
-- [ ] `run_project_task kind=test` always executes, even when inputs, command,
+- [x] `run_project_task kind=test` always executes, even when inputs, command,
       environment, and tool version are unchanged.
-- [ ] `affected_tests` is lexical and has no historical mapping from changed
+- [x] `affected_tests` is lexical and has no historical mapping from changed
       paths to actually failing/covering tests.
-- [ ] No cache key, invalidation, retention, stats, or replay provenance.
-- [ ] Integrator/test flows cannot distinguish a fresh run from a cached replay.
+- [x] No cache key, invalidation, retention, stats, or replay provenance.
+- [x] Integrator/test flows cannot distinguish a fresh run from a cached replay.
 
 ### Preemption
 
-- [ ] Wall-clock and tool deadlines are checked at turn/tool boundaries; a long
+- [x] Wall-clock and tool deadlines are checked at turn/tool boundaries; a long
       provider stream, shell command, HTTP call, browser/computer RPC, or LSP
       request can overrun them.
-- [ ] Cancellation does not interrupt the provider HTTP stream; it waits for the
+- [x] Cancellation does not interrupt the provider HTTP stream; it waits for the
       next boundary.
-- [ ] Hard preemption has no typed result/event, no partial-usage accounting, and
+- [x] Hard preemption has no typed result/event, no partial-usage accounting, and
       no process-group cleanup guarantee.
-- [ ] No distinction between cooperative pause and hard deadline preemption.
+- [x] No distinction between cooperative pause and hard deadline preemption.
 
 ### Budget fairness
 
-- [ ] The governor protects one heaviest chain only; parallel branches can
+- [x] The governor protects one heaviest chain only; parallel branches can
       starve or consume the reserve.
-- [ ] Weights use declared task budgets, never observed spend.
-- [ ] No per-department minimum, multi-path allocation, or starvation aging.
-- [ ] Deferred tasks are reconsidered, but ordering can still be dominated by a
+- [x] Weights use declared task budgets, never observed spend.
+- [x] No per-department minimum, multi-path allocation, or starvation aging.
+- [x] Deferred tasks are reconsidered, but ordering can still be dominated by a
       single path.
 
 ### Backup authenticity
 
-- [ ] v2 backups are encrypted but not signed; manifest tampering is detected by
+- [x] v2 backups are encrypted but not signed; manifest tampering is detected by
       AEAD only if the attacker lacks the key, and there is no key rotation.
-- [ ] Restore cannot prove the repository generation is the newest one seen.
-- [ ] No keyring, key id, rotation command, backup verify command, or rollback
+- [x] Restore cannot prove the repository generation is the newest one seen.
+- [x] No keyring, key id, rotation command, backup verify command, or rollback
       rejection.
 - [ ] v1 ZIP remains unauthenticated.
 
@@ -305,3 +305,43 @@ provider/tool cancellation plumbing; H5 is independent.
 - No test-result cache for the Integrator unless explicitly enabled.
 - No key escrow, remote KMS, or tamper-proof anti-rollback.
 - No archive extraction/media transcoding or Bitbucket adapter.
+
+---
+
+## 7. Implementation record
+
+Implemented on `main` from base `c6dca15` in five commits:
+
+```text
+03b4890 feat(test-cache): content-addressed test results and impact map (H2)
+4e51c48 feat(approvals): bounded templates, deduplication, and attention policy (H1)
+7afa818 feat(governor): multi-path budget fairness (H4)
+199016b feat(backup): signed v3 repositories, key rotation, and anti-rollback (H5)
+c535ab7 feat(runtime): precise preemption and deadlines (H3)
+```
+
+- Diff: **+38,453 / -2,392 lines across 94 files** (target +30,000).
+- Rust: `cargo test --workspace` **2,584 passed / 0 failed / 6 ignored**;
+  `cargo fmt --check` and `cargo clippy -D warnings` pass.
+- Swift: `xcodebuild test` **312 app + 132 helper = 444 passed / 0 failed**;
+  `swiftformat --lint` passes (0/101).
+- `just bundle` builds the Debug app and bundles `verlinpadd`.
+- ADR-0177–0181 record the five decisions.
+
+Merge-resolution notes:
+
+- CLI, daemon, store, and agent test tails were reconstructed from the
+  pre-merge versions so each side's tests were retained.
+- Merging H1+H2 pushed the recursive four-tier delegation test past the 2 MiB
+  test/daemon stack. The daemon now builds its runtime with an explicit 16 MiB
+  worker stack, `.cargo/config.toml` sets `RUST_MIN_STACK=16 MiB` for tests, and
+  the CLI parses/dispatches on a 32 MiB dedicated thread because the generated
+  clap parser and command future outgrew the platform main stack.
+- H3's provider/tool cancellation merged on top of H1's approval path and H2's
+  test cache; the combined suite passes with no relaxed gates.
+
+Explicit limits are recorded in AGENTS.md, README.md, PROGRESS.md, and AUDIT.md:
+approval templates never cover high-risk operations, the test cache excludes the
+Integrator by default and keys only a bounded input set, preemption is not
+exactly-once or resumable mid-stream, fairness is single-daemon and bounded to
+top-K paths, and backup signing has no escrow/KMS/remote attestation.

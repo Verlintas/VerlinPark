@@ -186,6 +186,11 @@
 | [0174](adr/0174-semantic-project-source-index.md) | Opt-in source embeddings with generation-scoped jobs and exact-cosine RRF hybrid retrieval | Accepted | Runtime/Store/Sources |
 | [0175](adr/0175-remote-worktree-integration.md) | Bounded remote Git bundle import into the local Verifier and deterministic merge queue | Accepted | Runtime/Remote/Merge |
 | [0176](adr/0176-budget-critical-path-governor.md) | Deterministic critical-path reserve and admission policy over plan-task budgets | Accepted | Runtime/Budget |
+| [0177](adr/0177-approval-attention-optimizer.md) | Bounded approval templates, deduplication, attention policy, and batch resolution | Accepted | Runtime/Approvals |
+| [0178](adr/0178-test-result-cache-and-impact-map.md) | Content-addressed test-result cache and labeled impact map | Accepted | Runtime/Tooling/Store |
+| [0179](adr/0179-precise-preemption-and-deadlines.md) | Provider/tool preemption tokens, deadlines, and honest partial-use accounting | Accepted | Runtime/Providers/Tools |
+| [0180](adr/0180-multi-path-budget-fairness.md) | Bounded multi-path allocation, department floors, and starvation aging | Accepted | Runtime/Budget |
+| [0181](adr/0181-signed-backups-key-rotation-anti-rollback.md) | Ed25519-signed v3 backups, key rotation, and local anti-rollback anchor | Accepted | Runtime/CLI/Security |
 
 ---
 
