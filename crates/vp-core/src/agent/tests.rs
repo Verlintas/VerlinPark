@@ -11535,3 +11535,43 @@ async fn program_start_fails_before_claim_without_a_provider() {
     assert_eq!(stored.attempts, 0);
     assert!(stored.session_id.is_none());
 }
+
+#[test]
+fn remote_tools_are_explicit_and_role_scoped() {
+    for tool in [
+        "remote_read",
+        "remote_write",
+        "remote_list",
+        "remote_exec",
+        "remote_git",
+        "remote_worktree",
+    ] {
+        assert!(
+            crate::agent::AgentRole::Leader.allows_tool(crate::agent::AgentProfile::Coding, tool)
+        );
+    }
+    assert!(
+        crate::agent::AgentRole::Manager
+            .allows_tool(crate::agent::AgentProfile::Coding, "remote_read")
+    );
+    assert!(
+        crate::agent::AgentRole::Manager
+            .allows_tool(crate::agent::AgentProfile::Coding, "remote_git")
+    );
+    assert!(
+        !crate::agent::AgentRole::Manager
+            .allows_tool(crate::agent::AgentProfile::Coding, "remote_write")
+    );
+    assert!(
+        crate::agent::AgentRole::Worker
+            .allows_tool(crate::agent::AgentProfile::Coding, "remote_worktree")
+    );
+    assert!(
+        !crate::agent::AgentRole::Worker
+            .allows_tool(crate::agent::AgentProfile::Research, "remote_worktree")
+    );
+    assert!(
+        !crate::agent::AgentRole::Verifier
+            .allows_tool(crate::agent::AgentProfile::Coding, "remote_write")
+    );
+}

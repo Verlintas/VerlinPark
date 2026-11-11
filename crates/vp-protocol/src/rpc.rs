@@ -4,7 +4,7 @@ use serde_json::Value;
 pub const JSONRPC_VERSION: &str = "2.0";
 
 /// Parsed JSON-RPC 2.0 request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcRequest {
     #[serde(default = "default_jsonrpc")]
     pub jsonrpc: String,

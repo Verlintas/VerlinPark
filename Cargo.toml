@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/vp-protocol",
+    "crates/vp-remote",
+    "crates/vp-remote-agent",
     "crates/vp-store",
     "crates/vp-providers",
     "crates/vp-core",

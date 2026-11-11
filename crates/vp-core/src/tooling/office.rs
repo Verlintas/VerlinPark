@@ -3424,6 +3424,7 @@ mod tests {
             restrict_home: false,
             read_jail: false,
             git_branch: None,
+            remote: None,
         }
     }
 

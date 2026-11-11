@@ -1330,6 +1330,7 @@ while True:
             restrict_home: false,
             read_jail: false,
             git_branch: None,
+            remote: None,
         };
         let key = ServerKey {
             root: root.clone(),

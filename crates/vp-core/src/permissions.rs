@@ -236,6 +236,45 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
                 ),
             }
         }
+        "remote_read" | "remote_list" => {
+            PermissionAssessment::new(RiskLevel::ReadOnly, "read-only remote workspace inspection")
+        }
+        "remote_write" => PermissionAssessment::new(
+            RiskLevel::External,
+            "remote write changes a configured external workspace",
+        ),
+        "remote_exec" => PermissionAssessment::new(
+            RiskLevel::HostState,
+            "remote shell execution can change the remote host",
+        ),
+        "remote_git" => {
+            let action = input
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status");
+            if matches!(action, "status" | "diff" | "log" | "rev_parse") {
+                PermissionAssessment::new(RiskLevel::ReadOnly, "read-only remote Git inspection")
+            } else {
+                PermissionAssessment::new(
+                    RiskLevel::HostState,
+                    "remote Git mutation can change the remote repository",
+                )
+            }
+        }
+        "remote_worktree" => {
+            let action = input
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("list");
+            if action == "list" {
+                PermissionAssessment::new(RiskLevel::ReadOnly, "read-only remote worktree listing")
+            } else {
+                PermissionAssessment::new(
+                    RiskLevel::HostState,
+                    "remote worktree mutation changes the remote repository",
+                )
+            }
+        }
         "run_project_task" | "code_diagnostics" => {
             if input.get("kind").and_then(Value::as_str) == Some("custom") {
                 let command = input
@@ -1878,6 +1917,74 @@ mod tests {
             unsafe_command.risk >= RiskLevel::HostState,
             "{unsafe_command:?}"
         );
+    }
+
+    #[test]
+    fn remote_tools_are_classified_by_effect() {
+        let worktree = worktree();
+        let read = assess_tool_call(
+            "remote_read",
+            &serde_json::json!({"path": "src/main.rs"}),
+            &worktree,
+        );
+        assert_eq!(read.risk, RiskLevel::ReadOnly);
+        let write = assess_tool_call(
+            "remote_write",
+            &serde_json::json!({"path": "src/main.rs"}),
+            &worktree,
+        );
+        assert_eq!(write.risk, RiskLevel::External);
+        let exec = assess_tool_call(
+            "remote_exec",
+            &serde_json::json!({"command": "make test"}),
+            &worktree,
+        );
+        assert_eq!(exec.risk, RiskLevel::HostState);
+        let status = assess_tool_call(
+            "remote_git",
+            &serde_json::json!({"action": "status"}),
+            &worktree,
+        );
+        assert_eq!(status.risk, RiskLevel::ReadOnly);
+        let worktree_add = assess_tool_call(
+            "remote_worktree",
+            &serde_json::json!({"action": "add"}),
+            &worktree,
+        );
+        assert_eq!(worktree_add.risk, RiskLevel::HostState);
+    }
+
+    #[test]
+    fn remote_tools_follow_approval_modes() {
+        use vp_protocol::types::ApprovalMode;
+
+        let worktree = worktree();
+        let write = assess_tool_call(
+            "remote_write",
+            &serde_json::json!({"path": "src/main.rs"}),
+            &worktree,
+        );
+        assert!(matches!(
+            decide(ApprovalMode::Smart, &write, false),
+            ApprovalDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            decide(ApprovalMode::Strict, &write, false),
+            ApprovalDecision::Ask { .. }
+        ));
+        let exec = assess_tool_call(
+            "remote_exec",
+            &serde_json::json!({"command": "make test"}),
+            &worktree,
+        );
+        assert!(matches!(
+            decide(ApprovalMode::Smart, &exec, false),
+            ApprovalDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            decide(ApprovalMode::Unattended, &exec, false),
+            ApprovalDecision::Deny { .. }
+        ));
     }
 
     #[test]

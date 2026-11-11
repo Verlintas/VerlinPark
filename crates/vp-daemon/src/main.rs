@@ -21,6 +21,10 @@ use tracing::{info, warn};
 use vp_core::Engine;
 use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
+use vp_protocol::remote::{
+    HostListParams, HostListResult, HostProbeParams, HostProjectParams, HostSetParams,
+    RemoteLedgerParams, RemoteStatusParams, RemoteWorktreeListParams,
+};
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
     AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams, AddProjectParams,
@@ -580,6 +584,67 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "project.list" => match state.engine.list_projects().await {
             Ok(projects) => RpcResponse::success(id, ProjectListResult { projects }),
             Err(error) => internal_error(id, error),
+        },
+        "host.list" => match parse_params::<HostListParams>(request.params) {
+            Ok(_) => match state.engine.list_execution_hosts().await {
+                Ok(hosts) => RpcResponse::success(id, HostListResult { hosts }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "host.add" | "host.update" => match parse_params::<HostSetParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_execution_host(&params.project_id, params.config)
+                .await
+            {
+                Ok(config) => RpcResponse::success(id, config),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "host.remove" => match parse_params::<HostProjectParams>(request.params) {
+            Ok(params) => match state.engine.remove_execution_host(&params.project_id).await {
+                Ok(removed) => RpcResponse::success(id, json!({"removed": removed})),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "host.probe" => match parse_params::<HostProbeParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .probe_execution_host(&params.project_id, params.timeout_secs)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "remote.status" => match parse_params::<RemoteStatusParams>(request.params) {
+            Ok(params) => match state.engine.remote_status(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "remote.ledger" => match parse_params::<RemoteLedgerParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .remote_ledger(&params.project_id, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "remote.worktree_list" => match parse_params::<RemoteWorktreeListParams>(request.params) {
+            Ok(params) => match state.engine.remote_worktree_list(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
         },
         "project.task_scheduler.get" => {
             match parse_params::<TaskSchedulerPolicyParams>(request.params) {
@@ -3015,6 +3080,9 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "project.worktree_policy.set"
             | "project.checkpoint_policy.set"
             | "project.task_scheduler.set"
+            | "host.add"
+            | "host.update"
+            | "host.remove"
             | "orchestration.policy.set"
             | "memory.policy.set"
             | "mailbox.policy.set"

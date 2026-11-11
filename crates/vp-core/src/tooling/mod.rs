@@ -16,4 +16,5 @@ pub mod media;
 pub mod office;
 pub mod process;
 pub mod project;
+pub mod remote;
 pub mod web;

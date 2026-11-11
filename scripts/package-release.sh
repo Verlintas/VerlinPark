@@ -19,7 +19,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 echo "==> building release binaries"
-cargo build --release -p vp-daemon -p vp-cli
+cargo build --release -p vp-daemon -p vp-cli -p vp-remote-agent
 
 echo "==> building release app"
 (
@@ -44,7 +44,8 @@ fi
 HELPER_DIR="$APP/Contents/Helpers"
 mkdir -p "$HELPER_DIR"
 cp "$ROOT/target/release/verlinpadd" "$HELPER_DIR/verlinpadd"
-chmod +x "$HELPER_DIR/verlinpadd"
+cp "$ROOT/target/release/vp-remote-agent" "$HELPER_DIR/vp-remote-agent"
+chmod +x "$HELPER_DIR/verlinpadd" "$HELPER_DIR/vp-remote-agent"
 BROWSER_HELPER="$ROOT/apps/macos/build/Build/Products/Release/VerlinParkBrowserHelper"
 if [[ -x "$BROWSER_HELPER" ]]; then
   cp "$BROWSER_HELPER" "$HELPER_DIR/VerlinParkBrowserHelper"
@@ -56,12 +57,14 @@ fi
 if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
   echo "==> Developer ID signing: $SIGN_IDENTITY"
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$HELPER_DIR/verlinpadd"
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$HELPER_DIR/vp-remote-agent"
   codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"
   SIGNED=1
 else
   echo "==> ad-hoc signing"
   codesign --force --sign - "$HELPER_DIR/verlinpadd"
+  codesign --force --sign - "$HELPER_DIR/vp-remote-agent"
   codesign --force --deep --sign - "$APP"
 fi
 
@@ -87,7 +90,8 @@ mkdir -p "$STAGE/bin" "$STAGE/docs"
 ditto "$APP" "$STAGE/VerlinPark.app"
 cp "$ROOT/target/release/verlinpadd" "$STAGE/bin/verlinpadd"
 cp "$ROOT/target/release/vp" "$STAGE/bin/vp"
-chmod +x "$STAGE/bin/verlinpadd" "$STAGE/bin/vp"
+cp "$ROOT/target/release/vp-remote-agent" "$STAGE/bin/vp-remote-agent"
+chmod +x "$STAGE/bin/verlinpadd" "$STAGE/bin/vp" "$STAGE/bin/vp-remote-agent"
 cp "$ROOT/README.md" "$STAGE/README.md"
 cp "$ROOT/LICENSE" "$STAGE/LICENSE"
 cp "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/THIRD_PARTY_NOTICES.md"
@@ -110,7 +114,8 @@ VerlinPark is distributed directly (GPL-3.0-only), not through the App Store.
 1. Drag VerlinPark.app into /Applications.
 2. Launch it. The app starts its bundled verlinpadd helper and writes a
    discovery token under ~/Library/Application Support/VerlinPark.
-3. For CLI use, copy bin/verlinpadd and bin/vp somewhere on PATH.
+3. For CLI use, copy bin/verlinpadd, bin/vp, and bin/vp-remote-agent somewhere on PATH.
+   vp-remote-agent is the helper to install on a remote SSH workspace host.
 
 ${INSTALL_NOTE}
 EOF

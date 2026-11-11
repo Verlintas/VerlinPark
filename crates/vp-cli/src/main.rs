@@ -186,6 +186,33 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// List project execution hosts (local and ssh).
+    HostList,
+    /// Set a project's execution host from an ExecutionHost JSON object.
+    HostSet {
+        project: String,
+        /// JSON object, a path to a .json file, or '-' for stdin.
+        #[arg(long)]
+        config: String,
+    },
+    /// Reset a project to the local execution host.
+    HostRemove { project: String },
+    /// Connect and probe a project's remote helper.
+    HostProbe {
+        project: String,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
+    /// Show cached remote workspace health.
+    RemoteStatus { project: String },
+    /// List Git worktrees on a project's remote host.
+    RemoteWorktrees { project: String },
+    /// Show the bounded remote operation ledger.
+    RemoteLedger {
+        project: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
     /// List project skill packs.
     Skills {
         project: String,
@@ -1577,6 +1604,57 @@ async fn main() -> Result<()> {
                 &discovery,
                 "project.add",
                 json!({"root": root, "name": name}),
+            )
+            .await?
+        }
+        Command::HostList => rpc(&discovery, "host.list", json!({})).await?,
+        Command::HostSet { project, config } => {
+            let text = if config == "-" {
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                text
+            } else if Path::new(&config).is_file() {
+                std::fs::read_to_string(&config)
+                    .with_context(|| format!("reading execution host config {config}"))?
+            } else {
+                config.clone()
+            };
+            let config: Value = serde_json::from_str(&text)
+                .context("execution host config must be a JSON object")?;
+            rpc(
+                &discovery,
+                "host.update",
+                json!({"project_id": project, "config": config}),
+            )
+            .await?
+        }
+        Command::HostRemove { project } => {
+            rpc(&discovery, "host.remove", json!({"project_id": project})).await?
+        }
+        Command::HostProbe { project, timeout } => {
+            rpc(
+                &discovery,
+                "host.probe",
+                json!({"project_id": project, "timeout_secs": timeout}),
+            )
+            .await?
+        }
+        Command::RemoteStatus { project } => {
+            rpc(&discovery, "remote.status", json!({"project_id": project})).await?
+        }
+        Command::RemoteWorktrees { project } => {
+            rpc(
+                &discovery,
+                "remote.worktree_list",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::RemoteLedger { project, limit } => {
+            rpc(
+                &discovery,
+                "remote.ledger",
+                json!({"project_id": project, "limit": limit}),
             )
             .await?
         }

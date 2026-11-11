@@ -3324,6 +3324,7 @@ dependencies = [
  "uuid",
  "vp-protocol",
  "vp-providers",
+ "vp-remote",
  "vp-store",
  "wiremock",
  "zip",
@@ -3374,6 +3375,39 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "wiremock",
+]
+
+[[package]]
+name = "vp-remote"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "vp-protocol",
+]
+
+[[package]]
+name = "vp-remote-agent"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vp-protocol",
+ "vp-remote",
 ]
 
 [[package]]

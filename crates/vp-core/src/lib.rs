@@ -90,6 +90,7 @@ pub mod orchestration;
 pub mod permissions;
 pub mod program;
 pub mod rebuild;
+pub mod remote;
 pub mod scheduler;
 mod session_graph;
 pub mod skills;
@@ -144,6 +145,7 @@ pub struct Engine {
     budget_registry: Arc<BudgetRegistry>,
     unlimited_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     mcp: Arc<mcp::McpManager>,
+    remote: Arc<remote::RemoteManager>,
     consoles: Arc<console::ConsoleManager>,
     terminals: Arc<terminal::TerminalManager>,
     browsers: Arc<browser::BrowserManager>,
@@ -555,6 +557,7 @@ impl Engine {
             budget_registry: Arc::new(BudgetRegistry::new()),
             unlimited_flags: Arc::new(Mutex::new(HashMap::new())),
             mcp: Arc::new(mcp::McpManager::from_env()),
+            remote: Arc::new(remote::RemoteManager::new(data_dir.clone())),
             consoles: Arc::new(console::ConsoleManager::new()),
             terminals: Arc::new(terminal::TerminalManager::new()),
             browsers: Arc::new(browser::BrowserManager::new(data_dir)),
@@ -601,6 +604,10 @@ impl Engine {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub fn remote_manager(&self) -> &Arc<remote::RemoteManager> {
+        &self.remote
     }
 
     pub fn scheduler(&self) -> &Arc<scheduler::TaskScheduler> {
@@ -11150,6 +11157,12 @@ impl Engine {
         tool: &str,
         input: &serde_json::Value,
     ) -> Result<bool> {
+        // Grants are local filesystem path prefixes and do not identify a
+        // remote host. A local grant must never auto-approve an operation on a
+        // different machine, so remote tools always use the risk broker.
+        if tool.starts_with("remote_") {
+            return Ok(false);
+        }
         let paths = approval_grant_paths(input);
         if paths.is_empty() {
             return Ok(false);
@@ -11658,6 +11671,7 @@ impl Engine {
             restrict_home: policy.restrict_home,
             read_jail: policy.read_jail,
             git_branch: session.branch.clone(),
+            remote: None,
         };
         self.consoles.open(&session.id, context).await
     }
@@ -11859,6 +11873,7 @@ impl Engine {
             restrict_home: policy.restrict_home,
             read_jail: policy.read_jail,
             git_branch: session.branch.clone(),
+            remote: None,
         };
         self.terminals.open(&session.id, context, cols, rows).await
     }

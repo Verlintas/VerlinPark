@@ -388,6 +388,7 @@ async fn build_command(launch: &AcpLaunch) -> Result<tokio::process::Command> {
         restrict_home: launch.restrict_home,
         read_jail: launch.read_jail,
         git_branch: launch.git_branch.clone(),
+        remote: None,
     };
     let mut command = crate::tools::sandboxed_command(&context).await?;
     let scratch = launch

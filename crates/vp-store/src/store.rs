@@ -26,6 +26,8 @@ use vp_protocol::types::{
     TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
+use vp_protocol::remote::ExecutionHost;
+
 use crate::paths;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,6 +590,8 @@ pub struct ProjectManifestSnapshot {
     #[serde(default)]
     pub orchestration_policy: OrchestrationPolicy,
     #[serde(default)]
+    pub execution_host: ExecutionHost,
+    #[serde(default)]
     pub approval_grants: Vec<ApprovalGrant>,
     /// Standalone task-inbox items. They are project-scoped rather than
     /// session-scoped, so the project manifest is their rebuild snapshot.
@@ -913,6 +917,12 @@ impl Store {
                 read_deny       TEXT NOT NULL,
                 restrict_home   INTEGER NOT NULL DEFAULT 0,
                 read_jail       INTEGER NOT NULL DEFAULT 0,
+                updated_at      TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_execution_hosts (
+                project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                config          TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
 
@@ -2201,6 +2211,7 @@ impl Store {
                 version: 1,
                 recorded_at: now_rfc3339(),
                 shell_policy: self.get_shell_policy(&project.id)?,
+                execution_host: self.get_execution_host(&project.id)?,
                 integration_policy: self.get_integration_policy(&project.id)?,
                 artifact_policy: self.get_artifact_policy(&project.id)?,
                 mailbox_policy: self.get_mailbox_policy(&project.id)?,
@@ -2331,6 +2342,66 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_execution_host(&self, project_id: &str) -> Result<ExecutionHost> {
+        let conn = self.lock()?;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT config FROM project_execution_hosts WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(config) => {
+                serde_json::from_str(&config).context("parsing stored project execution host")
+            }
+            None => Ok(ExecutionHost::default()),
+        }
+    }
+
+    pub fn execution_host_updated_at(&self, project_id: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT updated_at FROM project_execution_hosts WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn set_execution_host(&self, project_id: &str, config: &ExecutionHost) -> Result<()> {
+        let encoded =
+            serde_json::to_string(config).context("serializing project execution host")?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_execution_hosts (project_id, config, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                config = excluded.config,
+                updated_at = excluded.updated_at",
+            params![project_id, encoded, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_execution_host(&self, project_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let removed = conn.execute(
+            "DELETE FROM project_execution_hosts WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(removed > 0)
+    }
+
+    pub fn list_execution_hosts(&self) -> Result<Vec<ExecutionHost>> {
+        let projects = self.list_projects()?;
+        projects
+            .into_iter()
+            .map(|project| self.get_execution_host(&project.id))
+            .collect()
     }
 
     pub fn get_task_scheduler_policy(&self, project_id: &str) -> Result<TaskSchedulerPolicy> {

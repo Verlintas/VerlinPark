@@ -27,6 +27,7 @@ time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 vp-protocol = { path = "../vp-protocol" }
+vp-remote = { path = "../vp-remote" }
 vp-store = { path = "../vp-store" }
 uuid = { workspace = true }
 vp-providers = { path = "../vp-providers" }

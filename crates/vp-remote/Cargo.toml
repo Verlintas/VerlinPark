@@ -1,0 +1,22 @@
+[package]
+name = "vp-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+vp-protocol = { path = "../vp-protocol" }
+
+[dev-dependencies]
+tempfile = "3"

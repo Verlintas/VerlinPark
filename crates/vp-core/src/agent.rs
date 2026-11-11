@@ -946,6 +946,9 @@ impl AgentRole {
                         | "read_image"
                         | "read_document"
                         | "data_query"
+                        | "remote_read"
+                        | "remote_list"
+                        | "remote_git"
                 ) || (profile == AgentProfile::Research
                     && matches!(name, "fetch_url" | "web_search"))
             }
@@ -977,6 +980,10 @@ impl AgentRole {
                         | "process"
                         | "wait_for"
                         | "local_http"
+                        | "remote_read"
+                        | "remote_list"
+                        | "remote_git"
+                        | "remote_exec"
                 ) || (profile == AgentProfile::Research
                     && matches!(name, "fetch_url" | "web_search"))
             }
@@ -1003,6 +1010,9 @@ impl AgentRole {
                     | "read_source"
                     | "recall"
                     | "team_status"
+                    | "remote_read"
+                    | "remote_list"
+                    | "remote_git"
             ),
             Self::Worker | Self::Labour => match profile {
                 AgentProfile::Coding => matches!(
@@ -1038,6 +1048,12 @@ impl AgentRole {
                         | "wait_for"
                         | "local_http"
                         | "browser"
+                        | "remote_read"
+                        | "remote_write"
+                        | "remote_list"
+                        | "remote_exec"
+                        | "remote_git"
+                        | "remote_worktree"
                 ),
                 AgentProfile::Research => matches!(
                     name,
@@ -1064,6 +1080,10 @@ impl AgentRole {
                         | "data_query"
                         | "web_search"
                         | "local_http"
+                        | "remote_read"
+                        | "remote_write"
+                        | "remote_list"
+                        | "remote_git"
                 ),
                 AgentProfile::Verification => matches!(
                     name,
@@ -1093,6 +1113,10 @@ impl AgentRole {
                         | "process"
                         | "wait_for"
                         | "local_http"
+                        | "remote_read"
+                        | "remote_list"
+                        | "remote_git"
+                        | "remote_exec"
                 ),
                 AgentProfile::Generic => matches!(
                     name,
@@ -1115,6 +1139,9 @@ impl AgentRole {
                         | "read_image"
                         | "read_document"
                         | "data_query"
+                        | "remote_read"
+                        | "remote_list"
+                        | "remote_git"
                 ),
             },
         }
@@ -6455,6 +6482,7 @@ async fn run_integration_command(
         restrict_home: policy.restrict_home,
         read_jail: policy.read_jail,
         git_branch: session.branch.clone(),
+        remote: None,
     };
     let (exit, text) =
         crate::tools::run_sandboxed_login_shell(&context, &command, Duration::from_secs(300))
@@ -9250,6 +9278,7 @@ async fn run_loop_body(
         restrict_home: shell_policy.restrict_home,
         read_jail: shell_policy.read_jail,
         git_branch: Some(spec.branch.clone()),
+        remote: engine.remote_access(&project.id).await?.map(Arc::new),
     };
     let prompt = role_system_prompt(spec.role, project, session, spec, objective);
     let mut stable_prefix = prompt.stable_prefix;
@@ -12858,6 +12887,9 @@ fn is_parallel_safe_tool(name: &str) -> bool {
             | "dependency_graph"
             | "build_context"
             | "affected_tests"
+            | "remote_read"
+            | "remote_list"
+            | "remote_git"
     )
 }
 

@@ -4969,6 +4969,47 @@ fn project_manifest_round_trips_program_rows_policy_and_events() {
 }
 
 #[test]
+fn execution_hosts_round_trip_and_enter_the_project_manifest() {
+    use vp_protocol::remote::{ExecutionHost, ExecutionHostMode};
+
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("remote"))
+        .unwrap();
+    assert_eq!(
+        store.get_execution_host(&project.id).unwrap(),
+        ExecutionHost::default()
+    );
+    let config = ExecutionHost {
+        mode: ExecutionHostMode::Ssh,
+        host: "build.example.com".into(),
+        user: Some("agent".into()),
+        root: "/srv/project".into(),
+        token_env: Some("VERLINPARK_REMOTE_TOKEN".into()),
+        ..ExecutionHost::default()
+    };
+    store.set_execution_host(&project.id, &config).unwrap();
+    assert_eq!(store.get_execution_host(&project.id).unwrap(), config);
+    assert!(
+        store
+            .execution_host_updated_at(&project.id)
+            .unwrap()
+            .is_some()
+    );
+
+    store.record_project_manifest().unwrap();
+    let snapshots = crate::read_project_manifest(data.path()).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].execution_host, config);
+
+    assert!(store.remove_execution_host(&project.id).unwrap());
+    assert_eq!(
+        store.get_execution_host(&project.id).unwrap(),
+        ExecutionHost::default()
+    );
+}
+
+#[test]
 fn program_delete_tombstones_without_erasing_the_event_log() {
     let (_data, store, repo) = test_store();
     let project = store
@@ -5065,4 +5106,33 @@ fn program_event_sequences_are_independent_per_program() {
             .len(),
         2
     );
+}
+
+#[test]
+fn execution_host_defaults_are_independent_per_project() {
+    use vp_protocol::remote::{ExecutionHost, ExecutionHostMode};
+
+    let (_data, store, repo) = test_store();
+    let first = store
+        .add_project(repo.path().to_str().unwrap(), Some("one"))
+        .unwrap();
+    let other = TempDir::new().unwrap();
+    let second = store
+        .add_project(other.path().to_str().unwrap(), Some("two"))
+        .unwrap();
+    let config = ExecutionHost {
+        mode: ExecutionHostMode::Ssh,
+        host: "host".into(),
+        root: "/srv".into(),
+        token_env: Some("TOKEN".into()),
+        ..ExecutionHost::default()
+    };
+    store.set_execution_host(&first.id, &config).unwrap();
+    assert_eq!(store.get_execution_host(&first.id).unwrap(), config);
+    assert_eq!(
+        store.get_execution_host(&second.id).unwrap(),
+        ExecutionHost::default()
+    );
+    assert!(!store.remove_execution_host(&second.id).unwrap());
+    assert_eq!(store.list_execution_hosts().unwrap().len(), 2);
 }

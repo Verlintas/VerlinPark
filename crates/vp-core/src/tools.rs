@@ -51,6 +51,10 @@ pub struct ToolContext {
     /// The branch this agent is allowed to advance through Git metadata writes.
     /// `None` grants no common-ref writes.
     pub git_branch: Option<String>,
+    /// Explicit remote workspace access for `remote_*` tools. `None` means the
+    /// project has a local execution host; remote tools fail instead of
+    /// falling back to local paths.
+    pub remote: Option<Arc<crate::remote::RemoteToolAccess>>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +154,12 @@ impl ToolRegistry {
                 Arc::new(crate::tooling::media::ReadImage),
                 Arc::new(crate::tooling::office::ReadDocument),
                 Arc::new(crate::tooling::data::DataQuery),
+                Arc::new(crate::tooling::remote::RemoteRead),
+                Arc::new(crate::tooling::remote::RemoteWrite),
+                Arc::new(crate::tooling::remote::RemoteList),
+                Arc::new(crate::tooling::remote::RemoteExec),
+                Arc::new(crate::tooling::remote::RemoteGit),
+                Arc::new(crate::tooling::remote::RemoteWorktree),
             ],
         }
     }
@@ -1917,6 +1927,7 @@ mod tests {
                 git_branch: None,
                 secret_roots: Vec::new(),
                 network_allowed: true,
+                remote: None,
             },
         )
     }
@@ -2159,6 +2170,7 @@ mod tests {
             git_branch: None,
             secret_roots: Vec::new(),
             network_allowed: true,
+            remote: None,
         };
         let inside = Shell
             .execute(&context, json!({"command": "echo inside > inside.txt"}))
@@ -2209,6 +2221,7 @@ mod tests {
             restrict_home: true,
             read_jail: false,
             git_branch: None,
+            remote: None,
         };
         let visible = Shell
             .execute(&context, json!({"command": "cat visible.txt"}))
@@ -2245,6 +2258,7 @@ mod tests {
             restrict_home: false,
             read_jail: true,
             git_branch: None,
+            remote: None,
         };
         let visible = Shell
             .execute(&context, json!({"command": "cat visible.txt"}))
@@ -2283,6 +2297,7 @@ mod tests {
             git_branch: None,
             secret_roots: Vec::new(),
             network_allowed: false,
+            remote: None,
         };
         let output = Shell
             .execute(
@@ -2310,6 +2325,7 @@ mod tests {
             git_branch: None,
             secret_roots: Vec::new(),
             network_allowed: true,
+            remote: None,
         };
         let started = std::time::Instant::now();
         let result = Shell
@@ -2391,6 +2407,7 @@ mod tests {
             git_branch: Some("task".to_string()),
             secret_roots: Vec::new(),
             network_allowed: true,
+            remote: None,
         };
         let output = Shell
             .execute(
@@ -2480,6 +2497,7 @@ mod tests {
             git_branch: None,
             secret_roots: Vec::new(),
             network_allowed: true,
+            remote: None,
         };
         let output = Shell
             .execute(

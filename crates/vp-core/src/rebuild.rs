@@ -81,6 +81,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
         for snapshot in &snapshots {
             store.insert_project_snapshot(&snapshot.project)?;
             store.set_shell_policy(&snapshot.project.id, &snapshot.shell_policy)?;
+            store.set_execution_host(&snapshot.project.id, &snapshot.execution_host)?;
             store.set_integration_policy(&snapshot.project.id, &snapshot.integration_policy)?;
             store.set_artifact_policy(&snapshot.project.id, &snapshot.artifact_policy)?;
             store.set_mailbox_policy(&snapshot.project.id, &snapshot.mailbox_policy)?;
