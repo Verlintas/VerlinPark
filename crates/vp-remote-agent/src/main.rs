@@ -34,6 +34,7 @@ fn usage() -> &'static str {
        --root <DIR>            Canonical workspace root (required)\n\
        --token-env <NAME>      Read the auth token from this environment variable\n\
        --token-file <FILE>     Read the auth token from a 0600 file\n\
+                               Default fallback: ~/.verlinpark/remote-token (0600)\n\
        --ledger <FILE>         Operation ledger path (default: ~/.verlinpark/remote-agent-ledger.jsonl)\n\
        --no-ledger             Keep the operation ledger in memory only\n\
        --env-allow <NAMES>     Comma-separated extra exec environment names\n\
@@ -102,42 +103,83 @@ fn parse_args() -> Result<Args> {
 }
 
 fn read_token(args: &Args) -> Result<String> {
+    read_token_from(args, |name| std::env::var(name).ok(), default_token_file())
+}
+
+/// The helper's private default token path. Operators can provision the same
+/// token on the remote host without setting a remote environment variable,
+/// which OpenSSH does not forward by default.
+fn default_token_file() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".verlinpark").join("remote-token"))
+}
+
+fn read_token_from<F>(args: &Args, env: F, default_path: Option<PathBuf>) -> Result<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
     if let Some(path) = args.token_file.as_ref() {
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("reading token file metadata {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                bail!(
-                    "token file {} is accessible by group/others (mode {:o}); chmod 600 it",
-                    path.display(),
-                    mode
-                );
-            }
-        }
-        let token = std::fs::read_to_string(path)
-            .with_context(|| format!("reading token file {}", path.display()))?;
-        let token = token.trim().to_string();
-        if token.chars().count() < 16 {
-            bail!("token file must contain at least 16 characters");
-        }
-        return Ok(token);
+        return read_token_file(path);
     }
     if let Some(name) = args.token_env.as_deref() {
-        let token = std::env::var(name)
-            .with_context(|| format!("reading auth token from environment variable {name}"))?;
-        let token = token.trim().to_string();
-        if token.chars().count() < 16 {
-            bail!("auth token environment variable must contain at least 16 characters");
+        if let Some(token) = env(name) {
+            let token = token.trim().to_string();
+            if token.chars().count() < 16 {
+                bail!("auth token environment variable {name} must contain at least 16 characters");
+            }
+            return Ok(token);
         }
-        return Ok(token);
+        // An SSH-launched helper normally cannot see the daemon's environment
+        // because OpenSSH forwards only SendEnv names. Fall back to the
+        // standard private token file before failing.
+        if let Some(path) = default_path.as_ref()
+            && path.exists()
+        {
+            return read_token_file(path);
+        }
+        bail!(
+            "auth token environment variable {name} is not set and {} does not exist; \
+             provision a 0600 token file or configure SSH SendEnv/AcceptEnv",
+            default_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "the default token file".to_string())
+        );
+    }
+    if let Some(path) = default_path.as_ref()
+        && path.exists()
+    {
+        return read_token_file(path);
     }
     bail!(
-        "no auth token configured; pass --token-env or --token-file\n\n{}",
+        "no auth token configured; pass --token-env or --token-file, or create \
+         ~/.verlinpark/remote-token with mode 600\n\n{}",
         usage()
-    )
+    );
+}
+
+fn read_token_file(path: &std::path::Path) -> Result<String> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading token file metadata {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "token file {} is accessible by group/others (mode {:o}); chmod 600 it",
+                path.display(),
+                mode
+            );
+        }
+    }
+    let token = std::fs::read_to_string(path)
+        .with_context(|| format!("reading token file {}", path.display()))?;
+    let token = token.trim().to_string();
+    if token.chars().count() < 16 {
+        bail!("token file must contain at least 16 characters");
+    }
+    Ok(token)
 }
 
 fn default_ledger() -> Option<PathBuf> {
@@ -210,4 +252,104 @@ async fn run() -> Result<()> {
     );
     serve_stdio(config).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    fn write_token(path: &std::path::Path, token: &str, mode: u32) {
+        std::fs::write(path, token).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn private_token_file_is_read_and_trimmed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("token");
+        write_token(&path, "  token-from-file-1234\n", 0o600);
+        let args = Args {
+            token_file: Some(path),
+            ..Args::default()
+        };
+        let token = read_token_from(&args, |_| None, None).unwrap();
+        assert_eq!(token, "token-from-file-1234");
+    }
+
+    #[test]
+    fn group_readable_token_file_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("token");
+        write_token(&path, "token-from-file-1234", 0o644);
+        let args = Args {
+            token_file: Some(path),
+            ..Args::default()
+        };
+        let error = read_token_from(&args, |_| None, None).unwrap_err();
+        assert!(
+            error.to_string().contains("chmod 600"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn environment_token_wins_over_the_default_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("token");
+        write_token(&path, "token-from-default-1234", 0o600);
+        let args = Args {
+            token_env: Some("VP_TEST_TOKEN".into()),
+            ..Args::default()
+        };
+        let token = read_token_from(
+            &args,
+            |name| (name == "VP_TEST_TOKEN").then(|| " token-from-env-123456 ".into()),
+            Some(path),
+        )
+        .unwrap();
+        assert_eq!(token, "token-from-env-123456");
+    }
+
+    #[test]
+    fn missing_environment_token_falls_back_to_the_default_private_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("token");
+        write_token(&path, "token-from-default-1234", 0o600);
+        let args = Args {
+            token_env: Some("VP_TEST_TOKEN".into()),
+            ..Args::default()
+        };
+        let token = read_token_from(&args, |_| None, Some(path)).unwrap();
+        assert_eq!(token, "token-from-default-1234");
+    }
+
+    #[test]
+    fn short_environment_token_is_rejected_instead_of_falling_back() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("token");
+        write_token(&path, "token-from-default-1234", 0o600);
+        let args = Args {
+            token_env: Some("VP_TEST_TOKEN".into()),
+            ..Args::default()
+        };
+        let error = read_token_from(&args, |_| Some("short".into()), Some(path)).unwrap_err();
+        assert!(
+            error.to_string().contains("at least 16 characters"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn missing_all_token_sources_reports_the_expected_locations() {
+        let args = Args {
+            token_env: Some("VP_TEST_TOKEN".into()),
+            ..Args::default()
+        };
+        let error = read_token_from(&args, |_| None, None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("VP_TEST_TOKEN"));
+        assert!(message.contains("0600"));
+    }
 }
