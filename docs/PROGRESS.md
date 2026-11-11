@@ -1,10 +1,109 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-11 Long-task round 3: context checkpoints, ACP remote, IVF ANN, encrypted backups
+
+这一轮补齐三个明确缺口并升级一个记忆模块：compaction 后的 active-context
+checkpoint/restore、ACP Streamable HTTP/WebSocket、可选 IVF ANN 记忆索引、
+Argon2id + ChaCha20-Poly1305 的加密增量备份。全部保持 deterministic Rust 调度、
+事件先行、不绕过 approval / Seatbelt / path jail / write scope / Verifier /
+merge / capacity / budget gate。计划与验收见
+[CONTEXT_CHECKPOINT_ACP_ANN_BACKUP_PLAN.md](CONTEXT_CHECKPOINT_ACP_ANN_BACKUP_PLAN.md)，
+决策见 ADR-0164–0167。
+
+### D1 context checkpoints / restore
+
+- 新 `context_checkpoints` 表 + `ContextCheckpoint` 协议类型；保存
+  summary、through_message_id、message cursor、plan revision、provider/model、
+  prompt prefix hash、worktree head、token before/after、structured plan state。
+- 自动在每次成功 compaction 后创建 checkpoint；手动
+  `session.context.checkpoint` 捕获当前 active boundary。
+- `session.context.restore` 只恢复 context：追加一个新的
+  `context.compacted` 边界 + `context.restored` 审计事件，不启动 run、不重置
+  worktree、不删除/复制消息；原消息继续用于 search/audit/transcript。
+- 幂等 restore；两次 restore 得到相同 active context，产生两个审计事件，
+  不重复消息。
+- 前置检查：session idle/failed/cancelled、非 imported、plan revision、
+  provider/model、worktree clean/descendant、token/USD/time budget、
+  through-message 存在、恢复后估算低于 hard limit；`force` 只绕过阈值警告。
+- RPC：`session.context.checkpoints`、`checkpoint.detail`、`checkpoint`、
+  `restore`、`checkpoint.delete`、`checkpoint.prune`、`policy/policy.set`；
+  CLI `context-checkpoint*`；Stage/Efficiency context card 列表/预览/restore。
+- 事件：`context.checkpointed`、`context.restored`、
+  `context.checkpoint.deleted`；checkpoint 行事件先行、projection 后写，
+  replay/repair/bundle/db-rebuild 覆盖。
+- retention policy：enabled、max_checkpoints 1–100、max_age_days 0–365；
+  手动 dry-run prune、daemon sweep，始终保护 latest active checkpoint。
+
+### D2 ACP Streamable HTTP / WebSocket
+
+- `AcpAgent` 增加 transport（stdio/streamable_http/websocket）、endpoint、
+  auth_header_env、headers、connect_timeout_secs、allow_remote；stdio 默认与
+  行为不变，旧行 additive decode。
+- Streamable HTTP：initialize 200 + `Acp-Connection-Id`；其他请求 202；
+  connection-scoped SSE + 每 session 一条 SSE；按 JSON-RPC id/header 路由；
+  permission request/response、cancel、DELETE、cookie jar、显式 headers、
+  env-backed Authorization、`Acp-Protocol-Version`。
+- WebSocket：同一 endpoint upgrade、text frames、initialize first、binary
+  ignored、ping/pong、bounded frames、clean close。
+- 支持 explicit `session/load` resume；v1 不做自动 reconnect/in-flight
+  replay，不隐藏重试。Malformed JSON/SSE/batch fails closed。
+- Remote agent 是 trusted external service，不是本地 sandbox；必须显式
+  `allow_remote`，remote delegation 分类 host-state/approval，unattended
+  denied；不声称 worktree 写入隔离。auth value 不持久化/不返回/不进错误。
+- 测试覆盖 HTTP/SSE、WebSocket、multi-session、permission、resume、cancel、
+  timeout、malformed frames、no process spawn、stdio regression。
+
+### D3 opt-in IVF ANN memory
+
+- `MemoryEmbeddingPolicy` 增加 index=scan|ivf、ivf_nlist(4–1024)、
+  ivf_nprobe(1..nlist)、ivf_min_vectors、ivf_rebuild_vectors；默认 scan。
+- 新 `memory_embedding_index` / `memory_embedding_assignments`；确定性
+  seeded k-means++、bounded 24 iterations、normalized cosine centroids、
+  stable ties、versioned `VPIV` centroid encoding。
+- `recall` probe nprobe nearest centroids，取 bounded assigned vectors，
+  精确 cosine 后进入现有 RRF/lexical/task/scope/recency/status 权重；索引
+  disabled/stale/corrupt/too-small 时显式 fallback exact scan。
+- 增量 assignment、model/dimension/nlist 变更失效、growth-threshold rebuild、
+  delete/prune cleanup、corrupt repair、并发 rebuild/write 均有测试。
+- RPC `memory.embeddings.index.status/rebuild`；CLI/Swift health 显示 mode/
+  generation/coverage/cluster/fallback，可手动 rebuild。
+- 合成 fixture recall@10 ≥ 0.90；不声称通用 recall、HNSW/GPU/量化/分布式。
+
+### D4 encrypted incremental backup repository
+
+- 保留 v1 ZIP `vp backup --output` / `vp restore --input`；v1 仍显式不加密。
+- 新 v2 repository：`--repository`、`--incremental`、
+  `--passphrase-env`/`--passphrase-file`、`--plaintext`、`--no-compress`；
+  `backup-list`、`backup-prune`。manifest + content-addressed blobs + parent
+  chain + nonce table + tombstones。
+- Argon2id（默认 64 MiB / 3 iterations / 1 lane，bounds 8–256 MiB、1–10、
+  1–8）+ ChaCha20-Poly1305；blob/manifest/metadata 域分离子密钥，fresh nonce，
+  AEAD chunk framing，HMAC 认证 metadata/tombstones，zstd 前后 hash 校验。
+- passphrase 只从 env 或 0600 file，拒绝 group/other-readable；不出现于 argv/
+  log/manifest/error；`zeroize` key material。
+- restore 验证 chain/nonce/tombstone/每个 blob/hash/SQLite header 后原子替换；
+  失败保留原 data dir；prune 保护 retained manifest 引用，支持 dry-run。
+- 测试覆盖 v1 round-trip、encrypted repo、wrong passphrase、tamper、
+  missing parent、dedup、prune、atomic restore、secret redaction。
+
+### 验证与集成
+
+- 合并顺序：D4 `081fecd` → D3 `1bbc78f` → D2 `7f8ff32` → D1 `a7d54fd`；
+  计划 `b972436`。
+- `git diff --stat b972436..HEAD`：**35,046 insertions / 1,661 deletions**。
+- Rust：**1,654 passed，6 ignored**；Swift：**215 app + 116 helper**。
+- `just lint`、`xcodebuild test`、`just bundle` 通过；bundle 包含 verlinpadd、
+  browser helper、computer helper、remote agent。
+- 仍然不要声称：context restore 是 run resume、compaction 无损、remote ACP
+  sandbox、ANN 通用 recall、key escrow/rotation、跨主机 lease consensus。
 
 ---
 

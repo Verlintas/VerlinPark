@@ -173,6 +173,10 @@
 | [0161](adr/0161-cross-process-lease-fencing.md) | Fenced runtime leases, continuation claim/ack, and integration effect-boundary ownership | Accepted | Runtime/Store |
 | [0162](adr/0162-optional-hybrid-memory.md) | Explicit per-project embedding policy, derived hybrid recall, lexical fallback, and health | Accepted | Runtime/Store/Protocol |
 | [0163](adr/0163-cost-per-solved-task-benchmark.md) | Deterministic solved-task benchmark harness, metrics, reports, and comparison rules | Accepted | Tooling/Benchmark |
+| [0164](adr/0164-context-checkpoints-and-restore.md) | Durable active-context checkpoints and restore-by-rewriting the compaction boundary | Accepted | Runtime/Protocol |
+| [0165](adr/0165-acp-http-and-websocket-transport.md) | ACP Streamable HTTP and WebSocket remote transport with explicit remote trust | Accepted | Runtime/Protocol |
+| [0166](adr/0166-ivf-ann-memory-index.md) | Opt-in deterministic IVF index for hybrid memory with exact-scan fallback | Accepted | Runtime/Store |
+| [0167](adr/0167-encrypted-incremental-backup-repository.md) | Argon2id + ChaCha20-Poly1305 incremental backup repository with v1 ZIP compatibility | Accepted | Runtime/CLI/Security |
 
 ---
 

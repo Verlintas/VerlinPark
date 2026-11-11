@@ -1,6 +1,6 @@
 # VerlinPark Agent Tooling Roadmap
 
-> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, sandboxed WKWebView browser + ComputerLease, runtime introspection, native macOS computer control, explicit SSH/stdio remote workspaces, tool-output paging, compaction budgets, fenced leases, hybrid memory, and a cost-per-solved-task harness implemented on 2026-11-11; see ADR-0134/0136/0137/0155–0163.<br>
+> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, sandboxed WKWebView browser + ComputerLease, runtime introspection, native macOS computer control, explicit SSH/stdio remote workspaces, tool-output paging, compaction budgets, fenced leases, hybrid memory, a cost-per-solved-task harness, ACP Streamable HTTP/WebSocket, IVF ANN memory, and encrypted incremental backups implemented on 2026-11-11; see ADR-0134/0136/0137/0155–0167.<br>
 > **Date:** 2026-11-11<br>
 > **Code baseline:** 2026-11-11 tooling + long-task runtime wave; see ADR-0134/0136/0137/0155–0158.<br>
 > **Implementation budget:** ~10,000–30,000 code lines, target core ~24k, hard planning cap 30k<br>

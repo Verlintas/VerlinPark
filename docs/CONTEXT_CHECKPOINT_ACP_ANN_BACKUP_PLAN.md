@@ -1,12 +1,20 @@
 # Context Checkpoints, ACP Remote Transport, ANN Memory, and Encrypted Backups
 
-> **Status:** active implementation plan.
+> **Status:** implemented (2026-11-11); this file remains the design record.
 > **Created:** 2026-11-11
 > **Goal:** make compaction reversible at the active-context boundary, add
 > standard remote ACP transports, make hybrid memory scale beyond a SQLite scan,
 > and add encrypted incremental backups.
 > **Budget:** one large round, target +30,000 net lines of production code and
 > tests. No filler; every module must operate, fail closed, and be auditable.
+>
+> **Result:** D1–D4 landed as four commits on `main` (`081fecd`, `1bbc78f`,
+> `7f8ff32`, `a7d54fd`) plus this plan commit (`b972436`). `git diff --stat
+> b972436..HEAD` shows **35,046 insertions / 1,661 deletions** before the
+> documentation close-out. Rust is **1,654 passing tests with 6 ignored**;
+> Swift is **215 app tests plus 116 computer-helper tests**. `just lint`,
+> `xcodebuild test`, and `just bundle` pass. The implementation and remaining
+> limits are recorded in ADR-0164–0167 and `PROGRESS.md`.
 
 ---
 
@@ -216,6 +224,20 @@ snapshots while preserving the existing v1 restore path.
 (`argon2`, `chacha20poly1305`, `zeroize`); CLI; docs; tests; ADR.
 
 ---
+
+## 4.1 Implementation record (2026-11-11)
+
+| Workstream | Landed code | Operator surface | Limits that remain |
+|---|---|---|---|
+| D1 context checkpoints | `vp-core/src/context.rs`, context checkpoint table/events, auto/manual checkpoints, restore-by-rewriting the compaction boundary, retention sweep | `session.context.checkpoint*`, `session.context.restore`, `session.context.policy*`, CLI `context-checkpoint*`, Stage/Manage Dash card | Context-only restore, not run resume; summaries remain advisory/lossy; no cross-host consensus |
+| D2 ACP remote | ACP transport config, Streamable HTTP (POST + connection/session SSE), WebSocket, cookie/auth headers, bounded frames, `session/load` resume, remote approval guard | `acp.agent.add/update/probe` transport fields, CLI/Swift ACP settings | Remote agents are trusted external services, not sandboxed; no automatic reconnect/in-flight replay; test server is HTTP/1.1 |
+| D3 ANN memory | `memory_index.rs`, `memory_embedding_index`/assignments, deterministic IVF k-means, generation/incremental assignment, status/rebuild | `memory.embeddings.index.status/rebuild`, CLI flags/commands, Manage Dash memory health | Scan remains default/fallback; no HNSW/GPU/quantization/distributed index; recall is fixture-measured, not universal |
+| D4 encrypted backup | `backup/crypto.rs`, `backup/repository/*`, Argon2id + ChaCha20-Poly1305, content-addressed blobs, parent chain, prune, atomic restore | `vp backup --repository`, `backup-list`, `backup-prune`, encrypted restore flags | No key escrow/rotation/anti-rollback, no distributed lock, no live-daemon point-in-time snapshot; v1 ZIP remains unencrypted |
+
+All four modules preserve existing gates. Derived indexes, tool outputs,
+backup blobs, and context-checkpoint summaries are explicitly operational or
+event-backed as documented; none silently weakens approval, sandbox, path,
+write-scope, Verifier, merge, capacity, or budget enforcement.
 
 ## 5. Parallelization and integration order
 
