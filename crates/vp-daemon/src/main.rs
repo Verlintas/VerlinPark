@@ -27,8 +27,8 @@ use vp_protocol::remote::{
 };
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::types::{
-    AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams, AddProjectParams,
-    AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
+    AcpAgentConfig, AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams,
+    AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
     AnswerQuestionResult, ApprovalGrantCreateParams, ApprovalGrantCreateResult,
     ApprovalGrantDeleteParams, ApprovalGrantDeleteResult, ApprovalGrantListParams,
     ApprovalGrantListResult, ApprovalListResult, ArtifactBackfillParams, ArtifactDiffParams,
@@ -2608,15 +2608,21 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "acp.agent.add" => match parse_params::<AddAcpAgentParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .add_acp_agent(
-                    &params.name,
-                    &params.command,
-                    params.args,
-                    params.env,
-                    params.enabled,
-                    params.auto_approve,
-                    params.timeout_secs,
-                )
+                .add_acp_agent_config(AcpAgentConfig {
+                    name: params.name,
+                    command: params.command,
+                    args: params.args,
+                    env: params.env,
+                    enabled: params.enabled,
+                    auto_approve: params.auto_approve,
+                    timeout_secs: params.timeout_secs,
+                    transport: params.transport,
+                    endpoint: params.endpoint,
+                    auth_header_env: params.auth_header_env,
+                    headers: params.headers,
+                    connect_timeout_secs: params.connect_timeout_secs,
+                    allow_remote: params.allow_remote,
+                })
                 .await
             {
                 Ok(agent) => RpcResponse::success(id, json!({"agent": agent})),
@@ -2627,15 +2633,23 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "acp.agent.update" => match parse_params::<UpdateAcpAgentParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .update_acp_agent(
+                .update_acp_agent_config(
                     &params.id,
-                    &params.name,
-                    &params.command,
-                    params.args,
-                    params.env,
-                    params.enabled,
-                    params.auto_approve,
-                    params.timeout_secs,
+                    AcpAgentConfig {
+                        name: params.name,
+                        command: params.command,
+                        args: params.args,
+                        env: params.env,
+                        enabled: params.enabled,
+                        auto_approve: params.auto_approve,
+                        timeout_secs: params.timeout_secs,
+                        transport: params.transport,
+                        endpoint: params.endpoint,
+                        auth_header_env: params.auth_header_env,
+                        headers: params.headers,
+                        connect_timeout_secs: params.connect_timeout_secs,
+                        allow_remote: params.allow_remote,
+                    },
                 )
                 .await
             {
@@ -2658,7 +2672,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "acp.agent.probe" => match parse_params::<AcpProbeParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .probe_acp_agent(&params.agent_id, params.project_id)
+                .probe_acp_agent_options(&params.agent_id, params.project_id, params.create_session)
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),

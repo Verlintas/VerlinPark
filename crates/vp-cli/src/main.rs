@@ -45,6 +45,23 @@ impl McpTransportArg {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AcpTransportArg {
+    Stdio,
+    StreamableHttp,
+    Websocket,
+}
+
+impl AcpTransportArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::StreamableHttp => "streamable_http",
+            Self::Websocket => "websocket",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Check that the daemon is reachable.
@@ -67,10 +84,28 @@ enum Command {
     /// Add an external Agent Client Protocol (ACP) agent.
     AcpAdd {
         name: String,
-        command: String,
+        /// Stdio command. Omit for a remote transport.
+        command: Option<String>,
+        #[arg(long, value_enum, default_value_t = AcpTransportArg::Stdio)]
+        transport: AcpTransportArg,
+        /// Remote endpoint (http/https for streamable_http, ws/wss for websocket).
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Environment variable name holding the Authorization header value.
+        #[arg(long = "auth-header-env")]
+        auth_header_env: Option<String>,
+        /// Extra HTTP header as KEY=VALUE (repeatable; use ${ENV_VAR} for secrets).
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// Required opt-in before contacting a remote ACP agent.
+        #[arg(long = "allow-remote")]
+        allow_remote: bool,
+        /// Remote connect/handshake timeout in seconds.
+        #[arg(long = "connect-timeout", default_value_t = 30)]
+        connect_timeout: u64,
         #[arg(long = "arg")]
         args: Vec<String>,
-        /// Environment override as KEY=VALUE (repeatable).
+        /// Environment override as KEY=VALUE (repeatable, stdio only).
         #[arg(long = "env")]
         env: Vec<String>,
         /// Auto-approve this agent's own permission requests.
@@ -80,6 +115,57 @@ enum Command {
         #[arg(long, default_value_t = 1800)]
         timeout: u64,
     },
+    /// Update an ACP agent. Unspecified fields keep their current values.
+    AcpUpdate {
+        /// Agent id or unique name.
+        agent: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long, value_enum)]
+        transport: Option<AcpTransportArg>,
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Clear the remote endpoint.
+        #[arg(long = "clear-endpoint")]
+        clear_endpoint: bool,
+        #[arg(long = "auth-header-env")]
+        auth_header_env: Option<String>,
+        /// Clear the Authorization environment variable reference.
+        #[arg(long = "clear-auth-header-env")]
+        clear_auth_header_env: bool,
+        /// Replacement header map (repeatable; replaces all headers).
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// Clear all extra headers.
+        #[arg(long = "clear-headers")]
+        clear_headers: bool,
+        /// Enable remote transport for this agent.
+        #[arg(long = "allow-remote")]
+        allow_remote: bool,
+        /// Disable remote transport for this agent.
+        #[arg(long = "no-allow-remote")]
+        no_allow_remote: bool,
+        #[arg(long = "connect-timeout")]
+        connect_timeout: Option<u64>,
+        /// Replacement positional arguments (repeatable; replaces all arguments).
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// Replacement environment map (repeatable; replaces all variables).
+        #[arg(long = "env")]
+        env: Vec<String>,
+        #[arg(long)]
+        auto_approve: bool,
+        #[arg(long = "no-auto-approve")]
+        no_auto_approve: bool,
+        #[arg(long)]
+        enabled: bool,
+        #[arg(long)]
+        disabled: bool,
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
     /// Remove an ACP agent by id.
     AcpRemove { agent_id: String },
     /// Initialize an ACP agent and create a session without prompting.
@@ -87,6 +173,9 @@ enum Command {
         agent: String,
         #[arg(long)]
         project: Option<String>,
+        /// Skip session creation; only initialize and negotiate capabilities.
+        #[arg(long = "no-session")]
+        no_session: bool,
     },
     /// List configured MCP servers.
     McpServers,
@@ -1882,23 +1971,205 @@ async fn main() -> Result<()> {
         Command::AcpAdd {
             name,
             command,
+            transport,
+            endpoint,
+            auth_header_env,
+            headers,
+            allow_remote,
+            connect_timeout,
             args,
             env,
             auto_approve,
             timeout,
         } => {
             let env = parse_env_pairs(&env)?;
+            let headers = parse_pairs(&headers, "--header")?;
             rpc(
                 &discovery,
                 "acp.agent.add",
                 json!({
                     "name": name,
-                    "command": command,
+                    "command": command.unwrap_or_default(),
                     "args": args,
                     "env": env,
                     "enabled": true,
                     "auto_approve": auto_approve,
-                    "timeout_secs": timeout
+                    "timeout_secs": timeout,
+                    "transport": transport.as_str(),
+                    "endpoint": endpoint,
+                    "auth_header_env": auth_header_env,
+                    "headers": headers,
+                    "connect_timeout_secs": connect_timeout,
+                    "allow_remote": allow_remote
+                }),
+            )
+            .await?
+        }
+        Command::AcpUpdate {
+            agent,
+            name,
+            command,
+            transport,
+            endpoint,
+            clear_endpoint,
+            auth_header_env,
+            clear_auth_header_env,
+            headers,
+            clear_headers,
+            allow_remote,
+            no_allow_remote,
+            connect_timeout,
+            args,
+            env,
+            auto_approve,
+            no_auto_approve,
+            enabled,
+            disabled,
+            timeout,
+        } => {
+            if clear_endpoint && endpoint.is_some() {
+                bail!("use either --endpoint or --clear-endpoint, not both");
+            }
+            if clear_auth_header_env && auth_header_env.is_some() {
+                bail!("use either --auth-header-env or --clear-auth-header-env, not both");
+            }
+            if clear_headers && !headers.is_empty() {
+                bail!("use either --header or --clear-headers, not both");
+            }
+            if allow_remote && no_allow_remote {
+                bail!("use either --allow-remote or --no-allow-remote, not both");
+            }
+            if auto_approve && no_auto_approve {
+                bail!("use either --auto-approve or --no-auto-approve, not both");
+            }
+            if enabled && disabled {
+                bail!("use either --enabled or --disabled, not both");
+            }
+            let current = rpc(&discovery, "acp.agent.list", json!({})).await?;
+            let agent_json = current
+                .get("agents")
+                .and_then(Value::as_array)
+                .and_then(|agents| {
+                    agents.iter().find(|candidate| {
+                        candidate.get("id").and_then(Value::as_str) == Some(agent.as_str())
+                            || candidate.get("name").and_then(Value::as_str) == Some(agent.as_str())
+                    })
+                })
+                .cloned()
+                .with_context(|| format!("ACP agent not found: {agent}"))?;
+            let existing_transport = agent_json
+                .get("transport")
+                .and_then(Value::as_str)
+                .unwrap_or("stdio");
+            let transport = transport
+                .map(AcpTransportArg::as_str)
+                .unwrap_or(existing_transport)
+                .to_string();
+            let existing_args = agent_json.get("args").cloned().unwrap_or_else(|| json!([]));
+            let existing_env = agent_json.get("env").cloned().unwrap_or_else(|| json!({}));
+            let existing_headers = agent_json
+                .get("headers")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let env = if env.is_empty() {
+                existing_env
+            } else {
+                json!(parse_env_pairs(&env)?)
+            };
+            let headers = if !headers.is_empty() {
+                json!(parse_pairs(&headers, "--header")?)
+            } else if clear_headers {
+                json!({})
+            } else {
+                existing_headers
+            };
+            let endpoint = if clear_endpoint {
+                Value::Null
+            } else if let Some(endpoint) = endpoint {
+                json!(endpoint)
+            } else {
+                agent_json.get("endpoint").cloned().unwrap_or(Value::Null)
+            };
+            let auth_header_env = if clear_auth_header_env {
+                Value::Null
+            } else if let Some(name) = auth_header_env {
+                json!(name)
+            } else {
+                agent_json
+                    .get("auth_header_env")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            let allow_remote = if allow_remote {
+                true
+            } else if no_allow_remote {
+                false
+            } else {
+                agent_json
+                    .get("allow_remote")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let auto_approve = if auto_approve {
+                true
+            } else if no_auto_approve {
+                false
+            } else {
+                agent_json
+                    .get("auto_approve")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let enabled = if enabled {
+                true
+            } else if disabled {
+                false
+            } else {
+                agent_json
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            };
+            rpc(
+                &discovery,
+                "acp.agent.update",
+                json!({
+                    "id": agent_json.get("id").cloned().unwrap_or(Value::Null),
+                    "name": name.unwrap_or_else(|| {
+                        agent_json
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    }),
+                    "command": command.unwrap_or_else(|| {
+                        agent_json
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    }),
+                    "args": if args.is_empty() { existing_args } else { json!(args) },
+                    "env": env,
+                    "enabled": enabled,
+                    "auto_approve": auto_approve,
+                    "timeout_secs": timeout.unwrap_or_else(|| {
+                        agent_json
+                            .get("timeout_secs")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1800)
+                    }),
+                    "transport": transport,
+                    "endpoint": endpoint,
+                    "auth_header_env": auth_header_env,
+                    "headers": headers,
+                    "connect_timeout_secs": connect_timeout.unwrap_or_else(|| {
+                        agent_json
+                            .get("connect_timeout_secs")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(30)
+                    }),
+                    "allow_remote": allow_remote
                 }),
             )
             .await?
@@ -1911,11 +2182,19 @@ async fn main() -> Result<()> {
             )
             .await?
         }
-        Command::AcpProbe { agent, project } => {
+        Command::AcpProbe {
+            agent,
+            project,
+            no_session,
+        } => {
             rpc(
                 &discovery,
                 "acp.agent.probe",
-                json!({"agent_id": agent, "project_id": project}),
+                json!({
+                    "agent_id": agent,
+                    "project_id": project,
+                    "create_session": !no_session
+                }),
             )
             .await?
         }
@@ -5037,17 +5316,24 @@ fn parse_tool_thresholds(values: &[String]) -> Result<Vec<(String, u64)>> {
 }
 
 fn parse_env_pairs(values: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut env = std::collections::BTreeMap::new();
+    parse_pairs(values, "--env")
+}
+
+fn parse_pairs(
+    values: &[String],
+    flag: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut pairs = std::collections::BTreeMap::new();
     for value in values {
         let (key, val) = value
             .split_once('=')
-            .with_context(|| format!("--env must be KEY=VALUE: {value}"))?;
+            .with_context(|| format!("{flag} must be KEY=VALUE: {value}"))?;
         if key.trim().is_empty() {
-            bail!("--env key must not be empty");
+            bail!("{flag} key must not be empty");
         }
-        env.insert(key.trim().to_string(), val.to_string());
+        pairs.insert(key.trim().to_string(), val.to_string());
     }
-    Ok(env)
+    Ok(pairs)
 }
 
 fn read_json_input(file: Option<&std::path::Path>) -> Result<String> {
@@ -7871,6 +8157,16 @@ mod durable_run_cli_tests {
 mod hybrid_memory_cli_tests {
     use super::*;
 
+    fn parse_cli(args: &[&str]) -> Cli {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args).unwrap())
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
     #[test]
     fn hybrid_memory_commands_and_policy_flags_parse() {
         std::thread::Builder::new()
@@ -8051,5 +8347,132 @@ mod hybrid_memory_cli_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn acp_remote_add_flags_parse() {
+        let cli = parse_cli(&[
+            "vp",
+            "acp-add",
+            "remote",
+            "--transport",
+            "streamable-http",
+            "--endpoint",
+            "https://agent.example.test/acp",
+            "--auth-header-env",
+            "ACP_TOKEN",
+            "--header",
+            "x-project=demo",
+            "--header",
+            "x-token=${ACP_TOKEN}",
+            "--allow-remote",
+            "--connect-timeout",
+            "15",
+            "--timeout",
+            "600",
+        ]);
+        match cli.command {
+            Command::AcpAdd {
+                name,
+                command,
+                transport,
+                endpoint,
+                auth_header_env,
+                headers,
+                allow_remote,
+                connect_timeout,
+                timeout,
+                ..
+            } => {
+                assert_eq!(name, "remote");
+                assert!(command.is_none());
+                assert_eq!(transport.as_str(), "streamable_http");
+                assert_eq!(endpoint.as_deref(), Some("https://agent.example.test/acp"));
+                assert_eq!(auth_header_env.as_deref(), Some("ACP_TOKEN"));
+                assert_eq!(headers.len(), 2);
+                assert!(allow_remote);
+                assert_eq!(connect_timeout, 15);
+                assert_eq!(timeout, 600);
+            }
+            other => panic!("expected acp-add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acp_stdio_add_keeps_the_optional_command() {
+        let cli = parse_cli(&["vp", "acp-add", "local", "npx"]);
+        match cli.command {
+            Command::AcpAdd {
+                transport, command, ..
+            } => {
+                assert_eq!(transport.as_str(), "stdio");
+                assert_eq!(command.as_deref(), Some("npx"));
+            }
+            other => panic!("expected acp-add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acp_update_flags_parse() {
+        let cli = parse_cli(&[
+            "vp",
+            "acp-update",
+            "agent-1",
+            "--transport",
+            "websocket",
+            "--endpoint",
+            "wss://agent.example.test/acp",
+            "--allow-remote",
+            "--clear-headers",
+            "--no-auto-approve",
+            "--disabled",
+        ]);
+        match cli.command {
+            Command::AcpUpdate {
+                agent,
+                transport,
+                endpoint,
+                allow_remote,
+                clear_headers,
+                no_auto_approve,
+                disabled,
+                ..
+            } => {
+                assert_eq!(agent, "agent-1");
+                assert_eq!(transport.unwrap().as_str(), "websocket");
+                assert_eq!(endpoint.as_deref(), Some("wss://agent.example.test/acp"));
+                assert!(allow_remote);
+                assert!(clear_headers);
+                assert!(no_auto_approve);
+                assert!(disabled);
+            }
+            other => panic!("expected acp-update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acp_transport_names_are_stable() {
+        assert_eq!(AcpTransportArg::Stdio.as_str(), "stdio");
+        assert_eq!(AcpTransportArg::StreamableHttp.as_str(), "streamable_http");
+        assert_eq!(AcpTransportArg::Websocket.as_str(), "websocket");
+    }
+
+    #[test]
+    fn acp_header_pairs_reject_missing_equals_and_empty_keys() {
+        assert_eq!(
+            parse_pairs(&["x-project=demo".to_string()], "--header")
+                .unwrap()
+                .get("x-project")
+                .map(String::as_str),
+            Some("demo")
+        );
+        assert!(parse_pairs(&["missing".to_string()], "--header").is_err());
+        assert!(parse_pairs(&["=value".to_string()], "--header").is_err());
+        assert!(
+            parse_pairs(&["x=a=b".to_string()], "--header")
+                .unwrap()
+                .get("x")
+                .is_some_and(|value| value == "a=b")
+        );
     }
 }

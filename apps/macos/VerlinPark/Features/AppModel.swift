@@ -1630,7 +1630,13 @@ final class AppModel {
         args: [String],
         env: [String: String],
         autoApprove: Bool,
-        timeoutSecs: Int
+        timeoutSecs: Int,
+        transport: AcpTransport = .stdio,
+        endpoint: String? = nil,
+        authHeaderEnv: String? = nil,
+        headers: [String: String] = [:],
+        connectTimeoutSecs: Int = 30,
+        allowRemote: Bool = false
     ) async -> Bool {
         acpBusy = true
         defer { acpBusy = false }
@@ -1641,11 +1647,63 @@ final class AppModel {
                 args: args,
                 env: env,
                 autoApprove: autoApprove,
-                timeoutSecs: timeoutSecs
+                timeoutSecs: timeoutSecs,
+                transport: transport,
+                endpoint: endpoint,
+                authHeaderEnv: authHeaderEnv,
+                headers: headers,
+                connectTimeoutSecs: connectTimeoutSecs,
+                allowRemote: allowRemote
             )
             acpStatus = "ACP agent added."
             await loadAcpAgents()
             showToast("ACP agent added", detail: name, kind: .success)
+            return true
+        } catch {
+            acpStatus = error.localizedDescription
+            handle(error)
+            return false
+        }
+    }
+
+    func updateAcpAgentSettings(
+        id: String,
+        name: String,
+        command: String,
+        args: [String],
+        env: [String: String],
+        transport: AcpTransport,
+        endpoint: String?,
+        authHeaderEnv: String?,
+        headers: [String: String],
+        connectTimeoutSecs: Int,
+        allowRemote: Bool,
+        autoApprove: Bool,
+        timeoutSecs: Int,
+        enabled: Bool
+    ) async -> Bool {
+        acpBusy = true
+        defer { acpBusy = false }
+        do {
+            _ = try await core.updateAcpAgentSettings(
+                id: id,
+                name: name,
+                command: command,
+                args: args,
+                env: env,
+                transport: transport,
+                endpoint: endpoint,
+                authHeaderEnv: authHeaderEnv,
+                headers: headers,
+                connectTimeoutSecs: connectTimeoutSecs,
+                allowRemote: allowRemote,
+                autoApprove: autoApprove,
+                timeoutSecs: timeoutSecs,
+                enabled: enabled
+            )
+            acpStatus = "ACP agent updated."
+            await loadAcpAgents()
+            showToast("ACP agent updated", detail: name, kind: .success)
             return true
         } catch {
             acpStatus = error.localizedDescription
@@ -1703,8 +1761,11 @@ final class AppModel {
         acpProbeStatus[id] = "probing…"
         do {
             let result = try await core.probeAcpAgent(id: id, projectID: selectedProjectID)
+            let load = result.loadSession ? " · session/load" : ""
+            let endpoint = result.remote ? " · \(result.endpoint ?? "remote")" : ""
+            let http = result.httpVersion.map { " · \($0)" } ?? ""
             acpProbeStatus[id] =
-                "ok · \(result.agentName) \(result.version) · protocol \(result.protocolVersion)"
+                "ok · \(result.transport.displayName)\(http) · \(result.agentName) \(result.version) · protocol \(result.protocolVersion)\(load)\(endpoint)"
         } catch {
             acpProbeStatus[id] = error.localizedDescription
         }

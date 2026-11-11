@@ -2397,15 +2397,58 @@ pub struct McpToolListResult {
     pub tools: Vec<McpTool>,
 }
 
-/// A configured external agent that speaks the Agent Client Protocol over stdio.
+/// How VerlinPark reaches an external Agent Client Protocol (ACP) agent.
 ///
-/// ACP agents run as user-installed executables, are spawned inside the same
-/// Seatbelt write sandbox as shell work, and are recorded as Worker agents when
-/// they are delegated a task.
+/// `stdio` launches a user-installed executable; the two remote profiles speak
+/// ACP over the RFD Streamable HTTP / WebSocket transport. Remote agents are
+/// trusted external services and are not sandboxed by VerlinPark.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+    Websocket,
+}
+
+impl AcpTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::StreamableHttp => "streamable_http",
+            Self::Websocket => "websocket",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stdio" => Some(Self::Stdio),
+            "streamable_http" | "streamable-http" | "http" => Some(Self::StreamableHttp),
+            "websocket" | "ws" | "wss" => Some(Self::Websocket),
+            _ => None,
+        }
+    }
+
+    pub fn is_remote(self) -> bool {
+        !matches!(self, Self::Stdio)
+    }
+}
+
+/// A configured external agent that speaks the Agent Client Protocol.
+///
+/// A stdio ACP agent runs as a user-installed executable, is spawned inside the
+/// same Seatbelt write sandbox as shell work, and is recorded as a Worker agent
+/// when it is delegated a task. A remote agent is reached over Streamable HTTP
+/// or WebSocket, is always an explicitly opted-in trusted external service, and
+/// is **not** sandboxed or confined to the local worktree.
+///
+/// Remote credentials never live in these fields: `auth_header_env` names an
+/// environment variable and header values may reference `${ENV_VAR}`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AcpAgent {
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -2418,6 +2461,25 @@ pub struct AcpAgent {
     pub auto_approve: bool,
     #[serde(default = "default_acp_timeout")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub transport: AcpTransport,
+    /// Remote endpoint (`http`/`https` for Streamable HTTP, `ws`/`wss` for
+    /// WebSocket). Always empty for stdio agents.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Environment variable name holding the `Authorization` header value.
+    /// The value is read from the daemon environment and never persisted.
+    #[serde(default)]
+    pub auth_header_env: Option<String>,
+    /// Additional request headers. Values may contain `${ENV_VAR}` references;
+    /// expanded values are never persisted or logged.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_acp_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// Explicit opt-in required before VerlinPark contacts a remote agent.
+    #[serde(default)]
+    pub allow_remote: bool,
     pub created_at: String,
 }
 
@@ -2425,9 +2487,43 @@ fn default_acp_timeout() -> u64 {
     1_800
 }
 
+fn default_acp_connect_timeout() -> u64 {
+    30
+}
+
+/// Validated settings for creating or updating an ACP agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpAgentConfig {
+    pub name: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_approve: bool,
+    #[serde(default = "default_acp_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub transport: AcpTransport,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub auth_header_env: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_acp_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    #[serde(default)]
+    pub allow_remote: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddAcpAgentParams {
     pub name: String,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -2439,12 +2535,25 @@ pub struct AddAcpAgentParams {
     pub auto_approve: bool,
     #[serde(default = "default_acp_timeout")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub transport: AcpTransport,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub auth_header_env: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_acp_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    #[serde(default)]
+    pub allow_remote: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateAcpAgentParams {
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -2456,6 +2565,18 @@ pub struct UpdateAcpAgentParams {
     pub auto_approve: bool,
     #[serde(default = "default_acp_timeout")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub transport: AcpTransport,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub auth_header_env: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_acp_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    #[serde(default)]
+    pub allow_remote: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2468,6 +2589,10 @@ pub struct AcpProbeParams {
     pub agent_id: String,
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Create a session as part of the probe. Disable this for a pure
+    /// initialize/transport health check that leaves no server-side session.
+    #[serde(default = "default_true")]
+    pub create_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2475,13 +2600,50 @@ pub struct AcpAgentListResult {
     pub agents: Vec<AcpAgent>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Negotiated ACP capabilities observed during a probe.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpProbeCapabilities {
+    #[serde(default)]
+    pub load_session: bool,
+    #[serde(default)]
+    pub mcp_http: bool,
+    #[serde(default)]
+    pub mcp_sse: bool,
+    #[serde(default)]
+    pub prompt_image: bool,
+    #[serde(default)]
+    pub prompt_audio: bool,
+    #[serde(default)]
+    pub prompt_embedded_context: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpProbeResult {
     pub agent_id: String,
     pub agent_name: String,
     pub version: String,
     pub protocol_version: u16,
     pub session_created: bool,
+    #[serde(default)]
+    pub transport: AcpTransport,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub remote: bool,
+    #[serde(default)]
+    pub load_session: bool,
+    #[serde(default)]
+    pub capabilities: AcpProbeCapabilities,
+    /// Negotiated HTTP version for Streamable HTTP probes (`HTTP/1.1`,
+    /// `HTTP/2`, …); `None` for stdio and WebSocket.
+    #[serde(default)]
+    pub http_version: Option<String>,
+    #[serde(default)]
+    pub messages_sent: u64,
+    #[serde(default)]
+    pub messages_received: u64,
+    #[serde(default)]
+    pub streams_opened: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -6677,6 +6839,128 @@ pub struct ComputerStatusParams {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn legacy_acp_agent_configuration_decodes_as_stdio() {
+        let agent: AcpAgent = serde_json::from_value(json!({
+            "id": "agent-1",
+            "name": "gemini",
+            "command": "npx",
+            "args": ["-y", "gemini"],
+            "env": {"API_KEY": "hidden"},
+            "enabled": true,
+            "auto_approve": false,
+            "timeout_secs": 900,
+            "created_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(agent.transport, AcpTransport::Stdio);
+        assert_eq!(agent.endpoint, None);
+        assert_eq!(agent.auth_header_env, None);
+        assert!(agent.headers.is_empty());
+        assert_eq!(agent.connect_timeout_secs, 30);
+        assert!(!agent.allow_remote);
+        assert!(!agent.transport.is_remote());
+
+        let params: AddAcpAgentParams = serde_json::from_value(json!({
+            "name": "gemini",
+            "command": "npx"
+        }))
+        .unwrap();
+        assert_eq!(params.transport, AcpTransport::Stdio);
+        assert!(!params.allow_remote);
+    }
+
+    #[test]
+    fn remote_acp_agent_configuration_decodes_explicitly() {
+        let agent: AcpAgent = serde_json::from_value(json!({
+            "id": "agent-2",
+            "name": "remote",
+            "command": "",
+            "transport": "streamable_http",
+            "endpoint": "https://agent.example.test/acp",
+            "auth_header_env": "ACP_TOKEN",
+            "headers": {"x-project": "demo"},
+            "connect_timeout_secs": 45,
+            "allow_remote": true,
+            "timeout_secs": 900,
+            "created_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(agent.transport, AcpTransport::StreamableHttp);
+        assert!(agent.transport.is_remote());
+        assert_eq!(
+            agent.endpoint.as_deref(),
+            Some("https://agent.example.test/acp")
+        );
+        assert_eq!(agent.auth_header_env.as_deref(), Some("ACP_TOKEN"));
+        assert_eq!(agent.connect_timeout_secs, 45);
+        assert!(agent.allow_remote);
+
+        assert_eq!(
+            AcpTransport::parse("websocket"),
+            Some(AcpTransport::Websocket)
+        );
+        assert_eq!(
+            AcpTransport::parse("streamable-http"),
+            Some(AcpTransport::StreamableHttp)
+        );
+        assert_eq!(AcpTransport::parse("sse"), None);
+        assert_eq!(
+            serde_json::to_value(AcpTransport::StreamableHttp).unwrap(),
+            json!("streamable_http")
+        );
+    }
+
+    #[test]
+    fn acp_probe_capabilities_decode_additively() {
+        let legacy: AcpProbeResult = serde_json::from_value(json!({
+            "agent_id": "agent-1",
+            "agent_name": "gemini",
+            "version": "1",
+            "protocol_version": 1,
+            "session_created": true
+        }))
+        .unwrap();
+        assert_eq!(legacy.transport, AcpTransport::Stdio);
+        assert!(!legacy.remote);
+        assert!(!legacy.load_session);
+        assert!(!legacy.capabilities.load_session);
+        assert_eq!(legacy.http_version, None);
+        assert_eq!(legacy.messages_sent, 0);
+
+        let current: AcpProbeResult = serde_json::from_value(json!({
+            "agent_id": "agent-2",
+            "agent_name": "remote",
+            "version": "2",
+            "protocol_version": 1,
+            "session_created": true,
+            "transport": "websocket",
+            "endpoint": "wss://agent.example.test/acp",
+            "remote": true,
+            "load_session": true,
+            "http_version": "HTTP/2",
+            "messages_sent": 5,
+            "messages_received": 7,
+            "streams_opened": 2,
+            "capabilities": {
+                "load_session": true,
+                "mcp_http": true,
+                "mcp_sse": false,
+                "prompt_image": true,
+                "prompt_audio": false,
+                "prompt_embedded_context": true
+            }
+        }))
+        .unwrap();
+        assert_eq!(current.transport, AcpTransport::Websocket);
+        assert!(current.remote);
+        assert!(current.load_session);
+        assert!(current.capabilities.prompt_image);
+        assert!(!current.capabilities.prompt_audio);
+        assert_eq!(current.http_version.as_deref(), Some("HTTP/2"));
+        assert_eq!(current.streams_opened, 2);
+    }
 
     #[test]
     fn session_operation_ids_decode_as_optional() {

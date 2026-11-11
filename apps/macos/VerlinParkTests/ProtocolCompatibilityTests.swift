@@ -689,6 +689,10 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(agents.agents.first?.name, "gemini")
         XCTAssertEqual(agents.agents.first?.timeoutSecs, 900)
         XCTAssertEqual(agents.agents.first?.autoApprove, false)
+        XCTAssertEqual(agents.agents.first?.transport, .stdio)
+        XCTAssertNil(agents.agents.first?.endpoint)
+        XCTAssertFalse(agents.agents.first?.allowRemote ?? true)
+        XCTAssertEqual(agents.agents.first?.connectTimeoutSecs, 30)
 
         let probeJSON = """
         {
@@ -706,6 +710,99 @@ final class ProtocolCompatibilityTests: XCTestCase {
         XCTAssertEqual(probe.agentName, "gemini")
         XCTAssertEqual(probe.protocolVersion, 1)
         XCTAssertTrue(probe.sessionCreated)
+        XCTAssertEqual(probe.transport, .stdio)
+        XCTAssertFalse(probe.remote)
+        XCTAssertFalse(probe.loadSession)
+        XCTAssertFalse(probe.capabilities.loadSession)
+    }
+
+    func testAcpTransportProfilesAreExplicit() {
+        XCTAssertEqual(AcpTransport.stdio.rawValue, "stdio")
+        XCTAssertEqual(AcpTransport.streamableHTTP.rawValue, "streamable_http")
+        XCTAssertEqual(AcpTransport.websocket.rawValue, "websocket")
+        XCTAssertFalse(AcpTransport.stdio.isRemote)
+        XCTAssertTrue(AcpTransport.streamableHTTP.isRemote)
+        XCTAssertTrue(AcpTransport.websocket.isRemote)
+        XCTAssertEqual(AcpTransport.streamableHTTP.displayName, "streamable HTTP")
+    }
+
+    func testRemoteAcpAgentAndProbeDecode() throws {
+        let agentsJSON = """
+        {
+          "agents": [{
+            "id": "agent-remote",
+            "name": "remote",
+            "command": "",
+            "args": [],
+            "env": {},
+            "enabled": true,
+            "auto_approve": false,
+            "timeout_secs": 900,
+            "created_at": "2026-11-11T00:00:00Z",
+            "transport": "streamable_http",
+            "endpoint": "https://agent.example.test/acp",
+            "auth_header_env": "ACP_TOKEN",
+            "headers": {"x-project": "demo", "x-token": "${ACP_TOKEN}"},
+            "connect_timeout_secs": 15,
+            "allow_remote": true
+          }]
+        }
+        """
+        let agents = try JSONDecoder().decode(
+            AcpAgentListResult.self,
+            from: Data(agentsJSON.utf8)
+        )
+        let agent = try XCTUnwrap(agents.agents.first)
+        XCTAssertEqual(agent.transport, .streamableHTTP)
+        XCTAssertTrue(agent.transport.isRemote)
+        XCTAssertEqual(agent.endpoint, "https://agent.example.test/acp")
+        XCTAssertEqual(agent.authHeaderEnv, "ACP_TOKEN")
+        XCTAssertEqual(agent.headers["x-token"], "${ACP_TOKEN}")
+        XCTAssertEqual(agent.connectTimeoutSecs, 15)
+        XCTAssertTrue(agent.allowRemote)
+        XCTAssertEqual(agent.summary, "https://agent.example.test/acp")
+
+        let probeJSON = """
+        {
+          "agent_id": "agent-remote",
+          "agent_name": "remote-acp",
+          "version": "1.2.3",
+          "protocol_version": 1,
+          "session_created": true,
+          "transport": "websocket",
+          "endpoint": "wss://agent.example.test/acp",
+          "remote": true,
+          "load_session": true,
+          "http_version": "HTTP/2",
+          "messages_sent": 4,
+          "messages_received": 6,
+          "streams_opened": 2,
+          "capabilities": {
+            "load_session": true,
+            "mcp_http": true,
+            "mcp_sse": false,
+            "prompt_image": true,
+            "prompt_audio": false,
+            "prompt_embedded_context": true
+          }
+        }
+        """
+        let probe = try JSONDecoder().decode(
+            AcpProbeResult.self,
+            from: Data(probeJSON.utf8)
+        )
+        XCTAssertEqual(probe.transport, .websocket)
+        XCTAssertEqual(probe.endpoint, "wss://agent.example.test/acp")
+        XCTAssertTrue(probe.remote)
+        XCTAssertTrue(probe.loadSession)
+        XCTAssertTrue(probe.capabilities.loadSession)
+        XCTAssertTrue(probe.capabilities.mcpHTTP)
+        XCTAssertFalse(probe.capabilities.mcpSSE)
+        XCTAssertTrue(probe.capabilities.promptEmbeddedContext)
+        XCTAssertEqual(probe.httpVersion, "HTTP/2")
+        XCTAssertEqual(probe.messagesSent, 4)
+        XCTAssertEqual(probe.messagesReceived, 6)
+        XCTAssertEqual(probe.streamsOpened, 2)
     }
 
     func testMcpResourcesAndPromptsDecode() throws {

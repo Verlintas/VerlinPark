@@ -3456,6 +3456,78 @@ async fn manages_and_probes_acp_agents() {
     assert!(engine.list_acp_agents().await.unwrap().agents.is_empty());
 }
 
+#[tokio::test]
+async fn validates_remote_acp_transport_configuration() {
+    let data = TempDir::new().unwrap();
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let base = |transport: AcpTransport| AcpAgentConfig {
+        name: "remote".into(),
+        command: String::new(),
+        args: Vec::new(),
+        env: Default::default(),
+        enabled: true,
+        auto_approve: false,
+        timeout_secs: 900,
+        transport,
+        endpoint: Some("https://agent.example.test/acp".into()),
+        auth_header_env: Some("ACP_TOKEN".into()),
+        headers: std::collections::BTreeMap::from([("x-project".into(), "demo".into())]),
+        connect_timeout_secs: 15,
+        allow_remote: true,
+    };
+
+    let mut config = base(AcpTransport::StreamableHttp);
+    config.allow_remote = false;
+    assert!(
+        engine.add_acp_agent_config(config).await.is_err(),
+        "remote without allow_remote must fail"
+    );
+
+    let mut config = base(AcpTransport::StreamableHttp);
+    config.command = "npx".into();
+    assert!(engine.add_acp_agent_config(config).await.is_err());
+
+    let mut config = base(AcpTransport::StreamableHttp);
+    config.endpoint = Some("https://user:pass@agent.example.test/acp".into());
+    assert!(engine.add_acp_agent_config(config).await.is_err());
+
+    let mut config = base(AcpTransport::StreamableHttp);
+    config.endpoint = Some("wss://agent.example.test/acp".into());
+    assert!(engine.add_acp_agent_config(config).await.is_err());
+
+    let mut config = base(AcpTransport::StreamableHttp);
+    config.headers =
+        std::collections::BTreeMap::from([("authorization".into(), "Bearer inline-secret".into())]);
+    assert!(engine.add_acp_agent_config(config).await.is_err());
+
+    let mut config = base(AcpTransport::StreamableHttp);
+    config.auth_header_env = Some("INVALID-NAME".into());
+    assert!(engine.add_acp_agent_config(config).await.is_err());
+
+    let mut config = base(AcpTransport::Stdio);
+    config.name = "local".into();
+    config.command = "npx".into();
+    config.endpoint = None;
+    config.auth_header_env = None;
+    config.headers.clear();
+    config.allow_remote = false;
+    let stdio = engine.add_acp_agent_config(config).await.unwrap();
+    assert_eq!(stdio.transport, AcpTransport::Stdio);
+    assert_eq!(stdio.connect_timeout_secs, 30);
+
+    let mut config = base(AcpTransport::Websocket);
+    config.name = "remote-ws".into();
+    config.endpoint = Some("wss://agent.example.test/acp".into());
+    let remote = engine.add_acp_agent_config(config).await.unwrap();
+    assert_eq!(remote.transport, AcpTransport::Websocket);
+    assert_eq!(
+        remote.endpoint.as_deref(),
+        Some("wss://agent.example.test/acp")
+    );
+    assert!(remote.allow_remote);
+    assert_eq!(engine.list_acp_agents().await.unwrap().agents.len(), 2);
+}
+
 fn script_path(data: &TempDir, _project: &vp_protocol::types::Project) -> std::path::PathBuf {
     let path = data.path().join("probe-acp-agent.py");
     std::fs::write(

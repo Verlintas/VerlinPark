@@ -1294,9 +1294,15 @@ actor CoreClient {
         args: [String],
         env: [String: String],
         autoApprove: Bool,
-        timeoutSecs: Int
+        timeoutSecs: Int,
+        transport: AcpTransport = .stdio,
+        endpoint: String? = nil,
+        authHeaderEnv: String? = nil,
+        headers: [String: String] = [:],
+        connectTimeoutSecs: Int = 30,
+        allowRemote: Bool = false
     ) async throws -> AcpAgent {
-        let params: [String: JSONValue] = [
+        var params: [String: JSONValue] = [
             "name": .string(name),
             "command": .string(command),
             "args": .array(args.map(JSONValue.string)),
@@ -1304,7 +1310,17 @@ actor CoreClient {
             "enabled": .bool(true),
             "auto_approve": .bool(autoApprove),
             "timeout_secs": .number(Double(timeoutSecs)),
+            "transport": .string(transport.rawValue),
+            "headers": .object(headers.mapValues(JSONValue.string)),
+            "connect_timeout_secs": .number(Double(connectTimeoutSecs)),
+            "allow_remote": .bool(allowRemote),
         ]
+        if let endpoint {
+            params["endpoint"] = .string(endpoint)
+        }
+        if let authHeaderEnv {
+            params["auth_header_env"] = .string(authHeaderEnv)
+        }
         return try await request(method: "acp.agent.add", params: params)
             .decode(AcpAgentResult.self)
             .agent
@@ -1315,16 +1331,60 @@ actor CoreClient {
         enabled: Bool,
         autoApprove: Bool
     ) async throws -> AcpAgent {
-        let params: [String: JSONValue] = [
-            "id": .string(agent.id),
-            "name": .string(agent.name),
-            "command": .string(agent.command),
-            "args": .array(agent.args.map(JSONValue.string)),
-            "env": .object(agent.env.mapValues(JSONValue.string)),
+        try await updateAcpAgentSettings(
+            id: agent.id,
+            name: agent.name,
+            command: agent.command,
+            args: agent.args,
+            env: agent.env,
+            transport: agent.transport,
+            endpoint: agent.endpoint,
+            authHeaderEnv: agent.authHeaderEnv,
+            headers: agent.headers,
+            connectTimeoutSecs: agent.connectTimeoutSecs,
+            allowRemote: agent.allowRemote,
+            autoApprove: autoApprove,
+            timeoutSecs: agent.timeoutSecs,
+            enabled: enabled
+        )
+    }
+
+    func updateAcpAgentSettings(
+        id: String,
+        name: String,
+        command: String,
+        args: [String],
+        env: [String: String],
+        transport: AcpTransport,
+        endpoint: String?,
+        authHeaderEnv: String?,
+        headers: [String: String],
+        connectTimeoutSecs: Int,
+        allowRemote: Bool,
+        autoApprove: Bool,
+        timeoutSecs: Int,
+        enabled: Bool
+    ) async throws -> AcpAgent {
+        var params: [String: JSONValue] = [
+            "id": .string(id),
+            "name": .string(name),
+            "command": .string(command),
+            "args": .array(args.map(JSONValue.string)),
+            "env": .object(env.mapValues(JSONValue.string)),
             "enabled": .bool(enabled),
             "auto_approve": .bool(autoApprove),
-            "timeout_secs": .number(Double(agent.timeoutSecs)),
+            "timeout_secs": .number(Double(timeoutSecs)),
+            "transport": .string(transport.rawValue),
+            "headers": .object(headers.mapValues(JSONValue.string)),
+            "connect_timeout_secs": .number(Double(connectTimeoutSecs)),
+            "allow_remote": .bool(allowRemote),
         ]
+        if let endpoint {
+            params["endpoint"] = .string(endpoint)
+        }
+        if let authHeaderEnv {
+            params["auth_header_env"] = .string(authHeaderEnv)
+        }
         return try await request(method: "acp.agent.update", params: params)
             .decode(AcpAgentResult.self)
             .agent

@@ -17,17 +17,17 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AcpAgent, AcpAgentListResult, AcpProbeResult, AgentMessage, AgentRecord, Approval,
-    ApprovalGrant, Artifact, ArtifactBackfillResult, ArtifactDiffParams, ArtifactDiffResult,
-    ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy, ArtifactVersionsResult,
-    CheckpointPolicyResult, CheckpointRetentionPolicy, CitationAudit, CitationAuditMessage,
-    ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
-    ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement, ContextUsage,
-    ContinuationOutcome, CreateModelPresetParams, DoctorCheck, Event, GitLogResult, GitShowResult,
-    IntakeCreateParams, IntakeListResult, IntakeTask, IntakeUpdateParams, IntegrationPolicy,
-    MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult, McpProbeResult,
-    McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer, McpServerConfig,
-    McpServerListResult, McpToolListResult, MemoryBriefResult, MemoryConflict,
+    AcpAgent, AcpAgentConfig, AcpAgentListResult, AcpProbeResult, AcpTransport, AgentMessage,
+    AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactBackfillResult, ArtifactDiffParams,
+    ArtifactDiffResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
+    ArtifactVersionsResult, CheckpointPolicyResult, CheckpointRetentionPolicy, CitationAudit,
+    CitationAuditMessage, ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult,
+    ConsoleSignalResult, ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement,
+    ContextUsage, ContinuationOutcome, CreateModelPresetParams, DoctorCheck, Event, GitLogResult,
+    GitShowResult, IntakeCreateParams, IntakeListResult, IntakeTask, IntakeUpdateParams,
+    IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult,
+    McpProbeResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer,
+    McpServerConfig, McpServerListResult, McpToolListResult, MemoryBriefResult, MemoryConflict,
     MemoryConflictResolveResult, MemoryConflictScanResult, MemoryConflictsResult,
     MemoryDeleteResult, MemoryEmbeddingPolicy, MemoryEmbeddingsIndexRebuildResult,
     MemoryEmbeddingsIndexStatusResult, MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult,
@@ -13109,6 +13109,14 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.find_acp_agent(&identifier)).await?
     }
 
+    /// Add an ACP agent using the full transport-aware configuration.
+    pub async fn add_acp_agent_config(&self, config: AcpAgentConfig) -> Result<AcpAgent> {
+        let config = validate_acp_agent_config(config)?;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.add_acp_agent_config(&config)).await?
+    }
+
+    /// Backward-compatible stdio-only add used by older internal callers.
     #[allow(clippy::too_many_arguments)]
     pub async fn add_acp_agent(
         &self,
@@ -13120,23 +13128,37 @@ impl Engine {
         auto_approve: bool,
         timeout_secs: u64,
     ) -> Result<AcpAgent> {
-        let name = validate_acp_agent_fields(name, command, &args, &env, timeout_secs)?;
-        let store = self.store.clone();
-        let command = command.trim().to_string();
-        tokio::task::spawn_blocking(move || {
-            store.add_acp_agent(
-                &name,
-                &command,
-                &args,
-                &env,
-                enabled,
-                auto_approve,
-                timeout_secs,
-            )
+        self.add_acp_agent_config(AcpAgentConfig {
+            name: name.to_string(),
+            command: command.to_string(),
+            args,
+            env,
+            enabled,
+            auto_approve,
+            timeout_secs,
+            transport: AcpTransport::Stdio,
+            endpoint: None,
+            auth_header_env: None,
+            headers: Default::default(),
+            connect_timeout_secs: 30,
+            allow_remote: false,
         })
-        .await?
+        .await
     }
 
+    /// Update an ACP agent using the full transport-aware configuration.
+    pub async fn update_acp_agent_config(
+        &self,
+        id: &str,
+        config: AcpAgentConfig,
+    ) -> Result<Option<AcpAgent>> {
+        let config = validate_acp_agent_config(config)?;
+        let store = self.store.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.update_acp_agent_config(&id, &config)).await?
+    }
+
+    /// Backward-compatible stdio-only update used by older internal callers.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_acp_agent(
         &self,
@@ -13149,23 +13171,25 @@ impl Engine {
         auto_approve: bool,
         timeout_secs: u64,
     ) -> Result<Option<AcpAgent>> {
-        let name = validate_acp_agent_fields(name, command, &args, &env, timeout_secs)?;
-        let store = self.store.clone();
-        let id = id.to_string();
-        let command = command.trim().to_string();
-        tokio::task::spawn_blocking(move || {
-            store.update_acp_agent(
-                &id,
-                &name,
-                &command,
-                &args,
-                &env,
+        self.update_acp_agent_config(
+            id,
+            AcpAgentConfig {
+                name: name.to_string(),
+                command: command.to_string(),
+                args,
+                env,
                 enabled,
                 auto_approve,
                 timeout_secs,
-            )
-        })
-        .await?
+                transport: AcpTransport::Stdio,
+                endpoint: None,
+                auth_header_env: None,
+                headers: Default::default(),
+                connect_timeout_secs: 30,
+                allow_remote: false,
+            },
+        )
+        .await
     }
 
     pub async fn remove_acp_agent(&self, id: &str) -> Result<bool> {
@@ -13180,6 +13204,17 @@ impl Engine {
         &self,
         agent_id: &str,
         project_id: Option<String>,
+    ) -> Result<AcpProbeResult> {
+        self.probe_acp_agent_options(agent_id, project_id, true)
+            .await
+    }
+
+    /// Probe an agent, optionally skipping session creation.
+    pub async fn probe_acp_agent_options(
+        &self,
+        agent_id: &str,
+        project_id: Option<String>,
+        create_session: bool,
     ) -> Result<AcpProbeResult> {
         let agent = self
             .resolve_acp_agent(agent_id)
@@ -13237,8 +13272,16 @@ impl Engine {
             git_branch: None,
             mcp_servers,
             timeout: std::time::Duration::from_secs(agent.timeout_secs.min(120)),
+            transport: agent.transport,
+            endpoint: agent.endpoint.clone(),
+            auth_header_env: agent.auth_header_env.clone(),
+            headers: agent.headers.clone(),
+            connect_timeout: std::time::Duration::from_secs(agent.connect_timeout_secs),
+            allow_remote: agent.allow_remote,
+            resume_session_id: None,
+            diagnostics: None,
         };
-        let result = acp::probe(launch).await;
+        let result = acp::probe_with_options(launch, create_session).await;
         if let Err(error) = tokio::fs::remove_dir_all(&probe_root).await {
             tracing::warn!(%error, path = %probe_root.display(), "failed to remove ACP probe scratch");
         }
@@ -13249,6 +13292,15 @@ impl Engine {
             version: result.agent_version,
             protocol_version: result.protocol_version,
             session_created: result.session_created,
+            transport: agent.transport,
+            endpoint: agent.endpoint,
+            remote: agent.transport.is_remote(),
+            load_session: result.load_session,
+            capabilities: result.capabilities,
+            http_version: result.http_version,
+            messages_sent: result.messages_sent,
+            messages_received: result.messages_received,
+            streams_opened: result.streams_opened,
         })
     }
 
@@ -14346,40 +14398,8 @@ fn clip_transcript(text: &str, limit: usize) -> String {
     }
 }
 
-fn validate_acp_agent_fields(
-    name: &str,
-    command: &str,
-    args: &[String],
-    env: &std::collections::BTreeMap<String, String>,
-    timeout_secs: u64,
-) -> Result<String> {
-    let name = name.trim();
-    let command = command.trim();
-    if name.is_empty() || name.chars().count() > 100 {
-        anyhow::bail!("ACP agent name must be 1-100 characters");
-    }
-    if command.is_empty() || command.chars().count() > 4_096 {
-        anyhow::bail!("ACP agent command must be 1-4096 characters");
-    }
-    if args.len() > 128 || args.iter().any(|arg| arg.chars().count() > 4_096) {
-        anyhow::bail!("ACP agent arguments are limited to 128 values of 4096 characters");
-    }
-    if env.len() > 64
-        || env.iter().any(|(key, value)| {
-            key.is_empty()
-                || key.chars().count() > 256
-                || key.contains('=')
-                || key.contains('\0')
-                || value.chars().count() > 16_384
-                || value.contains('\0')
-        })
-    {
-        anyhow::bail!("ACP agent environment is limited to 64 valid variables of 16 KiB each");
-    }
-    if !(30..=14_400).contains(&timeout_secs) {
-        anyhow::bail!("ACP agent timeout must be between 30 and 14400 seconds");
-    }
-    Ok(name.to_string())
+fn validate_acp_agent_config(config: AcpAgentConfig) -> Result<AcpAgentConfig> {
+    acp::validate_agent_config(config)
 }
 
 fn validate_model_preset(

@@ -313,6 +313,24 @@ struct McpServer: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+enum AcpTransport: String, Codable, CaseIterable, Hashable, Sendable {
+    case stdio
+    case streamableHTTP = "streamable_http"
+    case websocket
+
+    var displayName: String {
+        switch self {
+        case .stdio: "stdio"
+        case .streamableHTTP: "streamable HTTP"
+        case .websocket: "WebSocket"
+        }
+    }
+
+    var isRemote: Bool {
+        self != .stdio
+    }
+}
+
 struct AcpAgent: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let name: String
@@ -323,6 +341,12 @@ struct AcpAgent: Codable, Identifiable, Hashable, Sendable {
     let autoApprove: Bool
     let timeoutSecs: Int
     let createdAt: String
+    let transport: AcpTransport
+    let endpoint: String?
+    let authHeaderEnv: String?
+    let headers: [String: String]
+    let connectTimeoutSecs: Int
+    let allowRemote: Bool
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -334,6 +358,38 @@ struct AcpAgent: Codable, Identifiable, Hashable, Sendable {
         case autoApprove = "auto_approve"
         case timeoutSecs = "timeout_secs"
         case createdAt = "created_at"
+        case transport
+        case endpoint
+        case authHeaderEnv = "auth_header_env"
+        case headers
+        case connectTimeoutSecs = "connect_timeout_secs"
+        case allowRemote = "allow_remote"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        command = try container.decodeIfPresent(String.self, forKey: .command) ?? ""
+        args = try container.decodeIfPresent([String].self, forKey: .args) ?? []
+        env = try container.decodeIfPresent([String: String].self, forKey: .env) ?? [:]
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove) ?? false
+        timeoutSecs = try container.decodeIfPresent(Int.self, forKey: .timeoutSecs) ?? 1800
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        transport = try container.decodeIfPresent(AcpTransport.self, forKey: .transport) ?? .stdio
+        endpoint = try container.decodeIfPresent(String.self, forKey: .endpoint)
+        authHeaderEnv = try container.decodeIfPresent(String.self, forKey: .authHeaderEnv)
+        headers = try container.decodeIfPresent([String: String].self, forKey: .headers) ?? [:]
+        connectTimeoutSecs = try container.decodeIfPresent(Int.self, forKey: .connectTimeoutSecs) ?? 30
+        allowRemote = try container.decodeIfPresent(Bool.self, forKey: .allowRemote) ?? false
+    }
+
+    var summary: String {
+        if transport.isRemote {
+            return endpoint ?? "remote endpoint"
+        }
+        return command
     }
 }
 
@@ -345,12 +401,59 @@ struct AcpAgentResult: Codable, Sendable {
     let agent: AcpAgent
 }
 
+struct AcpProbeCapabilities: Codable, Sendable {
+    let loadSession: Bool
+    let mcpHTTP: Bool
+    let mcpSSE: Bool
+    let promptImage: Bool
+    let promptAudio: Bool
+    let promptEmbeddedContext: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case loadSession = "load_session"
+        case mcpHTTP = "mcp_http"
+        case mcpSSE = "mcp_sse"
+        case promptImage = "prompt_image"
+        case promptAudio = "prompt_audio"
+        case promptEmbeddedContext = "prompt_embedded_context"
+    }
+
+    init() {
+        loadSession = false
+        mcpHTTP = false
+        mcpSSE = false
+        promptImage = false
+        promptAudio = false
+        promptEmbeddedContext = false
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        loadSession = try container.decodeIfPresent(Bool.self, forKey: .loadSession) ?? false
+        mcpHTTP = try container.decodeIfPresent(Bool.self, forKey: .mcpHTTP) ?? false
+        mcpSSE = try container.decodeIfPresent(Bool.self, forKey: .mcpSSE) ?? false
+        promptImage = try container.decodeIfPresent(Bool.self, forKey: .promptImage) ?? false
+        promptAudio = try container.decodeIfPresent(Bool.self, forKey: .promptAudio) ?? false
+        promptEmbeddedContext =
+            try container.decodeIfPresent(Bool.self, forKey: .promptEmbeddedContext) ?? false
+    }
+}
+
 struct AcpProbeResult: Codable, Sendable {
     let agentId: String
     let agentName: String
     let version: String
     let protocolVersion: Int
     let sessionCreated: Bool
+    let transport: AcpTransport
+    let endpoint: String?
+    let remote: Bool
+    let loadSession: Bool
+    let capabilities: AcpProbeCapabilities
+    let httpVersion: String?
+    let messagesSent: Int
+    let messagesReceived: Int
+    let streamsOpened: Int
 
     enum CodingKeys: String, CodingKey {
         case agentId = "agent_id"
@@ -358,6 +461,35 @@ struct AcpProbeResult: Codable, Sendable {
         case version
         case protocolVersion = "protocol_version"
         case sessionCreated = "session_created"
+        case transport
+        case endpoint
+        case remote
+        case loadSession = "load_session"
+        case capabilities
+        case httpVersion = "http_version"
+        case messagesSent = "messages_sent"
+        case messagesReceived = "messages_received"
+        case streamsOpened = "streams_opened"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        agentId = try container.decode(String.self, forKey: .agentId)
+        agentName = try container.decode(String.self, forKey: .agentName)
+        version = try container.decodeIfPresent(String.self, forKey: .version) ?? ""
+        protocolVersion = try container.decodeIfPresent(Int.self, forKey: .protocolVersion) ?? 1
+        sessionCreated = try container.decodeIfPresent(Bool.self, forKey: .sessionCreated) ?? false
+        transport = try container.decodeIfPresent(AcpTransport.self, forKey: .transport) ?? .stdio
+        endpoint = try container.decodeIfPresent(String.self, forKey: .endpoint)
+        remote = try container.decodeIfPresent(Bool.self, forKey: .remote) ?? false
+        loadSession = try container.decodeIfPresent(Bool.self, forKey: .loadSession) ?? false
+        capabilities =
+            try container.decodeIfPresent(AcpProbeCapabilities.self, forKey: .capabilities)
+                ?? AcpProbeCapabilities()
+        httpVersion = try container.decodeIfPresent(String.self, forKey: .httpVersion)
+        messagesSent = try container.decodeIfPresent(Int.self, forKey: .messagesSent) ?? 0
+        messagesReceived = try container.decodeIfPresent(Int.self, forKey: .messagesReceived) ?? 0
+        streamsOpened = try container.decodeIfPresent(Int.self, forKey: .streamsOpened) ?? 0
     }
 }
 

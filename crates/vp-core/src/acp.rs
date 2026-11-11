@@ -16,10 +16,10 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, CancelNotification, ContentBlock, EnvVariable, HttpHeader,
-    InitializeRequest, McpServer, McpServerHttp, McpServerSse, McpServerStdio, NewSessionRequest,
-    PermissionOption, PermissionOptionKind, PromptRequest, ProtocolVersion,
+    InitializeRequest, LoadSessionRequest, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
+    NewSessionRequest, PermissionOption, PermissionOptionKind, PromptRequest, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
+    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, TextContent,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo};
 use anyhow::{Context, Result, anyhow};
@@ -30,7 +30,15 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::tools::ToolContext;
-use vp_protocol::types::{McpServer as ManagedMcpServer, McpTransport};
+use vp_protocol::types::{
+    AcpProbeCapabilities, AcpTransport, McpServer as ManagedMcpServer, McpTransport,
+};
+
+mod config;
+mod transport;
+
+pub use config::validate_agent_config;
+pub(crate) use transport::{RemoteTransport, RemoteTransportConfig};
 
 /// One permission option offered by the external agent.
 #[derive(Debug, Clone)]
@@ -88,7 +96,11 @@ pub trait AcpHost: Send + Sync {
     async fn permission(&self, request: AcpPermissionRequest) -> AcpPermissionDecision;
 }
 
-/// Everything needed to launch an external agent under the shell sandbox.
+/// Everything needed to launch an external agent.
+///
+/// A stdio launch runs under the shell write sandbox. A remote launch uses
+/// `transport`, `endpoint`, and resolved header names; it never spawns a
+/// process and is not sandboxed by VerlinPark.
 #[derive(Debug, Clone)]
 pub struct AcpLaunch {
     pub name: String,
@@ -106,6 +118,18 @@ pub struct AcpLaunch {
     pub git_branch: Option<String>,
     pub mcp_servers: Vec<McpServer>,
     pub timeout: Duration,
+    pub transport: AcpTransport,
+    pub endpoint: Option<String>,
+    pub auth_header_env: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub connect_timeout: Duration,
+    pub allow_remote: bool,
+    /// Resume an existing agent session with `session/load`. The caller must
+    /// have confirmed that the agent advertises `loadSession`.
+    pub resume_session_id: Option<String>,
+    /// Optional shared diagnostics sink. Probes use it to report the
+    /// negotiated HTTP version; regular runs leave it unset.
+    pub(crate) diagnostics: Option<Arc<transport::TransportDiagnostics>>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +140,8 @@ pub struct AcpRunOutcome {
     pub agent_name: String,
     pub agent_version: String,
     pub protocol_version: u16,
+    pub transport: AcpTransport,
+    pub resumed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +150,13 @@ pub struct AcpProbeOutcome {
     pub agent_version: String,
     pub protocol_version: u16,
     pub session_created: bool,
+    pub transport: AcpTransport,
+    pub load_session: bool,
+    pub capabilities: AcpProbeCapabilities,
+    pub http_version: Option<String>,
+    pub messages_sent: u64,
+    pub messages_received: u64,
+    pub streams_opened: u64,
 }
 
 /// Run one prompt turn against an external ACP agent.
@@ -136,6 +169,8 @@ pub async fn run_prompt(
     let timeout = launch.timeout;
     let cwd = launch.cwd.clone();
     let mcp_server_configs = launch.mcp_servers.clone();
+    let transport = launch.transport;
+    let resume_session_id = launch.resume_session_id.clone();
     let outcome = connect(
         launch,
         host.clone(),
@@ -168,11 +203,28 @@ pub async fn run_prompt(
                     .unwrap_or(1);
                 let mcp_servers =
                     supported_mcp_servers(&initialized.agent_capabilities, &mcp_server_configs);
-                let session = connection
-                    .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers))
-                    .block_task()
-                    .await?;
-                let session_id = session.session_id;
+                let resumed = resume_session_id.is_some();
+                let session_id = if let Some(session_id) = resume_session_id.clone() {
+                    if !initialized.agent_capabilities.load_session {
+                        return Err(agent_client_protocol::util::internal_error(
+                            "ACP agent does not advertise the session/load capability",
+                        ));
+                    }
+                    let _ = connection
+                        .send_request(
+                            LoadSessionRequest::new(session_id.clone(), cwd.clone())
+                                .mcp_servers(mcp_servers),
+                        )
+                        .block_task()
+                        .await?;
+                    SessionId::new(session_id)
+                } else {
+                    connection
+                        .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers))
+                        .block_task()
+                        .await?
+                        .session_id
+                };
                 if *cancel.borrow() {
                     return Ok(AcpRunOutcome {
                         session_id: session_id.to_string(),
@@ -181,6 +233,8 @@ pub async fn run_prompt(
                         agent_name,
                         agent_version,
                         protocol_version,
+                        transport,
+                        resumed,
                     });
                 }
                 let prompt = connection
@@ -237,6 +291,8 @@ pub async fn run_prompt(
                     agent_name,
                     agent_version,
                     protocol_version,
+                    transport,
+                    resumed,
                 })
             })
         },
@@ -248,8 +304,27 @@ pub async fn run_prompt(
 /// Initialize an agent and create a session without sending a prompt. This is
 /// the safe connectivity check used by `vpx acp-probe` / Settings.
 pub async fn probe(launch: AcpLaunch) -> Result<AcpProbeOutcome> {
+    probe_with_options(launch, true).await
+}
+
+/// Probe an agent, optionally creating a session.
+///
+/// `create_session=false` is the lightweight transport/initialize health check:
+/// it negotiates capabilities and opens the connection stream but never sends
+/// `session/new`. This is useful for remote servers that charge for sessions or
+/// require an explicit provisioning step.
+pub async fn probe_with_options(
+    mut launch: AcpLaunch,
+    create_session: bool,
+) -> Result<AcpProbeOutcome> {
     let cwd = launch.cwd.clone();
+    let launch_transport = launch.transport;
     let mcp_server_configs = launch.mcp_servers.clone();
+    let diagnostics = launch
+        .diagnostics
+        .clone()
+        .unwrap_or_else(|| Arc::new(transport::TransportDiagnostics::default()));
+    launch.diagnostics = Some(diagnostics.clone());
     connect(
         launch,
         Arc::new(NoopHost),
@@ -261,11 +336,15 @@ pub async fn probe(launch: AcpLaunch) -> Result<AcpProbeOutcome> {
                     .await?;
                 let mcp_servers =
                     supported_mcp_servers(&initialized.agent_capabilities, &mcp_server_configs);
-                let session = connection
-                    .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers))
-                    .block_task()
-                    .await?;
-                let _ = session;
+                let session_created = if create_session {
+                    let _ = connection
+                        .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers))
+                        .block_task()
+                        .await?;
+                    true
+                } else {
+                    false
+                };
                 Ok(AcpProbeOutcome {
                     agent_name: initialized
                         .agent_info
@@ -282,7 +361,14 @@ pub async fn probe(launch: AcpLaunch) -> Result<AcpProbeOutcome> {
                         .to_string()
                         .parse()
                         .unwrap_or(1),
-                    session_created: true,
+                    session_created,
+                    transport: launch_transport,
+                    load_session: initialized.agent_capabilities.load_session,
+                    capabilities: probe_capabilities(&initialized.agent_capabilities),
+                    http_version: diagnostics.http_version(),
+                    messages_sent: diagnostics.messages_sent(),
+                    messages_received: diagnostics.messages_received(),
+                    streams_opened: diagnostics.streams_opened(),
                 })
             })
         },
@@ -304,29 +390,34 @@ where
         + Send
         + 'static,
 {
-    let mut command = build_command(&launch).await?;
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawning ACP agent {} ({})", launch.name, launch.command))?;
-    let _group = ProcessGroupGuard::new(child.id());
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("ACP agent stdin was not piped"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("ACP agent stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("ACP agent stderr was not piped"))?;
-    let stderr_buffer = Arc::new(Mutex::new(String::new()));
-    let stderr_task = tokio::spawn(read_stderr(stderr, stderr_buffer.clone()));
-    let transport = agent_client_protocol::ByteStreams::new(stdin.compat_write(), stdout.compat());
+    match launch.transport {
+        AcpTransport::Stdio => connect_stdio(launch, host, main).await,
+        AcpTransport::StreamableHttp | AcpTransport::Websocket => {
+            connect_remote(launch, host, main).await
+        }
+    }
+}
+
+/// Build the ACP client state machine once and bind it to a transport.
+async fn run_client<T, F, Tr>(
+    overall_timeout: Duration,
+    transport: Tr,
+    host: Arc<dyn AcpHost>,
+    main: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            ConnectionTo<Agent>,
+            Arc<dyn AcpHost>,
+            mpsc::UnboundedReceiver<SessionNotification>,
+        ) -> BoxMain<T>
+        + Send
+        + 'static,
+    Tr: agent_client_protocol::ConnectTo<Client> + 'static,
+{
     let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionNotification>();
     let permission_host = host.clone();
-    let overall_timeout = launch.timeout + Duration::from_secs(15);
     let connected = Client
         .builder()
         .on_receive_notification(
@@ -357,6 +448,45 @@ where
                 "ACP agent did not finish within {overall_timeout:?}"
             )))
         });
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => Err(anyhow!("{error}")),
+    }
+}
+
+async fn connect_stdio<T, F>(launch: AcpLaunch, host: Arc<dyn AcpHost>, main: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            ConnectionTo<Agent>,
+            Arc<dyn AcpHost>,
+            mpsc::UnboundedReceiver<SessionNotification>,
+        ) -> BoxMain<T>
+        + Send
+        + 'static,
+{
+    let mut command = build_command(&launch).await?;
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawning ACP agent {} ({})", launch.name, launch.command))?;
+    let _group = ProcessGroupGuard::new(child.id());
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("ACP agent stdin was not piped"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("ACP agent stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("ACP agent stderr was not piped"))?;
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+    let stderr_task = tokio::spawn(read_stderr(stderr, stderr_buffer.clone()));
+    let transport = agent_client_protocol::ByteStreams::new(stdin.compat_write(), stdout.compat());
+    let overall_timeout = launch.timeout + Duration::from_secs(15);
+    let result = run_client(overall_timeout, transport, host, main).await;
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), stderr_task).await;
@@ -375,6 +505,25 @@ where
             Err(anyhow!("ACP agent {} failed: {detail}", launch.name))
         }
     }
+}
+
+async fn connect_remote<T, F>(launch: AcpLaunch, host: Arc<dyn AcpHost>, main: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            ConnectionTo<Agent>,
+            Arc<dyn AcpHost>,
+            mpsc::UnboundedReceiver<SessionNotification>,
+        ) -> BoxMain<T>
+        + Send
+        + 'static,
+{
+    let config = RemoteTransportConfig::from_launch(&launch)?;
+    let transport = RemoteTransport::new(config);
+    let overall_timeout = launch.timeout + launch.connect_timeout + Duration::from_secs(15);
+    run_client(overall_timeout, transport, host, main)
+        .await
+        .map_err(|error| anyhow!("ACP agent {} failed: {error}", launch.name))
 }
 
 async fn build_command(launch: &AcpLaunch) -> Result<tokio::process::Command> {
@@ -630,6 +779,17 @@ fn acp_headers(server: &ManagedMcpServer) -> Result<Vec<HttpHeader>> {
         .collect())
 }
 
+fn probe_capabilities(capabilities: &AgentCapabilities) -> AcpProbeCapabilities {
+    AcpProbeCapabilities {
+        load_session: capabilities.load_session,
+        mcp_http: capabilities.mcp_capabilities.http,
+        mcp_sse: capabilities.mcp_capabilities.sse,
+        prompt_image: capabilities.prompt_capabilities.image,
+        prompt_audio: capabilities.prompt_capabilities.audio,
+        prompt_embedded_context: capabilities.prompt_capabilities.embedded_context,
+    }
+}
+
 fn supported_mcp_servers(
     capabilities: &AgentCapabilities,
     servers: &[McpServer],
@@ -688,6 +848,12 @@ impl Drop for ProcessGroupGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod transport_faults;
+
+#[cfg(test)]
+pub(crate) mod transport_integration;
 
 #[cfg(test)]
 mod tests {
@@ -840,6 +1006,14 @@ for line in sys.stdin:
             git_branch: None,
             mcp_servers: Vec::new(),
             timeout: Duration::from_secs(20),
+            transport: AcpTransport::Stdio,
+            endpoint: None,
+            auth_header_env: None,
+            headers: BTreeMap::new(),
+            connect_timeout: Duration::from_secs(5),
+            allow_remote: false,
+            resume_session_id: None,
+            diagnostics: None,
         };
         let outcome = run_prompt(launch, "do the task".into(), host.clone(), cancel_rx)
             .await
@@ -934,6 +1108,14 @@ for line in sys.stdin:
             git_branch: None,
             mcp_servers: Vec::new(),
             timeout: Duration::from_secs(20),
+            transport: AcpTransport::Stdio,
+            endpoint: None,
+            auth_header_env: None,
+            headers: BTreeMap::new(),
+            connect_timeout: Duration::from_secs(5),
+            allow_remote: false,
+            resume_session_id: None,
+            diagnostics: None,
         };
         let run =
             tokio::spawn(
@@ -977,6 +1159,14 @@ for line in sys.stdin:
             git_branch: None,
             mcp_servers: Vec::new(),
             timeout: Duration::from_secs(20),
+            transport: AcpTransport::Stdio,
+            endpoint: None,
+            auth_header_env: None,
+            headers: BTreeMap::new(),
+            connect_timeout: Duration::from_secs(5),
+            allow_remote: false,
+            resume_session_id: None,
+            diagnostics: None,
         };
         let outcome = probe(launch).await.unwrap();
         assert_eq!(outcome.agent_name, "fake-acp");

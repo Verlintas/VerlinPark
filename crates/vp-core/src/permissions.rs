@@ -384,6 +384,23 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
     }
 }
 
+/// Assess delegating a task to a configured ACP agent.
+///
+/// A stdio ACP agent runs under the local write sandbox, so the delegation
+/// itself stays read-only at the tool layer and the agent's own permission
+/// requests are assessed separately. A remote agent is not sandboxed by
+/// VerlinPark and may act on a different host, so the delegation is a
+/// host-state decision that a human must approve in `smart`/`strict` mode and
+/// that `unattended` denies.
+pub fn assess_remote_acp_delegation(name: &str, transport: &str) -> PermissionAssessment {
+    PermissionAssessment::new(
+        RiskLevel::HostState,
+        format!(
+            "remote ACP agent {name} ({transport}) is a trusted external service and is not sandboxed by VerlinPark"
+        ),
+    )
+}
+
 pub fn assess_acp_permission(
     request: &AcpPermissionRequest,
     worktree: &Path,
@@ -1890,6 +1907,40 @@ mod tests {
             RiskLevel::Destructive
         );
         assert!(shell("echo x >|/Users/example/file").risk >= RiskLevel::HostState);
+    }
+
+    #[test]
+    fn remote_acp_delegation_is_host_state_in_every_mode() {
+        for (mode, expected) in [
+            (ApprovalMode::Smart, Some(ApprovalDecision::Ask {
+                risk: RiskLevel::HostState,
+                reason: "remote ACP agent remote (streamable_http) is a trusted external service and is not sandboxed by VerlinPark".into(),
+            })),
+            (ApprovalMode::Strict, Some(ApprovalDecision::Ask {
+                risk: RiskLevel::HostState,
+                reason: "remote ACP agent remote (streamable_http) is a trusted external service and is not sandboxed by VerlinPark".into(),
+            })),
+            (ApprovalMode::Unattended, None),
+        ] {
+            let assessment = assess_remote_acp_delegation("remote", "streamable_http");
+            assert_eq!(assessment.risk, RiskLevel::HostState);
+            assert!(assessment.risk.requires_human());
+            let decision = decide(mode, &assessment, false);
+            match (decision, expected) {
+                (ApprovalDecision::Ask { risk, .. }, Some(ApprovalDecision::Ask { risk: want, .. })) => {
+                    assert_eq!(risk, want);
+                }
+                (ApprovalDecision::Deny { risk, .. }, None) => {
+                    assert_eq!(risk, RiskLevel::HostState);
+                }
+                (decision, expected) => {
+                    panic!("unexpected remote ACP decision {decision:?}, expected {expected:?}")
+                }
+            }
+        }
+        let assessment = assess_remote_acp_delegation("remote", "websocket");
+        assert!(assessment.reason.contains("not sandboxed"));
+        assert!(assessment.reason.contains("websocket"));
     }
 
     #[test]

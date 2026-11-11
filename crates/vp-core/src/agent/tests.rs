@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 use vp_providers::{EventStream, ProviderError};
 use vp_store::Store;
@@ -6786,6 +6787,163 @@ async fn delegates_to_an_external_acp_agent_and_integrates_it() {
         event.kind == "agent.finished"
             && event.payload["agent_role"] == "worker"
             && event.payload["merged"] == true
+    }));
+}
+
+#[tokio::test]
+async fn delegates_to_a_remote_acp_agent_with_host_state_approval() {
+    use crate::acp::transport_integration::{TestServerConfig, TestServerHandle};
+    use vp_protocol::types::{AcpAgentConfig, AcpTransport};
+
+    let server = TestServerHandle::start(TestServerConfig::default()).await;
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_blocked".into(),
+                    name: "delegate_acp".into(),
+                    arguments: serde_json::json!({
+                        "agent": "remote-blocked",
+                        "objective": "this must be refused"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_remote".into(),
+                    name: "delegate_acp".into(),
+                    arguments: serde_json::json!({
+                        "agent": "remote-http",
+                        "objective": "run on the remote service",
+                        "write_scope": ["remote.txt"]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    // Bypass add-time validation deliberately: a row created by an older build
+    // or a hand edit must still be refused by delegation.
+    engine
+        .store()
+        .add_acp_agent_config(&AcpAgentConfig {
+            name: "remote-blocked".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            enabled: true,
+            auto_approve: false,
+            timeout_secs: 120,
+            transport: AcpTransport::StreamableHttp,
+            endpoint: Some(server.endpoint.clone()),
+            auth_header_env: None,
+            headers: Default::default(),
+            connect_timeout_secs: 5,
+            allow_remote: false,
+        })
+        .unwrap();
+    engine
+        .add_acp_agent_config(AcpAgentConfig {
+            name: "remote-http".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            enabled: true,
+            auto_approve: false,
+            timeout_secs: 120,
+            transport: AcpTransport::StreamableHttp,
+            endpoint: Some(server.endpoint.clone()),
+            auth_header_env: None,
+            headers: Default::default(),
+            connect_timeout_secs: 5,
+            allow_remote: true,
+        })
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "remote acp".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+
+    let approver_engine = engine.clone();
+    let approver_session = session.id.clone();
+    let approver = tokio::spawn(async move {
+        for _ in 0..300 {
+            if let Ok(approvals) = approver_engine
+                .list_approvals(Some(approver_session.clone()))
+                .await
+            {
+                for approval in approvals
+                    .iter()
+                    .filter(|approval| approval.status == "pending")
+                {
+                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    set_approval_mode(&service, ApprovalMode::Strict);
+    service.start(&session.id, "remote acp").await.unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    approver.abort();
+    assert_eq!(finished.status, "idle");
+    assert_eq!(
+        server.server.counters.prompts.load(Ordering::SeqCst),
+        1,
+        "only the explicitly allowed remote agent may prompt"
+    );
+
+    let agents = engine.list_agents(&session.id).await.unwrap();
+    assert!(
+        agents.iter().any(|agent| agent.model == "acp:remote-http"),
+        "the allowed remote agent is recorded as a worker: {agents:?}"
+    );
+    assert!(
+        !agents
+            .iter()
+            .any(|agent| agent.model == "acp:remote-blocked"),
+        "a remote agent without allow_remote must never spawn"
+    );
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "approval.requested"
+            && event.payload["tool"] == "delegate_acp"
+            && event.payload["approval_risk"] == "host_state"
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.spawned"
+            && event.payload["acp_transport"] == "streamable_http"
+            && event.payload["acp_sandboxed"] == false
+            && event.payload["acp_endpoint"] == server.endpoint
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message"
+            && event.payload["acp_transport"] == "streamable_http"
+            && event.payload["acp_resumed"] == false
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.finished"
+            && event.payload["agent_role"] == "worker"
+            && event.payload["merged"] == false
     }));
 }
 

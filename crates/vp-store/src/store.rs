@@ -13,10 +13,10 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AcpAgent, AgentMessage, AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactPolicy,
-    ArtifactVersion, CheckpointRetentionPolicy, ContinuationOutcome, Event, IntakeTask,
-    IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryConflict,
-    MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
+    AcpAgent, AcpAgentConfig, AcpTransport, AgentMessage, AgentRecord, Approval, ApprovalGrant,
+    Artifact, ArtifactPolicy, ArtifactVersion, CheckpointRetentionPolicy, ContinuationOutcome,
+    Event, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport,
+    MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
     MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy,
     MemoryStatCount, MergeQueueEntry, MetricCount, ModelPreset, OrchestrationDecision,
     OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, Program,
@@ -1718,15 +1718,21 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS acp_agents (
-                id           TEXT PRIMARY KEY,
-                name         TEXT NOT NULL UNIQUE,
-                command      TEXT NOT NULL,
-                args         TEXT NOT NULL,
-                env          TEXT NOT NULL,
-                enabled      INTEGER NOT NULL DEFAULT 1,
-                auto_approve INTEGER NOT NULL DEFAULT 0,
-                timeout_secs INTEGER NOT NULL DEFAULT 1800,
-                created_at   TEXT NOT NULL
+                id                   TEXT PRIMARY KEY,
+                name                 TEXT NOT NULL UNIQUE,
+                command              TEXT NOT NULL,
+                args                 TEXT NOT NULL,
+                env                  TEXT NOT NULL,
+                enabled              INTEGER NOT NULL DEFAULT 1,
+                auto_approve         INTEGER NOT NULL DEFAULT 0,
+                timeout_secs         INTEGER NOT NULL DEFAULT 1800,
+                created_at           TEXT NOT NULL,
+                transport            TEXT NOT NULL DEFAULT 'stdio',
+                endpoint             TEXT,
+                auth_header_env      TEXT,
+                headers              TEXT NOT NULL DEFAULT '{}',
+                connect_timeout_secs INTEGER NOT NULL DEFAULT 30,
+                allow_remote         INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS project_memory_policies (
@@ -2496,6 +2502,27 @@ impl Store {
         ensure_column(&conn, "agents", "branch", "TEXT")?;
         ensure_column(&conn, "agents", "task_id", "TEXT")?;
         ensure_column(&conn, "agents", "department", "TEXT")?;
+        ensure_column(
+            &conn,
+            "acp_agents",
+            "transport",
+            "TEXT NOT NULL DEFAULT 'stdio'",
+        )?;
+        ensure_column(&conn, "acp_agents", "endpoint", "TEXT")?;
+        ensure_column(&conn, "acp_agents", "auth_header_env", "TEXT")?;
+        ensure_column(&conn, "acp_agents", "headers", "TEXT NOT NULL DEFAULT '{}'")?;
+        ensure_column(
+            &conn,
+            "acp_agents",
+            "connect_timeout_secs",
+            "INTEGER NOT NULL DEFAULT 30",
+        )?;
+        ensure_column(
+            &conn,
+            "acp_agents",
+            "allow_remote",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(
             &conn,
             "memories",
@@ -10622,12 +10649,16 @@ impl Store {
         Ok(conn.execute("DELETE FROM mcp_servers WHERE id = ?1", params![server_id])? > 0)
     }
 
+    const ACP_AGENT_COLUMNS: &'static str = "id, name, command, args, env, enabled, auto_approve, \
+         timeout_secs, created_at, transport, endpoint, auth_header_env, headers, \
+         connect_timeout_secs, allow_remote";
+
     pub fn list_acp_agents(&self) -> Result<Vec<AcpAgent>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at
-             FROM acp_agents ORDER BY name ASC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM acp_agents ORDER BY name ASC",
+            Self::ACP_AGENT_COLUMNS
+        ))?;
         let rows = stmt.query_map([], map_acp_agent)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -10635,8 +10666,10 @@ impl Store {
     pub fn get_acp_agent(&self, agent_id: &str) -> Result<Option<AcpAgent>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at
-             FROM acp_agents WHERE id = ?1",
+            &format!(
+                "SELECT {} FROM acp_agents WHERE id = ?1",
+                Self::ACP_AGENT_COLUMNS
+            ),
             params![agent_id],
             map_acp_agent,
         )
@@ -10647,8 +10680,10 @@ impl Store {
     pub fn find_acp_agent(&self, identifier: &str) -> Result<Option<AcpAgent>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at
-             FROM acp_agents WHERE id = ?1 OR name = ?1",
+            &format!(
+                "SELECT {} FROM acp_agents WHERE id = ?1 OR name = ?1",
+                Self::ACP_AGENT_COLUMNS
+            ),
             params![identifier],
             map_acp_agent,
         )
@@ -10656,6 +10691,53 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// Insert an ACP agent with the full transport-aware configuration.
+    pub fn add_acp_agent_config(&self, config: &AcpAgentConfig) -> Result<AcpAgent> {
+        let agent = AcpAgent {
+            id: Uuid::now_v7().to_string(),
+            name: config.name.clone(),
+            command: config.command.clone(),
+            args: config.args.clone(),
+            env: config.env.clone(),
+            enabled: config.enabled,
+            auto_approve: config.auto_approve,
+            timeout_secs: config.timeout_secs,
+            transport: config.transport,
+            endpoint: config.endpoint.clone(),
+            auth_header_env: config.auth_header_env.clone(),
+            headers: config.headers.clone(),
+            connect_timeout_secs: config.connect_timeout_secs,
+            allow_remote: config.allow_remote,
+            created_at: now_rfc3339(),
+        };
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO acp_agents
+             (id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at,
+              transport, endpoint, auth_header_env, headers, connect_timeout_secs, allow_remote)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                agent.id,
+                agent.name,
+                agent.command,
+                serde_json::to_string(&agent.args)?,
+                serde_json::to_string(&agent.env)?,
+                if agent.enabled { 1 } else { 0 },
+                if agent.auto_approve { 1 } else { 0 },
+                agent.timeout_secs as i64,
+                agent.created_at,
+                agent.transport.as_str(),
+                agent.endpoint,
+                agent.auth_header_env,
+                serde_json::to_string(&agent.headers)?,
+                agent.connect_timeout_secs as i64,
+                if agent.allow_remote { 1 } else { 0 }
+            ],
+        )?;
+        Ok(agent)
+    }
+
+    /// Backward-compatible stdio-only insert used by older internal callers.
     #[allow(clippy::too_many_arguments)]
     pub fn add_acp_agent(
         &self,
@@ -10667,8 +10749,7 @@ impl Store {
         auto_approve: bool,
         timeout_secs: u64,
     ) -> Result<AcpAgent> {
-        let agent = AcpAgent {
-            id: Uuid::now_v7().to_string(),
+        self.add_acp_agent_config(&AcpAgentConfig {
             name: name.to_string(),
             command: command.to_string(),
             args: args.to_vec(),
@@ -10676,28 +10757,53 @@ impl Store {
             enabled,
             auto_approve,
             timeout_secs,
-            created_at: now_rfc3339(),
-        };
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO acp_agents
-             (id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                agent.id,
-                agent.name,
-                agent.command,
-                serde_json::to_string(&agent.args)?,
-                serde_json::to_string(&agent.env)?,
-                if agent.enabled { 1 } else { 0 },
-                if agent.auto_approve { 1 } else { 0 },
-                agent.timeout_secs as i64,
-                agent.created_at
-            ],
-        )?;
-        Ok(agent)
+            transport: AcpTransport::Stdio,
+            endpoint: None,
+            auth_header_env: None,
+            headers: Default::default(),
+            connect_timeout_secs: 30,
+            allow_remote: false,
+        })
     }
 
+    /// Update every transport-aware field of an ACP agent.
+    pub fn update_acp_agent_config(
+        &self,
+        agent_id: &str,
+        config: &AcpAgentConfig,
+    ) -> Result<Option<AcpAgent>> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE acp_agents SET name = ?1, command = ?2, args = ?3, env = ?4,
+                enabled = ?5, auto_approve = ?6, timeout_secs = ?7, transport = ?8,
+                endpoint = ?9, auth_header_env = ?10, headers = ?11,
+                connect_timeout_secs = ?12, allow_remote = ?13
+             WHERE id = ?14",
+            params![
+                config.name,
+                config.command,
+                serde_json::to_string(&config.args)?,
+                serde_json::to_string(&config.env)?,
+                if config.enabled { 1 } else { 0 },
+                if config.auto_approve { 1 } else { 0 },
+                config.timeout_secs as i64,
+                config.transport.as_str(),
+                config.endpoint,
+                config.auth_header_env,
+                serde_json::to_string(&config.headers)?,
+                config.connect_timeout_secs as i64,
+                if config.allow_remote { 1 } else { 0 },
+                agent_id
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_acp_agent(agent_id)
+    }
+
+    /// Backward-compatible stdio-only update used by older internal callers.
     #[allow(clippy::too_many_arguments)]
     pub fn update_acp_agent(
         &self,
@@ -10710,27 +10816,24 @@ impl Store {
         auto_approve: bool,
         timeout_secs: u64,
     ) -> Result<Option<AcpAgent>> {
-        let conn = self.lock()?;
-        let changed = conn.execute(
-            "UPDATE acp_agents SET name = ?1, command = ?2, args = ?3, env = ?4,
-                enabled = ?5, auto_approve = ?6, timeout_secs = ?7
-             WHERE id = ?8",
-            params![
-                name,
-                command,
-                serde_json::to_string(args)?,
-                serde_json::to_string(env)?,
-                if enabled { 1 } else { 0 },
-                if auto_approve { 1 } else { 0 },
-                timeout_secs as i64,
-                agent_id
-            ],
-        )?;
-        if changed == 0 {
-            return Ok(None);
-        }
-        drop(conn);
-        self.get_acp_agent(agent_id)
+        self.update_acp_agent_config(
+            agent_id,
+            &AcpAgentConfig {
+                name: name.to_string(),
+                command: command.to_string(),
+                args: args.to_vec(),
+                env: env.clone(),
+                enabled,
+                auto_approve,
+                timeout_secs,
+                transport: AcpTransport::Stdio,
+                endpoint: None,
+                auth_header_env: None,
+                headers: Default::default(),
+                connect_timeout_secs: 30,
+                allow_remote: false,
+            },
+        )
     }
 
     pub fn remove_acp_agent(&self, agent_id: &str) -> Result<bool> {
@@ -19925,6 +20028,8 @@ fn fts_query(input: &str) -> Option<String> {
 fn map_acp_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AcpAgent> {
     let args: String = row.get(3)?;
     let env: String = row.get(4)?;
+    let transport: String = row.get(9)?;
+    let headers: String = row.get(12)?;
     Ok(AcpAgent {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -19935,6 +20040,12 @@ fn map_acp_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AcpAgent> {
         auto_approve: row.get::<_, i64>(6)? != 0,
         timeout_secs: row.get::<_, i64>(7)? as u64,
         created_at: row.get(8)?,
+        transport: AcpTransport::parse(&transport).unwrap_or_default(),
+        endpoint: row.get(10)?,
+        auth_header_env: row.get(11)?,
+        headers: serde_json::from_str(&headers).unwrap_or_default(),
+        connect_timeout_secs: row.get::<_, i64>(13)?.max(1) as u64,
+        allow_remote: row.get::<_, i64>(14)? != 0,
     })
 }
 

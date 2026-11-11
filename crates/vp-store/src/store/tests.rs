@@ -510,6 +510,116 @@ fn manages_acp_agent_configs() {
 }
 
 #[test]
+fn migrates_legacy_acp_agent_rows_to_stdio_defaults() {
+    let data = TempDir::new().unwrap();
+    let database = data.path().join("verlinpark.db");
+    {
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE acp_agents (
+                id           TEXT PRIMARY KEY,
+                name         TEXT NOT NULL UNIQUE,
+                command      TEXT NOT NULL,
+                args         TEXT NOT NULL,
+                env          TEXT NOT NULL,
+                enabled      INTEGER NOT NULL DEFAULT 1,
+                auto_approve INTEGER NOT NULL DEFAULT 0,
+                timeout_secs INTEGER NOT NULL DEFAULT 1800,
+                created_at   TEXT NOT NULL
+            );
+            INSERT INTO acp_agents
+                (id, name, command, args, env, enabled, auto_approve, timeout_secs, created_at)
+            VALUES
+                ('legacy', 'legacy', 'npx', '[]', '{}', 1, 0, 900, '2026-11-01T00:00:00Z');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(data.path()).unwrap();
+    let agent = store.find_acp_agent("legacy").unwrap().unwrap();
+    assert_eq!(agent.command, "npx");
+    assert_eq!(agent.transport, vp_protocol::types::AcpTransport::Stdio);
+    assert!(agent.endpoint.is_none());
+    assert!(agent.auth_header_env.is_none());
+    assert!(agent.headers.is_empty());
+    assert_eq!(agent.connect_timeout_secs, 30);
+    assert!(!agent.allow_remote);
+    assert_eq!(agent.timeout_secs, 900);
+}
+
+#[test]
+fn persists_remote_acp_transport_configuration() {
+    let (_data, store, _repo) = test_store();
+    let agent = store
+        .add_acp_agent_config(&vp_protocol::types::AcpAgentConfig {
+            name: "remote".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            enabled: true,
+            auto_approve: false,
+            timeout_secs: 900,
+            transport: vp_protocol::types::AcpTransport::StreamableHttp,
+            endpoint: Some("https://agent.example.test/acp".into()),
+            auth_header_env: Some("ACP_TOKEN".into()),
+            headers: std::collections::BTreeMap::from([("x-project".into(), "demo".into())]),
+            connect_timeout_secs: 15,
+            allow_remote: true,
+        })
+        .unwrap();
+    assert_eq!(
+        agent.transport,
+        vp_protocol::types::AcpTransport::StreamableHttp
+    );
+    assert_eq!(
+        agent.endpoint.as_deref(),
+        Some("https://agent.example.test/acp")
+    );
+    assert_eq!(agent.auth_header_env.as_deref(), Some("ACP_TOKEN"));
+    assert_eq!(agent.connect_timeout_secs, 15);
+    assert!(agent.allow_remote);
+
+    let loaded = store.get_acp_agent(&agent.id).unwrap().unwrap();
+    assert_eq!(loaded, agent);
+    assert_eq!(
+        loaded.headers.get("x-project").map(String::as_str),
+        Some("demo")
+    );
+
+    let updated = store
+        .update_acp_agent_config(
+            &agent.id,
+            &vp_protocol::types::AcpAgentConfig {
+                name: "remote-ws".into(),
+                command: String::new(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                enabled: false,
+                auto_approve: true,
+                timeout_secs: 300,
+                transport: vp_protocol::types::AcpTransport::Websocket,
+                endpoint: Some("wss://agent.example.test/acp".into()),
+                auth_header_env: None,
+                headers: std::collections::BTreeMap::new(),
+                connect_timeout_secs: 5,
+                allow_remote: true,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        updated.transport,
+        vp_protocol::types::AcpTransport::Websocket
+    );
+    assert_eq!(
+        updated.endpoint.as_deref(),
+        Some("wss://agent.example.test/acp")
+    );
+    assert!(updated.auth_header_env.is_none());
+    assert!(!updated.enabled);
+    assert!(updated.headers.is_empty());
+}
+
+#[test]
 fn creates_and_filters_project_memories() {
     let (_data, store, repo) = test_store();
     let project = store

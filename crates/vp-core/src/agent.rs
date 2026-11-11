@@ -35,7 +35,8 @@ use crate::RuntimeLeaseGuard;
 use crate::acp;
 use crate::budget::{BudgetReason, Rejection, ScopeRequest, Spend};
 use crate::permissions::{
-    ApprovalDecision, RiskLevel, assess_acp_permission, assess_tool_call, decide,
+    ApprovalDecision, RiskLevel, assess_acp_permission, assess_remote_acp_delegation,
+    assess_tool_call, decide,
 };
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::worktree;
@@ -8121,6 +8122,7 @@ struct AcpDelegateRequest {
     objective: String,
     instructions: String,
     timeout: Option<u64>,
+    resume_session_id: Option<String>,
 }
 
 fn parse_acp_delegate(input: &serde_json::Value) -> Result<AcpDelegateRequest> {
@@ -8154,12 +8156,25 @@ fn parse_acp_delegate(input: &serde_json::Value) -> Result<AcpDelegateRequest> {
         .get("timeout_secs")
         .and_then(serde_json::Value::as_u64)
         .filter(|seconds| *seconds >= 30);
+    let resume_session_id = input
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if resume_session_id
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > 256 || value.contains(['\r', '\n', '\0']))
+    {
+        return Err(anyhow!("session_id must be at most 256 characters"));
+    }
     Ok(AcpDelegateRequest {
         agent,
         name,
         objective,
         instructions,
         timeout,
+        resume_session_id,
     })
 }
 
@@ -8184,6 +8199,7 @@ async fn delegate_acp(
         objective,
         instructions,
         timeout,
+        resume_session_id,
     } = request;
     let Some(acp_agent) = engine.resolve_acp_agent(&agent_ref).await? else {
         return Ok(AcpDelegation::Output(ToolOutput::error(format!(
@@ -8195,6 +8211,85 @@ async fn delegate_acp(
             "ACP agent {} is disabled",
             acp_agent.name
         ))));
+    }
+    if acp_agent.transport.is_remote() && !acp_agent.allow_remote {
+        return Ok(AcpDelegation::Output(ToolOutput::error(format!(
+            "ACP agent {} is a remote agent but allow_remote is disabled",
+            acp_agent.name
+        ))));
+    }
+    if acp_agent.transport.is_remote() {
+        let assessment =
+            assess_remote_acp_delegation(&acp_agent.name, acp_agent.transport.as_str());
+        let risk = assessment.risk;
+        let reason = assessment.reason.clone();
+        let decision = decide(config.approval_mode, &assessment, false);
+        let denied = match decision {
+            ApprovalDecision::Allow { .. } => None,
+            ApprovalDecision::Deny { reason, .. } => Some(reason),
+            ApprovalDecision::Ask { .. } => {
+                let tool_call_id = format!("delegate-acp:{}", acp_agent.id);
+                let approval = engine
+                    .request_approval_with_risk(
+                        &session.id,
+                        &tool_call_id,
+                        "delegate_acp",
+                        serde_json::json!({
+                            "agent": acp_agent.name,
+                            "transport": acp_agent.transport.as_str(),
+                            "endpoint": acp_agent.endpoint.clone(),
+                            "objective": truncate(&objective),
+                        }),
+                        Some(serde_json::json!({"agent_id": parent_spec.id, "agent": parent_spec.name})),
+                        Some(risk.as_str()),
+                        Some(&reason),
+                    )
+                    .await;
+                let Ok((approval, receiver)) = approval else {
+                    return Ok(AcpDelegation::Output(ToolOutput::error(
+                        "could not request approval for the remote ACP delegation",
+                    )));
+                };
+                match wait_for_approval_with(
+                    control.subscribe(),
+                    receiver,
+                    Duration::from_secs(config.approval_timeout_secs),
+                )
+                .await
+                {
+                    ApprovalOutcome::Approved => None,
+                    ApprovalOutcome::Denied => {
+                        Some("operator denied the remote delegation".to_string())
+                    }
+                    ApprovalOutcome::TimedOut => {
+                        let _ = engine.resolve_approval(&approval.id, false).await;
+                        Some("remote delegation approval timed out".to_string())
+                    }
+                    ApprovalOutcome::Cancelled => {
+                        let _ = engine.resolve_approval(&approval.id, false).await;
+                        return Ok(AcpDelegation::Cancelled);
+                    }
+                }
+            }
+        };
+        if let Some(reason) = denied {
+            emit(
+                engine,
+                &session.id,
+                parent_spec,
+                "permission.denied",
+                serde_json::json!({
+                    "tool": "delegate_acp",
+                    "agent": acp_agent.name,
+                    "risk": risk.as_str(),
+                    "reason": truncate(&reason),
+                }),
+            )
+            .await?;
+            return Ok(AcpDelegation::Output(ToolOutput::error(format!(
+                "remote ACP delegation was denied: {reason}"
+            ))));
+        }
     }
     let Some((ordinal, _slot)) = budget.reserve_slot(AgentRole::Worker) else {
         return Ok(AcpDelegation::Output(ToolOutput::error(
@@ -8260,6 +8355,9 @@ async fn delegate_acp(
             "parent_name": parent_spec.name,
             "objective": truncate(&objective),
             "acp_agent": acp_agent.name,
+            "acp_transport": acp_agent.transport.as_str(),
+            "acp_endpoint": acp_agent.endpoint,
+            "acp_sandboxed": !acp_agent.transport.is_remote(),
             "acp_command": acp_agent.command,
             "backend": "acp",
         }),
@@ -8354,17 +8452,32 @@ Additional instructions:
 "
         )
     };
-    let prompt = format!(
-        "You are an external ACP agent delegated by {} inside VerlinPark.
-         Objective: {objective}
+    let prompt = if acp_agent.transport.is_remote() {
+        format!(
+            "You are a remote external ACP agent delegated by {} inside VerlinPark.
+             Objective: {objective}
+{instructions}         This delegation uses the {} transport. You are not running on the
+         VerlinPark host and you do not have access to the local worktree at {}.
+         Do not claim to have edited that path. Complete the objective in your
+         own environment, run relevant checks there, and finish with a concise
+         summary of what you did and which checks ran.",
+            parent_spec.name,
+            acp_agent.transport.as_str(),
+            child_spec.worktree.to_string_lossy(),
+        )
+    } else {
+        format!(
+            "You are an external ACP agent delegated by {} inside VerlinPark.
+             Objective: {objective}
 {instructions}         Work only in the current Git worktree at {} on branch {} (base commit {}).
          {scope_note}
          Make the requested changes directly, run relevant checks, and do not ask the user questions.          Finish with a concise summary of what changed and which checks ran.",
-        parent_spec.name,
-        child_spec.worktree.to_string_lossy(),
-        child_spec.branch,
-        child_spec.base_commit,
-    );
+            parent_spec.name,
+            child_spec.worktree.to_string_lossy(),
+            child_spec.branch,
+            child_spec.base_commit,
+        )
+    };
     let launch = acp::AcpLaunch {
         name: acp_agent.name.clone(),
         command: acp_agent.command.clone(),
@@ -8392,6 +8505,14 @@ Additional instructions:
                 .unwrap_or(acp_agent.timeout_secs)
                 .min(acp_agent.timeout_secs),
         ),
+        transport: acp_agent.transport,
+        endpoint: acp_agent.endpoint.clone(),
+        auth_header_env: acp_agent.auth_header_env.clone(),
+        headers: acp_agent.headers.clone(),
+        connect_timeout: Duration::from_secs(acp_agent.connect_timeout_secs),
+        allow_remote: acp_agent.allow_remote,
+        resume_session_id,
+        diagnostics: None,
     };
     let host = Arc::new(AcpWorkerHost {
         engine: engine.clone(),
@@ -8493,6 +8614,9 @@ Additional instructions:
             "backend": "acp",
             "acp_agent": outcome.agent_name,
             "acp_version": outcome.agent_version,
+            "acp_transport": outcome.transport.as_str(),
+            "acp_session_id": outcome.session_id,
+            "acp_resumed": outcome.resumed,
             "protocol_version": outcome.protocol_version,
         }),
     )
@@ -14994,7 +15118,7 @@ fn tool_schemas(
     if matches!(role, AgentRole::Leader | AgentRole::Manager) && allow_delegation {
         tools.push(ToolSchema {
             name: "delegate_acp".to_string(),
-            description: "Delegate a focused task to a configured external Agent Client Protocol (ACP) agent. It runs in an isolated task worktree, its permission requests use the risk-based approval policy, and its committed changes are verified and merged like a Worker.".to_string(),
+            description: "Delegate a focused task to a configured external Agent Client Protocol (ACP) agent. A stdio agent runs in an isolated task worktree under the local write sandbox and its committed changes go through verification and merge; a remote agent is a trusted external service that is not sandboxed and does not write the local worktree. Remote delegation asks for host-state approval first.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -15017,6 +15141,11 @@ fn tool_schemas(
                         "type": "integer",
                         "minimum": 30,
                         "description": "Optional timeout, capped by the configured agent timeout"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "maxLength": 256,
+                        "description": "Optional existing agent session id to resume with session/load when the agent advertises loadSession"
                     }
                 },
                 "required": ["agent", "objective"]
