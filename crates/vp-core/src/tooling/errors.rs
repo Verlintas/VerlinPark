@@ -418,6 +418,17 @@ tool_error_codes! {
     REMOTE_NETWORK_DENIED => "REMOTE_NETWORK_DENIED", false, "remote", "The project policy denies remote exec because the remote host cannot be sandboxed.";
     REMOTE_TIMEOUT => "REMOTE_TIMEOUT", true, "remote", "Retry with a bounded operation or after checking SSH latency.";
     REMOTE_FAILED => "REMOTE_FAILED", false, "remote", "Inspect the remote helper response and SSH state; do not silently reroute locally.";
+    REMOTE_INTEGRATION_DISABLED => "REMOTE_INTEGRATION_DISABLED", false, "remote", "Enable remote integration explicitly and add the host to the project allowlist before retrying.";
+    REMOTE_INTEGRATION_HOST_NOT_ALLOWED => "REMOTE_INTEGRATION_HOST_NOT_ALLOWED", false, "remote", "Add the exact configured SSH host to RemoteIntegrationPolicy.allowed_hosts; there is no wildcard.";
+    REMOTE_INTEGRATION_APPROVAL_REQUIRED => "REMOTE_INTEGRATION_APPROVAL_REQUIRED", false, "remote", "Repeat the operation with explicit operator confirmation; remote integration is never silent.";
+    REMOTE_BUNDLE_TOO_LARGE => "REMOTE_BUNDLE_TOO_LARGE", false, "remote", "Integrate a smaller branch or raise the bounded max_bundle_bytes policy after reviewing disk impact.";
+    REMOTE_BUNDLE_INVALID => "REMOTE_BUNDLE_INVALID", false, "remote", "Regenerate the bundle on the remote host; malformed or unverifiable bundles are never imported.";
+    REMOTE_BUNDLE_TAMPERED => "REMOTE_BUNDLE_TAMPERED", false, "remote", "Discard the download and regenerate the export; the bytes did not match the reported SHA-256.";
+    REMOTE_BUNDLE_HEAD_MISMATCH => "REMOTE_BUNDLE_HEAD_MISMATCH", false, "remote", "Re-read the remote branch head and export again; the imported commit must match it exactly.";
+    REMOTE_BUNDLE_IMPORT_FAILED => "REMOTE_BUNDLE_IMPORT_FAILED", false, "remote", "Inspect the local repository and the bundle prerequisites; the session branch was not changed.";
+    REMOTE_INTEGRATION_VERIFIER_REQUIRED => "REMOTE_INTEGRATION_VERIFIER_REQUIRED", false, "remote", "Configure an agent provider and retry, or explicitly disable require_verifier with operator confirmation.";
+    REMOTE_INTEGRATION_VERIFIER_REJECTED => "REMOTE_INTEGRATION_VERIFIER_REJECTED", false, "remote", "Ask the remote author to fix the rejected evidence; a rejected commit is not enqueued.";
+    REMOTE_INTEGRATION_FAILED => "REMOTE_INTEGRATION_FAILED", false, "remote", "Inspect the merge-queue entry; a conflict is retried explicitly against the imported ref.";
     REMOTE_PROTOCOL_ERROR => "REMOTE_PROTOCOL_ERROR", false, "remote", "The helper returned an invalid frame; verify helper version compatibility.";
 
     // Tool-output paging

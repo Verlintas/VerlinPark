@@ -25,6 +25,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
 use vp_protocol::rpc::RpcResponse;
 
+use crate::bundle::{self, BundleRegistry};
 use crate::exec::{ExecControl, allowed_env_names, run_exec, validate_exec};
 use crate::framing::{read_frame, write_frame};
 use crate::git;
@@ -85,6 +86,7 @@ struct ServerState {
     started: Instant,
     started_at: String,
     ledger: Arc<Mutex<OperationLedger>>,
+    bundles: AsyncMutex<BundleRegistry>,
     cancels: Arc<Mutex<HashMap<String, ExecControl>>>,
     shutdown: Arc<Notify>,
 }
@@ -110,16 +112,19 @@ impl ServerState {
             started: Instant::now(),
             started_at: vp_protocol::now_rfc3339(),
             ledger: Arc::new(Mutex::new(ledger)),
+            bundles: AsyncMutex::new(BundleRegistry::new()),
             cancels: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(Notify::new()),
         })
     }
 
     fn capabilities(&self) -> Vec<String> {
-        REQUIRED_CAPABILITIES
+        let mut capabilities = REQUIRED_CAPABILITIES
             .iter()
             .map(|value| (*value).to_string())
-            .collect()
+            .collect::<Vec<_>>();
+        capabilities.push(CAP_GIT_BUNDLE.to_string());
+        capabilities
     }
 
     fn probe(&self) -> ProbeResult {
@@ -317,8 +322,13 @@ where
         });
     }
     // A clean shutdown or client disconnect must not leave a command running
-    // in the remote user's process group after the helper exits.
+    // in the remote user's process group after the helper exits, nor a
+    // temporary bundle/export ref on disk.
     cancel_all(&state);
+    {
+        let mut bundles = state.bundles.lock().await;
+        bundle::cleanup_all(&state.jail, &mut bundles).await;
+    }
     Ok(())
 }
 
@@ -423,6 +433,8 @@ fn is_mutating(method: &str) -> bool {
             | METHOD_EXEC
             | METHOD_GIT_WORKTREE_ADD
             | METHOD_GIT_WORKTREE_REMOVE
+            | METHOD_GIT_BUNDLE_CREATE
+            | METHOD_GIT_BUNDLE_DELETE
     )
 }
 
@@ -581,6 +593,18 @@ async fn execute_mutation(
             let result = git::worktree_remove(&state.jail, &params).await?;
             to_value(result)
         }
+        METHOD_GIT_BUNDLE_CREATE => {
+            let params: GitBundleCreateParams = parse_params(params, method)?;
+            let mut bundles = state.bundles.lock().await;
+            let result = bundle::create(&state.jail, &mut bundles, &params).await?;
+            to_value(result)
+        }
+        METHOD_GIT_BUNDLE_DELETE => {
+            let params: GitBundleDeleteParams = parse_params(params, method)?;
+            let mut bundles = state.bundles.lock().await;
+            let result = bundle::delete(&state.jail, &mut bundles, &params).await?;
+            to_value(result)
+        }
         _ => Err(RemoteError::new(
             RemoteErrorCode::UnsupportedOperation,
             format!("unsupported mutating method: {method}"),
@@ -635,6 +659,11 @@ async fn dispatch(
         METHOD_GIT_WORKTREE_LIST => {
             let _: GitWorktreeListParams = parse_params(params, method)?;
             to_value(git::worktree_list(&state.jail).await?)
+        }
+        METHOD_GIT_BUNDLE_READ => {
+            let params: GitBundleReadParams = parse_params(params, method)?;
+            let mut bundles = state.bundles.lock().await;
+            to_value(bundle::read(&mut bundles, &params).await?)
         }
         METHOD_LEDGER_STATS => {
             let params: LedgerStatsParams = parse_params(params, method)?;

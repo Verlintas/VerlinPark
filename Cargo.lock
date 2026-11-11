@@ -3614,6 +3614,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

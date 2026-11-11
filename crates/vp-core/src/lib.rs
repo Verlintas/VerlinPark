@@ -117,6 +117,7 @@ pub mod program;
 pub mod prompt_cache;
 pub mod rebuild;
 pub mod remote;
+pub mod remote_integration;
 pub mod run_journal;
 pub mod scaling;
 pub mod scheduler;
@@ -14744,6 +14745,33 @@ impl Engine {
         base_commit: &str,
         detail: Option<String>,
     ) -> Result<MergeQueueEntry> {
+        self.enqueue_merge_with_source(
+            session_id,
+            agent_id,
+            agent_name,
+            task_id,
+            branch,
+            commit,
+            base_commit,
+            detail,
+            vp_protocol::types::MergeQueueSource::local(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_merge_with_source(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<String>,
+        branch: &str,
+        commit: &str,
+        base_commit: &str,
+        detail: Option<String>,
+        source: vp_protocol::types::MergeQueueSource,
+    ) -> Result<MergeQueueEntry> {
         let store = self.store.clone();
         let session_id = session_id.to_string();
         let agent_id = agent_id.to_string();
@@ -14752,7 +14780,7 @@ impl Engine {
         let commit = commit.to_string();
         let base_commit = base_commit.to_string();
         let (entry, event) = tokio::task::spawn_blocking(move || {
-            store.enqueue_merge_with_event(
+            store.enqueue_merge_with_event_source(
                 &session_id,
                 &agent_id,
                 &agent_name,
@@ -14761,10 +14789,36 @@ impl Engine {
                 &commit,
                 &base_commit,
                 detail.as_deref(),
+                &source,
             )
         })
         .await??;
         let _ = self.events.send(event);
+        Ok(entry)
+    }
+
+    pub async fn set_merge_queue_verification(
+        &self,
+        id: &str,
+        approved: Option<bool>,
+        summary: Option<String>,
+        environment_caveat: Option<String>,
+    ) -> Result<Option<MergeQueueEntry>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let updated = tokio::task::spawn_blocking(move || {
+            store.set_merge_queue_verification_with_event(
+                &id,
+                approved,
+                summary.as_deref(),
+                environment_caveat.as_deref(),
+            )
+        })
+        .await??;
+        let entry = updated.map(|(entry, event)| {
+            let _ = self.events.send(event);
+            entry
+        });
         Ok(entry)
     }
 

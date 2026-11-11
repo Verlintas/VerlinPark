@@ -24,7 +24,9 @@ use vp_protocol::discovery::Discovery;
 use vp_protocol::lsp::LspStatusParams;
 use vp_protocol::remote::{
     HostListParams, HostListResult, HostProbeParams, HostProjectParams, HostSetParams,
-    RemoteLedgerParams, RemoteStatusParams, RemoteWorktreeListParams,
+    RemoteIntegrationCleanupParams, RemoteIntegrationParams, RemoteIntegrationPolicyParams,
+    RemoteIntegrationStatusParams, RemoteLedgerParams, RemoteStatusParams,
+    RemoteWorktreeListParams, SetRemoteIntegrationPolicyParams,
 };
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::scaling::{
@@ -708,6 +710,65 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "remote.integrate" => match parse_params::<RemoteIntegrationParams>(request.params) {
+            Ok(params) => match state.agent.integrate_remote(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => remote_integration_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "remote.integration.status" => {
+            match parse_params::<RemoteIntegrationStatusParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .remote_integration_status(&params.project_id, params.session_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "remote.integration.policy.get" => {
+            match parse_params::<RemoteIntegrationPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .remote_integration_policy_result(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "remote.integration.cleanup" => {
+            match parse_params::<RemoteIntegrationCleanupParams>(request.params) {
+                Ok(params) => match state.engine.remote_integration_cleanup(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "remote.integration.policy.set" => {
+            match parse_params::<SetRemoteIntegrationPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_remote_integration_policy(
+                        &params.project_id,
+                        params.policy,
+                        params.confirm,
+                    )
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => remote_integration_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "project.task_scheduler.get" => {
             match parse_params::<TaskSchedulerPolicyParams>(request.params) {
                 Ok(params) => match state
@@ -3957,6 +4018,19 @@ fn spawn_process_sweeper(engine: Engine) {
             }
         }
     });
+}
+
+/// Remote integration failures carry the Q3 tool-error shape in `data` so the
+/// CLI and Swift can show a stable code, retryability, and hint. Other errors
+/// remain ordinary internal errors and never invent a code.
+fn remote_integration_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    match vp_core::remote_integration::failure_data(&error) {
+        Some(data) => RpcResponse::error(
+            id,
+            RpcError::with_data(codes::INTERNAL_ERROR, error.to_string(), data),
+        ),
+        None => internal_error(id, error),
+    }
 }
 
 fn spawn_worktree_sweeper(engine: Engine) {

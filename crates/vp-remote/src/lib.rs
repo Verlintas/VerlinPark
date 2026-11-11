@@ -14,6 +14,7 @@
 //! The daemon treats a configured remote host as trusted infrastructure. This
 //! crate does not claim to sandbox the remote user; see ADR-0156.
 
+pub mod bundle;
 pub mod client;
 pub mod exec;
 pub mod framing;
@@ -24,14 +25,17 @@ pub mod protocol;
 pub mod server;
 pub mod transport;
 
-pub use client::{RemoteClient, RemoteClientConfig};
+pub use bundle::{BundleRecord, BundleRegistry};
+pub use client::{RemoteClient, RemoteClientConfig, connect_stream};
 pub use jail::PathJail;
 pub use ledger::{
     DEFAULT_LEDGER_ENTRIES, LedgerBegin, LedgerEntry, LedgerReplay, LedgerStats,
     MAX_LEDGER_ENTRIES, OperationLedger,
 };
 pub use protocol::{
-    CancelParams, CancelParams as RemoteCancelParams, DirEntry, EntryKind, ExecParams, ExecResult,
+    CancelParams, CancelParams as RemoteCancelParams, DEFAULT_GIT_BUNDLE_CHUNK_BYTES, DirEntry,
+    EntryKind, ExecParams, ExecResult, GitBundleCreateParams, GitBundleCreateResult,
+    GitBundleDeleteParams, GitBundleDeleteResult, GitBundleReadParams, GitBundleReadResult,
     GitDiffParams, GitDiffResult, GitLogEntry, GitLogParams, GitLogResult, GitRevParseParams,
     GitRevParseResult, GitStatusEntry, GitStatusParams, GitStatusResult, GitWorktreeAddParams,
     GitWorktreeAddResult, GitWorktreeListParams, GitWorktreeListResult, GitWorktreeRemoveParams,

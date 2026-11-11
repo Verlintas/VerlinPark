@@ -6480,8 +6480,92 @@ pub struct MergeQueueEntry {
     pub attempt: u32,
     #[serde(default)]
     pub detail: Option<String>,
+    /// `local` for an ordinary Worker branch, `remote` for an imported bundle.
+    /// Older rows decode as `local`; this is additive within protocol v1.
+    #[serde(default = "merge_source_local")]
+    pub source: String,
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    #[serde(default)]
+    pub remote_branch: Option<String>,
+    #[serde(default)]
+    pub bundle_sha256: Option<String>,
+    /// Temporary ref (`refs/verlinpark/remote/...`) that holds the exact
+    /// imported commit. Retained while a remote entry is retryable.
+    #[serde(default)]
+    pub imported_ref: Option<String>,
+    /// Verifier verdict attached to a remote entry. Local entries leave these
+    /// empty because their approval is already part of the Worker run.
+    #[serde(default)]
+    pub verifier_approved: Option<bool>,
+    #[serde(default)]
+    pub verifier_summary: Option<String>,
+    #[serde(default)]
+    pub environment_caveat: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+pub const MERGE_SOURCE_LOCAL: &str = "local";
+pub const MERGE_SOURCE_REMOTE: &str = "remote";
+
+fn merge_source_local() -> String {
+    MERGE_SOURCE_LOCAL.to_string()
+}
+
+/// Provenance supplied when an entry enters the merge queue. Local Worker
+/// enqueues use [`MergeQueueSource::local`]; remote integration uses
+/// [`MergeQueueSource::remote`] with the exported host, branch, bundle hash,
+/// and temporary imported ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeQueueSource {
+    #[serde(default = "merge_source_local")]
+    pub source: String,
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    #[serde(default)]
+    pub remote_branch: Option<String>,
+    #[serde(default)]
+    pub bundle_sha256: Option<String>,
+    #[serde(default)]
+    pub imported_ref: Option<String>,
+}
+
+impl Default for MergeQueueSource {
+    fn default() -> Self {
+        Self::local()
+    }
+}
+
+impl MergeQueueSource {
+    pub fn local() -> Self {
+        Self {
+            source: MERGE_SOURCE_LOCAL.to_string(),
+            remote_host: None,
+            remote_branch: None,
+            bundle_sha256: None,
+            imported_ref: None,
+        }
+    }
+
+    pub fn remote(
+        host: impl Into<String>,
+        branch: impl Into<String>,
+        bundle_sha256: impl Into<String>,
+        imported_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            source: MERGE_SOURCE_REMOTE.to_string(),
+            remote_host: Some(host.into()),
+            remote_branch: Some(branch.into()),
+            bundle_sha256: Some(bundle_sha256.into()),
+            imported_ref: Some(imported_ref.into()),
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.source == MERGE_SOURCE_REMOTE
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -11834,6 +11918,59 @@ mod context_checkpoint_bundle_tests {
         assert!(policy.validate().is_ok());
         let normalized = policy.normalized();
         assert_eq!(normalized.status_ttl_secs, 30);
+    }
+
+    #[test]
+    fn merge_queue_entries_decode_legacy_rows_as_local() {
+        let entry: MergeQueueEntry = serde_json::from_value(json!({
+            "id": "e1",
+            "session_id": "s1",
+            "agent_id": "a1",
+            "agent_name": "Worker",
+            "branch": "verlinpark/s1--T1",
+            "commit": "abcdef1234567890",
+            "base_commit": "1234567890abcdef",
+            "status": "merged",
+            "attempt": 1,
+            "created_at": "2026-11-11T00:00:00Z",
+            "updated_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(entry.source, MERGE_SOURCE_LOCAL);
+        assert!(entry.remote_host.is_none());
+        assert!(entry.remote_branch.is_none());
+        assert!(entry.bundle_sha256.is_none());
+        assert!(entry.imported_ref.is_none());
+        assert!(entry.verifier_approved.is_none());
+        assert!(entry.verifier_summary.is_none());
+        assert!(entry.environment_caveat.is_none());
+        let remote = MergeQueueEntry {
+            source: MERGE_SOURCE_REMOTE.into(),
+            remote_host: Some("build.example.com".into()),
+            remote_branch: Some("feature/x".into()),
+            bundle_sha256: Some("a".repeat(64)),
+            imported_ref: Some("refs/verlinpark/remote/s1/i1".into()),
+            ..entry.clone()
+        };
+        let encoded = serde_json::to_value(&remote).unwrap();
+        let decoded: MergeQueueEntry = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.source, MERGE_SOURCE_REMOTE);
+        assert_eq!(decoded.remote_host.as_deref(), Some("build.example.com"));
+        assert_eq!(
+            decoded.imported_ref.as_deref(),
+            Some("refs/verlinpark/remote/s1/i1")
+        );
+        let source = MergeQueueSource::remote(
+            "build.example.com",
+            "feature/x",
+            "b".repeat(64),
+            "refs/verlinpark/remote/s1/i1",
+        );
+        assert!(source.is_remote());
+        assert_eq!(
+            serde_json::from_value::<MergeQueueSource>(json!({})).unwrap(),
+            MergeQueueSource::local()
+        );
     }
 
     #[test]

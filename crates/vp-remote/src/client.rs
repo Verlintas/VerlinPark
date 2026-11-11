@@ -13,8 +13,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::ChildStdin;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -44,9 +43,11 @@ impl Default for RemoteClientConfig {
     }
 }
 
+type ClientWriter = Box<dyn AsyncWrite + Unpin + Send>;
+
 pub struct RemoteClient {
-    writer: Arc<AsyncMutex<Option<ChildStdin>>>,
-    process: Arc<RemoteProcess>,
+    writer: Arc<AsyncMutex<Option<ClientWriter>>>,
+    process: Option<Arc<RemoteProcess>>,
     pending: PendingMap,
     next_id: AtomicU64,
     closed: Arc<AtomicBool>,
@@ -88,6 +89,53 @@ async fn connect_inner(
             format!("{description} did not expose stdout"),
         )
     })?;
+    connect_io(
+        stdout,
+        Box::new(stdin),
+        hello,
+        config,
+        description,
+        Some(Arc::new(process)),
+    )
+    .await
+}
+
+/// Connect a client to any async reader/writer pair. The server side can be the
+/// packaged helper over a pipe, an in-process `serve` future over a duplex for
+/// contract tests, or an embedding transport. The same bounded framing,
+/// handshake, capability, and cancellation rules apply.
+pub async fn connect_stream<R, W>(
+    reader: R,
+    writer: W,
+    hello: HelloParams,
+    config: RemoteClientConfig,
+) -> Result<RemoteClient, RemoteError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    connect_io(
+        reader,
+        Box::new(writer),
+        hello,
+        config,
+        "in-process remote helper stream".to_string(),
+        None,
+    )
+    .await
+}
+
+async fn connect_io<R>(
+    stdout: R,
+    stdin: ClientWriter,
+    hello: HelloParams,
+    config: RemoteClientConfig,
+    description: String,
+    process: Option<Arc<RemoteProcess>>,
+) -> Result<RemoteClient, RemoteError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     let closed = Arc::new(AtomicBool::new(false));
     let writer = Arc::new(AsyncMutex::new(Some(stdin)));
@@ -168,7 +216,7 @@ async fn connect_inner(
 
     let mut client = RemoteClient {
         writer,
-        process: Arc::new(process),
+        process,
         pending,
         next_id: AtomicU64::new(1),
         closed,
@@ -266,7 +314,10 @@ impl RemoteClient {
     }
 
     pub fn stderr_tail(&self) -> String {
-        self.process.stderr_tail()
+        self.process
+            .as_ref()
+            .map(|process| process.stderr_tail())
+            .unwrap_or_default()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -527,6 +578,62 @@ impl RemoteClient {
         .await
     }
 
+    pub fn supports_git_bundle(&self) -> bool {
+        self.hello.has_capability(CAP_GIT_BUNDLE)
+    }
+
+    fn require_git_bundle(&self) -> Result<(), RemoteError> {
+        if self.supports_git_bundle() {
+            Ok(())
+        } else {
+            Err(RemoteError::new(
+                RemoteErrorCode::UnsupportedOperation,
+                "the remote helper does not advertise the git.bundle capability",
+            )
+            .with_hint("upgrade vp-remote-agent before integrating a remote branch"))
+        }
+    }
+
+    /// Bundle generation can legitimately take longer than an ordinary file
+    /// read. The bound stays finite and the helper kills Git on timeout.
+    fn bundle_timeout(&self) -> Duration {
+        self.config
+            .request_timeout
+            .max(Duration::from_secs(300))
+            .min(Duration::from_secs(600))
+    }
+
+    pub async fn git_bundle_create(
+        &self,
+        params: &GitBundleCreateParams,
+    ) -> Result<GitBundleCreateResult, RemoteError> {
+        self.require_git_bundle()?;
+        self.call(METHOD_GIT_BUNDLE_CREATE, params, self.bundle_timeout())
+            .await
+    }
+
+    pub async fn git_bundle_read(
+        &self,
+        params: &GitBundleReadParams,
+    ) -> Result<GitBundleReadResult, RemoteError> {
+        self.require_git_bundle()?;
+        self.call(METHOD_GIT_BUNDLE_READ, params, self.bundle_timeout())
+            .await
+    }
+
+    pub async fn git_bundle_delete(
+        &self,
+        params: &GitBundleDeleteParams,
+    ) -> Result<GitBundleDeleteResult, RemoteError> {
+        self.require_git_bundle()?;
+        self.call(
+            METHOD_GIT_BUNDLE_DELETE,
+            params,
+            self.config.request_timeout,
+        )
+        .await
+    }
+
     pub async fn ledger_stats(
         &self,
         params: &LedgerStatsParams,
@@ -560,7 +667,9 @@ impl RemoteClient {
         if let Some(reader) = self.reader.lock().await.take() {
             reader.abort();
         }
-        self.process.shutdown(Duration::from_secs(2)).await;
+        if let Some(process) = self.process.as_ref() {
+            process.shutdown(Duration::from_secs(2)).await;
+        }
     }
 }
 

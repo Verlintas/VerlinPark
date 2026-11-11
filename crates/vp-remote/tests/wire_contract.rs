@@ -115,6 +115,44 @@ fn git_operation_envelopes_round_trip() {
 }
 
 #[test]
+fn bundle_envelopes_round_trip_and_default_bounds() {
+    let create = GitBundleCreateParams {
+        branch: "feature/remote".into(),
+        base: None,
+        max_bytes: 1024 * 1024,
+        chunk_bytes: 4096,
+        operation_id: Some("bundle-1".into()),
+    };
+    let decoded: GitBundleCreateParams =
+        serde_json::from_value(serde_json::to_value(&create).unwrap()).unwrap();
+    assert_eq!(decoded, create);
+    let created = GitBundleCreateResult {
+        bundle_id: "b1".into(),
+        branch: "feature/remote".into(),
+        head: "a".repeat(40),
+        export_ref: "refs/verlinpark/export/b1".into(),
+        base: Some("c".repeat(40)),
+        bytes: 10_000,
+        sha256: "b".repeat(64),
+        chunk_bytes: 4096,
+        chunks: 3,
+        expires_at_unix_ms: 1_700_000_000_000,
+        operation_id: Some("bundle-1".into()),
+        replayed: false,
+    };
+    let decoded: GitBundleCreateResult =
+        serde_json::from_value(serde_json::to_value(&created).unwrap()).unwrap();
+    assert_eq!(decoded, created);
+    let legacy: GitBundleCreateParams = serde_json::from_value(json!({
+        "branch": "main",
+        "max_bytes": 1024
+    }))
+    .unwrap();
+    assert_eq!(legacy.chunk_bytes, DEFAULT_GIT_BUNDLE_CHUNK_BYTES);
+    assert!(legacy.operation_id.is_none());
+}
+
+#[test]
 fn hello_round_trips_and_reports_missing_capabilities() {
     let hello = HelloParams {
         protocol_version: REMOTE_PROTOCOL_VERSION,

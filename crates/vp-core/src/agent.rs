@@ -7,24 +7,32 @@ use std::time::{Duration, Instant};
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
+use uuid::Uuid;
+use vp_protocol::remote::{
+    DEFAULT_BUNDLE_CHUNK_BYTES, RemoteBundleSummary, RemoteIntegrationParams,
+    RemoteIntegrationResult, RemoteIntegrationVerification,
+};
 use vp_protocol::types::{
     AgentInfo, AgentProbeResult, AgentRecord, ApprovalMode, CapacityInfo, ConfigureAgentParams,
     ContextCheckpoint, ContextCheckpointDetailResult, ContextCompactionSummary, ContextMeasurement,
     ContextRestorePreflight, ContextRestoreResult, ContextStructuredState, IntakeDispatchResult,
-    IntakeTask, MergeQueueEntry, OrchestrationRecovery, PlanDepartment, PlanRevisionDetailResult,
-    PlanTask, Program, ProgramMilestone, ProgramTickResult, Project, ReviseTeamPlanResult,
-    RoleModels, RunBudgetSnapshot, ScheduledTask, SchedulerProjectStatus, SchedulerStatusResult,
-    Session, SessionCachePlanResult, SessionCachePlanRole, SessionCacheWarmResult,
-    SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
-    SessionCompactResult, SessionForkResult, SessionMergeForkResult, SessionRunCancelResult,
-    SessionRunResumeResult, Skill, SourceCitation, SourceSearchHit, StallRecoveryMode,
-    StoredMessage, TeamPlan, TodoItem,
+    IntakeTask, MERGE_SOURCE_REMOTE, MergeQueueEntry, MergeQueueSource, OrchestrationRecovery,
+    PlanDepartment, PlanRevisionDetailResult, PlanTask, Program, ProgramMilestone,
+    ProgramTickResult, Project, ReviseTeamPlanResult, RoleModels, RunBudgetSnapshot, ScheduledTask,
+    SchedulerProjectStatus, SchedulerStatusResult, Session, SessionCachePlanResult,
+    SessionCachePlanRole, SessionCacheWarmResult, SessionCheckpoint, SessionCheckpointDiffResult,
+    SessionCheckpointRestoreResult, SessionCompactResult, SessionForkResult,
+    SessionMergeForkResult, SessionRunCancelResult, SessionRunResumeResult, Skill, SourceCitation,
+    SourceSearchHit, StallRecoveryMode, StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -43,7 +51,9 @@ use crate::budget_governor::{
 use crate::permissions::{
     ApprovalDecision, RiskLevel, assess_acp_permission, assess_remote_acp_delegation, decide,
 };
+use crate::remote_integration::{self, RemoteIntegrationFailure};
 use crate::scaling::ScalingSlots;
+use crate::tooling::errors::ToolErrorCode;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::worktree;
 
@@ -2366,6 +2376,824 @@ impl AgentService {
         })
     }
 
+    /// Import one remote branch through a bounded Git bundle, verify the
+    /// imported commit locally, and enqueue it through the existing
+    /// deterministic Integrator.
+    ///
+    /// This is operator-initiated and policy-gated. It never duplicates a
+    /// local Worker's authority: the remote commit is verified in the same
+    /// isolated clone, merged with `--no-ff`, and conflict/retry uses the same
+    /// persisted queue. The remote host is trusted infrastructure; the bundle
+    /// and the imported ref are the only transport surface.
+    pub async fn integrate_remote(
+        &self,
+        params: RemoteIntegrationParams,
+    ) -> Result<RemoteIntegrationResult> {
+        let session_id = params.session_id.clone();
+        self.begin_operation(&session_id)?;
+        let result = self.integrate_remote_inner(params, None).await;
+        self.end_operation(&session_id);
+        result
+    }
+
+    /// Integrate a bundle that is already on the local disk. The bytes are
+    /// still checked against `bundle.sha256`, the bundle is still verified, and
+    /// the imported head must still match `bundle.head`. This exists for
+    /// offline/operator workflows and deterministic contract tests; the daemon
+    /// RPC always downloads through the helper first.
+    pub async fn integrate_remote_bundle_file(
+        &self,
+        params: RemoteIntegrationParams,
+        bundle_path: PathBuf,
+        bundle: RemoteBundleSummary,
+    ) -> Result<RemoteIntegrationResult> {
+        let session_id = params.session_id.clone();
+        self.begin_operation(&session_id)?;
+        let result = self
+            .integrate_remote_inner(params, Some((bundle_path, bundle)))
+            .await;
+        self.end_operation(&session_id);
+        result
+    }
+
+    async fn integrate_remote_inner(
+        &self,
+        params: RemoteIntegrationParams,
+        downloaded: Option<(PathBuf, RemoteBundleSummary)>,
+    ) -> Result<RemoteIntegrationResult> {
+        let branch = remote_integration::validate_remote_branch(&params.branch)
+            .map_err(anyhow::Error::new)?;
+        let import_id = Uuid::now_v7().to_string();
+        remote_integration::validate_import_id(&import_id).map_err(anyhow::Error::new)?;
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned());
+        let (session, project) =
+            load_session_project(self.engine.store().clone(), &params.session_id).await?;
+        if session.project_id != params.project_id {
+            anyhow::bail!(
+                "session {} belongs to project {}, not {}",
+                session.id,
+                session.project_id,
+                params.project_id
+            );
+        }
+        if session.status == "landed" {
+            anyhow::bail!("session is already landed");
+        }
+        crate::ensure_session_quiescent(&session, "integrate a remote branch")?;
+        let host_config = self.engine.get_execution_host(&params.project_id).await?;
+        let policy = self
+            .engine
+            .get_remote_integration_policy(&params.project_id)
+            .await?;
+        remote_integration::authorize(&policy, &host_config, params.confirm)
+            .map_err(anyhow::Error::new)?;
+        if let Some(requested) = params.host.as_deref() {
+            let requested = requested.trim();
+            let matches = requested.eq_ignore_ascii_case(&host_config.host)
+                || requested.eq_ignore_ascii_case(&host_config.label())
+                || host_config.user.as_deref().is_some_and(|user| {
+                    requested.eq_ignore_ascii_case(&format!("{user}@{}", host_config.host))
+                });
+            if !matches {
+                return Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_INTEGRATION_HOST_NOT_ALLOWED,
+                    format!(
+                        "requested host {requested} does not match the configured host {}",
+                        host_config.host
+                    ),
+                )
+                .into());
+            }
+        }
+        if policy.require_verifier && config.is_none() {
+            return Err(RemoteIntegrationFailure::new(
+                ToolErrorCode::REMOTE_INTEGRATION_VERIFIER_REQUIRED,
+                "remote integration requires a configured Verifier provider",
+            )
+            .into());
+        }
+        let session_worktree = session
+            .worktree
+            .clone()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("session has no worktree"))?;
+        let session_branch = session
+            .branch
+            .clone()
+            .ok_or_else(|| anyhow!("session has no branch"))?;
+        let head_worktree = session_worktree.clone();
+        let session_head =
+            tokio::task::spawn_blocking(move || worktree::head_commit(&head_worktree)).await??;
+        let event_spec =
+            remote_integrator_spec(&session, &session_worktree, &session_branch, &session_head);
+        emit(
+            &self.engine,
+            &session.id,
+            &event_spec,
+            "remote.integration.requested",
+            json!({
+                "project_id": params.project_id,
+                "host": host_config.host,
+                "remote_branch": branch,
+                "expected_commit": params.expected_commit,
+                "task_id": params.task_id,
+                "max_bundle_bytes": policy.max_bundle_bytes,
+                "require_verifier": policy.require_verifier,
+            }),
+        )
+        .await?;
+        emit(
+            &self.engine,
+            &session.id,
+            &event_spec,
+            "remote.integration.approved",
+            json!({
+                "host": host_config.host,
+                "remote_branch": branch,
+                "risk": RiskLevel::HostState.as_str(),
+                "reason": "explicit operator confirmation for remote bundle import",
+                "approval_mode": self
+                    .config
+                    .read()
+                    .ok()
+                    .and_then(|config| config.as_ref().map(|config| config.approval_mode))
+                    .unwrap_or_default(),
+            }),
+        )
+        .await?;
+
+        let keep_import_refs = params.keep_import_refs.unwrap_or(policy.keep_import_refs);
+        let (bundle_path, mut bundle) = if let Some(downloaded) = downloaded {
+            downloaded
+        } else {
+            let workspace = self.engine.remote_workspace(&params.project_id).await?;
+            if !workspace.supports_git_bundle().await? {
+                return Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_PROTOCOL_ERROR,
+                    "the remote helper does not advertise the git.bundle capability",
+                )
+                .with_hint("upgrade vp-remote-agent on the remote host")
+                .into());
+            }
+            let chunk_bytes = DEFAULT_BUNDLE_CHUNK_BYTES
+                .min(policy.max_bundle_bytes.max(1024))
+                .max(1024);
+            let download = download_remote_bundle(
+                &workspace,
+                &session.id,
+                &branch,
+                policy.max_bundle_bytes,
+                chunk_bytes,
+                params.expected_commit.as_deref(),
+                params.base_commit.as_deref(),
+                &import_id,
+                self.engine.store().data_dir(),
+            )
+            .await;
+            match download {
+                Ok(download) => download,
+                Err(error) => {
+                    let detail = truncate(&error.to_string());
+                    emit(
+                        &self.engine,
+                        &session.id,
+                        &event_spec,
+                        "remote.integration.failed",
+                        json!({
+                            "stage": "bundle_download",
+                            "code": error.code(),
+                            "detail": detail,
+                            "host": host_config.host,
+                            "remote_branch": branch,
+                        }),
+                    )
+                    .await?;
+                    return Err(error.into());
+                }
+            }
+        };
+        bundle.host = host_config.host.clone();
+        if bundle.bytes > policy.max_bundle_bytes {
+            return Err(RemoteIntegrationFailure::new(
+                ToolErrorCode::REMOTE_BUNDLE_TOO_LARGE,
+                format!(
+                    "bundle reports {} bytes; the configured cap is {}",
+                    bundle.bytes, policy.max_bundle_bytes
+                ),
+            )
+            .into());
+        }
+        if let Some(expected) = params.expected_commit.as_deref()
+            && !expected.trim().is_empty()
+            && !expected.trim().eq_ignore_ascii_case(&bundle.head)
+        {
+            return Err(RemoteIntegrationFailure::new(
+                ToolErrorCode::REMOTE_BUNDLE_HEAD_MISMATCH,
+                format!(
+                    "bundle head {} does not match the expected commit {}",
+                    bundle.head,
+                    expected.trim()
+                ),
+            )
+            .into());
+        }
+        match tokio::fs::metadata(&bundle_path).await {
+            Ok(metadata) if metadata.len() == bundle.bytes => {}
+            Ok(metadata) => {
+                return Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_BUNDLE_TAMPERED,
+                    format!(
+                        "local bundle is {} bytes; the helper reported {}",
+                        metadata.len(),
+                        bundle.bytes
+                    ),
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_BUNDLE_IMPORT_FAILED,
+                    format!(
+                        "cannot inspect local bundle {}: {error}",
+                        bundle_path.display()
+                    ),
+                )
+                .into());
+            }
+        }
+        let import_root = PathBuf::from(&project.root);
+        let import_bundle_path = bundle_path.clone();
+        let expected_head = bundle.head.clone();
+        let expected_sha = bundle.sha256.clone();
+        let session_id_for_import = session.id.clone();
+        let import_id_for_ref = import_id.clone();
+        let keep_for_import = keep_import_refs;
+        let imported = tokio::task::spawn_blocking(move || {
+            remote_integration::import_bundle(
+                &import_root,
+                &import_bundle_path,
+                &expected_head,
+                Some(&expected_sha),
+                &session_id_for_import,
+                &import_id_for_ref,
+                keep_for_import,
+            )
+        })
+        .await?;
+        let _ = tokio::fs::remove_file(&bundle_path).await;
+        let imported = match imported {
+            Ok(imported) => imported,
+            Err(error) => {
+                let detail = truncate(&error.to_string());
+                emit(
+                    &self.engine,
+                    &session.id,
+                    &event_spec,
+                    "remote.integration.failed",
+                    json!({
+                        "stage": "bundle_import",
+                        "code": error.code(),
+                        "detail": detail,
+                        "bundle_sha256": bundle.sha256,
+                    }),
+                )
+                .await?;
+                return Err(error.into());
+            }
+        };
+        emit(
+            &self.engine,
+            &session.id,
+            &event_spec,
+            "remote.bundle.imported",
+            json!({
+                "host": bundle.host,
+                "remote_branch": bundle.branch,
+                "head": bundle.head,
+                "bundle_sha256": bundle.sha256,
+                "bytes": bundle.bytes,
+                "imported_ref": imported.imported_ref,
+            }),
+        )
+        .await?;
+
+        let data_dir = self.engine.store().data_dir().to_path_buf();
+        let project_root = PathBuf::from(&project.root);
+        let project_id = project.id.clone();
+        let session_id = session.id.clone();
+        let import_id_for_worktree = import_id.clone();
+        let imported_ref = imported.imported_ref.clone();
+        let worktree_result = tokio::task::spawn_blocking({
+            let project_root = project_root.clone();
+            move || {
+                remote_integration::create_remote_worktree(
+                    &project_root,
+                    &data_dir,
+                    &project_id,
+                    &session_id,
+                    &import_id_for_worktree,
+                    &imported_ref,
+                )
+            }
+        })
+        .await?;
+        let remote_worktree = match worktree_result {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                if !keep_import_refs {
+                    let _ = tokio::task::spawn_blocking({
+                        let project_root = project_root.clone();
+                        let imported_ref = imported.imported_ref.clone();
+                        move || {
+                            remote_integration::prune_import_refs(
+                                &project_root,
+                                &[imported_ref],
+                                false,
+                            )
+                        }
+                    })
+                    .await?;
+                }
+                return Err(error.into());
+            }
+        };
+        let agent_name = truncate_to(&format!("Remote {}", bundle.branch), 60);
+        let agent = self
+            .engine
+            .create_agent(
+                &session.id,
+                AgentRole::Worker.as_str(),
+                &agent_name,
+                Some("Remote integration".to_string()),
+                None,
+                &config
+                    .as_ref()
+                    .map(|config| model_for(config, AgentRole::Worker))
+                    .unwrap_or_else(|| "remote".to_string()),
+            )
+            .await?;
+        self.engine
+            .set_agent_worktree(
+                &agent.id,
+                &remote_worktree.path.to_string_lossy(),
+                &remote_worktree.branch,
+            )
+            .await?;
+        self.engine
+            .set_agent_profile(&agent.id, AgentProfile::Coding.as_str())
+            .await?;
+        self.engine
+            .set_agent_task(&agent.id, params.task_id.clone(), None)
+            .await?;
+
+        let profile = AgentProfile::Coding;
+        let manager_spec = AgentSpec {
+            id: "remote-integrator".to_string(),
+            role: AgentRole::Manager,
+            name: "Remote Integrator".to_string(),
+            depth: 1,
+            parent_name: None,
+            title: Some("Integration".to_string()),
+            task_id: None,
+            department: None,
+            profile: AgentProfile::Generic,
+            allow_delegation: false,
+            auto_approve: true,
+            worktree: PathBuf::from(&session.worktree.clone().unwrap_or_default()),
+            branch: session_branch.clone(),
+            session_worktree: PathBuf::from(&session.worktree.clone().unwrap_or_default()),
+            session_branch: session_branch.clone(),
+            write_scope: Vec::new(),
+            base_commit: session_head.clone(),
+        };
+        let worker_spec = AgentSpec {
+            id: agent.id.clone(),
+            role: AgentRole::Worker,
+            name: agent_name.clone(),
+            depth: 2,
+            parent_name: Some("Remote Integrator".to_string()),
+            title: agent.title.clone(),
+            task_id: params.task_id.clone(),
+            department: None,
+            profile,
+            allow_delegation: false,
+            auto_approve: true,
+            worktree: remote_worktree.path.clone(),
+            branch: remote_worktree.branch.clone(),
+            session_worktree: PathBuf::from(&session.worktree.clone().unwrap_or_default()),
+            session_branch: session_branch.clone(),
+            write_scope: Vec::new(),
+            base_commit: imported.commit.clone(),
+        };
+        let provenance = VerifierProvenance {
+            source: Some(MERGE_SOURCE_REMOTE.to_string()),
+            remote_host: Some(bundle.host.clone()),
+            remote_branch: Some(bundle.branch.clone()),
+            bundle_sha256: Some(bundle.sha256.clone()),
+            environment_caveat: Some(remote_integration::environment_caveat().to_string()),
+        };
+        let plan = self.engine.get_team_plan(&session.id).await.ok().flatten();
+        let task = params.task_id.as_deref().and_then(|task_id| {
+            plan.as_ref()
+                .and_then(|plan| plan.tasks.iter().find(|task| task.id == task_id))
+        });
+        let objective = params
+            .objective
+            .clone()
+            .or_else(|| task.map(|task| task.title.clone()))
+            .unwrap_or_else(|| {
+                format!(
+                    "Integrate remote branch {} from {}",
+                    bundle.branch, bundle.host
+                )
+            });
+        let acceptance = task.map(|task| task.acceptance.join("; "));
+        let mut verification = RemoteIntegrationVerification {
+            required: policy.require_verifier,
+            performed: false,
+            approved: None,
+            summary: None,
+            environment_caveat: remote_integration::environment_caveat().to_string(),
+        };
+        if policy.require_verifier {
+            let config = config
+                .as_ref()
+                .ok_or_else(|| anyhow!("agent provider is not configured"))?;
+            let control = Arc::new(RunControl::new_operation());
+            let budget = SessionBudget::new(
+                session.token_budget,
+                session.tokens_in + session.tokens_out,
+                AgentCaps {
+                    managers: config.max_managers,
+                    workers: config.max_workers,
+                    labour: config.max_labour,
+                },
+            )
+            .with_cost(session.cost_budget_usd, session.cost_spent_usd)
+            .with_time(session.time_budget_secs)
+            .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited));
+            let outcome = verify_worker(
+                &self.engine,
+                config,
+                &session,
+                &project,
+                &control,
+                &budget,
+                &manager_spec,
+                &worker_spec,
+                &imported.commit,
+                &objective,
+                &format!(
+                    "Imported {} bytes from {}:{} with bundle SHA-256 {}.",
+                    bundle.bytes, bundle.host, bundle.branch, bundle.sha256
+                ),
+                acceptance.as_deref(),
+                true,
+                &provenance,
+            )
+            .await?;
+            verification.performed = true;
+            match outcome {
+                VerificationOutcome::Approved(verdict) => {
+                    verification.approved = Some(true);
+                    verification.summary = Some(verdict.summary);
+                    self.engine.update_agent_status(&agent.id, "idle").await?;
+                }
+                VerificationOutcome::Rejected(verdict) => {
+                    verification.approved = Some(false);
+                    verification.summary = Some(verdict.summary.clone());
+                    self.engine.update_agent_status(&agent.id, "failed").await?;
+                    self.cleanup_remote_import(
+                        &project_root,
+                        &remote_worktree.path,
+                        &remote_worktree.branch,
+                        std::slice::from_ref(&imported.imported_ref),
+                        keep_import_refs,
+                    )
+                    .await;
+                    emit(
+                        &self.engine,
+                        &session.id,
+                        &event_spec,
+                        "remote.integration.rejected",
+                        json!({
+                            "host": bundle.host,
+                            "remote_branch": bundle.branch,
+                            "bundle_sha256": bundle.sha256,
+                            "summary": verdict.summary,
+                            "environment_caveat": verification.environment_caveat,
+                        }),
+                    )
+                    .await?;
+                    return Err(RemoteIntegrationFailure::new(
+                        ToolErrorCode::REMOTE_INTEGRATION_VERIFIER_REJECTED,
+                        format!(
+                            "the Verifier rejected the imported commit: {}",
+                            verdict.summary
+                        ),
+                    )
+                    .into());
+                }
+                VerificationOutcome::Cancelled => {
+                    self.cleanup_remote_import(
+                        &project_root,
+                        &remote_worktree.path,
+                        &remote_worktree.branch,
+                        std::slice::from_ref(&imported.imported_ref),
+                        keep_import_refs,
+                    )
+                    .await;
+                    return Err(RemoteIntegrationFailure::new(
+                        ToolErrorCode::REMOTE_INTEGRATION_FAILED,
+                        "remote verification was cancelled before enqueueing",
+                    )
+                    .into());
+                }
+                VerificationOutcome::BudgetExceeded(stop) => {
+                    self.cleanup_remote_import(
+                        &project_root,
+                        &remote_worktree.path,
+                        &remote_worktree.branch,
+                        std::slice::from_ref(&imported.imported_ref),
+                        keep_import_refs,
+                    )
+                    .await;
+                    return Err(RemoteIntegrationFailure::new(
+                        ToolErrorCode::REMOTE_INTEGRATION_FAILED,
+                        format!("remote verification stopped: {}", stop.summary()),
+                    )
+                    .into());
+                }
+                VerificationOutcome::Error(error) => {
+                    self.cleanup_remote_import(
+                        &project_root,
+                        &remote_worktree.path,
+                        &remote_worktree.branch,
+                        std::slice::from_ref(&imported.imported_ref),
+                        keep_import_refs,
+                    )
+                    .await;
+                    return Err(RemoteIntegrationFailure::new(
+                        ToolErrorCode::REMOTE_INTEGRATION_FAILED,
+                        format!("remote verification failed: {error}"),
+                    )
+                    .into());
+                }
+            }
+        } else {
+            emit(
+                &self.engine,
+                &session.id,
+                &worker_spec,
+                "remote.integration.verification_skipped",
+                json!({
+                    "host": bundle.host,
+                    "remote_branch": bundle.branch,
+                    "bundle_sha256": bundle.sha256,
+                    "reason": "RemoteIntegrationPolicy.require_verifier is false",
+                    "environment_caveat": remote_integration::environment_caveat(),
+                }),
+            )
+            .await?;
+        }
+        let base_worktree = PathBuf::from(&session.worktree.clone().unwrap_or_default());
+        let base_commit =
+            tokio::task::spawn_blocking(move || worktree::head_commit(&base_worktree)).await??;
+        let verification_detail = verification
+            .summary
+            .as_deref()
+            .map(|summary| format!("verifier: {summary}"))
+            .unwrap_or_else(|| "verifier skipped by policy".to_string());
+        let detail = truncate(&format!(
+            "remote {}:{} @ {}; bundle sha256 {}; {verification_detail}; {}",
+            bundle.host,
+            bundle.branch,
+            imported.commit,
+            bundle.sha256,
+            verification.environment_caveat
+        ));
+        let source = MergeQueueSource::remote(
+            bundle.host.clone(),
+            bundle.branch.clone(),
+            bundle.sha256.clone(),
+            imported.imported_ref.clone(),
+        );
+        let entry = self
+            .engine
+            .enqueue_merge_with_source(
+                &session.id,
+                &agent.id,
+                &agent_name,
+                params.task_id.clone(),
+                &remote_worktree.branch,
+                &imported.commit,
+                &base_commit,
+                Some(detail),
+                source,
+            )
+            .await?;
+        let entry = self
+            .engine
+            .set_merge_queue_verification(
+                &entry.id,
+                verification.approved,
+                verification.summary.clone(),
+                Some(verification.environment_caveat.clone()),
+            )
+            .await?
+            .unwrap_or(entry);
+        emit(
+            &self.engine,
+            &session.id,
+            &worker_spec,
+            "remote.integration.enqueued",
+            json!({
+                "entry_id": entry.id,
+                "host": bundle.host,
+                "remote_branch": bundle.branch,
+                "bundle_sha256": bundle.sha256,
+                "imported_ref": imported.imported_ref,
+                "commit": imported.commit,
+                "attempt": entry.attempt,
+            }),
+        )
+        .await?;
+        let integration_spec = AgentSpec {
+            auto_approve: false,
+            ..worker_spec
+        };
+        let integration = process_merge_entry(
+            &self.engine,
+            &session,
+            &integration_spec,
+            &entry,
+            config
+                .as_ref()
+                .and_then(|config| config.integration_command.as_deref()),
+        )
+        .await;
+        let entry = self
+            .engine
+            .get_merge_queue_entry(&entry.id)
+            .await?
+            .ok_or_else(|| anyhow!("merge queue entry disappeared after remote integration"))?;
+        match integration {
+            Ok(_) => {
+                let (pruned, cleanup_error) = match tokio::task::spawn_blocking({
+                    let project_root = project_root.clone();
+                    let imported_ref = imported.imported_ref.clone();
+                    move || {
+                        remote_integration::prune_import_refs(
+                            &project_root,
+                            &[imported_ref],
+                            keep_import_refs,
+                        )
+                    }
+                })
+                .await?
+                {
+                    Ok(pruned) => (pruned, None),
+                    Err(error) => {
+                        let detail = error.to_string();
+                        emit(
+                            &self.engine,
+                            &session.id,
+                            &integration_spec,
+                            "remote.integration.cleanup_failed",
+                            json!({"entry_id": entry.id, "detail": detail}),
+                        )
+                        .await?;
+                        (0, Some(detail))
+                    }
+                };
+                emit(
+                    &self.engine,
+                    &session.id,
+                    &integration_spec,
+                    "remote.integration.finished",
+                    json!({
+                        "entry_id": entry.id,
+                        "status": "merged",
+                        "host": bundle.host,
+                        "remote_branch": bundle.branch,
+                        "bundle_sha256": bundle.sha256,
+                        "imported_ref": entry.imported_ref,
+                        "refs_pruned": pruned,
+                        "environment_caveat": remote_integration::environment_caveat(),
+                    }),
+                )
+                .await?;
+                Ok(RemoteIntegrationResult {
+                    project_id: params.project_id,
+                    session_id: session.id,
+                    entry,
+                    bundle,
+                    verification,
+                    imported_ref: if keep_import_refs || cleanup_error.is_some() {
+                        Some(imported.imported_ref.clone())
+                    } else {
+                        None
+                    },
+                    refs_pruned: pruned > 0,
+                    cleanup_error,
+                    environment_caveat: remote_integration::environment_caveat().to_string(),
+                })
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                emit(
+                    &self.engine,
+                    &session.id,
+                    &integration_spec,
+                    "remote.integration.failed",
+                    json!({
+                        "entry_id": entry.id,
+                        "status": entry.status,
+                        "host": bundle.host,
+                        "remote_branch": bundle.branch,
+                        "bundle_sha256": bundle.sha256,
+                        "imported_ref": entry.imported_ref,
+                        "detail": truncate(&detail),
+                        "environment_caveat": remote_integration::environment_caveat(),
+                        "retry_hint": "retry the merge queue entry; the imported ref is retained while the entry is retryable",
+                    }),
+                )
+                .await?;
+                Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_INTEGRATION_FAILED,
+                    format!(
+                        "remote bundle was verified and enqueued as {}, but integration did not merge: {detail}",
+                        entry.id
+                    ),
+                )
+                .with_evidence(format!(
+                    "entry={}; status={}; imported_ref={}",
+                    entry.id,
+                    entry.status,
+                    entry.imported_ref.as_deref().unwrap_or("")
+                ))
+                .into())
+            }
+        }
+    }
+
+    /// Prune the imported ref after a successful retry/resolution unless the
+    /// project policy retains refs. A failure is returned as a warning string;
+    /// it never flips an already-merged entry back to failed.
+    async fn prune_remote_refs_after_merge(
+        &self,
+        project: &Project,
+        entry: &MergeQueueEntry,
+    ) -> Option<String> {
+        if entry.source != MERGE_SOURCE_REMOTE {
+            return None;
+        }
+        let reference = entry.imported_ref.clone()?;
+        let policy = self.engine.get_remote_integration_policy(&project.id).await;
+        let keep = match policy {
+            Ok(policy) => policy.keep_import_refs,
+            Err(error) => {
+                return Some(format!("could not read remote integration policy: {error}"));
+            }
+        };
+        if keep {
+            return None;
+        }
+        let root = PathBuf::from(&project.root);
+        match tokio::task::spawn_blocking(move || {
+            remote_integration::prune_import_refs(&root, &[reference], false)
+        })
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(format!("ref cleanup task failed: {error}")),
+        }
+    }
+
+    async fn cleanup_remote_import(
+        &self,
+        project_root: &Path,
+        worktree_path: &Path,
+        branch: &str,
+        references: &[String],
+        keep: bool,
+    ) {
+        let root = project_root.to_path_buf();
+        let worktree_path = worktree_path.to_path_buf();
+        let branch = branch.to_string();
+        let references = references.to_vec();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = remote_integration::remove_remote_worktree(&root, &worktree_path, &branch);
+            let _ = remote_integration::prune_import_refs(&root, &references, keep);
+        })
+        .await;
+    }
+
     pub async fn retry_merge(&self, entry_id: &str) -> Result<MergeQueueEntry> {
         let entry = self
             .engine
@@ -2444,6 +3272,20 @@ impl AgentService {
         let base_worktree = session_worktree.clone();
         let base_commit =
             tokio::task::spawn_blocking(move || worktree::head_commit(&base_worktree)).await??;
+        if entry.source == MERGE_SOURCE_REMOTE
+            && let Some(reference) = entry.imported_ref.clone()
+        {
+            let project_root = PathBuf::from(&project.root);
+            let commit_for_ref = commit.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::remote_integration::update_import_ref(
+                    &project_root,
+                    &reference,
+                    &commit_for_ref,
+                )
+            })
+            .await??;
+        }
 
         let profile = agent
             .profile
@@ -2533,6 +3375,7 @@ impl AgentService {
             "Rebased onto the current session branch after a previous integration attempt.",
             acceptance.as_deref(),
             true,
+            &verifier_provenance_for_entry(&entry),
         )
         .await?;
         let verifier_summary = match verification {
@@ -2608,10 +3451,24 @@ impl AgentService {
             config.integration_command.as_deref(),
         )
         .await?;
-        self.engine
+        let merged = self
+            .engine
             .get_merge_queue_entry(&entry.id)
             .await?
-            .ok_or_else(|| anyhow!("merge queue entry disappeared after retry"))
+            .ok_or_else(|| anyhow!("merge queue entry disappeared after retry"))?;
+        if merged.status == "merged"
+            && let Some(warning) = self.prune_remote_refs_after_merge(&project, &merged).await
+        {
+            emit(
+                &self.engine,
+                &session.id,
+                &spec,
+                "remote.integration.cleanup_failed",
+                json!({"entry_id": merged.id, "detail": warning}),
+            )
+            .await?;
+        }
+        Ok(merged)
     }
 
     /// Resolve a merge conflict with an internal coding agent, re-verify the
@@ -3037,6 +3894,20 @@ impl AgentService {
         let commit_worktree = worker_worktree.clone();
         let commit =
             tokio::task::spawn_blocking(move || worktree::head_commit(&commit_worktree)).await??;
+        if entry.source == MERGE_SOURCE_REMOTE
+            && let Some(reference) = entry.imported_ref.clone()
+        {
+            let project_root = PathBuf::from(&project.root);
+            let commit_for_ref = commit.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::remote_integration::update_import_ref(
+                    &project_root,
+                    &reference,
+                    &commit_for_ref,
+                )
+            })
+            .await??;
+        }
         self.engine
             .update_agent_status(&resolver.id, "idle")
             .await?;
@@ -3111,6 +3982,7 @@ impl AgentService {
             &outcome,
             Some("No conflict markers; both sides' intent is preserved; relevant tests pass"),
             true,
+            &verifier_provenance_for_entry(entry),
         )
         .await?;
         let verdict = match verification {
@@ -3215,10 +4087,24 @@ impl AgentService {
         )
         .await;
         integration?;
-        self.engine
+        let merged = self
+            .engine
             .get_merge_queue_entry(&entry.id)
             .await?
-            .ok_or_else(|| anyhow!("merge queue entry disappeared after auto-resolution"))
+            .ok_or_else(|| anyhow!("merge queue entry disappeared after auto-resolution"))?;
+        if merged.status == "merged"
+            && let Some(warning) = self.prune_remote_refs_after_merge(project, &merged).await
+        {
+            emit(
+                &self.engine,
+                &session.id,
+                &integration_spec,
+                "remote.integration.cleanup_failed",
+                json!({"entry_id": merged.id, "detail": warning}),
+            )
+            .await?;
+        }
+        Ok(merged)
     }
 
     /// Start the daemon-side watcher that auto-resolves conflicts when a
@@ -8106,6 +8992,275 @@ pub(crate) fn scopes_overlap(left: &[String], right: &[String]) -> bool {
     })
 }
 
+fn verifier_provenance_for_entry(entry: &MergeQueueEntry) -> VerifierProvenance {
+    if entry.source == MERGE_SOURCE_REMOTE {
+        VerifierProvenance {
+            source: Some(MERGE_SOURCE_REMOTE.to_string()),
+            remote_host: entry.remote_host.clone(),
+            remote_branch: entry.remote_branch.clone(),
+            bundle_sha256: entry.bundle_sha256.clone(),
+            environment_caveat: Some(crate::remote_integration::environment_caveat().to_string()),
+        }
+    } else {
+        VerifierProvenance::default()
+    }
+}
+
+fn remote_integrator_spec(
+    session: &Session,
+    worktree: &Path,
+    branch: &str,
+    base_commit: &str,
+) -> AgentSpec {
+    AgentSpec {
+        id: "remote-integrator".to_string(),
+        role: AgentRole::Manager,
+        name: "Remote Integrator".to_string(),
+        depth: 1,
+        parent_name: None,
+        title: Some("Integration".to_string()),
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: false,
+        auto_approve: true,
+        worktree: worktree.to_path_buf(),
+        branch: branch.to_string(),
+        session_worktree: session
+            .worktree
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| worktree.to_path_buf()),
+        session_branch: session.branch.clone().unwrap_or_else(|| branch.to_string()),
+        write_scope: Vec::new(),
+        base_commit: base_commit.to_string(),
+    }
+}
+
+async fn delete_helper_bundle(
+    workspace: &crate::remote::RemoteWorkspace,
+    bundle_id: &str,
+    operation_id: &str,
+) {
+    let _ = workspace
+        .git_bundle_delete(vp_remote::GitBundleDeleteParams {
+            bundle_id: bundle_id.to_string(),
+            operation_id: Some(operation_id.to_string()),
+        })
+        .await;
+}
+
+/// Download a bundle in bounded chunks, verifying every chunk hash and the
+/// total hash. The helper bundle is deleted on both success and failure; a
+/// partial local file is never imported.
+#[allow(clippy::too_many_arguments)]
+async fn download_remote_bundle(
+    workspace: &crate::remote::RemoteWorkspace,
+    session_id: &str,
+    branch: &str,
+    max_bytes: u64,
+    chunk_bytes: u64,
+    expected_commit: Option<&str>,
+    base_commit: Option<&str>,
+    import_id: &str,
+    data_dir: &Path,
+) -> Result<(PathBuf, RemoteBundleSummary), RemoteIntegrationFailure> {
+    let operation_base = format!("remote-bundle:{session_id}:{import_id}");
+    let created = workspace
+        .git_bundle_create(vp_remote::GitBundleCreateParams {
+            branch: branch.to_string(),
+            base: base_commit.map(str::to_string),
+            max_bytes,
+            chunk_bytes,
+            operation_id: Some(format!("{operation_base}:create")),
+        })
+        .await
+        .map_err(|error| {
+            RemoteIntegrationFailure::new(
+                ToolErrorCode::REMOTE_GIT_FAILED,
+                format!("remote bundle export failed: {error}"),
+            )
+        })?;
+    if created.bytes == 0 || created.bytes > max_bytes {
+        delete_helper_bundle(
+            workspace,
+            &created.bundle_id,
+            &format!("{operation_base}:delete"),
+        )
+        .await;
+        return Err(RemoteIntegrationFailure::new(
+            ToolErrorCode::REMOTE_BUNDLE_TOO_LARGE,
+            format!(
+                "remote bundle reported {} bytes; the configured cap is {max_bytes}",
+                created.bytes
+            ),
+        ));
+    }
+    if let Some(expected) = expected_commit
+        && !expected.trim().is_empty()
+        && !expected.trim().eq_ignore_ascii_case(&created.head)
+    {
+        delete_helper_bundle(
+            workspace,
+            &created.bundle_id,
+            &format!("{operation_base}:delete"),
+        )
+        .await;
+        return Err(RemoteIntegrationFailure::new(
+            ToolErrorCode::REMOTE_BUNDLE_HEAD_MISMATCH,
+            format!(
+                "remote branch head {} does not match the expected commit {}",
+                created.head,
+                expected.trim()
+            ),
+        ));
+    }
+    let directory = data_dir.join("tmp").join("remote-bundles");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| {
+            RemoteIntegrationFailure::new(
+                ToolErrorCode::REMOTE_BUNDLE_IMPORT_FAILED,
+                format!("cannot create local bundle directory: {error}"),
+            )
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await;
+    }
+    let path = directory.join(format!("{import_id}.bundle"));
+    let _ = tokio::fs::remove_file(&path).await;
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|error| {
+                RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_BUNDLE_IMPORT_FAILED,
+                    format!("cannot create local bundle file: {error}"),
+                )
+            })?;
+        let mut offset = 0u64;
+        let mut chunks = 0u32;
+        let mut hasher = Sha256::new();
+        loop {
+            let chunk = workspace
+                .git_bundle_read(vp_remote::GitBundleReadParams {
+                    bundle_id: created.bundle_id.clone(),
+                    offset,
+                    limit: chunk_bytes,
+                })
+                .await
+                .map_err(|error| {
+                    RemoteIntegrationFailure::new(
+                        ToolErrorCode::REMOTE_GIT_FAILED,
+                        format!("remote bundle chunk {chunks} failed: {error}"),
+                    )
+                })?;
+            if chunk.bundle_id != created.bundle_id
+                || chunk.offset != offset
+                || chunk.total_bytes != created.bytes
+                || !chunk.total_sha256.eq_ignore_ascii_case(&created.sha256)
+            {
+                return Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_BUNDLE_TAMPERED,
+                    "bundle chunk metadata changed between requests",
+                ));
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(chunk.base64.as_bytes())
+                .map_err(|error| {
+                    RemoteIntegrationFailure::new(
+                        ToolErrorCode::REMOTE_BUNDLE_TAMPERED,
+                        format!("bundle chunk is not valid base64: {error}"),
+                    )
+                })?;
+            if bytes.len() as u64 != chunk.bytes_read || bytes.len() as u64 > chunk_bytes {
+                return Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_BUNDLE_TAMPERED,
+                    "bundle chunk length does not match the requested bound",
+                ));
+            }
+            let mut chunk_hasher = Sha256::new();
+            chunk_hasher.update(&bytes);
+            if format!("{:x}", chunk_hasher.finalize()) != chunk.chunk_sha256 {
+                return Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_BUNDLE_TAMPERED,
+                    "bundle chunk SHA-256 does not match the helper report",
+                ));
+            }
+            if offset.saturating_add(bytes.len() as u64) > max_bytes {
+                return Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_BUNDLE_TOO_LARGE,
+                    format!("downloaded bundle exceeds the {max_bytes}-byte cap"),
+                ));
+            }
+            file.write_all(&bytes).await.map_err(|error| {
+                RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_BUNDLE_IMPORT_FAILED,
+                    format!("cannot write local bundle: {error}"),
+                )
+            })?;
+            hasher.update(&bytes);
+            offset = offset.saturating_add(bytes.len() as u64);
+            chunks = chunks.saturating_add(1);
+            if chunk.done {
+                break;
+            }
+            if bytes.is_empty() {
+                return Err(RemoteIntegrationFailure::new(
+                    ToolErrorCode::REMOTE_BUNDLE_TAMPERED,
+                    "helper returned an empty chunk before the bundle was complete",
+                ));
+            }
+        }
+        file.sync_all().await.map_err(|error| {
+            RemoteIntegrationFailure::new(
+                ToolErrorCode::REMOTE_BUNDLE_IMPORT_FAILED,
+                format!("cannot sync local bundle: {error}"),
+            )
+        })?;
+        let total_sha = format!("{:x}", hasher.finalize());
+        if offset != created.bytes || !total_sha.eq_ignore_ascii_case(&created.sha256) {
+            return Err(RemoteIntegrationFailure::new(
+                ToolErrorCode::REMOTE_BUNDLE_TAMPERED,
+                format!(
+                    "downloaded bundle has {} bytes and SHA-256 {}, expected {} bytes and {}",
+                    offset, total_sha, created.bytes, created.sha256
+                ),
+            ));
+        }
+        Ok(RemoteBundleSummary {
+            host: String::new(),
+            branch: created.branch.clone(),
+            head: created.head.clone(),
+            sha256: created.sha256.clone(),
+            bytes: created.bytes,
+            chunks,
+            chunk_bytes,
+            imported_at: vp_protocol::now_rfc3339(),
+        })
+    }
+    .await;
+    delete_helper_bundle(
+        workspace,
+        &created.bundle_id,
+        &format!("{operation_base}:delete"),
+    )
+    .await;
+    match result {
+        Ok(summary) => Ok((path, summary)),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            Err(error)
+        }
+    }
+}
+
 async fn commit_worker(spec: &AgentSpec, name: &str) -> Result<Option<String>> {
     let task_worktree = spec.worktree.clone();
     let message = format!("task: {name}");
@@ -8552,6 +9707,44 @@ enum VerificationOutcome {
     Error(String),
 }
 
+/// Provenance attached to a Verifier run. Local Worker verification uses the
+/// default empty value; remote integration records the exact host, branch,
+/// bundle hash, and the environment caveat so the event stream never implies
+/// that the remote host was reproduced.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VerifierProvenance {
+    pub source: Option<String>,
+    pub remote_host: Option<String>,
+    pub remote_branch: Option<String>,
+    pub bundle_sha256: Option<String>,
+    pub environment_caveat: Option<String>,
+}
+
+fn verification_payload(
+    mut payload: serde_json::Value,
+    provenance: &VerifierProvenance,
+) -> serde_json::Value {
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    if let Some(source) = provenance.source.as_deref() {
+        object.insert("source".into(), serde_json::json!(source));
+    }
+    if let Some(host) = provenance.remote_host.as_deref() {
+        object.insert("remote_host".into(), serde_json::json!(host));
+    }
+    if let Some(branch) = provenance.remote_branch.as_deref() {
+        object.insert("remote_branch".into(), serde_json::json!(branch));
+    }
+    if let Some(bundle) = provenance.bundle_sha256.as_deref() {
+        object.insert("bundle_sha256".into(), serde_json::json!(bundle));
+    }
+    if let Some(caveat) = provenance.environment_caveat.as_deref() {
+        object.insert("environment_caveat".into(), serde_json::json!(caveat));
+    }
+    payload
+}
+
 struct VerificationCheckout {
     path: PathBuf,
 }
@@ -8579,6 +9772,7 @@ async fn verify_worker(
     worker_summary: &str,
     acceptance: Option<&str>,
     auto_approve: bool,
+    provenance: &VerifierProvenance,
 ) -> Result<VerificationOutcome> {
     let Some((ordinal, _verifier_slot)) = budget.reserve_slot(AgentRole::Verifier) else {
         return Ok(VerificationOutcome::Error(
@@ -8663,9 +9857,18 @@ async fn verify_worker(
         .filter(|value| !value.trim().is_empty())
         .map(|value| format!(" Acceptance criteria: {value}."))
         .unwrap_or_default();
+    let provenance_note = match (
+        provenance.remote_host.as_deref(),
+        provenance.remote_branch.as_deref(),
+    ) {
+        (Some(host), Some(branch)) => format!(
+            " This is an imported remote commit from {host}:{branch}; local verification does not reproduce the remote host environment."
+        ),
+        _ => String::new(),
+    };
     let prompt = format!(
         "Verify Worker {} for this task. Objective: {objective}.{acceptance_note} \
-         Worker summary: {worker_summary}. The isolated verification worktree is {} on branch {}; base commit {}. \
+         Worker summary: {worker_summary}. The isolated verification worktree is {} on branch {}; base commit {}.{provenance_note} \
          {focus} Do not edit files. Then call submit_verdict with approved and summary.",
         worker_spec.name,
         verifier_spec.worktree.to_string_lossy(),
@@ -8677,12 +9880,15 @@ async fn verify_worker(
         &session.id,
         &verifier_spec,
         "agent.spawned",
-        serde_json::json!({
-            "parent_id": manager_spec.id,
-            "parent_name": manager_spec.name,
-            "objective": truncate(&prompt),
-            "verified_worker": worker_spec.name,
-        }),
+        verification_payload(
+            serde_json::json!({
+                "parent_id": manager_spec.id,
+                "parent_name": manager_spec.name,
+                "objective": truncate(&prompt),
+                "verified_worker": worker_spec.name,
+            }),
+            provenance,
+        ),
     )
     .await?;
     let mut conversation = vec![ChatMessage::user(prompt.clone())];
@@ -8726,14 +9932,17 @@ async fn verify_worker(
                     &session.id,
                     &verifier_spec,
                     "agent.finished",
-                    serde_json::json!({
-                        "status": "failed",
-                        "approved": false,
-                        "summary": summary,
-                        "verified_worker": worker_spec.name,
-                        "worktree": verifier_spec.worktree,
-                        "branch": verifier_spec.branch,
-                    }),
+                    verification_payload(
+                        serde_json::json!({
+                            "status": "failed",
+                            "approved": false,
+                            "summary": summary,
+                            "verified_worker": worker_spec.name,
+                            "worktree": verifier_spec.worktree,
+                            "branch": verifier_spec.branch,
+                        }),
+                        provenance,
+                    ),
                 )
                 .await?;
                 return Ok(VerificationOutcome::Rejected(VerifierVerdict {
@@ -8763,15 +9972,18 @@ async fn verify_worker(
                     &session.id,
                     &verifier_spec,
                     "agent.finished",
-                    serde_json::json!({
-                        "status": "failed",
-                        "approved": false,
-                        "summary": summary,
-                        "modified_paths": changed,
-                        "verified_worker": worker_spec.name,
-                        "worktree": verifier_spec.worktree,
-                        "branch": verifier_spec.branch,
-                    }),
+                    verification_payload(
+                        serde_json::json!({
+                            "status": "failed",
+                            "approved": false,
+                            "summary": summary,
+                            "modified_paths": changed,
+                            "verified_worker": worker_spec.name,
+                            "worktree": verifier_spec.worktree,
+                            "branch": verifier_spec.branch,
+                        }),
+                        provenance,
+                    ),
                 )
                 .await?;
                 return Ok(VerificationOutcome::Rejected(VerifierVerdict {
@@ -8785,14 +9997,17 @@ async fn verify_worker(
                 &session.id,
                 &verifier_spec,
                 "agent.finished",
-                serde_json::json!({
-                    "status": "idle",
-                    "approved": verdict.approved,
-                    "summary": truncate(&verdict.summary),
-                    "verified_worker": worker_spec.name,
-                    "worktree": verifier_spec.worktree,
-                    "branch": verifier_spec.branch,
-                }),
+                verification_payload(
+                    serde_json::json!({
+                        "status": "idle",
+                        "approved": verdict.approved,
+                        "summary": truncate(&verdict.summary),
+                        "verified_worker": worker_spec.name,
+                        "worktree": verifier_spec.worktree,
+                        "branch": verifier_spec.branch,
+                    }),
+                    provenance,
+                ),
             )
             .await?;
             Ok(if verdict.approved {
@@ -8813,12 +10028,15 @@ async fn verify_worker(
                 &session.id,
                 &verifier_spec,
                 "agent.finished",
-                serde_json::json!({
-                    "status": "failed",
-                    "approved": false,
-                    "summary": truncate(&summary),
-                    "verified_worker": worker_spec.name,
-                }),
+                verification_payload(
+                    serde_json::json!({
+                        "status": "failed",
+                        "approved": false,
+                        "summary": truncate(&summary),
+                        "verified_worker": worker_spec.name,
+                    }),
+                    provenance,
+                ),
             )
             .await?;
             Ok(VerificationOutcome::Error(summary))
@@ -8832,10 +10050,13 @@ async fn verify_worker(
                 &session.id,
                 &verifier_spec,
                 "agent.finished",
-                serde_json::json!({
-                    "status": "cancelled",
-                    "verified_worker": worker_spec.name,
-                }),
+                verification_payload(
+                    serde_json::json!({
+                        "status": "cancelled",
+                        "verified_worker": worker_spec.name,
+                    }),
+                    provenance,
+                ),
             )
             .await?;
             Ok(VerificationOutcome::Cancelled)
@@ -8847,11 +10068,14 @@ async fn verify_worker(
                 &session.id,
                 &verifier_spec,
                 "agent.finished",
-                serde_json::json!({
-                    "status": "failed",
-                    "summary": stop.summary(),
-                    "verified_worker": worker_spec.name,
-                }),
+                verification_payload(
+                    serde_json::json!({
+                        "status": "failed",
+                        "summary": stop.summary(),
+                        "verified_worker": worker_spec.name,
+                    }),
+                    provenance,
+                ),
             )
             .await?;
             Ok(VerificationOutcome::BudgetExceeded(stop))
@@ -8863,12 +10087,15 @@ async fn verify_worker(
                 &session.id,
                 &verifier_spec,
                 "agent.finished",
-                serde_json::json!({
-                    "status": "failed",
-                    "approved": false,
-                    "summary": truncate(error.to_string().as_str()),
-                    "verified_worker": worker_spec.name,
-                }),
+                verification_payload(
+                    serde_json::json!({
+                        "status": "failed",
+                        "approved": false,
+                        "summary": truncate(error.to_string().as_str()),
+                        "verified_worker": worker_spec.name,
+                    }),
+                    provenance,
+                ),
             )
             .await?;
             Ok(VerificationOutcome::Error(error.to_string()))
@@ -9817,6 +11044,7 @@ async fn finish_worker(
         summary,
         acceptance,
         false,
+        &VerifierProvenance::default(),
     )
     .await?;
     match verification {

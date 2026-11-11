@@ -5974,8 +5974,17 @@ struct MergeQueueEntry: Codable, Identifiable, Hashable, Sendable {
     let status: String
     let attempt: Int
     let detail: String?
+    let source: String?
+    let remoteHost: String?
+    let remoteBranch: String?
+    let bundleSha256: String?
+    let importedRef: String?
     let createdAt: String
     let updatedAt: String
+
+    var isRemote: Bool {
+        source == "remote"
+    }
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -5990,8 +5999,169 @@ struct MergeQueueEntry: Codable, Identifiable, Hashable, Sendable {
         case status
         case attempt
         case detail
+        case source
+        case remoteHost = "remote_host"
+        case remoteBranch = "remote_branch"
+        case bundleSha256 = "bundle_sha256"
+        case importedRef = "imported_ref"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
+    }
+}
+
+struct RemoteIntegrationPolicy: Codable, Sendable, Equatable {
+    let enabled: Bool
+    let maxBundleBytes: Int
+    let requireVerifier: Bool
+    let allowedHosts: [String]
+    let keepImportRefs: Bool
+
+    static let disabled = RemoteIntegrationPolicy(
+        enabled: false,
+        maxBundleBytes: 256 * 1024 * 1024,
+        requireVerifier: true,
+        allowedHosts: [],
+        keepImportRefs: false
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case maxBundleBytes = "max_bundle_bytes"
+        case requireVerifier = "require_verifier"
+        case allowedHosts = "allowed_hosts"
+        case keepImportRefs = "keep_import_refs"
+    }
+
+    init(
+        enabled: Bool,
+        maxBundleBytes: Int,
+        requireVerifier: Bool,
+        allowedHosts: [String],
+        keepImportRefs: Bool
+    ) {
+        self.enabled = enabled
+        self.maxBundleBytes = maxBundleBytes
+        self.requireVerifier = requireVerifier
+        self.allowedHosts = allowedHosts
+        self.keepImportRefs = keepImportRefs
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        maxBundleBytes =
+            try container.decodeIfPresent(Int.self, forKey: .maxBundleBytes)
+                ?? 256 * 1024 * 1024
+        requireVerifier =
+            try container.decodeIfPresent(Bool.self, forKey: .requireVerifier) ?? true
+        allowedHosts =
+            try container.decodeIfPresent([String].self, forKey: .allowedHosts) ?? []
+        keepImportRefs =
+            try container.decodeIfPresent(Bool.self, forKey: .keepImportRefs) ?? false
+    }
+}
+
+struct RemoteIntegrationPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: RemoteIntegrationPolicy
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+        case updatedAt = "updated_at"
+    }
+}
+
+struct RemoteIntegrationQueueEntry: Codable, Identifiable, Hashable, Sendable {
+    var id: String {
+        entryId
+    }
+
+    let entryId: String
+    let sessionId: String
+    let status: String
+    let commit: String
+    let branch: String
+    let remoteHost: String?
+    let remoteBranch: String?
+    let bundleSha256: String?
+    let importedRef: String?
+    let verifierApproved: Bool?
+    let verifierSummary: String?
+    let environmentCaveat: String?
+    let attempt: Int
+    let detail: String?
+    let createdAt: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case entryId = "entry_id"
+        case sessionId = "session_id"
+        case status
+        case commit
+        case branch
+        case remoteHost = "remote_host"
+        case remoteBranch = "remote_branch"
+        case bundleSha256 = "bundle_sha256"
+        case importedRef = "imported_ref"
+        case verifierApproved = "verifier_approved"
+        case verifierSummary = "verifier_summary"
+        case environmentCaveat = "environment_caveat"
+        case attempt
+        case detail
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+struct RemoteIntegrationCleanupResult: Codable, Sendable {
+    let projectId: String
+    let sessionId: String?
+    let removedRefs: [String]
+    let removedWorktrees: [String]
+    let skipped: [String]
+    let entriesExamined: Int
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case sessionId = "session_id"
+        case removedRefs = "removed_refs"
+        case removedWorktrees = "removed_worktrees"
+        case skipped
+        case entriesExamined = "entries_examined"
+    }
+}
+
+struct RemoteIntegrationStatusResult: Codable, Sendable {
+    let projectId: String
+    let sessionId: String?
+    let policy: RemoteIntegrationPolicy
+    let policyUpdatedAt: String
+    let entries: [RemoteIntegrationQueueEntry]
+    let total: Int
+    let pending: Int
+    let merged: Int
+    let conflicts: Int
+    let failed: Int
+    let retainedRefs: Int
+    let verifierRequired: Bool
+    let environmentCaveat: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case sessionId = "session_id"
+        case policy
+        case policyUpdatedAt = "policy_updated_at"
+        case entries
+        case total
+        case pending
+        case merged
+        case conflicts
+        case failed
+        case retainedRefs = "retained_refs"
+        case verifierRequired = "verifier_required"
+        case environmentCaveat = "environment_caveat"
     }
 }
 

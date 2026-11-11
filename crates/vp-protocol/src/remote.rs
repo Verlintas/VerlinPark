@@ -7,6 +7,19 @@
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_HELPER_PATH: &str = "vp-remote-agent";
+/// Default hard cap for a Git bundle exported by a remote helper. The daemon
+/// also enforces this as a policy value; the helper receives the effective cap
+/// in the create request and refuses a bundle that grows past it.
+pub const DEFAULT_MAX_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
+/// Lower bound exists so tests and small repositories can configure a visible
+/// cap without disabling the check.
+pub const MIN_MAX_BUNDLE_BYTES: u64 = 1024;
+/// Upper bound keeps one export from exhausting the helper filesystem.
+pub const MAX_MAX_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_BUNDLE_CHUNK_BYTES: u64 = 1024 * 1024;
+pub const MAX_BUNDLE_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_REMOTE_ALLOWED_HOSTS: usize = 32;
+pub const MAX_REMOTE_BRANCH_CHARS: usize = 255;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
@@ -416,6 +429,300 @@ pub struct RemoteWorktreeListResult {
     pub worktrees: Vec<RemoteWorktree>,
 }
 
+/// Project-scoped policy for importing a remote branch into the local
+/// Verifier and merge queue. Disabled by default; enabling requires an explicit
+/// host allowlist, because a helper on a trusted host can export any branch in
+/// its root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteIntegrationPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_max_bundle_bytes")]
+    pub max_bundle_bytes: u64,
+    #[serde(default = "default_true")]
+    pub require_verifier: bool,
+    /// Exact SSH host names (or `user@host`) that may be integrated. There is
+    /// no wildcard: an empty list cannot be enabled.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Keep `refs/verlinpark/remote/...` after a successful integration for
+    /// operator inspection. Retained refs are never fetched or merged
+    /// automatically.
+    #[serde(default)]
+    pub keep_import_refs: bool,
+}
+
+fn default_max_bundle_bytes() -> u64 {
+    DEFAULT_MAX_BUNDLE_BYTES
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for RemoteIntegrationPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_bundle_bytes: DEFAULT_MAX_BUNDLE_BYTES,
+            require_verifier: true,
+            allowed_hosts: Vec::new(),
+            keep_import_refs: false,
+        }
+    }
+}
+
+impl RemoteIntegrationPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(MIN_MAX_BUNDLE_BYTES..=MAX_MAX_BUNDLE_BYTES).contains(&self.max_bundle_bytes) {
+            return Err(format!(
+                "max_bundle_bytes must be {MIN_MAX_BUNDLE_BYTES}..={MAX_MAX_BUNDLE_BYTES}"
+            ));
+        }
+        if self.allowed_hosts.len() > MAX_REMOTE_ALLOWED_HOSTS {
+            return Err(format!(
+                "at most {MAX_REMOTE_ALLOWED_HOSTS} allowed hosts are permitted"
+            ));
+        }
+        for host in &self.allowed_hosts {
+            validate_allowed_host(host)?;
+        }
+        if self.enabled && self.allowed_hosts.is_empty() {
+            return Err(
+                "remote integration requires at least one explicit allowed host when enabled"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a configured execution host is explicitly allowed. Matching is
+    /// exact against the host name, `user@host`, or the full host label; no
+    /// substring or wildcard match is accepted.
+    pub fn allows_host(&self, config: &ExecutionHost) -> bool {
+        if !config.is_remote() {
+            return false;
+        }
+        let host = config.host.trim();
+        let user_host = config.user.as_deref().map(|user| format!("{user}@{host}"));
+        let label = config.label();
+        self.allowed_hosts.iter().any(|allowed| {
+            let allowed = allowed.trim();
+            !allowed.is_empty()
+                && (allowed.eq_ignore_ascii_case(host)
+                    || user_host
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(allowed))
+                    || allowed.eq_ignore_ascii_case(&label))
+        })
+    }
+
+    pub fn is_empty_policy(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn validate_allowed_host(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.len() > 255 {
+        return Err("allowed host entries must be 1..=255 characters".to_string());
+    }
+    if host.chars().any(|character| {
+        character.is_whitespace()
+            || character.is_control()
+            || matches!(
+                character,
+                ';' | '&' | '|' | '`' | '$' | '\'' | '"' | '\\' | '/' | '*' | '?'
+            )
+    }) {
+        return Err(format!(
+            "allowed host contains characters that cannot match a configured host: {host}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteIntegrationPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteIntegrationPolicyResult {
+    pub project_id: String,
+    pub policy: RemoteIntegrationPolicy,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetRemoteIntegrationPolicyParams {
+    pub project_id: String,
+    pub policy: RemoteIntegrationPolicy,
+    /// Explicit operator confirmation. Enabling remote integration without
+    /// this flag fails closed even when the policy body is valid.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteIntegrationParams {
+    pub project_id: String,
+    pub session_id: String,
+    /// Branch name in the remote project checkout (without `refs/heads/`).
+    pub branch: String,
+    /// Optional assertion of the exact remote host. When set it must match the
+    /// project execution host; the policy allowlist is checked regardless.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Optional recorded remote head. The bundle's exported head must equal
+    /// this value; when omitted the helper's reported head is used.
+    #[serde(default)]
+    pub expected_commit: Option<String>,
+    /// Optional local prerequisite commit for a thin bundle. The helper exports
+    /// `<branch> --not <base>`, and the local import still verifies the bundle
+    /// against this repository. Omit it for a self-contained bundle.
+    #[serde(default)]
+    pub base_commit: Option<String>,
+    /// Optional plan task to attach the merge-queue entry to.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub objective: Option<String>,
+    /// Explicit operator confirmation for a host-level integration action.
+    #[serde(default)]
+    pub confirm: bool,
+    /// Overrides `policy.keep_import_refs` for this integration.
+    #[serde(default)]
+    pub keep_import_refs: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteBundleSummary {
+    pub host: String,
+    pub branch: String,
+    pub head: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub chunks: u32,
+    pub chunk_bytes: u64,
+    /// Wall-clock time reported by the daemon after the last chunk arrived.
+    pub imported_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteIntegrationVerification {
+    pub required: bool,
+    pub performed: bool,
+    #[serde(default)]
+    pub approved: Option<bool>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Local verification runs against an isolated clone of the imported
+    /// commit. It does not reproduce the remote host, installed tools,
+    /// environment variables, or network.
+    pub environment_caveat: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteIntegrationResult {
+    pub project_id: String,
+    pub session_id: String,
+    pub entry: crate::types::MergeQueueEntry,
+    pub bundle: RemoteBundleSummary,
+    pub verification: RemoteIntegrationVerification,
+    #[serde(default)]
+    pub imported_ref: Option<String>,
+    pub refs_pruned: bool,
+    #[serde(default)]
+    pub cleanup_error: Option<String>,
+    pub environment_caveat: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteIntegrationStatusParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteIntegrationQueueEntry {
+    pub entry_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub commit: String,
+    pub branch: String,
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    #[serde(default)]
+    pub remote_branch: Option<String>,
+    #[serde(default)]
+    pub bundle_sha256: Option<String>,
+    #[serde(default)]
+    pub imported_ref: Option<String>,
+    #[serde(default)]
+    pub verifier_approved: Option<bool>,
+    #[serde(default)]
+    pub verifier_summary: Option<String>,
+    #[serde(default)]
+    pub environment_caveat: Option<String>,
+    pub attempt: u32,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteIntegrationCleanupParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Restrict cleanup to one queue entry.
+    #[serde(default)]
+    pub entry_id: Option<String>,
+    /// Also remove refs/worktrees for retryable (`conflict`/`failed`/
+    /// `interrupted`) entries. Without this flag those refs are retained so an
+    /// operator can retry the exact imported branch.
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteIntegrationCleanupResult {
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub removed_refs: Vec<String>,
+    pub removed_worktrees: Vec<String>,
+    pub skipped: Vec<String>,
+    pub entries_examined: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteIntegrationStatusResult {
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub policy: RemoteIntegrationPolicy,
+    pub policy_updated_at: String,
+    pub entries: Vec<RemoteIntegrationQueueEntry>,
+    pub total: usize,
+    pub pending: usize,
+    pub merged: usize,
+    pub conflicts: usize,
+    pub failed: usize,
+    /// Number of entries whose temporary ref is still present because the
+    /// integration failed or the policy keeps refs.
+    pub retained_refs: usize,
+    pub verifier_required: bool,
+    pub environment_caveat: String,
+}
+
+/// Stable environment statement attached to every remote verification and
+/// status result. Keeping it in one constant prevents a UI or CLI from
+/// implying that the remote host was reproduced.
+pub const REMOTE_VERIFICATION_ENVIRONMENT_CAVEAT: &str = "Local verification checks the imported commit in an isolated clone on this daemon host. It does not reproduce the remote host's OS, installed tools, environment variables, network, or uncommitted files.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +811,153 @@ mod tests {
             ..ExecutionHost::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn remote_integration_is_disabled_by_default_and_bounded() {
+        let policy = RemoteIntegrationPolicy::default();
+        assert!(!policy.enabled);
+        assert!(policy.require_verifier);
+        assert_eq!(policy.max_bundle_bytes, DEFAULT_MAX_BUNDLE_BYTES);
+        assert!(policy.allowed_hosts.is_empty());
+        assert!(policy.validate().is_ok());
+        assert!(policy.is_empty_policy());
+
+        let decoded: RemoteIntegrationPolicy =
+            serde_json::from_value(serde_json::json!({})).expect("legacy policy must decode");
+        assert_eq!(decoded, policy);
+
+        let mut invalid = policy.clone();
+        invalid.max_bundle_bytes = MIN_MAX_BUNDLE_BYTES - 1;
+        assert!(invalid.validate().is_err());
+        invalid.max_bundle_bytes = MAX_MAX_BUNDLE_BYTES + 1;
+        assert!(invalid.validate().is_err());
+        invalid.max_bundle_bytes = DEFAULT_MAX_BUNDLE_BYTES;
+        invalid.allowed_hosts = (0..=MAX_REMOTE_ALLOWED_HOSTS)
+            .map(|index| format!("host{index}"))
+            .collect();
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn enabling_remote_integration_requires_an_explicit_host_allowlist() {
+        let mut policy = RemoteIntegrationPolicy {
+            enabled: true,
+            ..RemoteIntegrationPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+        policy.allowed_hosts = vec!["build.example.com".into()];
+        assert!(policy.validate().is_ok());
+        let config = remote();
+        assert!(policy.allows_host(&config));
+        policy.allowed_hosts = vec!["agent@build.example.com".into()];
+        assert!(policy.allows_host(&config));
+        policy.allowed_hosts = vec!["agent@build.example.com:/srv/project".into()];
+        assert!(policy.allows_host(&config));
+        policy.allowed_hosts = vec!["build".into()];
+        assert!(!policy.allows_host(&config));
+        policy.allowed_hosts = vec!["*.example.com".into()];
+        assert!(policy.validate().is_err());
+        policy.allowed_hosts = vec!["host;rm".into()];
+        assert!(policy.validate().is_err());
+        assert!(!policy.allows_host(&ExecutionHost::default()));
+        policy.allowed_hosts = vec!["BUILD.EXAMPLE.COM".into()];
+        assert!(policy.allows_host(&config));
+        policy.allowed_hosts = vec!["Agent@Build.Example.Com".into()];
+        assert!(policy.allows_host(&config));
+        policy.allowed_hosts = vec!["agent@build.example.com:/srv/project".into()];
+        assert!(policy.allows_host(&config));
+        policy.allowed_hosts = vec!["build.example.com:2222".into()];
+        assert!(!policy.allows_host(&config));
+    }
+
+    #[test]
+    fn remote_integration_status_and_cleanup_round_trip() {
+        let status = RemoteIntegrationStatusResult {
+            project_id: "p1".into(),
+            session_id: Some("s1".into()),
+            policy: RemoteIntegrationPolicy {
+                enabled: true,
+                max_bundle_bytes: 4096,
+                require_verifier: true,
+                allowed_hosts: vec!["build.example.com".into()],
+                keep_import_refs: true,
+            },
+            policy_updated_at: "2026-11-11T00:00:00Z".into(),
+            entries: vec![RemoteIntegrationQueueEntry {
+                entry_id: "e1".into(),
+                session_id: "s1".into(),
+                status: "conflict".into(),
+                commit: "a".repeat(40),
+                branch: "verlinpark/s1--remote-1".into(),
+                remote_host: Some("build.example.com".into()),
+                remote_branch: Some("feature/x".into()),
+                bundle_sha256: Some("b".repeat(64)),
+                imported_ref: Some("refs/verlinpark/remote/s1/i1".into()),
+                verifier_approved: Some(true),
+                verifier_summary: Some("approved".into()),
+                environment_caveat: Some("local only".into()),
+                attempt: 2,
+                detail: Some("conflict".into()),
+                created_at: "2026-11-11T00:00:00Z".into(),
+                updated_at: "2026-11-11T00:01:00Z".into(),
+            }],
+            total: 1,
+            pending: 0,
+            merged: 0,
+            conflicts: 1,
+            failed: 0,
+            retained_refs: 1,
+            verifier_required: true,
+            environment_caveat: REMOTE_VERIFICATION_ENVIRONMENT_CAVEAT.into(),
+        };
+        let decoded: RemoteIntegrationStatusResult =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert_eq!(decoded.entries[0].verifier_approved, Some(true));
+        assert_eq!(
+            decoded.entries[0].remote_branch.as_deref(),
+            Some("feature/x")
+        );
+        assert_eq!(decoded.retained_refs, 1);
+        let cleanup = RemoteIntegrationCleanupParams {
+            project_id: "p1".into(),
+            session_id: None,
+            entry_id: Some("e1".into()),
+            force: true,
+        };
+        let decoded: RemoteIntegrationCleanupParams =
+            serde_json::from_value(serde_json::to_value(&cleanup).unwrap()).unwrap();
+        assert!(decoded.force);
+        assert!(decoded.session_id.is_none());
+        let result = RemoteIntegrationCleanupResult {
+            project_id: "p1".into(),
+            session_id: None,
+            removed_refs: vec!["refs/verlinpark/remote/s1/i1".into()],
+            removed_worktrees: Vec::new(),
+            skipped: vec!["e2: requires force".into()],
+            entries_examined: 2,
+        };
+        let decoded: RemoteIntegrationCleanupResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(decoded.removed_refs.len(), 1);
+        assert_eq!(decoded.entries_examined, 2);
+    }
+
+    #[test]
+    fn remote_integration_requests_default_to_unconfirmed_and_local_settings() {
+        let params: RemoteIntegrationParams = serde_json::from_value(serde_json::json!({
+            "project_id": "p1",
+            "session_id": "s1",
+            "branch": "feature/remote"
+        }))
+        .unwrap();
+        assert!(!params.confirm);
+        assert!(params.host.is_none());
+        assert!(params.expected_commit.is_none());
+        assert!(params.base_commit.is_none());
+        assert!(params.keep_import_refs.is_none());
+        let status: RemoteIntegrationStatusParams =
+            serde_json::from_value(serde_json::json!({"project_id": "p1"})).unwrap();
+        assert!(status.session_id.is_none());
     }
 }

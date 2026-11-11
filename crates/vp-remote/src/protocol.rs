@@ -38,6 +38,15 @@ pub const MAX_EXEC_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 120 * 1000;
 pub const MAX_GIT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_GIT_PATHS: usize = 100;
+/// Bundle exports are streamed in bounded base64 chunks. The chunk is kept
+/// below the 16 MiB frame limit after base64 expansion.
+pub const DEFAULT_GIT_BUNDLE_CHUNK_BYTES: u64 = 1024 * 1024;
+pub const MIN_GIT_BUNDLE_CHUNK_BYTES: u64 = 1024;
+pub const MAX_GIT_BUNDLE_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_GIT_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_ACTIVE_BUNDLES: usize = 4;
+pub const BUNDLE_TTL_SECS: u64 = 1_800;
+pub const MAX_BUNDLE_ID_CHARS: usize = 120;
 pub const MAX_ENV_VARS: usize = 32;
 pub const MAX_ENV_VALUE_BYTES: usize = 8 * 1024;
 pub const MAX_OPERATION_ID_CHARS: usize = 160;
@@ -60,6 +69,9 @@ pub const METHOD_GIT_REV_PARSE: &str = "git_rev_parse";
 pub const METHOD_GIT_WORKTREE_ADD: &str = "git_worktree_add";
 pub const METHOD_GIT_WORKTREE_LIST: &str = "git_worktree_list";
 pub const METHOD_GIT_WORKTREE_REMOVE: &str = "git_worktree_remove";
+pub const METHOD_GIT_BUNDLE_CREATE: &str = "git_bundle_create";
+pub const METHOD_GIT_BUNDLE_READ: &str = "git_bundle_read";
+pub const METHOD_GIT_BUNDLE_DELETE: &str = "git_bundle_delete";
 pub const METHOD_LEDGER_STATS: &str = "ledger_stats";
 pub const METHOD_CANCEL: &str = "cancel";
 pub const METHOD_SHUTDOWN: &str = "shutdown";
@@ -69,6 +81,9 @@ pub const CAP_FS_WRITE: &str = "fs.write";
 pub const CAP_EXEC: &str = "exec";
 pub const CAP_GIT: &str = "git";
 pub const CAP_GIT_WORKTREE: &str = "git.worktree";
+/// Optional capability. Adding it to the required set would break every
+/// existing helper, so the daemon probes it before attempting a bundle export.
+pub const CAP_GIT_BUNDLE: &str = "git.bundle";
 pub const CAP_CANCEL: &str = "cancel";
 pub const CAP_LEDGER: &str = "ledger";
 pub const CAP_SHA256: &str = "sha256";
@@ -778,6 +793,94 @@ pub struct GitWorktreeRemoveParams {
 pub struct GitWorktreeRemoveResult {
     pub path: String,
     pub removed: bool,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub replayed: bool,
+}
+
+/// Create a bounded Git bundle for one branch. The helper resolves the exact
+/// head first, exports it through a temporary `refs/verlinpark/export/...`
+/// ref, and records the SHA-256 of the resulting bytes. The bundle is retained
+/// for a short TTL so the client can page it with `git_bundle_read`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBundleCreateParams {
+    /// Branch in the remote repository, without `refs/heads/`.
+    pub branch: String,
+    /// Optional local prerequisite commit. When set, the helper exports
+    /// `<branch> --not <base>`, which keeps a bundle small when the daemon
+    /// already has the shared history. The local import still runs
+    /// `git bundle verify`, so a missing prerequisite fails closed.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Hard cap. The helper stops and deletes the partial bundle when it is
+    /// exceeded. The daemon supplies its policy value, never an unbounded one.
+    pub max_bytes: u64,
+    #[serde(default = "default_bundle_chunk_bytes")]
+    pub chunk_bytes: u64,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+}
+
+fn default_bundle_chunk_bytes() -> u64 {
+    DEFAULT_GIT_BUNDLE_CHUNK_BYTES
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBundleCreateResult {
+    pub bundle_id: String,
+    pub branch: String,
+    /// Exact commit exported. The client must compare this with the recorded
+    /// remote branch head before importing.
+    pub head: String,
+    pub export_ref: String,
+    #[serde(default)]
+    pub base: Option<String>,
+    pub bytes: u64,
+    pub sha256: String,
+    pub chunk_bytes: u64,
+    pub chunks: u32,
+    /// Unix milliseconds after which the helper may delete the bundle.
+    pub expires_at_unix_ms: u64,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBundleReadParams {
+    pub bundle_id: String,
+    /// Zero-based byte offset.
+    pub offset: u64,
+    #[serde(default = "default_bundle_chunk_bytes")]
+    pub limit: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBundleReadResult {
+    pub bundle_id: String,
+    pub offset: u64,
+    pub bytes_read: u64,
+    /// Raw chunk bytes encoded with standard base64.
+    pub base64: String,
+    pub chunk_sha256: String,
+    pub done: bool,
+    pub total_bytes: u64,
+    pub total_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBundleDeleteParams {
+    pub bundle_id: String,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBundleDeleteResult {
+    pub bundle_id: String,
+    pub deleted: bool,
     #[serde(default)]
     pub operation_id: Option<String>,
     #[serde(default)]

@@ -106,6 +106,9 @@ final class AppModel {
     var integrationMaxTokensText = ""
     var integrationPolicyBusy = false
     var integrationPolicyStatus: String?
+    var remoteIntegrationStatus: RemoteIntegrationStatusResult?
+    var remoteIntegrationBusy = false
+    var remoteIntegrationStatusMessage: String?
     var guiPolicy = GuiPolicy.standard
     var guiGraceSecs = 45
     var guiWaitMs = 15000
@@ -1636,6 +1639,51 @@ final class AppModel {
             integrationPolicyStatus = nil
         } catch {
             handle(error)
+        }
+    }
+
+    func loadRemoteIntegrationStatus() async {
+        guard let projectID = selectedProjectID else {
+            remoteIntegrationStatus = nil
+            remoteIntegrationStatusMessage = nil
+            return
+        }
+        remoteIntegrationBusy = true
+        defer { remoteIntegrationBusy = false }
+        do {
+            let status = try await core.remoteIntegrationStatus(
+                projectID: projectID,
+                sessionID: selectedSessionID
+            )
+            guard projectID == selectedProjectID else { return }
+            remoteIntegrationStatus = status
+            remoteIntegrationStatusMessage = nil
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            remoteIntegrationStatus = nil
+            remoteIntegrationStatusMessage = error.localizedDescription
+        }
+    }
+
+    func cleanupRemoteIntegrationRefs(force: Bool = false) async {
+        guard let projectID = selectedProjectID else {
+            remoteIntegrationStatusMessage = "Select a project first."
+            return
+        }
+        remoteIntegrationBusy = true
+        defer { remoteIntegrationBusy = false }
+        do {
+            let result = try await core.cleanupRemoteIntegration(
+                projectID: projectID,
+                sessionID: selectedSessionID,
+                entryID: nil,
+                force: force
+            )
+            remoteIntegrationStatusMessage =
+                "Removed \(result.removedRefs.count) ref(s); \(result.skipped.count) skipped."
+            await loadRemoteIntegrationStatus()
+        } catch {
+            remoteIntegrationStatusMessage = error.localizedDescription
         }
     }
 

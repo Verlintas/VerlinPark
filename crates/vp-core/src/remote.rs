@@ -17,8 +17,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use vp_protocol::now_rfc3339;
 use vp_protocol::remote::{
-    ExecutionHost, ExecutionHostMode, ProjectExecutionHost, RemoteLedgerEntry, RemoteLedgerResult,
-    RemoteProbeResult, RemoteStatusResult, RemoteWorktree, RemoteWorktreeListResult,
+    ExecutionHost, ExecutionHostMode, ProjectExecutionHost, REMOTE_VERIFICATION_ENVIRONMENT_CAVEAT,
+    RemoteIntegrationCleanupParams, RemoteIntegrationCleanupResult, RemoteIntegrationPolicy,
+    RemoteIntegrationPolicyResult, RemoteIntegrationQueueEntry, RemoteIntegrationStatusResult,
+    RemoteLedgerEntry, RemoteLedgerResult, RemoteProbeResult, RemoteStatusResult, RemoteWorktree,
+    RemoteWorktreeListResult,
 };
 use vp_protocol::types::ShellPolicy;
 use vp_remote::protocol::{
@@ -450,6 +453,35 @@ impl RemoteWorkspace {
         self.worktree_remove(params).await
     }
 
+    pub async fn supports_git_bundle(&self) -> Result<bool> {
+        let client = self.current_client().await?;
+        Ok(client.supports_git_bundle())
+    }
+
+    pub async fn git_bundle_create(
+        &self,
+        params: vp_remote::GitBundleCreateParams,
+    ) -> Result<vp_remote::GitBundleCreateResult> {
+        self.call(move |client| Box::pin(async move { client.git_bundle_create(&params).await }))
+            .await
+    }
+
+    pub async fn git_bundle_read(
+        &self,
+        params: vp_remote::GitBundleReadParams,
+    ) -> Result<vp_remote::GitBundleReadResult> {
+        self.call(move |client| Box::pin(async move { client.git_bundle_read(&params).await }))
+            .await
+    }
+
+    pub async fn git_bundle_delete(
+        &self,
+        params: vp_remote::GitBundleDeleteParams,
+    ) -> Result<vp_remote::GitBundleDeleteResult> {
+        self.call(move |client| Box::pin(async move { client.git_bundle_delete(&params).await }))
+            .await
+    }
+
     pub async fn health(&self) -> Result<ProbeResult> {
         let client = self.current_client().await?;
         client.health().await.map_err(|error| anyhow!(error))
@@ -715,6 +747,330 @@ pub fn ssh_config(config: &ExecutionHost) -> Result<SshConfig> {
 }
 
 impl Engine {
+    pub async fn get_remote_integration_policy(
+        &self,
+        project_id: &str,
+    ) -> Result<RemoteIntegrationPolicy> {
+        let store = self.store.clone();
+        let project_id_owned = project_id.to_string();
+        let exists = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id_owned.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .is_some();
+        if !exists {
+            bail!("project not found: {project_id}");
+        }
+        tokio::task::spawn_blocking(move || store.get_remote_integration_policy(&project_id_owned))
+            .await?
+    }
+
+    pub async fn remote_integration_policy_result(
+        &self,
+        project_id: &str,
+    ) -> Result<RemoteIntegrationPolicyResult> {
+        let policy = self.get_remote_integration_policy(project_id).await?;
+        let store = self.store.clone();
+        let project_id_owned = project_id.to_string();
+        let updated_at = tokio::task::spawn_blocking(move || {
+            store.remote_integration_policy_updated_at(&project_id_owned)
+        })
+        .await??
+        .unwrap_or_default();
+        Ok(RemoteIntegrationPolicyResult {
+            project_id: project_id.to_string(),
+            policy,
+            updated_at,
+        })
+    }
+
+    /// Persist an opt-in policy. Enabling remote integration requires operator
+    /// confirmation even though the caller is the local operator: this keeps a
+    /// scripted or accidental enable from silently widening host access.
+    pub async fn set_remote_integration_policy(
+        &self,
+        project_id: &str,
+        policy: RemoteIntegrationPolicy,
+        confirm: bool,
+    ) -> Result<RemoteIntegrationPolicyResult> {
+        policy
+            .validate()
+            .map_err(|error| anyhow!("invalid remote integration policy: {error}"))?;
+        if policy.enabled && !confirm {
+            return Err(crate::remote_integration::RemoteIntegrationFailure::new(
+                crate::tooling::errors::ToolErrorCode::REMOTE_INTEGRATION_APPROVAL_REQUIRED,
+                "enabling remote integration requires explicit operator confirmation",
+            )
+            .into());
+        }
+        let store = self.store.clone();
+        let project_id_owned = project_id.to_string();
+        let project_id_check = project_id_owned.clone();
+        let exists = tokio::task::spawn_blocking({
+            let store = store.clone();
+            move || store.get_project(&project_id_check)
+        })
+        .await??
+        .is_some();
+        if !exists {
+            bail!("project not found: {project_id}");
+        }
+        let policy_for_store = policy.clone();
+        let project_id_for_store = project_id_owned.clone();
+        tokio::task::spawn_blocking(move || {
+            store.set_remote_integration_policy(&project_id_for_store, &policy_for_store)?;
+            store.record_project_manifest()
+        })
+        .await??;
+        let updated_at = {
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || {
+                store.remote_integration_policy_updated_at(&project_id_owned)
+            })
+            .await??
+            .unwrap_or_default()
+        };
+        Ok(RemoteIntegrationPolicyResult {
+            project_id: project_id.to_string(),
+            policy,
+            updated_at,
+        })
+    }
+
+    pub async fn remote_integration_status(
+        &self,
+        project_id: &str,
+        session_id: Option<String>,
+    ) -> Result<RemoteIntegrationStatusResult> {
+        let store = self.store.clone();
+        let project_id_owned = project_id.to_string();
+        let session_filter = session_id.clone();
+        let project_id_check = project_id_owned.clone();
+        let (project, policy, updated_at, entries) = tokio::task::spawn_blocking(move || {
+            let project = store
+                .get_project(&project_id_check)?
+                .ok_or_else(|| anyhow!("project not found: {project_id_check}"))?;
+            if let Some(session_id) = session_filter.as_deref() {
+                let session = store
+                    .get_session(session_id)?
+                    .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+                if session.project_id != project_id_check {
+                    anyhow::bail!(
+                        "session {session_id} does not belong to project {project_id_check}"
+                    );
+                }
+            }
+            let policy = store.get_remote_integration_policy(&project_id_check)?;
+            let updated_at = store
+                .remote_integration_policy_updated_at(&project_id_check)?
+                .unwrap_or_default();
+            let entries =
+                store.list_remote_merge_queue(&project_id_check, session_filter.as_deref())?;
+            Ok::<_, anyhow::Error>((project, policy, updated_at, entries))
+        })
+        .await??;
+        let project_root = std::path::PathBuf::from(&project.root);
+        let retained_refs = entries
+            .iter()
+            .filter(|entry| {
+                entry.imported_ref.as_deref().is_some_and(|reference| {
+                    crate::remote_integration::import_ref_exists(&project_root, reference)
+                })
+            })
+            .count();
+        let mut pending = 0usize;
+        let mut merged = 0usize;
+        let mut conflicts = 0usize;
+        let mut failed = 0usize;
+        let total = entries.len();
+        let entries = entries
+            .into_iter()
+            .map(|entry| {
+                match entry.status.as_str() {
+                    "queued" | "merging" | "checking" => pending += 1,
+                    "merged" => merged += 1,
+                    "conflict" => conflicts += 1,
+                    "failed" | "interrupted" => failed += 1,
+                    _ => {}
+                }
+                RemoteIntegrationQueueEntry {
+                    entry_id: entry.id,
+                    session_id: entry.session_id,
+                    status: entry.status,
+                    commit: entry.commit,
+                    branch: entry.branch,
+                    remote_host: entry.remote_host,
+                    remote_branch: entry.remote_branch,
+                    bundle_sha256: entry.bundle_sha256,
+                    imported_ref: entry.imported_ref,
+                    verifier_approved: entry.verifier_approved,
+                    verifier_summary: entry.verifier_summary,
+                    environment_caveat: entry.environment_caveat,
+                    attempt: entry.attempt,
+                    detail: entry.detail,
+                    created_at: entry.created_at,
+                    updated_at: entry.updated_at,
+                }
+            })
+            .collect();
+        Ok(RemoteIntegrationStatusResult {
+            project_id: project_id.to_string(),
+            session_id,
+            policy: policy.clone(),
+            policy_updated_at: updated_at,
+            entries,
+            total,
+            pending,
+            merged,
+            conflicts,
+            failed,
+            retained_refs,
+            verifier_required: policy.require_verifier,
+            environment_caveat: REMOTE_VERIFICATION_ENVIRONMENT_CAVEAT.to_string(),
+        })
+    }
+
+    /// Remove temporary remote-integration refs, optionally with their local
+    /// worktrees. Retryable entries are protected unless `force` is set so an
+    /// operator cannot accidentally destroy the only copy of a conflicted
+    /// remote branch. Active integrations are never touched.
+    pub async fn remote_integration_cleanup(
+        &self,
+        params: RemoteIntegrationCleanupParams,
+    ) -> Result<RemoteIntegrationCleanupResult> {
+        let store = self.store.clone();
+        let project_id = params.project_id.clone();
+        let session_filter = params.session_id.clone();
+        let entry_filter = params.entry_id.clone();
+        let project_id_check = project_id.clone();
+        let (project, entries, agents) = tokio::task::spawn_blocking(move || {
+            let project = store
+                .get_project(&project_id_check)?
+                .ok_or_else(|| anyhow!("project not found: {project_id_check}"))?;
+            if let Some(session_id) = session_filter.as_deref() {
+                let session = store
+                    .get_session(session_id)?
+                    .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+                if session.project_id != project_id_check {
+                    anyhow::bail!(
+                        "session {session_id} does not belong to project {project_id_check}"
+                    );
+                }
+            }
+            if let Some(entry_id) = entry_filter.as_deref()
+                && store.get_merge_queue_entry(entry_id)?.is_none()
+            {
+                anyhow::bail!("merge queue entry not found: {entry_id}");
+            }
+            let entries =
+                store.list_remote_merge_queue(&project_id_check, session_filter.as_deref())?;
+            let mut agents = std::collections::HashMap::new();
+            for session in store.list_sessions(Some(&project_id_check))? {
+                for agent in store.list_agents(&session.id)? {
+                    agents.insert(agent.id.clone(), agent);
+                }
+            }
+            Ok::<_, anyhow::Error>((project, entries, agents))
+        })
+        .await??;
+        let root = std::path::PathBuf::from(&project.root);
+        let mut removed_refs = Vec::new();
+        let mut removed_worktrees = Vec::new();
+        let mut skipped = Vec::new();
+        let mut examined = 0usize;
+        for entry in entries {
+            if let Some(entry_id) = params.entry_id.as_deref()
+                && entry.id != entry_id
+            {
+                continue;
+            }
+            examined += 1;
+            if matches!(entry.status.as_str(), "queued" | "merging" | "checking") {
+                skipped.push(format!(
+                    "{}: integration is active ({})",
+                    entry.id, entry.status
+                ));
+                continue;
+            }
+            if !params.force
+                && matches!(entry.status.as_str(), "conflict" | "failed" | "interrupted")
+            {
+                skipped.push(format!(
+                    "{}: retryable entry ({}) requires force",
+                    entry.id, entry.status
+                ));
+                continue;
+            }
+            let Some(reference) = entry.imported_ref.clone() else {
+                skipped.push(format!("{}: no imported ref", entry.id));
+                continue;
+            };
+            if !crate::remote_integration::import_ref_exists(&root, &reference) {
+                skipped.push(format!("{}: imported ref already absent", entry.id));
+                continue;
+            }
+            let root_for_delete = root.clone();
+            let reference_for_delete = reference.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::remote_integration::delete_import_ref(
+                    &root_for_delete,
+                    &reference_for_delete,
+                )
+            })
+            .await?
+            {
+                Ok(()) => removed_refs.push(reference.clone()),
+                Err(error) => {
+                    skipped.push(format!("{}: {error:#}", entry.id));
+                    continue;
+                }
+            }
+            if params.force
+                && let Some(agent) = agents.get(&entry.agent_id)
+                && let (Some(path), Some(branch)) =
+                    (agent.worktree.as_deref(), agent.branch.as_deref())
+            {
+                let root_for_worktree = root.clone();
+                let path = std::path::PathBuf::from(path);
+                let path_label = path.to_string_lossy().to_string();
+                let branch = branch.to_string();
+                if let Ok(Ok(())) = tokio::task::spawn_blocking(move || {
+                    crate::remote_integration::remove_remote_worktree(
+                        &root_for_worktree,
+                        &path,
+                        &branch,
+                    )
+                    .map_err(anyhow::Error::new)
+                })
+                .await
+                {
+                    removed_worktrees.push(path_label);
+                }
+            }
+            self.append_event(
+                &entry.session_id,
+                "remote.integration.refs_pruned",
+                serde_json::json!({
+                    "entry_id": entry.id,
+                    "imported_ref": reference,
+                    "status": entry.status,
+                    "force": params.force,
+                }),
+            )
+            .await?;
+        }
+        Ok(RemoteIntegrationCleanupResult {
+            project_id,
+            session_id: params.session_id,
+            removed_refs,
+            removed_worktrees,
+            skipped,
+            entries_examined: examined,
+        })
+    }
+
     pub async fn list_execution_hosts(&self) -> Result<Vec<ProjectExecutionHost>> {
         let store = self.store.clone();
         let projects = tokio::task::spawn_blocking(move || store.list_projects()).await??;
@@ -834,6 +1190,17 @@ impl Engine {
     pub async fn remote_status(&self, project_id: &str) -> Result<RemoteStatusResult> {
         let config = self.get_execution_host(project_id).await?;
         self.remote.status(project_id, &config).await
+    }
+
+    /// Resolve the configured remote workspace for an explicit operation. This
+    /// never appears as a local tool and does not connect until a method is
+    /// called on the returned handle.
+    pub async fn remote_workspace(&self, project_id: &str) -> Result<Arc<RemoteWorkspace>> {
+        let config = self.get_execution_host(project_id).await?;
+        if !config.is_remote() {
+            bail!("project {project_id} uses a local execution host");
+        }
+        self.remote.workspace(project_id, &config).await
     }
 
     pub async fn remote_ledger(&self, project_id: &str, limit: u32) -> Result<RemoteLedgerResult> {

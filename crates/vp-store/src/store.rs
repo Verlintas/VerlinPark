@@ -19,12 +19,12 @@ use vp_protocol::types::{
     GuiActionInfo, GuiPolicy, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer,
     McpServerConfig, McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
     MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
-    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MetricCount, ModelPreset,
-    OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery,
-    PlanTaskProgress, ProcessPolicy, Program, ProgramEvent, ProgramMilestone,
-    ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget,
-    ProjectUsageSession, Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall,
-    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, SessionRun,
+    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
+    ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
+    OrchestrationRecovery, PlanTaskProgress, ProcessPolicy, Program, ProgramEvent,
+    ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project,
+    ProjectBudget, ProjectUsageSession, Question, RunBudgetSnapshot, RunCheckpoint, RunStep,
+    RunToolCall, ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, SessionRun,
     SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
     SourceEmbeddingIntegrity, SourceEmbeddingJobStatus, SourceEmbeddingPolicy,
     SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceSearchHit, SourceStats,
@@ -33,7 +33,7 @@ use vp_protocol::types::{
     WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
-use vp_protocol::remote::ExecutionHost;
+use vp_protocol::remote::{ExecutionHost, RemoteIntegrationPolicy};
 use vp_protocol::scaling::{ScalingDecision, ScalingPolicy};
 
 use crate::paths;
@@ -873,6 +873,10 @@ pub struct ProjectManifestSnapshot {
     pub critical_path_policy: CriticalPathPolicy,
     #[serde(default)]
     pub execution_host: ExecutionHost,
+    /// Opt-in remote worktree integration policy. Older manifests decode as
+    /// disabled with a bounded default cap.
+    #[serde(default)]
+    pub remote_integration_policy: RemoteIntegrationPolicy,
     #[serde(default)]
     pub approval_grants: Vec<ApprovalGrant>,
     /// Standalone task-inbox items. They are project-scoped rather than
@@ -2488,12 +2492,30 @@ impl Store {
                 status      TEXT NOT NULL,
                 attempt     INTEGER NOT NULL DEFAULT 1,
                 detail      TEXT,
+                source      TEXT NOT NULL DEFAULT 'local',
+                remote_host TEXT,
+                remote_branch TEXT,
+                bundle_sha256 TEXT,
+                imported_ref TEXT,
+                verifier_approved INTEGER,
+                verifier_summary TEXT,
+                environment_caveat TEXT,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_merge_queue_session
                 ON merge_queue(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS project_remote_integration_policies (
+                project_id       TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled          INTEGER NOT NULL DEFAULT 0,
+                max_bundle_bytes INTEGER NOT NULL,
+                require_verifier INTEGER NOT NULL DEFAULT 1,
+                allowed_hosts    TEXT NOT NULL DEFAULT '[]',
+                keep_import_refs INTEGER NOT NULL DEFAULT 0,
+                updated_at       TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS merge_auto_attempts (
                 entry_id TEXT PRIMARY KEY REFERENCES merge_queue(id) ON DELETE CASCADE,
@@ -3031,6 +3053,19 @@ impl Store {
         )?;
         ensure_column(&conn, "project_memory_policies", "embedding_json", "TEXT")?;
         ensure_column(&conn, "merge_queue", "pre_merge_commit", "TEXT")?;
+        ensure_column(
+            &conn,
+            "merge_queue",
+            "source",
+            "TEXT NOT NULL DEFAULT 'local'",
+        )?;
+        ensure_column(&conn, "merge_queue", "remote_host", "TEXT")?;
+        ensure_column(&conn, "merge_queue", "remote_branch", "TEXT")?;
+        ensure_column(&conn, "merge_queue", "bundle_sha256", "TEXT")?;
+        ensure_column(&conn, "merge_queue", "imported_ref", "TEXT")?;
+        ensure_column(&conn, "merge_queue", "verifier_approved", "INTEGER")?;
+        ensure_column(&conn, "merge_queue", "verifier_summary", "TEXT")?;
+        ensure_column(&conn, "merge_queue", "environment_caveat", "TEXT")?;
         ensure_column(&conn, "plan_tasks", "next_attempt_at", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_reason", "TEXT")?;
@@ -3187,6 +3222,7 @@ impl Store {
                 shell_policy: self.get_shell_policy(&project.id)?,
                 cache_policy: self.get_cache_policy(&project.id)?,
                 execution_host: self.get_execution_host(&project.id)?,
+                remote_integration_policy: self.get_remote_integration_policy(&project.id)?,
                 integration_policy: self.get_integration_policy(&project.id)?,
                 gui_policy: self.get_gui_policy(&project.id)?,
                 artifact_policy: self.get_artifact_policy(&project.id)?,
@@ -3385,6 +3421,93 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_remote_integration_policy(
+        &self,
+        project_id: &str,
+    ) -> Result<RemoteIntegrationPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT enabled, max_bundle_bytes, require_verifier, allowed_hosts, keep_import_refs
+                 FROM project_remote_integration_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        match stored {
+            Some((
+                enabled,
+                max_bundle_bytes,
+                require_verifier,
+                allowed_hosts,
+                keep_import_refs,
+            )) => Ok(RemoteIntegrationPolicy {
+                enabled,
+                max_bundle_bytes,
+                require_verifier,
+                allowed_hosts: serde_json::from_str(&allowed_hosts)
+                    .context("parsing stored remote integration allowlist")?,
+                keep_import_refs,
+            }),
+            None => Ok(RemoteIntegrationPolicy::default()),
+        }
+    }
+
+    pub fn set_remote_integration_policy(
+        &self,
+        project_id: &str,
+        policy: &RemoteIntegrationPolicy,
+    ) -> Result<()> {
+        policy
+            .validate()
+            .map_err(|error| anyhow!("invalid remote integration policy: {error}"))?;
+        let allowed_hosts = serde_json::to_string(&policy.allowed_hosts)
+            .context("serializing remote integration allowlist")?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_remote_integration_policies
+             (project_id, enabled, max_bundle_bytes, require_verifier, allowed_hosts,
+              keep_import_refs, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(project_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                max_bundle_bytes = excluded.max_bundle_bytes,
+                require_verifier = excluded.require_verifier,
+                allowed_hosts = excluded.allowed_hosts,
+                keep_import_refs = excluded.keep_import_refs,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                if policy.enabled { 1 } else { 0 },
+                policy.max_bundle_bytes as i64,
+                if policy.require_verifier { 1 } else { 0 },
+                allowed_hosts,
+                if policy.keep_import_refs { 1 } else { 0 },
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remote_integration_policy_updated_at(&self, project_id: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT updated_at FROM project_remote_integration_policies WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn get_cache_policy(&self, project_id: &str) -> Result<CachePolicy> {
@@ -12708,7 +12831,7 @@ impl Store {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash,
-                    base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+                    base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
              FROM merge_queue
              WHERE session_id = ?1 AND task_id = ?2 AND status = 'merged'
              ORDER BY updated_at DESC, created_at DESC, id ASC
@@ -14907,7 +15030,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, content, tool_calls, tool_call_id, created_at
-             FROM messages WHERE session_id = ?1 ORDER BY created_at ASC",
+             FROM messages WHERE session_id = ?1 ORDER BY julianday(created_at) ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             let tool_calls: String = row.get(4)?;
@@ -19550,7 +19673,7 @@ impl Store {
         }
         for id in &queue_ids {
             let entry = tx.query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -19705,8 +19828,8 @@ impl Store {
             for entry in queue {
                 tx.execute(
                     "INSERT INTO merge_queue
-                     (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13)",
+                     (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                     params![
                         entry.id,
                         entry.session_id,
@@ -19719,6 +19842,14 @@ impl Store {
                         entry.status,
                         entry.attempt as i64,
                         entry.detail,
+                        entry.source,
+                        entry.remote_host,
+                        entry.remote_branch,
+                        entry.bundle_sha256,
+                        entry.imported_ref,
+                        entry.verifier_approved.map(i64::from),
+                        entry.verifier_summary,
+                        entry.environment_caveat,
                         entry.created_at,
                         entry.updated_at
                     ],
@@ -20173,8 +20304,8 @@ impl Store {
         for entry in &bundle.merge_queue {
             tx.execute(
                 "INSERT INTO merge_queue
-                 (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13)",
+                 (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     entry.id,
                     entry.session_id,
@@ -20187,6 +20318,14 @@ impl Store {
                     entry.status,
                     entry.attempt as i64,
                     entry.detail,
+                    entry.source,
+                    entry.remote_host,
+                    entry.remote_branch,
+                    entry.bundle_sha256,
+                    entry.imported_ref,
+                    entry.verifier_approved.map(i64::from),
+                    entry.verifier_summary,
+                    entry.environment_caveat,
                     entry.created_at,
                     entry.updated_at
                 ],
@@ -20544,13 +20683,42 @@ impl Store {
         base_commit: &str,
         detail: Option<&str>,
     ) -> Result<MergeQueueEntry> {
+        self.enqueue_merge_with_source(
+            session_id,
+            agent_id,
+            agent_name,
+            task_id,
+            branch,
+            commit,
+            base_commit,
+            detail,
+            &MergeQueueSource::local(),
+        )
+    }
+
+    /// Enqueue an entry with explicit provenance. Remote integration uses this
+    /// to persist the host, branch, bundle hash, and temporary imported ref on
+    /// the same row that the deterministic Integrator later merges.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_merge_with_source(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<&str>,
+        branch: &str,
+        commit: &str,
+        base_commit: &str,
+        detail: Option<&str>,
+        source: &MergeQueueSource,
+    ) -> Result<MergeQueueEntry> {
         let id = Uuid::now_v7().to_string();
         let now = now_rfc3339();
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO merge_queue
-             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'queued', 1, ?9, ?10, ?10)",
+             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'queued', 1, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, NULL, ?15, ?15)",
             params![
                 id,
                 session_id,
@@ -20561,11 +20729,16 @@ impl Store {
                 commit,
                 base_commit,
                 detail,
-                now
+                source.source,
+                source.remote_host,
+                source.remote_branch,
+                source.bundle_sha256,
+                source.imported_ref,
+                now,
             ],
         )?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -20587,13 +20760,65 @@ impl Store {
             params![status, detail, now_rfc3339(), id],
         )?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Attach the Verifier verdict and environment caveat to a remote entry.
+    /// Emits a full-entry update so replay/repair reconstructs the verdict
+    /// without querying agent events.
+    pub fn set_merge_queue_verification_with_event(
+        &self,
+        id: &str,
+        approved: Option<bool>,
+        summary: Option<&str>,
+        environment_caveat: Option<&str>,
+    ) -> Result<Option<(MergeQueueEntry, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE merge_queue
+             SET verifier_approved = ?1, verifier_summary = ?2,
+                 environment_caveat = ?3, updated_at = ?4
+             WHERE id = ?5",
+            params![
+                approved.map(i64::from),
+                summary,
+                environment_caveat,
+                now_rfc3339(),
+                id
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let entry = tx
+            .query_row(
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+                 FROM merge_queue WHERE id = ?1",
+                params![id],
+                map_merge_queue_entry,
+            )
+            .optional()?;
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let event = insert_event_tx(
+            &tx,
+            &entry.session_id,
+            "merge_queue.updated",
+            serde_json::json!({"entry": entry, "reason": "verification_recorded"}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((entry, event)))
     }
 
     /// Mark a queue entry as merging and persist the exact pre-merge HEAD.
@@ -20610,7 +20835,7 @@ impl Store {
             params![pre_merge_commit, now_rfc3339(), id],
         )?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -20631,14 +20856,43 @@ impl Store {
         base_commit: &str,
         detail: Option<&str>,
     ) -> Result<(MergeQueueEntry, Event)> {
+        self.enqueue_merge_with_event_source(
+            session_id,
+            agent_id,
+            agent_name,
+            task_id,
+            branch,
+            commit,
+            base_commit,
+            detail,
+            &MergeQueueSource::local(),
+        )
+    }
+
+    /// Event-backed enqueue with explicit provenance. The complete entry,
+    /// including additive source fields, is embedded in `merge_queue.enqueued`
+    /// so replay/repair reconstructs it without a second event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_merge_with_event_source(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<&str>,
+        branch: &str,
+        commit: &str,
+        base_commit: &str,
+        detail: Option<&str>,
+        source: &MergeQueueSource,
+    ) -> Result<(MergeQueueEntry, Event)> {
         let id = Uuid::now_v7().to_string();
         let now = now_rfc3339();
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO merge_queue
-             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'queued', 1, ?9, ?10, ?10)",
+             (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'queued', 1, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, NULL, ?15, ?15)",
             params![
                 id,
                 session_id,
@@ -20649,11 +20903,16 @@ impl Store {
                 commit,
                 base_commit,
                 detail,
-                now
+                source.source,
+                source.remote_host,
+                source.remote_branch,
+                source.bundle_sha256,
+                source.imported_ref,
+                now,
             ],
         )?;
         let entry = tx.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -20690,7 +20949,7 @@ impl Store {
         }
         let entry = tx
             .query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -20733,7 +20992,7 @@ impl Store {
         }
         let entry = tx
             .query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -20762,7 +21021,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash,
-                    base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+                    base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
              FROM merge_queue
              WHERE status = 'interrupted' AND pre_merge_commit IS NOT NULL
              ORDER BY created_at ASC, id ASC",
@@ -20774,17 +21033,43 @@ impl Store {
     pub fn list_merge_queue(&self, session_id: &str) -> Result<Vec<MergeQueueEntry>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
              FROM merge_queue WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], map_merge_queue_entry)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Remote-sourced queue rows for a project, newest first. Local rows are
+    /// excluded even if a caller later filters by session.
+    pub fn list_remote_merge_queue(
+        &self,
+        project_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MergeQueueEntry>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.agent_id, m.agent_name, m.task_id, m.branch,
+                    m.commit_hash, m.base_commit, m.pre_merge_commit, m.status, m.attempt,
+                    m.detail, m.source, m.remote_host, m.remote_branch, m.bundle_sha256,
+                    m.imported_ref, m.verifier_approved, m.verifier_summary,
+                    m.environment_caveat, m.created_at, m.updated_at
+             FROM merge_queue m
+             JOIN sessions s ON s.id = m.session_id
+             WHERE s.project_id = ?1
+               AND m.source = 'remote'
+               AND (?2 IS NULL OR m.session_id = ?2)
+             ORDER BY m.created_at DESC, m.id DESC
+             LIMIT 500",
+        )?;
+        let rows = stmt.query_map(params![project_id, session_id], map_merge_queue_entry)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn get_merge_queue_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -20835,7 +21120,7 @@ impl Store {
         let mut entries = Vec::with_capacity(ids.len());
         for id in ids {
             entries.push(conn.query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -22079,8 +22364,16 @@ fn map_merge_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueue
         status: row.get(9)?,
         attempt: row.get::<_, i64>(10)? as u32,
         detail: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        source: row.get(12)?,
+        remote_host: row.get(13)?,
+        remote_branch: row.get(14)?,
+        bundle_sha256: row.get(15)?,
+        imported_ref: row.get(16)?,
+        verifier_approved: row.get::<_, Option<i64>>(17)?.map(|value| value != 0),
+        verifier_summary: row.get(18)?,
+        environment_caveat: row.get(19)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
     })
 }
 

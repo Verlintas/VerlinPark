@@ -33,7 +33,7 @@ struct GitOutput {
     truncated: bool,
 }
 
-fn git_environment(command: &mut Command, root: &Path) {
+pub(crate) fn git_environment(command: &mut Command, root: &Path) {
     command.env_clear();
     for name in [
         "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR",
@@ -168,7 +168,7 @@ fn validate_ref(value: &str, label: &str) -> Result<String, RemoteError> {
 /// Validate a commit-ish that may use Git's `~`/`^` traversal syntax. It is
 /// passed as a separate argv element after a fixed subcommand, so the only
 /// option-injection risk is a leading `-`, which remains rejected.
-fn validate_revision(value: &str, label: &str) -> Result<String, RemoteError> {
+pub(crate) fn validate_revision(value: &str, label: &str) -> Result<String, RemoteError> {
     let value = value.trim();
     if value.is_empty() || value.len() > 512 {
         return Err(RemoteError::new(
@@ -197,7 +197,7 @@ fn validate_revision(value: &str, label: &str) -> Result<String, RemoteError> {
     Ok(value.to_string())
 }
 
-fn validate_branch(value: &str) -> Result<String, RemoteError> {
+pub(crate) fn validate_branch(value: &str) -> Result<String, RemoteError> {
     let value = validate_ref(value, "branch")?;
     if value.ends_with('.') || value.ends_with(".lock") || value.starts_with("refs/heads/") {
         return Err(RemoteError::new(

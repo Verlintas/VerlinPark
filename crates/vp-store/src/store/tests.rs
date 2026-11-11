@@ -13652,3 +13652,183 @@ fn legacy_manifest_without_critical_path_policy_decodes_disabled() {
     assert!(!snapshot.critical_path_policy.enabled);
     assert_eq!(snapshot.project.id, project.id);
 }
+
+#[test]
+fn remote_merge_queue_rows_persist_provenance_and_filter_by_project() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("remote-queue"))
+        .unwrap();
+    let session = store.create_session(&project.id, "remote queue").unwrap();
+    let source = MergeQueueSource::remote(
+        "build.example.com",
+        "feature/remote",
+        "a".repeat(64),
+        "refs/verlinpark/remote/session/import-1",
+    );
+    let (entry, event) = store
+        .enqueue_merge_with_event_source(
+            &session.id,
+            "agent_remote",
+            "Remote Worker",
+            Some("T1"),
+            "verlinpark/session--remote-import-1",
+            "abcdef1234567890",
+            "1234567890abcdef",
+            Some("verified locally"),
+            &source,
+        )
+        .unwrap();
+    assert_eq!(entry.source, "remote");
+    assert_eq!(entry.remote_host.as_deref(), Some("build.example.com"));
+    assert_eq!(entry.remote_branch.as_deref(), Some("feature/remote"));
+    assert_eq!(
+        entry.bundle_sha256.as_deref(),
+        Some("a".repeat(64).as_str())
+    );
+    assert_eq!(
+        entry.imported_ref.as_deref(),
+        Some("refs/verlinpark/remote/session/import-1")
+    );
+    assert_eq!(event.kind, "merge_queue.enqueued");
+    assert_eq!(event.payload["entry"]["source"], "remote");
+    assert_eq!(event.payload["entry"]["bundle_sha256"], "a".repeat(64));
+    let (verified, verification_event) = store
+        .set_merge_queue_verification_with_event(
+            &entry.id,
+            Some(true),
+            Some("approved remotely"),
+            Some("local only"),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(verified.verifier_approved, Some(true));
+    assert_eq!(
+        verified.verifier_summary.as_deref(),
+        Some("approved remotely")
+    );
+    assert_eq!(verified.environment_caveat.as_deref(), Some("local only"));
+    assert_eq!(verification_event.kind, "merge_queue.updated");
+    assert_eq!(
+        verification_event.payload["entry"]["verifier_approved"],
+        true
+    );
+    let listed = store.list_remote_merge_queue(&project.id, None).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, entry.id);
+    assert!(
+        store
+            .list_remote_merge_queue(&project.id, Some("other-session"))
+            .unwrap()
+            .is_empty()
+    );
+
+    let local = store
+        .enqueue_merge(
+            &session.id,
+            "agent_local",
+            "Local Worker",
+            None,
+            "verlinpark/local",
+            "fedcba0987654321",
+            "1234567890abcdef",
+            None,
+        )
+        .unwrap();
+    assert_eq!(local.source, "local");
+    assert!(local.remote_host.is_none());
+    let remote_only = store.list_remote_merge_queue(&project.id, None).unwrap();
+    assert_eq!(remote_only.len(), 1);
+    assert_eq!(remote_only[0].id, entry.id);
+
+    store
+        .update_merge_queue_entry(&entry.id, "conflict", Some("retry me"))
+        .unwrap()
+        .unwrap();
+    let retried = store
+        .retry_merge_queue_entry(
+            &entry.id,
+            "fedcba0987654321",
+            "1234567890abcdef",
+            Some("rebased and re-verified"),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried.status, "queued");
+    assert_eq!(retried.source, "remote");
+    assert_eq!(retried.remote_host, entry.remote_host);
+    assert_eq!(retried.imported_ref, entry.imported_ref);
+    assert_eq!(retried.attempt, 2);
+    assert_eq!(retried.commit, "fedcba0987654321");
+}
+
+#[test]
+fn remote_integration_policy_persists_and_decodes_as_disabled() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("remote-policy"))
+        .unwrap();
+    assert_eq!(
+        store.get_remote_integration_policy(&project.id).unwrap(),
+        RemoteIntegrationPolicy::default()
+    );
+    assert!(
+        store
+            .remote_integration_policy_updated_at(&project.id)
+            .unwrap()
+            .is_none()
+    );
+    let policy = RemoteIntegrationPolicy {
+        enabled: true,
+        max_bundle_bytes: 1024 * 1024,
+        require_verifier: false,
+        allowed_hosts: vec!["build.example.com".into(), "agent@other.example.com".into()],
+        keep_import_refs: true,
+    };
+    store
+        .set_remote_integration_policy(&project.id, &policy)
+        .unwrap();
+    assert_eq!(
+        store.get_remote_integration_policy(&project.id).unwrap(),
+        policy
+    );
+    assert!(
+        store
+            .remote_integration_policy_updated_at(&project.id)
+            .unwrap()
+            .is_some()
+    );
+    store.record_project_manifest().unwrap();
+    let snapshot = crate::read_project_manifest(store.data_dir())
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.remote_integration_policy, policy);
+    let legacy = serde_json::from_value::<crate::ProjectManifestSnapshot>(serde_json::json!({
+        "version": 1,
+        "recorded_at": "2026-11-11T00:00:00Z",
+        "project": snapshot.project,
+        "shell_policy": vp_protocol::types::ShellPolicy::default(),
+        "integration_policy": vp_protocol::types::IntegrationPolicy::default(),
+        "artifact_policy": vp_protocol::types::ArtifactPolicy::default(),
+        "mailbox_policy": vp_protocol::types::MailboxPolicy::default(),
+        "worktree_policy": vp_protocol::types::WorktreeRetentionPolicy::default(),
+        "budget": vp_protocol::types::ProjectBudget::default()
+    }))
+    .unwrap();
+    assert_eq!(
+        legacy.remote_integration_policy,
+        RemoteIntegrationPolicy::default()
+    );
+    let invalid = RemoteIntegrationPolicy {
+        enabled: true,
+        allowed_hosts: Vec::new(),
+        ..policy
+    };
+    assert!(
+        store
+            .set_remote_integration_policy(&project.id, &invalid)
+            .is_err()
+    );
+}

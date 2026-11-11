@@ -429,6 +429,9 @@ struct DashboardView: View {
         case .git:
             ForksCard()
             ProjectForkForestCard()
+            if let project = model.selectedProject {
+                RemoteIntegrationCard(project: project)
+            }
         case .checkpoints:
             CheckpointsCard()
         case .storage:
@@ -507,6 +510,7 @@ struct DashboardView: View {
         case .git:
             await model.loadProjectForkForest()
             await model.loadLineage()
+            await model.loadRemoteIntegrationStatus()
             if model.forkTree != nil {
                 await model.loadForkTree()
             }

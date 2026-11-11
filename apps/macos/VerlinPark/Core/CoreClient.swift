@@ -1555,6 +1555,44 @@ actor CoreClient {
             .entries
     }
 
+    func remoteIntegrationStatus(
+        projectID: String,
+        sessionID: String?
+    ) async throws -> RemoteIntegrationStatusResult {
+        var params: [String: JSONValue] = ["project_id": .string(projectID)]
+        if let sessionID {
+            params["session_id"] = .string(sessionID)
+        }
+        return try await request(method: "remote.integration.status", params: params)
+            .decode(RemoteIntegrationStatusResult.self)
+    }
+
+    func cleanupRemoteIntegration(
+        projectID: String,
+        sessionID: String?,
+        entryID: String?,
+        force: Bool
+    ) async throws -> RemoteIntegrationCleanupResult {
+        var params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "force": .bool(force),
+        ]
+        if let sessionID {
+            params["session_id"] = .string(sessionID)
+        }
+        if let entryID {
+            params["entry_id"] = .string(entryID)
+        }
+        return try await request(method: "remote.integration.cleanup", params: params)
+            .decode(RemoteIntegrationCleanupResult.self)
+    }
+
+    func remoteIntegrationPolicy(projectID: String) async throws -> RemoteIntegrationPolicyResult {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "remote.integration.policy.get", params: params)
+            .decode(RemoteIntegrationPolicyResult.self)
+    }
+
     func retryMerge(entryID: String) async throws -> MergeQueueEntry {
         let params: [String: JSONValue] = ["entry_id": .string(entryID)]
         return try await request(method: "merge_queue.retry", params: params)

@@ -83,6 +83,10 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             store.set_shell_policy(&snapshot.project.id, &snapshot.shell_policy)?;
             store.set_cache_policy(&snapshot.project.id, &snapshot.cache_policy)?;
             store.set_execution_host(&snapshot.project.id, &snapshot.execution_host)?;
+            store.set_remote_integration_policy(
+                &snapshot.project.id,
+                &snapshot.remote_integration_policy,
+            )?;
             store.set_integration_policy(&snapshot.project.id, &snapshot.integration_policy)?;
             store.set_gui_policy(&snapshot.project.id, &snapshot.gui_policy)?;
             store.set_artifact_policy(&snapshot.project.id, &snapshot.artifact_policy)?;
@@ -795,5 +799,107 @@ mod run_journal_rebuild_tests {
         let replay = engine.replay_session(&session_id).await.unwrap();
         assert!(replay.runs_match, "{:?}", replay.mismatches);
         assert!(replay.run_checkpoints_match, "{:?}", replay.mismatches);
+    }
+}
+
+#[cfg(test)]
+mod remote_integration_rebuild_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+    use vp_protocol::remote::{ExecutionHost, ExecutionHostMode, RemoteIntegrationPolicy};
+
+    fn init_repo(path: &Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_restores_the_remote_integration_policy_and_rejects_invalid_hosts() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let (project_id, policy) = {
+            let engine = Engine::new(Store::open(data.path()).unwrap());
+            let project = engine
+                .add_project(
+                    repo.path().to_string_lossy().to_string(),
+                    Some("remote rebuild".into()),
+                )
+                .await
+                .unwrap();
+            engine
+                .set_execution_host(
+                    &project.id,
+                    ExecutionHost {
+                        mode: ExecutionHostMode::Ssh,
+                        host: "build.example.com".into(),
+                        user: Some("agent".into()),
+                        root: "/srv/repo".into(),
+                        token_env: Some("VERLINPARK_REMOTE_TOKEN".into()),
+                        ..ExecutionHost::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let policy = RemoteIntegrationPolicy {
+                enabled: true,
+                max_bundle_bytes: 4 * 1024 * 1024,
+                require_verifier: false,
+                allowed_hosts: vec!["agent@build.example.com".into()],
+                keep_import_refs: true,
+            };
+            engine
+                .set_remote_integration_policy(&project.id, policy.clone(), true)
+                .await
+                .unwrap();
+            engine.record_project_manifest().await.unwrap();
+            (project.id, policy)
+        };
+        let report = rebuild_database(data.path(), false).await.unwrap();
+        assert_eq!(report.projects, 1);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        assert_eq!(
+            engine
+                .get_remote_integration_policy(&project_id)
+                .await
+                .unwrap(),
+            policy
+        );
+        let status = engine
+            .remote_integration_status(&project_id, None)
+            .await
+            .unwrap();
+        assert!(status.policy.enabled);
+        assert!(!status.verifier_required);
+        assert_eq!(status.total, 0);
+        let invalid = RemoteIntegrationPolicy {
+            allowed_hosts: Vec::new(),
+            ..policy
+        };
+        assert!(
+            engine
+                .set_remote_integration_policy(&project_id, invalid, true)
+                .await
+                .is_err()
+        );
     }
 }

@@ -18183,3 +18183,692 @@ fn governor_throttle_stop_is_task_scoped_and_retryable() {
     assert!(!stop.is_abortive());
     assert!(stop.summary().contains("budget governor throttle"));
 }
+
+fn test_remote_host() -> vp_protocol::remote::ExecutionHost {
+    vp_protocol::remote::ExecutionHost {
+        mode: vp_protocol::remote::ExecutionHostMode::Ssh,
+        host: "build.example.com".into(),
+        user: Some("agent".into()),
+        root: "/srv/repo".into(),
+        token_env: Some("VERLINPARK_TEST_REMOTE_TOKEN".into()),
+        ..vp_protocol::remote::ExecutionHost::default()
+    }
+}
+
+fn test_remote_policy() -> vp_protocol::remote::RemoteIntegrationPolicy {
+    vp_protocol::remote::RemoteIntegrationPolicy {
+        enabled: true,
+        max_bundle_bytes: 8 * 1024 * 1024,
+        require_verifier: true,
+        allowed_hosts: vec!["agent@build.example.com".into()],
+        keep_import_refs: false,
+    }
+}
+
+fn git_test(root: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn remote_bundle_fixture(
+    project_root: &Path,
+    relative_path: &str,
+    content: &str,
+) -> (
+    TempDir,
+    PathBuf,
+    vp_protocol::remote::RemoteBundleSummary,
+    String,
+) {
+    let remote = TempDir::new().unwrap();
+    let clone = remote.path().join("remote");
+    let status = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(project_root)
+        .arg(&clone)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    git_test(&clone, &["config", "user.email", "test@example.com"]);
+    git_test(&clone, &["config", "user.name", "Remote Test"]);
+    git_test(&clone, &["checkout", "-q", "-b", "feature/remote"]);
+    let target = clone.join(relative_path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&target, content).unwrap();
+    git_test(&clone, &["add", relative_path]);
+    git_test(&clone, &["commit", "-q", "-m", "remote change"]);
+    let head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let bundle_dir = TempDir::new().unwrap();
+    let bundle_path = bundle_dir.path().join("remote.bundle");
+    git_test(
+        &clone,
+        &[
+            "bundle",
+            "create",
+            bundle_path.to_str().unwrap(),
+            "feature/remote",
+        ],
+    );
+    let bytes = std::fs::metadata(&bundle_path).unwrap().len();
+    let sha256 = crate::remote_integration::sha256_file(&bundle_path).unwrap();
+    let summary = vp_protocol::remote::RemoteBundleSummary {
+        host: "build.example.com".into(),
+        branch: "feature/remote".into(),
+        head: head.clone(),
+        sha256,
+        bytes,
+        chunks: 1,
+        chunk_bytes: 1024 * 1024,
+        imported_at: vp_protocol::now_rfc3339(),
+    };
+    // Keep both the clone and the bundle alive: the bundle lives in its own
+    // temp dir, while the clone is the source repository for the branch.
+    (bundle_dir, bundle_path, summary, head)
+}
+
+async fn configure_remote_integration(
+    engine: &Engine,
+    project_id: &str,
+    policy: vp_protocol::remote::RemoteIntegrationPolicy,
+) {
+    engine
+        .set_execution_host(project_id, test_remote_host())
+        .await
+        .unwrap();
+    engine
+        .set_remote_integration_policy(project_id, policy, true)
+        .await
+        .unwrap();
+}
+
+fn remote_params(
+    project_id: &str,
+    session_id: &str,
+) -> vp_protocol::remote::RemoteIntegrationParams {
+    vp_protocol::remote::RemoteIntegrationParams {
+        project_id: project_id.to_string(),
+        session_id: session_id.to_string(),
+        branch: "feature/remote".into(),
+        host: None,
+        expected_commit: None,
+        base_commit: None,
+        task_id: None,
+        objective: Some("Integrate the remote change".into()),
+        confirm: true,
+        keep_import_refs: None,
+    }
+}
+
+fn verdict_provider(verdicts: usize) -> Arc<QueueProvider> {
+    Arc::new(QueueProvider {
+        responses: Mutex::new(
+            (0..verdicts)
+                .map(|index| {
+                    vec![
+                        StreamEvent::ToolCall(ToolCall {
+                            id: format!("verdict-{index}"),
+                            name: "submit_verdict".into(),
+                            arguments:
+                                r#"{"approved":true,"summary":"remote import looks correct"}"#
+                                    .into(),
+                        }),
+                        StreamEvent::Done,
+                    ]
+                })
+                .collect(),
+        ),
+    })
+}
+
+#[tokio::test]
+async fn remote_integration_fails_before_connecting_when_policy_denies_it() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "remote policy".into(), None)
+        .await
+        .unwrap();
+    let (_bundle_dir, bundle_path, bundle, _head) =
+        remote_bundle_fixture(Path::new(project.root.as_str()), "remote.txt", "remote\n");
+    let error = service
+        .integrate_remote(remote_params(&project.id, &session.id))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("REMOTE_INTEGRATION_DISABLED"));
+
+    // Enabling without confirmation is rejected before the policy is stored.
+    engine
+        .set_execution_host(&project.id, test_remote_host())
+        .await
+        .unwrap();
+    let error = engine
+        .set_remote_integration_policy(&project.id, test_remote_policy(), false)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("REMOTE_INTEGRATION_APPROVAL_REQUIRED"));
+    assert!(
+        !engine
+            .get_remote_integration_policy(&project.id)
+            .await
+            .unwrap()
+            .enabled
+    );
+
+    engine
+        .set_remote_integration_policy(&project.id, test_remote_policy(), true)
+        .await
+        .unwrap();
+    let mut wrong_host = remote_params(&project.id, &session.id);
+    wrong_host.host = Some("other.example.com".into());
+    let error = service.integrate_remote(wrong_host).await.unwrap_err();
+    assert!(format!("{error:#}").contains("REMOTE_INTEGRATION_HOST_NOT_ALLOWED"));
+
+    let mut unconfirmed = remote_params(&project.id, &session.id);
+    unconfirmed.confirm = false;
+    let error = service.integrate_remote(unconfirmed).await.unwrap_err();
+    assert!(format!("{error:#}").contains("REMOTE_INTEGRATION_APPROVAL_REQUIRED"));
+
+    let mut disabled = test_remote_policy();
+    disabled.enabled = false;
+    engine
+        .set_remote_integration_policy(&project.id, disabled, true)
+        .await
+        .unwrap();
+    let error = service
+        .integrate_remote_bundle_file(remote_params(&project.id, &session.id), bundle_path, bundle)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("REMOTE_INTEGRATION_DISABLED"));
+    assert!(
+        engine
+            .list_merge_queue(&session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn imports_verifies_and_integrates_a_remote_bundle() {
+    let dir = TempDir::new().unwrap();
+    let provider = verdict_provider(1);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    configure_remote_integration(&engine, &project.id, test_remote_policy()).await;
+    let session = engine
+        .create_session(project.id.clone(), "remote import".into(), None)
+        .await
+        .unwrap();
+    let (_bundle_dir, bundle_path, bundle, head) = remote_bundle_fixture(
+        Path::new(project.root.as_str()),
+        "remote.txt",
+        "from remote\n",
+    );
+    let result = service
+        .integrate_remote_bundle_file(remote_params(&project.id, &session.id), bundle_path, bundle)
+        .await
+        .unwrap();
+    assert_eq!(result.entry.status, "merged");
+    assert_eq!(result.entry.source, "remote");
+    assert_eq!(
+        result.entry.remote_host.as_deref(),
+        Some("build.example.com")
+    );
+    assert_eq!(
+        result.entry.remote_branch.as_deref(),
+        Some("feature/remote")
+    );
+    assert_eq!(result.entry.commit, head);
+    assert_eq!(result.entry.verifier_approved, Some(true));
+    assert_eq!(
+        result.entry.verifier_summary.as_deref(),
+        Some("remote import looks correct")
+    );
+    assert!(result.entry.environment_caveat.is_some());
+    assert!(result.verification.required);
+    assert!(result.verification.performed);
+    assert_eq!(result.verification.approved, Some(true));
+    assert!(result.refs_pruned);
+    assert!(result.imported_ref.is_none());
+    let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(session_worktree.join("remote.txt")).unwrap(),
+        "from remote\n"
+    );
+    let queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].source, "remote");
+    assert_eq!(queue[0].status, "merged");
+    assert_eq!(queue[0].bundle_sha256, Some(result.bundle.sha256.clone()));
+    assert_eq!(queue[0].verifier_approved, Some(true));
+    assert!(queue[0].environment_caveat.is_some());
+    assert!(!crate::remote_integration::import_ref_exists(
+        Path::new(&project.root),
+        queue[0].imported_ref.as_deref().unwrap()
+    ));
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "remote.integration.approved")
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.finished"
+            && event.payload["source"] == "remote"
+            && event.payload["bundle_sha256"] == result.bundle.sha256
+            && event.payload["environment_caveat"].is_string()
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "merge_queue.enqueued"
+            && event.payload["entry"]["source"] == "remote"
+            && event.payload["entry"]["imported_ref"].is_string()
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "remote.integration.finished"
+                && event.payload["status"] == "merged")
+    );
+}
+
+#[tokio::test]
+async fn optional_verifier_skips_the_provider_and_still_integrates() {
+    let dir = TempDir::new().unwrap();
+    let provider = verdict_provider(0);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut policy = test_remote_policy();
+    policy.require_verifier = false;
+    configure_remote_integration(&engine, &project.id, policy).await;
+    let session = engine
+        .create_session(project.id.clone(), "remote optional".into(), None)
+        .await
+        .unwrap();
+    let (_bundle_dir, bundle_path, bundle, _head) = remote_bundle_fixture(
+        Path::new(project.root.as_str()),
+        "optional.txt",
+        "optional\n",
+    );
+    let result = service
+        .integrate_remote_bundle_file(remote_params(&project.id, &session.id), bundle_path, bundle)
+        .await
+        .unwrap();
+    assert_eq!(result.entry.status, "merged");
+    assert!(!result.verification.required);
+    assert!(!result.verification.performed);
+    assert_eq!(result.verification.approved, None);
+    assert_eq!(result.entry.verifier_approved, None);
+    assert!(result.entry.environment_caveat.is_some());
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.kind == "remote.integration.verification_skipped" })
+    );
+}
+
+#[tokio::test]
+async fn conflict_retains_the_imported_ref_and_retry_reverifies_then_merges() {
+    let dir = TempDir::new().unwrap();
+    let provider = verdict_provider(2);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    configure_remote_integration(&engine, &project.id, test_remote_policy()).await;
+    let session = engine
+        .create_session(project.id.clone(), "remote conflict".into(), None)
+        .await
+        .unwrap();
+    let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+    std::fs::write(session_worktree.join("README.md"), "session side\n").unwrap();
+    let session_commit = crate::worktree::commit_all(&session_worktree, "session side").unwrap();
+    assert!(session_commit.is_some());
+    let (_bundle_dir, bundle_path, bundle, _head) = remote_bundle_fixture(
+        Path::new(project.root.as_str()),
+        "README.md",
+        "remote side\n",
+    );
+    let error = service
+        .integrate_remote_bundle_file(remote_params(&project.id, &session.id), bundle_path, bundle)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("REMOTE_INTEGRATION_FAILED"));
+    let queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert_eq!(queue.len(), 1);
+    let entry = &queue[0];
+    assert_eq!(entry.status, "conflict");
+    let imported_ref = entry.imported_ref.clone().unwrap();
+    assert!(crate::remote_integration::import_ref_exists(
+        Path::new(&project.root),
+        &imported_ref
+    ));
+
+    // Resolve the rebase in the local remote worktree exactly as an operator
+    // would, update the imported ref, then retry through the same Verifier.
+    let agents = engine.list_agents(&session.id).await.unwrap();
+    let agent = agents
+        .iter()
+        .find(|agent| agent.name.starts_with("Remote "))
+        .unwrap();
+    let remote_worktree = PathBuf::from(agent.worktree.clone().unwrap());
+    let _ = crate::worktree::rebase_onto_keep_conflicts(
+        &remote_worktree,
+        &session.branch.clone().unwrap(),
+    );
+    std::fs::write(remote_worktree.join("README.md"), "resolved both sides\n").unwrap();
+    crate::worktree::stage_all(&remote_worktree).unwrap();
+    crate::worktree::continue_rebase(&remote_worktree).unwrap();
+    let resolved_commit = crate::worktree::head_commit(&remote_worktree).unwrap();
+    crate::remote_integration::update_import_ref(
+        Path::new(&project.root),
+        &imported_ref,
+        &resolved_commit,
+    )
+    .unwrap();
+    let retried = service.retry_merge(&entry.id).await.unwrap();
+    assert_eq!(retried.status, "merged");
+    assert_eq!(retried.source, "remote");
+    assert_eq!(retried.attempt, 2);
+    assert_eq!(
+        std::fs::read_to_string(session_worktree.join("README.md")).unwrap(),
+        "resolved both sides\n"
+    );
+    assert!(!crate::remote_integration::import_ref_exists(
+        Path::new(&project.root),
+        &imported_ref
+    ));
+}
+
+#[tokio::test]
+async fn tampered_and_head_mismatched_bundles_never_enter_the_queue() {
+    let dir = TempDir::new().unwrap();
+    let provider = verdict_provider(0);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    configure_remote_integration(&engine, &project.id, test_remote_policy()).await;
+    let session = engine
+        .create_session(project.id.clone(), "remote tamper".into(), None)
+        .await
+        .unwrap();
+    let (_bundle_dir, bundle_path, mut bundle, _head) =
+        remote_bundle_fixture(Path::new(project.root.as_str()), "tamper.txt", "tamper\n");
+    bundle.sha256 = "0".repeat(64);
+    let error = service
+        .integrate_remote_bundle_file(
+            remote_params(&project.id, &session.id),
+            bundle_path.clone(),
+            bundle.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("REMOTE_BUNDLE_TAMPERED"));
+
+    let (_bundle_dir2, bundle_path2, mut bundle2, _head2) =
+        remote_bundle_fixture(Path::new(project.root.as_str()), "tamper.txt", "tamper\n");
+    bundle2.head = "1".repeat(40);
+    let error = service
+        .integrate_remote_bundle_file(
+            remote_params(&project.id, &session.id),
+            bundle_path2,
+            bundle2,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("REMOTE_BUNDLE_HEAD_MISMATCH"));
+    assert!(
+        engine
+            .list_merge_queue(&session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn remote_queue_provenance_replays_from_the_enqueue_event() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "remote replay".into(), None)
+        .await
+        .unwrap();
+    let source = vp_protocol::types::MergeQueueSource::remote(
+        "build.example.com",
+        "feature/remote",
+        "a".repeat(64),
+        "refs/verlinpark/remote/session/import-1",
+    );
+    engine
+        .enqueue_merge_with_source(
+            &session.id,
+            "remote-agent",
+            "Remote Worker",
+            None,
+            "verlinpark/session--remote-import-1",
+            "abcdef1234567890",
+            "1234567890abcdef",
+            Some("verified locally".to_string()),
+            source,
+        )
+        .await
+        .unwrap();
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
+    assert!(report.queue_matches);
+    let _ = engine.repair_session(&session.id).await.unwrap();
+    let queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].source, "remote");
+    assert_eq!(queue[0].remote_host.as_deref(), Some("build.example.com"));
+    assert_eq!(
+        queue[0].imported_ref.as_deref(),
+        Some("refs/verlinpark/remote/session/import-1")
+    );
+}
+
+#[tokio::test]
+async fn remote_ref_cleanup_protects_retryable_entries_unless_forced() {
+    let dir = TempDir::new().unwrap();
+    let provider = verdict_provider(1);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    configure_remote_integration(&engine, &project.id, test_remote_policy()).await;
+    let session = engine
+        .create_session(project.id.clone(), "remote cleanup".into(), None)
+        .await
+        .unwrap();
+    let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+    std::fs::write(session_worktree.join("README.md"), "session cleanup side\n").unwrap();
+    crate::worktree::commit_all(&session_worktree, "session side").unwrap();
+    let (_bundle_dir, bundle_path, bundle, _head) = remote_bundle_fixture(
+        Path::new(project.root.as_str()),
+        "README.md",
+        "remote cleanup side\n",
+    );
+    let _ = service
+        .integrate_remote_bundle_file(remote_params(&project.id, &session.id), bundle_path, bundle)
+        .await
+        .unwrap_err();
+    let entry = engine.list_merge_queue(&session.id).await.unwrap()[0].clone();
+    let imported_ref = entry.imported_ref.clone().unwrap();
+    let agent = engine
+        .list_agents(&session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|agent| agent.name.starts_with("Remote "))
+        .unwrap();
+    let worktree = PathBuf::from(agent.worktree.clone().unwrap());
+    assert!(worktree.exists());
+    let protected = engine
+        .remote_integration_cleanup(vp_protocol::remote::RemoteIntegrationCleanupParams {
+            project_id: project.id.clone(),
+            session_id: Some(session.id.clone()),
+            entry_id: None,
+            force: false,
+        })
+        .await
+        .unwrap();
+    assert!(protected.removed_refs.is_empty());
+    assert!(
+        protected
+            .skipped
+            .iter()
+            .any(|reason| reason.contains("requires force"))
+    );
+    assert!(crate::remote_integration::import_ref_exists(
+        Path::new(&project.root),
+        &imported_ref
+    ));
+    let forced = engine
+        .remote_integration_cleanup(vp_protocol::remote::RemoteIntegrationCleanupParams {
+            project_id: project.id.clone(),
+            session_id: Some(session.id.clone()),
+            entry_id: Some(entry.id.clone()),
+            force: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(forced.removed_refs, vec![imported_ref.clone()]);
+    assert!(
+        forced
+            .removed_worktrees
+            .iter()
+            .any(|path| path == &worktree.to_string_lossy())
+    );
+    assert!(!crate::remote_integration::import_ref_exists(
+        Path::new(&project.root),
+        &imported_ref
+    ));
+    assert!(!worktree.exists());
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "remote.integration.refs_pruned"
+            && event.payload["entry_id"] == entry.id
+            && event.payload["force"] == true
+    }));
+}
+
+#[tokio::test]
+async fn remote_integration_status_reports_counts_and_retained_refs() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "remote status".into(), None)
+        .await
+        .unwrap();
+    let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+    let commit = crate::worktree::head_commit(&session_worktree).unwrap();
+    let reference = "refs/verlinpark/remote/status/import-1".to_string();
+    crate::remote_integration::update_import_ref(Path::new(&project.root), &reference, &commit)
+        .unwrap();
+    let source = vp_protocol::types::MergeQueueSource::remote(
+        "build.example.com",
+        "feature/status",
+        "b".repeat(64),
+        reference.clone(),
+    );
+    let merged = engine
+        .enqueue_merge_with_source(
+            &session.id,
+            "remote-agent-1",
+            "Remote One",
+            None,
+            "verlinpark/status--remote-1",
+            &commit,
+            &commit,
+            Some("merged".into()),
+            source.clone(),
+        )
+        .await
+        .unwrap();
+    engine
+        .update_merge_queue_entry(&merged.id, "merged", Some("ok".into()))
+        .await
+        .unwrap();
+    let conflict = engine
+        .enqueue_merge_with_source(
+            &session.id,
+            "remote-agent-2",
+            "Remote Two",
+            None,
+            "verlinpark/status--remote-2",
+            &commit,
+            &commit,
+            Some("conflict".into()),
+            vp_protocol::types::MergeQueueSource::remote(
+                "build.example.com",
+                "feature/conflict",
+                "c".repeat(64),
+                "refs/verlinpark/remote/status/missing",
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .update_merge_queue_entry(&conflict.id, "conflict", Some("conflict".into()))
+        .await
+        .unwrap();
+    engine
+        .set_merge_queue_verification(
+            &merged.id,
+            Some(true),
+            Some("approved by verifier".into()),
+            Some("local only".into()),
+        )
+        .await
+        .unwrap();
+    let status = engine
+        .remote_integration_status(&project.id, Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(status.total, 2);
+    assert_eq!(status.merged, 1);
+    assert_eq!(status.conflicts, 1);
+    assert_eq!(status.pending, 0);
+    assert_eq!(status.failed, 0);
+    assert_eq!(status.retained_refs, 1);
+    assert!(status.verifier_required);
+    let entry = status
+        .entries
+        .iter()
+        .find(|entry| entry.entry_id == merged.id)
+        .unwrap();
+    assert_eq!(entry.verifier_approved, Some(true));
+    assert_eq!(
+        entry.verifier_summary.as_deref(),
+        Some("approved by verifier")
+    );
+    assert_eq!(entry.environment_caveat.as_deref(), Some("local only"));
+    let policy = engine
+        .remote_integration_policy_result(&project.id)
+        .await
+        .unwrap();
+    assert!(!policy.policy.enabled);
+    assert_eq!(policy.project_id, project.id);
+}

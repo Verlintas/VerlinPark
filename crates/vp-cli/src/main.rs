@@ -12,6 +12,7 @@ use vp_core::backup::repository::{
     Compression, KdfConfig, Passphrase, RepositoryBackupOptions, RepositoryEncryption,
 };
 use vp_protocol::discovery::Discovery;
+use vp_protocol::remote::RemoteIntegrationPolicy;
 use vp_protocol::rpc::RpcResponse;
 use vp_store::paths;
 
@@ -374,6 +375,85 @@ enum Command {
         project: String,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+    },
+    /// Import a remote branch through a bounded Git bundle, verify it locally,
+    /// and enqueue it for deterministic integration.
+    #[command(name = "remote-integrate")]
+    RemoteIntegrate {
+        project: String,
+        session: String,
+        branch: String,
+        /// Assert the exact configured SSH host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Required remote head; the exported bundle must match it exactly.
+        #[arg(long)]
+        expected_commit: Option<String>,
+        /// Local prerequisite commit for a thin bundle (`--not <base>`).
+        #[arg(long)]
+        base_commit: Option<String>,
+        /// Attach the queue entry to this plan task.
+        #[arg(long)]
+        task: Option<String>,
+        /// Extra objective text for the Verifier.
+        #[arg(long)]
+        objective: Option<String>,
+        /// Explicit operator confirmation for this host-level action.
+        #[arg(long)]
+        confirm: bool,
+        /// Retain the temporary refs/verlinpark/remote/... namespace.
+        #[arg(long)]
+        keep_import_refs: bool,
+    },
+    /// Show remote integration policy and remote-sourced queue entries.
+    #[command(name = "remote-integration")]
+    RemoteIntegration {
+        project: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Remove retained remote-integration refs. Retryable entries require
+    /// --force; queued/merging entries are never touched.
+    #[command(name = "remote-integration-cleanup")]
+    RemoteIntegrationCleanup {
+        project: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        entry: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the project's remote integration policy.
+    #[command(name = "remote-integration-policy")]
+    RemoteIntegrationPolicy { project: String },
+    /// Update the project's remote integration policy. Unspecified fields keep
+    /// their current values.
+    #[command(name = "remote-integration-policy-set")]
+    RemoteIntegrationPolicySet {
+        project: String,
+        #[arg(long)]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        #[arg(long)]
+        max_bundle_bytes: Option<u64>,
+        #[arg(long)]
+        require_verifier: bool,
+        #[arg(long = "no-require-verifier")]
+        no_require_verifier: bool,
+        /// Replace the allowlist with these exact hosts (repeatable).
+        #[arg(long = "allow-host")]
+        allowed_hosts: Vec<String>,
+        #[arg(long = "clear-hosts")]
+        clear_hosts: bool,
+        #[arg(long)]
+        keep_import_refs: bool,
+        #[arg(long = "no-keep-import-refs")]
+        no_keep_import_refs: bool,
+        /// Required to enable remote integration.
+        #[arg(long)]
+        confirm: bool,
     },
     /// List project skill packs.
     Skills {
@@ -2775,6 +2855,161 @@ async fn main() -> Result<()> {
                 &discovery,
                 "remote.ledger",
                 json!({"project_id": project, "limit": limit}),
+            )
+            .await?
+        }
+        Command::RemoteIntegrate {
+            project,
+            session,
+            branch,
+            host,
+            expected_commit,
+            base_commit,
+            task,
+            objective,
+            confirm,
+            keep_import_refs,
+        } => {
+            rpc(
+                &discovery,
+                "remote.integrate",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "branch": branch,
+                    "host": host,
+                    "expected_commit": expected_commit,
+                    "base_commit": base_commit,
+                    "task_id": task,
+                    "objective": objective,
+                    "confirm": confirm,
+                    "keep_import_refs": if keep_import_refs { Some(true) } else { None },
+                }),
+            )
+            .await?
+        }
+        Command::RemoteIntegration { project, session } => {
+            rpc(
+                &discovery,
+                "remote.integration.status",
+                json!({"project_id": project, "session_id": session}),
+            )
+            .await?
+        }
+        Command::RemoteIntegrationCleanup {
+            project,
+            session,
+            entry,
+            force,
+        } => {
+            rpc(
+                &discovery,
+                "remote.integration.cleanup",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "entry_id": entry,
+                    "force": force,
+                }),
+            )
+            .await?
+        }
+        Command::RemoteIntegrationPolicy { project } => {
+            rpc(
+                &discovery,
+                "remote.integration.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::RemoteIntegrationPolicySet {
+            project,
+            enable,
+            disable,
+            max_bundle_bytes,
+            require_verifier,
+            no_require_verifier,
+            allowed_hosts,
+            clear_hosts,
+            keep_import_refs,
+            no_keep_import_refs,
+            confirm,
+        } => {
+            if enable && disable {
+                bail!("use either --enable or --disable, not both");
+            }
+            if require_verifier && no_require_verifier {
+                bail!("use either --require-verifier or --no-require-verifier, not both");
+            }
+            if keep_import_refs && no_keep_import_refs {
+                bail!("use either --keep-import-refs or --no-keep-import-refs, not both");
+            }
+            let current = rpc(
+                &discovery,
+                "remote.integration.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy: RemoteIntegrationPolicy = serde_json::from_value(
+                current
+                    .get("policy")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("policy response is missing `policy`"))?,
+            )
+            .context("decoding the current remote integration policy")?;
+            let mut changed = false;
+            if enable {
+                policy.enabled = true;
+                changed = true;
+            }
+            if disable {
+                policy.enabled = false;
+                changed = true;
+            }
+            if let Some(bytes) = max_bundle_bytes {
+                policy.max_bundle_bytes = bytes;
+                changed = true;
+            }
+            if require_verifier {
+                policy.require_verifier = true;
+                changed = true;
+            }
+            if no_require_verifier {
+                policy.require_verifier = false;
+                changed = true;
+            }
+            if clear_hosts {
+                policy.allowed_hosts.clear();
+                changed = true;
+            }
+            if !allowed_hosts.is_empty() {
+                policy.allowed_hosts = allowed_hosts;
+                changed = true;
+            }
+            if keep_import_refs {
+                policy.keep_import_refs = true;
+                changed = true;
+            }
+            if no_keep_import_refs {
+                policy.keep_import_refs = false;
+                changed = true;
+            }
+            if !changed {
+                bail!(
+                    "no policy change requested; pass --enable/--disable, --max-bundle-bytes, verifier flags, --allow-host, or keep-ref flags"
+                );
+            }
+            policy
+                .validate()
+                .map_err(|error| anyhow::anyhow!("invalid remote integration policy: {error}"))?;
+            rpc(
+                &discovery,
+                "remote.integration.policy.set",
+                json!({
+                    "project_id": project,
+                    "policy": policy,
+                    "confirm": confirm,
+                }),
             )
             .await?
         }
@@ -7410,6 +7645,193 @@ fn scaling_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn remote_integration_lines(value: &Value) -> Option<Vec<String>> {
+    if value.get("removed_refs").is_some() && value.get("skipped").is_some() {
+        let refs = value["removed_refs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let worktrees = value["removed_worktrees"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let skipped = value["skipped"].as_array().cloned().unwrap_or_default();
+        let mut lines = vec![format!(
+            "remote integration cleanup for {}: examined {} · removed {} ref(s) · {} worktree(s) · {} skipped",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["entries_examined"].as_u64().unwrap_or(0),
+            refs.len(),
+            worktrees.len(),
+            skipped.len()
+        )];
+        for reference in refs {
+            if let Some(reference) = reference.as_str() {
+                lines.push(format!("  removed {reference}"));
+            }
+        }
+        for worktree in worktrees {
+            if let Some(worktree) = worktree.as_str() {
+                lines.push(format!("  removed worktree {worktree}"));
+            }
+        }
+        for reason in skipped {
+            if let Some(reason) = reason.as_str() {
+                lines.push(format!("  skipped {reason}"));
+            }
+        }
+        return Some(lines);
+    }
+    if let (Some(entry), Some(bundle), Some(verification)) = (
+        value.get("entry"),
+        value.get("bundle"),
+        value.get("verification"),
+    ) {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "remote integration {}  {}  {}:{}",
+            entry["status"].as_str().unwrap_or("?"),
+            entry["id"].as_str().unwrap_or("?"),
+            bundle["host"].as_str().unwrap_or("?"),
+            bundle["branch"].as_str().unwrap_or("?")
+        ));
+        lines.push(format!(
+            "  commit {}  bundle sha256 {}  bytes {}",
+            entry["commit"].as_str().unwrap_or("?"),
+            bundle["sha256"].as_str().unwrap_or("?"),
+            bundle["bytes"].as_u64().unwrap_or(0)
+        ));
+        lines.push(format!(
+            "  verifier required={} performed={} approved={}",
+            verification["required"].as_bool().unwrap_or(false),
+            verification["performed"].as_bool().unwrap_or(false),
+            verification["approved"]
+                .as_bool()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "—".into())
+        ));
+        if let Some(summary) = verification["summary"].as_str() {
+            lines.push(format!("  verdict {summary}"));
+        }
+        lines.push(format!(
+            "  imported_ref {}  refs_pruned {}",
+            value["imported_ref"].as_str().unwrap_or("—"),
+            value["refs_pruned"].as_bool().unwrap_or(false)
+        ));
+        if let Some(caveat) = value["environment_caveat"].as_str() {
+            lines.push(format!("  caveat {caveat}"));
+        }
+        return Some(lines);
+    }
+    if let Some(policy) = value.get("policy")
+        && let Some(entries) = value.get("entries").and_then(Value::as_array)
+    {
+        let mut lines = vec![format!(
+            "remote integration policy enabled={} verifier_required={} max_bundle_bytes={} keep_refs={}",
+            policy["enabled"].as_bool().unwrap_or(false),
+            policy["require_verifier"].as_bool().unwrap_or(true),
+            policy["max_bundle_bytes"].as_u64().unwrap_or(0),
+            policy["keep_import_refs"].as_bool().unwrap_or(false)
+        )];
+        let hosts = policy["allowed_hosts"]
+            .as_array()
+            .map(|hosts| {
+                hosts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        lines.push(format!(
+            "  allowed hosts: {}",
+            if hosts.is_empty() {
+                "(none)".to_string()
+            } else {
+                hosts
+            }
+        ));
+        lines.push(format!(
+            "  queue total {} · pending {} · merged {} · conflicts {} · failed {} · refs retained {}",
+            value["total"].as_u64().unwrap_or(0),
+            value["pending"].as_u64().unwrap_or(0),
+            value["merged"].as_u64().unwrap_or(0),
+            value["conflicts"].as_u64().unwrap_or(0),
+            value["failed"].as_u64().unwrap_or(0),
+            value["retained_refs"].as_u64().unwrap_or(0)
+        ));
+        if entries.is_empty() {
+            lines.push("  no remote queue entries".to_string());
+        }
+        for entry in entries {
+            lines.push(format!(
+                "  {}  {:<10}  {}  {}:{}  attempt {}  {}",
+                entry["entry_id"].as_str().unwrap_or("?"),
+                entry["status"].as_str().unwrap_or("?"),
+                entry["commit"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .chars()
+                    .take(12)
+                    .collect::<String>(),
+                entry["remote_host"].as_str().unwrap_or("?"),
+                entry["remote_branch"].as_str().unwrap_or("?"),
+                entry["attempt"].as_u64().unwrap_or(0),
+                entry["imported_ref"].as_str().unwrap_or("—")
+            ));
+            if let Some(approved) = entry["verifier_approved"].as_bool() {
+                lines.push(format!(
+                    "    verifier {}: {}",
+                    if approved { "approved" } else { "rejected" },
+                    entry["verifier_summary"].as_str().unwrap_or("no summary")
+                ));
+            }
+            if let Some(detail) = entry["detail"].as_str()
+                && !detail.is_empty()
+            {
+                lines.push(format!("    {detail}"));
+            }
+        }
+        if let Some(caveat) = value["environment_caveat"].as_str() {
+            lines.push(format!("  caveat {caveat}"));
+        }
+        return Some(lines);
+    }
+    if let Some(policy) = value.get("policy")
+        && value.get("project_id").is_some()
+        && value.get("entries").is_none()
+    {
+        let hosts = policy["allowed_hosts"]
+            .as_array()
+            .map(|hosts| {
+                hosts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return Some(vec![
+            format!(
+                "remote integration policy for {} enabled={} verifier_required={}",
+                value["project_id"].as_str().unwrap_or("?"),
+                policy["enabled"].as_bool().unwrap_or(false),
+                policy["require_verifier"].as_bool().unwrap_or(true)
+            ),
+            format!(
+                "  max_bundle_bytes {} · keep_import_refs {} · allowed hosts {}",
+                policy["max_bundle_bytes"].as_u64().unwrap_or(0),
+                policy["keep_import_refs"].as_bool().unwrap_or(false),
+                if hosts.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    hosts
+                }
+            ),
+        ]);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
     if let Some(lines) = process_console_lines(value) {
         for line in lines {
@@ -7418,6 +7840,12 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(lines) = governor_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = remote_integration_lines(value) {
         for line in lines {
             println!("{line}");
         }
@@ -12204,5 +12632,214 @@ mod governor_cli_tests {
         assert!(lines.contains("enabled"));
         assert!(lines.contains("reserve 50%"));
         assert!(lines.contains("throttle 20%"));
+    }
+}
+
+#[cfg(test)]
+mod remote_integration_cli_tests {
+    use super::*;
+
+    #[test]
+    fn remote_integration_commands_parse_explicit_confirmation_and_bounds() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(parse_remote_integration_commands)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn parse_remote_integration_commands() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "remote-integrate",
+            "prj-1",
+            "ses-1",
+            "feature/remote",
+            "--host",
+            "build.example.com",
+            "--expected-commit",
+            "abcdef1234567890",
+            "--task",
+            "T1",
+            "--objective",
+            "integrate it",
+            "--confirm",
+            "--keep-import-refs",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::RemoteIntegrate {
+                project,
+                session,
+                branch,
+                host,
+                expected_commit,
+                base_commit,
+                task,
+                objective,
+                confirm,
+                keep_import_refs,
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(session, "ses-1");
+                assert_eq!(branch, "feature/remote");
+                assert_eq!(host.as_deref(), Some("build.example.com"));
+                assert_eq!(expected_commit.as_deref(), Some("abcdef1234567890"));
+                assert!(base_commit.is_none());
+                assert_eq!(task.as_deref(), Some("T1"));
+                assert_eq!(objective.as_deref(), Some("integrate it"));
+                assert!(confirm);
+                assert!(keep_import_refs);
+            }
+            other => panic!("expected remote-integrate, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "remote-integration-policy-set",
+            "prj-1",
+            "--enable",
+            "--max-bundle-bytes",
+            "1048576",
+            "--no-require-verifier",
+            "--allow-host",
+            "build.example.com",
+            "--no-keep-import-refs",
+            "--confirm",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::RemoteIntegrationPolicySet {
+                project,
+                enable,
+                max_bundle_bytes,
+                no_require_verifier,
+                allowed_hosts,
+                no_keep_import_refs,
+                confirm,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert!(enable);
+                assert_eq!(max_bundle_bytes, Some(1_048_576));
+                assert!(no_require_verifier);
+                assert_eq!(allowed_hosts, vec!["build.example.com".to_string()]);
+                assert!(no_keep_import_refs);
+                assert!(confirm);
+            }
+            other => panic!("expected remote-integration-policy-set, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "remote-integration", "prj-1", "--session", "ses-1"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RemoteIntegration {
+                session: Some(ref session),
+                ..
+            } if session == "ses-1"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "remote-integration-cleanup",
+            "prj-1",
+            "--entry",
+            "e1",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::RemoteIntegrationCleanup {
+                project,
+                session,
+                entry,
+                force,
+            } => {
+                assert_eq!(project, "prj-1");
+                assert!(session.is_none());
+                assert_eq!(entry.as_deref(), Some("e1"));
+                assert!(force);
+            }
+            other => panic!("expected remote-integration-cleanup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_integration_human_output_reports_status_and_caveat() {
+        let value = serde_json::json!({
+            "entry": {
+                "id": "e1",
+                "status": "merged",
+                "commit": "abcdef1234567890"
+            },
+            "bundle": {
+                "host": "build.example.com",
+                "branch": "feature/x",
+                "sha256": "a".repeat(64),
+                "bytes": 1024
+            },
+            "verification": {
+                "required": true,
+                "performed": true,
+                "approved": true,
+                "summary": "looks good"
+            },
+            "imported_ref": null,
+            "refs_pruned": true,
+            "environment_caveat": "local only"
+        });
+        let lines = remote_integration_lines(&value).unwrap();
+        let text = lines.join("\n");
+        assert!(text.contains("merged"));
+        assert!(text.contains("build.example.com"));
+        assert!(text.contains("verifier required=true performed=true approved=true"));
+        assert!(text.contains("local only"));
+
+        let status = serde_json::json!({
+            "project_id": "prj-1",
+            "policy": {
+                "enabled": true,
+                "max_bundle_bytes": 1024,
+                "require_verifier": true,
+                "allowed_hosts": ["build.example.com"],
+                "keep_import_refs": false
+            },
+            "entries": [{
+                "entry_id": "e1",
+                "status": "conflict",
+                "commit": "abcdef1234567890",
+                "remote_host": "build.example.com",
+                "remote_branch": "feature/x",
+                "attempt": 2,
+                "imported_ref": "refs/verlinpark/remote/s/i",
+                "detail": "conflict"
+            }],
+            "total": 1,
+            "pending": 0,
+            "merged": 0,
+            "conflicts": 1,
+            "failed": 0,
+            "retained_refs": 1,
+            "environment_caveat": "local only"
+        });
+        let lines = remote_integration_lines(&status).unwrap();
+        let text = lines.join("\n");
+        assert!(text.contains("enabled=true"));
+        assert!(text.contains("conflict"));
+        assert!(text.contains("refs retained 1"));
+
+        let cleanup = serde_json::json!({
+            "project_id": "prj-1",
+            "removed_refs": ["refs/verlinpark/remote/s/i"],
+            "removed_worktrees": [],
+            "skipped": ["e2: retryable entry (conflict) requires force"],
+            "entries_examined": 2
+        });
+        let lines = remote_integration_lines(&cleanup).unwrap();
+        let text = lines.join("\n");
+        assert!(text.contains("removed 1 ref(s)"));
+        assert!(text.contains("requires force"));
     }
 }
