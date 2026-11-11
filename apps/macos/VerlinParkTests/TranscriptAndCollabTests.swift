@@ -816,6 +816,97 @@ final class TranscriptAndCollabTests: XCTestCase {
         XCTAssertEqual(AgentApprovalMode.unattended.rawValue, "unattended")
     }
 
+    func testCodeIntelligenceSourceLabelsAndSummaries() {
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "find_symbol",
+                input: .object(["query": .string("Widget"), "source": .string("lsp")])
+            ),
+            "Widget · lsp"
+        )
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "find_references",
+                input: .object(["name": .string("Widget"), "source": .string("lexical")])
+            ),
+            "Widget · lexical"
+        )
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "code_diagnostics",
+                input: .object([
+                    "severity": .string("warning"),
+                    "source": .string("build"),
+                    "paths": .array([.string("src/lib.rs")]),
+                ])
+            ),
+            "warning · build · 1 paths"
+        )
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "repo_map",
+                input: .object(["path": .string("src"), "source": .string("lexical")])
+            ),
+            "src · lexical"
+        )
+        XCTAssertEqual(
+            ToolTrace.summary(
+                name: "build_context",
+                input: .object(["goal": .string("fix widget"), "source": .string("lsp")])
+            ),
+            "fix widget · lsp"
+        )
+
+        XCTAssertEqual(
+            ToolTrace.intelligenceSource(.object(["source": .string("lsp")])),
+            "LSP"
+        )
+        XCTAssertEqual(
+            ToolTrace.intelligenceSource(.object(["source": .string("lexical")])),
+            "Lexical"
+        )
+        XCTAssertEqual(
+            ToolTrace.intelligenceSource(.object(["source": .string("build")])),
+            "Build"
+        )
+        XCTAssertNil(ToolTrace.intelligenceSource(.object(["source": .string("model")])))
+        XCTAssertNil(ToolTrace.intelligenceSource(nil))
+        XCTAssertEqual(
+            ToolTrace.intelligenceStatus(.object(["status": .string("fallback")])),
+            "fallback"
+        )
+    }
+
+    func testTranscriptCarriesCodeIntelligenceSourceFromStructuredResult() {
+        let events = [
+            event(1, "tool.started", [
+                "tool_call_id": .string("lsp-1"),
+                "name": .string("find_symbol"),
+                "input": .object(["query": .string("Widget")]),
+            ]),
+            event(2, "tool.finished", [
+                "tool_call_id": .string("lsp-1"),
+                "name": .string("find_symbol"),
+                "output": .string("LSP · rust-analyzer · workspace/symbol"),
+                "is_error": .bool(true),
+                "input": .object(["query": .string("Widget")]),
+                "structured": .object([
+                    "source": .string("lsp"),
+                    "status": .string("timeout"),
+                    "confidence": .string("lsp"),
+                ]),
+            ]),
+        ]
+        let entries = TranscriptProjection.build(events: events)
+        XCTAssertEqual(entries.count, 1)
+        guard case let .tool(entry) = entries[0] else {
+            return XCTFail("expected a tool entry")
+        }
+        XCTAssertEqual(entry.intelligenceSource, "LSP")
+        XCTAssertTrue(entry.isError)
+        XCTAssertEqual(entry.summary, "Widget")
+    }
+
     private func event(
         _ seq: UInt64,
         _ type: String,

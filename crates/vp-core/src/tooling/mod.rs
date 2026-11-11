@@ -5,6 +5,7 @@
 //! model to compose long shell/search/read chains.
 
 pub mod code;
+pub mod code_intel;
 pub mod data;
 pub mod diff;
 pub mod files;

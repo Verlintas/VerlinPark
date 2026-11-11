@@ -43,8 +43,28 @@ enum ToolTrace {
             return path.isEmpty ? action : "\(action) · \(path)"
         case "lsp_query":
             let action = string(input, "action") ?? "symbols"
-            let path = string(input, "path") ?? ""
+            let path = string(input, "path") ?? string(input, "language") ?? ""
             return path.isEmpty ? action : "\(action) · \(path)"
+        case "find_symbol":
+            let query = string(input, "query") ?? "symbol"
+            let source = string(input, "source") ?? ""
+            return source.isEmpty ? query : "\(query) · \(source)"
+        case "find_references":
+            let target = string(input, "name") ?? string(input, "symbol_id") ?? "references"
+            let source = string(input, "source") ?? ""
+            return source.isEmpty ? target : "\(target) · \(source)"
+        case "repo_map":
+            let path = string(input, "path") ?? "."
+            return "\(path) · \(string(input, "source") ?? "lexical")"
+        case "build_context":
+            let goal = string(input, "goal") ?? "context"
+            return "\(goal) · \(string(input, "source") ?? "lexical")"
+        case "code_diagnostics":
+            let severity = string(input, "severity") ?? "error"
+            let source = string(input, "source") ?? "auto"
+            let paths = arrayCount(input, "paths")
+            let detail = paths == 0 ? "" : " · \(paths) paths"
+            return "\(severity) · \(source)\(detail)"
         case "web_search":
             return string(input, "query") ?? "web search"
         case "read_pdf", "read_image":
@@ -119,6 +139,33 @@ enum ToolTrace {
 
     static func displayName(_ name: String) -> String {
         name.isEmpty ? "tool" : name
+    }
+
+    /// Optional source badge for code-intelligence tool results. Unknown or
+    /// absent sources return nil so ordinary tools do not get a badge.
+    static func intelligenceSource(_ structured: JSONValue?) -> String? {
+        guard let value = structured?.objectValue?["source"]?.stringValue else {
+            return nil
+        }
+        switch value.lowercased() {
+        case "lsp":
+            return "LSP"
+        case "lexical":
+            return "Lexical"
+        case "build":
+            return "Build"
+        default:
+            return nil
+        }
+    }
+
+    static func intelligenceStatus(_ structured: JSONValue?) -> String? {
+        guard let status = structured?.objectValue?["status"]?.stringValue,
+              !status.isEmpty
+        else {
+            return nil
+        }
+        return status
     }
 
     static func icon(name: String, isError: Bool) -> String {

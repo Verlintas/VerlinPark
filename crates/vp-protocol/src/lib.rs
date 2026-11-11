@@ -5,6 +5,7 @@
 //! runtime concerns.
 
 pub mod discovery;
+pub mod lsp;
 pub mod remote;
 pub mod rpc;
 pub mod types;

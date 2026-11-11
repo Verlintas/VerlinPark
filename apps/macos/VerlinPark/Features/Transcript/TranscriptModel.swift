@@ -36,6 +36,7 @@ struct TranscriptToolEntry: Identifiable, Equatable {
     let input: JSONValue
     let output: String
     let isError: Bool
+    let intelligenceSource: String?
     let agent: String?
     let startedAt: String
     let finishedAt: String?
@@ -236,6 +237,7 @@ enum TranscriptProjection {
                 input: event.payload.objectValue?["input"] ?? .null,
                 output: "",
                 isError: false,
+                intelligenceSource: nil,
                 agent: TranscriptProjection.agentLabel(event),
                 startedAt: event.createdAt,
                 finishedAt: nil
@@ -256,6 +258,9 @@ enum TranscriptProjection {
             }
             let output = event.payload.objectValue?["output"]?.stringValue ?? ""
             let isError = event.payload.objectValue?["is_error"]?.boolValue ?? false
+            let intelligenceSource = ToolTrace.intelligenceSource(
+                event.payload.objectValue?["structured"]
+            )
             if TranscriptProjection.isRoutineTool(name), !isError,
                toolIndices[toolCallID] == nil
             {
@@ -267,6 +272,7 @@ enum TranscriptProjection {
                 input: event.payload.objectValue?["input"] ?? .null,
                 output: output,
                 isError: isError,
+                intelligenceSource: intelligenceSource,
                 agent: TranscriptProjection.agentLabel(event),
                 startedAt: event.createdAt,
                 finishedAt: event.createdAt
@@ -281,6 +287,7 @@ enum TranscriptProjection {
                         input: existing.input,
                         output: output,
                         isError: isError,
+                        intelligenceSource: intelligenceSource,
                         agent: existing.agent,
                         startedAt: existing.startedAt,
                         finishedAt: event.createdAt

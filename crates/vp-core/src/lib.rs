@@ -15,6 +15,7 @@ use async_recursion::async_recursion;
 use ignore::WalkBuilder;
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
+use vp_protocol::lsp::{LspLanguageStatus, LspStatusResult};
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpAgentListResult, AcpProbeResult, AcpTransport, AgentMessage,
@@ -1224,6 +1225,47 @@ impl Engine {
         .await??
         .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
         tokio::task::spawn_blocking(move || store.get_shell_policy(&project_id)).await?
+    }
+
+    /// Read-only language-server availability for a project checkout. This
+    /// never spawns a server; it only checks PATH and the in-process registry.
+    pub async fn lsp_status(&self, project_id: &str) -> Result<LspStatusResult> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        let project = tokio::task::spawn_blocking({
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let report = tokio::task::spawn_blocking(move || {
+            crate::tooling::lsp::status_report(Path::new(&project.root))
+        })
+        .await?;
+        Ok(LspStatusResult {
+            project_id,
+            root: report.root,
+            languages: report
+                .languages
+                .into_iter()
+                .map(|language| LspLanguageStatus {
+                    language: language.language,
+                    display: language.display,
+                    server: language.server,
+                    installed: language.installed,
+                    running: language.running,
+                    capabilities: language.capabilities,
+                    install_hint: language.install_hint,
+                    idle_secs: language.idle_secs,
+                })
+                .collect(),
+            running: report.running,
+            installed: report.installed,
+            supported_languages: crate::tooling::lsp::all_languages()
+                .iter()
+                .map(|language| language.id.to_string())
+                .collect(),
+        })
     }
 
     pub async fn get_task_scheduler_policy(

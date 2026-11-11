@@ -365,6 +365,8 @@ enum Command {
     },
     /// Show cached remote workspace health.
     RemoteStatus { project: String },
+    /// Show installed/running language servers and capabilities for a project.
+    Lsp { project: String },
     /// List Git worktrees on a project's remote host.
     RemoteWorktrees { project: String },
     /// Show the bounded remote operation ledger.
@@ -2409,6 +2411,9 @@ async fn main() -> Result<()> {
         }
         Command::RemoteStatus { project } => {
             rpc(&discovery, "remote.status", json!({"project_id": project})).await?
+        }
+        Command::Lsp { project } => {
+            rpc(&discovery, "lsp.status", json!({"project_id": project})).await?
         }
         Command::RemoteWorktrees { project } => {
             rpc(
@@ -5677,7 +5682,59 @@ fn context_checkpoint_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn lsp_status_lines(value: &Value) -> Option<Vec<String>> {
+    let languages = value.get("languages")?.as_array()?;
+    value.get("supported_languages")?;
+    let mut lines = vec![format!(
+        "code intelligence · {} · {} running · {} installed",
+        value["root"].as_str().unwrap_or("?"),
+        value["running"].as_u64().unwrap_or(0),
+        value["installed"].as_u64().unwrap_or(0)
+    )];
+    for language in languages {
+        let state = if language["running"].as_bool().unwrap_or(false) {
+            "running"
+        } else if language["installed"].as_bool().unwrap_or(false) {
+            "installed"
+        } else {
+            "missing"
+        };
+        let server = language["server"].as_str().unwrap_or("—");
+        let capabilities = language["capabilities"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "—".to_string());
+        lines.push(format!(
+            "  {:<12} {:<10} {:<20} {}",
+            language["display"].as_str().unwrap_or("?"),
+            state,
+            server,
+            capabilities
+        ));
+        if state == "missing"
+            && let Some(hint) = language["install_hint"].as_str()
+            && !hint.is_empty()
+        {
+            lines.push(format!("    {hint}"));
+        }
+    }
+    Some(lines)
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = lsp_status_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = context_checkpoint_lines(value) {
         for line in lines {
             println!("{line}");
@@ -8272,6 +8329,64 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn lsp_command_parses_project() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "lsp", "proj-1"]).unwrap();
+                match cli.command {
+                    Command::Lsp { project } => assert_eq!(project, "proj-1"),
+                    other => panic!("expected lsp command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn lsp_status_lines_label_running_installed_and_missing() {
+        let value = json!({
+            "root": "/tmp/project",
+            "running": 1,
+            "installed": 2,
+            "supported_languages": ["rust", "python"],
+            "languages": [
+                {
+                    "language": "rust",
+                    "display": "Rust",
+                    "server": "rust-analyzer",
+                    "installed": true,
+                    "running": true,
+                    "capabilities": ["workspace_symbols", "references"],
+                    "install_hint": "install rust-analyzer"
+                },
+                {
+                    "language": "python",
+                    "display": "Python",
+                    "server": "pyright-langserver",
+                    "installed": false,
+                    "running": false,
+                    "capabilities": [],
+                    "install_hint": "install pyright"
+                }
+            ]
+        });
+        let lines = lsp_status_lines(&value).unwrap();
+        assert_eq!(
+            lines[0],
+            "code intelligence · /tmp/project · 1 running · 2 installed"
+        );
+        assert!(lines[1].contains("Rust"));
+        assert!(lines[1].contains("running"));
+        assert!(lines[1].contains("workspace_symbols,references"));
+        assert!(lines[2].contains("Python"));
+        assert!(lines[2].contains("missing"));
+        assert_eq!(lines[3].trim(), "install pyright");
+        assert!(lsp_status_lines(&json!({"languages": []})).is_none());
     }
 
     #[test]

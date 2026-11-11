@@ -1,10 +1,11 @@
 //! Deterministic code intelligence for agent tools.
 //!
-//! The implementation is a bounded lexical index, not a full language server.
+//! The lexical implementation is a bounded index, not a full language server.
 //! It extracts symbols with per-language patterns and resolves imports where a
 //! project layout makes that unambiguous. Every result reports lexical
 //! confidence so the model does not confuse it with compiler-accurate
-//! navigation. LSP remains an optional future backend.
+//! navigation. An installed language server is the optional exact backend; the
+//! high-level tools label LSP, lexical, and build results separately (ADR-0171).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,13 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::tooling::code_intel::{
+    BUILD_CONFIDENCE, Backend, CodeDiagnostic, CodeLocation, CodeRange, CodeSymbol,
+    LEXICAL_CONFIDENCE_REFERENCE, LEXICAL_CONFIDENCE_SYMBOL, LSP_CONFIDENCE_SYMBOL, SourceChoice,
+    Status, backend_sentence, display_language, kind_group, prepare_diagnostics, prepare_locations,
+    prepare_symbols, render_diagnostics, render_locations, render_symbols, score_name_match,
+};
+use crate::tooling::lsp::{self, DeclarationPosition, LspAttemptError, MAX_DIAGNOSTIC_FILES};
 use crate::tooling::project::{
     AffectedTest, affected_tests, detect_profile, git_changed_paths, run_detected_task,
 };
@@ -736,7 +744,7 @@ impl AgentTool for RepoMap {
     }
 
     fn description(&self) -> &'static str {
-        "Return a compact map of repository languages, files, public symbols, tests, and config boundaries. Lexical confidence, not LSP."
+        "Return a compact map of repository languages, files, public symbols, tests, and config boundaries. Symbols are lexical by default; source=auto uses an already-running language server, source=lsp asks an installed one and labels exact results."
     }
 
     fn schema(&self) -> Value {
@@ -746,7 +754,8 @@ impl AgentTool for RepoMap {
                 "path": {"type": "string", "description": "Directory relative to the worktree root; default ."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "Default 2000"},
                 "max_symbols": {"type": "integer", "minimum": 1, "maximum": 800, "description": "Default 300"},
-                "include_tests": {"type": "boolean", "description": "Include test files and symbols; default false"}
+                "include_tests": {"type": "boolean", "description": "Include test files and symbols; default false"},
+                "source": {"type": "string", "enum": ["auto", "lsp", "lexical"], "description": "Default lexical; auto only uses an already-running server"}
             }
         })
     }
@@ -758,6 +767,16 @@ impl AgentTool for RepoMap {
             return Ok(ToolOutput::error_structured(
                 "repo_map path must be a directory",
                 json!({"code": "INVALID_ARGUMENT", "path": relative}),
+            ));
+        }
+        let source = match parse_source_choice(&input, SourceChoice::Lexical) {
+            Ok(source) => source,
+            Err(output) => return Ok(*output),
+        };
+        if source == SourceChoice::Build {
+            return Ok(ToolOutput::error_structured(
+                "repo_map does not have a build backend; use lexical or lsp",
+                json!({"code": "INVALID_ARGUMENT", "field": "source"}),
             ));
         }
         let max_files = input
@@ -790,20 +809,50 @@ impl AgentTool for RepoMap {
             .iter()
             .filter(|symbol| file_set.contains(symbol.path.as_str()))
             .filter(|symbol| include_tests || !is_test_path(&symbol.path))
+            .map(|symbol| lexical_code_symbol(&root, symbol, symbol.confidence))
             .collect::<Vec<_>>();
-        symbols.sort_by(|left, right| {
-            right
-                .visibility
-                .is_some()
-                .cmp(&left.visibility.is_some())
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.line.cmp(&right.line))
-        });
-        let symbols = symbols
-            .into_iter()
-            .take(max_symbols)
-            .cloned()
-            .collect::<Vec<_>>();
+        let lexical_symbol_count = symbols.len();
+        let mut backend = Backend::lexical(Status::Ok, LEXICAL_CONFIDENCE_SYMBOL);
+        let mut symbol_source = "lexical";
+        let mut lsp_attempt_list = Vec::new();
+        if source != SourceChoice::Lexical {
+            let lsp_files = files
+                .iter()
+                .map(|file| context.root.join(&file.path))
+                .collect::<Vec<_>>();
+            let allow_spawn = source == SourceChoice::Lsp;
+            match lsp::collect_file_symbols(context, &lsp_files, max_symbols, allow_spawn).await {
+                Ok(batch) => {
+                    let mut enriched = batch.symbols;
+                    if !include_tests {
+                        enriched.retain(|symbol| !is_test_path(&symbol.path));
+                    }
+                    let (enriched, _) = prepare_symbols(enriched, None, max_symbols);
+                    lsp_attempt_list = lsp_attempts(&batch.attempts);
+                    if !enriched.is_empty() {
+                        symbols = enriched;
+                        symbol_source = "lsp";
+                        backend = backend_for_lsp_batch(
+                            SourceChoice::Lsp,
+                            batch.status,
+                            LSP_CONFIDENCE_SYMBOL,
+                            &batch.attempts,
+                        );
+                    } else {
+                        backend = Backend::lexical(Status::Fallback, LEXICAL_CONFIDENCE_SYMBOL)
+                            .with_fallback("lsp_empty", None)
+                            .with_attempts(lsp_attempt_list.clone());
+                    }
+                }
+                Err(error) => {
+                    if source == SourceChoice::Lsp {
+                        return Ok(lsp_unavailable_output(&error, "repo_map"));
+                    }
+                    backend = lexical_fallback_backend(&error);
+                }
+            }
+        }
+        let (symbols, capped) = prepare_symbols(symbols, None, max_symbols);
         let tests = index
             .files
             .iter()
@@ -817,16 +866,7 @@ impl AgentTool for RepoMap {
             .filter(|file| file.is_config)
             .map(|file| file.path.clone())
             .collect::<Vec<_>>();
-        let rendered = symbols
-            .iter()
-            .map(|symbol| {
-                format!(
-                    "{}:{} · {} {}",
-                    symbol.path, symbol.line, symbol.kind, symbol.name
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let rendered = render_symbols(&symbols);
         let language_names = index
             .languages
             .iter()
@@ -835,7 +875,7 @@ impl AgentTool for RepoMap {
             .collect::<Vec<_>>()
             .join(", ");
         let summary = format!(
-            "{} files · {} languages{} · {} symbols · {} tests",
+            "{} files · {} languages{} · {} symbols · {} tests · {}",
             files.len(),
             index.languages.len(),
             if language_names.is_empty() {
@@ -844,9 +884,10 @@ impl AgentTool for RepoMap {
                 format!(" ({language_names})")
             },
             symbols.len(),
-            tests.len()
+            tests.len(),
+            backend_sentence(&backend)
         );
-        let structured = json!({
+        let mut structured = json!({
             "root": index.root,
             "files": files.iter().map(|file| json!({
                 "path": file.path,
@@ -860,10 +901,14 @@ impl AgentTool for RepoMap {
             "tests": tests,
             "configs": configs,
             "summary": summary,
-            "truncated": index.truncated || files.len() >= max_files,
-            "confidence": "lexical",
+            "truncated": index.truncated || files.len() >= max_files || capped,
+            "symbol_source": symbol_source,
+            "lsp_symbols": if symbol_source == "lsp" { symbols.len() } else { 0 },
+            "lexical_symbols": if symbol_source == "lsp" { 0 } else { lexical_symbol_count },
+            "lsp_attempts": lsp_attempt_list,
             "build_ms": index.build_ms,
         });
+        backend.apply(&mut structured);
         Ok(ToolOutput::ok_structured(
             truncate(format!("{summary}\n{rendered}")),
             structured,
@@ -878,7 +923,7 @@ impl AgentTool for FindSymbol {
     }
 
     fn description(&self) -> &'static str {
-        "Find a function, type, module, or other symbol by name. Returns path, line range, signature, and optional body."
+        "Find a function, type, module, or other symbol by name with path, range, signature, and optional body. Uses an installed language server when source=auto/lsp and labels every result source and confidence."
     }
 
     fn schema(&self) -> Value {
@@ -886,11 +931,12 @@ impl AgentTool for FindSymbol {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Symbol name or substring"},
-                "kind": {"type": "string", "description": "Optional kind filter such as function, type, module"},
+                "kind": {"type": "string", "description": "Optional kind or kind group filter such as function, type, module"},
                 "language": {"type": "string", "description": "Optional language filter"},
                 "path": {"type": "string", "description": "Optional directory filter"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Default 20"},
-                "include_body": {"type": "boolean", "description": "Include the symbol body; default false"}
+                "include_body": {"type": "boolean", "description": "Include the symbol body; default false"},
+                "source": {"type": "string", "enum": ["auto", "lsp", "lexical"], "description": "Default auto; falls back to lexical only when explicitly labeled"}
             },
             "required": ["query"]
         })
@@ -903,6 +949,16 @@ impl AgentTool for FindSymbol {
             .map(str::trim)
             .filter(|query| !query.is_empty())
             .ok_or_else(|| anyhow!("query is required"))?;
+        let source = match parse_source_choice(&input, SourceChoice::Auto) {
+            Ok(source) => source,
+            Err(output) => return Ok(*output),
+        };
+        if source == SourceChoice::Build {
+            return Ok(ToolOutput::error_structured(
+                "find_symbol does not have a build backend; use auto, lsp, or lexical",
+                json!({"code": "INVALID_ARGUMENT", "field": "source"}),
+            ));
+        }
         let index = cached_index(&context.root);
         let kind = input.get("kind").and_then(Value::as_str);
         let language = input.get("language").and_then(Value::as_str);
@@ -916,106 +972,461 @@ impl AgentTool for FindSymbol {
             .get("include_body")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let query_lower = query.to_ascii_lowercase();
-        let mut matches = index
-            .symbols
-            .iter()
-            .filter(|symbol| kind.is_none_or(|kind| symbol.kind == kind))
-            .filter(|symbol| {
-                language.is_none_or(|language| symbol.language.eq_ignore_ascii_case(language))
-            })
-            .filter(|symbol| path_filter.is_none_or(|path| symbol.path.starts_with(path)))
-            .filter_map(|symbol| {
-                let name = symbol.name.to_ascii_lowercase();
-                let score = if symbol.name == query {
-                    1.0
-                } else if name == query_lower {
-                    0.95
-                } else if name.starts_with(&query_lower) {
-                    0.9
-                } else if name.contains(&query_lower) {
-                    0.75
-                } else if query
-                    .split(|ch: char| !ch.is_alphanumeric())
-                    .filter(|token| !token.is_empty())
-                    .all(|token| name.contains(&token.to_ascii_lowercase()))
-                {
-                    0.65
-                } else {
-                    return None;
-                };
-                Some((score, symbol))
-            })
-            .collect::<Vec<_>>();
-        matches.sort_by(|left, right| {
-            right
-                .0
-                .partial_cmp(&left.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    right
-                        .1
-                        .visibility
-                        .is_some()
-                        .cmp(&left.1.visibility.is_some())
+        if source != SourceChoice::Lexical {
+            let scope_files = index
+                .files
+                .iter()
+                .filter(|file| path_filter.is_none_or(|path| file.path.starts_with(path)))
+                .filter(|file| {
+                    language.is_none_or(|language| {
+                        file.language.eq_ignore_ascii_case(language)
+                            || lsp::language_for_path(Path::new(&file.path)).is_some_and(|server| {
+                                server.id.eq_ignore_ascii_case(language)
+                                    || server.display.eq_ignore_ascii_case(language)
+                            })
+                    })
                 })
-                .then_with(|| left.1.path.cmp(&right.1.path))
-                .then_with(|| left.1.line.cmp(&right.1.line))
-        });
-        matches.truncate(limit);
-        let mut results = Vec::new();
-        for (score, symbol) in matches {
-            let mut value = serde_json::to_value(symbol).unwrap_or_else(|_| json!({}));
-            value["score"] = json!(score);
-            if include_body {
-                let body = read_body(&context.root, symbol).unwrap_or_default();
-                value["body"] = json!(body);
-            }
-            results.push(value);
-        }
-        let rendered = results
-            .iter()
-            .map(|value| {
-                let mut line = format!(
-                    "{}:{} · {} {} · {}",
-                    value["path"].as_str().unwrap_or("?"),
-                    value["line"].as_u64().unwrap_or(0),
-                    value["kind"].as_str().unwrap_or("symbol"),
-                    value["name"].as_str().unwrap_or("?"),
-                    value["signature"].as_str().unwrap_or("")
-                );
-                if let Some(body) = value["body"].as_str() {
-                    line.push('\n');
-                    line.push_str(body);
+                .map(|file| context.root.join(&file.path))
+                .collect::<Vec<_>>();
+            let languages = lsp::languages_for_files(&scope_files, 3);
+            if !languages.is_empty() {
+                match lsp::search_symbols(context, &languages, query, &scope_files, limit, true)
+                    .await
+                {
+                    Ok(batch) => {
+                        let symbols = batch
+                            .symbols
+                            .into_iter()
+                            .filter(|symbol| symbol_filter(symbol, kind, language, path_filter))
+                            .collect::<Vec<_>>();
+                        let (symbols, capped) = prepare_symbols(symbols, Some(query), limit);
+                        let backend = backend_for_lsp_batch(
+                            SourceChoice::Lsp,
+                            batch.status,
+                            LSP_CONFIDENCE_SYMBOL,
+                            &batch.attempts,
+                        );
+                        let values = symbol_values(&context.root, &symbols, include_body);
+                        let rendered =
+                            render_symbols_with_body(&context.root, &symbols, include_body);
+                        let heading = symbol_heading(&backend, query, symbols.len());
+                        let text = if rendered.is_empty() {
+                            format!("{heading}\nno symbols matched {query}")
+                        } else {
+                            format!("{heading}\n{rendered}")
+                        };
+                        let mut structured = json!({
+                            "query": query,
+                            "symbols": values,
+                            "count": symbols.len(),
+                            "truncated": batch.truncated || capped,
+                        });
+                        backend.apply(&mut structured);
+                        return Ok(ToolOutput::ok_structured(truncate(text), structured));
+                    }
+                    Err(error) => {
+                        if source == SourceChoice::Lsp {
+                            return Ok(lsp_unavailable_output(&error, "find_symbol"));
+                        }
+                        let backend = lexical_fallback_backend(&error);
+                        return Ok(lexical_find_symbol_output(
+                            context,
+                            &index,
+                            query,
+                            kind,
+                            language,
+                            path_filter,
+                            limit,
+                            include_body,
+                            backend,
+                        ));
+                    }
                 }
-                line
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        Ok(ToolOutput::ok_structured(
-            truncate(if rendered.is_empty() {
-                format!("no symbols matched {query}")
+            } else if source == SourceChoice::Lsp {
+                let error = LspAttemptError::NoLanguage {
+                    supported: lsp::all_languages()
+                        .iter()
+                        .map(|language| language.id.to_string())
+                        .collect(),
+                };
+                return Ok(lsp_unavailable_output(&error, "find_symbol"));
             } else {
-                rendered
-            }),
-            json!({
-                "query": query,
-                "symbols": results,
-                "count": results.len(),
-                "confidence": "lexical",
-            }),
+                let error = LspAttemptError::NoLanguage {
+                    supported: lsp::all_languages()
+                        .iter()
+                        .map(|language| language.id.to_string())
+                        .collect(),
+                };
+                let backend = lexical_fallback_backend(&error);
+                return Ok(lexical_find_symbol_output(
+                    context,
+                    &index,
+                    query,
+                    kind,
+                    language,
+                    path_filter,
+                    limit,
+                    include_body,
+                    backend,
+                ));
+            }
+        }
+        let backend = Backend::lexical(Status::Ok, LEXICAL_CONFIDENCE_SYMBOL);
+        Ok(lexical_find_symbol_output(
+            context,
+            &index,
+            query,
+            kind,
+            language,
+            path_filter,
+            limit,
+            include_body,
+            backend,
         ))
     }
 }
 
-fn read_body(root: &Path, symbol: &Symbol) -> Result<String> {
-    let path = root.join(&symbol.path);
-    let content = std::fs::read_to_string(&path)?;
+#[allow(clippy::too_many_arguments)]
+fn lexical_find_symbol_output(
+    context: &ToolContext,
+    index: &CodeIndex,
+    query: &str,
+    kind: Option<&str>,
+    language: Option<&str>,
+    path_filter: Option<&str>,
+    limit: usize,
+    include_body: bool,
+    backend: Backend,
+) -> ToolOutput {
+    let symbols = index
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            kind.is_none_or(|kind| symbol.kind == kind || kind_group(&symbol.kind) == kind)
+        })
+        .filter(|symbol| {
+            language.is_none_or(|language| symbol.language.eq_ignore_ascii_case(language))
+        })
+        .filter(|symbol| path_filter.is_none_or(|path| symbol.path.starts_with(path)))
+        .filter_map(|symbol| {
+            let score = score_name_match(&symbol.name, query);
+            (score > 0.0).then(|| lexical_code_symbol(&context.root, symbol, score))
+        })
+        .collect::<Vec<_>>();
+    let (mut symbols, capped) = prepare_symbols(symbols, Some(query), limit);
+    symbols.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.line.cmp(&right.line))
+    });
+    let values = symbol_values(&context.root, &symbols, include_body);
+    let rendered = render_symbols_with_body(&context.root, &symbols, include_body);
+    let heading = symbol_heading(&backend, query, symbols.len());
+    let text = if rendered.is_empty() {
+        format!("{heading}\nno symbols matched {query}")
+    } else {
+        format!("{heading}\n{rendered}")
+    };
+    let mut structured = json!({
+        "query": query,
+        "symbols": values,
+        "count": symbols.len(),
+        "truncated": capped,
+    });
+    backend.apply(&mut structured);
+    ToolOutput::ok_structured(truncate(text), structured)
+}
+
+fn read_code_body(root: &Path, path: &str, line: u64, end_line: u64) -> Option<String> {
+    let content = std::fs::read_to_string(root.join(path)).ok()?;
     let lines = content.lines().collect::<Vec<_>>();
-    let start = symbol.line.saturating_sub(1).min(lines.len());
-    let end = symbol.end_line.min(lines.len());
-    let body = lines[start..end].join("\n");
-    Ok(body.chars().take(8_000).collect())
+    let start = usize::try_from(line.saturating_sub(1))
+        .ok()?
+        .min(lines.len());
+    let end = usize::try_from(end_line).ok()?.min(lines.len());
+    if start >= end {
+        return Some(String::new());
+    }
+    Some(lines[start..end].join("\n").chars().take(8_000).collect())
+}
+
+fn line_column(root: &Path, path: &str, line: usize, needle: &str) -> Option<u64> {
+    let content = std::fs::read_to_string(root.join(path)).ok()?;
+    let text = content.lines().nth(line.saturating_sub(1))?;
+    let byte = text.find(needle)?;
+    Some((text[..byte].chars().count() as u64).saturating_add(1))
+}
+
+fn lexical_code_symbol(root: &Path, symbol: &Symbol, score: f64) -> CodeSymbol {
+    let column = line_column(root, &symbol.path, symbol.line, &symbol.name).unwrap_or(1);
+    let end_column = column.saturating_add(symbol.name.chars().count() as u64);
+    let line = symbol.line as u64;
+    let end_line = (symbol.end_line as u64).max(line);
+    CodeSymbol {
+        id: symbol.id.clone(),
+        name: symbol.name.clone(),
+        kind: symbol.kind.clone(),
+        kind_group: kind_group(&symbol.kind).to_string(),
+        language: symbol.language.clone(),
+        path: symbol.path.clone(),
+        line,
+        column,
+        end_line,
+        end_column,
+        range: CodeRange {
+            line,
+            column,
+            end_line,
+            end_column,
+        },
+        container: symbol.container.clone(),
+        visibility: symbol.visibility.clone(),
+        signature: symbol.signature.clone(),
+        score,
+        source: "lexical".to_string(),
+        confidence: "lexical".to_string(),
+        confidence_score: LEXICAL_CONFIDENCE_SYMBOL,
+    }
+}
+
+fn parse_source_choice(
+    input: &Value,
+    default: SourceChoice,
+) -> std::result::Result<SourceChoice, Box<ToolOutput>> {
+    match input.get("source").and_then(Value::as_str) {
+        Some(value) => SourceChoice::parse(value).ok_or_else(|| {
+            Box::new(ToolOutput::error_structured(
+                format!("invalid source: {value}"),
+                json!({
+                    "code": "INVALID_ARGUMENT",
+                    "field": "source",
+                    "allowed": ["auto", "lsp", "lexical", "build"],
+                }),
+            ))
+        }),
+        None => Ok(default),
+    }
+}
+
+fn lsp_unavailable_output(error: &LspAttemptError, action: &str) -> ToolOutput {
+    let mut structured = json!({
+        "action": action,
+        "code": error.code(),
+        "status": error.status().as_str(),
+        "source": "lsp",
+        "confidence": "lsp",
+        "confidence_score": 0.0,
+        "message": error.to_string(),
+        "fallback_reason": error.reason(),
+        "searched": error.searched(),
+        "supported_languages": lsp::all_languages().iter().map(|language| language.id).collect::<Vec<_>>(),
+    });
+    if let Some(language) = error.language() {
+        structured["language"] = json!(language);
+    }
+    if let Some(server) = error.server() {
+        structured["language_server"] = json!(server);
+    }
+    if let Some(hint) = error.install_hint() {
+        structured["install_hint"] = json!(hint);
+    }
+    if let Some(capabilities) = error.capabilities() {
+        structured["capabilities"] = capabilities.summary();
+    }
+    ToolOutput::error_structured(error.to_string(), structured)
+}
+
+fn backend_attempts(error: &LspAttemptError) -> Vec<crate::tooling::code_intel::BackendAttempt> {
+    vec![error.attempt()]
+}
+
+fn lexical_fallback_backend(error: &LspAttemptError) -> Backend {
+    Backend::lexical(Status::Fallback, LEXICAL_CONFIDENCE_SYMBOL)
+        .with_fallback(error.reason(), error.install_hint())
+        .with_attempts(backend_attempts(error))
+}
+
+fn lsp_attempts(items: &[lsp::LspAttempt]) -> Vec<crate::tooling::code_intel::BackendAttempt> {
+    items
+        .iter()
+        .map(lsp::LspAttempt::to_backend_attempt)
+        .collect()
+}
+
+fn backend_for_lsp_batch(
+    source: SourceChoice,
+    status: Status,
+    score: f64,
+    attempts: &[lsp::LspAttempt],
+) -> Backend {
+    let primary = attempts
+        .iter()
+        .find(|attempt| attempt.status.is_success())
+        .or_else(|| attempts.first());
+    let mut backend = Backend::lsp(
+        primary
+            .map(|attempt| attempt.language.as_str())
+            .unwrap_or("unknown"),
+        primary.and_then(|attempt| attempt.server.as_deref()),
+        primary
+            .and_then(|attempt| attempt.method.as_deref())
+            .unwrap_or("lsp"),
+        status,
+    )
+    .with_score(score)
+    .with_attempts(lsp_attempts(attempts));
+    if let Some(version) = primary.and_then(|attempt| attempt.server_version.as_deref()) {
+        backend = backend.with_server_version(version);
+    }
+    if source != SourceChoice::Lsp
+        && let Some(attempt) = primary
+    {
+        backend = backend.with_language(display_language(&attempt.language));
+    }
+    backend
+}
+
+fn symbol_filter(
+    symbol: &CodeSymbol,
+    kind: Option<&str>,
+    language: Option<&str>,
+    path: Option<&str>,
+) -> bool {
+    if let Some(kind) = kind
+        && symbol.kind != kind
+        && symbol.kind_group != kind
+    {
+        return false;
+    }
+    if let Some(language) = language
+        && !symbol.language.eq_ignore_ascii_case(language)
+    {
+        return false;
+    }
+    if let Some(path) = path
+        && !symbol.path.starts_with(path)
+    {
+        return false;
+    }
+    true
+}
+
+fn symbol_values(root: &Path, symbols: &[CodeSymbol], include_body: bool) -> Vec<Value> {
+    symbols
+        .iter()
+        .map(|symbol| {
+            let mut value = serde_json::to_value(symbol).unwrap_or_else(|_| json!({}));
+            if include_body
+                && let Some(body) = read_code_body(root, &symbol.path, symbol.line, symbol.end_line)
+            {
+                value["body"] = json!(body);
+            }
+            value
+        })
+        .collect()
+}
+
+fn render_symbols_with_body(root: &Path, symbols: &[CodeSymbol], include_body: bool) -> String {
+    if !include_body {
+        return render_symbols(symbols);
+    }
+    symbols
+        .iter()
+        .map(|symbol| {
+            let mut rendered = render_symbols(std::slice::from_ref(symbol));
+            if let Some(body) = read_code_body(root, &symbol.path, symbol.line, symbol.end_line) {
+                rendered.push('\n');
+                rendered.push_str(&body);
+            }
+            rendered
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn symbol_heading(backend: &Backend, query: &str, count: usize) -> String {
+    format!(
+        "{} · {count} match{} for {query}",
+        backend_sentence(backend),
+        if count == 1 { "" } else { "es" }
+    )
+}
+
+fn reference_values(locations: &[CodeLocation]) -> Vec<Value> {
+    locations
+        .iter()
+        .map(|location| serde_json::to_value(location).unwrap_or_else(|_| json!({})))
+        .collect()
+}
+
+fn lexical_reference_locations(
+    root: &Path,
+    index: &CodeIndex,
+    symbol: &Symbol,
+    limit: usize,
+) -> (Vec<CodeLocation>, bool, usize) {
+    let regex = match Regex::new(&format!(r"\b{}\b", regex::escape(&symbol.name))) {
+        Ok(regex) => regex,
+        Err(_) => return (Vec::new(), false, 0),
+    };
+    let mut references = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut scanned_bytes = 0u64;
+    let mut scan_truncated = false;
+    for file in &index.files {
+        if file.bytes > MAX_INDEX_FILE_BYTES {
+            continue;
+        }
+        if scanned_files >= MAX_SCAN_FILES || scanned_bytes >= MAX_SCAN_BYTES {
+            scan_truncated = true;
+            break;
+        }
+        scanned_files += 1;
+        scanned_bytes = scanned_bytes.saturating_add(file.bytes);
+        let Ok(content) = std::fs::read_to_string(root.join(&file.path)) else {
+            continue;
+        };
+        for (line_index, text) in content.lines().enumerate() {
+            for found in regex.find_iter(text) {
+                let column = (text[..found.start()].chars().count() as u64).saturating_add(1);
+                let end_column = (text[..found.end()].chars().count() as u64).saturating_add(1);
+                let line = (line_index as u64).saturating_add(1);
+                references.push(CodeLocation {
+                    path: file.path.clone(),
+                    line,
+                    column,
+                    end_line: line,
+                    end_column,
+                    range: CodeRange {
+                        line,
+                        column,
+                        end_line: line,
+                        end_column,
+                    },
+                    context: Some(text.trim().chars().take(240).collect()),
+                    is_definition: file.path == symbol.path && line == symbol.line as u64,
+                    kind: Some(symbol.kind.clone()),
+                    source: "lexical".to_string(),
+                    confidence: "lexical".to_string(),
+                    confidence_score: LEXICAL_CONFIDENCE_REFERENCE,
+                });
+                if references.len() >= limit {
+                    break;
+                }
+            }
+            if references.len() >= limit {
+                break;
+            }
+        }
+        if references.len() >= limit {
+            break;
+        }
+    }
+    let (locations, capped) = prepare_locations(references, limit);
+    (locations, scan_truncated || capped, scanned_files)
 }
 
 #[async_trait]
@@ -1025,7 +1436,7 @@ impl AgentTool for FindReferences {
     }
 
     fn description(&self) -> &'static str {
-        "Find textual references to a symbol. Results are lexical, not LSP-accurate; use file/line to disambiguate."
+        "Find exact language-server references when available, with a clearly labeled lexical fallback. Results include file, range, definition marker, symbol kind, source, and confidence."
     }
 
     fn schema(&self) -> Value {
@@ -1036,108 +1447,286 @@ impl AgentTool for FindReferences {
                 "name": {"type": "string", "description": "Symbol name; required when symbol_id is absent"},
                 "path": {"type": "string", "description": "Optional declaration path for disambiguation"},
                 "line": {"type": "integer", "minimum": 1, "description": "Optional declaration line"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Default 100"}
+                "column": {"type": "integer", "minimum": 1, "description": "Optional declaration character column"},
+                "include_declaration": {"type": "boolean", "description": "Include the declaration; default true"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Default 100"},
+                "source": {"type": "string", "enum": ["auto", "lsp", "lexical"], "description": "Default auto; lexical fallback is explicit"}
             }
         })
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let index = cached_index(&context.root);
+        let source = match parse_source_choice(&input, SourceChoice::Auto) {
+            Ok(source) => source,
+            Err(output) => return Ok(*output),
+        };
+        if source == SourceChoice::Build {
+            return Ok(ToolOutput::error_structured(
+                "find_references does not have a build backend; use auto, lsp, or lexical",
+                json!({"code": "INVALID_ARGUMENT", "field": "source"}),
+            ));
+        }
         let symbol_id = input.get("symbol_id").and_then(Value::as_str);
         let name = input.get("name").and_then(Value::as_str);
         let path = input.get("path").and_then(Value::as_str);
         let line = input.get("line").and_then(Value::as_u64);
-        let symbol = if let Some(symbol_id) = symbol_id {
-            index.symbols.iter().find(|symbol| symbol.id == symbol_id)
-        } else {
-            let name = name
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| anyhow!("symbol_id or name is required"))?;
-            index
-                .symbols
-                .iter()
-                .filter(|symbol| symbol.name == name)
-                .min_by_key(|symbol| {
-                    let path_penalty = path.is_some_and(|path| symbol.path != path);
-                    let line_penalty = line.is_some_and(|line| symbol.line != line as usize);
-                    (path_penalty, line_penalty, symbol.line)
-                })
-        };
-        let Some(symbol) = symbol else {
-            return Ok(ToolOutput::error_structured(
-                "symbol was not found in the lexical index",
-                json!({"code": "SYMBOL_NOT_FOUND", "name": name, "symbol_id": symbol_id}),
-            ));
-        };
+        let column_input = input.get("column").and_then(Value::as_u64);
+        let include_declaration = input
+            .get("include_declaration")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
             .unwrap_or(100)
             .clamp(1, MAX_REFERENCES as u64) as usize;
-        let regex = Regex::new(&format!(r"\b{}\b", regex::escape(&symbol.name)))
-            .map_err(|error| anyhow!("building reference regex: {error}"))?;
-        let mut references = Vec::new();
-        let mut scanned_files = 0usize;
-        let mut scanned_bytes = 0u64;
-        let mut scan_truncated = false;
-        for file in &index.files {
-            if file.bytes > MAX_INDEX_FILE_BYTES {
-                continue;
-            }
-            if scanned_files >= MAX_SCAN_FILES || scanned_bytes >= MAX_SCAN_BYTES {
-                scan_truncated = true;
-                break;
-            }
-            scanned_files += 1;
-            scanned_bytes = scanned_bytes.saturating_add(file.bytes);
-            let Ok(content) = std::fs::read_to_string(context.root.join(&file.path)) else {
-                continue;
+        let symbol = resolve_reference_symbol(&index, symbol_id, name, path, line);
+        let target = if let Some(symbol) = &symbol {
+            let column = column_input
+                .or_else(|| line_column(&context.root, &symbol.path, symbol.line, &symbol.name))
+                .unwrap_or(1);
+            Some((
+                symbol.path.clone(),
+                symbol.line as u64,
+                column,
+                symbol.name.clone(),
+                Some(symbol.kind.clone()),
+            ))
+        } else if let Some(parsed) = symbol_id.and_then(parse_symbol_id) {
+            let column = column_input
+                .or_else(|| {
+                    line_column(
+                        &context.root,
+                        &parsed.0,
+                        usize::try_from(parsed.1).unwrap_or(usize::MAX),
+                        &parsed.2,
+                    )
+                })
+                .unwrap_or(1);
+            Some((parsed.0, parsed.1, column, parsed.2, None))
+        } else {
+            None
+        };
+        let Some((
+            declaration_path,
+            declaration_line,
+            declaration_column,
+            symbol_name,
+            symbol_kind,
+        )) = target
+        else {
+            return Ok(ToolOutput::error_structured(
+                "symbol_id or name is required and the declaration must be resolvable",
+                json!({"code": "SYMBOL_NOT_FOUND", "name": name, "symbol_id": symbol_id}),
+            ));
+        };
+        if source != SourceChoice::Lexical {
+            let declaration = DeclarationPosition {
+                path: context.root.join(&declaration_path),
+                line: declaration_line,
+                column: declaration_column,
+                kind: symbol_kind.clone(),
             };
-            for (index, text) in content.lines().enumerate() {
-                if !regex.is_match(text) {
-                    continue;
+            match lsp::find_references(context, &declaration, include_declaration, limit).await {
+                Ok(batch) => {
+                    let locations = if include_declaration {
+                        batch.locations
+                    } else {
+                        batch
+                            .locations
+                            .into_iter()
+                            .filter(|location| !location.is_definition)
+                            .collect()
+                    };
+                    let backend = backend_for_lsp_batch(
+                        SourceChoice::Lsp,
+                        batch.status,
+                        LEXICAL_CONFIDENCE_REFERENCE,
+                        &batch.attempts,
+                    );
+                    let values = reference_values(&locations);
+                    let rendered = render_locations(&locations);
+                    let heading = format!(
+                        "{} · {} reference{} for {}",
+                        backend_sentence(&backend),
+                        locations.len(),
+                        if locations.len() == 1 { "" } else { "s" },
+                        symbol_name
+                    );
+                    let text = if rendered.is_empty() {
+                        format!("{heading}\nno references")
+                    } else {
+                        format!("{heading}\n{rendered}")
+                    };
+                    let mut structured = json!({
+                        "symbol": {
+                            "name": symbol_name,
+                            "path": declaration_path,
+                            "line": declaration_line,
+                            "column": declaration_column,
+                            "kind": symbol_kind,
+                        },
+                        "declaration": batch.declaration,
+                        "references": values,
+                        "count": locations.len(),
+                        "truncated": batch.truncated,
+                    });
+                    backend.apply(&mut structured);
+                    return Ok(ToolOutput::ok_structured(truncate(text), structured));
                 }
-                let is_definition = file.path == symbol.path && index + 1 == symbol.line;
-                references.push(json!({
-                    "path": file.path,
-                    "line": index + 1,
-                    "text": text.trim().chars().take(240).collect::<String>(),
-                    "is_definition": is_definition,
-                    "confidence": "lexical",
-                }));
-                if references.len() >= limit {
-                    break;
+                Err(error) => {
+                    if source == SourceChoice::Lsp {
+                        return Ok(lsp_unavailable_output(&error, "find_references"));
+                    }
+                    let backend = lexical_fallback_backend(&error);
+                    return Ok(lexical_references_output(
+                        context,
+                        &index,
+                        symbol,
+                        symbol_id,
+                        name,
+                        declaration_path,
+                        declaration_line,
+                        declaration_column,
+                        symbol_name,
+                        symbol_kind,
+                        include_declaration,
+                        limit,
+                        backend,
+                    ));
                 }
-            }
-            if references.len() >= limit {
-                break;
             }
         }
-        let rendered = references
-            .iter()
-            .map(|reference| {
-                format!(
-                    "{}:{}: {}",
-                    reference["path"].as_str().unwrap_or("?"),
-                    reference["line"].as_u64().unwrap_or(0),
-                    reference["text"].as_str().unwrap_or("")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(ToolOutput::ok_structured(
-            truncate(rendered),
-            json!({
-                "symbol": symbol,
-                "references": references,
-                "count": references.len(),
-                "confidence": "lexical",
-                "truncated": references.len() >= limit || scan_truncated,
-                "scanned_files": scanned_files,
-            }),
+        let backend = Backend::lexical(Status::Ok, LEXICAL_CONFIDENCE_REFERENCE);
+        Ok(lexical_references_output(
+            context,
+            &index,
+            symbol,
+            symbol_id,
+            name,
+            declaration_path,
+            declaration_line,
+            declaration_column,
+            symbol_name,
+            symbol_kind,
+            include_declaration,
+            limit,
+            backend,
         ))
     }
+}
+
+fn parse_symbol_id(symbol_id: &str) -> Option<(String, u64, String)> {
+    let mut parts = symbol_id.rsplitn(3, ':');
+    let name = parts.next()?.to_string();
+    let line = parts.next()?.parse::<u64>().ok()?;
+    let path = parts.next()?.to_string();
+    if path.is_empty() || name.is_empty() || line == 0 {
+        return None;
+    }
+    Some((path, line, name))
+}
+
+fn resolve_reference_symbol<'a>(
+    index: &'a CodeIndex,
+    symbol_id: Option<&str>,
+    name: Option<&str>,
+    path: Option<&str>,
+    line: Option<u64>,
+) -> Option<&'a Symbol> {
+    if let Some(symbol_id) = symbol_id
+        && let Some(symbol) = index.symbols.iter().find(|symbol| symbol.id == symbol_id)
+    {
+        return Some(symbol);
+    }
+    if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+        return index
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == name)
+            .min_by_key(|symbol| {
+                let path_penalty = path.is_some_and(|path| symbol.path != path);
+                let line_penalty = line.is_some_and(|line| symbol.line != line as usize);
+                (path_penalty, line_penalty, symbol.line)
+            });
+    }
+    let (path, line, name) = symbol_id.and_then(parse_symbol_id)?;
+    index
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.name == name)
+        .min_by_key(|symbol| {
+            let path_penalty = symbol.path != path;
+            let line_penalty = symbol.line != line as usize;
+            (path_penalty, line_penalty, symbol.line)
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lexical_references_output(
+    context: &ToolContext,
+    index: &CodeIndex,
+    symbol: Option<&Symbol>,
+    symbol_id: Option<&str>,
+    _name: Option<&str>,
+    declaration_path: String,
+    declaration_line: u64,
+    declaration_column: u64,
+    symbol_name: String,
+    symbol_kind: Option<String>,
+    include_declaration: bool,
+    limit: usize,
+    backend: Backend,
+) -> ToolOutput {
+    let Some(symbol) = symbol else {
+        return ToolOutput::error_structured(
+            "symbol was not found in the lexical index; use source=lsp with an exact symbol_id or name/path/line",
+            json!({
+                "code": "SYMBOL_NOT_FOUND",
+                "symbol_id": symbol_id,
+                "path": declaration_path,
+                "line": declaration_line,
+            }),
+        );
+    };
+    let (mut locations, scan_truncated, scanned_files) =
+        lexical_reference_locations(&context.root, index, symbol, limit);
+    if !include_declaration {
+        locations.retain(|location| !location.is_definition);
+    }
+    for location in &mut locations {
+        location.kind = symbol_kind.clone();
+    }
+    let values = reference_values(&locations);
+    let rendered = render_locations(&locations);
+    let heading = format!(
+        "{} · {} reference{} for {}",
+        backend_sentence(&backend),
+        locations.len(),
+        if locations.len() == 1 { "" } else { "s" },
+        symbol_name
+    );
+    let text = if rendered.is_empty() {
+        format!("{heading}\nno references")
+    } else {
+        format!("{heading}\n{rendered}")
+    };
+    let mut structured = json!({
+        "symbol": {
+            "name": symbol_name,
+            "path": symbol.path,
+            "line": declaration_line,
+            "column": declaration_column,
+            "kind": symbol_kind,
+        },
+        "references": values,
+        "count": locations.len(),
+        "truncated": scan_truncated || locations.len() >= limit,
+        "scanned_files": scanned_files,
+    });
+    backend.apply(&mut structured);
+    ToolOutput::ok_structured(truncate(text), structured)
 }
 
 #[async_trait]
@@ -1147,149 +1736,350 @@ impl AgentTool for CodeDiagnostics {
     }
 
     fn description(&self) -> &'static str {
-        "Run the project's check or lint task and return structured diagnostics grouped by file. No LSP server is required."
+        "Return diagnostics grouped by file and severity. source=auto asks an installed language server first and falls back to the detected check/lint command with an explicit label; source=lsp never silently falls back."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional path filters"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional file or directory filters"},
                 "severity": {"type": "string", "enum": ["error", "warning", "all"], "description": "Default error"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Default 100"},
-                "source": {"type": "string", "enum": ["auto", "build", "lsp"], "description": "Default auto; lsp is unavailable"}
+                "source": {"type": "string", "enum": ["auto", "build", "lsp"], "description": "Default auto; lsp is exact-or-error"}
             }
         })
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
-        let source = input
-            .get("source")
-            .and_then(Value::as_str)
-            .unwrap_or("auto");
-        if source == "lsp" {
-            return Ok(ToolOutput::error_structured(
-                "no LSP backend is configured; use source=build or auto",
-                json!({"code": "LSP_UNAVAILABLE"}),
-            ));
-        }
+        let source = match parse_source_choice(&input, SourceChoice::Auto) {
+            Ok(source) => source,
+            Err(output) => return Ok(*output),
+        };
         let severity = input
             .get("severity")
             .and_then(Value::as_str)
             .unwrap_or("error");
+        if !matches!(severity, "error" | "warning" | "all") {
+            return Ok(ToolOutput::error_structured(
+                format!("invalid severity: {severity}"),
+                json!({"code": "INVALID_ARGUMENT", "field": "severity"}),
+            ));
+        }
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
             .unwrap_or(100)
             .clamp(1, 200) as usize;
         let paths = input.get("paths").and_then(Value::as_array);
-        let mut run = run_detected_task(context, "check", 300).await?;
-        if run.is_none() {
-            run = run_detected_task(context, "lint", 300).await?;
+        if source == SourceChoice::Build {
+            return build_diagnostics_output(context, severity, limit, paths, None).await;
         }
-        let Some(run) = run else {
-            let profile = detect_profile(&context.root);
-            return Ok(ToolOutput::error_structured(
-                "no check or lint command was detected",
-                json!({
-                    "code": "DIAGNOSTICS_UNAVAILABLE",
-                    "detected_commands": profile.commands.keys().collect::<Vec<_>>(),
-                }),
-            ));
+        let index = cached_index(&context.root);
+        let files = match diagnostic_files(context, &index, paths) {
+            Ok(files) => files,
+            Err(output) => return Ok(*output),
         };
-        let mut diagnostics = run
-            .failures
-            .iter()
-            .filter(|failure| {
-                severity == "all"
-                    || (severity == "warning" && failure.severity == "warning")
-                    || (severity == "error" && failure.severity != "warning")
-            })
-            .filter(|failure| {
-                paths.is_none_or(|paths| {
-                    failure.path.as_deref().is_some_and(|path| {
-                        paths
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .any(|filter| path.starts_with(filter))
-                    })
+        if files.is_empty() {
+            let error = LspAttemptError::NoLanguage {
+                supported: lsp::all_languages()
+                    .iter()
+                    .map(|language| language.id.to_string())
+                    .collect(),
+            };
+            if source == SourceChoice::Lsp {
+                return Ok(lsp_unavailable_output(&error, "code_diagnostics"));
+            }
+            return build_diagnostics_output(context, severity, limit, paths, Some(&error)).await;
+        }
+        match lsp::collect_diagnostics(context, &files, limit).await {
+            Ok(batch) => {
+                let diagnostics = filter_diagnostic_severity(batch.diagnostics, severity);
+                let summary = prepare_diagnostics(diagnostics, limit);
+                let backend = backend_for_lsp_batch(
+                    SourceChoice::Lsp,
+                    batch.status,
+                    BUILD_CONFIDENCE,
+                    &batch.attempts,
+                );
+                let rendered = render_diagnostics(&summary);
+                let heading = format!(
+                    "{} · {} error{} · {} warning{}",
+                    backend_sentence(&backend),
+                    summary.errors,
+                    if summary.errors == 1 { "" } else { "s" },
+                    summary.warnings,
+                    if summary.warnings == 1 { "" } else { "s" }
+                );
+                let text = if summary.total == 0 {
+                    format!("{heading}\nno diagnostics")
+                } else {
+                    format!("{heading}\n{rendered}")
+                };
+                let group_values = serde_json::to_value(&summary.groups).unwrap_or(json!([]));
+                let values = serde_json::to_value(
+                    summary
+                        .groups
+                        .iter()
+                        .flat_map(|group| group.diagnostics.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or(json!([]));
+                let primary = batch
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.status.is_success())
+                    .or_else(|| batch.attempts.first());
+                let language = primary.map(|attempt| attempt.language.clone());
+                let server = primary.and_then(|attempt| attempt.server.clone());
+                let mut structured = json!({
+                    "ok": summary.ok(),
+                    "diagnostics": values,
+                    "groups": group_values,
+                    "group_count": summary.groups.len(),
+                    "error_count": summary.errors,
+                    "warning_count": summary.warnings,
+                    "information_count": summary.information,
+                    "hint_count": summary.hints,
+                    "truncated": batch.truncated || summary.truncated,
+                    "language": language,
+                    "language_server": server,
+                    "lsp_attempts": lsp_attempts(&batch.attempts),
+                    "paths": paths.cloned().unwrap_or_default(),
+                });
+                backend.apply(&mut structured);
+                Ok(ToolOutput::ok_structured(truncate(text), structured))
+            }
+            Err(error) => {
+                if source == SourceChoice::Lsp {
+                    return Ok(lsp_unavailable_output(&error, "code_diagnostics"));
+                }
+                build_diagnostics_output(context, severity, limit, paths, Some(&error)).await
+            }
+        }
+    }
+}
+
+fn diagnostic_files(
+    context: &ToolContext,
+    index: &CodeIndex,
+    paths: Option<&Vec<Value>>,
+) -> std::result::Result<Vec<PathBuf>, Box<ToolOutput>> {
+    let mut files = Vec::new();
+    if let Some(paths) = paths {
+        for raw in paths.iter().filter_map(Value::as_str) {
+            let path = match safe_existing_path(&context.root, raw) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Err(Box::new(ToolOutput::error_structured(
+                        format!("invalid diagnostics path {raw}: {error}"),
+                        json!({"code": "INVALID_ARGUMENT", "path": raw}),
+                    )));
+                }
+            };
+            if path.is_file() {
+                if lsp::language_for_path(&path).is_some() {
+                    files.push(path);
+                }
+                continue;
+            }
+            let relative = path
+                .strip_prefix(&context.root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let relative = relative.trim_start_matches("./");
+            for file in &index.files {
+                if file.path.starts_with(relative) {
+                    let candidate = context.root.join(&file.path);
+                    if lsp::language_for_path(&candidate).is_some() {
+                        files.push(candidate);
+                    }
+                    if files.len() >= MAX_DIAGNOSTIC_FILES {
+                        break;
+                    }
+                }
+            }
+            if files.len() >= MAX_DIAGNOSTIC_FILES {
+                break;
+            }
+        }
+    } else {
+        for file in &index.files {
+            let candidate = context.root.join(&file.path);
+            if lsp::language_for_path(&candidate).is_some() {
+                files.push(candidate);
+            }
+            if files.len() >= MAX_DIAGNOSTIC_FILES {
+                break;
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files.truncate(MAX_DIAGNOSTIC_FILES);
+    Ok(files)
+}
+
+fn filter_diagnostic_severity(
+    diagnostics: Vec<CodeDiagnostic>,
+    severity: &str,
+) -> Vec<CodeDiagnostic> {
+    diagnostics
+        .into_iter()
+        .filter(|diagnostic| match severity {
+            "all" => true,
+            "warning" => diagnostic.severity == "warning",
+            _ => diagnostic.severity != "warning",
+        })
+        .collect()
+}
+
+fn build_diagnostic(
+    failure: &crate::tooling::project::Failure,
+    command_source: &str,
+) -> CodeDiagnostic {
+    let line = failure.line.unwrap_or(1).max(1) as u64;
+    let column = failure.column.unwrap_or(1).max(1) as u64;
+    CodeDiagnostic {
+        path: failure
+            .path
+            .clone()
+            .unwrap_or_else(|| "(project)".to_string()),
+        line,
+        column,
+        end_line: line,
+        end_column: column.saturating_add(1),
+        range: CodeRange {
+            line,
+            column,
+            end_line: line,
+            end_column: column.saturating_add(1),
+        },
+        severity: if failure.severity == "warning" {
+            "warning".to_string()
+        } else {
+            "error".to_string()
+        },
+        code: failure.code.clone().map(Value::String),
+        source: Some(command_source.to_string()),
+        server: None,
+        message: failure.message.clone(),
+        backend: "build".to_string(),
+        confidence_score: BUILD_CONFIDENCE,
+    }
+}
+
+async fn build_diagnostics_output(
+    context: &ToolContext,
+    severity: &str,
+    limit: usize,
+    paths: Option<&Vec<Value>>,
+    fallback: Option<&LspAttemptError>,
+) -> Result<ToolOutput> {
+    let mut run = run_detected_task(context, "check", 300).await?;
+    if run.is_none() {
+        run = run_detected_task(context, "lint", 300).await?;
+    }
+    let Some(run) = run else {
+        let profile = detect_profile(&context.root);
+        let mut structured = json!({
+            "code": "DIAGNOSTICS_UNAVAILABLE",
+            "message": "no check or lint command was detected",
+            "detected_commands": profile.commands.keys().collect::<Vec<_>>(),
+            "source": "build",
+            "status": "unavailable",
+            "confidence": "compiler-or-parser",
+            "confidence_score": 0.0,
+        });
+        if let Some(error) = fallback {
+            structured["fallback_reason"] = json!(error.reason());
+            structured["lsp_message"] = json!(error.to_string());
+            if let Some(hint) = error.install_hint() {
+                structured["install_hint"] = json!(hint);
+            }
+        }
+        return Ok(ToolOutput::error_structured(
+            "no language server and no check/lint command was detected",
+            structured,
+        ));
+    };
+    let diagnostics = run
+        .failures
+        .iter()
+        .filter(|failure| {
+            severity == "all"
+                || (severity == "warning" && failure.severity == "warning")
+                || (severity == "error" && failure.severity != "warning")
+        })
+        .filter(|failure| {
+            paths.is_none_or(|paths| {
+                failure.path.as_deref().is_some_and(|path| {
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|filter| path.starts_with(filter.trim_start_matches("./")))
                 })
             })
-            .take(limit)
-            .cloned()
-            .collect::<Vec<_>>();
-        diagnostics.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.line.cmp(&right.line))
-        });
-        let mut grouped: BTreeMap<String, Vec<&crate::tooling::project::Failure>> = BTreeMap::new();
-        for diagnostic in &diagnostics {
-            grouped
-                .entry(
-                    diagnostic
-                        .path
-                        .clone()
-                        .unwrap_or_else(|| "(project)".to_string()),
-                )
-                .or_default()
-                .push(diagnostic);
-        }
-        let group_count = grouped.len();
-        let rendered = grouped
+        })
+        .map(|failure| build_diagnostic(failure, &run.source))
+        .collect::<Vec<_>>();
+    let summary = prepare_diagnostics(diagnostics, limit);
+    let ok = run.exit_code == 0 && summary.errors == 0;
+    let backend = Backend::build(if fallback.is_some() {
+        Status::Fallback
+    } else {
+        Status::Ok
+    })
+    .with_method(run.command.clone())
+    .with_fallback(
+        fallback
+            .map(LspAttemptError::reason)
+            .unwrap_or("lsp_unavailable"),
+        fallback.and_then(LspAttemptError::install_hint),
+    )
+    .with_attempts(fallback.map(backend_attempts).unwrap_or_default());
+    let rendered = render_diagnostics(&summary);
+    let heading = backend_sentence(&backend);
+    let text = if ok && summary.total == 0 {
+        format!("{heading}\nno diagnostics ({})", run.command)
+    } else if summary.total == 0 {
+        format!(
+            "{heading}\n{} exited {} with no parsed diagnostics",
+            run.command, run.exit_code
+        )
+    } else {
+        format!("{heading}\n{rendered}")
+    };
+    let values = serde_json::to_value(
+        summary
+            .groups
             .iter()
-            .map(|(path, diagnostics)| {
-                let lines = diagnostics
-                    .iter()
-                    .map(|diagnostic| {
-                        format!(
-                            "  {}:{}{} {}",
-                            path,
-                            diagnostic.line.unwrap_or(0),
-                            diagnostic
-                                .column
-                                .map(|column| format!(":{column}"))
-                                .unwrap_or_default(),
-                            diagnostic.message
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("{path}\n{lines}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let ok = diagnostics.is_empty() && run.exit_code == 0;
-        Ok(ToolOutput::ok_structured(
-            truncate(if ok {
-                format!("no diagnostics ({})", run.command)
-            } else if rendered.is_empty() {
-                format!(
-                    "{} exited {} with no parsed diagnostics",
-                    run.command, run.exit_code
-                )
-            } else {
-                format!(
-                    "{} ({}) {}\n{rendered}",
-                    run.command, run.source, run.exit_code
-                )
-            }),
-            json!({
-                "ok": ok,
-                "source": "build",
-                "command": run.command,
-                "command_source": run.source,
-                "exit_code": run.exit_code,
-                "diagnostics": diagnostics,
-                "groups": group_count,
-                "warning_count": run.warning_count,
-                "duration_ms": run.duration_ms,
-                "raw_tail": tail_chars(&run.output, 4_000),
-                "truncated": diagnostics.len() >= limit,
-                "confidence": "compiler-or-parser",
-            }),
-        ))
-    }
+            .flat_map(|group| group.diagnostics.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(json!([]));
+    let group_values = serde_json::to_value(&summary.groups).unwrap_or(json!([]));
+    let mut structured = json!({
+        "ok": ok,
+        "command": run.command,
+        "command_source": run.source,
+        "exit_code": run.exit_code,
+        "diagnostics": values,
+        "groups": group_values,
+        "group_count": summary.groups.len(),
+        "error_count": summary.errors,
+        "warning_count": summary.warnings,
+        "parsed_warning_count": run.warning_count,
+        "information_count": summary.information,
+        "hint_count": summary.hints,
+        "duration_ms": run.duration_ms,
+        "raw_tail": tail_chars(&run.output, 4_000),
+        "truncated": summary.truncated,
+        "paths": paths.cloned().unwrap_or_default(),
+    });
+    backend.apply(&mut structured);
+    Ok(ToolOutput::ok_structured(truncate(text), structured))
 }
 
 #[async_trait]
@@ -1904,7 +2694,7 @@ impl AgentTool for BuildContext {
     }
 
     fn description(&self) -> &'static str {
-        "Assemble a bounded, cited context packet for a goal from symbols, files, tests, project commands, and recent changes. No model call."
+        "Assemble a bounded, cited context packet for a goal from symbols, files, tests, project commands, and recent changes. No model call. Symbols are lexical by default and can optionally use an installed language server."
     }
 
     fn schema(&self) -> Value {
@@ -1914,7 +2704,8 @@ impl AgentTool for BuildContext {
                 "goal": {"type": "string", "description": "What the agent is trying to do"},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional focus paths"},
                 "max_tokens": {"type": "integer", "minimum": 500, "maximum": 16000, "description": "Default 4000"},
-                "include": {"type": "array", "items": {"type": "string", "enum": ["code", "tests", "git", "profile", "docs"]}, "description": "Sections to include"}
+                "include": {"type": "array", "items": {"type": "string", "enum": ["code", "tests", "git", "profile", "docs"]}, "description": "Sections to include"},
+                "source": {"type": "string", "enum": ["auto", "lsp", "lexical"], "description": "Default lexical; auto only uses an already-running server"}
             },
             "required": ["goal"]
         })
@@ -1927,6 +2718,16 @@ impl AgentTool for BuildContext {
             .map(str::trim)
             .filter(|goal| !goal.is_empty())
             .ok_or_else(|| anyhow!("goal is required"))?;
+        let source = match parse_source_choice(&input, SourceChoice::Lexical) {
+            Ok(source) => source,
+            Err(output) => return Ok(*output),
+        };
+        if source == SourceChoice::Build {
+            return Ok(ToolOutput::error_structured(
+                "build_context does not have a build backend; use lexical or lsp",
+                json!({"code": "INVALID_ARGUMENT", "field": "source"}),
+            ));
+        }
         let max_tokens = input
             .get("max_tokens")
             .and_then(Value::as_u64)
@@ -1983,7 +2784,7 @@ impl AgentTool for BuildContext {
         let mut file_scores: BTreeMap<String, f64> = BTreeMap::new();
         for (score, symbol) in symbol_scores.into_iter().take(30) {
             *file_scores.entry(symbol.path.clone()).or_default() += score;
-            selected_symbols.push(symbol.clone());
+            selected_symbols.push(lexical_code_symbol(&context.root, symbol, score));
             if selected_symbols.len() >= 12 {
                 break;
             }
@@ -2008,6 +2809,63 @@ impl AgentTool for BuildContext {
                 .then_with(|| left.0.cmp(&right.0))
         });
         files.truncate(6);
+        let mut backend = Backend::lexical(Status::Ok, LEXICAL_CONFIDENCE_SYMBOL);
+        let mut symbol_source = "lexical";
+        let mut lsp_attempt_list = Vec::new();
+        if source != SourceChoice::Lexical && include.contains("code") {
+            let lsp_files = files
+                .iter()
+                .map(|(path, _)| context.root.join(path))
+                .collect::<Vec<_>>();
+            let allow_spawn = source == SourceChoice::Lsp;
+            match lsp::collect_file_symbols(context, &lsp_files, 24, allow_spawn).await {
+                Ok(batch) => {
+                    let mut enriched = batch
+                        .symbols
+                        .into_iter()
+                        .filter_map(|symbol| {
+                            let score = match_score(&symbol.name, &tokens, &symbol.path);
+                            (score > 0.0).then_some((score, symbol))
+                        })
+                        .collect::<Vec<_>>();
+                    enriched.sort_by(|left, right| {
+                        right
+                            .0
+                            .partial_cmp(&left.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| left.1.path.cmp(&right.1.path))
+                    });
+                    lsp_attempt_list = lsp_attempts(&batch.attempts);
+                    if !enriched.is_empty() {
+                        selected_symbols = enriched
+                            .into_iter()
+                            .take(12)
+                            .map(|(score, mut symbol)| {
+                                symbol.score = score;
+                                symbol
+                            })
+                            .collect();
+                        symbol_source = "lsp";
+                        backend = backend_for_lsp_batch(
+                            SourceChoice::Lsp,
+                            batch.status,
+                            LSP_CONFIDENCE_SYMBOL,
+                            &batch.attempts,
+                        );
+                    } else {
+                        backend = Backend::lexical(Status::Fallback, LEXICAL_CONFIDENCE_SYMBOL)
+                            .with_fallback("lsp_empty", None)
+                            .with_attempts(lsp_attempt_list.clone());
+                    }
+                }
+                Err(error) => {
+                    if source == SourceChoice::Lsp {
+                        return Ok(lsp_unavailable_output(&error, "build_context"));
+                    }
+                    backend = lexical_fallback_backend(&error);
+                }
+            }
+        }
         let char_budget = max_tokens.saturating_mul(4);
         let mut sections = Vec::new();
         let mut citations = Vec::new();
@@ -2039,11 +2897,11 @@ impl AgentTool for BuildContext {
                     citations.push(json!({
                         "path": symbol.path,
                         "line": symbol.line,
-                        "reason": "symbol",
+                        "reason": if symbol_source == "lsp" { "lsp symbol" } else { "lexical symbol" },
                     }));
                     format!(
-                        "- {}:{} {} {}",
-                        symbol.path, symbol.line, symbol.kind, symbol.name
+                        "- {}:{}:{} {} {}",
+                        symbol.path, symbol.line, symbol.column, symbol.kind, symbol.name
                     )
                 })
                 .collect::<Vec<_>>()
@@ -2121,24 +2979,29 @@ impl AgentTool for BuildContext {
         }
         let estimated_tokens = packet.len() / 4;
         let summary = format!(
-            "{} chars · ~{} tokens · {} symbols · {} files",
+            "{} chars · ~{} tokens · {} symbols · {} files · {}",
             packet.len(),
             estimated_tokens,
             selected_symbols.len(),
-            files_seen(&citations)
+            files_seen(&citations),
+            backend_sentence(&backend)
         );
+        let mut structured = json!({
+            "goal": goal,
+            "context": packet,
+            "citations": citations,
+            "estimated_tokens": estimated_tokens,
+            "max_tokens": max_tokens,
+            "truncated": truncated,
+            "symbol_source": symbol_source,
+            "symbols": selected_symbols,
+            "lsp_attempts": lsp_attempt_list,
+            "next_actions": ["read the cited files before editing"],
+        });
+        backend.apply(&mut structured);
         Ok(ToolOutput::ok_structured(
             truncate(format!("{summary}\n\n{packet}")),
-            json!({
-                "goal": goal,
-                "context": packet,
-                "citations": citations,
-                "estimated_tokens": estimated_tokens,
-                "max_tokens": max_tokens,
-                "truncated": truncated,
-                "confidence": "lexical",
-                "next_actions": ["read the cited files before editing"],
-            }),
+            structured,
         ))
     }
 }
@@ -2409,5 +3272,299 @@ mod tests {
         let index = build_index(go.path());
         assert!(index.symbols.iter().any(|symbol| symbol.name == "Thing"));
         assert!(index.symbols.iter().any(|symbol| symbol.name == "Build"));
+    }
+
+    #[tokio::test]
+    async fn lexical_symbol_results_declare_source_range_and_confidence() {
+        let dir = fixture();
+        let output = FindSymbol
+            .execute(
+                &context(dir.path()),
+                json!({"query": "build_widget", "source": "lexical"}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["source"], "lexical");
+        assert_eq!(structured["status"], "ok");
+        assert_eq!(structured["confidence"], "lexical");
+        assert_eq!(structured["confidence_score"], 0.75);
+        assert_eq!(structured["backend"]["source"], "lexical");
+        let symbol = &structured["symbols"][0];
+        assert_eq!(symbol["path"], "src/lib.rs");
+        assert!(symbol["line"].as_u64().unwrap() >= 1);
+        assert!(symbol["column"].as_u64().unwrap() >= 1);
+        assert!(symbol["end_line"].as_u64().unwrap() >= symbol["line"].as_u64().unwrap());
+        assert_eq!(symbol["range"]["line"], symbol["line"]);
+        assert_eq!(symbol["range"]["end_line"], symbol["end_line"]);
+        assert_eq!(symbol["kind"], "function");
+        assert_eq!(symbol["kind_group"], "function");
+        assert_eq!(symbol["source"], "lexical");
+        assert_eq!(symbol["confidence"], "lexical");
+        assert!(output.content.contains("lexical index"));
+        assert!(output.content.contains("not compiler-accurate"));
+    }
+
+    #[tokio::test]
+    async fn explicit_lsp_without_a_mapped_language_is_unavailable_not_fake_exact() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "no code here\n").unwrap();
+        let output = FindSymbol
+            .execute(
+                &context(dir.path()),
+                json!({"query": "Widget", "source": "lsp"}),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["code"], "LSP_UNAVAILABLE");
+        assert_eq!(structured["status"], "unavailable");
+        assert_eq!(structured["source"], "lsp");
+        assert_eq!(structured["confidence_score"], 0.0);
+        assert!(
+            structured["supported_languages"]
+                .as_array()
+                .is_some_and(|languages| !languages.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_symbol_search_labels_the_lexical_fallback() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "no code here\n").unwrap();
+        let output = FindSymbol
+            .execute(
+                &context(dir.path()),
+                json!({"query": "Widget", "source": "auto"}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["source"], "lexical");
+        assert_eq!(structured["status"], "fallback");
+        assert_eq!(structured["fallback_reason"], "lsp_unsupported_language");
+        assert_eq!(structured["backend"]["status"], "fallback");
+        assert!(output.content.contains("lexical fallback"));
+    }
+
+    #[tokio::test]
+    async fn lexical_references_include_range_column_and_definition_marker() {
+        let dir = fixture();
+        let output = FindReferences
+            .execute(
+                &context(dir.path()),
+                json!({
+                    "name": "Widget",
+                    "path": "src/lib.rs",
+                    "source": "lexical",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["source"], "lexical");
+        assert_eq!(structured["status"], "ok");
+        assert_eq!(structured["confidence_score"], 0.55);
+        assert_eq!(structured["symbol"]["name"], "Widget");
+        assert_eq!(structured["symbol"]["path"], "src/lib.rs");
+        let references = structured["references"].as_array().unwrap();
+        assert!(!references.is_empty());
+        assert!(
+            references
+                .iter()
+                .any(|reference| reference["is_definition"] == true)
+        );
+        for reference in references {
+            assert!(reference["path"].is_string());
+            assert!(reference["line"].as_u64().unwrap() >= 1);
+            assert!(reference["column"].as_u64().unwrap() >= 1);
+            assert!(reference["range"]["end_line"].as_u64().unwrap() >= 1);
+            assert_eq!(reference["kind"], "type");
+            assert_eq!(reference["source"], "lexical");
+            assert_eq!(reference["confidence_score"], 0.55);
+        }
+    }
+
+    #[tokio::test]
+    async fn lexical_references_include_multiple_matches_on_one_line() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "struct Widget;\nfn f() { let _ = Widget; let _ = Widget; }\n",
+        )
+        .unwrap();
+        let output = FindReferences
+            .execute(
+                &context(dir.path()),
+                json!({"name": "Widget", "source": "lexical"}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let structured = output.structured.unwrap();
+        let references = structured["references"].as_array().unwrap();
+        assert_eq!(references.len(), 3);
+        let line_two = references
+            .iter()
+            .filter(|reference| reference["line"] == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(line_two.len(), 2);
+        assert!(line_two[0]["column"].as_u64().unwrap() < line_two[1]["column"].as_u64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn find_references_accepts_a_symbol_id_that_is_not_in_the_index() {
+        let dir = fixture();
+        let output = FindReferences
+            .execute(
+                &context(dir.path()),
+                json!({
+                    "symbol_id": "src/lib.rs:1:build_widget",
+                    "source": "lexical",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["symbol"]["path"], "src/lib.rs");
+        assert!(structured["symbol"]["line"].as_u64().unwrap() >= 1);
+        assert_eq!(structured["symbol"]["name"], "build_widget");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_explicit_lsp_without_mapping_is_structured_unavailable() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "no code here\n").unwrap();
+        let output = CodeDiagnostics
+            .execute(&context(dir.path()), json!({"source": "lsp"}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["code"], "LSP_UNAVAILABLE");
+        assert_eq!(structured["status"], "unavailable");
+        assert_eq!(structured["source"], "lsp");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_auto_without_any_backend_reports_build_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let output = CodeDiagnostics
+            .execute(&context(dir.path()), json!({"source": "auto"}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["code"], "DIAGNOSTICS_UNAVAILABLE");
+        assert_eq!(structured["source"], "build");
+        assert_eq!(structured["status"], "unavailable");
+        assert_eq!(structured["fallback_reason"], "lsp_unsupported_language");
+        assert!(output.content.contains("no language server"));
+    }
+
+    #[tokio::test]
+    async fn repo_map_and_context_label_lexical_evidence() {
+        let dir = fixture();
+        let map = RepoMap
+            .execute(
+                &context(dir.path()),
+                json!({"include_tests": true, "source": "lexical"}),
+            )
+            .await
+            .unwrap();
+        let structured = map.structured.unwrap();
+        assert_eq!(structured["source"], "lexical");
+        assert_eq!(structured["symbol_source"], "lexical");
+        assert_eq!(structured["symbols"][0]["source"], "lexical");
+
+        let packet = BuildContext
+            .execute(
+                &context(dir.path()),
+                json!({"goal": "change build_widget", "source": "lexical"}),
+            )
+            .await
+            .unwrap();
+        let structured = packet.structured.unwrap();
+        assert_eq!(structured["source"], "lexical");
+        assert_eq!(structured["symbol_source"], "lexical");
+        assert!(
+            structured["citations"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_map_explicit_lsp_without_source_files_is_unavailable() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "no code here\n").unwrap();
+        let output = RepoMap
+            .execute(&context(dir.path()), json!({"source": "lsp"}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["code"], "LSP_UNAVAILABLE");
+        assert_eq!(structured["status"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn repo_map_auto_without_a_running_server_labels_lexical_fallback() {
+        let dir = fixture();
+        let output = RepoMap
+            .execute(
+                &context(dir.path()),
+                json!({"include_tests": true, "source": "auto"}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["source"], "lexical");
+        assert_eq!(structured["status"], "fallback");
+        assert_eq!(structured["fallback_reason"], "lsp_unavailable");
+        assert_eq!(structured["symbol_source"], "lexical");
+        assert!(structured["install_hint"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn build_context_auto_without_a_running_server_labels_lexical_fallback() {
+        let dir = fixture();
+        let output = BuildContext
+            .execute(
+                &context(dir.path()),
+                json!({"goal": "change build_widget", "source": "auto"}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["source"], "lexical");
+        assert_eq!(structured["status"], "fallback");
+        assert_eq!(structured["symbol_source"], "lexical");
+    }
+
+    #[test]
+    fn parses_source_choices_and_symbol_ids() {
+        assert_eq!(
+            parse_source_choice(&json!({"source": "auto"}), SourceChoice::Lexical).unwrap(),
+            SourceChoice::Auto
+        );
+        assert_eq!(
+            parse_source_choice(&json!({"source": "LSP"}), SourceChoice::Lexical).unwrap(),
+            SourceChoice::Lsp
+        );
+        assert!(parse_source_choice(&json!({"source": "model"}), SourceChoice::Lexical).is_err());
+        assert_eq!(
+            parse_symbol_id("src/lib.rs:12:Widget"),
+            Some(("src/lib.rs".to_string(), 12, "Widget".to_string()))
+        );
+        assert_eq!(parse_symbol_id("Widget"), None);
+        assert_eq!(parse_symbol_id("src/lib.rs:0:Widget"), None);
     }
 }

@@ -43,6 +43,18 @@ struct ToolTraceRow: View {
                             .truncationMode(.middle)
                     }
 
+                    if let source = entry.intelligenceSource {
+                        Text(source)
+                            .font(VPTheme.mono(7, weight: .semibold))
+                            .tracking(0.4)
+                            .foregroundStyle(VPTheme.info)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 0.5)
+                            .background(
+                                Capsule().fill(VPTheme.info.opacity(0.12))
+                            )
+                    }
+
                     if let agent = entry.agent {
                         Text(agent)
                             .font(VPTheme.mono(7.5))

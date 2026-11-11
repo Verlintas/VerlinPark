@@ -21,6 +21,7 @@ use tracing::{info, warn};
 use vp_core::Engine;
 use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
+use vp_protocol::lsp::LspStatusParams;
 use vp_protocol::remote::{
     HostListParams, HostListResult, HostProbeParams, HostProjectParams, HostSetParams,
     RemoteLedgerParams, RemoteStatusParams, RemoteWorktreeListParams,
@@ -640,6 +641,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "remote.status" => match parse_params::<RemoteStatusParams>(request.params) {
             Ok(params) => match state.engine.remote_status(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "lsp.status" => match parse_params::<LspStatusParams>(request.params) {
+            Ok(params) => match state.engine.lsp_status(&params.project_id).await {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
