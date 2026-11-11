@@ -2005,6 +2005,12 @@ fn agent_fields(payload: &mut serde_json::Value, spec: &AgentSpec) {
         if let Some(title) = &spec.title {
             object.insert("agent_title".into(), serde_json::json!(title));
         }
+        if let Some(task_id) = &spec.task_id {
+            object.insert("task_id".into(), serde_json::json!(task_id));
+        }
+        if let Some(department) = &spec.department {
+            object.insert("department".into(), serde_json::json!(department));
+        }
     }
 }
 
@@ -10397,26 +10403,37 @@ impl acp::AcpHost for AcpWorkerHost {
 
     async fn permission(&self, request: acp::AcpPermissionRequest) -> acp::AcpPermissionDecision {
         let assessment = assess_acp_permission(&request, &self.spec.worktree);
-        let granted = !self.auto_approve
-            && self
-                .engine
-                .approval_grant_matches(
-                    &self.session.project_id,
-                    &format!("acp.{}", self.acp_name),
-                    request
-                        .raw_input
-                        .as_ref()
-                        .unwrap_or(&serde_json::Value::Null),
+        let tool = format!("acp.{}", self.acp_name);
+        let raw_input = request
+            .raw_input
+            .as_ref()
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let decision = match self.engine.evaluate_tool_permission(
+            &self.session.id,
+            &self.session.project_id,
+            &assessment,
+            &tool,
+            &raw_input,
+            self.approval_mode,
+            self.auto_approve,
+        ) {
+            Ok(evaluation) => evaluation.decision,
+            Err(error) => {
+                let _ = emit(
+                    &self.engine,
+                    &self.session.id,
+                    &self.spec,
+                    "permission.denied",
+                    serde_json::json!({
+                        "tool": tool,
+                        "risk": assessment.risk.as_str(),
+                        "reason": format!("approval evaluation failed: {error}"),
+                    }),
                 )
-                .await
-                .unwrap_or(false);
-        let decision = if granted {
-            crate::permissions::ApprovalDecision::Allow {
-                risk: assessment.risk,
-                reason: "matched a project approval grant".to_string(),
+                .await;
+                return acp::AcpPermissionDecision::Deny;
             }
-        } else {
-            decide(self.approval_mode, &assessment, self.auto_approve)
         };
         let tool_call_id = format!("acp:{}:{}", self.spec.id, request.tool_call_id);
         let (risk, reason) = match decision {
@@ -10428,7 +10445,7 @@ impl acp::AcpHost for AcpWorkerHost {
                         &self.spec,
                         "permission.allowed",
                         serde_json::json!({
-                            "tool": format!("acp.{}", self.acp_name),
+                            "tool": tool,
                             "tool_call_id": tool_call_id,
                             "risk": risk.as_str(),
                             "reason": reason,
@@ -10445,7 +10462,7 @@ impl acp::AcpHost for AcpWorkerHost {
                     &self.spec,
                     "permission.denied",
                     serde_json::json!({
-                        "tool": format!("acp.{}", self.acp_name),
+                        "tool": tool,
                         "tool_call_id": tool_call_id,
                         "risk": risk.as_str(),
                         "reason": reason,
@@ -10477,18 +10494,16 @@ impl acp::AcpHost for AcpWorkerHost {
         let mut context = serde_json::json!({});
         agent_fields(&mut context, &self.spec);
         context["acp_agent"] = serde_json::json!(self.acp_name);
-        let approval = self
-            .engine
-            .request_approval_with_risk(
-                &self.session.id,
-                &tool_call_id,
-                &format!("acp.{}", self.acp_name),
-                input,
-                Some(context),
-                Some(risk.as_str()),
-                Some(&reason),
-            )
-            .await;
+        let approval = Box::pin(self.engine.request_approval_with_risk(
+            &self.session.id,
+            &tool_call_id,
+            &format!("acp.{}", self.acp_name),
+            input,
+            Some(context),
+            Some(risk.as_str()),
+            Some(&reason),
+        ))
+        .await;
         let Ok((approval, receiver)) = approval else {
             return acp::AcpPermissionDecision::Deny;
         };
@@ -14776,12 +14791,6 @@ async fn run_loop_body(
             }
             let scout_blocked =
                 spec.role == AgentRole::Scout && !spec.role.allows_tool(spec.profile, &call.name);
-            let granted = !spec.auto_approve
-                && !scout_blocked
-                && engine
-                    .approval_grant_matches(&session.project_id, &call.name, &input)
-                    .await
-                    .unwrap_or(false);
             let decision = if scout_blocked {
                 // Do not prompt for a tool the Scout can never execute, and do
                 // not route it through the permission broker. The tool is not
@@ -14790,13 +14799,22 @@ async fn run_loop_body(
                     risk: RiskLevel::ReadOnly,
                     reason: "tool is outside the Scout read-only policy".to_string(),
                 }
-            } else if granted {
-                crate::permissions::ApprovalDecision::Allow {
-                    risk: assessment.risk,
-                    reason: "matched a project approval grant".to_string(),
-                }
             } else {
-                decide(config.approval_mode, &assessment, spec.auto_approve)
+                match engine.evaluate_tool_permission(
+                    &session.id,
+                    &session.project_id,
+                    &assessment,
+                    &call.name,
+                    &input,
+                    config.approval_mode,
+                    spec.auto_approve,
+                ) {
+                    Ok(evaluation) => evaluation.decision,
+                    Err(error) => crate::permissions::ApprovalDecision::Deny {
+                        risk: assessment.risk,
+                        reason: format!("approval evaluation failed: {error}"),
+                    },
+                }
             };
             let approval_risk = assessment.risk;
             let mut approval_wait_ms: Option<u64> = None;
@@ -14823,17 +14841,16 @@ async fn run_loop_body(
                 ApprovalDecision::Ask { risk, reason } => {
                     let mut context = serde_json::json!({});
                     agent_fields(&mut context, spec);
-                    let (approval, receiver) = engine
-                        .request_approval_with_risk(
-                            &session.id,
-                            &call_id,
-                            &call.name,
-                            input.clone(),
-                            Some(context),
-                            Some(risk.as_str()),
-                            Some(&reason),
-                        )
-                        .await?;
+                    let (approval, receiver) = Box::pin(engine.request_approval_with_risk(
+                        &session.id,
+                        &call_id,
+                        &call.name,
+                        input.clone(),
+                        Some(context),
+                        Some(risk.as_str()),
+                        Some(&reason),
+                    ))
+                    .await?;
                     let approval_step = match journal
                         .approval_intent(
                             engine,

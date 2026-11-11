@@ -4644,7 +4644,7 @@ pub struct ApprovalGrantDeleteResult {
     pub deleted: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Approval {
     pub id: String,
     pub session_id: String,
@@ -4661,6 +4661,334 @@ pub struct Approval {
     /// Human-readable explanation of why the approval was requested.
     #[serde(default)]
     pub approval_reason: Option<String>,
+    /// Agent that requested the approval. Older rows and events decode as
+    /// `None`; the event payload still carries the agent context at top level
+    /// for compatibility with the pre-H1 UI.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub agent_role: Option<String>,
+    #[serde(default)]
+    pub agent_title: Option<String>,
+    /// Plan task blocked by this approval, when the requester supplied one.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// SHA-256 of the canonical input scope. This is an identity fingerprint,
+    /// not a replacement for the stored input; it never contains command text
+    /// or file contents.
+    #[serde(default)]
+    pub scope_hash: Option<String>,
+    /// Deterministic deduplication key: session + agent + tool + scope + risk.
+    #[serde(default)]
+    pub dedup_key: Option<String>,
+    /// Number of current and historical waiters coalesced onto this row. One
+    /// operator decision resolves every waiter registered at resolution time.
+    #[serde(default)]
+    pub waiter_count: u32,
+    /// Template that produced the original decision, when one matched.
+    #[serde(default)]
+    pub template_id: Option<String>,
+    /// Snapshot of the plan-task priority at request time, followed by the
+    /// attention policy boost when the request is listed.
+    #[serde(default)]
+    pub priority: i32,
+    /// Expiry computed from the attention policy at creation time. Expired
+    /// rows are denied, never approved.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Whether this row was allowed to create an inbox notification. Rows
+    /// inside the session/tool/risk coalescing window carry `false` while
+    /// remaining fully reviewable in the approval queue.
+    #[serde(default)]
+    pub notify: bool,
+    /// Stable session/tool/risk/window key used by notification coalescing.
+    #[serde(default)]
+    pub notify_key: Option<String>,
+}
+
+/// Project-scoped bounded auto-approval/deny rule. Templates are deliberately
+/// smaller than a permission system: they never cover Destructive or HostState
+/// risks and never replace the approval queue for high-risk operations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalTemplate {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Exact tool name, prefix glob (`write_*`), or bounded `*`/`?` glob.
+    pub tool_pattern: String,
+    /// Known risk names. Empty decodes to the low-risk default
+    /// (`external`, `workspace_write`); `allow` templates reject HostState and
+    /// Destructive risks even if a hand-edited row names them.
+    #[serde(default)]
+    pub risk_levels: Vec<String>,
+    /// Relative path globs. Empty means the whole tool, not an unrestricted
+    /// filesystem; absolute paths and `..` are rejected when the template is
+    /// created. `*` does not cross `/`; `**` does.
+    #[serde(default)]
+    pub path_globs: Vec<String>,
+    /// `allow`, `deny`, or `escalate`.
+    #[serde(default = "default_approval_action")]
+    pub action: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub used_count: u32,
+    pub created_by: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+impl ApprovalTemplate {
+    /// Remaining uses, capped at zero. `None` means unlimited.
+    pub fn remaining_uses(&self) -> Option<u32> {
+        self.max_uses.map(|max| max.saturating_sub(self.used_count))
+    }
+}
+
+fn default_approval_action() -> String {
+    "allow".to_string()
+}
+
+/// Project-scoped approval attention policy. Values are normalized on write and
+/// on read so a hand-edited manifest cannot create an unbounded queue.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttentionPolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_max_pending_per_session")]
+    pub max_pending_per_session: u32,
+    #[serde(default = "default_coalesce_window_secs")]
+    pub coalesce_window_secs: u64,
+    #[serde(default = "default_stale_after_secs")]
+    pub stale_after_secs: u64,
+    /// Risk threshold whose approvals bypass notification coalescing and get a
+    /// longer stale window. They never bypass operator approval.
+    #[serde(default = "default_priority_boost_risk")]
+    pub priority_boost_risk: String,
+    #[serde(default = "default_notify_coalesce_secs")]
+    pub notify_coalesce_secs: u64,
+}
+
+fn default_max_pending_per_session() -> u32 {
+    64
+}
+
+fn default_coalesce_window_secs() -> u64 {
+    120
+}
+
+fn default_stale_after_secs() -> u64 {
+    86_400
+}
+
+fn default_priority_boost_risk() -> String {
+    "host_state".to_string()
+}
+
+fn default_notify_coalesce_secs() -> u64 {
+    60
+}
+
+impl Default for AttentionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_pending_per_session: default_max_pending_per_session(),
+            coalesce_window_secs: default_coalesce_window_secs(),
+            stale_after_secs: default_stale_after_secs(),
+            priority_boost_risk: default_priority_boost_risk(),
+            notify_coalesce_secs: default_notify_coalesce_secs(),
+        }
+    }
+}
+
+impl AttentionPolicy {
+    /// Clamp all numeric bounds and normalize the boost risk to a known name.
+    /// Unknown names fail closed to `host_state` (the conservative middle).
+    pub fn normalized(mut self) -> Self {
+        self.max_pending_per_session = self.max_pending_per_session.clamp(1, 500);
+        self.coalesce_window_secs = self.coalesce_window_secs.min(3_600);
+        self.stale_after_secs = self.stale_after_secs.clamp(60, 7 * 24 * 60 * 60);
+        self.notify_coalesce_secs = self.notify_coalesce_secs.min(3_600);
+        self.priority_boost_risk = match self.priority_boost_risk.as_str() {
+            "read_only" | "workspace_write" | "external" | "host_state" | "destructive" => {
+                self.priority_boost_risk
+            }
+            _ => default_priority_boost_risk(),
+        };
+        self
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalTemplateListParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalTemplateListResult {
+    pub templates: Vec<ApprovalTemplate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalTemplateCreateParams {
+    pub project_id: String,
+    pub name: String,
+    pub tool_pattern: String,
+    #[serde(default)]
+    pub risk_levels: Vec<String>,
+    #[serde(default)]
+    pub path_globs: Vec<String>,
+    pub action: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalTemplateResult {
+    pub template: ApprovalTemplate,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalTemplateUpdateParams {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub tool_pattern: String,
+    #[serde(default)]
+    pub risk_levels: Vec<String>,
+    #[serde(default)]
+    pub path_globs: Vec<String>,
+    pub action: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalTemplateDeleteParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalTemplateDeleteResult {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalTemplateFromApprovalParams {
+    pub approval_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttentionPolicyGetParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AttentionPolicyResult {
+    pub project_id: String,
+    pub policy: AttentionPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttentionPolicySetParams {
+    pub project_id: String,
+    pub policy: AttentionPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalQueueParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalQueueResult {
+    /// Pending rows in deterministic attention order: risk, blocked-task
+    /// criticality, age, then id.
+    pub approvals: Vec<Approval>,
+    pub policy: AttentionPolicy,
+    pub pending_count: u32,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalBatchDecision {
+    pub approval_id: String,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalBatchResolveParams {
+    pub decisions: Vec<ApprovalBatchDecision>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalBatchItemResult {
+    pub approval_id: String,
+    pub resolved: bool,
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Stable Q3-style code (`APPROVAL_NOT_FOUND`, `APPROVAL_NOT_PENDING`).
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub waiter_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalBatchResolveResult {
+    pub results: Vec<ApprovalBatchItemResult>,
+    pub resolved_count: u32,
+    pub failed_count: u32,
+}
+
+/// One project-scoped approval audit row. Template matches and template
+/// mutations are recorded here rather than in a session event stream because
+/// they are project configuration. Session-scoped lifecycle events remain in
+/// the normal event table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalAuditEvent {
+    pub id: String,
+    pub project_id: String,
+    pub kind: String,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalAuditParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalAuditResult {
+    pub events: Vec<ApprovalAuditEvent>,
 }
 
 /// Cache-read share of the provider input buckets.
@@ -12655,5 +12983,166 @@ mod critical_path_governor_tests {
         assert_eq!(value["project_id"], "p1");
         assert_eq!(value["policy"]["enabled"], true);
         assert_eq!(value["policy"]["reserve_ratio"], 0.25);
+    }
+}
+
+#[cfg(test)]
+mod approval_optimizer_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_approval_json_decodes_with_attention_defaults() {
+        let value = json!({
+            "id": "a1",
+            "session_id": "s1",
+            "tool_call_id": "call-1",
+            "tool": "write_file",
+            "input": {"path": "README.md"},
+            "status": "pending",
+            "created_at": "2026-11-12T00:00:00Z",
+            "approval_risk": "workspace_write",
+            "approval_reason": "workspace write"
+        });
+        let approval: Approval = serde_json::from_value(value).unwrap();
+        assert_eq!(approval.id, "a1");
+        assert_eq!(approval.waiter_count, 0);
+        assert!(approval.agent_id.is_none());
+        assert!(approval.dedup_key.is_none());
+        assert!(!approval.notify);
+        assert_eq!(approval.priority, 0);
+    }
+
+    #[test]
+    fn approval_round_trips_all_attention_fields() {
+        let approval = Approval {
+            id: "a1".into(),
+            session_id: "s1".into(),
+            tool_call_id: "call-1".into(),
+            tool: "write_file".into(),
+            input: json!({"path": "src/lib.rs"}),
+            status: "pending".into(),
+            created_at: "2026-11-12T00:00:00Z".into(),
+            resolved_at: None,
+            approval_risk: Some("workspace_write".into()),
+            approval_reason: Some("workspace write".into()),
+            agent_id: Some("worker-1".into()),
+            agent_name: Some("Worker".into()),
+            agent_role: Some("worker".into()),
+            agent_title: Some("API".into()),
+            task_id: Some("task-1".into()),
+            scope_hash: Some("abc".into()),
+            dedup_key: Some("key".into()),
+            waiter_count: 3,
+            template_id: Some("t1".into()),
+            priority: 42,
+            expires_at: Some("2026-11-13T00:00:00Z".into()),
+            notify: true,
+            notify_key: Some("s1|write_file|workspace_write".into()),
+        };
+        let value = serde_json::to_value(&approval).unwrap();
+        assert_eq!(value["waiter_count"], 3);
+        assert_eq!(value["notify"], true);
+        let decoded: Approval = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, approval);
+    }
+
+    #[test]
+    fn attention_policy_defaults_and_clamps_are_stable() {
+        let policy = AttentionPolicy::default();
+        assert!(policy.enabled);
+        assert_eq!(policy.max_pending_per_session, 64);
+        assert_eq!(policy.coalesce_window_secs, 120);
+        assert_eq!(policy.stale_after_secs, 86_400);
+        assert_eq!(policy.priority_boost_risk, "host_state");
+        assert_eq!(policy.notify_coalesce_secs, 60);
+
+        let clamped = AttentionPolicy {
+            enabled: false,
+            max_pending_per_session: 0,
+            coalesce_window_secs: 99_999,
+            stale_after_secs: 1,
+            priority_boost_risk: "not-a-risk".into(),
+            notify_coalesce_secs: 99_999,
+        }
+        .normalized();
+        assert_eq!(clamped.max_pending_per_session, 1);
+        assert_eq!(clamped.coalesce_window_secs, 3_600);
+        assert_eq!(clamped.stale_after_secs, 60);
+        assert_eq!(clamped.priority_boost_risk, "host_state");
+        assert_eq!(clamped.notify_coalesce_secs, 3_600);
+    }
+
+    #[test]
+    fn approval_template_defaults_are_low_risk_allow() {
+        let value = json!({
+            "id": "t1",
+            "project_id": "p1",
+            "name": "writes",
+            "tool_pattern": "write_file",
+            "created_by": "operator",
+            "created_at": "2026-11-12T00:00:00Z"
+        });
+        let template: ApprovalTemplate = serde_json::from_value(value).unwrap();
+        assert!(template.enabled);
+        assert_eq!(template.action, "allow");
+        assert!(template.risk_levels.is_empty());
+        assert!(template.path_globs.is_empty());
+        assert_eq!(template.used_count, 0);
+        assert_eq!(template.remaining_uses(), None);
+
+        let capped = ApprovalTemplate {
+            max_uses: Some(3),
+            used_count: 2,
+            ..template
+        };
+        assert_eq!(capped.remaining_uses(), Some(1));
+    }
+
+    #[test]
+    fn batch_and_queue_params_decode_explicitly() {
+        let params: ApprovalBatchResolveParams = serde_json::from_value(json!({
+            "decisions": [
+                {"approval_id": "a1", "approved": true},
+                {"approval_id": "a2", "approved": false}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(params.decisions.len(), 2);
+        assert!(params.decisions[0].approved);
+
+        let queue: ApprovalQueueParams = serde_json::from_value(json!({})).unwrap();
+        assert!(queue.session_id.is_none());
+        assert!(queue.project_id.is_none());
+
+        let result = ApprovalBatchResolveResult {
+            results: vec![ApprovalBatchItemResult {
+                approval_id: "a1".into(),
+                resolved: false,
+                status: Some("approved".into()),
+                code: Some("APPROVAL_NOT_PENDING".into()),
+                message: Some("already resolved".into()),
+                waiter_count: 2,
+            }],
+            resolved_count: 0,
+            failed_count: 1,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["results"][0]["code"], "APPROVAL_NOT_PENDING");
+        assert_eq!(value["failed_count"], 1);
+    }
+
+    #[test]
+    fn audit_events_round_trip() {
+        let event = ApprovalAuditEvent {
+            id: "e1".into(),
+            project_id: "p1".into(),
+            kind: "approval.template.matched".into(),
+            payload: json!({"template_id": "t1", "remaining_uses": 2}),
+            created_at: "2026-11-12T00:00:00Z".into(),
+        };
+        let decoded: ApprovalAuditEvent =
+            serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+        assert_eq!(decoded, event);
     }
 }

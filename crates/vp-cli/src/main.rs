@@ -2187,10 +2187,87 @@ enum Command {
     },
     /// Show the session worktree diff.
     Diff { session: String },
-    /// List approvals, optionally scoped to a session.
+    /// List pending approvals from the attention-ordered queue.
     Approvals {
         #[arg(long)]
         session: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Resolve an explicit list of approvals, one decision per id.
+    ApprovalBatch {
+        /// Approve this approval id (repeatable).
+        #[arg(long = "approve")]
+        approve: Vec<String>,
+        /// Deny this approval id (repeatable).
+        #[arg(long = "deny")]
+        deny: Vec<String>,
+    },
+    /// List project approval templates.
+    ApprovalTemplate {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Create or replace a project approval template.
+    ApprovalTemplateSet {
+        #[arg(long)]
+        project: Option<String>,
+        /// Existing template id. Omit to create.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        /// Exact tool, prefix (`write_*`), or bounded `*`/`?` glob.
+        #[arg(long = "tool-pattern")]
+        tool_pattern: Option<String>,
+        /// Known risk name (repeatable; defaults to external/workspace_write).
+        #[arg(long = "risk")]
+        risk: Vec<String>,
+        /// Relative path glob (repeatable).
+        #[arg(long = "path-glob")]
+        path_glob: Vec<String>,
+        /// allow, deny, or escalate.
+        #[arg(long)]
+        action: Option<String>,
+        /// RFC3339 expiry.
+        #[arg(long = "expires-at")]
+        expires_at: Option<String>,
+        #[arg(long = "max-uses")]
+        max_uses: Option<u32>,
+        /// Disable the template (update only).
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Delete an approval template by id.
+    ApprovalTemplateDelete { id: String },
+    /// Show the project approval attention policy.
+    ApprovalPolicy {
+        #[arg(long)]
+        project: String,
+    },
+    /// Update the project approval attention policy.
+    ApprovalPolicySet {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long = "max-pending")]
+        max_pending: Option<u32>,
+        #[arg(long = "coalesce-secs")]
+        coalesce_secs: Option<u64>,
+        #[arg(long = "stale-secs")]
+        stale_secs: Option<u64>,
+        #[arg(long = "priority-boost-risk")]
+        priority_boost_risk: Option<String>,
+        #[arg(long = "notify-coalesce-secs")]
+        notify_coalesce_secs: Option<u64>,
+    },
+    /// List project approval audit rows (template matches and mutations).
+    ApprovalAudit {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
     },
     /// List blocking user questions.
     Questions {
@@ -6561,8 +6638,234 @@ async fn main() -> Result<()> {
         Command::Diff { session } => {
             rpc(&discovery, "session.diff", json!({"session_id": session})).await?
         }
-        Command::Approvals { session } => {
-            rpc(&discovery, "approval.list", json!({"session_id": session})).await?
+        Command::Approvals { session, project } => {
+            let project = match project {
+                Some(project) => Some(resolve_project(&discovery, Some(&project)).await?),
+                None => None,
+            };
+            rpc(
+                &discovery,
+                "approval.queue",
+                json!({"session_id": session, "project_id": project}),
+            )
+            .await?
+        }
+        Command::ApprovalBatch { approve, deny } => {
+            if approve.is_empty() && deny.is_empty() {
+                bail!("approval-batch needs at least one --approve or --deny id");
+            }
+            if let Some(id) = approve.iter().find(|id| deny.contains(id)) {
+                bail!("approval id '{id}' appears in both --approve and --deny");
+            }
+            let mut decisions = Vec::new();
+            decisions.extend(
+                approve
+                    .into_iter()
+                    .map(|id| json!({"approval_id": id, "approved": true})),
+            );
+            decisions.extend(
+                deny.into_iter()
+                    .map(|id| json!({"approval_id": id, "approved": false})),
+            );
+            rpc(
+                &discovery,
+                "approval.batch.resolve",
+                json!({"decisions": decisions}),
+            )
+            .await?
+        }
+        Command::ApprovalTemplate { project } => {
+            let project = resolve_project(&discovery, project.as_deref()).await?;
+            rpc(
+                &discovery,
+                "approval.templates",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ApprovalTemplateSet {
+            project,
+            id,
+            name,
+            tool_pattern,
+            risk,
+            path_glob,
+            action,
+            expires_at,
+            max_uses,
+            disabled,
+        } => {
+            let project = resolve_project(&discovery, project.as_deref()).await?;
+            if let Some(id) = id {
+                let current = rpc(
+                    &discovery,
+                    "approval.templates",
+                    json!({"project_id": project}),
+                )
+                .await?;
+                let existing = current
+                    .get("templates")
+                    .and_then(Value::as_array)
+                    .and_then(|templates| {
+                        templates.iter().find(|template| {
+                            template.get("id").and_then(Value::as_str) == Some(&id)
+                        })
+                    })
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("approval template not found: {id}"))?;
+                let name = name.unwrap_or_else(|| {
+                    existing
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("template")
+                        .to_string()
+                });
+                let tool_pattern = tool_pattern.unwrap_or_else(|| {
+                    existing
+                        .get("tool_pattern")
+                        .and_then(Value::as_str)
+                        .unwrap_or("write_file")
+                        .to_string()
+                });
+                let action = action.unwrap_or_else(|| {
+                    existing
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("allow")
+                        .to_string()
+                });
+                let risk = if risk.is_empty() {
+                    existing
+                        .get("risk_levels")
+                        .and_then(Value::as_array)
+                        .map(|levels| {
+                            levels
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    risk
+                };
+                let path_glob = if path_glob.is_empty() {
+                    existing
+                        .get("path_globs")
+                        .and_then(Value::as_array)
+                        .map(|globs| {
+                            globs
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    path_glob
+                };
+                rpc(
+                    &discovery,
+                    "approval.template.update",
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "enabled": !disabled,
+                        "tool_pattern": tool_pattern,
+                        "risk_levels": risk,
+                        "path_globs": path_glob,
+                        "action": action,
+                        "expires_at": expires_at.or_else(|| {
+                            existing.get("expires_at").cloned().and_then(|value| value.as_str().map(str::to_string))
+                        }),
+                        "max_uses": max_uses.or_else(|| {
+                            existing.get("max_uses").and_then(Value::as_u64).map(|value| value as u32)
+                        }),
+                    }),
+                )
+                .await?
+            } else {
+                let name = name.ok_or_else(|| anyhow::anyhow!("--name is required"))?;
+                let tool_pattern =
+                    tool_pattern.ok_or_else(|| anyhow::anyhow!("--tool-pattern is required"))?;
+                let action = action.ok_or_else(|| anyhow::anyhow!("--action is required"))?;
+                rpc(
+                    &discovery,
+                    "approval.template.create",
+                    json!({
+                        "project_id": project,
+                        "name": name,
+                        "tool_pattern": tool_pattern,
+                        "risk_levels": risk,
+                        "path_globs": path_glob,
+                        "action": action,
+                        "expires_at": expires_at,
+                        "max_uses": max_uses,
+                    }),
+                )
+                .await?
+            }
+        }
+        Command::ApprovalTemplateDelete { id } => {
+            rpc(&discovery, "approval.template.delete", json!({"id": id})).await?
+        }
+        Command::ApprovalPolicy { project } => {
+            rpc(
+                &discovery,
+                "approval.policy",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ApprovalPolicySet {
+            project,
+            enabled,
+            max_pending,
+            coalesce_secs,
+            stale_secs,
+            priority_boost_risk,
+            notify_coalesce_secs,
+        } => {
+            let current = rpc(
+                &discovery,
+                "approval.policy",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(enabled) = enabled {
+                policy["enabled"] = json!(enabled);
+            }
+            if let Some(max_pending) = max_pending {
+                policy["max_pending_per_session"] = json!(max_pending);
+            }
+            if let Some(coalesce_secs) = coalesce_secs {
+                policy["coalesce_window_secs"] = json!(coalesce_secs);
+            }
+            if let Some(stale_secs) = stale_secs {
+                policy["stale_after_secs"] = json!(stale_secs);
+            }
+            if let Some(priority_boost_risk) = priority_boost_risk {
+                policy["priority_boost_risk"] = json!(priority_boost_risk);
+            }
+            if let Some(notify_coalesce_secs) = notify_coalesce_secs {
+                policy["notify_coalesce_secs"] = json!(notify_coalesce_secs);
+            }
+            rpc(
+                &discovery,
+                "approval.policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::ApprovalAudit { project, limit } => {
+            let project = resolve_project(&discovery, Some(&project)).await?;
+            rpc(
+                &discovery,
+                "approval.audit",
+                json!({"project_id": project, "limit": limit}),
+            )
+            .await?
         }
         Command::Questions { session } => {
             rpc(&discovery, "question.list", json!({"session_id": session})).await?
@@ -6619,6 +6922,38 @@ fn read_discovery(data_dir: Option<&Path>) -> Result<Discovery> {
     let discovery: Discovery =
         serde_json::from_slice(&data).context("parsing daemon discovery file")?;
     Ok(discovery)
+}
+
+async fn resolve_project(discovery: &Discovery, requested: Option<&str>) -> Result<String> {
+    let projects = rpc(discovery, "project.list", json!({})).await?;
+    let projects = projects
+        .get("projects")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(requested) = requested {
+        if let Some(project) = projects.iter().find(|project| {
+            project.get("id").and_then(Value::as_str) == Some(requested)
+                || project
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+        }) && let Some(id) = project.get("id").and_then(Value::as_str)
+        {
+            return Ok(id.to_string());
+        }
+        // Allow an explicit id that the daemon can resolve later.
+        return Ok(requested.to_string());
+    }
+    match projects.as_slice() {
+        [project] => project
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("project list returned a malformed project")),
+        [] => bail!("no projects configured; pass --project"),
+        _ => bail!("multiple projects configured; pass --project"),
+    }
 }
 
 async fn rpc(discovery: &Discovery, method: &str, params: Value) -> Result<Value> {
@@ -10970,11 +11305,23 @@ fn print_human(value: &Value) {
         }
         for approval in approvals {
             println!(
-                "{}  {}  [{}]",
+                "{}  {}  [{}]  risk={}  waiters={}  priority={}",
                 approval["id"].as_str().unwrap_or("?"),
                 approval["tool"].as_str().unwrap_or("?"),
-                approval["status"].as_str().unwrap_or("?")
+                approval["status"].as_str().unwrap_or("?"),
+                approval["approval_risk"].as_str().unwrap_or("-"),
+                approval["waiter_count"].as_u64().unwrap_or(0),
+                approval["priority"].as_i64().unwrap_or(0)
             );
+            if let Some(template) = approval["template_id"].as_str() {
+                println!("  template {template}");
+            }
+            if let Some(expires) = approval["expires_at"].as_str() {
+                println!("  expires {expires}");
+            }
+            if let Some(reason) = approval["approval_reason"].as_str() {
+                println!("  reason {reason}");
+            }
             println!("  {}", approval["input"]);
         }
         return;
@@ -13358,5 +13705,144 @@ mod test_cache_cli_tests {
         assert!(text.contains("test impact"));
         assert!(text.contains("tests/smoke.rs"));
         assert!(text.contains("LEXICAL") || text.contains("lexical"));
+    }
+}
+
+#[cfg(test)]
+mod approval_optimizer_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// The full CLI enum is large; parse on a generously sized thread so the
+    /// test reflects parsing behavior rather than the test harness's 2 MiB
+    /// stack.
+    fn parse(args: &[&str]) -> Cli {
+        let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args).unwrap())
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn parses_explicit_batch_decisions() {
+        let cli = parse(&[
+            "vp",
+            "approval-batch",
+            "--approve",
+            "a1",
+            "--approve",
+            "a2",
+            "--deny",
+            "a3",
+        ]);
+        match cli.command {
+            Command::ApprovalBatch { approve, deny } => {
+                assert_eq!(approve, vec!["a1", "a2"]);
+                assert_eq!(deny, vec!["a3"]);
+            }
+            _ => panic!("expected approval batch"),
+        }
+    }
+
+    #[test]
+    fn parses_template_create_and_update_flags() {
+        let cli = parse(&[
+            "vp",
+            "approval-template-set",
+            "--project",
+            "p1",
+            "--name",
+            "src writes",
+            "--tool-pattern",
+            "write_*",
+            "--risk",
+            "workspace_write",
+            "--path-glob",
+            "src/**",
+            "--action",
+            "allow",
+            "--max-uses",
+            "5",
+        ]);
+        match cli.command {
+            Command::ApprovalTemplateSet {
+                project,
+                name,
+                tool_pattern,
+                risk,
+                path_glob,
+                action,
+                max_uses,
+                ..
+            } => {
+                assert_eq!(project.as_deref(), Some("p1"));
+                assert_eq!(name.as_deref(), Some("src writes"));
+                assert_eq!(tool_pattern.as_deref(), Some("write_*"));
+                assert_eq!(risk, vec!["workspace_write"]);
+                assert_eq!(path_glob, vec!["src/**"]);
+                assert_eq!(action.as_deref(), Some("allow"));
+                assert_eq!(max_uses, Some(5));
+            }
+            _ => panic!("expected approval template set"),
+        }
+    }
+
+    #[test]
+    fn parses_attention_policy_updates() {
+        let cli = parse(&[
+            "vp",
+            "approval-policy-set",
+            "--project",
+            "p1",
+            "--max-pending",
+            "12",
+            "--coalesce-secs",
+            "30",
+            "--stale-secs",
+            "600",
+            "--priority-boost-risk",
+            "destructive",
+            "--notify-coalesce-secs",
+            "15",
+        ]);
+        match cli.command {
+            Command::ApprovalPolicySet {
+                project,
+                max_pending,
+                coalesce_secs,
+                stale_secs,
+                priority_boost_risk,
+                notify_coalesce_secs,
+                ..
+            } => {
+                assert_eq!(project, "p1");
+                assert_eq!(max_pending, Some(12));
+                assert_eq!(coalesce_secs, Some(30));
+                assert_eq!(stale_secs, Some(600));
+                assert_eq!(priority_boost_risk.as_deref(), Some("destructive"));
+                assert_eq!(notify_coalesce_secs, Some(15));
+            }
+            _ => panic!("expected approval policy set"),
+        }
+    }
+
+    #[test]
+    fn approval_queue_human_output_includes_attention_fields() {
+        let value = serde_json::json!({
+            "approvals": [{
+                "id": "a1",
+                "tool": "write_file",
+                "status": "pending",
+                "approval_risk": "workspace_write",
+                "waiter_count": 3,
+                "priority": 42,
+                "input": {"path": "src/lib.rs"}
+            }],
+            "pending_count": 1
+        });
+        print_human(&value);
     }
 }

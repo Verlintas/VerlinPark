@@ -136,6 +136,9 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             store.set_orchestration_policy(&snapshot.project.id, &snapshot.orchestration_policy)?;
             store.set_critical_path_policy(&snapshot.project.id, &snapshot.critical_path_policy)?;
             store.restore_approval_grants(&snapshot.project.id, &snapshot.approval_grants)?;
+            store.restore_approval_templates(&snapshot.project.id, &snapshot.approval_templates)?;
+            store.set_attention_policy(&snapshot.project.id, &snapshot.attention_policy)?;
+            store.restore_approval_audit(&snapshot.project.id, &snapshot.approval_audit)?;
             for skill in &snapshot.skills {
                 store.insert_skill(skill)?;
             }

@@ -74,6 +74,11 @@ enum JSONValue: Codable, Hashable, Sendable {
         return value
     }
 
+    var arrayValue: [JSONValue]? {
+        guard case let .array(value) = self else { return nil }
+        return value
+    }
+
     var shortDescription: String {
         switch self {
         case .null:

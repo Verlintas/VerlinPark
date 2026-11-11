@@ -12777,3 +12777,571 @@ mod budget_governor_engine_tests {
         assert_eq!(manifest[0].critical_path_policy, policy);
     }
 }
+
+#[tokio::test]
+async fn approval_template_allow_is_atomic_and_audited() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("approval".into()),
+        )
+        .await
+        .unwrap();
+    let _session = engine
+        .create_session(project.id.clone(), "template precedence".into(), None)
+        .await
+        .unwrap();
+    let created = engine
+        .create_approval_template(vp_protocol::types::ApprovalTemplateCreateParams {
+            project_id: project.id.clone(),
+            name: "src writes".into(),
+            tool_pattern: "write_file".into(),
+            risk_levels: vec!["workspace_write".into()],
+            path_globs: vec!["src/**".into()],
+            action: "allow".into(),
+            expires_at: None,
+            max_uses: Some(1),
+            created_by: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let assessment = crate::permissions::PermissionAssessment::new(
+        crate::permissions::RiskLevel::WorkspaceWrite,
+        "workspace write",
+    );
+    let first = engine
+        .evaluate_tool_permission(
+            "s1",
+            &project.id,
+            &assessment,
+            "write_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            vp_protocol::types::ApprovalMode::Strict,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        first.source,
+        crate::approvals::ApprovalDecisionSource::TemplateAllow
+    );
+    assert_eq!(
+        first.template_id.as_deref(),
+        Some(created.template.id.as_str())
+    );
+    assert_eq!(first.remaining_uses, Some(0));
+
+    let second = engine
+        .evaluate_tool_permission(
+            "s1",
+            &project.id,
+            &assessment,
+            "write_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            vp_protocol::types::ApprovalMode::Strict,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        second.source,
+        crate::approvals::ApprovalDecisionSource::RiskPolicy
+    );
+    assert!(matches!(
+        second.decision,
+        crate::permissions::ApprovalDecision::Ask { .. }
+    ));
+    let audit = engine.approval_audit(&project.id, None).await.unwrap();
+    assert!(audit.events.iter().any(|event| {
+        event.kind == "approval.template.matched"
+            && event.payload["template_id"] == created.template.id
+            && event.payload["remaining_uses"] == 0
+    }));
+}
+
+#[tokio::test]
+async fn approval_deny_template_beats_project_grant() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("deny".into()),
+        )
+        .await
+        .unwrap();
+    engine
+        .create_approval_grant(&project.id, "write_file", "src", true, "test")
+        .await
+        .unwrap();
+    engine
+        .create_approval_template(vp_protocol::types::ApprovalTemplateCreateParams {
+            project_id: project.id.clone(),
+            name: "deny secrets".into(),
+            tool_pattern: "write_file".into(),
+            risk_levels: vec!["workspace_write".into()],
+            path_globs: vec!["src/secrets/**".into()],
+            action: "deny".into(),
+            expires_at: None,
+            max_uses: None,
+            created_by: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let assessment = crate::permissions::PermissionAssessment::new(
+        crate::permissions::RiskLevel::WorkspaceWrite,
+        "workspace write",
+    );
+    let evaluation = engine
+        .evaluate_tool_permission(
+            "s1",
+            &project.id,
+            &assessment,
+            "write_file",
+            &serde_json::json!({"path": "src/secrets/key.txt"}),
+            vp_protocol::types::ApprovalMode::Smart,
+            false,
+        )
+        .unwrap();
+    assert!(matches!(
+        evaluation.decision,
+        crate::permissions::ApprovalDecision::Deny { .. }
+    ));
+    assert_eq!(
+        evaluation.source,
+        crate::approvals::ApprovalDecisionSource::TemplateDeny
+    );
+}
+
+#[tokio::test]
+async fn approval_templates_never_cover_host_state() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("host".into()),
+        )
+        .await
+        .unwrap();
+    let assessment = crate::permissions::PermissionAssessment::new(
+        crate::permissions::RiskLevel::HostState,
+        "host state",
+    );
+    let evaluation = engine
+        .evaluate_tool_permission(
+            "s1",
+            &project.id,
+            &assessment,
+            "computer",
+            &serde_json::json!({"action": "click"}),
+            vp_protocol::types::ApprovalMode::Smart,
+            false,
+        )
+        .unwrap();
+    assert!(matches!(
+        evaluation.decision,
+        crate::permissions::ApprovalDecision::Ask { .. }
+    ));
+    assert_eq!(
+        evaluation.source,
+        crate::approvals::ApprovalDecisionSource::RiskPolicy
+    );
+}
+
+#[tokio::test]
+async fn duplicate_approval_requests_coalesce_and_resolve_every_waiter() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("dedup".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "dedup approvals".into(), None)
+        .await
+        .unwrap();
+    let agent = serde_json::json!({
+        "agent_id": "worker-1",
+        "agent_name": "Worker",
+        "agent_role": "worker"
+    });
+    let (first, first_rx) = engine
+        .request_approval_with_risk(
+            &session.id,
+            "call-1",
+            "write_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            Some(agent.clone()),
+            Some("workspace_write"),
+            Some("workspace write"),
+        )
+        .await
+        .unwrap();
+    let (second, second_rx) = engine
+        .request_approval_with_risk(
+            &session.id,
+            "call-2",
+            "write_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            Some(agent),
+            Some("workspace_write"),
+            Some("workspace write"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.id, second.id);
+    assert_eq!(second.waiter_count, 2);
+    assert!(engine.resolve_approval(&first.id, true).await.unwrap());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), first_rx)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), second_rx)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "approval.coalesced")
+    );
+    assert!(events.iter().any(|event| event.kind == "approval.created"));
+}
+
+#[tokio::test]
+async fn batch_approval_resolution_reports_partial_failures() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("batch".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "batch approvals".into(), None)
+        .await
+        .unwrap();
+    let (first, _) = engine
+        .request_approval_with_risk(
+            &session.id,
+            "call-1",
+            "write_file",
+            serde_json::json!({"path": "a.txt"}),
+            None,
+            Some("workspace_write"),
+            Some("write"),
+        )
+        .await
+        .unwrap();
+    let (second, _) = engine
+        .request_approval_with_risk(
+            &session.id,
+            "call-2",
+            "write_file",
+            serde_json::json!({"path": "b.txt"}),
+            None,
+            Some("workspace_write"),
+            Some("write"),
+        )
+        .await
+        .unwrap();
+    engine.resolve_approval(&first.id, true).await.unwrap();
+    let result = engine
+        .resolve_approvals(vec![
+            (first.id.clone(), true),
+            (second.id.clone(), false),
+            ("missing".into(), true),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(result.resolved_count, 1);
+    assert_eq!(result.failed_count, 2);
+    assert_eq!(
+        result.results[0].code.as_deref(),
+        Some("APPROVAL_NOT_PENDING")
+    );
+    assert!(result.results[1].resolved);
+    assert_eq!(
+        result.results[2].code.as_deref(),
+        Some("APPROVAL_NOT_FOUND")
+    );
+}
+
+#[tokio::test]
+async fn approval_sweep_expires_stale_rows_without_approving_them() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("sweep".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "stale approval".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_attention_policy(vp_protocol::types::AttentionPolicySetParams {
+            project_id: project.id,
+            policy: vp_protocol::types::AttentionPolicy {
+                enabled: true,
+                stale_after_secs: 60,
+                ..vp_protocol::types::AttentionPolicy::default()
+            },
+        })
+        .await
+        .unwrap();
+    let approval = engine
+        .store()
+        .create_approval_deduplicated(
+            &session.id,
+            "call-old",
+            "write_file",
+            &serde_json::json!({"path": "old.txt"}),
+            None,
+            Some("workspace_write"),
+            Some("old"),
+            Some("old-key"),
+            Some("old-scope"),
+            0,
+            Some("2020-01-01T00:00:00Z"),
+            0,
+            0,
+            64,
+            "host_state",
+        )
+        .unwrap();
+    let expired = engine.sweep_expired_approvals().await.unwrap();
+    assert_eq!(expired, 1);
+    let stored = engine
+        .store()
+        .get_approval(&approval.approval.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "expired");
+    let events = engine.list_events(session.id, 0, 100).await.unwrap();
+    assert!(events.iter().any(|event| event.kind == "approval.expired"));
+}
+
+#[tokio::test]
+async fn approval_policy_and_templates_survive_manifest_round_trip() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("manifest".into()),
+        )
+        .await
+        .unwrap();
+    engine
+        .set_attention_policy(vp_protocol::types::AttentionPolicySetParams {
+            project_id: project.id.clone(),
+            policy: vp_protocol::types::AttentionPolicy {
+                enabled: true,
+                max_pending_per_session: 7,
+                ..vp_protocol::types::AttentionPolicy::default()
+            },
+        })
+        .await
+        .unwrap();
+    engine
+        .create_approval_template(vp_protocol::types::ApprovalTemplateCreateParams {
+            project_id: project.id.clone(),
+            name: "manifest template".into(),
+            tool_pattern: "write_file".into(),
+            risk_levels: vec!["workspace_write".into()],
+            path_globs: vec!["src/**".into()],
+            action: "allow".into(),
+            expires_at: None,
+            max_uses: Some(4),
+            created_by: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    engine.record_project_manifest().await.unwrap();
+    let snapshots = vp_store::store::read_project_manifest(engine.store().data_dir()).unwrap();
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.attention_policy.max_pending_per_session, 7);
+    assert_eq!(snapshot.approval_templates.len(), 1);
+    assert_eq!(snapshot.approval_templates[0].max_uses, Some(4));
+    assert!(
+        snapshot
+            .approval_audit
+            .iter()
+            .any(|event| event.kind == "approval.policy.updated")
+    );
+}
+
+#[tokio::test]
+async fn approval_coalescing_replays_and_exports_in_a_bundle() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("replay".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "replay approvals".into(), None)
+        .await
+        .unwrap();
+    let (first, _) = engine
+        .request_approval_with_risk(
+            &session.id,
+            "call-1",
+            "write_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            Some(serde_json::json!({"agent_id": "worker-1"})),
+            Some("workspace_write"),
+            Some("write"),
+        )
+        .await
+        .unwrap();
+    let (second, _) = engine
+        .request_approval_with_risk(
+            &session.id,
+            "call-2",
+            "write_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            Some(serde_json::json!({"agent_id": "worker-1"})),
+            Some("workspace_write"),
+            Some("write"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.id, second.id);
+    engine.resolve_approval(&first.id, false).await.unwrap();
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
+    assert!(report.approvals_matches);
+
+    let bundle = engine.export_session(&session.id).await.unwrap();
+    assert_eq!(bundle.approvals.len(), 1);
+    assert_eq!(bundle.approvals[0].waiter_count, 2);
+    assert_eq!(bundle.approvals[0].status, "denied");
+    assert!(
+        bundle
+            .events
+            .iter()
+            .any(|event| event.kind == "approval.coalesced")
+    );
+    assert!(
+        bundle
+            .events
+            .iter()
+            .any(|event| event.kind == "approval.created")
+    );
+    let decoded = serde_json::from_value::<vp_protocol::types::SessionBundle>(
+        serde_json::to_value(&bundle).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(decoded.approvals[0].waiter_count, 2);
+}
+
+#[tokio::test]
+async fn db_rebuild_restores_approval_templates_policy_and_audit() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let project_id = {
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("rebuild".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "rebuild approvals".into(), None)
+            .await
+            .unwrap();
+        engine
+            .set_attention_policy(vp_protocol::types::AttentionPolicySetParams {
+                project_id: project.id.clone(),
+                policy: vp_protocol::types::AttentionPolicy {
+                    enabled: true,
+                    max_pending_per_session: 9,
+                    ..vp_protocol::types::AttentionPolicy::default()
+                },
+            })
+            .await
+            .unwrap();
+        engine
+            .create_approval_template(vp_protocol::types::ApprovalTemplateCreateParams {
+                project_id: project.id.clone(),
+                name: "rebuild template".into(),
+                tool_pattern: "write_file".into(),
+                risk_levels: vec!["workspace_write".into()],
+                path_globs: vec!["src/**".into()],
+                action: "allow".into(),
+                expires_at: None,
+                max_uses: Some(2),
+                created_by: Some("test".into()),
+            })
+            .await
+            .unwrap();
+        // Ensure the session mirror exists for the archive rebuild.
+        let _ = session;
+        project.id
+    };
+    let report = crate::rebuild::rebuild_database(data.path(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.projects, 1);
+    let store = Store::open(data.path()).unwrap();
+    let policy = store.get_attention_policy(&project_id).unwrap();
+    assert_eq!(policy.max_pending_per_session, 9);
+    let templates = store.list_approval_templates(&project_id).unwrap();
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].max_uses, Some(2));
+    let audit = store.list_approval_audit(&project_id, None).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|event| event.kind == "approval.template.created")
+    );
+    assert!(
+        audit
+            .iter()
+            .any(|event| event.kind == "approval.policy.updated")
+    );
+}

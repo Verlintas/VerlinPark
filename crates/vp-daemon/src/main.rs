@@ -39,18 +39,22 @@ use vp_protocol::test_cache::{
 use vp_protocol::types::{
     AcpAgentConfig, AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams,
     AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
-    AnswerQuestionResult, ApprovalGrantCreateParams, ApprovalGrantCreateResult,
+    AnswerQuestionResult, ApprovalAuditParams, ApprovalBatchResolveParams,
+    ApprovalBatchResolveResult, ApprovalGrantCreateParams, ApprovalGrantCreateResult,
     ApprovalGrantDeleteParams, ApprovalGrantDeleteResult, ApprovalGrantListParams,
-    ApprovalGrantListResult, ApprovalListResult, ArtifactBackfillParams, ArtifactDiffParams,
-    ArtifactGcParams, ArtifactGetParams, ArtifactListParams, ArtifactListResult,
-    ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult, ArtifactRestoreParams,
-    ArtifactResult, ArtifactVersionsParams, AuthParams, AuthResult, CachePolicyParams,
-    CachePolicyResult, CancelSessionParams, CancelSessionResult, CheckpointPolicyParams,
-    CleanupWorktreesParams, CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams,
-    ConsoleOpenParams, ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams,
-    ContextCheckpointCreateParams, ContextCheckpointDeleteParams, ContextCheckpointDetailParams,
-    ContextCheckpointListParams, ContextCheckpointPolicyParams, ContextCheckpointPruneParams,
-    ContextRestoreParams, CreateModelPresetParams, CreateSessionParams, CriticalPathPolicyParams,
+    ApprovalGrantListResult, ApprovalListResult, ApprovalQueueParams, ApprovalTemplateCreateParams,
+    ApprovalTemplateDeleteParams, ApprovalTemplateFromApprovalParams, ApprovalTemplateListParams,
+    ApprovalTemplateListResult, ApprovalTemplateUpdateParams, ArtifactBackfillParams,
+    ArtifactDiffParams, ArtifactGcParams, ArtifactGetParams, ArtifactListParams,
+    ArtifactListResult, ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult,
+    ArtifactRestoreParams, ArtifactResult, ArtifactVersionsParams, AttentionPolicyGetParams,
+    AttentionPolicySetParams, AuthParams, AuthResult, CachePolicyParams, CachePolicyResult,
+    CancelSessionParams, CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams,
+    CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
+    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, ContextCheckpointCreateParams,
+    ContextCheckpointDeleteParams, ContextCheckpointDetailParams, ContextCheckpointListParams,
+    ContextCheckpointPolicyParams, ContextCheckpointPruneParams, ContextRestoreParams,
+    CreateModelPresetParams, CreateSessionParams, CriticalPathPolicyParams,
     CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult, DashboardParams,
     DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult,
     ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams, GovernorPreviewParams,
@@ -157,8 +161,20 @@ struct AppState {
     pid: u32,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Recursive Leader -> Manager -> Worker -> Labour delegation keeps a boxed
+/// async future per level. Give daemon workers a deterministic stack budget so
+/// a deep team graph cannot overflow the default 2 MiB worker stack.
+const DAEMON_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(DAEMON_WORKER_STACK_BYTES)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -246,6 +262,7 @@ async fn main() -> Result<()> {
     spawn_task_stall_sweeper(state.engine.clone());
     spawn_stall_recovery_reconciler(state.agent.clone());
     spawn_process_sweeper(state.engine.clone());
+    spawn_approval_sweeper(state.engine.clone());
     spawn_orchestration_controller(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
@@ -3989,8 +4006,120 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(resolved) => RpcResponse::success(id, ResolveApprovalResult { resolved }),
-                Err(error) => internal_error(id, error),
+                Err(error) => approval_error(id, error),
             },
+            Err(response) => response_with_id(id, response),
+        },
+        "approval.queue" => match parse_params::<ApprovalQueueParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .approval_queue(params.session_id, params.project_id)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => approval_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "approval.batch.resolve" => {
+            match parse_params::<ApprovalBatchResolveParams>(request.params) {
+                Ok(params) => {
+                    let decisions = params
+                        .decisions
+                        .into_iter()
+                        .map(|decision| (decision.approval_id, decision.approved))
+                        .collect::<Vec<_>>();
+                    match state.engine.resolve_approvals(decisions).await {
+                        Ok(result) => RpcResponse::success(
+                            id,
+                            ApprovalBatchResolveResult {
+                                results: result.results,
+                                resolved_count: result.resolved_count,
+                                failed_count: result.failed_count,
+                            },
+                        ),
+                        Err(error) => approval_error(id, error),
+                    }
+                }
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "approval.templates" | "approval.template.list" => {
+            match parse_params::<ApprovalTemplateListParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .list_approval_templates(&params.project_id)
+                    .await
+                {
+                    Ok(templates) => {
+                        RpcResponse::success(id, ApprovalTemplateListResult { templates })
+                    }
+                    Err(error) => approval_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "approval.template.create" => {
+            match parse_params::<ApprovalTemplateCreateParams>(request.params) {
+                Ok(params) => match state.engine.create_approval_template(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => approval_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "approval.template.update" => {
+            match parse_params::<ApprovalTemplateUpdateParams>(request.params) {
+                Ok(params) => match state.engine.update_approval_template(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => approval_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "approval.template.delete" => {
+            match parse_params::<ApprovalTemplateDeleteParams>(request.params) {
+                Ok(params) => match state.engine.delete_approval_template(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => approval_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "approval.template.from_approval" => {
+            match parse_params::<ApprovalTemplateFromApprovalParams>(request.params) {
+                Ok(params) => match state.engine.approval_template_from_approval(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => approval_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "approval.policy" => match parse_params::<AttentionPolicyGetParams>(request.params) {
+            Ok(params) => match state.engine.get_attention_policy(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => approval_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "approval.policy.set" => match parse_params::<AttentionPolicySetParams>(request.params) {
+            Ok(params) => match state.engine.set_attention_policy(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => approval_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "approval.audit" => match parse_params::<ApprovalAuditParams>(request.params) {
+            Ok(params) => {
+                match state
+                    .engine
+                    .approval_audit(&params.project_id, params.limit)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => approval_error(id, error),
+                }
+            }
             Err(response) => response_with_id(id, response),
         },
         "event.subscribe" => RpcResponse::success(id, json!({"subscribed": true})),
@@ -4041,6 +4170,42 @@ fn response_with_id(id: Option<Value>, error: RpcError) -> RpcResponse {
 
 fn internal_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(id, RpcError::new(codes::INTERNAL_ERROR, error.to_string()))
+}
+
+/// Approval rule failures are typed with the Q3 catalog. Invalid template or
+/// policy input is a client error; everything else stays an internal error.
+fn approval_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(rule) = error.downcast_ref::<vp_core::approvals::ApprovalRuleError>() {
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(codes::INVALID_PARAMS, rule.to_string(), rule.data()),
+        );
+    }
+    RpcResponse::error(id, RpcError::new(codes::INVALID_PARAMS, error.to_string()))
+}
+
+/// Expire stale pending approvals for projects with attention enabled. The
+/// sweep never approves; it denies the waiting agents and emits
+/// `approval.expired` for each row.
+fn spawn_approval_sweeper(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_APPROVAL_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        loop {
+            interval.tick().await;
+            match engine.sweep_expired_approvals().await {
+                Ok(0) => {}
+                Ok(expired) => tracing::info!(expired, "approval attention sweep"),
+                Err(error) => tracing::warn!(%error, "approval attention sweep failed"),
+            }
+        }
+    });
 }
 
 fn spawn_process_sweeper(engine: Engine) {

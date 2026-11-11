@@ -449,6 +449,7 @@ struct DashboardView: View {
         case .policies:
             if let project = model.selectedProject {
                 ShellPolicyCard(project: project)
+                ApprovalOptimizerCard(project: project)
                 IntegrationPolicyCard(project: project)
                 GuiPolicyCard(project: project)
             } else {

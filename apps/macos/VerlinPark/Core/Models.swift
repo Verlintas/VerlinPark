@@ -3013,11 +3013,38 @@ struct Approval: Codable, Identifiable, Hashable, Sendable {
     let agentName: String?
     let agentRole: String?
     let agentTitle: String?
+    let agentId: String?
+    let taskId: String?
     let approvalRisk: String?
     let approvalReason: String?
+    let waiterCount: Int
+    let templateId: String?
+    let priority: Int
+    let expiresAt: String?
+    let notify: Bool
+    let notifyKey: String?
+    let dedupKey: String?
 
     var isDenied: Bool {
         status == "denied"
+    }
+
+    var isPending: Bool {
+        status == "pending"
+    }
+
+    var attentionLabel: String {
+        var parts: [String] = []
+        if waiterCount > 1 {
+            parts.append("\(waiterCount) waiters")
+        }
+        if priority != 0 {
+            parts.append("criticality \(priority)")
+        }
+        if let templateId, !templateId.isEmpty {
+            parts.append("template \(templateId.prefix(8))")
+        }
+        return parts.joined(separator: " · ")
     }
 
     enum CodingKeys: String, CodingKey {
@@ -3032,8 +3059,230 @@ struct Approval: Codable, Identifiable, Hashable, Sendable {
         case agentName = "agent_name"
         case agentRole = "agent_role"
         case agentTitle = "agent_title"
+        case agentId = "agent_id"
+        case taskId = "task_id"
         case approvalRisk = "approval_risk"
         case approvalReason = "approval_reason"
+        case waiterCount = "waiter_count"
+        case templateId = "template_id"
+        case priority
+        case expiresAt = "expires_at"
+        case notify
+        case notifyKey = "notify_key"
+        case dedupKey = "dedup_key"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        toolCallId = try container.decode(String.self, forKey: .toolCallId)
+        tool = try container.decode(String.self, forKey: .tool)
+        input = try container.decodeIfPresent(JSONValue.self, forKey: .input) ?? .null
+        status = try container.decode(String.self, forKey: .status)
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+        resolvedAt = try container.decodeIfPresent(String.self, forKey: .resolvedAt)
+        agentName = try container.decodeIfPresent(String.self, forKey: .agentName)
+        agentRole = try container.decodeIfPresent(String.self, forKey: .agentRole)
+        agentTitle = try container.decodeIfPresent(String.self, forKey: .agentTitle)
+        agentId = try container.decodeIfPresent(String.self, forKey: .agentId)
+        taskId = try container.decodeIfPresent(String.self, forKey: .taskId)
+        approvalRisk = try container.decodeIfPresent(String.self, forKey: .approvalRisk)
+        approvalReason = try container.decodeIfPresent(String.self, forKey: .approvalReason)
+        waiterCount = try container.decodeIfPresent(Int.self, forKey: .waiterCount) ?? 0
+        templateId = try container.decodeIfPresent(String.self, forKey: .templateId)
+        priority = try container.decodeIfPresent(Int.self, forKey: .priority) ?? 0
+        expiresAt = try container.decodeIfPresent(String.self, forKey: .expiresAt)
+        notify = try container.decodeIfPresent(Bool.self, forKey: .notify) ?? false
+        notifyKey = try container.decodeIfPresent(String.self, forKey: .notifyKey)
+        dedupKey = try container.decodeIfPresent(String.self, forKey: .dedupKey)
+    }
+}
+
+struct ApprovalTemplate: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let name: String
+    let enabled: Bool
+    let toolPattern: String
+    let riskLevels: [String]
+    let pathGlobs: [String]
+    let action: String
+    let expiresAt: String?
+    let maxUses: Int?
+    let usedCount: Int
+    let createdBy: String
+    let createdAt: String
+    let updatedAt: String?
+
+    var remainingUses: Int? {
+        maxUses.map { max(0, $0 - usedCount) }
+    }
+
+    var isExhausted: Bool {
+        remainingUses == 0
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case name
+        case enabled
+        case toolPattern = "tool_pattern"
+        case riskLevels = "risk_levels"
+        case pathGlobs = "path_globs"
+        case action
+        case expiresAt = "expires_at"
+        case maxUses = "max_uses"
+        case usedCount = "used_count"
+        case createdBy = "created_by"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        name = try container.decode(String.self, forKey: .name)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        toolPattern = try container.decode(String.self, forKey: .toolPattern)
+        riskLevels = try container.decodeIfPresent([String].self, forKey: .riskLevels) ?? []
+        pathGlobs = try container.decodeIfPresent([String].self, forKey: .pathGlobs) ?? []
+        action = try container.decodeIfPresent(String.self, forKey: .action) ?? "allow"
+        expiresAt = try container.decodeIfPresent(String.self, forKey: .expiresAt)
+        maxUses = try container.decodeIfPresent(Int.self, forKey: .maxUses)
+        usedCount = try container.decodeIfPresent(Int.self, forKey: .usedCount) ?? 0
+        createdBy = try container.decode(String.self, forKey: .createdBy)
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt)
+    }
+}
+
+struct ApprovalTemplateListResult: Codable, Sendable {
+    let templates: [ApprovalTemplate]
+}
+
+struct ApprovalTemplateResult: Codable, Sendable {
+    let template: ApprovalTemplate
+}
+
+struct ApprovalTemplateDeleteResult: Codable, Sendable {
+    let deleted: Bool
+}
+
+struct AttentionPolicy: Codable, Hashable, Sendable {
+    var enabled: Bool = true
+    var maxPendingPerSession: Int = 64
+    var coalesceWindowSecs: Int = 120
+    var staleAfterSecs: Int = 86400
+    var priorityBoostRisk: String = "host_state"
+    var notifyCoalesceSecs: Int = 60
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case maxPendingPerSession = "max_pending_per_session"
+        case coalesceWindowSecs = "coalesce_window_secs"
+        case staleAfterSecs = "stale_after_secs"
+        case priorityBoostRisk = "priority_boost_risk"
+        case notifyCoalesceSecs = "notify_coalesce_secs"
+    }
+
+    init(
+        enabled: Bool = true,
+        maxPendingPerSession: Int = 64,
+        coalesceWindowSecs: Int = 120,
+        staleAfterSecs: Int = 86400,
+        priorityBoostRisk: String = "host_state",
+        notifyCoalesceSecs: Int = 60
+    ) {
+        self.enabled = enabled
+        self.maxPendingPerSession = maxPendingPerSession
+        self.coalesceWindowSecs = coalesceWindowSecs
+        self.staleAfterSecs = staleAfterSecs
+        self.priorityBoostRisk = priorityBoostRisk
+        self.notifyCoalesceSecs = notifyCoalesceSecs
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        maxPendingPerSession = try container.decodeIfPresent(Int.self, forKey: .maxPendingPerSession) ?? 64
+        coalesceWindowSecs = try container.decodeIfPresent(Int.self, forKey: .coalesceWindowSecs) ?? 120
+        staleAfterSecs = try container.decodeIfPresent(Int.self, forKey: .staleAfterSecs) ?? 86400
+        priorityBoostRisk = try container.decodeIfPresent(String.self, forKey: .priorityBoostRisk) ?? "host_state"
+        notifyCoalesceSecs = try container.decodeIfPresent(Int.self, forKey: .notifyCoalesceSecs) ?? 60
+    }
+}
+
+struct ApprovalPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: AttentionPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
+extension AttentionPolicy {
+    var jsonObject: [String: JSONValue] {
+        [
+            "enabled": .bool(enabled),
+            "max_pending_per_session": .number(Double(maxPendingPerSession)),
+            "coalesce_window_secs": .number(Double(coalesceWindowSecs)),
+            "stale_after_secs": .number(Double(staleAfterSecs)),
+            "priority_boost_risk": .string(priorityBoostRisk),
+            "notify_coalesce_secs": .number(Double(notifyCoalesceSecs)),
+        ]
+    }
+}
+
+struct ApprovalQueueResult: Codable, Sendable {
+    let approvals: [Approval]
+    let policy: AttentionPolicy
+    let pendingCount: Int
+    let generatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case approvals
+        case policy
+        case pendingCount = "pending_count"
+        case generatedAt = "generated_at"
+    }
+}
+
+struct ApprovalBatchItemResult: Codable, Identifiable, Sendable {
+    let approvalId: String
+    let resolved: Bool
+    let status: String?
+    let code: String?
+    let message: String?
+    let waiterCount: Int
+
+    var id: String {
+        approvalId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case approvalId = "approval_id"
+        case resolved
+        case status
+        case code
+        case message
+        case waiterCount = "waiter_count"
+    }
+}
+
+struct ApprovalBatchResolveResult: Codable, Sendable {
+    let results: [ApprovalBatchItemResult]
+    let resolvedCount: Int
+    let failedCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case results
+        case resolvedCount = "resolved_count"
+        case failedCount = "failed_count"
     }
 }
 

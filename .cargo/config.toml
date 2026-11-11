@@ -1,0 +1,4 @@
+# libtest spawns a thread per test. Deep recursive delegation futures need more
+# than the default 2 MiB; match the daemon's explicit worker stack budget.
+[env]
+RUST_MIN_STACK = "16777216"

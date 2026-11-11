@@ -3330,6 +3330,147 @@ actor CoreClient {
             .resolved
     }
 
+    func approvalQueue(sessionID: String?, projectID: String?) async throws -> ApprovalQueueResult {
+        try await request(
+            method: "approval.queue",
+            params: [
+                "session_id": sessionID.map(JSONValue.string) ?? .null,
+                "project_id": projectID.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(ApprovalQueueResult.self)
+    }
+
+    func resolveApprovals(_ decisions: [(String, Bool)]) async throws -> ApprovalBatchResolveResult {
+        let payload = decisions.map { id, approved in
+            JSONValue.object([
+                "approval_id": .string(id),
+                "approved": .bool(approved),
+            ])
+        }
+        return try await request(
+            method: "approval.batch.resolve",
+            params: ["decisions": .array(payload)]
+        )
+        .decode(ApprovalBatchResolveResult.self)
+    }
+
+    func listApprovalTemplates(projectID: String) async throws -> [ApprovalTemplate] {
+        try await request(
+            method: "approval.templates",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ApprovalTemplateListResult.self)
+        .templates
+    }
+
+    func createApprovalTemplate(
+        projectID: String,
+        name: String,
+        toolPattern: String,
+        riskLevels: [String],
+        pathGlobs: [String],
+        action: String,
+        expiresAt: String?,
+        maxUses: Int?
+    ) async throws -> ApprovalTemplate {
+        try await request(
+            method: "approval.template.create",
+            params: [
+                "project_id": .string(projectID),
+                "name": .string(name),
+                "tool_pattern": .string(toolPattern),
+                "risk_levels": .array(riskLevels.map(JSONValue.string)),
+                "path_globs": .array(pathGlobs.map(JSONValue.string)),
+                "action": .string(action),
+                "expires_at": expiresAt.map(JSONValue.string) ?? .null,
+                "max_uses": maxUses.map { .number(Double($0)) } ?? .null,
+                "created_by": .string("operator"),
+            ]
+        )
+        .decode(ApprovalTemplateResult.self)
+        .template
+    }
+
+    func updateApprovalTemplate(
+        id: String,
+        name: String,
+        enabled: Bool,
+        toolPattern: String,
+        riskLevels: [String],
+        pathGlobs: [String],
+        action: String,
+        expiresAt: String?,
+        maxUses: Int?
+    ) async throws -> ApprovalTemplate {
+        try await request(
+            method: "approval.template.update",
+            params: [
+                "id": .string(id),
+                "name": .string(name),
+                "enabled": .bool(enabled),
+                "tool_pattern": .string(toolPattern),
+                "risk_levels": .array(riskLevels.map(JSONValue.string)),
+                "path_globs": .array(pathGlobs.map(JSONValue.string)),
+                "action": .string(action),
+                "expires_at": expiresAt.map(JSONValue.string) ?? .null,
+                "max_uses": maxUses.map { .number(Double($0)) } ?? .null,
+            ]
+        )
+        .decode(ApprovalTemplateResult.self)
+        .template
+    }
+
+    func deleteApprovalTemplate(id: String) async throws -> Bool {
+        try await request(
+            method: "approval.template.delete",
+            params: ["id": .string(id)]
+        )
+        .decode(ApprovalTemplateDeleteResult.self)
+        .deleted
+    }
+
+    func createApprovalTemplateFromApproval(
+        approvalID: String,
+        name: String?,
+        maxUses: Int,
+        expiresAt: String?
+    ) async throws -> ApprovalTemplate {
+        try await request(
+            method: "approval.template.from_approval",
+            params: [
+                "approval_id": .string(approvalID),
+                "name": name.map(JSONValue.string) ?? .null,
+                "max_uses": .number(Double(maxUses)),
+                "expires_at": expiresAt.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(ApprovalTemplateResult.self)
+        .template
+    }
+
+    func attentionPolicy(projectID: String) async throws -> ApprovalPolicyResult {
+        try await request(
+            method: "approval.policy",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ApprovalPolicyResult.self)
+    }
+
+    func setAttentionPolicy(
+        projectID: String,
+        policy: AttentionPolicy
+    ) async throws -> ApprovalPolicyResult {
+        try await request(
+            method: "approval.policy.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": .object(policy.jsonObject),
+            ]
+        )
+        .decode(ApprovalPolicyResult.self)
+    }
+
     func agentInfo() async throws -> AgentInfo {
         try await request(method: "agent.info", params: [:])
             .decode(AgentInfo.self)

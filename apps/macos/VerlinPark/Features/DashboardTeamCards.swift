@@ -110,6 +110,11 @@ struct ProjectUsageCard: View {
 
 struct ApprovalCenterCard: View {
     @Environment(AppModel.self) private var model
+    @State private var templateApproval: Approval?
+
+    private var selectedCount: Int {
+        model.pendingApprovals.count { model.approvalSelection.contains($0.id) }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -120,7 +125,7 @@ struct ApprovalCenterCard: View {
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
                 }
                 Spacer()
-                if model.approvalCenterBusy {
+                if model.approvalCenterBusy || model.approvalBatchBusy {
                     ProgressView().controlSize(.small)
                 }
                 Text("\(model.pendingApprovals.count) pending")
@@ -138,72 +143,44 @@ struct ApprovalCenterCard: View {
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(model.pendingApprovals) { approval in
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 6) {
-                            Text(approval.tool.uppercased())
-                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(.orange)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(.orange.opacity(0.1), in: Capsule())
-                            if let risk = approval.approvalRisk, !risk.isEmpty {
-                                Text(risk.uppercased())
-                                    .font(.system(size: 7, weight: .semibold, design: .monospaced))
-                                    .foregroundStyle(riskColor(risk))
-                                    .padding(.horizontal, 4)
-                                    .padding(.vertical, 2)
-                                    .background(riskColor(risk).opacity(0.09), in: Capsule())
-                            }
-                            Text(approval.agentName ?? approval.agentRole ?? "agent")
-                                .font(.system(size: 9, weight: .medium))
-                            if let title = approval.agentTitle {
-                                Text("· \(title)")
-                                    .font(.system(size: 8, design: .monospaced))
-                                    .foregroundStyle(.tertiary)
-                            }
-                            Spacer()
-                            Text(
-                                model.approvalSessionGoals[approval.sessionId]
-                                    ?? String(approval.sessionId.prefix(8))
-                            )
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                        }
-                        Text(inputSummary(approval))
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(3)
-                            .textSelection(.enabled)
-                        if let reason = approval.approvalReason, !reason.isEmpty {
-                            Text(reason)
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(riskColor(approval.approvalRisk ?? ""))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        HStack(spacing: 6) {
-                            Button("Approve") {
-                                Task {
-                                    await model.resolveGlobalApproval(approval.id, approved: true)
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            .tint(.green)
-                            .disabled(model.approvalCenterBusy)
-                            Button("Deny") {
-                                Task {
-                                    await model.resolveGlobalApproval(approval.id, approved: false)
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(model.approvalCenterBusy)
-                        }
+                HStack(spacing: 6) {
+                    Button("Select all") {
+                        model.selectAllPendingApprovals()
                     }
-                    .padding(9)
-                    .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Button("Clear") {
+                        model.clearApprovalSelection()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.approvalSelection.isEmpty)
+                    Spacer()
+                    Text("\(selectedCount) selected")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    Button("Approve selected") {
+                        Task { await model.resolveSelectedApprovals(approved: true) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(.green)
+                    .disabled(model.approvalSelection.isEmpty || model.approvalBatchBusy)
+                    Button("Deny selected") {
+                        Task { await model.resolveSelectedApprovals(approved: false) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.approvalSelection.isEmpty || model.approvalBatchBusy)
+                }
+                if let status = model.approvalBatchStatus, !status.isEmpty {
+                    Text(status)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(model.pendingApprovals) { approval in
+                    approvalRow(approval)
                 }
             }
         }
@@ -218,6 +195,118 @@ struct ApprovalCenterCard: View {
         .task {
             await model.loadPendingApprovals()
         }
+        .sheet(item: $templateApproval) { approval in
+            ApprovalTemplateSheet(approval: approval)
+        }
+    }
+
+    private func approvalRow(_ approval: Approval) -> some View {
+        let selected = model.approvalSelection.contains(approval.id)
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Button {
+                    model.toggleApprovalSelection(approval.id)
+                } label: {
+                    Image(systemName: selected ? "checkmark.square.fill" : "square")
+                        .font(.system(size: 11))
+                        .foregroundStyle(selected ? VPTheme.accent : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help(selected ? "Deselect approval" : "Select approval")
+                Text(approval.tool.uppercased())
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(.orange.opacity(0.1), in: Capsule())
+                if let risk = approval.approvalRisk, !risk.isEmpty {
+                    Text(risk.uppercased())
+                        .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(riskColor(risk))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(riskColor(risk).opacity(0.09), in: Capsule())
+                }
+                Text(approval.agentName ?? approval.agentRole ?? "agent")
+                    .font(.system(size: 9, weight: .medium))
+                if let title = approval.agentTitle {
+                    Text("· \(title)")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Text(
+                    model.approvalSessionGoals[approval.sessionId]
+                        ?? String(approval.sessionId.prefix(8))
+                )
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            }
+            Text(inputSummary(approval))
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .textSelection(.enabled)
+            if let reason = approval.approvalReason, !reason.isEmpty {
+                Text(reason)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(riskColor(approval.approvalRisk ?? ""))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !approval.attentionLabel.isEmpty {
+                Text(approval.attentionLabel)
+                    .font(.system(size: 7.5, design: .monospaced))
+                    .foregroundStyle(VPTheme.accentDeep)
+            }
+            HStack(spacing: 6) {
+                Button("Approve") {
+                    Task {
+                        await model.resolveGlobalApproval(approval.id, approved: true)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(.green)
+                .disabled(model.approvalCenterBusy || model.approvalBatchBusy)
+                Button("Deny") {
+                    Task {
+                        await model.resolveGlobalApproval(approval.id, approved: false)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.approvalCenterBusy || model.approvalBatchBusy)
+                if canCreateTemplate(approval) {
+                    Button("Template") {
+                        templateApproval = approval
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Create a bounded template from this approval")
+                }
+            }
+        }
+        .padding(9)
+        .background(
+            selected ? VPTheme.accent.opacity(0.06) : .white.opacity(0.03),
+            in: RoundedRectangle(cornerRadius: 9)
+        )
+    }
+
+    private func canCreateTemplate(_ approval: Approval) -> Bool {
+        guard let risk = approval.approvalRisk else { return false }
+        let object = approval.input.objectValue
+        let hasPath =
+            object?["path"]?.stringValue != nil
+                || object?["paths"]?.arrayValue?.isEmpty == false
+        return ["workspace_write", "external"].contains(risk)
+            && hasPath
+            && !approval.tool.hasPrefix("remote_")
+            && ![
+                "mcp", "computer", "shell", "process", "run_project_task",
+                "local_http", "code_diagnostics", "task_control",
+            ].contains(approval.tool)
     }
 
     private func riskColor(_ risk: String) -> Color {

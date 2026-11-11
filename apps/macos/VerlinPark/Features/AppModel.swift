@@ -162,8 +162,18 @@ final class AppModel {
     var projectUsageStatus: String?
     var pendingApprovals: [Approval] = []
     var approvalSessionGoals: [String: String] = [:]
+    var approvalProjectIDs: [String: String] = [:]
     var approvalCenterBusy = false
     var approvalCenterStatus: String?
+    var approvalSelection: Set<String> = []
+    var approvalBatchBusy = false
+    var approvalBatchStatus: String?
+    var approvalTemplates: [ApprovalTemplate] = []
+    var approvalTemplateBusy = false
+    var approvalTemplateStatus: String?
+    var attentionPolicy: AttentionPolicy?
+    var attentionPolicyBusy = false
+    var attentionPolicyStatus: String?
     var questions: [Question] = []
     var pendingQuestions: [Question] = []
     var questionCenterBusy = false
@@ -1746,11 +1756,15 @@ final class AppModel {
         approvalCenterBusy = true
         defer { approvalCenterBusy = false }
         do {
-            let approvals = try await core.listApprovals(sessionID: nil)
+            let queue = try await core.approvalQueue(sessionID: nil, projectID: nil)
             let allSessions = try await core.listSessions(projectID: nil)
-            pendingApprovals = approvals.filter { $0.status == "pending" }
+            pendingApprovals = queue.approvals
+            approvalSelection = approvalSelection.intersection(Set(queue.approvals.map(\.id)))
             approvalSessionGoals = Dictionary(
                 uniqueKeysWithValues: allSessions.map { ($0.id, $0.goal) }
+            )
+            approvalProjectIDs = Dictionary(
+                uniqueKeysWithValues: allSessions.map { ($0.id, $0.projectId) }
             )
             approvalCenterStatus = pendingApprovals.isEmpty ? "No pending approvals." : nil
         } catch {
@@ -1765,10 +1779,145 @@ final class AppModel {
             let resolved = try await core.resolveApproval(id: id, approved: approved)
             if resolved {
                 pendingApprovals.removeAll { $0.id == id }
+                approvalSelection.remove(id)
             }
             approvalCenterStatus = pendingApprovals.isEmpty ? "No pending approvals." : nil
         } catch {
             approvalCenterStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func toggleApprovalSelection(_ id: String) {
+        if approvalSelection.contains(id) {
+            approvalSelection.remove(id)
+        } else {
+            approvalSelection.insert(id)
+        }
+    }
+
+    func selectAllPendingApprovals() {
+        approvalSelection = Set(pendingApprovals.map(\.id))
+    }
+
+    func clearApprovalSelection() {
+        approvalSelection.removeAll()
+    }
+
+    func resolveSelectedApprovals(approved: Bool) async {
+        let ids = pendingApprovals
+            .map(\.id)
+            .filter { approvalSelection.contains($0) }
+        guard !ids.isEmpty else {
+            approvalBatchStatus = "Select at least one approval."
+            return
+        }
+        approvalBatchBusy = true
+        defer { approvalBatchBusy = false }
+        do {
+            let result = try await core.resolveApprovals(ids.map { ($0, approved) })
+            let resolved = Set(
+                result.results
+                    .filter(\.resolved)
+                    .map(\.approvalId)
+            )
+            pendingApprovals.removeAll { resolved.contains($0.id) }
+            approvalSelection.subtract(resolved)
+            let failures = result.results.filter { !$0.resolved }
+            if failures.isEmpty {
+                approvalBatchStatus = "\(result.resolvedCount) resolved."
+            } else {
+                let labels = failures.prefix(3).map { item in
+                    "\(item.approvalId.prefix(8)): \(item.message ?? item.code ?? "failed")"
+                }
+                approvalBatchStatus =
+                    "\(result.resolvedCount) resolved, \(result.failedCount) failed — "
+                        + labels.joined(separator: " · ")
+            }
+            if pendingApprovals.isEmpty {
+                approvalCenterStatus = "No pending approvals."
+            }
+        } catch {
+            approvalBatchStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadApprovalTemplates(projectID: String) async {
+        approvalTemplateBusy = true
+        defer { approvalTemplateBusy = false }
+        do {
+            approvalTemplates = try await core.listApprovalTemplates(projectID: projectID)
+            approvalTemplateStatus = approvalTemplates.isEmpty ? "No templates." : nil
+        } catch {
+            approvalTemplateStatus = error.localizedDescription
+        }
+    }
+
+    func createApprovalTemplateFromApproval(
+        _ approval: Approval,
+        name: String,
+        maxUses: Int,
+        expiresAt: String?
+    ) async {
+        approvalTemplateBusy = true
+        defer { approvalTemplateBusy = false }
+        do {
+            let template = try await core.createApprovalTemplateFromApproval(
+                approvalID: approval.id,
+                name: name.isEmpty ? nil : name,
+                maxUses: maxUses,
+                expiresAt: expiresAt
+            )
+            approvalTemplates.insert(template, at: 0)
+            approvalTemplateStatus = "Created \(template.name)."
+            if let projectID = approvalProjectIDs[approval.sessionId] {
+                await loadApprovalTemplates(projectID: projectID)
+            }
+        } catch {
+            approvalTemplateStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func deleteApprovalTemplate(_ template: ApprovalTemplate) async {
+        approvalTemplateBusy = true
+        defer { approvalTemplateBusy = false }
+        do {
+            let deleted = try await core.deleteApprovalTemplate(id: template.id)
+            if deleted {
+                approvalTemplates.removeAll { $0.id == template.id }
+            }
+            approvalTemplateStatus = deleted ? "Deleted \(template.name)." : "Template was already gone."
+        } catch {
+            approvalTemplateStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadAttentionPolicy(projectID: String) async {
+        attentionPolicyBusy = true
+        defer { attentionPolicyBusy = false }
+        do {
+            attentionPolicy = try await core.attentionPolicy(projectID: projectID).policy
+            attentionPolicyStatus = nil
+        } catch {
+            attentionPolicyStatus = error.localizedDescription
+        }
+    }
+
+    func saveAttentionPolicy(_ policy: AttentionPolicy, projectID: String) async {
+        attentionPolicyBusy = true
+        defer { attentionPolicyBusy = false }
+        do {
+            attentionPolicy = try await core.setAttentionPolicy(
+                projectID: projectID,
+                policy: policy
+            ).policy
+            attentionPolicyStatus = "Attention policy saved."
+            await loadPendingApprovals()
+        } catch {
+            attentionPolicyStatus = error.localizedDescription
             handle(error)
         }
     }
@@ -8501,16 +8650,20 @@ final class AppModel {
             Task { await self.loadMemories() }
         }
 
-        if event.type == "approval.requested",
+        if ["approval.requested", "approval.created"].contains(event.type),
            let approval = try? event.payload.decode(Approval.self),
            !pendingApprovals.contains(where: { $0.id == approval.id })
         {
             pendingApprovals.append(approval)
         }
-        if event.type == "approval.resolved",
+        if ["approval.resolved", "approval.expired"].contains(event.type),
            let approvalID = event.payload.objectValue?["approval_id"]?.stringValue
         {
             pendingApprovals.removeAll { $0.id == approvalID }
+            approvalSelection.remove(approvalID)
+        }
+        if event.type == "approval.coalesced" {
+            Task { await self.loadPendingApprovals() }
         }
 
         if ["question.requested", "question.answered", "question.cancelled", "question.expired"]
@@ -8562,8 +8715,13 @@ final class AppModel {
                 detail: question.question,
                 createdAt: event.createdAt
             )
-        case "approval.requested":
+        case "approval.requested", "approval.created":
             guard let approval = try? event.payload.decode(Approval.self) else { return }
+            // The daemon sets `notify=false` for rows inside the same
+            // session/tool/risk coalescing window. Older events have no field
+            // and remain notifiable.
+            let notify = event.payload.objectValue?["notify"]?.boolValue ?? true
+            guard notify else { return }
             addNotice(
                 id: "approval-\(approval.id)",
                 event: event,

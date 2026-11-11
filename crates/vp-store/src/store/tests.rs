@@ -14019,6 +14019,247 @@ fn test_cache_hit_event_and_expired_prune_are_projected() {
     );
 }
 
+fn approval_store_fixture() -> (TempDir, TempDir, Store, Project, Session) {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "approval optimizer")
+        .unwrap();
+    (data, repo, store, project, session)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_test_approval(
+    store: &Store,
+    session: &Session,
+    key: &str,
+    tool: &str,
+    risk: &str,
+    priority: i32,
+    coalesce: u64,
+    notify: u64,
+    max_pending: u32,
+    boost: &str,
+) -> ApprovalCreateOutcome {
+    store
+        .create_approval_deduplicated(
+            &session.id,
+            &format!("call-{key}"),
+            tool,
+            &serde_json::json!({"path": format!("src/{key}.rs")}),
+            Some(&serde_json::json!({
+                "agent_id": "worker-1",
+                "agent_name": "Worker",
+                "agent_role": "worker",
+                "task_id": "task-1"
+            })),
+            Some(risk),
+            Some("test approval"),
+            Some(key),
+            Some("scope"),
+            priority,
+            None,
+            coalesce,
+            notify,
+            max_pending,
+            boost,
+        )
+        .unwrap()
+}
+
+#[test]
+fn approval_dedup_coalesces_pending_requests_and_resolves_all_waiters() {
+    let (_data, _repo, store, _project, session) = approval_store_fixture();
+    let first = create_test_approval(
+        &store,
+        &session,
+        "one",
+        "write_file",
+        "workspace_write",
+        0,
+        120,
+        60,
+        64,
+        "host_state",
+    );
+    assert!(!first.coalesced);
+    assert_eq!(first.approval.waiter_count, 1);
+    assert!(
+        first
+            .events
+            .iter()
+            .any(|event| event.kind == "approval.created")
+    );
+    assert!(
+        first
+            .events
+            .iter()
+            .any(|event| event.kind == "approval.requested")
+    );
+
+    let second = create_test_approval(
+        &store,
+        &session,
+        "one",
+        "write_file",
+        "workspace_write",
+        0,
+        120,
+        60,
+        64,
+        "host_state",
+    );
+    assert!(second.coalesced);
+    assert_eq!(second.approval.id, first.approval.id);
+    assert_eq!(second.approval.waiter_count, 2);
+    assert!(
+        second
+            .events
+            .iter()
+            .any(|event| event.kind == "approval.coalesced")
+    );
+
+    let (resolved, events) = store
+        .resolve_approval_with_events(&first.approval.id, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.status, "approved");
+    assert_eq!(resolved.waiter_count, 2);
+    assert!(events.iter().any(|event| event.kind == "approval.resolved"));
+
+    // A later identical request is a new row; coalescing never turns into a
+    // grant or a silent auto-approval.
+    let third = create_test_approval(
+        &store,
+        &session,
+        "one",
+        "write_file",
+        "workspace_write",
+        0,
+        120,
+        60,
+        64,
+        "host_state",
+    );
+    assert!(!third.coalesced);
+    assert_ne!(third.approval.id, first.approval.id);
+    assert_eq!(third.approval.status, "pending");
+    assert_eq!(store.list_approvals(Some(&session.id)).unwrap().len(), 2);
+}
+
+#[test]
+fn approval_dedup_does_not_cross_agents_or_risks() {
+    let (_data, _repo, store, _project, session) = approval_store_fixture();
+    let first = create_test_approval(
+        &store,
+        &session,
+        "agent-a",
+        "write_file",
+        "workspace_write",
+        0,
+        120,
+        0,
+        64,
+        "host_state",
+    );
+    let second = store
+        .create_approval_deduplicated(
+            &session.id,
+            "call-agent-b",
+            "write_file",
+            &serde_json::json!({"path": "src/agent-a.rs"}),
+            Some(&serde_json::json!({"agent_id": "worker-2"})),
+            Some("workspace_write"),
+            Some("test"),
+            Some("agent-b"),
+            Some("scope"),
+            0,
+            None,
+            120,
+            0,
+            64,
+            "host_state",
+        )
+        .unwrap();
+    assert!(!second.coalesced);
+    assert_ne!(first.approval.id, second.approval.id);
+
+    let other_risk = store
+        .create_approval_deduplicated(
+            &session.id,
+            "call-risk",
+            "write_file",
+            &serde_json::json!({"path": "src/agent-a.rs"}),
+            Some(&serde_json::json!({"agent_id": "worker-1"})),
+            Some("external"),
+            Some("test"),
+            Some("risk-variant"),
+            Some("scope"),
+            0,
+            None,
+            120,
+            0,
+            64,
+            "host_state",
+        )
+        .unwrap();
+    assert!(!other_risk.coalesced);
+    assert_ne!(first.approval.id, other_risk.approval.id);
+}
+
+#[test]
+fn approval_template_use_consumption_is_atomic_across_threads() {
+    let (_data, _repo, store, project, _session) = approval_store_fixture();
+    let template = ApprovalTemplate {
+        id: "t1".to_string(),
+        project_id: project.id.clone(),
+        name: "bounded".to_string(),
+        enabled: true,
+        tool_pattern: "write_file".to_string(),
+        risk_levels: vec!["workspace_write".to_string()],
+        path_globs: vec!["src/**".to_string()],
+        action: "allow".to_string(),
+        expires_at: None,
+        max_uses: Some(10),
+        used_count: 0,
+        created_by: "test".to_string(),
+        created_at: now_rfc3339(),
+        updated_at: None,
+    };
+    store.create_approval_template(&template).unwrap();
+    let mut handles = Vec::new();
+    for _ in 0..24 {
+        let store = store.clone();
+        handles.push(std::thread::spawn(move || {
+            store
+                .consume_approval_template_use("t1", &now_rfc3339())
+                .unwrap()
+        }));
+    }
+    let successes = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(Option::is_some)
+        .count();
+    assert_eq!(successes, 10);
+    assert_eq!(
+        store
+            .get_approval_template("t1")
+            .unwrap()
+            .unwrap()
+            .used_count,
+        10
+    );
+    assert!(
+        store
+            .consume_approval_template_use("t1", &now_rfc3339())
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[test]
 fn test_cache_historical_lookup_matches_covered_paths_and_ignores_failures() {
     let (_data, store, repo) = test_store();
@@ -14066,4 +14307,393 @@ fn test_cache_historical_lookup_matches_covered_paths_and_ignores_failures() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, "tr-pass");
+}
+
+#[test]
+fn approval_template_expiry_is_inert_and_persisted_in_the_manifest() {
+    let (_data, _repo, store, project, _session) = approval_store_fixture();
+    let template = ApprovalTemplate {
+        id: "t-expired".to_string(),
+        project_id: project.id.clone(),
+        name: "expired".to_string(),
+        enabled: true,
+        tool_pattern: "write_file".to_string(),
+        risk_levels: vec!["workspace_write".to_string()],
+        path_globs: Vec::new(),
+        action: "allow".to_string(),
+        expires_at: Some("2020-01-01T00:00:00Z".to_string()),
+        max_uses: Some(5),
+        used_count: 0,
+        created_by: "test".to_string(),
+        created_at: now_rfc3339(),
+        updated_at: None,
+    };
+    store.create_approval_template(&template).unwrap();
+    assert!(
+        store
+            .consume_approval_template_use("t-expired", &now_rfc3339())
+            .unwrap()
+            .is_none()
+    );
+    store.record_project_manifest().unwrap();
+    let snapshots = read_project_manifest(store.data_dir()).unwrap();
+    let snapshot = snapshots
+        .iter()
+        .find(|s| s.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.approval_templates.len(), 1);
+    assert!(snapshot.approval_templates[0].expires_at.is_some());
+}
+
+#[test]
+fn attention_policy_round_trips_and_is_normalized() {
+    let (_data, _repo, store, project, _session) = approval_store_fixture();
+    let policy = AttentionPolicy {
+        enabled: true,
+        max_pending_per_session: 0,
+        coalesce_window_secs: 999_999,
+        stale_after_secs: 1,
+        priority_boost_risk: "bogus".to_string(),
+        notify_coalesce_secs: 999_999,
+    };
+    store.set_attention_policy(&project.id, &policy).unwrap();
+    let loaded = store.get_attention_policy(&project.id).unwrap();
+    assert_eq!(loaded.max_pending_per_session, 1);
+    assert_eq!(loaded.coalesce_window_secs, 3_600);
+    assert_eq!(loaded.stale_after_secs, 60);
+    assert_eq!(loaded.priority_boost_risk, "host_state");
+    assert_eq!(loaded.notify_coalesce_secs, 3_600);
+    assert_eq!(store.list_enabled_attention_policies().unwrap().len(), 1);
+
+    store.record_project_manifest().unwrap();
+    let snapshots = read_project_manifest(store.data_dir()).unwrap();
+    let snapshot = snapshots
+        .iter()
+        .find(|s| s.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.attention_policy, loaded);
+}
+
+#[test]
+fn stale_approvals_expire_and_never_become_approved() {
+    let (_data, _repo, store, project, session) = approval_store_fixture();
+    store
+        .set_attention_policy(
+            &project.id,
+            &AttentionPolicy {
+                enabled: true,
+                stale_after_secs: 60,
+                ..AttentionPolicy::default()
+            },
+        )
+        .unwrap();
+    let created = create_test_approval(
+        &store,
+        &session,
+        "stale",
+        "write_file",
+        "workspace_write",
+        0,
+        0,
+        0,
+        64,
+        "host_state",
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE approvals SET created_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+            params![created.approval.id],
+        )
+        .unwrap();
+    let expired = store
+        .expire_stale_approvals(time::OffsetDateTime::now_utc())
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].0.status, "expired");
+    assert!(
+        expired[0]
+            .1
+            .iter()
+            .any(|event| event.kind == "approval.expired")
+    );
+    let approval = store.get_approval(&created.approval.id).unwrap().unwrap();
+    assert_eq!(approval.status, "expired");
+    assert!(approval.resolved_at.is_some());
+}
+
+#[test]
+fn batch_resolution_reports_each_failure_without_a_blanket_decision() {
+    let (_data, _repo, store, _project, session) = approval_store_fixture();
+    let first = create_test_approval(
+        &store,
+        &session,
+        "first",
+        "write_file",
+        "workspace_write",
+        0,
+        0,
+        0,
+        64,
+        "host_state",
+    );
+    let second = create_test_approval(
+        &store,
+        &session,
+        "second",
+        "write_file",
+        "workspace_write",
+        0,
+        0,
+        0,
+        64,
+        "host_state",
+    );
+    store.resolve_approval(&first.approval.id, true).unwrap();
+    let outcomes = store
+        .resolve_approvals_with_events(&[
+            (first.approval.id.clone(), true),
+            (second.approval.id.clone(), false),
+            ("missing".to_string(), true),
+        ])
+        .unwrap();
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(outcomes[0].code.as_deref(), Some("APPROVAL_NOT_PENDING"));
+    assert_eq!(outcomes[1].approval.as_ref().unwrap().status, "denied");
+    assert_eq!(outcomes[2].code.as_deref(), Some("APPROVAL_NOT_FOUND"));
+    assert_eq!(
+        store
+            .get_approval(&first.approval.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "approved"
+    );
+}
+
+#[test]
+fn attention_cap_expires_the_oldest_low_risk_row() {
+    let (_data, _repo, store, _project, session) = approval_store_fixture();
+    let first = create_test_approval(
+        &store,
+        &session,
+        "first",
+        "write_file",
+        "workspace_write",
+        0,
+        0,
+        0,
+        2,
+        "host_state",
+    );
+    let _second = create_test_approval(
+        &store,
+        &session,
+        "second",
+        "write_file",
+        "workspace_write",
+        0,
+        0,
+        0,
+        2,
+        "host_state",
+    );
+    let third = create_test_approval(
+        &store,
+        &session,
+        "third",
+        "write_file",
+        "workspace_write",
+        0,
+        0,
+        0,
+        2,
+        "host_state",
+    );
+    assert_eq!(third.expired.len(), 1);
+    assert_eq!(third.expired[0].id, first.approval.id);
+    assert_eq!(
+        store
+            .get_approval(&first.approval.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "expired"
+    );
+    let pending = store
+        .list_pending_approvals(Some(&session.id), None)
+        .unwrap();
+    assert_eq!(pending.len(), 2);
+}
+
+#[test]
+fn notification_coalescing_is_per_session_tool_risk_and_boost_bypasses_it() {
+    let (_data, _repo, store, _project, session) = approval_store_fixture();
+    let first = create_test_approval(
+        &store,
+        &session,
+        "n1",
+        "write_file",
+        "workspace_write",
+        0,
+        0,
+        60,
+        64,
+        "host_state",
+    );
+    let second = create_test_approval(
+        &store,
+        &session,
+        "n2",
+        "write_file",
+        "workspace_write",
+        0,
+        0,
+        60,
+        64,
+        "host_state",
+    );
+    assert!(first.approval.notify);
+    assert!(!second.approval.notify);
+    assert_eq!(
+        second.approval.notify_key.as_deref(),
+        first.approval.notify_key.as_deref()
+    );
+
+    let high_first = create_test_approval(
+        &store,
+        &session,
+        "h1",
+        "shell",
+        "host_state",
+        0,
+        0,
+        60,
+        64,
+        "host_state",
+    );
+    let high_second = create_test_approval(
+        &store,
+        &session,
+        "h2",
+        "shell",
+        "host_state",
+        0,
+        0,
+        60,
+        64,
+        "host_state",
+    );
+    assert!(high_first.approval.notify);
+    assert!(high_second.approval.notify);
+}
+
+#[test]
+fn approval_queue_orders_by_risk_then_blocked_task_criticality() {
+    let (_data, _repo, store, _project, session) = approval_store_fixture();
+    for (task_id, priority) in [("task-low", 0i64), ("task-high", 40i64)] {
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO plan_tasks
+                 (session_id, plan_seq, task_id, project_id, department, title, priority,
+                  status, deps, write_scope, attempts, enqueued_at, updated_at)
+                 VALUES (?1, 1, ?2, ?3, 'api', ?2, ?4, 'running', '[]', '[]', 0, ?5, ?5)",
+                params![
+                    session.id,
+                    task_id,
+                    session.project_id,
+                    priority,
+                    now_rfc3339()
+                ],
+            )
+            .unwrap();
+    }
+    let low = create_test_approval(
+        &store,
+        &session,
+        "low",
+        "write_file",
+        "workspace_write",
+        0,
+        0,
+        0,
+        64,
+        "host_state",
+    );
+    let high = create_test_approval(
+        &store,
+        &session,
+        "high",
+        "write_file",
+        "workspace_write",
+        40,
+        0,
+        0,
+        64,
+        "host_state",
+    );
+    // The store computes live task criticality; approval.priority is only the
+    // creation snapshot.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE approvals SET task_id = 'task-low' WHERE id = ?1",
+            params![low.approval.id],
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE approvals SET task_id = 'task-high' WHERE id = ?1",
+            params![high.approval.id],
+        )
+        .unwrap();
+    let pending = store
+        .list_pending_approvals(Some(&session.id), None)
+        .unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].id, high.approval.id);
+    let destructive = create_test_approval(
+        &store,
+        &session,
+        "destructive",
+        "computer",
+        "destructive",
+        0,
+        0,
+        0,
+        64,
+        "host_state",
+    );
+    let pending = store
+        .list_pending_approvals(Some(&session.id), None)
+        .unwrap();
+    assert_eq!(pending[0].id, destructive.approval.id);
+}
+
+#[test]
+fn approval_audit_rows_are_persisted_and_restored() {
+    let (_data, _repo, store, project, _session) = approval_store_fixture();
+    let event = ApprovalAuditEvent {
+        id: "audit-1".to_string(),
+        project_id: project.id.clone(),
+        kind: "approval.template.created".to_string(),
+        payload: serde_json::json!({"template_id": "t1"}),
+        created_at: now_rfc3339(),
+    };
+    store.insert_approval_audit(&event).unwrap();
+    assert_eq!(
+        store.list_approval_audit(&project.id, None).unwrap().len(),
+        1
+    );
+    store
+        .restore_approval_audit(&project.id, std::slice::from_ref(&event))
+        .unwrap();
+    let audit = store.list_approval_audit(&project.id, None).unwrap();
+    assert_eq!(audit, vec![event]);
 }
