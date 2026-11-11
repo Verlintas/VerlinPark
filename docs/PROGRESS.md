@@ -107,7 +107,7 @@ write scope / Verifier / merge / capacity / budget gate。计划与验收见
 - 合并顺序：C4 `b0adba1` → C2 `26256ed` → C3 `93a991a` → C1 `bef841a`；
   计划 `beaefae`。
 - `git diff --stat a5f57c8..HEAD`：**38,436 insertions / 2,153 deletions**。
-- Rust：**1,330 passed，6 ignored**；Swift：**195 app + 116 computer-helper**。
+- Rust：**1,331 passed，6 ignored**；Swift：**195 app + 116 computer-helper**。
 - `just lint`、`xcodebuild test`、`just bundle` 通过；bundle 包含 verlinpadd、
   browser helper、computer helper、remote agent。
 - C1 的 paging 指标在 C4 的 bench 报告中现在可记录；C4 的 paging-on scenario

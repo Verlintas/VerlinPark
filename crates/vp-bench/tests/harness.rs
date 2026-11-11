@@ -13,7 +13,7 @@ use vp_bench::report::{
     BenchReport, HostMetadata, REPORT_CAVEAT, load_report, write_artifacts_with_stem,
 };
 use vp_bench::runner::{BenchRunOptions, ProviderSelection, run_scenarios};
-use vp_bench::scenario::Scenario;
+use vp_bench::scenario::{Availability, Scenario};
 
 fn baseline() -> Scenario {
     Scenario::find("baseline-single-session").unwrap()
@@ -216,12 +216,41 @@ async fn worktree_parallelism_caps_change_measured_peak() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_scenario_is_refused_not_silently_skipped() {
-    let scenario = Scenario::find("tool-output-paging-on").unwrap();
+    let mut scenario = Scenario::find("tool-output-paging-on").unwrap();
+    scenario.availability = Availability::unavailable("test-only unavailable fixture");
     let error = run_scenarios(&[scenario], &BenchRunOptions::fake(1))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("unavailable"));
-    assert!(error.to_string().contains("C1"));
+    assert!(error.to_string().contains("test-only"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paging_on_spills_and_paging_off_does_not() {
+    let off = Scenario::find("tool-output-paging-off").unwrap();
+    let on = Scenario::find("tool-output-paging-on").unwrap();
+    let runs = run_scenarios(&[off, on], &BenchRunOptions::fake(1))
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 2);
+    let off = runs
+        .iter()
+        .find(|run| run.scenario_id == "tool-output-paging-off")
+        .unwrap();
+    let on = runs
+        .iter()
+        .find(|run| run.scenario_id == "tool-output-paging-on")
+        .unwrap();
+    assert!(off.solved, "{:?}", off.unsolved_reasons);
+    assert!(on.solved, "{:?}", on.unsolved_reasons);
+    assert!(off.metrics.tool_output_paging_supported);
+    assert_eq!(off.metrics.tool_output_spills, Some(0));
+    assert!(on.metrics.tool_output_paging_supported);
+    assert!(
+        on.metrics.tool_output_spills.unwrap_or(0) >= 1,
+        "paging-on must emit at least one spill: {:?}",
+        on.metrics
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

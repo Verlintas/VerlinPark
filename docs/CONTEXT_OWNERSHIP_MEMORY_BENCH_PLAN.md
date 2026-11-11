@@ -11,7 +11,7 @@
 > **Result:** C1–C4 landed as four commits on `main` (`b0adba1`, `26256ed`,
 > `93a991a`, `bef841a`) plus this plan commit (`beaefae`). `git diff --stat
 > a5f57c8..HEAD` shows **38,436 insertions / 2,153 deletions** before the
-> documentation close-out. Rust is **1,330 passing tests with 6 ignored**;
+> documentation close-out. Rust is **1,331 passing tests with 6 ignored**;
 > Swift is **195 app tests plus 116 computer-helper tests**. `just lint`,
 > `xcodebuild test`, and `just bundle` pass. The implementation and remaining
 > limits are recorded in ADR-0159–0163 and `PROGRESS.md`.

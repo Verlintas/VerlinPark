@@ -453,7 +453,8 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert!(outcome.human.contains("baseline-single-session"));
         assert!(outcome.human.contains("tool-output-paging-on"));
-        assert!(outcome.human.contains("unavailable:"));
+        assert!(outcome.human.contains("available"));
+        assert!(!outcome.human.contains("unavailable:"));
         assert!(outcome.json.is_none());
     }
 

@@ -216,6 +216,14 @@ pub struct ScenarioConfig {
     /// fixture can set this false while requirements still expect approval, and
     /// the run must be classified unsolved.
     pub fake_verifier_approves: bool,
+    /// Optional per-scenario tool-output policy override. `None` leaves the
+    /// runtime default (spilling enabled at 16 KiB).
+    #[serde(default)]
+    pub tool_output_enabled: Option<bool>,
+    #[serde(default)]
+    pub tool_output_spill_threshold_bytes: Option<u64>,
+    #[serde(default)]
+    pub tool_output_preview_bytes: Option<u64>,
 }
 
 impl ScenarioConfig {
@@ -236,6 +244,9 @@ impl ScenarioConfig {
             merge_timeout_secs: 10,
             max_provider_calls: 512,
             fake_verifier_approves: true,
+            tool_output_enabled: None,
+            tool_output_spill_threshold_bytes: None,
+            tool_output_preview_bytes: None,
         }
     }
 }
@@ -705,6 +716,7 @@ fn paging_off_scenario() -> Scenario {
         fixture: FixtureKind::Paging,
         config: ScenarioConfig {
             max_workers: 2,
+            tool_output_enabled: Some(false),
             ..ScenarioConfig::defaults()
         },
         direct: Some(DirectTask {
@@ -731,6 +743,9 @@ fn paging_on_scenario() -> Scenario {
         fixture: FixtureKind::Paging,
         config: ScenarioConfig {
             max_workers: 2,
+            tool_output_enabled: Some(true),
+            tool_output_spill_threshold_bytes: Some(8 * 1024),
+            tool_output_preview_bytes: Some(2 * 1024),
             ..ScenarioConfig::defaults()
         },
         direct: Some(DirectTask {
@@ -741,10 +756,7 @@ fn paging_on_scenario() -> Scenario {
         plan: None,
         acceptance: AcceptanceSpec::new().expect_file(target, content),
         requirements: Requirements::default(),
-        availability: Availability::unavailable(
-            "the C1 tool-output pager is not present in this build; the harness refuses to label \
-             the bounded audit-event payload as paged output",
-        ),
+        availability: Availability::available(),
     }
 }
 
@@ -900,14 +912,19 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_one_explicitly_unavailable_scenario() {
+    fn catalog_has_no_explicitly_unavailable_scenarios() {
         let unavailable = Scenario::catalog()
             .into_iter()
             .filter(|scenario| !scenario.availability.is_available())
             .collect::<Vec<_>>();
-        assert_eq!(unavailable.len(), 1);
-        assert_eq!(unavailable[0].id, "tool-output-paging-on");
-        assert!(unavailable[0].availability.reason().unwrap().contains("C1"));
+        assert!(unavailable.is_empty(), "{unavailable:?}");
+        let paging = Scenario::find("tool-output-paging-on").unwrap();
+        assert!(paging.availability.is_available());
+        assert_eq!(paging.config.tool_output_enabled, Some(true));
+        assert_eq!(
+            paging.config.tool_output_spill_threshold_bytes,
+            Some(8 * 1024)
+        );
     }
 
     #[test]

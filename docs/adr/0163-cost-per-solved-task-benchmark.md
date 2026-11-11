@@ -69,17 +69,18 @@ The checked-in catalog is:
 | `baseline-single-session` | Leader edits directly in the session worktree | acceptance |
 | `plan-worker-chain` | stored TeamPlan → Worker → Verifier → Integrator | acceptance + verdict + merge |
 | `read-only-scout` | Leader delegates to a fresh-context Scout | acceptance + Scout completion + clean worktree |
-| `tool-output-paging-off` | large tool output before a small edit | acceptance; spill metrics absent |
-| `tool-output-paging-on` | same fixture with the C1 pager | **unavailable** in this build |
+| `tool-output-paging-off` | large tool output before a small edit with spilling disabled | acceptance; zero spills |
+| `tool-output-paging-on` | same fixture with the C1 pager (8 KiB spill threshold, 2 KiB preview) | available; must observe at least one spill |
 | `compaction-off` | preloaded history, context management disabled | acceptance; zero compactions |
 | `compaction-on` | same history through summary/compaction | acceptance + at least one compaction |
 | `worktree-parallelism-1` | four independent plan tasks, Worker cap 1 | acceptance + verdicts + merges + peak 1 |
 | `worktree-parallelism-4` | same four tasks, Worker cap 4 | acceptance + verdicts + merges + peak ≥ 2 |
 
-The paging-on entry remains in `vp bench list` with an explicit reason. Selecting
-it is a configuration error (exit 2), not a silent skip and not a fake "paged"
-measurement. The report records `tool_output_paging_supported` and reports spill
-counts as absent unless the runtime actually emits spill events.
+The paging-on entry is available now that C1 is merged. It forces an 8 KiB
+spill threshold and 2 KiB preview, and the harness requires an observed
+`tool.output_spilled` event. A synthetic unavailable scenario still exercises the
+exit-code-2 refusal path; an unavailable entry is never silently skipped or
+reported as a fake "paged" measurement.
 
 Scenario validation enforces unique ids, bounded repetitions/timeouts, valid
 paths, plan/acceptance consistency, expected merge counts equal to the number of
@@ -313,9 +314,10 @@ content.
 - Peak Worker parallelism is measured from overlapping Worker provider streams,
   not from eager plan-task creation. This is the honest execution signal for the
   current runtime.
-- Tool-output spill metrics are absent until the C1 pager exists. Event-visible
-  output bytes are bounded by the runtime's event cap and are not the full
-  process output.
+- Tool-output spill metrics require an observed `tool.output_spilled` event.
+  Paging-off scenarios record 0 spills; paging-on scenarios require at least one.
+  Event-visible output bytes are bounded by the runtime's event cap and are not
+  the full process output.
 - The harness is single-host, single-daemon, and sequential across repetitions.
   It does not measure cross-process contention or distributed scheduling.
 - Real-provider runs need explicit operator setup and may cost money; the

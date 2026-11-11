@@ -19,6 +19,7 @@ use vp_core::agent::{AgentConfig, AgentService, CapacityController, ScopeLocks};
 use vp_core::tools::ToolRegistry;
 use vp_protocol::types::{
     ApprovalMode, PlanDepartment, PlanTask, RoleModelConfig, RoleModels, Session, TeamPlan,
+    ToolOutputPolicy,
 };
 use vp_providers::Provider;
 use vp_store::Store;
@@ -34,11 +35,11 @@ use crate::report::{
 };
 use crate::scenario::{ExpectedMerges, FixtureKind, Scenario};
 
-/// This build has no C1 tool-output pager. The report therefore records spill
-/// metrics as absent rather than pretending the bounded audit-event payload is
-/// a paged output store. If the runtime starts emitting spill events, the
-/// runner promotes the capability automatically and records the observed count.
-pub const TOOL_OUTPUT_PAGING_SUPPORTED: bool = false;
+/// The C1 tool-output pager is part of the runtime. Paging-on scenarios force
+/// a small spill threshold and must observe `tool.output_spilled`; the runner
+/// still promotes the capability from observed events so a mixed/older build
+/// cannot claim support without evidence.
+pub const TOOL_OUTPUT_PAGING_SUPPORTED: bool = true;
 
 /// Provider selection for a benchmark run. Fake is the default everywhere.
 #[derive(Clone)]
@@ -154,6 +155,7 @@ async fn run_one(
             Some("vp-bench fixture".to_string()),
         )
         .await?;
+    apply_scenario_tool_output_policy(scenario, &engine, &project.id)?;
     let built = build_provider(scenario, options)?;
     let config = build_agent_config(scenario, &engine, &built)?;
     let pricing = scenario.config.pricing;
@@ -351,6 +353,33 @@ async fn run_one(
     drop(service);
     drop(engine);
     Ok(record)
+}
+
+fn apply_scenario_tool_output_policy(
+    scenario: &Scenario,
+    engine: &Engine,
+    project_id: &str,
+) -> Result<()> {
+    let config = &scenario.config;
+    if config.tool_output_enabled.is_none()
+        && config.tool_output_spill_threshold_bytes.is_none()
+        && config.tool_output_preview_bytes.is_none()
+    {
+        return Ok(());
+    }
+    let store = engine.store();
+    let mut policy: ToolOutputPolicy = store.get_tool_output_policy(project_id)?;
+    if let Some(enabled) = config.tool_output_enabled {
+        policy.enabled = enabled;
+    }
+    if let Some(bytes) = config.tool_output_spill_threshold_bytes {
+        policy.spill_threshold_bytes = bytes;
+    }
+    if let Some(bytes) = config.tool_output_preview_bytes {
+        policy.preview_bytes = bytes;
+    }
+    store.set_tool_output_policy(project_id, &policy)?;
+    Ok(())
 }
 
 fn build_provider(scenario: &Scenario, options: &BenchRunOptions) -> Result<BuiltProvider> {

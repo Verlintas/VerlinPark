@@ -367,7 +367,7 @@ Efficiency acceptance for the round:
 
 Round 1 commits: `32b449b` (E3), `97fdeb2` (E1), `3fc2bed` (E4),
 `71544fb` (E2). Round 2 commits: `b0adba1` (C4), `26256ed` (C2),
-`93a991a` (C3), `bef841a` (C1). Test baseline after round 2: **1,330 Rust /
+`93a991a` (C3), `bef841a` (C1). Test baseline after round 2: **1,331 Rust /
 311 Swift**. Limits are recorded in ADR-0159–0163 and `PROGRESS.md`.
 
 Update the checkboxes as work lands, and keep this file as the durable index for

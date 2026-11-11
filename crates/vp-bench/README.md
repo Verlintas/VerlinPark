@@ -33,7 +33,7 @@ JSON is the machine source of truth.
 | `plan-worker-chain` | stored TeamPlan → Worker → Verifier → Integrator | bytes + approving verdict + merged commit |
 | `read-only-scout` | Leader calls the read-only Scout tool | Scout completed, no writes, clean worktree |
 | `tool-output-paging-off` | Leader reads a large fixture output before editing | exact file bytes |
-| `tool-output-paging-on` | C1 paged-output path | **unavailable** in this build |
+| `tool-output-paging-on` | C1 paged-output path (8 KiB threshold) | available; requires a spill event |
 | `compaction-off` | preloaded history, context management disabled | bytes + zero compactions |
 | `compaction-on` | preloaded history through compaction | bytes + at least one compaction |
 | `worktree-parallelism-1` | four independent plan tasks, Worker cap 1 | bytes + 4 verdicts/merges + peak 1 |
@@ -160,7 +160,7 @@ comparison is 2, and an unsolved side is 1.
   gates.
 - Fake-provider usage is simulated. It is useful for runtime mechanics and
   regression comparisons, not model quality.
-- Tool-output spill metrics are absent until the C1 pager exists.
+- Tool-output spill metrics require an observed `tool.output_spilled` event; paging-off records 0 and paging-on requires at least one.
 - Peak Worker parallelism is measured from overlapping Worker provider streams,
   not from eager plan-task creation.
 - One host, one model, and one fixture set are not a universal ranking. No
