@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::test_cache::TestCacheEntry;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -6837,6 +6839,11 @@ pub struct SessionBundle {
     /// metadata-only and can never be reattached or read as local files.
     #[serde(default)]
     pub supervised_processes: Vec<SupervisedProcess>,
+    /// Event-backed test-cache metadata. Output bodies are operational state
+    /// and are not part of the archive; imported rows can be inspected but their
+    /// `output_ref` cannot resolve a local body.
+    #[serde(default)]
+    pub test_results: Vec<TestCacheEntry>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -11697,6 +11704,7 @@ mod context_checkpoint_bundle_tests {
                 created_at: "2026-11-11T00:00:00Z".into(),
             }],
             supervised_processes: Vec::new(),
+            test_results: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();

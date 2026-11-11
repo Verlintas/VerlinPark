@@ -540,6 +540,7 @@ async fn build_command(launch: &AcpLaunch) -> Result<tokio::process::Command> {
         remote: None,
         session_id: None,
         process_supervisor: None,
+        test_cache: None,
     };
     let mut command = crate::tools::sandboxed_command(&context).await?;
     let scratch = launch

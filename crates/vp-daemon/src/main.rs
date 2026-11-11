@@ -32,6 +32,10 @@ use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes
 use vp_protocol::scaling::{
     ScalingPolicyParams, ScalingPreviewParams, ScalingStatusParams, SetScalingPolicyParams,
 };
+use vp_protocol::test_cache::{
+    SetTestCachePolicyParams, TestCacheClearParams, TestCacheEntriesParams, TestCacheImpactParams,
+    TestCachePolicyParams, TestCachePruneParams, TestCacheStatsParams,
+};
 use vp_protocol::types::{
     AcpAgentConfig, AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams,
     AddProjectParams, AgentListParams, AgentListResult, AgentMessageResult, AnswerQuestionParams,
@@ -3704,6 +3708,65 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "test_cache.policy.get" => match parse_params::<TestCachePolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_test_cache_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    vp_protocol::test_cache::TestCachePolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "test_cache.policy.set" => match parse_params::<SetTestCachePolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_test_cache_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "test_cache.stats" => match parse_params::<TestCacheStatsParams>(request.params) {
+            Ok(params) => match state.engine.test_cache_stats(&params.project_id).await {
+                Ok(stats) => RpcResponse::success(id, stats),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "test_cache.entries" => match parse_params::<TestCacheEntriesParams>(request.params) {
+            Ok(params) => match state.engine.list_test_cache_entries(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "test_cache.prune" => match parse_params::<TestCachePruneParams>(request.params) {
+            Ok(params) => match state.engine.prune_test_cache(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "test_cache.clear" => match parse_params::<TestCacheClearParams>(request.params) {
+            Ok(params) => match state.engine.clear_test_cache(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "test_cache.impact" => match parse_params::<TestCacheImpactParams>(request.params) {
+            Ok(params) => match state.engine.test_cache_impact(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "artifact.policy.get" => match parse_params::<ArtifactPolicyParams>(request.params) {
             Ok(params) => match state.engine.get_artifact_policy(&params.project_id).await {
                 Ok(policy) => RpcResponse::success(
@@ -4624,6 +4687,7 @@ mod process_rpc_tests {
             remote: None,
             session_id: Some(session.to_string()),
             process_supervisor: Some(supervisor),
+            test_cache: None,
         }
     }
 
@@ -4809,5 +4873,174 @@ mod process_rpc_tests {
         )
         .await;
         assert!(missing.error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod test_cache_rpc_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use vp_protocol::test_cache::{TEST_CACHE_KEY_VERSION, TestCacheEntry};
+
+    fn state(store: &Store, data: &Path) -> AppState {
+        let engine = Engine::new(store.clone());
+        AppState {
+            engine: engine.clone(),
+            agent: AgentService::from_env(engine),
+            token: Arc::new("test-token".to_string()),
+            data_dir: data.to_path_buf(),
+            started_at: vp_protocol::now_rfc3339(),
+            started: Instant::now(),
+            pid: std::process::id(),
+        }
+    }
+
+    async fn call(state: &AppState, method: &str, params: Value) -> Value {
+        let response = dispatch(state, RpcRequest::new(json!(1), method, params)).await;
+        assert!(
+            response.error.is_none(),
+            "{method} failed: {:?}",
+            response.error
+        );
+        response.result.unwrap_or(Value::Null)
+    }
+
+    #[tokio::test]
+    async fn policy_stats_entries_prune_and_clear_are_dispatchable() {
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let worktree = TempDir::new().unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let session = store.create_session(&project.id, "cache rpc").unwrap();
+        let state = state(&store, data.path());
+
+        let policy = call(
+            &state,
+            "test_cache.policy.get",
+            json!({"project_id": project.id}),
+        )
+        .await;
+        assert_eq!(policy["policy"]["enabled"], true);
+        assert_eq!(policy["policy"]["include_integration"], false);
+
+        let policy = call(
+            &state,
+            "test_cache.policy.set",
+            json!({
+                "project_id": project.id,
+                "policy": {
+                    "enabled": true,
+                    "max_entries": 7,
+                    "retention_days": 3,
+                    "max_output_bytes": 65536,
+                    "reuse_lint": false,
+                    "include_integration": true,
+                    "failed_retention_secs": 120
+                }
+            }),
+        )
+        .await;
+        assert_eq!(policy["policy"]["max_entries"], 7);
+        assert_eq!(policy["policy"]["reuse_lint"], false);
+        assert_eq!(policy["policy"]["include_integration"], true);
+
+        let invalid = dispatch(
+            &state,
+            RpcRequest::new(
+                json!(2),
+                "test_cache.policy.set",
+                json!({
+                    "project_id": project.id,
+                    "policy": {"max_entries": 0}
+                }),
+            ),
+        )
+        .await;
+        assert!(invalid.error.is_some());
+        assert!(
+            invalid
+                .error
+                .unwrap()
+                .message
+                .contains("TEST_CACHE_POLICY_INVALID")
+        );
+
+        let now = vp_protocol::now_rfc3339();
+        let row = TestCacheEntry {
+            id: String::new(),
+            project_id: project.id.clone(),
+            session_id: session.id.clone(),
+            kind: "test".into(),
+            command: "cargo test".into(),
+            command_source: "Cargo.toml".into(),
+            key_version: TEST_CACHE_KEY_VERSION,
+            cache_key: format!("v1:{}", "a".repeat(64)),
+            inputs_hash: "inputs".into(),
+            impact_generation: "impact".into(),
+            status: "passed".into(),
+            exit_code: 0,
+            duration_ms: 1,
+            output_ref: None,
+            output_bytes: 0,
+            covered_paths: vec!["tests/a.rs".into()],
+            warnings: Vec::new(),
+            warning_count: 0,
+            failure_count: 0,
+            created_at: now,
+            expires_at: "2999-01-01T00:00:00Z".into(),
+            hit_count: 0,
+            last_hit_at: None,
+        };
+        store.record_test_result_with_events(&row, "{}", 7).unwrap();
+        let stats = call(
+            &state,
+            "test_cache.stats",
+            json!({"project_id": project.id}),
+        )
+        .await;
+        assert_eq!(stats["entries"], 1);
+        assert_eq!(stats["passed"], 1);
+
+        let entries = call(
+            &state,
+            "test_cache.entries",
+            json!({"project_id": project.id, "limit": 10}),
+        )
+        .await;
+        assert_eq!(entries["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(entries["entries"][0]["command"], "cargo test");
+
+        let prune = call(
+            &state,
+            "test_cache.prune",
+            json!({"project_id": project.id, "older_than_secs": 0, "dry_run": true}),
+        )
+        .await;
+        assert_eq!(prune["pruned"], 1);
+        assert_eq!(prune["remaining"], 1);
+
+        let unconfirmed = dispatch(
+            &state,
+            RpcRequest::new(
+                json!(3),
+                "test_cache.clear",
+                json!({"project_id": project.id}),
+            ),
+        )
+        .await;
+        assert!(unconfirmed.error.is_some());
+
+        let cleared = call(
+            &state,
+            "test_cache.clear",
+            json!({"project_id": project.id, "confirm": true}),
+        )
+        .await;
+        assert_eq!(cleared["cleared"], 1);
+        assert_eq!(cleared["remaining"], 0);
     }
 }

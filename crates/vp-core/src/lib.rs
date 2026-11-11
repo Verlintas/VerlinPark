@@ -126,6 +126,7 @@ pub mod skills;
 pub mod source_embedding;
 pub mod sources;
 pub mod terminal;
+pub mod test_cache;
 pub mod textdiff;
 pub mod tool_output;
 pub mod tooling;
@@ -162,6 +163,7 @@ struct ReplayData {
     run_checkpoints: Vec<vp_protocol::types::RunCheckpoint>,
     context_checkpoints: Vec<vp_protocol::types::ContextCheckpoint>,
     processes: Vec<vp_protocol::types::SupervisedProcess>,
+    test_results: Vec<vp_protocol::test_cache::TestCacheEntry>,
     events: Vec<Event>,
 }
 
@@ -12395,6 +12397,15 @@ impl Engine {
             let run_checkpoints = store.list_session_run_checkpoints(&id)?;
             let context_checkpoints = store.list_context_checkpoints(&id, 10_000)?;
             let processes = store.list_supervised_processes(&id, true, 500)?;
+            let test_results = store.list_test_results(
+                &session.project_id,
+                Some(&id),
+                None,
+                None,
+                true,
+                10_000,
+                &vp_protocol::now_rfc3339(),
+            )?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -12422,6 +12433,7 @@ impl Engine {
                 run_checkpoints,
                 context_checkpoints,
                 processes,
+                test_results,
                 events,
             })
         })
@@ -13254,6 +13266,15 @@ impl Engine {
             ));
         }
 
+        let expected_test_results = crate::test_cache::results_from_events(&data.events);
+        if !crate::test_cache::results_match(&data.test_results, &expected_test_results) {
+            mismatches.push(format!(
+                "test cache: projection={}, replay={}",
+                data.test_results.len(),
+                expected_test_results.len()
+            ));
+        }
+
         let expected_artifacts = Self::expected_artifacts(data);
         let projected_artifacts = data
             .artifacts
@@ -13870,6 +13891,7 @@ impl Engine {
             run_checkpoints: journal.as_ref().map(|value| value.2.clone()),
             context_checkpoints,
             supervised_processes: processes,
+            test_results: Some(crate::test_cache::results_from_events(&data.events)),
             artifact_warnings,
         })
     }
@@ -14053,6 +14075,7 @@ impl Engine {
         let project_id = bundle.project.id.clone();
         let session_id = bundle.session.id.clone();
         let event_count = bundle.events.len() + 2;
+        let bundle_test_results = bundle.test_results.clone();
         let store = self.store.clone();
         let event =
             tokio::task::spawn_blocking(move || store.import_session_bundle(&bundle)).await??;
@@ -14109,6 +14132,13 @@ impl Engine {
                 projection_store
                     .replace_context_checkpoints(&projection_id, &context_checkpoints)?;
             }
+            let replayed_test_results = crate::test_cache::results_from_events(&events);
+            let test_results = if replayed_test_results.is_empty() {
+                bundle_test_results
+            } else {
+                replayed_test_results
+            };
+            projection_store.replace_test_results(&projection_id, &test_results)?;
             Ok(())
         })
         .await??;
@@ -14226,6 +14256,7 @@ impl Engine {
             run_checkpoints: data.run_checkpoints,
             context_checkpoints: data.context_checkpoints,
             supervised_processes: data.processes,
+            test_results: data.test_results,
         })
     }
 
@@ -15630,6 +15661,7 @@ impl Engine {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         };
         self.consoles.open(&session.id, context).await
     }
@@ -15940,6 +15972,7 @@ impl Engine {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         };
         self.terminals.open(&session.id, context, cols, rows).await
     }
@@ -16907,7 +16940,7 @@ impl Engine {
     /// Manifest snapshots are a rebuild aid; a failed append must not turn a
     /// successfully committed SQLite mutation into a user-visible failure and
     /// invite a duplicate retry.
-    async fn record_project_manifest_best_effort(&self) {
+    pub(crate) async fn record_project_manifest_best_effort(&self) {
         let store = self.store.clone();
         match tokio::task::spawn_blocking(move || store.record_project_manifest()).await {
             Ok(Ok(())) => {}

@@ -9,6 +9,7 @@ pub mod lsp;
 pub mod remote;
 pub mod rpc;
 pub mod scaling;
+pub mod test_cache;
 pub mod types;
 
 pub const PROTOCOL_VERSION: u32 = 1;

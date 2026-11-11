@@ -159,6 +159,17 @@ enum ToolTrace {
         }
     }
 
+    /// Cache provenance comes only from the runtime's structured result. A
+    /// missing or non-boolean `cache.cache_hit` never renders a badge.
+    static func cacheProvenance(_ structured: JSONValue?) -> String? {
+        guard let cache = structured?.objectValue?["cache"]?.objectValue,
+              cache["cache_hit"]?.boolValue == true
+        else {
+            return nil
+        }
+        return "CACHED"
+    }
+
     static func intelligenceStatus(_ structured: JSONValue?) -> String? {
         guard let status = structured?.objectValue?["status"]?.stringValue,
               !status.isEmpty

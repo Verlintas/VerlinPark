@@ -64,6 +64,19 @@ struct ToolTraceRow: View {
                             )
                     }
 
+                    if let cache = entry.cacheProvenance {
+                        Text(cache)
+                            .font(VPTheme.mono(7, weight: .semibold))
+                            .tracking(0.4)
+                            .foregroundStyle(VPTheme.success)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 0.5)
+                            .background(
+                                Capsule().fill(VPTheme.success.opacity(0.12))
+                            )
+                            .help("Served from the test-result cache; no command ran for this call.")
+                    }
+
                     if let agent = entry.agent {
                         Text(agent)
                             .font(VPTheme.mono(7.5))

@@ -37,6 +37,9 @@ struct TranscriptToolEntry: Identifiable, Equatable {
     let output: String
     let isError: Bool
     let intelligenceSource: String?
+    /// Set only when the runtime reported `cache.cache_hit=true`; the UI never
+    /// infers a cache hit from tool names or command text.
+    let cacheProvenance: String?
     let agent: String?
     let startedAt: String
     let finishedAt: String?
@@ -248,6 +251,7 @@ enum TranscriptProjection {
                 output: "",
                 isError: false,
                 intelligenceSource: nil,
+                cacheProvenance: nil,
                 agent: TranscriptProjection.agentLabel(event),
                 startedAt: event.createdAt,
                 finishedAt: nil,
@@ -276,6 +280,7 @@ enum TranscriptProjection {
             let output = payload?["output"]?.stringValue ?? ""
             let isError = payload?["is_error"]?.boolValue ?? false
             let intelligenceSource = ToolTrace.intelligenceSource(payload?["structured"])
+            let cacheProvenance = ToolTrace.cacheProvenance(payload?["structured"])
             if TranscriptProjection.isRoutineTool(name), !isError,
                toolIndices[toolCallID] == nil
             {
@@ -294,6 +299,7 @@ enum TranscriptProjection {
                 output: output,
                 isError: isError,
                 intelligenceSource: intelligenceSource,
+                cacheProvenance: cacheProvenance,
                 agent: TranscriptProjection.agentLabel(event),
                 startedAt: event.createdAt,
                 finishedAt: event.createdAt,
@@ -315,6 +321,7 @@ enum TranscriptProjection {
                         output: output,
                         isError: isError,
                         intelligenceSource: intelligenceSource,
+                        cacheProvenance: cacheProvenance,
                         agent: existing.agent,
                         startedAt: existing.startedAt,
                         finishedAt: event.createdAt,

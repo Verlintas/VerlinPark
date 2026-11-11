@@ -132,6 +132,21 @@ final class AppModel {
     var toolOutputToolThresholds: [String: Int] = [:]
     var toolOutputPolicyBusy = false
     var toolOutputPolicyStatus: String?
+    var testCacheStats: TestCacheStats?
+    var testCacheEntries: [TestCacheEntry] = []
+    var testCachePolicy = TestCachePolicy.default
+    var testCacheEnabled = true
+    var testCacheMaxEntriesText = "512"
+    var testCacheRetentionDaysText = "14"
+    var testCacheMaxOutputBytesText = "262144"
+    var testCacheReuseLint = true
+    var testCacheIncludeIntegration = false
+    var testCacheFailedRetentionText = "900"
+    var testCacheBusy = false
+    var testCacheStatus: String?
+    var testImpactResult: TestCacheImpactResult?
+    var testImpactBusy = false
+    var testImpactStatus: String?
     var artifactPolicy = ArtifactPolicy.disabled
     var artifactAutoGc = false
     var artifactMaxBytesText = ""
@@ -3867,6 +3882,163 @@ final class AppModel {
                     + "\(audit.hashMismatches) mismatched, \(audit.cleanedOrphans) orphan(s) cleaned"
         } catch {
             toolOutputPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadTestCache(includeEntries: Bool = true) async {
+        guard let projectID = selectedProjectID else {
+            testCacheStats = nil
+            testCacheEntries = []
+            applyTestCachePolicy(.default)
+            testCacheStatus = nil
+            return
+        }
+        testCacheBusy = true
+        defer { testCacheBusy = false }
+        do {
+            let stats = try await core.testCacheStats(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            testCacheStats = stats
+            testCachePolicy = stats.policy
+            applyTestCachePolicy(stats.policy)
+            if includeEntries {
+                let result = try await core.testCacheEntries(
+                    projectID: projectID,
+                    sessionID: nil,
+                    includeExpired: false,
+                    limit: 200
+                )
+                guard projectID == selectedProjectID else { return }
+                testCacheEntries = result.entries
+            }
+            testCacheStatus = nil
+        } catch {
+            testCacheStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    private func applyTestCachePolicy(_ policy: TestCachePolicy) {
+        testCachePolicy = policy
+        testCacheEnabled = policy.enabled
+        testCacheMaxEntriesText = String(policy.maxEntries)
+        testCacheRetentionDaysText = String(policy.retentionDays)
+        testCacheMaxOutputBytesText = String(policy.maxOutputBytes)
+        testCacheReuseLint = policy.reuseLint
+        testCacheIncludeIntegration = policy.includeIntegration
+        testCacheFailedRetentionText = String(policy.failedRetentionSecs)
+    }
+
+    func saveTestCachePolicy() async {
+        guard let projectID = selectedProjectID else {
+            testCacheStatus = "Select a project first."
+            return
+        }
+        guard let maxEntries = Int(testCacheMaxEntriesText.trimmingCharacters(in: .whitespaces)),
+              let retentionDays = Int(
+                  testCacheRetentionDaysText.trimmingCharacters(in: .whitespaces)
+              ),
+              let maxOutputBytes = Int(
+                  testCacheMaxOutputBytesText.trimmingCharacters(in: .whitespaces)
+              ),
+              let failedRetention = Int(
+                  testCacheFailedRetentionText.trimmingCharacters(in: .whitespaces)
+              )
+        else {
+            testCacheStatus = "All test-cache policy fields must be integers."
+            return
+        }
+        guard (1 ... 10000).contains(maxEntries) else {
+            testCacheStatus = "Max entries must be between 1 and 10,000."
+            return
+        }
+        guard (1 ... 365).contains(retentionDays) else {
+            testCacheStatus = "Retention must be between 1 and 365 days."
+            return
+        }
+        guard (4096 ... 8_388_608).contains(maxOutputBytes) else {
+            testCacheStatus = "Output bound must be between 4 KiB and 8 MiB."
+            return
+        }
+        guard (60 ... 86400).contains(failedRetention) else {
+            testCacheStatus = "Failed-result TTL must be between 60 and 86,400 seconds."
+            return
+        }
+        testCacheBusy = true
+        defer { testCacheBusy = false }
+        do {
+            let policy = try await core.setTestCachePolicy(
+                projectID: projectID,
+                policy: TestCachePolicy(
+                    enabled: testCacheEnabled,
+                    maxEntries: maxEntries,
+                    retentionDays: retentionDays,
+                    maxOutputBytes: maxOutputBytes,
+                    reuseLint: testCacheReuseLint,
+                    includeIntegration: testCacheIncludeIntegration,
+                    failedRetentionSecs: failedRetention
+                )
+            )
+            guard projectID == selectedProjectID else { return }
+            applyTestCachePolicy(policy)
+            testCacheStatus = policy.enabled ? "Test cache policy saved" : "Test cache disabled"
+            await loadTestCache()
+        } catch {
+            testCacheStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func pruneTestCache(dryRun: Bool) async {
+        guard let projectID = selectedProjectID else { return }
+        testCacheBusy = true
+        defer { testCacheBusy = false }
+        do {
+            let result = try await core.pruneTestCache(projectID: projectID, dryRun: dryRun)
+            testCacheStatus = dryRun
+                ? "Prune preview: \(result.pruned) row(s) would be removed"
+                : "Pruned \(result.pruned) row(s)"
+            if !dryRun {
+                await loadTestCache()
+            }
+        } catch {
+            testCacheStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func clearTestCache() async {
+        guard let projectID = selectedProjectID else { return }
+        testCacheBusy = true
+        defer { testCacheBusy = false }
+        do {
+            let result = try await core.clearTestCache(projectID: projectID, confirm: true)
+            testCacheStatus = "Cleared \(result.cleared) row(s)"
+            await loadTestCache()
+        } catch {
+            testCacheStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func previewTestImpact() async {
+        guard let sessionID = selectedSessionID else {
+            testImpactStatus = "Select a session first."
+            return
+        }
+        testImpactBusy = true
+        defer { testImpactBusy = false }
+        do {
+            let result = try await core.testImpact(
+                sessionID: sessionID,
+                changedPaths: []
+            )
+            guard sessionID == selectedSessionID else { return }
+            testImpactResult = result
+            testImpactStatus = nil
+        } catch {
+            testImpactStatus = error.localizedDescription
             handle(error)
         }
     }

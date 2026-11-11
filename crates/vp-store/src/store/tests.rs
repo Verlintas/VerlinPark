@@ -11774,6 +11774,7 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         run_checkpoints: Vec::new(),
         context_checkpoints: vec![checkpoint.clone()],
         supervised_processes: Vec::new(),
+        test_results: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12028,6 +12029,7 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         run_checkpoints: Vec::new(),
         context_checkpoints: vec![checkpoint.clone()],
         supervised_processes: Vec::new(),
+        test_results: Vec::new(),
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -13321,6 +13323,7 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
         run_checkpoints: Vec::new(),
         context_checkpoints: Vec::new(),
         supervised_processes: vec![row.clone()],
+        test_results: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     let data = TempDir::new().unwrap();
@@ -13379,6 +13382,7 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         run_checkpoints: Vec::new(),
         context_checkpoints: Vec::new(),
         supervised_processes: vec![row],
+        test_results: Vec::new(),
     };
     let error = validate_session_bundle(&bundle).unwrap_err();
     assert!(error.to_string().contains("belongs to session"), "{error}");
@@ -13831,4 +13835,235 @@ fn remote_integration_policy_persists_and_decodes_as_disabled() {
             .set_remote_integration_policy(&project.id, &invalid)
             .is_err()
     );
+}
+
+#[test]
+fn test_cache_policy_round_trips_manifest_and_legacy_defaults() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("test cache"))
+        .unwrap();
+    let default = store.get_test_cache_policy(&project.id).unwrap();
+    assert!(default.enabled);
+    assert!(!default.include_integration);
+    assert_eq!(default, vp_protocol::test_cache::TestCachePolicy::default());
+    let policy = vp_protocol::test_cache::TestCachePolicy {
+        enabled: true,
+        max_entries: 9,
+        retention_days: 2,
+        max_output_bytes: 32_768,
+        reuse_lint: false,
+        include_integration: true,
+        failed_retention_secs: 180,
+    };
+    store.set_test_cache_policy(&project.id, &policy).unwrap();
+    assert_eq!(store.get_test_cache_policy(&project.id).unwrap(), policy);
+    store.record_project_manifest().unwrap();
+    let snapshot = crate::read_project_manifest(store.data_dir()).unwrap();
+    let snapshot = snapshot
+        .into_iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.test_cache_policy, policy);
+
+    let legacy = serde_json::from_value::<crate::ProjectManifestSnapshot>(serde_json::json!({
+        "version": 1,
+        "recorded_at": "2026-11-11T00:00:00Z",
+        "project": snapshot.project,
+        "shell_policy": vp_protocol::types::ShellPolicy::default(),
+        "integration_policy": vp_protocol::types::IntegrationPolicy::default(),
+        "artifact_policy": vp_protocol::types::ArtifactPolicy::default(),
+        "mailbox_policy": vp_protocol::types::MailboxPolicy::default(),
+        "worktree_policy": vp_protocol::types::WorktreeRetentionPolicy::default(),
+        "budget": vp_protocol::types::ProjectBudget::default()
+    }))
+    .unwrap();
+    assert_eq!(
+        legacy.test_cache_policy,
+        vp_protocol::test_cache::TestCachePolicy::default()
+    );
+
+    // Stored values are normalized even if a caller bypasses strict validation.
+    let oversized = vp_protocol::test_cache::TestCachePolicy {
+        max_entries: u32::MAX,
+        ..policy
+    };
+    store
+        .set_test_cache_policy(&project.id, &oversized)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_test_cache_policy(&project.id)
+            .unwrap()
+            .max_entries,
+        vp_protocol::test_cache::HARD_MAX_TEST_CACHE_ENTRIES
+    );
+}
+
+#[test]
+fn test_cache_clear_chunks_prune_events_and_removes_every_row() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache clear"))
+        .unwrap();
+    let session = store.create_session(&project.id, "clear").unwrap();
+    let now = now_rfc3339();
+    for index in 0..600 {
+        let entry = vp_protocol::test_cache::TestCacheEntry {
+            id: format!("tr-clear-{index}"),
+            project_id: project.id.clone(),
+            session_id: session.id.clone(),
+            kind: "test".into(),
+            command: format!("cargo test {index}"),
+            command_source: "Cargo.toml".into(),
+            key_version: vp_protocol::test_cache::TEST_CACHE_KEY_VERSION,
+            cache_key: format!("v1:{index:064x}"),
+            inputs_hash: format!("inputs-{index}"),
+            impact_generation: "impact".into(),
+            status: "passed".into(),
+            exit_code: 0,
+            duration_ms: 1,
+            output_ref: None,
+            output_bytes: 0,
+            covered_paths: Vec::new(),
+            warnings: Vec::new(),
+            warning_count: 0,
+            failure_count: 0,
+            created_at: now.clone(),
+            expires_at: "2999-01-01T00:00:00Z".into(),
+            hit_count: 0,
+            last_hit_at: None,
+        };
+        store
+            .record_test_result_with_events(&entry, "{}", 1_000)
+            .unwrap();
+    }
+    let sweep = store
+        .clear_test_results(&project.id, Some(&session.id), None, &now)
+        .unwrap();
+    assert_eq!(sweep.removed_ids.len(), 600);
+    assert_eq!(sweep.remaining, 0);
+    assert!(sweep.events.len() >= 3, "clear events must be chunked");
+    let removed_from_events = sweep
+        .events
+        .iter()
+        .flat_map(|event| event.payload["ids"].as_array().cloned().unwrap_or_default())
+        .count();
+    assert_eq!(removed_from_events, 600);
+    assert_eq!(
+        store
+            .count_test_results(&project.id, None, None, None, true, &now)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn test_cache_hit_event_and_expired_prune_are_projected() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache hit"))
+        .unwrap();
+    let session = store.create_session(&project.id, "hit").unwrap();
+    let now = now_rfc3339();
+    let entry = vp_protocol::test_cache::TestCacheEntry {
+        id: "tr-hit".into(),
+        project_id: project.id.clone(),
+        session_id: session.id.clone(),
+        kind: "test".into(),
+        command: "cargo test".into(),
+        command_source: "Cargo.toml".into(),
+        key_version: vp_protocol::test_cache::TEST_CACHE_KEY_VERSION,
+        cache_key: format!("v1:{}", "b".repeat(64)),
+        inputs_hash: "inputs".into(),
+        impact_generation: "impact".into(),
+        status: "passed".into(),
+        exit_code: 0,
+        duration_ms: 2,
+        output_ref: None,
+        output_bytes: 0,
+        covered_paths: vec!["tests/a.rs".into()],
+        warnings: Vec::new(),
+        warning_count: 0,
+        failure_count: 0,
+        created_at: "2000-01-01T00:00:00Z".into(),
+        expires_at: "2000-01-02T00:00:00Z".into(),
+        hit_count: 0,
+        last_hit_at: None,
+    };
+    store
+        .record_test_result_with_events(&entry, "{}", 10)
+        .unwrap();
+    let event = store
+        .record_test_result_hit("tr-hit", &session.id, &now)
+        .unwrap()
+        .expect("hit event");
+    assert_eq!(event.kind, "test_cache.hit");
+    assert_eq!(event.payload["result_id"], "tr-hit");
+    let stored = store
+        .find_test_result_by_key(&project.id, &entry.cache_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.entry.hit_count, 1);
+    assert!(stored.entry.last_hit_at.is_some());
+    let sweep = store
+        .prune_test_results(&project.id, None, true, None, false, &now)
+        .unwrap();
+    assert_eq!(sweep.removed_ids, vec!["tr-hit".to_string()]);
+    assert_eq!(sweep.remaining, 0);
+    assert!(
+        sweep
+            .events
+            .iter()
+            .any(|event| event.kind == "test_cache.pruned")
+    );
+}
+
+#[test]
+fn test_cache_historical_lookup_matches_covered_paths_and_ignores_failures() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache history"))
+        .unwrap();
+    let session = store.create_session(&project.id, "history").unwrap();
+    let now = now_rfc3339();
+    for (id, status, covered) in [
+        ("tr-pass", "passed", vec!["src/lib.rs".to_string()]),
+        ("tr-fail", "failed", vec!["src/lib.rs".to_string()]),
+        ("tr-other", "passed", vec!["src/other.rs".to_string()]),
+    ] {
+        let entry = vp_protocol::test_cache::TestCacheEntry {
+            id: id.into(),
+            project_id: project.id.clone(),
+            session_id: session.id.clone(),
+            kind: "test".into(),
+            command: format!("cargo test {id}"),
+            command_source: "Cargo.toml".into(),
+            key_version: vp_protocol::test_cache::TEST_CACHE_KEY_VERSION,
+            cache_key: format!("v1:{id:0>64}"),
+            inputs_hash: id.into(),
+            impact_generation: "impact".into(),
+            status: status.into(),
+            exit_code: if status == "passed" { 0 } else { 1 },
+            duration_ms: 1,
+            output_ref: None,
+            output_bytes: 0,
+            covered_paths: covered,
+            warnings: Vec::new(),
+            warning_count: 0,
+            failure_count: u64::from(status != "passed"),
+            created_at: now.clone(),
+            expires_at: "2999-01-01T00:00:00Z".into(),
+            hit_count: 0,
+            last_hit_at: None,
+        };
+        store
+            .record_test_result_with_events(&entry, "{}", 100)
+            .unwrap();
+    }
+    let rows = store
+        .test_results_for_paths(&project.id, &["src/lib.rs".into()], &now, 100)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "tr-pass");
 }

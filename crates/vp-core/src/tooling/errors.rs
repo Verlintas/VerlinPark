@@ -482,6 +482,13 @@ tool_error_codes! {
     QUESTION_TIMEOUT => "QUESTION_TIMEOUT", false, "session", "Proceed with the safest assumption or ask again; do not block forever.";
     VERDICT_INVALID => "VERDICT_INVALID", false, "session", "Submit a verdict with approved plus a concrete summary.";
     TODO_INVALID => "TODO_INVALID", false, "session", "Use 1-50 bounded todo items with valid statuses.";
+    TEST_CACHE_POLICY_INVALID => "TEST_CACHE_POLICY_INVALID", false, "test_cache", "Use bounded entry, retention, output-size, and failed-result TTL values; the Integrator is excluded unless include_integration is explicit.";
+    TEST_CACHE_UNAVAILABLE => "TEST_CACHE_UNAVAILABLE", false, "test_cache", "Run through the daemon so the project-scoped cache store is available, or pass cache=bypass.";
+    TEST_CACHE_INPUT_INCOMPLETE => "TEST_CACHE_INPUT_INCOMPLETE", false, "test_cache", "The worktree exceeds the hashing bound or contains an unreadable input; the command ran but the result was not reused.";
+    TEST_CACHE_CONFLICT => "TEST_CACHE_CONFLICT", false, "test_cache", "Re-read the cache row and retry; do not overwrite a result for different inputs.";
+    TEST_CACHE_CLEAR_UNCONFIRMED => "TEST_CACHE_CLEAR_UNCONFIRMED", false, "test_cache", "Repeat the clear with confirm=true after reviewing the stats; clearing cannot be undone.";
+    TEST_CACHE_KEY_INVALID => "TEST_CACHE_KEY_INVALID", false, "test_cache", "Use the versioned key produced by the daemon; do not hand-craft cache keys.";
+    IMPACT_MAP_UNAVAILABLE => "IMPACT_MAP_UNAVAILABLE", false, "test_cache", "Fall back to mode=lexical or provide changed_paths; the impact map never executes tests.";
     SCALING_POLICY_INVALID => "SCALING_POLICY_INVALID", false, "scaling", "Use bounded Worker/Labour minimums and maximums, a cooldown, and an optional 0.0-1.0 budget headroom ratio.";
     SCALING_STATE_CONFLICT => "SCALING_STATE_CONFLICT", false, "scaling", "Re-read the plan revision and scaling status before retrying; do not create Managers or rewrite the plan.";
     ACP_AGENT_FAILED => "ACP_AGENT_FAILED", false, "acp", "Inspect the external agent stderr/report; do not retry an unchanged session.";

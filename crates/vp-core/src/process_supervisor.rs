@@ -1889,6 +1889,7 @@ mod tests {
             remote: None,
             session_id: Some(session.to_string()),
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
+            test_cache: None,
         }
     }
 
@@ -2444,6 +2445,7 @@ mod replay_tests {
             remote: None,
             session_id: Some(session.id.clone()),
             process_supervisor: Some(Arc::clone(&supervisor)),
+            test_cache: None,
         };
         let row = supervisor
             .start(
@@ -2520,6 +2522,7 @@ mod supervisor_edge_tests {
             remote: None,
             session_id: Some(session.to_string()),
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
+            test_cache: None,
         }
     }
 
@@ -2840,6 +2843,7 @@ mod supervisor_safety_tests {
             remote: None,
             session_id: Some(session.to_string()),
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
+            test_cache: None,
         }
     }
 
@@ -3119,6 +3123,7 @@ mod lifecycle_replay_tests {
             remote: None,
             session_id: Some(session.to_string()),
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
+            test_cache: None,
         }
     }
 
@@ -3533,6 +3538,7 @@ mod process_policy_tests {
             remote: None,
             session_id: Some(session.to_string()),
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
+            test_cache: None,
         }
     }
 

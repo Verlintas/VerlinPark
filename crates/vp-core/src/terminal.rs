@@ -411,6 +411,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         }
     }
 

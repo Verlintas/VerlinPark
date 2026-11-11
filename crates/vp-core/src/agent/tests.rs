@@ -18872,3 +18872,87 @@ async fn remote_integration_status_reports_counts_and_retained_refs() {
     assert!(!policy.policy.enabled);
     assert_eq!(policy.project_id, project.id);
 }
+
+#[tokio::test]
+async fn integration_command_cache_is_off_by_default_and_opt_in_when_enabled() {
+    let data = TempDir::new().unwrap();
+    let worktree = TempDir::new().unwrap();
+    std::fs::write(worktree.path().join(".gitignore"), "runs.log\n").unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(worktree.path().to_str().unwrap(), None)
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "integration cache")
+        .unwrap();
+    let engine = Engine::new(store.clone());
+
+    let first = run_integration_command(
+        &engine,
+        &project,
+        &session,
+        worktree.path().to_path_buf(),
+        "echo x >> runs.log".to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(!first.contains("integration cache hit"));
+    let second = run_integration_command(
+        &engine,
+        &project,
+        &session,
+        worktree.path().to_path_buf(),
+        "echo x >> runs.log".to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(!second.contains("integration cache hit"));
+    assert_eq!(
+        std::fs::read_to_string(worktree.path().join("runs.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "the default policy must never reuse an integration command"
+    );
+
+    engine
+        .set_test_cache_policy(
+            &project.id,
+            vp_protocol::test_cache::TestCachePolicy {
+                enabled: true,
+                include_integration: true,
+                ..vp_protocol::test_cache::TestCachePolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let executed = run_integration_command(
+        &engine,
+        &project,
+        &session,
+        worktree.path().to_path_buf(),
+        "echo x >> runs.log".to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(!executed.contains("integration cache hit"));
+    let cached = run_integration_command(
+        &engine,
+        &project,
+        &session,
+        worktree.path().to_path_buf(),
+        "echo x >> runs.log".to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(cached.contains("integration cache hit"));
+    assert_eq!(
+        std::fs::read_to_string(worktree.path().join("runs.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        3,
+        "the explicitly enabled integration cache must skip the second command"
+    );
+}

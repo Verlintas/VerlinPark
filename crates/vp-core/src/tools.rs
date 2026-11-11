@@ -62,6 +62,10 @@ pub struct ToolContext {
     /// cannot create durable processes (for example a one-shot integration
     /// command or an isolated tool unit test).
     pub process_supervisor: Option<Arc<crate::process_supervisor::ProcessSupervisor>>,
+    /// Project-scoped test-result cache. `None` in isolated tool tests, the
+    /// deterministic Integrator command, and any context that must never reuse
+    /// an executed result.
+    pub test_cache: Option<Arc<crate::test_cache::TestCacheAccess>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2323,6 +2327,7 @@ mod tests {
                 remote: None,
                 session_id: None,
                 process_supervisor: None,
+                test_cache: None,
             },
         )
     }
@@ -2568,6 +2573,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         };
         let inside = Shell
             .execute(&context, json!({"command": "echo inside > inside.txt"}))
@@ -2621,6 +2627,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         };
         let visible = Shell
             .execute(&context, json!({"command": "cat visible.txt"}))
@@ -2660,6 +2667,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         };
         let visible = Shell
             .execute(&context, json!({"command": "cat visible.txt"}))
@@ -2701,6 +2709,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         };
         let output = Shell
             .execute(
@@ -2731,6 +2740,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         };
         let started = std::time::Instant::now();
         let result = Shell
@@ -2815,6 +2825,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         };
         let output = Shell
             .execute(
@@ -2907,6 +2918,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         };
         let output = Shell
             .execute(

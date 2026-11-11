@@ -98,6 +98,14 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                     )
                 })?;
             store.set_tool_output_policy(&snapshot.project.id, &snapshot.tool_output_policy)?;
+            let test_cache_policy = snapshot.test_cache_policy.clone().normalized();
+            if let Err(message) = test_cache_policy.validate() {
+                anyhow::bail!(
+                    "test-cache policy for project {} is invalid: {message}",
+                    snapshot.project.id
+                );
+            }
+            store.set_test_cache_policy(&snapshot.project.id, &test_cache_policy)?;
             store.set_mailbox_policy(&snapshot.project.id, &snapshot.mailbox_policy)?;
             store.set_worktree_policy(&snapshot.project.id, &snapshot.worktree_policy)?;
             store.set_checkpoint_policy(&snapshot.project.id, &snapshot.checkpoint_policy)?;
@@ -478,6 +486,51 @@ mod tests {
                 .await
                 .unwrap();
             engine
+                .set_test_cache_policy(
+                    &project.id,
+                    vp_protocol::test_cache::TestCachePolicy {
+                        max_entries: 7,
+                        retention_days: 3,
+                        include_integration: true,
+                        ..vp_protocol::test_cache::TestCachePolicy::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let test_result = vp_protocol::test_cache::TestCacheEntry {
+                id: "tr-rebuild".into(),
+                project_id: project.id.clone(),
+                session_id: session.id.clone(),
+                kind: "test".into(),
+                command: "cargo test".into(),
+                command_source: "Cargo.toml".into(),
+                key_version: vp_protocol::test_cache::TEST_CACHE_KEY_VERSION,
+                cache_key: format!("v1:{}", "a".repeat(64)),
+                inputs_hash: "inputs".into(),
+                impact_generation: "impact".into(),
+                status: "passed".into(),
+                exit_code: 0,
+                duration_ms: 1,
+                output_ref: None,
+                output_bytes: 0,
+                covered_paths: vec!["tests/rebuild.rs".into()],
+                warnings: Vec::new(),
+                warning_count: 0,
+                failure_count: 0,
+                created_at: "2026-11-12T00:00:00Z".into(),
+                expires_at: "2999-01-01T00:00:00Z".into(),
+                hit_count: 0,
+                last_hit_at: None,
+            };
+            engine
+                .append_event(
+                    &session.id,
+                    "test_cache.stored",
+                    serde_json::json!({"entry": test_result}),
+                )
+                .await
+                .unwrap();
+            engine
                 .record_agent_usage(
                     &session.id,
                     "worker-rebuild",
@@ -532,6 +585,23 @@ mod tests {
         assert_eq!(tasks[0].task_id, "T1");
         assert_eq!(tasks[0].status, "completed");
         assert_eq!(tasks[0].attempts, 1);
+        let test_cache_policy = store.get_test_cache_policy(&project_id).unwrap();
+        assert_eq!(test_cache_policy.max_entries, 7);
+        assert_eq!(test_cache_policy.retention_days, 3);
+        assert!(test_cache_policy.include_integration);
+        let test_results = store
+            .list_test_results(
+                &project_id,
+                Some(&session_id),
+                None,
+                None,
+                true,
+                10,
+                "2026-11-12T01:00:00Z",
+            )
+            .unwrap();
+        assert_eq!(test_results.len(), 1);
+        assert_eq!(test_results[0].id, "tr-rebuild");
         let policy = store.get_task_scheduler_policy(&project_id).unwrap();
         assert!(policy.enabled);
         assert_eq!(policy.cooldown_secs, 30);

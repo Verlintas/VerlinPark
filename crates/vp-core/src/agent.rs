@@ -9303,10 +9303,67 @@ async fn run_integration_command(
     command: String,
 ) -> Result<String> {
     let policy = engine.get_shell_policy(&project.id).await?;
+    let cache_policy = engine.get_test_cache_policy(&project.id).await?;
+    let mut cache_key = None;
+    let mut inputs_hash = None;
+    let mut impact_generation = None;
+    let mut cache_access = None;
+    if cache_policy.enabled && cache_policy.include_integration {
+        let profile = crate::tooling::project::detect_profile(&worktree);
+        let profile_hash = crate::test_cache::profile_hash(&profile);
+        let fingerprint = crate::test_cache::compute_input_fingerprint(&worktree, &[], &[]);
+        if fingerprint.complete {
+            let generation = crate::test_cache::full_impact_generation(&profile_hash);
+            let material = crate::test_cache::TestCacheKeyMaterial::resolved(
+                "check",
+                &command,
+                &profile_hash,
+                &fingerprint.hash,
+                &generation,
+            );
+            let key = crate::test_cache::compute_cache_key(&material);
+            let access =
+                crate::test_cache::TestCacheAccess::new(engine.store().clone(), project.id.clone());
+            let lookup_access = access.clone();
+            let lookup_key = key.clone();
+            let lookup_session = session.id.clone();
+            let hit = tokio::task::spawn_blocking(move || {
+                lookup_access.lookup(&lookup_key, &lookup_session, &vp_protocol::now_rfc3339())
+            })
+            .await??;
+            if let Some(hit) = hit {
+                let text = hit
+                    .result
+                    .get("raw_tail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if hit.entry.status == "passed" {
+                    return Ok(format!(
+                        "{text}\n[integration cache hit {}: no command ran; inputs {}]",
+                        hit.entry.id, hit.entry.inputs_hash
+                    ));
+                }
+                return Err(anyhow!(
+                    "integration command cached failure (exit {}):\n{text}",
+                    hit.entry.exit_code
+                ));
+            }
+            cache_key = Some(key);
+            inputs_hash = Some(fingerprint.hash);
+            impact_generation = Some(generation);
+            cache_access = Some(access);
+        } else {
+            tracing::warn!(
+                session_id = %session.id,
+                "integration cache policy is enabled but input hashing was incomplete; running fresh"
+            );
+        }
+    }
     let mut secret_roots = shell_secret_roots(engine.store().data_dir());
     secret_roots.extend(policy.read_deny.iter().map(PathBuf::from));
     let context = crate::tools::ToolContext {
-        root: worktree,
+        root: worktree.clone(),
         project_root: PathBuf::from(&project.root),
         sandbox_root: engine
             .store()
@@ -9323,11 +9380,64 @@ async fn run_integration_command(
         remote: None,
         session_id: None,
         process_supervisor: None,
+        test_cache: None,
     };
     let (exit, text) =
         crate::tools::run_sandboxed_login_shell(&context, &command, Duration::from_secs(300))
             .await?;
     let text = truncate(&text);
+    if let (Some(access), Some(key), Some(hash), Some(generation)) =
+        (cache_access, cache_key, inputs_hash, impact_generation)
+    {
+        let retention = if exit == 0 {
+            u64::from(cache_policy.retention_days).saturating_mul(86_400)
+        } else {
+            cache_policy.failed_retention_secs
+        };
+        let spill = crate::test_cache::spill_cache_output(
+            &access,
+            &session.id,
+            &text,
+            cache_policy.max_output_bytes,
+            retention,
+        );
+        let spec = crate::test_cache::TestResultSpec {
+            session_id: session.id.clone(),
+            kind: "check".to_string(),
+            command: command.clone(),
+            command_source: "integration_policy".to_string(),
+            cache_key: key,
+            inputs_hash: hash,
+            impact_generation: generation,
+            status: if exit == 0 { "passed" } else { "failed" }.to_string(),
+            exit_code: exit,
+            duration_ms: 0,
+            output_ref: spill.output_ref,
+            output_bytes: spill.bytes,
+            covered_paths: Vec::new(),
+            warnings: Vec::new(),
+            warning_count: 0,
+            failure_count: u64::from(exit != 0),
+            result_json: serde_json::json!({
+                "ok": exit == 0,
+                "raw_tail": text,
+                "exit_code": exit,
+                "source": "integration_policy",
+            }),
+        };
+        let persist_access = access;
+        let persist_policy = cache_policy.clone();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || persist_access.persist(spec, &persist_policy))
+                .await?
+        {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "failed to persist integration command cache metadata"
+            );
+        }
+    }
     if exit == 0 {
         Ok(text)
     } else {
@@ -13491,6 +13601,10 @@ async fn run_loop_body(
         remote: engine.remote_access(&project.id).await?.map(Arc::new),
         session_id: Some(session.id.clone()),
         process_supervisor: Some(Arc::clone(engine.process_supervisor())),
+        test_cache: Some(Arc::new(crate::test_cache::TestCacheAccess::new(
+            engine.store().clone(),
+            project.id.clone(),
+        ))),
     };
     let sections = build_prompt_sections(engine, project, session, spec, objective, true).await;
     let system = sections.render();

@@ -16,9 +16,15 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::test_cache::{
+    TestCacheKeyMaterial, build_impact_map, compute_cache_key, compute_input_fingerprint,
+    full_impact_generation, impact_targets_as_affected, incomplete_input_note, profile_hash,
+    spill_cache_output,
+};
 use crate::tools::{
     AgentTool, ToolContext, ToolOutput, run_sandboxed_shell_captured, safe_existing_path,
 };
+use vp_protocol::test_cache::{AffectedTestsMode, TestCacheMode, TestCacheProvenance};
 
 const MAX_SCAN_FILES: usize = 30_000;
 const MAX_FAILURES: usize = 60;
@@ -147,7 +153,7 @@ impl AgentTool for RunProjectTask {
     }
 
     fn description(&self) -> &'static str {
-        "Run the project's detected build, test, lint, format, typecheck, or check task under the shell sandbox. Returns parsed failures and a bounded raw tail."
+        "Run the project's detected build, test, lint, format, typecheck, or check task under the shell sandbox. Returns parsed failures and a bounded raw tail. Test/lint/check results may be reused from the content-addressed cache when every input matches."
     }
 
     fn schema(&self) -> Value {
@@ -160,6 +166,8 @@ impl AgentTool for RunProjectTask {
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Changed source paths used to select affected tests"},
                 "changed_only": {"type": "boolean", "description": "Select tests affected by current Git changes"},
                 "command": {"type": "string", "description": "Explicit command, required only for kind=custom"},
+                "mode": {"type": "string", "enum": ["lexical", "impact"], "description": "Affected-test mapping source; default lexical for compatibility"},
+                "cache": {"type": "string", "enum": ["auto", "bypass", "refresh"], "description": "auto reuses an exact key, bypass never reads/writes, refresh executes and replaces; default auto"},
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 1800, "description": "Default 300"},
                 "dry_run": {"type": "boolean", "description": "Resolve and report the command without running it"}
             },
@@ -188,6 +196,25 @@ impl AgentTool for RunProjectTask {
                 json!({"code": "INVALID_ARGUMENT", "kind": kind}),
             ));
         }
+        let cache_mode = match TestCacheMode::parse(input.get("cache").and_then(Value::as_str)) {
+            Ok(mode) => mode,
+            Err(message) => {
+                return Ok(ToolOutput::error_structured(
+                    message,
+                    json!({"code": "INVALID_ARGUMENT", "field": "cache"}),
+                ));
+            }
+        };
+        let affected_mode =
+            match AffectedTestsMode::parse(input.get("mode").and_then(Value::as_str)) {
+                Ok(mode) => mode,
+                Err(message) => {
+                    return Ok(ToolOutput::error_structured(
+                        message,
+                        json!({"code": "INVALID_ARGUMENT", "field": "mode"}),
+                    ));
+                }
+            };
         let package = input.get("package").and_then(Value::as_str);
         let filter = input.get("filter").and_then(Value::as_str);
         let dry_run = input
@@ -204,6 +231,7 @@ impl AgentTool for RunProjectTask {
             .unwrap_or(300)
             .clamp(1, 1_800);
         let profile = detect_profile(&context.root);
+        let profile_digest = profile_hash(&profile);
         let mut warnings = Vec::new();
         let mut affected = Vec::new();
         let mut changed_paths = input
@@ -220,8 +248,86 @@ impl AgentTool for RunProjectTask {
         if changed_only && changed_paths.is_empty() {
             changed_paths = git_changed_paths(&context.root);
         }
+        changed_paths = changed_paths
+            .into_iter()
+            .filter_map(|path| crate::test_cache::normalize_changed_path(&path))
+            .collect();
+        let access = context.test_cache.clone();
+        let policy = if cache_mode != TestCacheMode::Bypass {
+            match access.as_ref() {
+                Some(access) => {
+                    let access = access.clone();
+                    match tokio::task::spawn_blocking(move || access.policy()).await {
+                        Ok(Ok(policy)) => Some(policy),
+                        Ok(Err(error)) => {
+                            warnings.push(format!(
+                                "test-cache policy unavailable; caching disabled: {error}"
+                            ));
+                            None
+                        }
+                        Err(error) => {
+                            warnings.push(format!(
+                                "test-cache policy task failed; caching disabled: {error}"
+                            ));
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let policy_allows_kind = policy
+            .as_ref()
+            .is_some_and(|policy| policy.allows_kind(kind));
+        let mut impact_map: Option<vp_protocol::test_cache::TestImpactMap> = None;
+        let mut impact_generation_value = full_impact_generation(&profile_digest);
+        let mut impact_available = true;
         if !changed_paths.is_empty() {
-            affected = affected_tests(&context.root, &changed_paths);
+            let want_impact = affected_mode == AffectedTestsMode::Impact
+                || (cache_mode != TestCacheMode::Bypass && policy_allows_kind);
+            if want_impact {
+                match build_impact_map(
+                    context,
+                    access.as_deref(),
+                    &changed_paths,
+                    32,
+                    cache_mode != TestCacheMode::Bypass,
+                )
+                .await
+                {
+                    Ok(map) => {
+                        impact_generation_value = map.generation.clone();
+                        if affected_mode == AffectedTestsMode::Impact {
+                            affected = impact_targets_as_affected(&map);
+                        } else {
+                            affected = affected_tests(&context.root, &changed_paths);
+                        }
+                        impact_map = Some(map);
+                    }
+                    Err(error) => {
+                        if affected_mode == AffectedTestsMode::Impact {
+                            return Ok(ToolOutput::error_coded(
+                                "run_project_task",
+                                crate::tooling::errors::ToolErrorCode::IMPACT_MAP_UNAVAILABLE,
+                                format!("impact mapping failed: {error}"),
+                            )
+                            .with_failure_evidence(format!(
+                                "kind={kind}; changed_paths={}",
+                                changed_paths.len()
+                            )));
+                        }
+                        warnings.push(format!(
+                            "impact mapping failed; lexical mapping was used and caching is disabled: {error}"
+                        ));
+                        impact_available = false;
+                        affected = affected_tests(&context.root, &changed_paths);
+                    }
+                }
+            } else {
+                affected = affected_tests(&context.root, &changed_paths);
+            }
         }
 
         let mut resolved = if kind == "custom" {
@@ -299,9 +405,21 @@ impl AgentTool for RunProjectTask {
         warnings.extend(resolved.warnings.clone());
 
         let summary = format!("{kind}: `{}`", resolved.command);
+        let mut affected_sources = impact_map
+            .as_ref()
+            .map(|map| map.sources.clone())
+            .unwrap_or_default();
+        if affected_sources.is_empty() {
+            for test in &affected {
+                *affected_sources.entry(test.source.clone()).or_insert(0) += 1;
+            }
+        }
         if dry_run {
             return Ok(ToolOutput::ok_structured(
-                format!("{summary}\nsource: {}\n(dry run)", resolved.source),
+                format!(
+                    "{summary}\nsource: {}\ncache: dry_run (no lookup, no command)\n(dry run)",
+                    resolved.source
+                ),
                 json!({
                     "ok": true,
                     "kind": kind,
@@ -311,9 +429,157 @@ impl AgentTool for RunProjectTask {
                     "dry_run": true,
                     "changed_paths": changed_paths,
                     "affected_tests": affected,
+                    "affected_sources": affected_sources,
+                    "impact_generation": impact_generation_value,
+                    "cache_hit": false,
+                    "cache": {
+                        "decision": "dry_run",
+                        "cache_hit": false,
+                        "key_version": vp_protocol::test_cache::TEST_CACHE_KEY_VERSION,
+                        "note": "dry run: no cache lookup and no command execution"
+                    },
                     "warnings": warnings,
                 }),
             ));
+        }
+
+        let mut cacheable = cache_mode != TestCacheMode::Bypass
+            && access.is_some()
+            && policy_allows_kind
+            && impact_available;
+        let mut cache_key: Option<String> = None;
+        let mut inputs_hash: Option<String> = None;
+        let mut provenance = if cache_mode == TestCacheMode::Bypass {
+            TestCacheProvenance::bypass("cache=bypass: no lookup, no write")
+        } else if access.is_none() {
+            crate::test_cache::unavailable_provenance()
+        } else if let Some(policy) = &policy {
+            if !policy.enabled {
+                TestCacheProvenance {
+                    decision: "disabled".to_string(),
+                    note: "project test-cache policy is disabled".to_string(),
+                    ..TestCacheProvenance::miss(String::new())
+                }
+            } else if !policy.allows_kind(kind) {
+                TestCacheProvenance {
+                    decision: "uncacheable".to_string(),
+                    note: format!("kind={kind} is not cacheable by policy"),
+                    ..TestCacheProvenance::miss(String::new())
+                }
+            } else if !impact_available {
+                TestCacheProvenance {
+                    decision: "uncacheable".to_string(),
+                    note: "impact generation was unavailable; cache reuse is disabled for this run"
+                        .to_string(),
+                    ..TestCacheProvenance::miss(String::new())
+                }
+            } else {
+                TestCacheProvenance::miss("no cached result for these exact inputs")
+            }
+        } else {
+            TestCacheProvenance::miss("no test-cache policy is available")
+        };
+        if cacheable {
+            let dependency_paths = impact_map
+                .as_ref()
+                .map(|map| map.dependency_paths.clone())
+                .unwrap_or_default();
+            let fingerprint =
+                compute_input_fingerprint(&context.root, &changed_paths, &dependency_paths);
+            if !fingerprint.complete {
+                cacheable = false;
+                if let Some(note) = incomplete_input_note(&fingerprint) {
+                    warnings.push(note.clone());
+                    provenance = TestCacheProvenance {
+                        decision: "uncacheable".to_string(),
+                        inputs_hash: Some(fingerprint.hash.clone()),
+                        impact_generation: Some(impact_generation_value.clone()),
+                        note,
+                        ..TestCacheProvenance::miss(String::new())
+                    };
+                }
+            } else {
+                inputs_hash = Some(fingerprint.hash.clone());
+                let material = TestCacheKeyMaterial::resolved(
+                    kind,
+                    &resolved.command,
+                    &profile_digest,
+                    &fingerprint.hash,
+                    &impact_generation_value,
+                );
+                cache_key = Some(compute_cache_key(&material));
+                provenance.inputs_hash = inputs_hash.clone();
+                provenance.impact_generation = Some(impact_generation_value.clone());
+                provenance.cache_key = cache_key.clone();
+                provenance.key_version = vp_protocol::test_cache::TEST_CACHE_KEY_VERSION;
+            }
+        }
+
+        if cacheable
+            && cache_mode == TestCacheMode::Auto
+            && let (Some(access), Some(key)) = (access.clone(), cache_key.clone())
+        {
+            let session_id = context.session_id.clone().unwrap_or_default();
+            if session_id.is_empty() {
+                cacheable = false;
+                provenance = TestCacheProvenance {
+                    decision: "uncacheable".to_string(),
+                    note: "no session id is attached to this tool context".to_string(),
+                    ..TestCacheProvenance::miss(String::new())
+                };
+            } else {
+                let key_for_lookup = key.clone();
+                let lookup = tokio::task::spawn_blocking(move || {
+                    access.lookup(&key_for_lookup, &session_id, &vp_protocol::now_rfc3339())
+                })
+                .await;
+                match lookup {
+                    Ok(Ok(Some(hit))) => {
+                        return Ok(cached_task_output(
+                            hit,
+                            &summary,
+                            kind,
+                            &resolved.command,
+                            &resolved.source,
+                            changed_paths,
+                            affected,
+                            warnings,
+                            affected_sources,
+                        ));
+                    }
+                    Ok(Ok(None)) => {
+                        provenance = TestCacheProvenance {
+                            decision: "miss".to_string(),
+                            note: "no cached result for these exact inputs".to_string(),
+                            inputs_hash: inputs_hash.clone(),
+                            impact_generation: Some(impact_generation_value.clone()),
+                            cache_key: cache_key.clone(),
+                            key_version: vp_protocol::test_cache::TEST_CACHE_KEY_VERSION,
+                            ..TestCacheProvenance::miss(String::new())
+                        };
+                    }
+                    Ok(Err(error)) => {
+                        warnings.push(format!(
+                            "test-cache lookup failed; the command ran fresh: {error}"
+                        ));
+                        provenance = TestCacheProvenance {
+                            decision: "error".to_string(),
+                            cache_hit: false,
+                            inputs_hash: inputs_hash.clone(),
+                            impact_generation: Some(impact_generation_value.clone()),
+                            cache_key: cache_key.clone(),
+                            key_version: vp_protocol::test_cache::TEST_CACHE_KEY_VERSION,
+                            note: format!("cache lookup failed; no result was reused: {error}"),
+                            ..TestCacheProvenance::miss(String::new())
+                        };
+                    }
+                    Err(error) => {
+                        warnings.push(format!(
+                            "test-cache lookup task failed; the command ran fresh: {error}"
+                        ));
+                    }
+                }
+            }
         }
 
         let captured = match run_sandboxed_shell_captured(
@@ -425,6 +691,125 @@ impl AgentTool for RunProjectTask {
                 tail
             )
         };
+
+        if cacheable
+            && let (Some(access), Some(policy), Some(key)) =
+                (access.clone(), policy.clone(), cache_key.clone())
+            && let Some(inputs_hash_value) = inputs_hash.clone()
+        {
+            let session_id = context.session_id.clone().unwrap_or_default();
+            let retention_secs = if ok {
+                u64::from(policy.retention_days).saturating_mul(86_400)
+            } else {
+                policy.failed_retention_secs
+            };
+            let spill = spill_cache_output(
+                &access,
+                &session_id,
+                &combined,
+                policy.max_output_bytes,
+                retention_secs,
+            );
+            if let Some(note) = spill.note.clone() {
+                warnings.push(note);
+            }
+            let mut covered_paths = changed_paths.clone();
+            covered_paths.extend(affected.iter().map(|test| test.path.clone()));
+            if let Some(map) = &impact_map {
+                covered_paths.extend(map.dependency_paths.clone());
+                covered_paths.extend(map.targets.iter().map(|target| target.path.clone()));
+            }
+            covered_paths.sort();
+            covered_paths.dedup();
+            covered_paths.truncate(crate::test_cache::MAX_COVERED_PATHS);
+            let result_json = json!({
+                "ok": ok,
+                "kind": kind,
+                "command": resolved.command,
+                "source": resolved.source,
+                "exit_code": captured.exit_code,
+                "duration_ms": captured.duration_ms,
+                "failures": failures,
+                "warnings": warnings,
+                "warning_count": warning_count,
+                "raw_tail": tail,
+                "truncated": captured.stdout_truncated || captured.stderr_truncated,
+                "changed_paths": changed_paths,
+                "affected_tests": affected,
+                "next_actions": next_actions,
+            });
+            let spec = crate::test_cache::TestResultSpec {
+                session_id: session_id.clone(),
+                kind: normalized_cache_kind(kind).to_string(),
+                command: resolved.command.clone(),
+                command_source: resolved.source.clone(),
+                cache_key: key.clone(),
+                inputs_hash: inputs_hash_value.clone(),
+                impact_generation: impact_generation_value.clone(),
+                status: if ok { "passed" } else { "failed" }.to_string(),
+                exit_code: captured.exit_code,
+                duration_ms: captured.duration_ms,
+                output_ref: spill.output_ref.clone(),
+                output_bytes: spill.bytes,
+                covered_paths,
+                warnings: warnings.clone(),
+                warning_count: warning_count as u64,
+                failure_count: failures.len() as u64,
+                result_json: result_json.clone(),
+            };
+            let persist = tokio::task::spawn_blocking(move || access.persist(spec, &policy)).await;
+            provenance = match persist {
+                Ok(Ok(stored)) => TestCacheProvenance {
+                    decision: if cache_mode == TestCacheMode::Refresh {
+                        "refresh".to_string()
+                    } else {
+                        "miss".to_string()
+                    },
+                    cache_hit: false,
+                    result_id: Some(stored.id),
+                    cache_key: Some(key),
+                    key_version: vp_protocol::test_cache::TEST_CACHE_KEY_VERSION,
+                    inputs_hash: Some(inputs_hash_value),
+                    impact_generation: Some(impact_generation_value.clone()),
+                    cached_at: Some(stored.created_at),
+                    expires_at: Some(stored.expires_at),
+                    origin_session_id: Some(session_id),
+                    status: Some(stored.status),
+                    note: if cache_mode == TestCacheMode::Refresh {
+                        "cache=refresh: command executed and the result replaced the prior entry"
+                            .to_string()
+                    } else {
+                        "command executed; result stored for identical future inputs".to_string()
+                    },
+                },
+                Ok(Err(error)) => {
+                    warnings.push(format!("test-cache write failed: {error}"));
+                    TestCacheProvenance {
+                        decision: "error".to_string(),
+                        cache_hit: false,
+                        inputs_hash: Some(inputs_hash_value),
+                        impact_generation: Some(impact_generation_value.clone()),
+                        cache_key: Some(key),
+                        key_version: vp_protocol::test_cache::TEST_CACHE_KEY_VERSION,
+                        note: format!("cache write failed; the fresh result is returned: {error}"),
+                        ..TestCacheProvenance::miss(String::new())
+                    }
+                }
+                Err(error) => {
+                    warnings.push(format!("test-cache write task failed: {error}"));
+                    TestCacheProvenance {
+                        decision: "error".to_string(),
+                        cache_hit: false,
+                        note: format!("cache write task failed: {error}"),
+                        ..TestCacheProvenance::miss(String::new())
+                    }
+                }
+            };
+        } else if cache_mode == TestCacheMode::Refresh {
+            provenance.decision = "refresh".to_string();
+            provenance.note = "cache=refresh: command executed; result was not stored".to_string();
+        }
+
         let structured = json!({
             "ok": ok,
             "kind": kind,
@@ -440,6 +825,12 @@ impl AgentTool for RunProjectTask {
             "truncated": captured.stdout_truncated || captured.stderr_truncated,
             "changed_paths": changed_paths,
             "affected_tests": affected,
+            "affected_sources": affected_sources,
+            "impact_generation": impact_generation_value,
+            "inputs_hash": inputs_hash,
+            "cache_hit": false,
+            "cached_at": Value::Null,
+            "cache": provenance,
             "next_actions": next_actions,
         });
         let output = ToolOutput::ok_structured_preserving(text, structured, false);
@@ -455,6 +846,168 @@ impl AgentTool for RunProjectTask {
                 ),
             ))
         }
+    }
+}
+
+fn normalized_cache_kind(kind: &str) -> &str {
+    match kind {
+        "test" => "test",
+        "lint" => "lint",
+        _ => "check",
+    }
+}
+
+fn render_cached_failures(failures: &Value) -> String {
+    let Some(failures) = failures.as_array() else {
+        return String::new();
+    };
+    failures
+        .iter()
+        .take(12)
+        .map(|failure| {
+            let path = failure
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("project");
+            let line = failure.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let message = failure
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("failure");
+            let test = failure
+                .get("test")
+                .and_then(Value::as_str)
+                .map(|test| format!(" [{test}]"))
+                .unwrap_or_default();
+            format!("{path}:{line}: {message}{test}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_task_output(
+    hit: crate::test_cache::CachedTestResult,
+    summary: &str,
+    kind: &str,
+    command: &str,
+    source: &str,
+    changed_paths: Vec<String>,
+    affected: Vec<AffectedTest>,
+    warnings: Vec<String>,
+    affected_sources: BTreeMap<String, u64>,
+) -> ToolOutput {
+    let ok = hit.entry.status == "passed";
+    let failures = hit
+        .result
+        .get("failures")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let mut warnings = warnings;
+    if let Some(stored_warnings) = hit.result.get("warnings").and_then(Value::as_array) {
+        for warning in stored_warnings.iter().filter_map(Value::as_str) {
+            if warnings.len() >= 32 {
+                break;
+            }
+            if !warnings.iter().any(|existing| existing == warning) {
+                warnings.push(warning.to_string());
+            }
+        }
+    }
+    for warning in &hit.entry.warnings {
+        if warnings.len() >= 32 {
+            break;
+        }
+        if !warnings.iter().any(|existing| existing == warning) {
+            warnings.push(warning.clone());
+        }
+    }
+    let warning_count = hit
+        .result
+        .get("warning_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(hit.entry.warning_count);
+    let raw_tail = hit
+        .result
+        .get("raw_tail")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let failure_lines = render_cached_failures(&failures);
+    let cached_note = format!(
+        "cache hit: no command ran; cached at {} ({}); inputs {}; impact {}",
+        hit.entry.created_at,
+        if ok { "pass" } else { "failure" },
+        hit.entry.inputs_hash,
+        hit.entry.impact_generation
+    );
+    let text = if ok {
+        format!(
+            "{summary}\n{cached_note}\nexit 0 in {}ms{}",
+            hit.entry.duration_ms,
+            if warning_count > 0 {
+                format!(", {warning_count} warning(s)")
+            } else {
+                String::new()
+            }
+        )
+    } else {
+        format!(
+            "{summary}\n{cached_note}\nexit {} in {}ms\n{}{}",
+            hit.entry.exit_code,
+            hit.entry.duration_ms,
+            if failure_lines.is_empty() {
+                String::new()
+            } else {
+                format!("{failure_lines}\n")
+            },
+            raw_tail
+        )
+    };
+    let exit_code = hit.entry.exit_code;
+    let duration_ms = hit.entry.duration_ms;
+    let cached_at = hit.entry.created_at.clone();
+    let inputs_hash = hit.entry.inputs_hash.clone();
+    let impact_generation = hit.entry.impact_generation.clone();
+    let result_id = hit.entry.id.clone();
+    let status = hit.entry.status.clone();
+    let provenance = hit.provenance;
+    let structured = json!({
+        "ok": ok,
+        "kind": kind,
+        "command": command,
+        "source": source,
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+        "failures": failures,
+        "warnings": warnings,
+        "warning_count": warning_count,
+        "raw_tail": raw_tail,
+        "truncated": hit.result.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+        "changed_paths": changed_paths,
+        "affected_tests": affected,
+        "affected_sources": affected_sources,
+        "impact_generation": impact_generation,
+        "inputs_hash": inputs_hash,
+        "cache_hit": true,
+        "cached_at": cached_at,
+        "cache_result_id": result_id,
+        "cache_status": status,
+        "cache": provenance,
+        "next_actions": hit.result.get("next_actions").cloned().unwrap_or_else(|| json!([])),
+    });
+    let output = ToolOutput::ok_structured_preserving(text, structured, false);
+    if ok {
+        output
+    } else {
+        output.mark_failure(
+            "run_project_task",
+            if status == "error" {
+                crate::tooling::errors::ToolErrorCode::COMMAND_FAILED
+            } else {
+                crate::tooling::errors::ToolErrorCode::TEST_FAILED
+            },
+            "a cached failure was reused because every input matches; no command ran and no pass is claimed",
+        )
     }
 }
 
@@ -1436,6 +1989,10 @@ pub(crate) struct AffectedTest {
     pub path: String,
     pub reason: String,
     pub confidence: f64,
+    /// `profile`, `lexical`, `lsp`, or `history`. Legacy lexical results label
+    /// their source instead of implying completeness.
+    #[serde(default)]
+    pub source: String,
 }
 
 pub(crate) fn affected_tests(root: &Path, changed: &[String]) -> Vec<AffectedTest> {
@@ -1452,6 +2009,7 @@ pub(crate) fn affected_tests(root: &Path, changed: &[String]) -> Vec<AffectedTes
                     path: candidate,
                     reason: format!("derived from {path}"),
                     confidence,
+                    source: "profile".to_string(),
                 });
             }
             if found.len() >= MAX_AFFECTED_TESTS {
@@ -1460,6 +2018,15 @@ pub(crate) fn affected_tests(root: &Path, changed: &[String]) -> Vec<AffectedTes
         }
     }
     found
+}
+
+/// Profile-convention candidates that actually exist in the worktree. The
+/// impact map labels these `profile` and does not execute anything.
+pub(crate) fn profile_affected_candidates(root: &Path, path: &str) -> Vec<(String, f64)> {
+    affected_candidates(root, path)
+        .into_iter()
+        .filter(|(candidate, _)| root.join(candidate).exists())
+        .collect()
 }
 
 fn affected_candidates(root: &Path, path: &str) -> Vec<(String, f64)> {
@@ -2003,6 +2570,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         }
     }
 
@@ -2213,6 +2781,311 @@ Test Case 'ATests.testFoo' failed (0.01 seconds).\n";
             failures
                 .iter()
                 .any(|failure| failure.test.as_deref() == Some("ATests.testFoo"))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_project_task_reuses_an_exact_cache_hit_and_honors_refresh_and_bypass() {
+        use std::sync::Arc;
+        use vp_store::Store;
+
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let worktree = TempDir::new().unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let session = store.create_session(&project.id, "cache test").unwrap();
+        std::fs::write(
+            worktree.path().join("Makefile"),
+            "test:\n\t@echo x >> runs.log\n",
+        )
+        .unwrap();
+        std::fs::write(worktree.path().join(".gitignore"), "runs.log\n").unwrap();
+        let access = Arc::new(crate::test_cache::TestCacheAccess::new(
+            store.clone(),
+            project.id.clone(),
+        ));
+        let context = ToolContext {
+            root: worktree.path().to_path_buf(),
+            project_root: worktree.path().to_path_buf(),
+            sandbox_root: data.path().join("sandbox"),
+            secret_roots: Vec::new(),
+            network_allowed: false,
+            home: worktree.path().join("home"),
+            restrict_home: false,
+            read_jail: false,
+            git_branch: None,
+            remote: None,
+            session_id: Some(session.id.clone()),
+            process_supervisor: None,
+            test_cache: Some(access),
+        };
+        let first = RunProjectTask
+            .execute(&context, json!({"kind": "test"}))
+            .await
+            .unwrap();
+        assert!(!first.is_error, "{}", first.content);
+        let first_structured = first.structured.unwrap();
+        assert_eq!(first_structured["cache_hit"], false);
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("runs.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let second = RunProjectTask
+            .execute(&context, json!({"kind": "test"}))
+            .await
+            .unwrap();
+        assert!(!second.is_error, "{}", second.content);
+        let second_structured = second.structured.unwrap();
+        assert_eq!(second_structured["cache_hit"], true);
+        assert_eq!(second_structured["cache"]["decision"], "hit");
+        assert!(second.content.contains("no command ran"));
+        assert_eq!(
+            second_structured["cache_status"], "passed",
+            "a cached pass must be labeled, not inferred"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("runs.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "a cache hit must not execute the command"
+        );
+        let hit_stats = store
+            .test_cache_stats(&project.id, &vp_protocol::now_rfc3339())
+            .unwrap();
+        assert_eq!(hit_stats.entries, 1);
+        assert_eq!(hit_stats.total_hits, 1);
+        let refreshed = RunProjectTask
+            .execute(&context, json!({"kind": "test", "cache": "refresh"}))
+            .await
+            .unwrap();
+        assert!(!refreshed.is_error, "{}", refreshed.content);
+        assert_eq!(
+            refreshed.structured.unwrap()["cache"]["decision"],
+            "refresh"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("runs.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        let bypassed = RunProjectTask
+            .execute(&context, json!({"kind": "test", "cache": "bypass"}))
+            .await
+            .unwrap();
+        assert!(!bypassed.is_error, "{}", bypassed.content);
+        assert_eq!(bypassed.structured.unwrap()["cache"]["decision"], "bypass");
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("runs.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        let stats = store
+            .test_cache_stats(&project.id, &vp_protocol::now_rfc3339())
+            .unwrap();
+        assert_eq!(stats.entries, 1);
+    }
+
+    #[tokio::test]
+    async fn run_project_task_never_returns_a_pass_for_changed_inputs() {
+        use std::sync::Arc;
+        use vp_store::Store;
+
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let worktree = TempDir::new().unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let session = store
+            .create_session(&project.id, "cache invalidation")
+            .unwrap();
+        std::fs::write(
+            worktree.path().join("Makefile"),
+            "test:\n\t@test ! -f fail\n",
+        )
+        .unwrap();
+        let access = Arc::new(crate::test_cache::TestCacheAccess::new(
+            store.clone(),
+            project.id.clone(),
+        ));
+        let context = ToolContext {
+            root: worktree.path().to_path_buf(),
+            project_root: worktree.path().to_path_buf(),
+            sandbox_root: data.path().join("sandbox"),
+            secret_roots: Vec::new(),
+            network_allowed: false,
+            home: worktree.path().join("home"),
+            restrict_home: false,
+            read_jail: false,
+            git_branch: None,
+            remote: None,
+            session_id: Some(session.id.clone()),
+            process_supervisor: None,
+            test_cache: Some(access),
+        };
+        let first = RunProjectTask
+            .execute(&context, json!({"kind": "test"}))
+            .await
+            .unwrap();
+        assert!(!first.is_error, "{}", first.content);
+        std::fs::write(worktree.path().join("fail"), "").unwrap();
+        let second = RunProjectTask
+            .execute(&context, json!({"kind": "test"}))
+            .await
+            .unwrap();
+        assert!(second.is_error, "{}", second.content);
+        let structured = second.structured.unwrap();
+        assert_eq!(structured["cache_hit"], false);
+        assert_eq!(structured["cache"]["decision"], "miss");
+        assert!(
+            structured["inputs_hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_failure_is_returned_as_a_failure_and_never_cached_as_a_pass() {
+        use std::sync::Arc;
+        use vp_store::Store;
+
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let worktree = TempDir::new().unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let session = store.create_session(&project.id, "cached failure").unwrap();
+        std::fs::write(worktree.path().join("Makefile"), "test:\n\t@test -f pass\n").unwrap();
+        let context = ToolContext {
+            root: worktree.path().to_path_buf(),
+            project_root: worktree.path().to_path_buf(),
+            sandbox_root: data.path().join("sandbox"),
+            secret_roots: Vec::new(),
+            network_allowed: false,
+            home: worktree.path().join("home"),
+            restrict_home: false,
+            read_jail: false,
+            git_branch: None,
+            remote: None,
+            session_id: Some(session.id.clone()),
+            process_supervisor: None,
+            test_cache: Some(Arc::new(crate::test_cache::TestCacheAccess::new(
+                store.clone(),
+                project.id.clone(),
+            ))),
+        };
+        let first = RunProjectTask
+            .execute(&context, json!({"kind": "test"}))
+            .await
+            .unwrap();
+        assert!(first.is_error, "{}", first.content);
+        assert_eq!(first.structured.unwrap()["cache_hit"], false);
+        let cached = RunProjectTask
+            .execute(&context, json!({"kind": "test"}))
+            .await
+            .unwrap();
+        assert!(cached.is_error, "{}", cached.content);
+        let structured = cached.structured.unwrap();
+        assert_eq!(structured["cache_hit"], true);
+        assert_eq!(structured["cache_status"], "failed");
+        assert_eq!(structured["ok"], false);
+        assert!(cached.content.contains("no command ran"));
+        // A changed input must miss and execute again instead of reusing the
+        // cached failure as if it were a pass.
+        std::fs::write(worktree.path().join("pass"), "").unwrap();
+        let fixed = RunProjectTask
+            .execute(&context, json!({"kind": "test"}))
+            .await
+            .unwrap();
+        assert!(!fixed.is_error, "{}", fixed.content);
+        assert_eq!(fixed.structured.unwrap()["cache_hit"], false);
+    }
+
+    #[tokio::test]
+    async fn dry_run_in_impact_mode_labels_sources_without_executing() {
+        use std::sync::Arc;
+        use vp_store::Store;
+
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let worktree = TempDir::new().unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let session = store.create_session(&project.id, "impact dry run").unwrap();
+        std::fs::write(worktree.path().join("pyproject.toml"), "[tool.pytest]\n").unwrap();
+        std::fs::create_dir_all(worktree.path().join("tests")).unwrap();
+        std::fs::write(worktree.path().join("pkg.py"), "def a():\n    return 1\n").unwrap();
+        std::fs::write(
+            worktree.path().join("tests/test_pkg.py"),
+            "from pkg import a\n\ndef test_a():\n    assert a() == 1\n",
+        )
+        .unwrap();
+        let context = ToolContext {
+            root: worktree.path().to_path_buf(),
+            project_root: worktree.path().to_path_buf(),
+            sandbox_root: data.path().join("sandbox"),
+            secret_roots: Vec::new(),
+            network_allowed: false,
+            home: worktree.path().join("home"),
+            restrict_home: false,
+            read_jail: false,
+            git_branch: None,
+            remote: None,
+            session_id: Some(session.id.clone()),
+            process_supervisor: None,
+            test_cache: Some(Arc::new(crate::test_cache::TestCacheAccess::new(
+                store.clone(),
+                project.id.clone(),
+            ))),
+        };
+        let output = RunProjectTask
+            .execute(
+                &context,
+                json!({
+                    "kind": "test",
+                    "paths": ["pkg.py"],
+                    "mode": "impact",
+                    "dry_run": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["cache"]["decision"], "dry_run");
+        assert_eq!(structured["cache_hit"], false);
+        assert!(
+            structured["impact_generation"]
+                .as_str()
+                .is_some_and(|generation| generation.starts_with("impact-v1:"))
+        );
+        let affected = structured["affected_tests"].as_array().unwrap();
+        assert!(!affected.is_empty());
+        assert!(affected.iter().all(|test| {
+            test["source"]
+                .as_str()
+                .is_some_and(|source| matches!(source, "profile" | "lexical" | "lsp" | "history"))
+        }));
+        assert_eq!(
+            store
+                .test_cache_stats(&project.id, &vp_protocol::now_rfc3339())
+                .unwrap()
+                .entries,
+            0,
+            "a dry run must never write a cache row"
         );
     }
 

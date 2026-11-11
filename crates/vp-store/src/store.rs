@@ -35,6 +35,7 @@ use vp_protocol::types::{
 
 use vp_protocol::remote::{ExecutionHost, RemoteIntegrationPolicy};
 use vp_protocol::scaling::{ScalingDecision, ScalingPolicy};
+use vp_protocol::test_cache::{TestCacheEntry, TestCachePolicy, TestCacheStats};
 
 use crate::paths;
 
@@ -622,6 +623,9 @@ pub struct SessionRepair {
     /// Event-backed supervised-process lifecycle rows. `None` leaves the
     /// projection untouched; operational telemetry is not reconstructed.
     pub supervised_processes: Option<Vec<SupervisedProcess>>,
+    /// Event-backed test-cache metadata rows. `None` leaves the projection
+    /// untouched; output bodies are not reconstructed.
+    pub test_results: Option<Vec<TestCacheEntry>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -820,6 +824,26 @@ pub struct ContinuationDelivery {
     pub events: Vec<Event>,
 }
 
+/// A test-cache metadata row plus its bounded structured payload. The command
+/// output body is deliberately absent: it is an opaque `output_ref` into the
+/// tool-output store and may have expired independently of this metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTestResult {
+    pub entry: TestCacheEntry,
+    pub result_json: String,
+}
+
+/// Result of one prune/clear sweep. Events are returned so the caller can
+/// broadcast them after the projection transaction commits; the store has
+/// already persisted each event and its mirror.
+#[derive(Debug, Clone, Default)]
+pub struct TestCacheSweep {
+    pub removed_ids: Vec<String>,
+    pub remaining: u64,
+    pub affected_sessions: u64,
+    pub events: Vec<Event>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectManifestSnapshot {
     pub version: u32,
@@ -838,6 +862,10 @@ pub struct ProjectManifestSnapshot {
     pub artifact_policy: ArtifactPolicy,
     #[serde(default)]
     pub tool_output_policy: ToolOutputPolicy,
+    /// Project-scoped test-result reuse. Older manifests decode as the enabled,
+    /// bounded default; policy rows are restored by `db-rebuild`.
+    #[serde(default)]
+    pub test_cache_policy: TestCachePolicy,
     pub mailbox_policy: MailboxPolicy,
     pub worktree_policy: WorktreeRetentionPolicy,
     #[serde(default)]
@@ -1056,6 +1084,21 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
     }
     for entry in &bundle.usage {
         ensure_bundle_session("usage entry", &entry.session_id, &bundle.session.id)?;
+    }
+    for test_result in &bundle.test_results {
+        ensure_bundle_session("test result", &test_result.session_id, &bundle.session.id)?;
+        if test_result.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle test result {} belongs to a different project",
+                test_result.id
+            ));
+        }
+        if test_result.cache_key.trim().is_empty() || test_result.inputs_hash.trim().is_empty() {
+            return Err(anyhow!(
+                "bundle test result {} has an empty cache key or inputs hash",
+                test_result.id
+            ));
+        }
     }
     for memory in &bundle.memories {
         ensure_bundle_session("memory", &memory.session_id, &bundle.session.id)?;
@@ -2007,6 +2050,57 @@ impl Store {
                 policy     TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            -- Test-result reuse policy (ADR-0178). Stored as JSON so the
+            -- policy can grow additively; reads normalize and clamp bounds.
+            CREATE TABLE IF NOT EXISTS project_test_cache_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- Content-addressed test/lint/check results. `cache_key` is a
+            -- versioned digest over command, argv, cwd, normalized environment,
+            -- profile, tool version, input content, and impact generation.
+            -- `result_json` is a bounded structured payload used for cache-hit
+            -- rendering; full command output lives in the tool-output store as
+            -- an opaque `output_ref`, never inline here.
+            CREATE TABLE IF NOT EXISTS test_results (
+                id                TEXT PRIMARY KEY,
+                project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                kind              TEXT NOT NULL,
+                command           TEXT NOT NULL,
+                command_source    TEXT NOT NULL DEFAULT '',
+                key_version       INTEGER NOT NULL DEFAULT 1,
+                cache_key         TEXT NOT NULL,
+                inputs_hash       TEXT NOT NULL,
+                impact_generation TEXT NOT NULL,
+                status            TEXT NOT NULL,
+                exit_code         INTEGER NOT NULL,
+                duration_ms       INTEGER NOT NULL,
+                output_ref        TEXT,
+                output_bytes      INTEGER NOT NULL DEFAULT 0,
+                covered_paths     TEXT NOT NULL DEFAULT '[]',
+                warnings          TEXT NOT NULL DEFAULT '[]',
+                warning_count     INTEGER NOT NULL DEFAULT 0,
+                failure_count     INTEGER NOT NULL DEFAULT 0,
+                result_json       TEXT NOT NULL DEFAULT '{}',
+                created_at        TEXT NOT NULL,
+                expires_at        TEXT NOT NULL,
+                hit_count         INTEGER NOT NULL DEFAULT 0,
+                last_hit_at       TEXT,
+                UNIQUE(project_id, cache_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_test_results_project_created
+                ON test_results(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_test_results_project_expires
+                ON test_results(project_id, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_test_results_session
+                ON test_results(session_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_test_results_project_kind
+                ON test_results(project_id, kind, status, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS project_budgets (
                 project_id     TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -3227,6 +3321,7 @@ impl Store {
                 gui_policy: self.get_gui_policy(&project.id)?,
                 artifact_policy: self.get_artifact_policy(&project.id)?,
                 tool_output_policy: self.get_tool_output_policy(&project.id)?,
+                test_cache_policy: self.get_test_cache_policy(&project.id)?,
                 mailbox_policy: self.get_mailbox_policy(&project.id)?,
                 worktree_policy: self.get_worktree_policy(&project.id)?,
                 checkpoint_policy: self.get_checkpoint_policy(&project.id)?,
@@ -9453,6 +9548,582 @@ impl Store {
             params![project_id, text, now_rfc3339()],
         )?;
         Ok(())
+    }
+
+    pub fn get_test_cache_policy(&self, project_id: &str) -> Result<TestCachePolicy> {
+        let conn = self.lock()?;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT policy FROM project_test_cache_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored
+            .and_then(|policy| serde_json::from_str::<TestCachePolicy>(&policy).ok())
+            .unwrap_or_default()
+            .normalized())
+    }
+
+    pub fn set_test_cache_policy(&self, project_id: &str, policy: &TestCachePolicy) -> Result<()> {
+        let normalized = policy.clone().normalized();
+        let text = serde_json::to_string(&normalized).context("serializing test-cache policy")?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_test_cache_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, text, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_test_result(&self, id: &str) -> Result<Option<StoredTestResult>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, project_id, session_id, kind, command, command_source,
+                    key_version, cache_key, inputs_hash, impact_generation, status,
+                    exit_code, duration_ms, output_ref, output_bytes, covered_paths,
+                    warnings, warning_count, failure_count, result_json, created_at,
+                    expires_at, hit_count, last_hit_at
+             FROM test_results WHERE id = ?1",
+            params![id],
+            map_stored_test_result,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn find_test_result_by_key(
+        &self,
+        project_id: &str,
+        cache_key: &str,
+    ) -> Result<Option<StoredTestResult>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, project_id, session_id, kind, command, command_source,
+                    key_version, cache_key, inputs_hash, impact_generation, status,
+                    exit_code, duration_ms, output_ref, output_bytes, covered_paths,
+                    warnings, warning_count, failure_count, result_json, created_at,
+                    expires_at, hit_count, last_hit_at
+             FROM test_results WHERE project_id = ?1 AND cache_key = ?2",
+            params![project_id, cache_key],
+            map_stored_test_result,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_test_results(
+        &self,
+        project_id: &str,
+        session_id: Option<&str>,
+        kind: Option<&str>,
+        status: Option<&str>,
+        include_expired: bool,
+        limit: usize,
+        now: &str,
+    ) -> Result<Vec<TestCacheEntry>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, session_id, kind, command, command_source,
+                    key_version, cache_key, inputs_hash, impact_generation, status,
+                    exit_code, duration_ms, output_ref, output_bytes, covered_paths,
+                    warnings, warning_count, failure_count, result_json, created_at,
+                    expires_at, hit_count, last_hit_at
+             FROM test_results
+             WHERE project_id = ?1
+               AND (?2 IS NULL OR session_id = ?2)
+               AND (?3 IS NULL OR kind = ?3)
+               AND (?4 IS NULL OR status = ?4)
+               AND (?5 = 1 OR expires_at > ?6)
+             ORDER BY created_at DESC, id ASC
+             LIMIT ?7",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                session_id,
+                kind,
+                status,
+                if include_expired { 1 } else { 0 },
+                now,
+                limit.clamp(1, 10_000) as i64
+            ],
+            |row| map_stored_test_result(row).map(|stored| stored.entry),
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn count_test_results(
+        &self,
+        project_id: &str,
+        session_id: Option<&str>,
+        kind: Option<&str>,
+        status: Option<&str>,
+        include_expired: bool,
+        now: &str,
+    ) -> Result<u64> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM test_results
+             WHERE project_id = ?1
+               AND (?2 IS NULL OR session_id = ?2)
+               AND (?3 IS NULL OR kind = ?3)
+               AND (?4 IS NULL OR status = ?4)
+               AND (?5 = 1 OR expires_at > ?6)",
+            params![
+                project_id,
+                session_id,
+                kind,
+                status,
+                if include_expired { 1 } else { 0 },
+                now
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    pub fn test_cache_stats(&self, project_id: &str, now: &str) -> Result<TestCacheStats> {
+        let policy = self.get_test_cache_policy(project_id)?;
+        let conn = self.lock()?;
+        let (entries, passed, failed, error, expired, total_hits, output_bytes) = conn.query_row(
+            "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN status = 'passed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN expires_at <= ?2 THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(hit_count), 0),
+                        COALESCE(SUM(output_bytes), 0)
+                 FROM test_results WHERE project_id = ?1",
+            params![project_id, now],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, i64>(4)?.max(0) as u64,
+                    row.get::<_, i64>(5)?.max(0) as u64,
+                    row.get::<_, i64>(6)?.max(0) as u64,
+                ))
+            },
+        )?;
+        let mut by_kind = std::collections::BTreeMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT kind, COUNT(*) FROM test_results
+                 WHERE project_id = ?1 GROUP BY kind ORDER BY kind ASC",
+            )?;
+            for row in stmt.query_map(params![project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })? {
+                let (kind, count) = row?;
+                by_kind.insert(kind, count);
+            }
+        }
+        let (oldest_created_at, newest_created_at) = conn.query_row(
+            "SELECT MIN(created_at), MAX(created_at) FROM test_results WHERE project_id = ?1",
+            params![project_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )?;
+        Ok(TestCacheStats {
+            project_id: project_id.to_string(),
+            entries,
+            passed,
+            failed,
+            error,
+            expired,
+            total_hits,
+            output_bytes,
+            by_kind,
+            oldest_created_at,
+            newest_created_at,
+            policy,
+            generated_at: now.to_string(),
+        })
+    }
+
+    /// Insert or replace one content-addressed result. Replacing a different
+    /// row with the same key emits `test_cache.invalidated` for the old owner,
+    /// then `test_cache.stored` for the new row. Entries beyond
+    /// `policy.max_entries` are evicted oldest-first with a `test_cache.pruned`
+    /// event per affected session. All events and projections commit together.
+    pub fn record_test_result_with_events(
+        &self,
+        row: &TestCacheEntry,
+        result_json: &str,
+        max_entries: u32,
+    ) -> Result<(TestCacheEntry, Vec<Event>)> {
+        if row.project_id.trim().is_empty()
+            || row.session_id.trim().is_empty()
+            || row.cache_key.trim().is_empty()
+        {
+            anyhow::bail!("test result needs a project, session, and cache key");
+        }
+        let mut stored = row.clone();
+        if stored.id.trim().is_empty() {
+            stored.id = Uuid::now_v7().to_string();
+        }
+        if stored.created_at.trim().is_empty() {
+            stored.created_at = now_rfc3339();
+        }
+        let preview = bounded_test_result_preview(result_json);
+        let mut events = Vec::new();
+
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let project: Option<String> = tx
+            .query_row(
+                "SELECT project_id FROM sessions WHERE id = ?1",
+                params![stored.session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match project {
+            Some(project_id) if project_id == stored.project_id => {}
+            Some(_) => anyhow::bail!(
+                "test result session {} belongs to a different project",
+                stored.session_id
+            ),
+            None => anyhow::bail!("session not found: {}", stored.session_id),
+        }
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id, session_id FROM test_results
+                 WHERE project_id = ?1 AND cache_key = ?2",
+                params![stored.project_id, stored.cache_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_id, existing_session)) = existing {
+            let event = insert_event_tx(
+                &tx,
+                &existing_session,
+                "test_cache.invalidated",
+                serde_json::json!({
+                    "result_id": existing_id,
+                    "cache_key": stored.cache_key,
+                    "reason": "replaced_by_refresh",
+                }),
+            )?;
+            events.push(event);
+            tx.execute(
+                "DELETE FROM test_results WHERE id = ?1",
+                params![existing_id],
+            )?;
+        }
+        let event = insert_event_tx(
+            &tx,
+            &stored.session_id,
+            "test_cache.stored",
+            serde_json::json!({
+                "entry": stored,
+                "result_preview": preview,
+            }),
+        )?;
+        events.push(event);
+        insert_test_result_tx(&tx, &stored, result_json)?;
+
+        let max_entries = max_entries.clamp(1, 10_000) as i64;
+        let overflow = {
+            let mut stmt = tx.prepare(
+                "SELECT id, session_id FROM test_results
+                 WHERE project_id = ?1
+                 ORDER BY created_at DESC, id ASC
+                 LIMIT -1 OFFSET ?2",
+            )?;
+            let rows = stmt.query_map(params![stored.project_id, max_entries], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if !overflow.is_empty() {
+            let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for (id, session_id) in overflow {
+                grouped.entry(session_id).or_default().push(id);
+            }
+            for (session_id, ids) in grouped {
+                events.extend(emit_test_cache_prune_events_tx(
+                    &tx,
+                    &session_id,
+                    &ids,
+                    "max_entries",
+                )?);
+                for id in ids {
+                    tx.execute("DELETE FROM test_results WHERE id = ?1", params![id])?;
+                }
+            }
+        }
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((stored, events))
+    }
+
+    /// Record a cache hit against the owner row and append a `test_cache.hit`
+    /// audit event to the requesting session. Hit counters are operational
+    /// telemetry; replay never requires them to match the projection.
+    pub fn record_test_result_hit(
+        &self,
+        result_id: &str,
+        requesting_session_id: &str,
+        now: &str,
+    ) -> Result<Option<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let owner: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT session_id, hit_count FROM test_results WHERE id = ?1",
+                params![result_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((owner_session, hits)) = owner else {
+            return Ok(None);
+        };
+        let hit_count = hits.max(0) as u64 + 1;
+        tx.execute(
+            "UPDATE test_results SET hit_count = ?1, last_hit_at = ?2 WHERE id = ?3",
+            params![hit_count as i64, now, result_id],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            requesting_session_id,
+            "test_cache.hit",
+            serde_json::json!({
+                "result_id": result_id,
+                "owner_session_id": owner_session,
+                "hit_count": hit_count,
+                "hit_at": now,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
+    /// Prune cache metadata by age, expiry, or kind. `older_than_secs` is
+    /// measured from `created_at`; when absent, the project retention policy is
+    /// used. The output body is not touched here: tool-output retention owns
+    /// body lifetime independently.
+    pub fn prune_test_results(
+        &self,
+        project_id: &str,
+        older_than_secs: Option<u64>,
+        expired_only: bool,
+        kind: Option<&str>,
+        dry_run: bool,
+        now: &str,
+    ) -> Result<TestCacheSweep> {
+        let policy = self.get_test_cache_policy(project_id)?;
+        let cutoff = if expired_only {
+            now.to_string()
+        } else {
+            let seconds =
+                older_than_secs.unwrap_or_else(|| u64::from(policy.retention_days) * 86_400);
+            match parse_rfc3339(now) {
+                Some(now_time) => now_time
+                    .saturating_sub(time::Duration::seconds(seconds.min(i64::MAX as u64) as i64))
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| now.to_string()),
+                None => now.to_string(),
+            }
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT id, session_id FROM test_results
+             WHERE project_id = ?1
+               AND (
+                    (?2 = 1 AND expires_at <= ?5)
+                    OR (?2 = 0 AND (created_at <= ?3 OR expires_at <= ?5))
+               )
+               AND (?4 IS NULL OR kind = ?4)
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    project_id,
+                    if expired_only { 1 } else { 0 },
+                    cutoff,
+                    kind,
+                    now
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut sweep = TestCacheSweep {
+            removed_ids: rows.iter().map(|(id, _)| id.clone()).collect(),
+            ..TestCacheSweep::default()
+        };
+        if !dry_run {
+            let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for (id, session_id) in &rows {
+                grouped
+                    .entry(session_id.clone())
+                    .or_default()
+                    .push(id.clone());
+            }
+            sweep.affected_sessions = grouped.len() as u64;
+            for (session_id, ids) in grouped {
+                let events = emit_test_cache_prune_events_tx(
+                    &tx,
+                    &session_id,
+                    &ids,
+                    if expired_only { "expired" } else { "retention" },
+                )?;
+                sweep.events.extend(events);
+                for id in ids {
+                    tx.execute("DELETE FROM test_results WHERE id = ?1", params![id])?;
+                }
+            }
+        } else {
+            let mut sessions = std::collections::BTreeSet::new();
+            for (_, session_id) in &rows {
+                sessions.insert(session_id.clone());
+            }
+            sweep.affected_sessions = sessions.len() as u64;
+        }
+        tx.commit()?;
+        drop(conn);
+        for event in &sweep.events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        sweep.remaining = self.count_test_results(project_id, None, kind, None, true, now)?;
+        Ok(sweep)
+    }
+
+    /// Clear matching rows. The daemon requires explicit operator confirmation
+    /// before calling this; the store itself does not silently clear.
+    pub fn clear_test_results(
+        &self,
+        project_id: &str,
+        session_id: Option<&str>,
+        kind: Option<&str>,
+        now: &str,
+    ) -> Result<TestCacheSweep> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT id, session_id FROM test_results
+             WHERE project_id = ?1
+               AND (?2 IS NULL OR session_id = ?2)
+               AND (?3 IS NULL OR kind = ?3)
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![project_id, session_id, kind], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut sweep = TestCacheSweep {
+            removed_ids: rows.iter().map(|(id, _)| id.clone()).collect(),
+            ..TestCacheSweep::default()
+        };
+        let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (id, owner_session) in &rows {
+            grouped
+                .entry(owner_session.clone())
+                .or_default()
+                .push(id.clone());
+        }
+        sweep.affected_sessions = grouped.len() as u64;
+        for (owner_session, ids) in grouped {
+            let events = emit_test_cache_prune_events_tx(&tx, &owner_session, &ids, "cleared")?;
+            sweep.events.extend(events);
+            for id in ids {
+                tx.execute("DELETE FROM test_results WHERE id = ?1", params![id])?;
+            }
+        }
+        tx.commit()?;
+        drop(conn);
+        for event in &sweep.events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        sweep.remaining = self.count_test_results(project_id, None, None, None, true, now)?;
+        Ok(sweep)
+    }
+
+    /// Replace one session's metadata rows from the event stream. Used by
+    /// `session.replay {repair:true}`, bundle import, and `db-rebuild`.
+    /// Output bodies are intentionally not reconstructed.
+    pub fn replace_test_results(&self, session_id: &str, entries: &[TestCacheEntry]) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM test_results WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for entry in entries {
+            insert_test_result_tx(&tx, entry, "{}")?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Recent metadata rows used by historical impact mapping. This deliberately
+    /// loads a bounded window and filters covered paths in Rust; no unbounded
+    /// JSON-table scan can be triggered by a crafted path.
+    pub fn test_results_for_paths(
+        &self,
+        project_id: &str,
+        changed_paths: &[String],
+        now: &str,
+        limit: usize,
+    ) -> Result<Vec<TestCacheEntry>> {
+        if changed_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = self.list_test_results(
+            project_id,
+            None,
+            None,
+            None,
+            false,
+            limit.clamp(1, 2_000),
+            now,
+        )?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.status == "passed")
+            .filter(|entry| {
+                entry.covered_paths.iter().any(|covered| {
+                    changed_paths.iter().any(|changed| {
+                        covered == changed
+                            || covered.starts_with(&format!("{changed}/"))
+                            || changed.starts_with(&format!("{covered}/"))
+                    })
+                })
+            })
+            .collect())
     }
 
     /// Verify the metadata/blob boundary. Metadata is never deleted here;
@@ -20034,6 +20705,15 @@ impl Store {
         if let Some(processes) = &repair.supervised_processes {
             replace_supervised_processes_tx(&tx, session_id, processes)?;
         }
+        if let Some(test_results) = &repair.test_results {
+            tx.execute(
+                "DELETE FROM test_results WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for entry in test_results {
+                insert_test_result_tx(&tx, entry, "{}")?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -20462,6 +21142,16 @@ impl Store {
                     entry.created_at
                 ],
             )?;
+        }
+        // Bundle metadata is a projection fallback. Output bodies are never part
+        // of an archive, so imported rows keep `output_ref` but cannot resolve a
+        // local body. Engine-level import rebuilds from events when they exist.
+        tx.execute(
+            "DELETE FROM test_results WHERE session_id = ?1",
+            params![bundle.session.id],
+        )?;
+        for entry in &bundle.test_results {
+            insert_test_result_tx(&tx, entry, "{}")?;
         }
         for program in &bundle.programs {
             let existing: Option<i64> = tx
@@ -23487,6 +24177,124 @@ fn map_question(row: &rusqlite::Row<'_>) -> rusqlite::Result<Question> {
         created_at: row.get(8)?,
         answered_at: row.get(9)?,
     })
+}
+
+/// Emit one or more bounded `test_cache.pruned` events for a session. Chunking
+/// keeps each event small while ensuring replay removes every pruned row.
+fn emit_test_cache_prune_events_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    ids: &[String],
+    reason: &str,
+) -> Result<Vec<Event>> {
+    let mut events = Vec::new();
+    for chunk in ids.chunks(256) {
+        events.push(insert_event_tx(
+            tx,
+            session_id,
+            "test_cache.pruned",
+            serde_json::json!({
+                "ids": chunk,
+                "reason": reason,
+            }),
+        )?);
+    }
+    Ok(events)
+}
+
+fn map_stored_test_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTestResult> {
+    let covered_paths: String = row.get(15)?;
+    let warnings: String = row.get(16)?;
+    let entry = TestCacheEntry {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        session_id: row.get(2)?,
+        kind: row.get(3)?,
+        command: row.get(4)?,
+        command_source: row.get(5)?,
+        key_version: row.get::<_, i64>(6)?.max(0) as u32,
+        cache_key: row.get(7)?,
+        inputs_hash: row.get(8)?,
+        impact_generation: row.get(9)?,
+        status: row.get(10)?,
+        exit_code: row.get(11)?,
+        duration_ms: row.get::<_, i64>(12)?.max(0) as u64,
+        output_ref: row.get(13)?,
+        output_bytes: row.get::<_, i64>(14)?.max(0) as u64,
+        covered_paths: serde_json::from_str(&covered_paths).unwrap_or_default(),
+        warnings: serde_json::from_str(&warnings).unwrap_or_default(),
+        warning_count: row.get::<_, i64>(17)?.max(0) as u64,
+        failure_count: row.get::<_, i64>(18)?.max(0) as u64,
+        created_at: row.get(20)?,
+        expires_at: row.get(21)?,
+        hit_count: row.get::<_, i64>(22)?.max(0) as u64,
+        last_hit_at: row.get(23)?,
+    };
+    Ok(StoredTestResult {
+        entry,
+        result_json: row.get(19)?,
+    })
+}
+
+fn insert_test_result_tx(
+    tx: &Transaction<'_>,
+    entry: &TestCacheEntry,
+    result_json: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO test_results
+         (id, project_id, session_id, kind, command, command_source, key_version,
+          cache_key, inputs_hash, impact_generation, status, exit_code, duration_ms,
+          output_ref, output_bytes, covered_paths, warnings, warning_count,
+          failure_count, result_json, created_at, expires_at, hit_count, last_hit_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+        params![
+            entry.id,
+            entry.project_id,
+            entry.session_id,
+            entry.kind,
+            entry.command,
+            entry.command_source,
+            i64::from(entry.key_version),
+            entry.cache_key,
+            entry.inputs_hash,
+            entry.impact_generation,
+            entry.status,
+            entry.exit_code,
+            entry.duration_ms as i64,
+            entry.output_ref,
+            entry.output_bytes as i64,
+            serde_json::to_string(&entry.covered_paths)?,
+            serde_json::to_string(&entry.warnings)?,
+            entry.warning_count as i64,
+            entry.failure_count as i64,
+            bounded_test_result_preview(result_json),
+            entry.created_at,
+            entry.expires_at,
+            entry.hit_count as i64,
+            entry.last_hit_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Event payloads and projection rows are bounded. A cached result still
+/// carries its status, exit code, warnings, and failure count even when the
+/// structured preview was clipped; the full body remains behind `output_ref`.
+fn bounded_test_result_preview(result_json: &str) -> String {
+    const MAX_PREVIEW_BYTES: usize = 8 * 1024;
+    if result_json.len() <= MAX_PREVIEW_BYTES {
+        return result_json.to_string();
+    }
+    let mut end = MAX_PREVIEW_BYTES;
+    while end > 0 && !result_json.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}… (cached structured result truncated at {MAX_PREVIEW_BYTES} bytes)",
+        &result_json[..end]
+    )
 }
 
 fn escape_like(query: &str) -> String {

@@ -18,6 +18,7 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::tooling::code_intel::{
     BUILD_CONFIDENCE, Backend, CodeDiagnostic, CodeLocation, CodeRange, CodeSymbol,
@@ -27,7 +28,8 @@ use crate::tooling::code_intel::{
 };
 use crate::tooling::lsp::{self, DeclarationPosition, LspAttemptError, MAX_DIAGNOSTIC_FILES};
 use crate::tooling::project::{
-    AffectedTest, affected_tests, detect_profile, git_changed_paths, run_detected_task,
+    AffectedTest, affected_tests, detect_profile, git_changed_paths, profile_affected_candidates,
+    run_detected_task,
 };
 use crate::tools::{AgentTool, ToolContext, ToolOutput, safe_existing_path, truncate};
 
@@ -274,7 +276,7 @@ fn language_for_file(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn is_test_path(path: &str) -> bool {
+pub(crate) fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.contains("/tests/")
         || lower.contains("/test/")
@@ -2098,12 +2100,24 @@ impl AgentTool for AffectedTests {
             "properties": {
                 "changed_paths": {"type": "array", "items": {"type": "string"}},
                 "base_ref": {"type": "string", "description": "Git ref; uses git diff --name-only <ref>"},
+                "mode": {"type": "string", "enum": ["lexical", "impact"], "description": "Mapping source; default lexical for compatibility"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Default 12"}
             }
         })
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
+        let mode = match vp_protocol::test_cache::AffectedTestsMode::parse(
+            input.get("mode").and_then(Value::as_str),
+        ) {
+            Ok(mode) => mode,
+            Err(message) => {
+                return Ok(ToolOutput::error_structured(
+                    message,
+                    json!({"code": "INVALID_ARGUMENT", "field": "mode"}),
+                ));
+            }
+        };
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
@@ -2134,42 +2148,91 @@ impl AgentTool for AffectedTests {
                 json!({"code": "INVALID_ARGUMENT"}),
             ));
         }
-        let mut tests = affected_tests(&context.root, &changed);
-        tests.truncate(limit);
         let profile = detect_profile(&context.root);
         let command = profile
             .commands
             .get("test")
             .map(|command| command.command.clone());
+        let mut warnings = Vec::new();
+        let (mut tests, impact) = if mode == vp_protocol::test_cache::AffectedTestsMode::Impact {
+            match crate::test_cache::build_impact_map(
+                context,
+                context.test_cache.as_deref(),
+                &changed,
+                limit.max(1),
+                true,
+            )
+            .await
+            {
+                Ok(map) => {
+                    let mut tests = crate::test_cache::impact_targets_as_affected(&map);
+                    tests.truncate(limit);
+                    (tests, Some(map))
+                }
+                Err(error) => {
+                    return Ok(ToolOutput::error_coded(
+                        "affected_tests",
+                        crate::tooling::errors::ToolErrorCode::IMPACT_MAP_UNAVAILABLE,
+                        format!("impact mapping failed: {error}"),
+                    )
+                    .with_failure_evidence(format!("changed_paths={}", changed.len())));
+                }
+            }
+        } else {
+            let mut tests = affected_tests(&context.root, &changed);
+            tests.truncate(limit);
+            (tests, None)
+        };
+        tests.truncate(limit);
+        if tests.is_empty() {
+            warnings.push("no mapping found; run the full test suite");
+        }
         let rendered = tests
             .iter()
             .map(|test| {
                 format!(
-                    "{} ({}, {:.0}%)",
+                    "{} ({}, {:.0}%, {})",
                     test.path,
                     test.reason,
-                    test.confidence * 100.0
+                    test.confidence * 100.0,
+                    test.source
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let mut structured = json!({
+            "changed_paths": changed,
+            "tests": tests,
+            "test_command": command,
+            "warnings": warnings,
+            "confidence": "lexical",
+            "mode": mode.as_str(),
+            "target_sources": tests.iter().map(|test| test.source.clone()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>(),
+        });
+        if let Some(map) = &impact {
+            structured["confidence"] = json!(if map.lexical_only {
+                "impact-lexical"
+            } else {
+                "impact"
+            });
+            structured["impact_generation"] = json!(map.generation);
+            structured["profile_hash"] = json!(map.profile_hash);
+            structured["sources"] = json!(map.sources);
+            structured["dependency_paths"] = json!(map.dependency_paths);
+            structured["lsp_available"] = json!(map.lsp_available);
+            structured["lexical_only"] = json!(map.lexical_only);
+            structured["truncated"] = json!(map.truncated);
+            structured["warnings"] = json!(map.notes);
+            structured["no_execution_note"] =
+                json!("impact mapping never executes tests and does not claim completeness");
+        }
         Ok(ToolOutput::ok_structured(
             truncate(if rendered.is_empty() {
                 "no affected tests matched; run the full suite".to_string()
             } else {
                 rendered
             }),
-            json!({
-                "changed_paths": changed,
-                "tests": tests,
-                "test_command": command,
-                "warnings": if tests.is_empty() {
-                    vec!["no mapping found; run the full test suite"]
-                } else {
-                    Vec::<&str>::new()
-                },
-                "confidence": "lexical",
-            }),
+            structured,
         ))
     }
 }
@@ -2406,6 +2469,216 @@ fn build_dependency_graph(
         graph.insert(file.path.clone(), edges);
     }
     (graph, truncated)
+}
+
+/// Reverse lexical dependency closure for deterministic impact mapping.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImpactDependency {
+    pub paths: Vec<String>,
+    pub digest: String,
+    pub truncated: bool,
+}
+
+/// Reference locations from an already-running language server. This is an
+/// optional enrichment source; an empty result is expected when no server is
+/// running and never blocks the lexical/profile mapping.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImpactLspResult {
+    pub available: bool,
+    pub paths: Vec<String>,
+    pub checked_symbols: usize,
+    pub notes: Vec<String>,
+}
+
+/// Compute the bounded reverse import closure (files that may be affected by a
+/// changed file) without reading test results or executing tests.
+pub(crate) fn impact_dependency_closure(
+    root: &Path,
+    changed: &[String],
+    max_depth: usize,
+) -> ImpactDependency {
+    const MAX_DEPENDENCY_PATHS: usize = 300;
+    let index = cached_index(root);
+    let (graph, scan_truncated) = build_dependency_graph(root, &index);
+    let changed_set = changed
+        .iter()
+        .map(|path| path.trim_start_matches("./").to_string())
+        .collect::<BTreeSet<_>>();
+    if changed_set.is_empty() {
+        return ImpactDependency::default();
+    }
+    let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (from, edges) in &graph {
+        for edge in edges {
+            if edge.external {
+                continue;
+            }
+            reverse
+                .entry(edge.to.as_str())
+                .or_default()
+                .push(from.as_str());
+        }
+    }
+    let mut closure = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for path in &changed_set {
+        queue.push_back((path.clone(), 0usize));
+    }
+    while let Some((path, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        if let Some(importers) = reverse.get(path.as_str()) {
+            for importer in importers {
+                if changed_set.contains(*importer) || !closure.insert((*importer).to_string()) {
+                    continue;
+                }
+                if closure.len() >= MAX_DEPENDENCY_PATHS {
+                    break;
+                }
+                queue.push_back(((*importer).to_string(), depth + 1));
+            }
+        }
+        if closure.len() >= MAX_DEPENDENCY_PATHS {
+            break;
+        }
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"impact-dependency-v1");
+    for path in &changed_set {
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+    }
+    for path in &closure {
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+    }
+    let mut edges = Vec::new();
+    for (from, imports) in &graph {
+        if !changed_set.contains(from) && !closure.contains(from) {
+            continue;
+        }
+        for edge in imports {
+            if !edge.external && (changed_set.contains(&edge.to) || closure.contains(&edge.to)) {
+                edges.push(format!("{from}->{}", edge.to));
+            }
+        }
+    }
+    edges.sort();
+    for edge in &edges {
+        digest.update((edge.len() as u64).to_le_bytes());
+        digest.update(edge.as_bytes());
+    }
+    let digest = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    ImpactDependency {
+        paths: closure.into_iter().collect(),
+        digest,
+        truncated: scan_truncated,
+    }
+}
+
+/// Query references for up to four defined symbols per changed file using only
+/// an already-running language server. No server is spawned and no test is
+/// executed; an unavailable backend is reported as a note.
+pub(crate) async fn impact_lsp_targets(
+    context: &ToolContext,
+    changed: &[String],
+) -> ImpactLspResult {
+    const MAX_SYMBOLS_PER_FILE: usize = 4;
+    const MAX_REFERENCE_PATHS: usize = 80;
+    let index = cached_index(&context.root);
+    let mut result = ImpactLspResult::default();
+    if index.truncated {
+        result
+            .notes
+            .push("lexical index was truncated; LSP enrichment is partial".to_string());
+    }
+    const MAX_LSP_DEFINITIONS: usize = 24;
+    let mut definitions = Vec::new();
+    'paths: for path in changed {
+        let normalized = path.trim_start_matches("./");
+        let mut symbols = index
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.path == normalized)
+            .collect::<Vec<_>>();
+        symbols.sort_by(|left, right| {
+            left.line
+                .cmp(&right.line)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        for symbol in symbols.into_iter().take(MAX_SYMBOLS_PER_FILE) {
+            if definitions.len() >= MAX_LSP_DEFINITIONS {
+                result.notes.push(format!(
+                    "LSP reference lookup was bounded at {MAX_LSP_DEFINITIONS} symbols"
+                ));
+                break 'paths;
+            }
+            definitions.push((normalized.to_string(), symbol.line, symbol.name.clone()));
+        }
+    }
+    if definitions.is_empty() {
+        result
+            .notes
+            .push("no lexical symbol definitions were found for LSP references".to_string());
+        return result;
+    }
+    let mut paths = BTreeSet::new();
+    for (path, line, name) in definitions {
+        if paths.len() >= MAX_REFERENCE_PATHS {
+            break;
+        }
+        let Some(column) = line_column(&context.root, &path, line, &name) else {
+            continue;
+        };
+        let declaration = DeclarationPosition {
+            path: context.root.join(&path),
+            line: line as u64,
+            column,
+            kind: None,
+        };
+        match lsp::find_references_without_spawn(context, &declaration, false, 20).await {
+            Ok(batch) => {
+                result.available = true;
+                result.checked_symbols += 1;
+                for location in batch.locations {
+                    if location.path.is_empty() || location.path == path {
+                        continue;
+                    }
+                    paths.insert(location.path);
+                    if paths.len() >= MAX_REFERENCE_PATHS {
+                        break;
+                    }
+                }
+                if batch.truncated {
+                    result
+                        .notes
+                        .push("LSP reference results were truncated".to_string());
+                }
+            }
+            Err(error) => {
+                let note = format!("{}: {}", error.code(), error.reason());
+                if !result.notes.contains(&note) {
+                    result.notes.push(note);
+                }
+            }
+        }
+    }
+    result.paths = paths.into_iter().collect();
+    result
+}
+
+/// Existing profile candidates for a changed path, filtered by existence and
+/// capped so one path never floods the impact map.
+pub(crate) fn impact_profile_candidates(root: &Path, path: &str) -> Vec<(String, f64)> {
+    profile_affected_candidates(root, path)
+        .into_iter()
+        .take(6)
+        .collect()
 }
 
 struct ImportRef {
@@ -3146,6 +3419,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         }
     }
 

@@ -759,6 +759,7 @@ mod tests {
             remote: None,
             session_id: Some(session_id.to_string()),
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
+            test_cache: None,
         }
     }
 

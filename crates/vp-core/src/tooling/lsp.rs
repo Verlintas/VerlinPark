@@ -2982,6 +2982,55 @@ pub(crate) async fn find_references(
     }
 }
 
+/// Exact references from an already-running language server. This never spawns
+/// a server, so deterministic impact mapping cannot turn into hidden process
+/// startup. Callers label an unavailable result and continue lexically.
+pub(crate) async fn find_references_without_spawn(
+    context: &ToolContext,
+    declaration: &DeclarationPosition,
+    include_declaration: bool,
+    limit: usize,
+) -> Result<ReferenceBatch, LspAttemptError> {
+    let Some(language) = language_for_path(&declaration.path) else {
+        return Err(LspAttemptError::NoLanguage {
+            supported: all_languages()
+                .iter()
+                .map(|language| language.id.to_string())
+                .collect(),
+        });
+    };
+    let connection = connect_for_language(context, language, false).await?;
+    let info = connection.info();
+    if !info.capabilities.references && !info.capabilities.definition {
+        return Err(unsupported(language, &info, "textDocument/references"));
+    }
+    let scan = references_on_connection(&connection, declaration, include_declaration, limit)
+        .await
+        .map_err(|error| attempt_error_from_lsp(language, &info, error))?;
+    Ok(ReferenceBatch {
+        locations: scan
+            .locations
+            .into_iter()
+            .map(|mut location| {
+                location.kind = declaration.kind.clone();
+                location
+            })
+            .collect(),
+        declaration: scan.declaration,
+        attempts: vec![LspAttempt {
+            language: language.id.to_string(),
+            server: scan.server.clone(),
+            server_version: info.server_version.clone(),
+            method: Some(scan.method.clone()),
+            status: scan.status,
+            message: None,
+            install_hint: None,
+        }],
+        status: scan.status,
+        truncated: scan.truncated,
+    })
+}
+
 pub(crate) async fn collect_diagnostics(
     context: &ToolContext,
     files: &[PathBuf],
@@ -3666,6 +3715,7 @@ mod tests {
             remote: None,
             session_id: None,
             process_supervisor: None,
+            test_cache: None,
         }
     }
 

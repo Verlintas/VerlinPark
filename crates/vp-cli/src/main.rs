@@ -2021,6 +2021,76 @@ enum Command {
         #[arg(long)]
         clean_orphans: bool,
     },
+    /// Show the project test-result cache policy and counters.
+    TestCache { project: String },
+    /// List cached test/lint/check metadata (never output bodies).
+    TestCacheEntries {
+        project: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        include_expired: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Update the project test-result cache policy.
+    TestCachePolicySet {
+        project: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        enabled: Option<bool>,
+        #[arg(long)]
+        max_entries: Option<u32>,
+        #[arg(long)]
+        retention_days: Option<u32>,
+        /// Maximum stored output body size in bytes (4096–8388608).
+        #[arg(long)]
+        max_output_bytes: Option<u64>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        reuse_lint: Option<bool>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        include_integration: Option<bool>,
+        #[arg(long)]
+        failed_retention_secs: Option<u64>,
+    },
+    /// Prune cached test-result metadata by age, expiry, or kind.
+    TestCachePrune {
+        project: String,
+        #[arg(long)]
+        older_than_secs: Option<u64>,
+        #[arg(long)]
+        expired_only: bool,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Clear cached test-result metadata. Requires --yes.
+    TestCacheClear {
+        project: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        /// Explicit confirmation; clearing cannot be undone.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview the bounded changed-path test impact map for a session.
+    TestImpact {
+        session: String,
+        /// Changed path (repeatable). Defaults to git status.
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        #[arg(long, default_value_t = 32)]
+        limit: u32,
+        /// Exclude historical cache rows.
+        #[arg(long)]
+        no_history: bool,
+    },
     /// Show the project artifact retention policy.
     ArtifactPolicy { project: String },
     /// Update artifact retention and optional automatic GC.
@@ -6191,6 +6261,145 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::TestCache { project } => {
+            rpc(
+                &discovery,
+                "test_cache.stats",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::TestCacheEntries {
+            project,
+            session,
+            kind,
+            status,
+            include_expired,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "test_cache.entries",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "kind": kind,
+                    "status": status,
+                    "include_expired": include_expired,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::TestCachePolicySet {
+            project,
+            enabled,
+            max_entries,
+            retention_days,
+            max_output_bytes,
+            reuse_lint,
+            include_integration,
+            failed_retention_secs,
+        } => {
+            let current = rpc(
+                &discovery,
+                "test_cache.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_default();
+            if !policy.is_object() {
+                policy = json!({});
+            }
+            if let Some(object) = policy.as_object_mut() {
+                if let Some(value) = enabled {
+                    object.insert("enabled".into(), json!(value));
+                }
+                if let Some(value) = max_entries {
+                    object.insert("max_entries".into(), json!(value));
+                }
+                if let Some(value) = retention_days {
+                    object.insert("retention_days".into(), json!(value));
+                }
+                if let Some(value) = max_output_bytes {
+                    object.insert("max_output_bytes".into(), json!(value));
+                }
+                if let Some(value) = reuse_lint {
+                    object.insert("reuse_lint".into(), json!(value));
+                }
+                if let Some(value) = include_integration {
+                    object.insert("include_integration".into(), json!(value));
+                }
+                if let Some(value) = failed_retention_secs {
+                    object.insert("failed_retention_secs".into(), json!(value));
+                }
+            }
+            rpc(
+                &discovery,
+                "test_cache.policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::TestCachePrune {
+            project,
+            older_than_secs,
+            expired_only,
+            kind,
+            dry_run,
+        } => {
+            rpc(
+                &discovery,
+                "test_cache.prune",
+                json!({
+                    "project_id": project,
+                    "older_than_secs": older_than_secs,
+                    "expired_only": expired_only,
+                    "kind": kind,
+                    "dry_run": dry_run,
+                }),
+            )
+            .await?
+        }
+        Command::TestCacheClear {
+            project,
+            session,
+            kind,
+            yes,
+        } => {
+            if !yes {
+                bail!("refusing to clear test-cache metadata without --yes");
+            }
+            rpc(
+                &discovery,
+                "test_cache.clear",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "kind": kind,
+                    "confirm": yes,
+                }),
+            )
+            .await?
+        }
+        Command::TestImpact {
+            session,
+            paths,
+            limit,
+            no_history,
+        } => {
+            rpc(
+                &discovery,
+                "test_cache.impact",
+                json!({
+                    "session_id": session,
+                    "changed_paths": paths,
+                    "limit": limit,
+                    "include_history": !no_history,
+                }),
+            )
+            .await?
+        }
         Command::ArtifactPolicy { project } => {
             rpc(
                 &discovery,
@@ -7832,7 +8041,140 @@ fn remote_integration_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn test_cache_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(map) = value.get("map") {
+        let mut lines = vec![format!(
+            "test impact  session {}  project {}  {} target(s)  generation {}",
+            value["session_id"].as_str().unwrap_or("?"),
+            value["project_id"].as_str().unwrap_or("?"),
+            map["targets"].as_array().map(Vec::len).unwrap_or(0),
+            map["generation"].as_str().unwrap_or("?")
+        )];
+        if let Some(command) = value.get("test_command").and_then(Value::as_str) {
+            lines.push(format!("  command: {command}"));
+        }
+        lines.push(format!(
+            "  lsp_available={} lexical_only={} truncated={} changed={}",
+            map["lsp_available"].as_bool().unwrap_or(false),
+            map["lexical_only"].as_bool().unwrap_or(false),
+            map["truncated"].as_bool().unwrap_or(false),
+            map["changed_paths"].as_array().map(Vec::len).unwrap_or(0)
+        ));
+        for target in map["targets"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  {:<42} {:<8} {:>5.0}%  {}",
+                target["path"].as_str().unwrap_or("?"),
+                target["source"].as_str().unwrap_or("?"),
+                target["confidence"].as_f64().unwrap_or(0.0) * 100.0,
+                target["reason"].as_str().unwrap_or("")
+            ));
+        }
+        for note in map["notes"].as_array().into_iter().flatten() {
+            lines.push(format!("  note: {}", note.as_str().unwrap_or("?")));
+        }
+        return Some(lines);
+    }
+    if let Some(entries) = value.get("entries").and_then(Value::as_array)
+        && value.get("total").is_some()
+        && value.get("project_id").is_some()
+    {
+        let mut lines = vec![format!(
+            "test cache entries  {}  {} of {} shown",
+            value["project_id"].as_str().unwrap_or("?"),
+            entries.len(),
+            value["total"].as_u64().unwrap_or(0)
+        )];
+        for entry in entries {
+            lines.push(format!(
+                "  {}  {:<5} {:<6}  exit {:<3}  {:>7}ms  hits {:<4}  {}",
+                entry["id"].as_str().unwrap_or("?"),
+                entry["kind"].as_str().unwrap_or("?"),
+                entry["status"].as_str().unwrap_or("?"),
+                entry["exit_code"].as_i64().unwrap_or(0),
+                entry["duration_ms"].as_u64().unwrap_or(0),
+                entry["hit_count"].as_u64().unwrap_or(0),
+                entry["command"].as_str().unwrap_or("")
+            ));
+        }
+        if entries.is_empty() {
+            lines.push("  no cached results".to_string());
+        }
+        return Some(lines);
+    }
+    if value.get("pruned").is_some() && value.get("affected_sessions").is_some() {
+        let mut lines = vec![format!(
+            "test cache prune  {}  {} removed · {} remaining · {} session(s) · dry_run={}",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["pruned"].as_u64().unwrap_or(0),
+            value["remaining"].as_u64().unwrap_or(0),
+            value["affected_sessions"].as_u64().unwrap_or(0),
+            value["dry_run"].as_bool().unwrap_or(false)
+        )];
+        if let Some(ids) = value.get("removed_ids").and_then(Value::as_array) {
+            for id in ids.iter().take(20).filter_map(Value::as_str) {
+                lines.push(format!("  removed {id}"));
+            }
+        }
+        return Some(lines);
+    }
+    if value.get("cleared").is_some() && value.get("affected_sessions").is_some() {
+        return Some(vec![format!(
+            "test cache clear  {}  {} cleared · {} remaining · {} session(s)",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["cleared"].as_u64().unwrap_or(0),
+            value["remaining"].as_u64().unwrap_or(0),
+            value["affected_sessions"].as_u64().unwrap_or(0)
+        )]);
+    }
+    if let Some(policy) = value
+        .get("policy")
+        .filter(|policy| policy.get("max_output_bytes").is_some())
+    {
+        let mut lines = vec![format!(
+            "test cache policy  {}  enabled={}  max-entries={}  retention={}d  output≤{}B  reuse-lint={}  integrator={}  failed-ttl={}s",
+            value["project_id"].as_str().unwrap_or("?"),
+            policy["enabled"].as_bool().unwrap_or(true),
+            policy["max_entries"].as_u64().unwrap_or(0),
+            policy["retention_days"].as_u64().unwrap_or(0),
+            policy["max_output_bytes"].as_u64().unwrap_or(0),
+            policy["reuse_lint"].as_bool().unwrap_or(true),
+            policy["include_integration"].as_bool().unwrap_or(false),
+            policy["failed_retention_secs"].as_u64().unwrap_or(0)
+        )];
+        if value.get("entries").is_some_and(Value::is_u64) {
+            lines.push(format!(
+                "  entries={} passed={} failed={} error={} expired={} hits={} output={}B",
+                value["entries"].as_u64().unwrap_or(0),
+                value["passed"].as_u64().unwrap_or(0),
+                value["failed"].as_u64().unwrap_or(0),
+                value["error"].as_u64().unwrap_or(0),
+                value["expired"].as_u64().unwrap_or(0),
+                value["total_hits"].as_u64().unwrap_or(0),
+                value["output_bytes"].as_u64().unwrap_or(0)
+            ));
+            if let Some(kinds) = value.get("by_kind").and_then(Value::as_object) {
+                let summary = kinds
+                    .iter()
+                    .map(|(kind, count)| format!("{kind}={}", count.as_u64().unwrap_or(0)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !summary.is_empty() {
+                    lines.push(format!("  kinds: {summary}"));
+                }
+            }
+        }
+        return Some(lines);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = test_cache_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = process_console_lines(value) {
         for line in lines {
             println!("{line}");
@@ -12841,5 +13183,180 @@ mod remote_integration_cli_tests {
         let text = lines.join("\n");
         assert!(text.contains("removed 1 ref(s)"));
         assert!(text.contains("requires force"));
+    }
+}
+
+#[cfg(test)]
+mod test_cache_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_test_cache_commands_additively() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "test-cache-policy-set",
+                    "prj-1",
+                    "--max-entries",
+                    "7",
+                    "--retention-days",
+                    "3",
+                    "--max-output-bytes",
+                    "65536",
+                    "--reuse-lint",
+                    "false",
+                    "--include-integration",
+                    "--failed-retention-secs",
+                    "120",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::TestCachePolicySet {
+                        project,
+                        max_entries,
+                        retention_days,
+                        max_output_bytes,
+                        reuse_lint,
+                        include_integration,
+                        failed_retention_secs,
+                        ..
+                    } => {
+                        assert_eq!(project, "prj-1");
+                        assert_eq!(max_entries, Some(7));
+                        assert_eq!(retention_days, Some(3));
+                        assert_eq!(max_output_bytes, Some(65536));
+                        assert_eq!(reuse_lint, Some(false));
+                        assert_eq!(include_integration, Some(true));
+                        assert_eq!(failed_retention_secs, Some(120));
+                    }
+                    other => panic!("expected test-cache-policy-set, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "test-cache-clear",
+                    "prj-1",
+                    "--kind",
+                    "lint",
+                    "--yes",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::TestCacheClear {
+                        project, kind, yes, ..
+                    } => {
+                        assert_eq!(project, "prj-1");
+                        assert_eq!(kind.as_deref(), Some("lint"));
+                        assert!(yes);
+                    }
+                    other => panic!("expected test-cache-clear, got {other:?}"),
+                }
+
+                let cli =
+                    Cli::try_parse_from(["vp", "test-impact", "ses-1", "--no-history"]).unwrap();
+                match cli.command {
+                    Command::TestImpact {
+                        session,
+                        no_history,
+                        ..
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert!(no_history);
+                    }
+                    other => panic!("expected test-impact, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn renders_stats_policy_entries_and_prune() {
+        let stats = json!({
+            "project_id": "prj-1",
+            "entries": 2,
+            "passed": 1,
+            "failed": 1,
+            "error": 0,
+            "expired": 0,
+            "total_hits": 4,
+            "output_bytes": 2048,
+            "by_kind": {"test": 2},
+            "policy": {
+                "enabled": true,
+                "max_entries": 512,
+                "retention_days": 14,
+                "max_output_bytes": 262144,
+                "reuse_lint": true,
+                "include_integration": false,
+                "failed_retention_secs": 900
+            },
+            "generated_at": "2026-11-12T00:00:00Z"
+        });
+        let lines = test_cache_lines(&stats).unwrap();
+        let text = lines.join("\n");
+        assert!(text.contains("test cache policy"));
+        assert!(text.contains("entries=2"));
+        assert!(text.contains("integrator=false"));
+
+        let entries = json!({
+            "project_id": "prj-1",
+            "entries": [
+                {
+                    "id": "tr-1",
+                    "kind": "test",
+                    "status": "passed",
+                    "exit_code": 0,
+                    "duration_ms": 42,
+                    "hit_count": 2,
+                    "command": "cargo test"
+                }
+            ],
+            "total": 1,
+            "truncated": false
+        });
+        let text = test_cache_lines(&entries).unwrap().join("\n");
+        assert!(text.contains("test cache entries"));
+        assert!(text.contains("cargo test"));
+
+        let prune = json!({
+            "project_id": "prj-1",
+            "pruned": 1,
+            "remaining": 0,
+            "dry_run": true,
+            "affected_sessions": 1,
+            "removed_ids": ["tr-1"],
+            "reason": "retention"
+        });
+        let text = test_cache_lines(&prune).unwrap().join("\n");
+        assert!(text.contains("dry_run=true"));
+        assert!(text.contains("removed tr-1"));
+
+        let impact = json!({
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "test_command": "cargo test",
+            "map": {
+                "generation": "impact-v1:abc",
+                "lsp_available": false,
+                "lexical_only": true,
+                "truncated": false,
+                "changed_paths": ["src/lib.rs"],
+                "targets": [{
+                    "path": "tests/smoke.rs",
+                    "source": "lexical",
+                    "confidence": 0.9,
+                    "reason": "reverse import"
+                }],
+                "notes": ["heuristic"]
+            }
+        });
+        let text = test_cache_lines(&impact).unwrap().join("\n");
+        assert!(text.contains("test impact"));
+        assert!(text.contains("tests/smoke.rs"));
+        assert!(text.contains("LEXICAL") || text.contains("lexical"));
     }
 }

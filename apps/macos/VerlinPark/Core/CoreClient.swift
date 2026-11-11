@@ -1226,6 +1226,129 @@ actor CoreClient {
             .decode(ToolOutputAuditResult.self)
     }
 
+    func testCacheStats(projectID: String) async throws -> TestCacheStats {
+        try await request(
+            method: "test_cache.stats",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(TestCacheStats.self)
+    }
+
+    func testCachePolicy(projectID: String) async throws -> TestCachePolicy {
+        try await request(
+            method: "test_cache.policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(TestCachePolicyResult.self)
+        .policy
+    }
+
+    func setTestCachePolicy(
+        projectID: String,
+        policy: TestCachePolicy
+    ) async throws -> TestCachePolicy {
+        let value: [String: JSONValue] = [
+            "enabled": .bool(policy.enabled),
+            "max_entries": .number(Double(policy.maxEntries)),
+            "retention_days": .number(Double(policy.retentionDays)),
+            "max_output_bytes": .number(Double(policy.maxOutputBytes)),
+            "reuse_lint": .bool(policy.reuseLint),
+            "include_integration": .bool(policy.includeIntegration),
+            "failed_retention_secs": .number(Double(policy.failedRetentionSecs)),
+        ]
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object(value),
+        ]
+        return try await request(method: "test_cache.policy.set", params: params)
+            .decode(TestCachePolicyResult.self)
+            .policy
+    }
+
+    func testCacheEntries(
+        projectID: String,
+        sessionID: String? = nil,
+        kind: String? = nil,
+        status: String? = nil,
+        includeExpired: Bool = false,
+        limit: Int = 100
+    ) async throws -> TestCacheEntriesResult {
+        var params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "include_expired": .bool(includeExpired),
+            "limit": .number(Double(limit)),
+        ]
+        if let sessionID {
+            params["session_id"] = .string(sessionID)
+        }
+        if let kind {
+            params["kind"] = .string(kind)
+        }
+        if let status {
+            params["status"] = .string(status)
+        }
+        return try await request(method: "test_cache.entries", params: params)
+            .decode(TestCacheEntriesResult.self)
+    }
+
+    func pruneTestCache(
+        projectID: String,
+        olderThanSecs: Int? = nil,
+        expiredOnly: Bool = false,
+        kind: String? = nil,
+        dryRun: Bool = false
+    ) async throws -> TestCachePruneResult {
+        var params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "expired_only": .bool(expiredOnly),
+            "dry_run": .bool(dryRun),
+        ]
+        if let olderThanSecs {
+            params["older_than_secs"] = .number(Double(olderThanSecs))
+        }
+        if let kind {
+            params["kind"] = .string(kind)
+        }
+        return try await request(method: "test_cache.prune", params: params)
+            .decode(TestCachePruneResult.self)
+    }
+
+    func clearTestCache(
+        projectID: String,
+        sessionID: String? = nil,
+        kind: String? = nil,
+        confirm: Bool
+    ) async throws -> TestCacheClearResult {
+        var params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "confirm": .bool(confirm),
+        ]
+        if let sessionID {
+            params["session_id"] = .string(sessionID)
+        }
+        if let kind {
+            params["kind"] = .string(kind)
+        }
+        return try await request(method: "test_cache.clear", params: params)
+            .decode(TestCacheClearResult.self)
+    }
+
+    func testImpact(
+        sessionID: String,
+        changedPaths: [String],
+        limit: Int = 32,
+        includeHistory: Bool = true
+    ) async throws -> TestCacheImpactResult {
+        let params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "changed_paths": .array(changedPaths.map(JSONValue.string)),
+            "limit": .number(Double(limit)),
+            "include_history": .bool(includeHistory),
+        ]
+        return try await request(method: "test_cache.impact", params: params)
+            .decode(TestCacheImpactResult.self)
+    }
+
     func resumePlan(sessionID: String) async throws -> Bool {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.plan_resume", params: params)

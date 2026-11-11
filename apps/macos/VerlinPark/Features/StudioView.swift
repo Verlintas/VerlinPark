@@ -306,6 +306,8 @@ struct PreviewPanelView: View {
                         TerminalPanel()
                     case .trace:
                         trace
+                    case .tests:
+                        TestCachePanel()
                     }
                 }
                 .id(mode)
@@ -347,6 +349,9 @@ struct PreviewPanelView: View {
             }
             if mode == .processes {
                 await model.loadProcesses()
+            }
+            if mode == .tests {
+                await model.loadTestCache()
             }
         }
         .alert("Commit worktree", isPresented: $showingCommit) {
@@ -1247,6 +1252,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
     case processes
     case terminal
     case trace
+    case tests
 
     var id: String {
         rawValue
@@ -1267,6 +1273,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .processes: L10n.t("Processes")
         case .terminal: L10n.t("Terminal")
         case .trace: L10n.t("Trace")
+        case .tests: L10n.t("Tests")
         }
     }
 
@@ -1285,12 +1292,13 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .processes: "gearshape.2"
         case .terminal: "apple.terminal"
         case .trace: "list.bullet.rectangle"
+        case .tests: "testtube.2"
         }
     }
 
     static let primary: [PreviewMode] = [.showcase, .changes, .files, .sources, .plan]
     static let secondary: [PreviewMode] = [
-        .history, .queue, .mailbox, .cost, .console, .processes, .terminal, .trace,
+        .history, .queue, .mailbox, .cost, .console, .processes, .terminal, .trace, .tests,
     ]
 }
 

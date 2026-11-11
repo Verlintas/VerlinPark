@@ -56,6 +56,7 @@ fn context(root: &Path) -> ToolContext {
         remote: None,
         session_id: None,
         process_supervisor: None,
+        test_cache: None,
     }
 }
 
