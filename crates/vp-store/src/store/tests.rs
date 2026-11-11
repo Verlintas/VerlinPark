@@ -2158,6 +2158,66 @@ fn expired_runtime_leases_can_be_swept_or_taken_over() {
 }
 
 #[test]
+fn lease_expiry_comparison_handles_rfc3339_fractional_seconds() {
+    let (_data, store, _repo) = test_store();
+    assert!(
+        store
+            .try_acquire_runtime_lease("session:fractional", "daemon-a", "session", Some("s"), 60)
+            .unwrap()
+    );
+    {
+        let conn = store.lock().unwrap();
+        // RFC3339 may include fractional seconds. A plain string comparison
+        // would sort "2020-01-01T00:00:00.500Z" *after* "...00Z" because '.'
+        // sorts below 'Z', leaving an expired lease permanently stuck.
+        conn.execute(
+            "UPDATE runtime_leases SET expires_at = '2020-01-01T00:00:00.500Z'
+             WHERE lease_key = ?1",
+            params!["session:fractional"],
+        )
+        .unwrap();
+    }
+    assert!(
+        store
+            .try_acquire_runtime_lease("session:fractional", "daemon-b", "session", Some("s"), 60)
+            .unwrap()
+    );
+    let lease = store
+        .runtime_lease_owner("session:fractional")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.owner_id, "daemon-b");
+
+    assert!(
+        store
+            .try_acquire_runtime_lease(
+                "session:fractional-2",
+                "daemon-a",
+                "session",
+                Some("s2"),
+                60
+            )
+            .unwrap()
+    );
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE runtime_leases SET expires_at = '2020-01-01T00:00:00.500Z'
+             WHERE lease_key = ?1",
+            params!["session:fractional-2"],
+        )
+        .unwrap();
+    }
+    assert_eq!(store.clear_expired_runtime_leases().unwrap(), 1);
+    assert!(
+        store
+            .runtime_lease_owner("session:fractional-2")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn computer_leases_are_exclusive_owned_and_audited() {
     let (_data, store, repo) = test_store();
     let project = store

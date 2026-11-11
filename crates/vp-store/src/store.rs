@@ -10485,7 +10485,7 @@ impl Store {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
-            "DELETE FROM runtime_leases WHERE expires_at <= ?1",
+            "DELETE FROM runtime_leases WHERE julianday(expires_at) <= julianday(?1)",
             params![now_text],
         )?;
         let existing = tx
@@ -10586,7 +10586,7 @@ impl Store {
         let now = now_rfc3339();
         let conn = self.lock()?;
         let changed = conn.execute(
-            "DELETE FROM runtime_leases WHERE expires_at <= ?1",
+            "DELETE FROM runtime_leases WHERE julianday(expires_at) <= julianday(?1)",
             params![now],
         )?;
         Ok(changed)
@@ -10628,7 +10628,7 @@ impl Store {
                 let mut stmt = tx.prepare(
                     "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
                             acquired_at, heartbeat_at, expires_at
-                     FROM computer_leases WHERE expires_at <= ?1
+                     FROM computer_leases WHERE julianday(expires_at) <= julianday(?1)
                      ORDER BY expires_at ASC, lease_id ASC",
                 )?;
                 let rows = stmt.query_map(params![now_text], map_computer_lease)?;
@@ -10831,7 +10831,7 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
                         acquired_at, heartbeat_at, expires_at
-                 FROM computer_leases WHERE expires_at <= ?1
+                 FROM computer_leases WHERE julianday(expires_at) <= julianday(?1)
                  ORDER BY expires_at ASC, lease_id ASC",
             )?;
             let rows = stmt.query_map(params![now], map_computer_lease)?;
