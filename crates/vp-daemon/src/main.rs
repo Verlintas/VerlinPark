@@ -63,25 +63,26 @@ use vp_protocol::types::{
     SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
     SessionImportParams, SessionLineageParams, SessionListResult, SessionLogParams,
     SessionMergeForkParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
-    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult,
+    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionRunCancelParams,
+    SessionRunDetailParams, SessionRunPolicyParams, SessionRunResumeParams, SessionRunsParams,
     SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
     SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
     SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
-    SetProjectBudgetParams, SetSessionPriorityParams, SetSessionUnlimitedParams,
-    SetShellPolicyParams, SetSourceCollectionParams, SetSourceLabelsParams,
-    SetTaskSchedulerPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SkillCreateParams, SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams,
-    SkillUpdateParams, SourceActionParams, SourceCollectionsParams, SourceCreateFileParams,
-    SourceCreateNoteParams, SourceCreateUrlParams, SourceGetParams, SourceImportParams,
-    SourceListParams, SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult,
-    TaskDispatchParams, TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams,
-    TeamPlanParams, TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
-    TerminalResizeParams, TerminalWriteParams, UpdateAcpAgentParams, UpdateCheckParams,
-    UpdateDownloadParams, UpdateMcpServerParams, UpdateModelPresetParams,
-    UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceGrepParams,
-    WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams,
-    WorktreePolicyParams,
+    SetProjectBudgetParams, SetSessionPriorityParams, SetSessionRunPolicyParams,
+    SetSessionUnlimitedParams, SetShellPolicyParams, SetSourceCollectionParams,
+    SetSourceLabelsParams, SetTaskSchedulerPolicyParams, SetWorktreePolicyParams,
+    ShellPolicyParams, ShellPolicyResult, SkillCreateParams, SkillEnabledParams, SkillIdParams,
+    SkillImportParams, SkillListParams, SkillUpdateParams, SourceActionParams,
+    SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
+    SourceGetParams, SourceImportParams, SourceListParams, SourceSearchParams, SubscribeParams,
+    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
+    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
+    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
+    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
+    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
+    WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -164,6 +165,11 @@ async fn main() -> Result<()> {
         Ok(0) => {}
         Ok(started) => tracing::info!(started, "re-enqueued persisted queued sessions"),
         Err(error) => tracing::warn!(%error, "failed to re-enqueue queued sessions"),
+    }
+    match agent.auto_resume_interrupted_runs().await {
+        Ok(0) => {}
+        Ok(started) => tracing::info!(started, "auto-resumed interrupted durable runs"),
+        Err(error) => tracing::warn!(%error, "failed to auto-resume interrupted durable runs"),
     }
     let token = generate_token();
     let started_at = now_rfc3339();
@@ -2143,6 +2149,70 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "session.runs" => match parse_params::<SessionRunsParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_runs(&params.session_id, params.limit.unwrap_or(50))
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.run.detail" => match parse_params::<SessionRunDetailParams>(request.params) {
+            Ok(params) => match state.engine.session_run_detail(&params.run_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.run.resume" => match parse_params::<SessionRunResumeParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .resume_session_run(
+                    &params.session_id,
+                    params.run_id.as_deref(),
+                    params.operation_id.as_deref(),
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.run.cancel" => match parse_params::<SessionRunCancelParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .cancel_session_run(&params.session_id, params.run_id.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.run.policy.get" => match parse_params::<SessionRunPolicyParams>(request.params) {
+            Ok(params) => match state.engine.session_run_policy(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.run.policy.set" => {
+            match parse_params::<SetSessionRunPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_session_run_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.commit" => match parse_params::<CommitSessionParams>(request.params) {
             Ok(params) => match state
                 .engine

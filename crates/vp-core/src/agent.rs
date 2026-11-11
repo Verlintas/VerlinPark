@@ -18,10 +18,11 @@ use vp_protocol::types::{
     ContextCompactionSummary, ContextMeasurement, IntakeDispatchResult, IntakeTask,
     MergeQueueEntry, OrchestrationRecovery, PlanDepartment, PlanRevisionDetailResult, PlanTask,
     Program, ProgramMilestone, ProgramTickResult, Project, ReviseTeamPlanResult, RoleModels,
-    ScheduledTask, SchedulerProjectStatus, SchedulerStatusResult, Session, SessionCheckpoint,
-    SessionCheckpointDiffResult, SessionCheckpointRestoreResult, SessionCompactResult,
-    SessionForkResult, SessionMergeForkResult, Skill, SourceCitation, SourceSearchHit,
-    StallRecoveryMode, StoredMessage, TeamPlan, TodoItem,
+    RunBudgetSnapshot, ScheduledTask, SchedulerProjectStatus, SchedulerStatusResult, Session,
+    SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
+    SessionCompactResult, SessionForkResult, SessionMergeForkResult, SessionRunCancelResult,
+    SessionRunResumeResult, Skill, SourceCitation, SourceSearchHit, StallRecoveryMode,
+    StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -522,6 +523,12 @@ struct RunControl {
     finalized: tokio::sync::Mutex<Option<String>>,
     manual: bool,
     cancellable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeMode {
+    Manual,
+    Auto,
 }
 
 impl RunControl {
@@ -1391,6 +1398,18 @@ impl SessionBudget {
 
     fn is_unlimited(&self) -> bool {
         self.unlimited.load(Ordering::SeqCst)
+    }
+
+    fn run_snapshot(&self) -> RunBudgetSnapshot {
+        RunBudgetSnapshot {
+            token_limit: self.limit,
+            tokens_spent: self.spent(),
+            cost_limit_usd: self.cost_limit,
+            cost_spent_usd: self.cost_spent(),
+            time_limit_secs: self.time_limit.map(|limit| limit.as_secs()),
+            elapsed_secs: self.elapsed_secs(),
+            unlimited: self.is_unlimited(),
+        }
     }
 
     fn add_cost(&self, cost: f64) -> bool {
@@ -2678,6 +2697,7 @@ impl AgentService {
             &mut conversation,
             None,
             false,
+            None,
         )
         .await;
         let outcome = match result {
@@ -4583,8 +4603,326 @@ impl AgentService {
             prompt.to_string(),
             control,
             lease,
+            None,
         );
         Ok(())
+    }
+
+    /// Explicit manual resume. The optional operation id is a receipt for this
+    /// RPC only; it is deliberately separate from `session.prompt` admission.
+    pub async fn resume_session_run(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> Result<SessionRunResumeResult> {
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "run_id": run_id,
+        });
+        let receipt = match crate::operation::begin(
+            self.engine.store(),
+            session_id,
+            operation_id,
+            "session.run.resume",
+            &payload,
+        )
+        .await?
+        {
+            crate::operation::OperationStart::Replay(result) => {
+                return crate::operation::replay(&result);
+            }
+            crate::operation::OperationStart::Proceed(receipt) => receipt,
+        };
+        let result = self
+            .resume_run_inner(session_id, run_id, ResumeMode::Manual)
+            .await;
+        match &result {
+            Ok(resume) => crate::operation::complete(&receipt, resume).await?,
+            Err(error) => crate::operation::fail(&receipt, &format!("{error:#}")).await,
+        }
+        result
+    }
+
+    /// Daemon startup auto-resume. Opt-in per project and bounded by the same
+    /// preflight as manual resume. One attempt per session per tick.
+    pub async fn auto_resume_interrupted_runs(&self) -> Result<usize> {
+        let configured = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().map(|_| ()))
+            .is_some();
+        if !configured {
+            return Ok(0);
+        }
+        let runs = crate::run_journal::all_resumable_runs(&self.engine).await?;
+        let mut seen_sessions = std::collections::HashSet::new();
+        let mut started = 0usize;
+        for run in runs {
+            if !run.top_level || !seen_sessions.insert(run.session_id.clone()) {
+                continue;
+            }
+            let policy = crate::run_journal::policy(&self.engine, &run.project_id).await?;
+            if !policy.auto_resume {
+                continue;
+            }
+            match self
+                .resume_run_inner(&run.session_id, Some(&run.run_id), ResumeMode::Auto)
+                .await
+            {
+                Ok(_) => started = started.saturating_add(1),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        run_id = %run.run_id,
+                        session_id = %run.session_id,
+                        "auto-resume refused a durable run"
+                    );
+                }
+            }
+        }
+        Ok(started)
+    }
+
+    /// Cooperatively cancel one active run. The cancellation is requested on
+    /// the session's in-memory run control; the run loop is the only writer
+    /// that records the terminal interrupted/cancelled journal row.
+    pub async fn cancel_session_run(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<SessionRunCancelResult> {
+        let store = self.engine.store().clone();
+        let session_id_owned = session_id.to_string();
+        let requested_run = run_id.map(str::to_string);
+        let run = tokio::task::spawn_blocking(move || {
+            if let Some(run_id) = requested_run {
+                return store.get_session_run(&run_id);
+            }
+            Ok::<_, anyhow::Error>(
+                store
+                    .list_session_runs(&session_id_owned, 100)?
+                    .into_iter()
+                    .find(|run| run.status == "running"),
+            )
+        })
+        .await??;
+        let Some(run) = run else {
+            return Ok(SessionRunCancelResult {
+                session_id: session_id.to_string(),
+                run_id: run_id.map(str::to_string),
+                cancelled: false,
+                detail: "no running durable run was found".to_string(),
+            });
+        };
+        if run.session_id != session_id {
+            anyhow::bail!("run {} belongs to another session", run.run_id);
+        }
+        if run.status != "running" {
+            return Ok(SessionRunCancelResult {
+                session_id: session_id.to_string(),
+                run_id: Some(run.run_id),
+                cancelled: false,
+                detail: format!("run is already {}", run.status),
+            });
+        }
+        let cancelled = self.cancel(session_id);
+        if cancelled
+            && let Err(error) = self
+                .engine
+                .append_event(
+                    session_id,
+                    "session.run.cancel_requested",
+                    serde_json::json!({"run_id": run.run_id}),
+                )
+                .await
+        {
+            tracing::warn!(%error, run_id = %run.run_id, "failed to record durable cancel intent");
+        }
+        Ok(SessionRunCancelResult {
+            session_id: session_id.to_string(),
+            run_id: Some(run.run_id),
+            cancelled,
+            detail: if cancelled {
+                "cooperative cancellation requested; the run loop records the terminal journal row at its next boundary"
+                    .to_string()
+            } else {
+                "no live run control is available in this daemon".to_string()
+            },
+        })
+    }
+
+    async fn resume_run_inner(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        mode: ResumeMode,
+    ) -> Result<SessionRunResumeResult> {
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned())
+            .ok_or_else(|| {
+                anyhow!("agent provider is not configured; a resumed run needs the same provider and model")
+            })?;
+        let store = self.engine.store().clone();
+        let (session, _project) = load_session_project(store.clone(), session_id).await?;
+        let run = if let Some(run_id) = run_id {
+            let store = store.clone();
+            let requested = run_id.to_string();
+            let lookup = requested.clone();
+            tokio::task::spawn_blocking(move || store.get_session_run(&lookup))
+                .await??
+                .ok_or_else(|| anyhow!("run not found: {requested}"))?
+        } else {
+            let store = store.clone();
+            let id = session_id.to_string();
+            tokio::task::spawn_blocking(move || store.list_session_runs(&id, 100))
+                .await??
+                .into_iter()
+                .find(|run| {
+                    run.top_level
+                        && crate::run_journal::is_resumable_status(&run.status)
+                        && !run.failure.as_ref().is_some_and(|failure| {
+                            matches!(failure.kind.as_str(), "cancelled" | "superseded")
+                        })
+                })
+                .ok_or_else(|| {
+                    anyhow!("session has no interrupted or failed top-level run to resume")
+                })?
+        };
+        if run.session_id != session_id {
+            anyhow::bail!("run {} belongs to another session", run.run_id);
+        }
+        let policy = crate::run_journal::policy(&self.engine, &session.project_id).await?;
+        if mode == ResumeMode::Auto && !policy.auto_resume {
+            anyhow::bail!(
+                "project {} has not opted into auto_resume",
+                session.project_id
+            );
+        }
+        let model = model_for(&config, AgentRole::Leader);
+        let plan = crate::run_journal::preflight(
+            &self.engine,
+            &session,
+            &run,
+            &policy,
+            &config.provider_name,
+            &model,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
+        let worktree = PathBuf::from(
+            session
+                .worktree
+                .clone()
+                .ok_or_else(|| anyhow!("session has no worktree"))?,
+        );
+        let control = self.begin_resumable_run(session_id)?;
+        let lease = match self
+            .engine
+            .acquire_session_lease(session_id, std::time::Duration::from_secs(180))
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                if let Ok(mut runs) = self.runs.lock() {
+                    runs.remove(session_id);
+                }
+                return Err(error);
+            }
+        };
+        let budget = RunBudgetSnapshot {
+            token_limit: session.token_budget,
+            tokens_spent: session.tokens_in.saturating_add(session.tokens_out),
+            cost_limit_usd: session.cost_budget_usd,
+            cost_spent_usd: session.cost_spent_usd,
+            time_limit_secs: session.time_budget_secs,
+            elapsed_secs: 0,
+            unlimited: session.unlimited,
+        };
+        let journal = match crate::run_journal::begin_resumed_run(
+            &self.engine,
+            &session,
+            &plan.previous,
+            &config.provider_name,
+            &model,
+            &worktree,
+            budget,
+        )
+        .await
+        {
+            Ok(journal) => journal,
+            Err(error) => {
+                if let Ok(mut runs) = self.runs.lock() {
+                    runs.remove(session_id);
+                }
+                let _ = self
+                    .engine
+                    .update_session_status(session_id, "failed")
+                    .await;
+                lease.release().await;
+                return Err(error);
+            }
+        };
+        let new_run_id = journal.id().to_string();
+        let attempt = journal.run.attempt;
+        let resumed_from = journal.run.resumed_from_run_id.clone();
+        let prepared: Result<()> = async {
+            self.engine
+                .update_session_status(session_id, "queued")
+                .await?;
+            self.engine
+                .append_message(session_id, "user", &plan.note, serde_json::json!([]), None)
+                .await?;
+            self.engine
+                .append_event(
+                    session_id,
+                    "agent.queued",
+                    serde_json::json!({
+                        "prompt": plan.note,
+                        "resumed_run_id": new_run_id,
+                        "resumed_from_run_id": plan.previous.run_id,
+                        "attempt": attempt,
+                    }),
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = prepared {
+            let _ = journal
+                .finish_failed(&self.engine, "resume_start_failed", &format!("{error:#}"))
+                .await;
+            if let Ok(mut runs) = self.runs.lock() {
+                runs.remove(session_id);
+            }
+            let _ = self
+                .engine
+                .update_session_status(session_id, "failed")
+                .await;
+            lease.release().await;
+            return Err(error);
+        }
+        self.spawn_run(
+            config,
+            session.id.clone(),
+            session.project_id.clone(),
+            session.priority,
+            plan.note,
+            control,
+            lease,
+            Some(journal),
+        );
+        Ok(SessionRunResumeResult {
+            session_id: session_id.to_string(),
+            resumed: true,
+            run_id: new_run_id,
+            resumed_from_run_id: resumed_from,
+            attempt,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4597,6 +4935,7 @@ impl AgentService {
         prompt: String,
         control: Arc<RunControl>,
         lease: crate::SessionLease,
+        resume_journal: Option<crate::run_journal::RunJournal>,
     ) {
         let engine = self.engine.clone();
         let runs = self.runs.clone();
@@ -4607,6 +4946,15 @@ impl AgentService {
                 _ = wait_for_cancel(&control) => None,
             };
             let Some(_permit) = permit else {
+                if let Some(journal) = &resume_journal {
+                    let _ = journal
+                        .finish_interrupted(
+                            &engine,
+                            "cancelled",
+                            "admission was cancelled before the resumed run started",
+                        )
+                        .await;
+                }
                 let _ = engine
                     .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
                     .await;
@@ -4620,6 +4968,15 @@ impl AgentService {
                 return;
             };
             if control.is_cancelled() {
+                if let Some(journal) = &resume_journal {
+                    let _ = journal
+                        .finish_interrupted(
+                            &engine,
+                            "cancelled",
+                            "the resumed run was cancelled before it started",
+                        )
+                        .await;
+                }
                 let _ = engine
                     .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
                     .await;
@@ -4644,6 +5001,7 @@ impl AgentService {
                 &session_id,
                 &prompt,
                 control.clone(),
+                resume_journal,
             )
             .await;
             if let Err(error) = &result {
@@ -4713,6 +5071,7 @@ impl AgentService {
                 prompt,
                 control,
                 lease,
+                None,
             );
             started += 1;
         }
@@ -5068,6 +5427,21 @@ impl AgentService {
             anyhow::bail!("session is already running");
         }
         let control = Arc::new(RunControl::new_manual());
+        runs.insert(session_id.to_string(), control.clone());
+        Ok(control)
+    }
+
+    /// A resumed or normal long run is cancellable and pausable. Foreground
+    /// operations use the non-cancellable variants above.
+    fn begin_resumable_run(&self, session_id: &str) -> Result<Arc<RunControl>> {
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| anyhow!("agent run mutex poisoned"))?;
+        if runs.contains_key(session_id) {
+            anyhow::bail!("session is already running");
+        }
+        let control = Arc::new(RunControl::new());
         runs.insert(session_id.to_string(), control.clone());
         Ok(control)
     }
@@ -5999,6 +6373,14 @@ async fn run_plan_resume(
             .await?;
         return Ok(());
     }
+    if let Err(error) =
+        crate::run_journal::supersede_unresolved_runs(&engine, session_id, "plan-resume").await
+    {
+        control
+            .finalize_session(&engine, session_id, "failed")
+            .await?;
+        return Err(error);
+    }
     if let Some(agent_id) = &leader_id {
         engine.update_agent_status(agent_id, "running").await?;
     }
@@ -6086,6 +6468,7 @@ async fn run_agent(
     session_id: &str,
     prompt: &str,
     control: Arc<RunControl>,
+    resume_journal: Option<crate::run_journal::RunJournal>,
 ) -> Result<()> {
     let store = engine.store().clone();
     let (_, project) = load_session_project(store.clone(), session_id).await?;
@@ -6136,7 +6519,42 @@ async fn run_agent(
     .with_cost(session.cost_budget_usd, session.cost_spent_usd)
     .with_time(session.time_budget_secs)
     .with_unlimited_flag(engine.unlimited_flag(&session.id, session.unlimited));
+    let load_from_events = resume_journal.is_some();
+    let journal = match resume_journal {
+        Some(journal) => journal,
+        None => {
+            crate::run_journal::RunJournal::begin(
+                &engine,
+                &session,
+                &project.id,
+                &spec.id,
+                &spec.name,
+                spec.role.as_str(),
+                spec.task_id.as_deref(),
+                spec.department.as_deref(),
+                prompt,
+                &config.provider_name,
+                &model_for(&config, spec.role),
+                &worktree,
+                budget.run_snapshot(),
+                true,
+            )
+            .await?
+        }
+    };
     if budget.exhausted() {
+        if let Err(error) = journal
+            .finish_failed(
+                &engine,
+                "budget_exceeded",
+                budget
+                    .exceeded_reason()
+                    .unwrap_or("session budget exhausted"),
+            )
+            .await
+        {
+            tracing::warn!(%error, "failed to finish a budget-exhausted run journal");
+        }
         emit(
             &engine,
             session_id,
@@ -6156,11 +6574,33 @@ async fn run_agent(
         engine.update_session_status(session_id, "failed").await?;
         return Ok(());
     }
-    if let Some(agent_id) = &leader_id {
-        engine.update_agent_status(agent_id, "running").await?;
+    if !load_from_events
+        && let Err(error) =
+            crate::run_journal::supersede_unresolved_runs(&engine, session_id, journal.id()).await
+    {
+        let _ = journal
+            .finish_failed(
+                &engine,
+                "error",
+                &format!("could not supersede older unresolved runs: {error:#}"),
+            )
+            .await;
+        return Err(error);
+    }
+    if let Some(agent_id) = &leader_id
+        && let Err(error) = engine.update_agent_status(agent_id, "running").await
+    {
+        let _ = journal
+            .finish_failed(
+                &engine,
+                "error",
+                &format!("could not mark the agent running: {error:#}"),
+            )
+            .await;
+        return Err(error);
     }
 
-    emit(
+    if let Err(error) = emit(
         &engine,
         session_id,
         &spec,
@@ -6174,9 +6614,67 @@ async fn run_agent(
             "branch": session.branch,
         }),
     )
-    .await?;
+    .await
+    {
+        let _ = journal
+            .finish_failed(
+                &engine,
+                "error",
+                &format!("failed to record agent.started: {error:#}"),
+            )
+            .await;
+        return Err(error);
+    }
 
-    let loaded = load_conversation(&engine, session_id).await?;
+    let loaded = if load_from_events {
+        let (mut messages, ids) = match engine.conversation_from_events(session_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                if let Err(finish_error) = journal
+                    .finish_failed(
+                        &engine,
+                        "journal_unreadable",
+                        &format!("could not reconstruct the resumed conversation: {error:#}"),
+                    )
+                    .await
+                {
+                    tracing::warn!(%finish_error, "failed to finish an unreadable run journal");
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = journal
+            .repair_resumed_conversation(&engine, &mut messages)
+            .await
+        {
+            if let Err(finish_error) = journal
+                .finish_failed(
+                    &engine,
+                    "journal_unreadable",
+                    &format!("could not repair the resumed conversation: {error:#}"),
+                )
+                .await
+            {
+                tracing::warn!(%finish_error, "failed to finish an unreadable run journal");
+            }
+            return Err(error);
+        }
+        LoadedConversation { messages, ids }
+    } else {
+        match load_conversation(&engine, session_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let _ = journal
+                    .finish_failed(
+                        &engine,
+                        "error",
+                        &format!("could not load the persisted conversation: {error:#}"),
+                    )
+                    .await;
+                return Err(error);
+            }
+        }
+    };
     let mut conversation = loaded.messages;
     let mut conversation_ids = loaded.ids;
     let result = run_loop(
@@ -6191,6 +6689,7 @@ async fn run_agent(
         &mut conversation,
         Some(&mut conversation_ids),
         true,
+        Some(journal),
     )
     .await;
     if result.is_err()
@@ -6894,6 +7393,7 @@ async fn verify_worker(
         &mut conversation,
         None,
         false,
+        None,
     )
     .await;
     match result {
@@ -9117,7 +9617,30 @@ async fn run_loop(
     conversation: &mut Vec<ChatMessage>,
     conversation_ids: Option<&mut Vec<Option<String>>>,
     top_level: bool,
+    resume_journal: Option<crate::run_journal::RunJournal>,
 ) -> Result<LoopOutcome> {
+    let journal = match resume_journal {
+        Some(journal) => journal,
+        None => {
+            crate::run_journal::RunJournal::begin(
+                engine,
+                session,
+                &project.id,
+                &spec.id,
+                &spec.name,
+                spec.role.as_str(),
+                spec.task_id.as_deref(),
+                spec.department.as_deref(),
+                objective,
+                &config.provider_name,
+                &model_for(config, spec.role),
+                &spec.worktree,
+                budget.run_snapshot(),
+                top_level,
+            )
+            .await?
+        }
+    };
     let result = run_loop_body(
         engine,
         config,
@@ -9130,6 +9653,7 @@ async fn run_loop(
         conversation,
         conversation_ids,
         top_level,
+        &journal,
     )
     .await;
     // A run boundary is final for steering: anything still pending was not
@@ -9144,6 +9668,37 @@ async fn run_loop(
         .await
     {
         tracing::warn!(%error, agent_id = %spec.id, "failed to cancel pending steering at run end");
+    }
+    let finish = match &result {
+        Ok(LoopOutcome::Final(_) | LoopOutcome::Verdict(_)) => {
+            journal.finish_completed(engine).await
+        }
+        Ok(LoopOutcome::Cancelled) => {
+            journal
+                .finish_interrupted(
+                    engine,
+                    "cancelled",
+                    "the run was cancelled before it completed",
+                )
+                .await
+        }
+        Ok(LoopOutcome::BudgetExceeded(stop)) => {
+            journal
+                .finish_failed(engine, "budget_exceeded", &stop.summary())
+                .await
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            let kind = if message.contains("maximum turns reached") {
+                "max_turns"
+            } else {
+                "error"
+            };
+            journal.finish_failed(engine, kind, &message).await
+        }
+    };
+    if let Err(error) = finish {
+        tracing::warn!(%error, run_id = journal.id(), "failed to finish durable run journal");
     }
     result
 }
@@ -9161,6 +9716,7 @@ async fn run_loop_body(
     conversation: &mut Vec<ChatMessage>,
     conversation_ids: Option<&mut Vec<Option<String>>>,
     top_level: bool,
+    journal: &crate::run_journal::RunJournal,
 ) -> Result<LoopOutcome> {
     let mut empty_ids = Vec::new();
     let conversation_ids: &mut Vec<Option<String>> = match conversation_ids {
@@ -9409,6 +9965,9 @@ async fn run_loop_body(
             .await?;
         }
         {
+            let compaction_before = crate::run_journal::journal_cursors(engine, &session.id)
+                .await?
+                .0;
             compact_context_if_needed(
                 engine,
                 config,
@@ -9426,6 +9985,20 @@ async fn run_loop_body(
                 context_strategy(spec.role),
             )
             .await?;
+            let compaction_after = crate::run_journal::journal_cursors(engine, &session.id)
+                .await?
+                .0;
+            if compaction_after != compaction_before {
+                journal
+                    .record_compaction(
+                        engine,
+                        turn + 1,
+                        compaction_before,
+                        compaction_after,
+                        conversation.len(),
+                    )
+                    .await?;
+            }
             if control.is_cancelled() {
                 return Ok(LoopOutcome::Cancelled);
             }
@@ -9483,6 +10056,11 @@ async fn run_loop_body(
             // is enforced when a tool is dispatched, not by changing schemas.
             tools: tools.clone(),
         };
+        // A safe turn boundary: messages, budget, worktree HEAD, and plan
+        // revision are all durable before the provider request intent.
+        journal
+            .checkpoint(engine, turn + 1, budget.run_snapshot())
+            .await?;
         const MIN_OUTPUT_TOKENS: u64 = 64;
         let configured_output = config.max_tokens.unwrap_or(4096).max(1) as u64;
         let input_estimate = estimate_request_tokens(&request);
@@ -9589,6 +10167,7 @@ async fn run_loop_body(
             request.max_tokens = Some(output_budget.min(u32::MAX as u64) as u32);
         }
         let _scope_lease = scope_lease;
+        let model_step = journal.model_intent(engine, turn + 1, &request).await?;
         let stream_turn = consume_stream(
             engine,
             &session.id,
@@ -9724,6 +10303,13 @@ async fn run_loop_body(
                 || cost_exceeded;
         }
         if stream_turn.cancelled {
+            journal
+                .model_failed(
+                    engine,
+                    &model_step,
+                    "the run was cancelled during the provider stream",
+                )
+                .await?;
             return Ok(LoopOutcome::Cancelled);
         }
         if let Some(error) = stream_turn.error {
@@ -9743,9 +10329,19 @@ async fn run_loop_body(
                 )
                 .await?;
             }
+            journal
+                .model_failed(engine, &model_step, &format!("{error:#}"))
+                .await?;
             return Err(error);
         }
         if budget_exceeded {
+            journal
+                .model_failed(
+                    engine,
+                    &model_step,
+                    "the provider response arrived but the session budget was exhausted before it could be persisted",
+                )
+                .await?;
             return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
         }
         if !budget.is_unlimited() && plan_budget.active() {
@@ -9774,6 +10370,20 @@ async fn run_loop_body(
         let tool_calls = stream_turn.tool_calls;
 
         if text.is_empty() && tool_calls.is_empty() {
+            journal
+                .model_completed(
+                    engine,
+                    &model_step,
+                    None,
+                    "",
+                    &[],
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    estimated,
+                )
+                .await?;
             emit(
                 engine,
                 &session.id,
@@ -9825,6 +10435,20 @@ async fn run_loop_body(
             tool_calls: assistant_tool_calls,
             tool_call_id: None,
         });
+        journal
+            .model_completed(
+                engine,
+                &model_step,
+                stored_id.as_deref(),
+                &text,
+                &tool_calls,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                estimated,
+            )
+            .await?;
 
         if !wait_for_task_resume(engine, &session.id, spec, control).await? {
             return Ok(LoopOutcome::Cancelled);
@@ -9875,7 +10499,8 @@ async fn run_loop_body(
                 prepared.push((index, call_id, call.name.clone(), input, tool));
             }
             if !prepared.is_empty() {
-                for (_, call_id, name, input, _) in &prepared {
+                let mut journal_pairs = std::collections::HashMap::new();
+                for (index, call_id, name, input, _) in &prepared {
                     if let Err(error) = engine
                         .touch_task_progress(
                             &session.id,
@@ -9887,6 +10512,10 @@ async fn run_loop_body(
                     {
                         tracing::warn!(%error, "failed to record task tool progress");
                     }
+                    let pair = journal
+                        .tool_intent(engine, turn + 1, call_id, name, input)
+                        .await?;
+                    journal_pairs.insert(*index, pair);
                     emit(
                         engine,
                         &session.id,
@@ -9948,7 +10577,12 @@ async fn run_loop_body(
                     }
                 }
                 results.sort_by_key(|(index, _, _, _)| *index);
-                for (_, call_id, name, output) in results {
+                for (index, call_id, name, output) in results {
+                    if let Some((journal_step, journal_tool)) = journal_pairs.remove(&index) {
+                        journal
+                            .tool_completed(engine, &journal_step, &journal_tool, &output)
+                            .await?;
+                    }
                     emit(
                         engine,
                         &session.id,
@@ -10017,6 +10651,36 @@ async fn run_loop_body(
             };
             let input: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+            // Duplicate-write gate runs before approval and before any journal
+            // intent: an already-completed write is returned from the journal,
+            // not executed again. Read-only tools re-run normally.
+            let duplicate = journal
+                .check_duplicate_write(engine, &call.name, &input)
+                .await?;
+            let journal_pair = if duplicate.is_none() {
+                Some(
+                    journal
+                        .tool_intent(engine, turn + 1, &call_id, &call.name, &input)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            if duplicate.is_some() {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                        "journal_replay": true,
+                    }),
+                )
+                .await?;
+            }
             let is_delegate = call.name == "delegate" && spec.allow_delegation;
             let is_acp_delegate = call.name == "delegate_acp"
                 && spec.allow_delegation
@@ -10133,26 +10797,52 @@ async fn run_loop_body(
                             Some(&reason),
                         )
                         .await?;
-                    match wait_for_approval(
+                    let approval_step = match journal
+                        .approval_intent(
+                            engine,
+                            turn + 1,
+                            &approval.id,
+                            &call.name,
+                            &call_id,
+                            risk.as_str(),
+                            &reason,
+                        )
+                        .await
+                    {
+                        Ok(step) => step,
+                        Err(error) => {
+                            let _ = engine.resolve_approval(&approval.id, false).await;
+                            return Err(error);
+                        }
+                    };
+                    let outcome = match wait_for_approval(
                         receiver,
                         control,
                         Duration::from_secs(config.approval_timeout_secs),
                     )
                     .await
                     {
-                        ApprovalOutcome::Approved => {}
+                        ApprovalOutcome::Approved => "approved",
                         ApprovalOutcome::Denied => {
                             denied_reason = Some("The user denied this tool call.".to_string());
+                            "denied"
                         }
                         ApprovalOutcome::TimedOut => {
                             denied_reason = Some("The approval request timed out.".to_string());
                             let _ = engine.resolve_approval(&approval.id, false).await;
+                            "timed_out"
                         }
                         ApprovalOutcome::Cancelled => {
                             let _ = engine.resolve_approval(&approval.id, false).await;
+                            journal
+                                .approval_completed(engine, &approval_step, "cancelled")
+                                .await?;
                             return Ok(LoopOutcome::Cancelled);
                         }
-                    }
+                    };
+                    journal
+                        .approval_completed(engine, &approval_step, outcome)
+                        .await?;
                 }
                 ApprovalDecision::Deny { risk, reason } => {
                     emit(
@@ -10176,7 +10866,9 @@ async fn run_loop_body(
             let skill_denied = active_skill
                 .as_ref()
                 .filter(|skill| !skill_allows_tool(skill, &call.name));
-            let output = if let Some(reason) = denied_reason {
+            let output = if let Some(output) = duplicate {
+                output
+            } else if let Some(reason) = denied_reason {
                 ToolOutput::error(reason)
             } else if let Some(skill) = skill_denied {
                 ToolOutput::error(format!(
@@ -10536,6 +11228,9 @@ async fn run_loop_body(
                 let (item, receiver) = engine
                     .request_question(&session.id, &spec.id, &spec.name, question, options)
                     .await?;
+                let question_step = journal
+                    .question_intent(engine, turn + 1, &item.id, &item.question, &item.options)
+                    .await?;
                 engine
                     .update_session_status(&session.id, "waiting_input")
                     .await?;
@@ -10556,17 +11251,26 @@ async fn run_loop_body(
                 .await?;
                 match wait_for_question(receiver, control, config.question_timeout_secs).await {
                     QuestionOutcome::Answered(answer) => {
+                        journal
+                            .question_completed(engine, &question_step, "answered")
+                            .await?;
                         engine.update_session_status(&session.id, "running").await?;
                         engine.update_agent_status(&spec.id, "running").await?;
                         ToolOutput::ok(format!("User answered: {answer}"))
                     }
                     QuestionOutcome::Cancelled => {
                         let _ = engine.close_question(&item.id, "cancelled").await;
+                        journal
+                            .question_completed(engine, &question_step, "cancelled")
+                            .await?;
                         engine.update_agent_status(&spec.id, "cancelled").await?;
                         return Ok(LoopOutcome::Cancelled);
                     }
                     QuestionOutcome::TimedOut => {
                         let _ = engine.close_question(&item.id, "expired").await;
+                        journal
+                            .question_completed(engine, &question_step, "timed_out")
+                            .await?;
                         engine.update_session_status(&session.id, "running").await?;
                         engine.update_agent_status(&spec.id, "running").await?;
                         ToolOutput::error("User did not answer before the question timed out.")
@@ -10669,6 +11373,16 @@ async fn run_loop_body(
                 .await?;
                 match parse_verdict(&input) {
                     Ok(verdict) => {
+                        if let Some((journal_step, journal_tool)) = &journal_pair {
+                            journal
+                                .tool_completed(
+                                    engine,
+                                    journal_step,
+                                    journal_tool,
+                                    &ToolOutput::ok("verdict recorded"),
+                                )
+                                .await?;
+                        }
                         emit(
                             engine,
                             &session.id,
@@ -10888,6 +11602,7 @@ async fn run_loop_body(
                                     &mut child_conversation,
                                     None,
                                     false,
+                                    None,
                                 )
                                 .await;
                                 match child_result {
@@ -11092,6 +11807,11 @@ async fn run_loop_body(
                 ))
             };
 
+            if let Some((journal_step, journal_tool)) = &journal_pair {
+                journal
+                    .tool_completed(engine, journal_step, journal_tool, &output)
+                    .await?;
+            }
             emit(
                 engine,
                 &session.id,
@@ -14028,6 +14748,7 @@ async fn run_scout(
         &mut conversation,
         None,
         false,
+        None,
     )
     .await;
     let usage = scout_usage(engine, &session.id, &child.id).await;
@@ -14512,6 +15233,7 @@ async fn run_parallel_workers(
                 conversation,
                 None,
                 false,
+                None,
             )
         });
     let results = futures_util::future::join_all(futures).await;
@@ -15027,6 +15749,7 @@ async fn deliberate_team_plan(
                 conversation,
                 None,
                 false,
+                None,
             )
         });
         let results = futures_util::future::join_all(futures).await;
@@ -16129,6 +16852,7 @@ async fn execute_team_plan(
                     conversation,
                     None,
                     false,
+                    None,
                 )
             });
         let results = futures_util::future::join_all(futures).await;
@@ -16710,6 +17434,87 @@ async fn load_session_project(store: Store, session_id: &str) -> Result<(Session
 struct LoadedConversation {
     messages: Vec<ChatMessage>,
     ids: Vec<Option<String>>,
+}
+
+/// Build the active conversation from `message.created` events. This is the
+/// resume path: it deliberately does not trust a live in-memory vector or an
+/// imported archive's convenience projection.
+pub(crate) fn conversation_from_events(
+    events: &[vp_protocol::types::Event],
+    session_id: &str,
+) -> Result<(Vec<ChatMessage>, Vec<Option<String>>)> {
+    let mut stored = Vec::new();
+    let mut compaction: Option<&vp_protocol::types::Event> = None;
+    for event in events {
+        if event.session_id != session_id {
+            anyhow::bail!("event stream contains an event for another session");
+        }
+        match event.kind.as_str() {
+            "message.created" => {
+                let message: StoredMessage = serde_json::from_value(event.payload.clone())
+                    .context("decoding a durable message event")?;
+                stored.push(message);
+            }
+            "context.compacted" => {
+                compaction = Some(event);
+            }
+            _ => {}
+        }
+    }
+    let mut start = 0usize;
+    let mut summary = None;
+    if let Some(event) = compaction {
+        let mode = event
+            .payload
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("summary");
+        let through = event
+            .payload
+            .get("through_message_id")
+            .and_then(serde_json::Value::as_str);
+        let text = event
+            .payload
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty());
+        if let Some(through) = through
+            && let Some(index) = stored.iter().position(|message| message.id == through)
+        {
+            start = index.saturating_add(1);
+            if mode == "summary" {
+                summary = text.map(str::to_string);
+            }
+        }
+    }
+    let mut ids = stored
+        .iter()
+        .skip(start)
+        .map(|message| Some(message.id.clone()))
+        .collect::<Vec<_>>();
+    let mut messages = stored
+        .into_iter()
+        .skip(start)
+        .map(|message| {
+            let tool_calls: Vec<ToolCall> =
+                serde_json::from_value(message.tool_calls).unwrap_or_default();
+            ChatMessage {
+                role: message.role,
+                content: message.content,
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+                tool_call_id: message.tool_call_id,
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(summary) = summary {
+        messages.insert(0, ChatMessage::user(summary));
+        ids.insert(0, None);
+    }
+    Ok((messages, ids))
 }
 
 async fn load_conversation(engine: &Engine, session_id: &str) -> Result<LoadedConversation> {

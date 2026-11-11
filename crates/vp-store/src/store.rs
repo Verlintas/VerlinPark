@@ -20,10 +20,11 @@ use vp_protocol::types::{
     MetricCount, ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
     OrchestrationRecovery, PlanTaskProgress, Program, ProgramEvent, ProgramMilestone,
     ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget,
-    ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle,
-    SessionContinuation, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
-    SourceSearchHit, SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall,
-    TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
+    ProjectUsageSession, Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall,
+    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, SessionRun,
+    SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk, SourceCollection, SourceSearchHit,
+    SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan,
+    TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
 use vp_protocol::remote::ExecutionHost;
@@ -452,6 +453,10 @@ pub struct SessionRepair {
     pub steering: Option<Vec<SteeringMessage>>,
     pub continuations: Option<Vec<SessionContinuation>>,
     pub recoveries: Option<Vec<OrchestrationRecovery>>,
+    /// Event-backed durable run rows. `None` leaves the projection untouched.
+    pub runs: Option<Vec<SessionRun>>,
+    pub run_steps: Option<Vec<RunStep>>,
+    pub run_checkpoints: Option<Vec<RunCheckpoint>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -585,6 +590,8 @@ pub struct ProjectManifestSnapshot {
     pub budget: ProjectBudget,
     #[serde(default)]
     pub task_scheduler_policy: TaskSchedulerPolicy,
+    #[serde(default)]
+    pub session_run_policy: SessionRunPolicy,
     #[serde(default)]
     pub memory_policy: MemoryPolicy,
     #[serde(default)]
@@ -853,6 +860,42 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
     }
     for agent in &bundle.agents {
         validate_storage_id("agent", &agent.id)?;
+    }
+    let run_ids = bundle
+        .session_runs
+        .iter()
+        .map(|run| run.run_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for run in &bundle.session_runs {
+        ensure_bundle_session("run", &run.session_id, &bundle.session.id)?;
+        if run.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle run {} belongs to a different project",
+                run.run_id
+            ));
+        }
+        validate_run_status(
+            &run.status,
+            &["running", "completed", "failed", "interrupted", "resumed"],
+        )?;
+    }
+    for step in &bundle.run_steps {
+        ensure_bundle_session("run step", &step.session_id, &bundle.session.id)?;
+        if !run_ids.contains(step.run_id.as_str()) {
+            return Err(anyhow!(
+                "bundle run step {} references a missing run",
+                step.step_id
+            ));
+        }
+    }
+    for checkpoint in &bundle.run_checkpoints {
+        ensure_bundle_session("run checkpoint", &checkpoint.session_id, &bundle.session.id)?;
+        if !run_ids.contains(checkpoint.run_id.as_str()) {
+            return Err(anyhow!(
+                "bundle run checkpoint {} references a missing run",
+                checkpoint.checkpoint_id
+            ));
+        }
     }
     Ok(())
 }
@@ -1653,6 +1696,113 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_session_operations_status
                 ON session_operations(status, updated_at);
 
+            CREATE TABLE IF NOT EXISTS project_session_run_policies (
+                project_id     TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                auto_resume    INTEGER NOT NULL DEFAULT 0,
+                max_attempts   INTEGER NOT NULL DEFAULT 1,
+                max_age_hours  INTEGER NOT NULL DEFAULT 24,
+                updated_at     TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS session_runs (
+                run_id                 TEXT PRIMARY KEY,
+                session_id             TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                project_id             TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                agent_id               TEXT NOT NULL,
+                agent_name             TEXT NOT NULL DEFAULT '',
+                agent_role             TEXT NOT NULL DEFAULT '',
+                task_id                TEXT,
+                department             TEXT,
+                objective              TEXT NOT NULL DEFAULT '',
+                provider               TEXT NOT NULL DEFAULT '',
+                model                  TEXT NOT NULL DEFAULT '',
+                status                 TEXT NOT NULL,
+                attempt                INTEGER NOT NULL DEFAULT 1,
+                resumed_from_run_id    TEXT,
+                resume_root_id         TEXT NOT NULL DEFAULT '',
+                top_level              INTEGER NOT NULL DEFAULT 0,
+                started_at             TEXT NOT NULL,
+                updated_at             TEXT NOT NULL,
+                ended_at               TEXT,
+                budget_json            TEXT NOT NULL DEFAULT '{}',
+                worktree_head          TEXT NOT NULL DEFAULT '',
+                plan_revision          INTEGER NOT NULL DEFAULT 0,
+                last_event_seq         INTEGER NOT NULL DEFAULT 0,
+                failure_json           TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_runs_session
+                ON session_runs(session_id, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_session_runs_status
+                ON session_runs(status, started_at);
+            CREATE INDEX IF NOT EXISTS idx_session_runs_root
+                ON session_runs(resume_root_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_session_runs_resumable
+                ON session_runs(top_level, status, started_at);
+
+            CREATE TABLE IF NOT EXISTS run_steps (
+                step_id      TEXT PRIMARY KEY,
+                run_id       TEXT NOT NULL REFERENCES session_runs(run_id) ON DELETE CASCADE,
+                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq          INTEGER NOT NULL,
+                turn         INTEGER NOT NULL DEFAULT 0,
+                kind         TEXT NOT NULL,
+                status       TEXT NOT NULL,
+                input_hash   TEXT NOT NULL DEFAULT '',
+                output_hash  TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                UNIQUE (run_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_run_steps_run
+                ON run_steps(run_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_run_steps_session
+                ON run_steps(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS run_tool_calls (
+                run_id             TEXT NOT NULL REFERENCES session_runs(run_id) ON DELETE CASCADE,
+                session_id         TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                step_id            TEXT NOT NULL,
+                tool_call_id       TEXT NOT NULL,
+                tool_name          TEXT NOT NULL,
+                input_fingerprint  TEXT NOT NULL,
+                status             TEXT NOT NULL,
+                result_json        TEXT,
+                error              TEXT,
+                consumed_by_run_id TEXT,
+                consumed_at        TEXT,
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL,
+                PRIMARY KEY (run_id, tool_call_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_run_tool_calls_session
+                ON run_tool_calls(session_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_run_tool_calls_match
+                ON run_tool_calls(tool_name, input_fingerprint, status);
+            CREATE INDEX IF NOT EXISTS idx_run_tool_calls_step
+                ON run_tool_calls(run_id, step_id);
+
+            CREATE TABLE IF NOT EXISTS run_checkpoints (
+                checkpoint_id  TEXT PRIMARY KEY,
+                run_id         TEXT NOT NULL REFERENCES session_runs(run_id) ON DELETE CASCADE,
+                session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq            INTEGER NOT NULL,
+                turn           INTEGER NOT NULL DEFAULT 0,
+                message_cursor INTEGER NOT NULL DEFAULT 0,
+                event_cursor   INTEGER NOT NULL DEFAULT 0,
+                budget_json    TEXT NOT NULL DEFAULT '{}',
+                worktree_head  TEXT NOT NULL DEFAULT '',
+                plan_revision  INTEGER NOT NULL DEFAULT 0,
+                created_at     TEXT NOT NULL,
+                UNIQUE (run_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_run_checkpoints_run
+                ON run_checkpoints(run_id, seq);
+
             CREATE TABLE IF NOT EXISTS session_continuations (
                 id              TEXT PRIMARY KEY,
                 session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -2238,6 +2388,7 @@ impl Store {
                 checkpoint_policy: self.get_checkpoint_policy(&project.id)?,
                 budget: self.get_project_budget(&project.id)?,
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
+                session_run_policy: self.get_session_run_policy(&project.id)?,
                 memory_policy: self.get_memory_policy(&project.id)?,
                 orchestration_policy: self.get_orchestration_policy(&project.id)?,
                 approval_grants: self.list_approval_grants(&project.id)?,
@@ -10071,6 +10222,884 @@ impl Store {
         Ok(changed)
     }
 
+    pub fn get_session_run_policy(&self, project_id: &str) -> Result<SessionRunPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT auto_resume, max_attempts, max_age_hours
+                 FROM project_session_run_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(SessionRunPolicy {
+                        auto_resume: row.get::<_, i64>(0)? != 0,
+                        max_attempts: row.get::<_, i64>(1)?.clamp(1, 3) as u32,
+                        max_age_hours: row.get::<_, i64>(2)?.clamp(1, 168) as u32,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn has_session_run_policy(&self, project_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM project_session_run_policies WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn set_session_run_policy(
+        &self,
+        project_id: &str,
+        policy: &SessionRunPolicy,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_session_run_policies
+             (project_id, auto_resume, max_attempts, max_age_hours, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id) DO UPDATE SET
+                auto_resume = excluded.auto_resume,
+                max_attempts = excluded.max_attempts,
+                max_age_hours = excluded.max_age_hours,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                if policy.auto_resume { 1 } else { 0 },
+                policy.max_attempts.clamp(1, 3) as i64,
+                policy.max_age_hours.clamp(1, 168) as i64,
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a run row and its `session.run.started` event atomically.
+    pub fn start_session_run(&self, run: &SessionRun) -> Result<(SessionRun, Event)> {
+        validate_run_status(&run.status, &["running"])?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let project_id: String = tx
+            .query_row(
+                "SELECT project_id FROM sessions WHERE id = ?1",
+                params![run.session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("session not found: {}", run.session_id))?;
+        if project_id != run.project_id {
+            return Err(anyhow!(
+                "run project {} does not match session project {project_id}",
+                run.project_id
+            ));
+        }
+        let event_seq = next_event_seq_tx(&tx, &run.session_id)?;
+        let mut stored = run.clone();
+        stored.last_event_seq = event_seq;
+        insert_session_run_tx(&tx, &stored)?;
+        let event = insert_event_tx(
+            &tx,
+            &stored.session_id,
+            "session.run.started",
+            serde_json::json!({"run": serde_json::to_value(&stored)?}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((stored, event))
+    }
+
+    /// Record a checkpoint at a safe turn boundary. The cursor values are the
+    /// durable event sequence and message-event count observed by the caller
+    /// immediately before the checkpoint event was appended.
+    pub fn record_run_checkpoint(
+        &self,
+        checkpoint: &RunCheckpoint,
+    ) -> Result<(RunCheckpoint, Event)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut stored = checkpoint.clone();
+        if stored.seq == 0 {
+            stored.seq = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_checkpoints WHERE run_id = ?1",
+                params![stored.run_id],
+                |row| row.get::<_, i64>(0),
+            )? as u64;
+        }
+        let event_seq = next_event_seq_tx(&tx, &stored.session_id)?;
+        tx.execute(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, session_id, seq, turn, message_cursor, event_cursor,
+              budget_json, worktree_head, plan_revision, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                stored.checkpoint_id,
+                stored.run_id,
+                stored.session_id,
+                stored.seq as i64,
+                i64::from(stored.turn),
+                stored.message_cursor as i64,
+                stored.event_cursor as i64,
+                serde_json::to_string(&stored.budget)?,
+                stored.worktree_head,
+                i64::from(stored.plan_revision),
+                stored.created_at
+            ],
+        )?;
+        tx.execute(
+            "UPDATE session_runs SET last_event_seq = ?2 WHERE run_id = ?1",
+            params![stored.run_id, event_seq as i64],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &stored.session_id,
+            "session.run.checkpointed",
+            serde_json::json!({"checkpoint": serde_json::to_value(&stored)?}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((stored, event))
+    }
+
+    /// Insert a step intent and, for a tool call, its operational tool-call row.
+    /// Both journal events commit in the same transaction.
+    pub fn record_run_step_intent(
+        &self,
+        step: &RunStep,
+        tool: Option<&RunToolCall>,
+    ) -> Result<(RunStep, Vec<Event>)> {
+        validate_step_status(&step.status, &["intent"])?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut stored = step.clone();
+        if stored.seq == 0 {
+            stored.seq = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_steps WHERE run_id = ?1",
+                params![stored.run_id],
+                |row| row.get::<_, i64>(0),
+            )? as u64;
+        }
+        insert_run_step_tx(&tx, &stored)?;
+        if let Some(tool) = tool
+            && (tool.step_id != stored.step_id || tool.run_id != stored.run_id)
+        {
+            return Err(anyhow!("tool call does not match its step intent"));
+        }
+        let step_event = insert_event_tx(
+            &tx,
+            &stored.session_id,
+            "session.run.step_intent",
+            serde_json::json!({"step": serde_json::to_value(&stored)?}),
+        )?;
+        let mut events = vec![step_event];
+        if let Some(tool) = tool {
+            insert_run_tool_call_tx(&tx, tool)?;
+            events.push(insert_event_tx(
+                &tx,
+                &stored.session_id,
+                "session.run.tool_intent",
+                serde_json::json!({"tool": serde_json::to_value(tool)?}),
+            )?);
+        }
+        let last_seq = events.last().map(|event| event.seq).unwrap_or(0);
+        tx.execute(
+            "UPDATE session_runs SET last_event_seq = ?2 WHERE run_id = ?1",
+            params![stored.run_id, last_seq as i64],
+        )?;
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((stored, events))
+    }
+
+    /// Complete or fail a step. For a tool step the operational tool row is
+    /// updated in the same transaction and a bounded result/error is attached.
+    pub fn record_run_step_completed(
+        &self,
+        step: &RunStep,
+        tool: Option<&RunToolCall>,
+    ) -> Result<(RunStep, Option<RunToolCall>, Vec<Event>)> {
+        validate_step_status(&step.status, &["completed", "failed", "unknown"])?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE run_steps
+             SET status = ?2, input_hash = ?3, output_hash = ?4, payload_json = ?5,
+                 updated_at = ?6
+             WHERE step_id = ?1",
+            params![
+                step.step_id,
+                step.status,
+                step.input_hash,
+                step.output_hash,
+                serde_json::to_string(&step.payload)?,
+                step.updated_at
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("run step not found: {}", step.step_id));
+        }
+        let mut events = vec![insert_event_tx(
+            &tx,
+            &step.session_id,
+            "session.run.step_completed",
+            serde_json::json!({"step": serde_json::to_value(step)?}),
+        )?];
+        let mut stored_tool = None;
+        if let Some(tool) = tool {
+            let changed = tx.execute(
+                "UPDATE run_tool_calls
+                 SET status = ?3, result_json = ?4, error = ?5, updated_at = ?6
+                 WHERE run_id = ?1 AND tool_call_id = ?2",
+                params![
+                    tool.run_id,
+                    tool.tool_call_id,
+                    tool.status,
+                    tool.result
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    tool.error,
+                    tool.updated_at
+                ],
+            )?;
+            if changed == 0 {
+                return Err(anyhow!(
+                    "run tool call not found: {} / {}",
+                    tool.run_id,
+                    tool.tool_call_id
+                ));
+            }
+            events.push(insert_event_tx(
+                &tx,
+                &step.session_id,
+                "session.run.tool_completed",
+                serde_json::json!({"tool": serde_json::to_value(tool)?}),
+            )?);
+            stored_tool = Some(tool.clone());
+        }
+        let last_seq = events.last().map(|event| event.seq).unwrap_or(0);
+        tx.execute(
+            "UPDATE session_runs SET last_event_seq = ?2 WHERE run_id = ?1",
+            params![step.run_id, last_seq as i64],
+        )?;
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((step.clone(), stored_tool, events))
+    }
+
+    /// Finish a run. `completed`, `failed`, and `interrupted` are the only
+    /// terminal statuses; cancellation is recorded as `interrupted` with a
+    /// `cancelled` failure kind so it cannot be resumed implicitly.
+    pub fn finish_session_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        failure: Option<&vp_protocol::types::RunFailure>,
+    ) -> Result<(SessionRun, Event)> {
+        validate_run_status(status, &["completed", "failed", "interrupted"])?;
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let session_id: String = tx
+            .query_row(
+                "SELECT session_id FROM session_runs WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        let event_seq = next_event_seq_tx(&tx, &session_id)?;
+        let changed = tx.execute(
+            "UPDATE session_runs
+             SET status = ?2, failure_json = ?3, ended_at = ?4, updated_at = ?4,
+                 last_event_seq = ?5
+             WHERE run_id = ?1 AND status = 'running'",
+            params![
+                run_id,
+                status,
+                failure.map(serde_json::to_string).transpose()?,
+                now,
+                event_seq as i64
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!(
+                "run {run_id} is not running; terminal status cannot be overwritten"
+            ));
+        }
+        if status != "completed" {
+            // A replay claim is only final once the resumed attempt completed.
+            // If it failed or was interrupted, release the claim so the next
+            // attempt can return the journaled result instead of re-running a
+            // write whose result never reached the persisted conversation.
+            tx.execute(
+                "UPDATE run_tool_calls
+                 SET consumed_by_run_id = NULL, consumed_at = NULL, updated_at = ?2
+                 WHERE consumed_by_run_id = ?1",
+                params![run_id, now],
+            )?;
+        }
+        let run = load_session_run_tx(&tx, run_id)?;
+        let (kind, payload) = match status {
+            "completed" => (
+                "session.run.completed",
+                serde_json::json!({"run": serde_json::to_value(&run)?}),
+            ),
+            "failed" => (
+                "session.run.failed",
+                serde_json::json!({"run": serde_json::to_value(&run)?}),
+            ),
+            _ => (
+                "session.run.interrupted",
+                serde_json::json!({"run": serde_json::to_value(&run)?}),
+            ),
+        };
+        let event = insert_event_tx(&tx, &session_id, kind, payload)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((run, event))
+    }
+
+    /// Mark the previous run `resumed` and insert the linked new attempt in one
+    /// transaction, emitting both `session.run.resumed` and
+    /// `session.run.started`.
+    pub fn mark_session_run_resumed(
+        &self,
+        previous_run_id: &str,
+        new_run: &SessionRun,
+    ) -> Result<(SessionRun, Event, Event)> {
+        validate_run_status(&new_run.status, &["running"])?;
+        if new_run.resumed_from_run_id.as_deref() != Some(previous_run_id) {
+            return Err(anyhow!(
+                "resumed run must point at {previous_run_id} as its source"
+            ));
+        }
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let previous = load_session_run_tx(&tx, previous_run_id)?;
+        if !matches!(previous.status.as_str(), "interrupted" | "failed") {
+            return Err(anyhow!(
+                "run {previous_run_id} is {} and cannot be resumed",
+                previous.status
+            ));
+        }
+        if previous
+            .failure
+            .as_ref()
+            .is_some_and(|failure| matches!(failure.kind.as_str(), "cancelled" | "superseded"))
+        {
+            return Err(anyhow!(
+                "run {previous_run_id} is {} and cannot be resumed",
+                previous
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.kind.as_str())
+                    .unwrap_or("cancelled")
+            ));
+        }
+        if previous.session_id != new_run.session_id {
+            return Err(anyhow!("resumed run belongs to a different session"));
+        }
+        let resumed_seq = next_event_seq_tx(&tx, &new_run.session_id)?;
+        let started_seq = resumed_seq.saturating_add(1);
+        tx.execute(
+            "UPDATE session_runs
+             SET status = 'resumed', updated_at = ?2, last_event_seq = ?3
+             WHERE run_id = ?1",
+            params![previous_run_id, now, resumed_seq as i64],
+        )?;
+        let mut stored_new = new_run.clone();
+        stored_new.last_event_seq = started_seq;
+        insert_session_run_tx(&tx, &stored_new)?;
+        let previous = load_session_run_tx(&tx, previous_run_id)?;
+        let resumed = insert_event_tx(
+            &tx,
+            &new_run.session_id,
+            "session.run.resumed",
+            serde_json::json!({
+                "previous_run": previous,
+                "run_id": stored_new.run_id,
+                "attempt": stored_new.attempt,
+            }),
+        )?;
+        let started = insert_event_tx(
+            &tx,
+            &new_run.session_id,
+            "session.run.started",
+            serde_json::json!({"run": stored_new}),
+        )?;
+        tx.commit()?;
+        for event in [&resumed, &started] {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((previous, resumed, started))
+    }
+
+    /// A new top-level prompt is an explicit abandonment of older unresolved
+    /// attempts in the same session. They are not deleted (their journal stays
+    /// inspectable); their failure kind becomes `superseded`, which resume
+    /// preflight refuses. Status is preserved so replay remains truthful about
+    /// whether the prior attempt was interrupted or failed.
+    pub fn supersede_resumable_session_runs(
+        &self,
+        session_id: &str,
+        new_run_id: &str,
+    ) -> Result<Vec<Event>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT run_id, status, failure_json FROM session_runs
+             WHERE session_id = ?1 AND top_level = 1
+               AND status IN ('interrupted', 'failed')
+             ORDER BY started_at ASC, run_id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut events = Vec::new();
+        for (run_id, status, failure_json) in rows {
+            let failure = failure_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<vp_protocol::types::RunFailure>(json).ok());
+            if failure
+                .as_ref()
+                .is_some_and(|failure| matches!(failure.kind.as_str(), "cancelled" | "superseded"))
+            {
+                continue;
+            }
+            let previous_kind = failure
+                .as_ref()
+                .map(|failure| failure.kind.as_str())
+                .unwrap_or("interrupted");
+            let superseded = serde_json::to_string(&vp_protocol::types::RunFailure {
+                kind: "superseded".to_string(),
+                message: format!(
+                    "superseded by new prompt run {new_run_id} (previous failure: {previous_kind})"
+                ),
+            })?;
+            let event_seq = next_event_seq_tx(&tx, session_id)?;
+            tx.execute(
+                "UPDATE session_runs
+                 SET failure_json = ?2, updated_at = ?3, last_event_seq = ?4
+                 WHERE run_id = ?1 AND status = ?5",
+                params![run_id, superseded, now, event_seq as i64, status],
+            )?;
+            let run = load_session_run_tx(&tx, &run_id)?;
+            let kind = if status == "failed" {
+                "session.run.failed"
+            } else {
+                "session.run.interrupted"
+            };
+            events.push(insert_event_tx(
+                &tx,
+                session_id,
+                kind,
+                serde_json::json!({"run": run}),
+            )?);
+        }
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok(events)
+    }
+
+    /// Startup recovery. Every `running` run becomes `interrupted`; tool-call
+    /// intents become `unknown` because the process cannot know whether the
+    /// side effect landed. Model-step intents stay `intent` and are labeled
+    /// retryable by the resume classifier.
+    pub fn interrupt_running_session_runs(&self) -> Result<(Vec<SessionRun>, Vec<Event>)> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT run_id FROM session_runs WHERE status = 'running' ORDER BY started_at ASC, run_id ASC",
+        )?;
+        let run_ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut cancel_stmt =
+            tx.prepare("SELECT payload FROM events WHERE type = 'session.run.cancel_requested'")?;
+        let cancelled_runs = cancel_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .filter_map(|payload| {
+                serde_json::from_str::<serde_json::Value>(&payload)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("run_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
+            .collect::<std::collections::HashSet<_>>();
+        drop(cancel_stmt);
+        tx.execute(
+            "UPDATE run_tool_calls
+             SET status = 'unknown', error = COALESCE(error, 'daemon stopped before the tool outcome was committed'),
+                 consumed_by_run_id = NULL, consumed_at = NULL, updated_at = ?1
+             WHERE status = 'intent'",
+            params![now],
+        )?;
+        tx.execute(
+            "UPDATE run_tool_calls
+             SET consumed_by_run_id = NULL, consumed_at = NULL, updated_at = ?1
+             WHERE consumed_by_run_id IS NOT NULL",
+            params![now],
+        )?;
+        let mut runs = Vec::new();
+        let mut events = Vec::new();
+        for run_id in run_ids {
+            let session_id: String = tx.query_row(
+                "SELECT session_id FROM session_runs WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )?;
+            let (kind, message) = if cancelled_runs.contains(&run_id) {
+                (
+                    "cancelled",
+                    "the operator requested cancellation before the daemon restarted",
+                )
+            } else {
+                (
+                    "interrupted",
+                    "the daemon restarted while this run was active",
+                )
+            };
+            let failure = serde_json::to_string(&vp_protocol::types::RunFailure {
+                kind: kind.to_string(),
+                message: message.to_string(),
+            })?;
+            let event_seq = next_event_seq_tx(&tx, &session_id)?;
+            tx.execute(
+                "UPDATE session_runs
+                 SET status = 'interrupted', failure_json = ?2, ended_at = ?3, updated_at = ?3,
+                     last_event_seq = ?4
+                 WHERE run_id = ?1 AND status = 'running'",
+                params![run_id, failure, now, event_seq as i64],
+            )?;
+            let run = load_session_run_tx(&tx, &run_id)?;
+            events.push(insert_event_tx(
+                &tx,
+                &run.session_id,
+                "session.run.interrupted",
+                serde_json::json!({"run": serde_json::to_value(&run)?}),
+            )?);
+            runs.push(run);
+        }
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((runs, events))
+    }
+
+    /// Latest event sequence and the number of persisted `message.created`
+    /// events. Checkpoints store these cursors without reading the message or
+    /// event bodies into memory.
+    pub fn session_has_imported_event(&self, session_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND type IN ('session.imported', 'session.rehydrated')",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn plan_revision_count(&self, session_id: &str) -> Result<u32> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE session_id = ?1 AND type IN ('team_plan.submitted', 'team_plan.revised')",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.clamp(0, i64::from(u32::MAX)) as u32)
+    }
+
+    pub fn journal_cursors(&self, session_id: &str) -> Result<(u64, u64)> {
+        let conn = self.lock()?;
+        let (event_cursor, message_cursor) = conn.query_row(
+            "SELECT COALESCE((SELECT MAX(seq) FROM events WHERE session_id = ?1), 0),
+                    COALESCE((SELECT COUNT(*) FROM messages WHERE session_id = ?1), 0)",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            },
+        )?;
+        Ok((event_cursor, message_cursor))
+    }
+
+    pub fn list_all_session_runs(&self, session_id: &str) -> Result<Vec<SessionRun>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
+                    department, objective, provider, model, status, attempt, resumed_from_run_id,
+                    resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
+                    worktree_head, plan_revision, last_event_seq, failure_json
+             FROM session_runs WHERE session_id = ?1
+             ORDER BY started_at ASC, run_id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], map_session_run)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_session_runs(&self, session_id: &str, limit: u32) -> Result<Vec<SessionRun>> {
+        let limit = limit.clamp(1, 500) as i64;
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
+                    department, objective, provider, model, status, attempt, resumed_from_run_id,
+                    resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
+                    worktree_head, plan_revision, last_event_seq, failure_json
+             FROM session_runs WHERE session_id = ?1
+             ORDER BY started_at DESC, run_id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], map_session_run)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_resumable_session_runs(&self, limit: u32) -> Result<Vec<SessionRun>> {
+        let limit = limit.clamp(1, 500) as i64;
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
+                    department, objective, provider, model, status, attempt, resumed_from_run_id,
+                    resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
+                    worktree_head, plan_revision, last_event_seq, failure_json
+             FROM session_runs
+             WHERE top_level = 1 AND status IN ('interrupted', 'failed')
+               AND (failure_json IS NULL
+                    OR (failure_json NOT LIKE '%\"kind\":\"cancelled\"%'
+                        AND failure_json NOT LIKE '%\"kind\":\"superseded\"%'))
+             ORDER BY started_at DESC, run_id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], map_session_run)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_session_run(&self, run_id: &str) -> Result<Option<SessionRun>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
+                    department, objective, provider, model, status, attempt, resumed_from_run_id,
+                    resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
+                    worktree_head, plan_revision, last_event_seq, failure_json
+             FROM session_runs WHERE run_id = ?1",
+            params![run_id],
+            map_session_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_run_steps(&self, run_id: &str) -> Result<Vec<RunStep>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT step_id, run_id, session_id, seq, turn, kind, status, input_hash,
+                    output_hash, payload_json, created_at, updated_at
+             FROM run_steps WHERE run_id = ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id], map_run_step)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_run_tool_calls(&self, run_id: &str) -> Result<Vec<RunToolCall>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, session_id, step_id, tool_call_id, tool_name, input_fingerprint,
+                    status, result_json, error, consumed_by_run_id, consumed_at, created_at,
+                    updated_at
+             FROM run_tool_calls WHERE run_id = ?1 ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id], map_run_tool_call)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_run_checkpoints(&self, run_id: &str) -> Result<Vec<RunCheckpoint>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT checkpoint_id, run_id, session_id, seq, turn, message_cursor, event_cursor,
+                    budget_json, worktree_head, plan_revision, created_at
+             FROM run_checkpoints WHERE run_id = ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id], map_run_checkpoint)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_session_run_steps(&self, session_id: &str) -> Result<Vec<RunStep>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT step_id, run_id, session_id, seq, turn, kind, status, input_hash,
+                    output_hash, payload_json, created_at, updated_at
+             FROM run_steps WHERE session_id = ?1 ORDER BY run_id ASC, seq ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], map_run_step)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_lineage_run_checkpoints(&self, run_id: &str) -> Result<Vec<RunCheckpoint>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT c.checkpoint_id, c.run_id, c.session_id, c.seq, c.turn,
+                    c.message_cursor, c.event_cursor, c.budget_json, c.worktree_head,
+                    c.plan_revision, c.created_at
+             FROM run_checkpoints c
+             JOIN session_runs r ON r.run_id = c.run_id
+             WHERE COALESCE(NULLIF(r.resume_root_id, ''), r.run_id) = (
+                 SELECT COALESCE(NULLIF(resume_root_id, ''), run_id)
+                 FROM session_runs WHERE run_id = ?1
+             )
+             ORDER BY c.created_at ASC, c.run_id ASC, c.seq ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id], map_run_checkpoint)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_session_run_checkpoints(&self, session_id: &str) -> Result<Vec<RunCheckpoint>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT checkpoint_id, run_id, session_id, seq, turn, message_cursor, event_cursor,
+                    budget_json, worktree_head, plan_revision, created_at
+             FROM run_checkpoints WHERE session_id = ?1 ORDER BY run_id ASC, seq ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], map_run_checkpoint)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Every tool row in the resume lineage whose root is the root of
+    /// `run_id`. Used to build the bounded journal note and the duplicate-write
+    /// gate. Results are newest-first but the caller re-orders for display.
+    pub fn list_run_lineage_tool_calls(&self, run_id: &str) -> Result<Vec<RunToolCall>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT tc.run_id, tc.session_id, tc.step_id, tc.tool_call_id, tc.tool_name,
+                    tc.input_fingerprint, tc.status, tc.result_json, tc.error,
+                    tc.consumed_by_run_id, tc.consumed_at, tc.created_at, tc.updated_at
+             FROM run_tool_calls tc
+             JOIN session_runs r ON r.run_id = tc.run_id
+             WHERE COALESCE(NULLIF(r.resume_root_id, ''), r.run_id) = (
+                 SELECT COALESCE(NULLIF(resume_root_id, ''), run_id)
+                 FROM session_runs WHERE run_id = ?1
+             )
+             ORDER BY tc.created_at ASC, tc.rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id], map_run_tool_call)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Consume one completed journaled tool result for a resumed attempt.
+    /// The compare-and-set on `consumed_by_run_id IS NULL` makes this
+    /// consume-once across concurrent/duplicate calls: a second identical call
+    /// in the same attempt will not short-circuit on the same row again.
+    pub fn claim_completed_tool_result(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        input_fingerprint: &str,
+        new_run_id: &str,
+    ) -> Result<Option<RunToolCall>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let candidate: Option<i64> = tx
+            .query_row(
+                "SELECT tc.rowid
+                 FROM run_tool_calls tc
+                 JOIN session_runs r ON r.run_id = tc.run_id
+                 WHERE COALESCE(NULLIF(r.resume_root_id, ''), r.run_id) = (
+                     SELECT COALESCE(NULLIF(resume_root_id, ''), run_id)
+                     FROM session_runs WHERE run_id = ?1
+                 )
+                   AND tc.run_id <> ?4
+                   AND tc.status = 'completed'
+                   AND tc.tool_name = ?2
+                   AND tc.input_fingerprint = ?3
+                   AND tc.consumed_by_run_id IS NULL
+                 ORDER BY tc.created_at ASC, tc.rowid ASC
+                 LIMIT 1",
+                params![run_id, tool_name, input_fingerprint, new_run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(rowid) = candidate else {
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE run_tool_calls
+             SET consumed_by_run_id = ?2, consumed_at = ?3, updated_at = ?3
+             WHERE rowid = ?1 AND consumed_by_run_id IS NULL",
+            params![rowid, new_run_id, now],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let tool = tx.query_row(
+            "SELECT run_id, session_id, step_id, tool_call_id, tool_name, input_fingerprint,
+                    status, result_json, error, consumed_by_run_id, consumed_at, created_at,
+                    updated_at
+             FROM run_tool_calls WHERE rowid = ?1",
+            params![rowid],
+            map_run_tool_call,
+        )?;
+        tx.commit()?;
+        Ok(Some(tool))
+    }
+
+    /// Replace event-backed run/step/checkpoint projections from replay.
+    /// Operational tool-call rows are preserved; a run that still has tool
+    /// rows is never dropped just because it is absent from the expected set.
+    pub fn replace_run_journal_projections(
+        &self,
+        session_id: &str,
+        runs: &[SessionRun],
+        steps: &[RunStep],
+        checkpoints: &[RunCheckpoint],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        replace_run_journal_projections_tx(&tx, session_id, runs, steps, checkpoints)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Persist an operator steering request and its creation event in one
     /// transaction. The engine validates the target run before calling this.
     pub fn create_steering_with_event(
@@ -13347,13 +14376,38 @@ impl Store {
         let sessions = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM sessions
-                 WHERE status IN ('running', 'paused', 'waiting_input')",
+                 WHERE status IN ('running', 'paused', 'waiting_input')
+                    OR (status = 'queued' AND (
+                        EXISTS (
+                            SELECT 1 FROM session_runs r
+                            WHERE r.session_id = sessions.id AND r.status = 'running'
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM events e
+                            WHERE e.session_id = sessions.id
+                              AND e.type = 'agent.queued'
+                              AND e.payload LIKE '%\"resumed_run_id\"%'
+                        )
+                    ))",
             )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
-            "UPDATE sessions SET status = 'failed' WHERE status IN ('running', 'paused', 'waiting_input')",
+            "UPDATE sessions SET status = 'failed'
+             WHERE status IN ('running', 'paused', 'waiting_input')
+                OR (status = 'queued' AND (
+                    EXISTS (
+                        SELECT 1 FROM session_runs r
+                        WHERE r.session_id = sessions.id AND r.status = 'running'
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM events e
+                        WHERE e.session_id = sessions.id
+                          AND e.type = 'agent.queued'
+                          AND e.payload LIKE '%\"resumed_run_id\"%'
+                    )
+                ))",
             [],
         )?;
         let agents = {
@@ -13937,6 +14991,15 @@ impl Store {
                 )?;
             }
         }
+        if let Some(runs) = &repair.runs {
+            replace_run_journal_projections_tx(
+                &tx,
+                session_id,
+                runs,
+                repair.run_steps.as_deref().unwrap_or(&[]),
+                repair.run_checkpoints.as_deref().unwrap_or(&[]),
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -14444,6 +15507,13 @@ impl Store {
             // spend even though imported sessions are read-only archives.
             Self::rebuild_program_session_links_tx(&tx, &archived.id)?;
         }
+        replace_run_journal_projections_tx(
+            &tx,
+            &bundle.session.id,
+            &bundle.session_runs,
+            &bundle.run_steps,
+            &bundle.run_checkpoints,
+        )?;
         let status_event = insert_event_tx(
             &tx,
             &bundle.session.id,
@@ -14496,6 +15566,13 @@ impl Store {
                 continue;
             }
             let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            // A durable resume already created its linked run row. Re-running
+            // the queued journal note as a plain prompt would bypass the
+            // duplicate-write gate; startup recovery marks that session failed
+            // and leaves it to the explicit/opt-in resume path.
+            if payload.get("resumed_run_id").is_some() {
+                continue;
+            }
             if let Some(prompt) = payload.get("prompt").and_then(serde_json::Value::as_str)
                 && !prompt.trim().is_empty()
             {
@@ -15212,17 +16289,381 @@ pub(crate) fn steering_content(message: &SteeringMessage) -> String {
     format!("[Operator steering #{}] {}", message.id, message.body)
 }
 
+fn replace_run_journal_projections_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    runs: &[SessionRun],
+    steps: &[RunStep],
+    checkpoints: &[RunCheckpoint],
+) -> Result<()> {
+    for run in runs {
+        if run.session_id != session_id {
+            return Err(anyhow!("run {} belongs to a different session", run.run_id));
+        }
+        tx.execute(
+            "INSERT INTO session_runs
+             (run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
+              department, objective, provider, model, status, attempt, resumed_from_run_id,
+              resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
+              worktree_head, plan_revision, last_event_seq, failure_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+             ON CONFLICT(run_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                project_id = excluded.project_id,
+                agent_id = excluded.agent_id,
+                agent_name = excluded.agent_name,
+                agent_role = excluded.agent_role,
+                task_id = excluded.task_id,
+                department = excluded.department,
+                objective = excluded.objective,
+                provider = excluded.provider,
+                model = excluded.model,
+                status = excluded.status,
+                attempt = excluded.attempt,
+                resumed_from_run_id = excluded.resumed_from_run_id,
+                resume_root_id = excluded.resume_root_id,
+                top_level = excluded.top_level,
+                started_at = excluded.started_at,
+                updated_at = excluded.updated_at,
+                ended_at = excluded.ended_at,
+                budget_json = excluded.budget_json,
+                worktree_head = excluded.worktree_head,
+                plan_revision = excluded.plan_revision,
+                last_event_seq = excluded.last_event_seq,
+                failure_json = excluded.failure_json",
+            params![
+                run.run_id,
+                run.session_id,
+                run.project_id,
+                run.agent_id,
+                run.agent_name,
+                run.agent_role,
+                run.task_id,
+                run.department,
+                run.objective,
+                run.provider,
+                run.model,
+                run.status,
+                i64::from(run.attempt),
+                run.resumed_from_run_id,
+                run.resume_root_id,
+                if run.top_level { 1 } else { 0 },
+                run.started_at,
+                run.updated_at,
+                run.ended_at,
+                serde_json::to_string(&run.budget)?,
+                run.worktree_head,
+                i64::from(run.plan_revision),
+                run.last_event_seq as i64,
+                run.failure
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?
+            ],
+        )?;
+    }
+    let run_ids = runs
+        .iter()
+        .map(|run| run.run_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut stmt = tx.prepare("SELECT run_id FROM session_runs WHERE session_id = ?1")?;
+    let projected = stmt
+        .query_map(params![session_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for run_id in projected {
+        if run_ids.contains(&run_id) {
+            continue;
+        }
+        let has_tools: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_tool_calls WHERE run_id = ?1)",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        if !has_tools {
+            tx.execute(
+                "DELETE FROM session_runs WHERE run_id = ?1",
+                params![run_id],
+            )?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM run_steps WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    for step in steps {
+        if step.session_id != session_id {
+            return Err(anyhow!(
+                "run step {} belongs to a different session",
+                step.step_id
+            ));
+        }
+        insert_run_step_tx(tx, step)?;
+    }
+    tx.execute(
+        "DELETE FROM run_checkpoints WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    for checkpoint in checkpoints {
+        if checkpoint.session_id != session_id {
+            return Err(anyhow!(
+                "run checkpoint {} belongs to a different session",
+                checkpoint.checkpoint_id
+            ));
+        }
+        tx.execute(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, session_id, seq, turn, message_cursor, event_cursor,
+              budget_json, worktree_head, plan_revision, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                checkpoint.checkpoint_id,
+                checkpoint.run_id,
+                checkpoint.session_id,
+                checkpoint.seq as i64,
+                i64::from(checkpoint.turn),
+                checkpoint.message_cursor as i64,
+                checkpoint.event_cursor as i64,
+                serde_json::to_string(&checkpoint.budget)?,
+                checkpoint.worktree_head,
+                i64::from(checkpoint.plan_revision),
+                checkpoint.created_at
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn next_event_seq_tx(tx: &Transaction<'_>, session_id: &str) -> Result<u64> {
+    Ok(tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn validate_run_status(status: &str, allowed: &[&str]) -> Result<()> {
+    if !allowed.contains(&status) {
+        return Err(anyhow!(
+            "invalid run status {status}; expected {}",
+            allowed.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn validate_step_status(status: &str, allowed: &[&str]) -> Result<()> {
+    if !allowed.contains(&status) {
+        return Err(anyhow!(
+            "invalid run step status {status}; expected {}",
+            allowed.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn insert_session_run_tx(tx: &Transaction<'_>, run: &SessionRun) -> Result<()> {
+    tx.execute(
+        "INSERT INTO session_runs
+         (run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
+          department, objective, provider, model, status, attempt, resumed_from_run_id,
+          resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
+          worktree_head, plan_revision, last_event_seq, failure_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+        params![
+            run.run_id,
+            run.session_id,
+            run.project_id,
+            run.agent_id,
+            run.agent_name,
+            run.agent_role,
+            run.task_id,
+            run.department,
+            run.objective,
+            run.provider,
+            run.model,
+            run.status,
+            i64::from(run.attempt),
+            run.resumed_from_run_id,
+            run.resume_root_id,
+            if run.top_level { 1 } else { 0 },
+            run.started_at,
+            run.updated_at,
+            run.ended_at,
+            serde_json::to_string(&run.budget)?,
+            run.worktree_head,
+            i64::from(run.plan_revision),
+            run.last_event_seq as i64,
+            run.failure
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_run_step_tx(tx: &Transaction<'_>, step: &RunStep) -> Result<()> {
+    tx.execute(
+        "INSERT INTO run_steps
+         (step_id, run_id, session_id, seq, turn, kind, status, input_hash, output_hash,
+          payload_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            step.step_id,
+            step.run_id,
+            step.session_id,
+            step.seq as i64,
+            i64::from(step.turn),
+            step.kind,
+            step.status,
+            step.input_hash,
+            step.output_hash,
+            serde_json::to_string(&step.payload)?,
+            step.created_at,
+            step.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_run_tool_call_tx(tx: &Transaction<'_>, tool: &RunToolCall) -> Result<()> {
+    tx.execute(
+        "INSERT INTO run_tool_calls
+         (run_id, session_id, step_id, tool_call_id, tool_name, input_fingerprint, status,
+          result_json, error, consumed_by_run_id, consumed_at, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            tool.run_id,
+            tool.session_id,
+            tool.step_id,
+            tool.tool_call_id,
+            tool.tool_name,
+            tool.input_fingerprint,
+            tool.status,
+            tool.result
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            tool.error,
+            tool.consumed_by_run_id,
+            tool.consumed_at,
+            tool.created_at,
+            tool.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_session_run_tx(tx: &Transaction<'_>, run_id: &str) -> Result<SessionRun> {
+    tx.query_row(
+        "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
+                department, objective, provider, model, status, attempt, resumed_from_run_id,
+                resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
+                worktree_head, plan_revision, last_event_seq, failure_json
+         FROM session_runs WHERE run_id = ?1",
+        params![run_id],
+        map_session_run,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("run not found: {run_id}"))
+}
+
+fn map_session_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRun> {
+    let budget_json: String = row.get(19)?;
+    let failure_json: Option<String> = row.get(23)?;
+    Ok(SessionRun {
+        run_id: row.get(0)?,
+        session_id: row.get(1)?,
+        project_id: row.get(2)?,
+        agent_id: row.get(3)?,
+        agent_name: row.get(4)?,
+        agent_role: row.get(5)?,
+        task_id: row.get(6)?,
+        department: row.get(7)?,
+        objective: row.get(8)?,
+        provider: row.get(9)?,
+        model: row.get(10)?,
+        status: row.get(11)?,
+        attempt: row.get::<_, i64>(12)?.max(1) as u32,
+        resumed_from_run_id: row.get(13)?,
+        resume_root_id: row.get(14)?,
+        top_level: row.get::<_, i64>(15)? != 0,
+        started_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        ended_at: row.get(18)?,
+        budget: serde_json::from_str::<RunBudgetSnapshot>(&budget_json).unwrap_or_default(),
+        worktree_head: row.get(20)?,
+        plan_revision: row.get::<_, i64>(21)?.max(0) as u32,
+        last_event_seq: row.get::<_, i64>(22)?.max(0) as u64,
+        failure: failure_json
+            .and_then(|json| serde_json::from_str::<vp_protocol::types::RunFailure>(&json).ok()),
+    })
+}
+
+fn map_run_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunStep> {
+    let payload_json: String = row.get(9)?;
+    Ok(RunStep {
+        step_id: row.get(0)?,
+        run_id: row.get(1)?,
+        session_id: row.get(2)?,
+        seq: row.get::<_, i64>(3)?.max(0) as u64,
+        turn: row.get::<_, i64>(4)?.max(0) as u32,
+        kind: row.get(5)?,
+        status: row.get(6)?,
+        input_hash: row.get(7)?,
+        output_hash: row.get(8)?,
+        payload: serde_json::from_str(&payload_json).unwrap_or(serde_json::Value::Null),
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+fn map_run_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunToolCall> {
+    let result_json: Option<String> = row.get(7)?;
+    Ok(RunToolCall {
+        run_id: row.get(0)?,
+        session_id: row.get(1)?,
+        step_id: row.get(2)?,
+        tool_call_id: row.get(3)?,
+        tool_name: row.get(4)?,
+        input_fingerprint: row.get(5)?,
+        status: row.get(6)?,
+        result: result_json.and_then(|json| serde_json::from_str(&json).ok()),
+        error: row.get(8)?,
+        consumed_by_run_id: row.get(9)?,
+        consumed_at: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn map_run_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunCheckpoint> {
+    let budget_json: String = row.get(7)?;
+    Ok(RunCheckpoint {
+        checkpoint_id: row.get(0)?,
+        run_id: row.get(1)?,
+        session_id: row.get(2)?,
+        seq: row.get::<_, i64>(3)?.max(0) as u64,
+        turn: row.get::<_, i64>(4)?.max(0) as u32,
+        message_cursor: row.get::<_, i64>(5)?.max(0) as u64,
+        event_cursor: row.get::<_, i64>(6)?.max(0) as u64,
+        budget: serde_json::from_str::<RunBudgetSnapshot>(&budget_json).unwrap_or_default(),
+        worktree_head: row.get(8)?,
+        plan_revision: row.get::<_, i64>(9)?.max(0) as u32,
+        created_at: row.get(10)?,
+    })
+}
+
 fn insert_event_tx(
     tx: &Transaction<'_>,
     session_id: &str,
     kind: &str,
     payload: serde_json::Value,
 ) -> Result<Event> {
-    let seq: u64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
-        params![session_id],
-        |row| row.get(0),
-    )?;
+    let seq = next_event_seq_tx(tx, session_id)?;
     let event = Event {
         session_id: session_id.to_string(),
         seq,

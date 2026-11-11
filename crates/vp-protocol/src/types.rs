@@ -3797,6 +3797,275 @@ pub struct SessionBundle {
     pub program_milestones: Vec<ProgramMilestone>,
     #[serde(default)]
     pub program_events: Vec<ProgramEvent>,
+    /// Event-backed durable run rows. Older bundles decode as an empty list.
+    #[serde(default)]
+    pub session_runs: Vec<SessionRun>,
+    /// Event-backed run step rows. Tool outcomes are deliberately not part of
+    /// a replayable bundle; they are operational audit state.
+    #[serde(default)]
+    pub run_steps: Vec<RunStep>,
+    #[serde(default)]
+    pub run_checkpoints: Vec<RunCheckpoint>,
+}
+
+/// Project policy for automatic crash resume. Manual `session.run.resume`
+/// always remains available within the same bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRunPolicy {
+    /// Opt-in. Default false: a daemon restart marks runs interrupted and
+    /// leaves them for an operator.
+    #[serde(default)]
+    pub auto_resume: bool,
+    /// Total attempts, including the first run. Bounded 1..=3.
+    #[serde(default = "default_run_max_attempts")]
+    pub max_attempts: u32,
+    /// A run older than this is not resumed automatically or manually.
+    /// Bounded 1..=168 hours.
+    #[serde(default = "default_run_max_age_hours")]
+    pub max_age_hours: u32,
+}
+
+impl Default for SessionRunPolicy {
+    fn default() -> Self {
+        Self {
+            auto_resume: false,
+            max_attempts: default_run_max_attempts(),
+            max_age_hours: default_run_max_age_hours(),
+        }
+    }
+}
+
+pub fn default_run_max_attempts() -> u32 {
+    1
+}
+
+pub fn default_run_max_age_hours() -> u32 {
+    24
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunBudgetSnapshot {
+    #[serde(default)]
+    pub token_limit: Option<u64>,
+    #[serde(default)]
+    pub tokens_spent: u64,
+    #[serde(default)]
+    pub cost_limit_usd: Option<f64>,
+    #[serde(default)]
+    pub cost_spent_usd: f64,
+    #[serde(default)]
+    pub time_limit_secs: Option<u64>,
+    #[serde(default)]
+    pub elapsed_secs: u64,
+    #[serde(default)]
+    pub unlimited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFailure {
+    /// Stable classification: `error`, `cancelled`, `budget_exceeded`,
+    /// `max_turns`, or `interrupted`.
+    pub kind: String,
+    pub message: String,
+}
+
+/// One durable agent run. Status and attempt transitions are event-backed;
+/// step tool outcomes are operational audit state and are exempt from replay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRun {
+    pub run_id: String,
+    pub session_id: String,
+    pub project_id: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub agent_name: String,
+    #[serde(default)]
+    pub agent_role: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    /// `running`, `completed`, `failed`, `interrupted`, or `resumed`.
+    pub status: String,
+    #[serde(default = "default_run_attempt")]
+    pub attempt: u32,
+    #[serde(default)]
+    pub resumed_from_run_id: Option<String>,
+    #[serde(default)]
+    pub resume_root_id: String,
+    #[serde(default)]
+    pub top_level: bool,
+    pub started_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub budget: RunBudgetSnapshot,
+    #[serde(default)]
+    pub worktree_head: String,
+    #[serde(default)]
+    pub plan_revision: u32,
+    #[serde(default)]
+    pub last_event_seq: u64,
+    #[serde(default)]
+    pub failure: Option<RunFailure>,
+}
+
+pub fn default_run_attempt() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunStep {
+    pub step_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub seq: u64,
+    pub turn: u32,
+    /// `model_request`, `tool_call`, `compaction`, `approval`, or `question`.
+    pub kind: String,
+    /// `intent`, `completed`, `failed`, or `unknown`.
+    pub status: String,
+    #[serde(default)]
+    pub input_hash: String,
+    #[serde(default)]
+    pub output_hash: String,
+    #[serde(default)]
+    pub payload: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Operational audit row for one tool invocation. It is durable so a resume can
+/// detect completed write tools and interrupted calls, but it is intentionally
+/// not rebuilt by replay/repair and is not exported as replayable state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunToolCall {
+    pub run_id: String,
+    pub session_id: String,
+    pub step_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub input_fingerprint: String,
+    /// `intent`, `completed`, `failed`, or `unknown`.
+    pub status: String,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub consumed_by_run_id: Option<String>,
+    #[serde(default)]
+    pub consumed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunCheckpoint {
+    pub checkpoint_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub seq: u64,
+    /// Agent turn at which the checkpoint was taken.
+    #[serde(default)]
+    pub turn: u32,
+    #[serde(default)]
+    pub message_cursor: u64,
+    #[serde(default)]
+    pub event_cursor: u64,
+    #[serde(default)]
+    pub budget: RunBudgetSnapshot,
+    #[serde(default)]
+    pub worktree_head: String,
+    #[serde(default)]
+    pub plan_revision: u32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRunsParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRunsResult {
+    pub session_id: String,
+    pub runs: Vec<SessionRun>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRunDetailParams {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRunDetailResult {
+    pub run: SessionRun,
+    pub steps: Vec<RunStep>,
+    pub tool_calls: Vec<RunToolCall>,
+    pub checkpoints: Vec<RunCheckpoint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRunResumeParams {
+    pub session_id: String,
+    /// Omit to resume the newest resumable top-level run.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Optional idempotency key for this explicit resume request. This is a
+    /// separate receipt from session prompt admission.
+    #[serde(default)]
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRunResumeResult {
+    pub session_id: String,
+    pub resumed: bool,
+    pub run_id: String,
+    pub resumed_from_run_id: Option<String>,
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRunCancelParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRunCancelResult {
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub cancelled: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRunPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSessionRunPolicyParams {
+    pub project_id: String,
+    pub policy: SessionRunPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRunPolicyResult {
+    pub project_id: String,
+    pub policy: SessionRunPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3836,6 +4105,13 @@ pub struct SessionReplayReport {
     pub steering_matches: bool,
     #[serde(default)]
     pub continuations_match: bool,
+    /// Event-backed durable run status/attempt projections.
+    #[serde(default)]
+    pub runs_match: bool,
+    #[serde(default)]
+    pub run_steps_match: bool,
+    #[serde(default)]
+    pub run_checkpoints_match: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -6464,5 +6740,68 @@ mod program_wire_tests {
         let list: ProgramListParams = serde_json::from_value(json!({"status": "active"})).unwrap();
         assert_eq!(list.status, Some(ProgramStatus::Active));
         assert!(list.project_id.is_none());
+    }
+
+    #[test]
+    fn durable_run_policy_and_rows_decode_with_safe_defaults() {
+        let policy: SessionRunPolicy = serde_json::from_str(r#"{"auto_resume":true}"#).unwrap();
+        assert!(policy.auto_resume);
+        assert_eq!(policy.max_attempts, 1);
+        assert_eq!(policy.max_age_hours, 24);
+
+        let run: SessionRun = serde_json::from_value(serde_json::json!({
+            "run_id": "run-1",
+            "session_id": "ses-1",
+            "project_id": "proj-1",
+            "agent_id": "agent-1",
+            "status": "running",
+            "started_at": "2026-11-11T00:00:00Z",
+            "updated_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(run.attempt, 1);
+        assert!(!run.top_level);
+        assert!(run.task_id.is_none());
+        assert!(run.failure.is_none());
+        assert_eq!(run.budget, RunBudgetSnapshot::default());
+
+        let checkpoint: RunCheckpoint = serde_json::from_value(serde_json::json!({
+            "checkpoint_id": "cp-1",
+            "run_id": "run-1",
+            "session_id": "ses-1",
+            "seq": 1,
+            "created_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(checkpoint.turn, 0);
+        assert_eq!(checkpoint.message_cursor, 0);
+        assert_eq!(checkpoint.event_cursor, 0);
+
+        let step: RunStep = serde_json::from_value(serde_json::json!({
+            "step_id": "step-1",
+            "run_id": "run-1",
+            "session_id": "ses-1",
+            "seq": 1,
+            "turn": 1,
+            "kind": "model_request",
+            "status": "intent",
+            "created_at": "2026-11-11T00:00:00Z",
+            "updated_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(step.input_hash, "");
+        assert_eq!(step.payload, Value::Null);
+    }
+
+    #[test]
+    fn durable_run_policy_bounds_round_trip() {
+        let policy = SessionRunPolicy {
+            auto_resume: true,
+            max_attempts: 3,
+            max_age_hours: 168,
+        };
+        let encoded = serde_json::to_string(&policy).unwrap();
+        let decoded: SessionRunPolicy = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, policy);
     }
 }

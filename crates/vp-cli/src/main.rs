@@ -766,6 +766,44 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// List durable agent runs for a session.
+    Runs {
+        session: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Show one durable run with steps, tool calls, and checkpoints.
+    RunDetail { run: String },
+    /// Explicitly resume an interrupted or failed top-level run.
+    RunResume {
+        session: String,
+        /// Run id; omitted selects the newest resumable top-level run.
+        #[arg(long)]
+        run: Option<String>,
+        /// Idempotency key for the resume RPC.
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
+    /// Cooperatively cancel an active run.
+    RunCancel {
+        session: String,
+        #[arg(long)]
+        run: Option<String>,
+    },
+    /// Show a project's durable-run resume policy.
+    RunPolicy { project: String },
+    /// Update a project's durable-run resume policy (unspecified fields keep
+    /// their current values).
+    RunPolicySet {
+        project: String,
+        /// Explicitly enable or disable auto resume.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        auto_resume: Option<bool>,
+        #[arg(long)]
+        max_attempts: Option<u32>,
+        #[arg(long)]
+        max_age_hours: Option<u32>,
+    },
     /// List standalone intake tasks (project task inbox).
     Intake {
         #[arg(long)]
@@ -2640,6 +2678,80 @@ async fn main() -> Result<()> {
                 &discovery,
                 "task.queue",
                 json!({"project_id": project, "session_id": session}),
+            )
+            .await?
+        }
+        Command::Runs { session, limit } => {
+            rpc(
+                &discovery,
+                "session.runs",
+                json!({"session_id": session, "limit": limit}),
+            )
+            .await?
+        }
+        Command::RunDetail { run } => {
+            rpc(&discovery, "session.run.detail", json!({"run_id": run})).await?
+        }
+        Command::RunResume {
+            session,
+            run,
+            operation_id,
+        } => {
+            rpc(
+                &discovery,
+                "session.run.resume",
+                json!({
+                    "session_id": session,
+                    "run_id": run,
+                    "operation_id": operation_id,
+                }),
+            )
+            .await?
+        }
+        Command::RunCancel { session, run } => {
+            rpc(
+                &discovery,
+                "session.run.cancel",
+                json!({"session_id": session, "run_id": run}),
+            )
+            .await?
+        }
+        Command::RunPolicy { project } => {
+            rpc(
+                &discovery,
+                "session.run.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::RunPolicySet {
+            project,
+            auto_resume,
+            max_attempts,
+            max_age_hours,
+        } => {
+            let current = rpc(
+                &discovery,
+                "session.run.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(object) = policy.as_object_mut() {
+                if let Some(auto_resume) = auto_resume {
+                    object.insert("auto_resume".into(), json!(auto_resume));
+                }
+                if let Some(max_attempts) = max_attempts {
+                    object.insert("max_attempts".into(), json!(max_attempts));
+                }
+                if let Some(max_age_hours) = max_age_hours {
+                    object.insert("max_age_hours".into(), json!(max_age_hours));
+                }
+            }
+            rpc(
+                &discovery,
+                "session.run.policy.set",
+                json!({"project_id": project, "policy": policy}),
             )
             .await?
         }
@@ -6426,6 +6538,70 @@ mod tests {
                 match cli.command {
                     Command::Cache { session } => assert_eq!(session, "ses-123"),
                     other => panic!("expected cache command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod durable_run_cli_tests {
+    use super::*;
+
+    #[test]
+    fn durable_run_commands_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "run-policy-set",
+                    "proj-1",
+                    "--auto-resume",
+                    "--max-attempts",
+                    "3",
+                    "--max-age-hours",
+                    "12",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::RunPolicySet {
+                        project,
+                        auto_resume,
+                        max_attempts,
+                        max_age_hours,
+                    } => {
+                        assert_eq!(project, "proj-1");
+                        assert_eq!(auto_resume, Some(true));
+                        assert_eq!(max_attempts, Some(3));
+                        assert_eq!(max_age_hours, Some(12));
+                    }
+                    other => panic!("expected run-policy-set, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "run-resume",
+                    "ses-1",
+                    "--run",
+                    "run-1",
+                    "--operation-id",
+                    "op-resume",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::RunResume {
+                        session,
+                        run,
+                        operation_id,
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(run.as_deref(), Some("run-1"));
+                        assert_eq!(operation_id.as_deref(), Some("op-resume"));
+                    }
+                    other => panic!("expected run-resume, got {other:?}"),
                 }
             })
             .unwrap()

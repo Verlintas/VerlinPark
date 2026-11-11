@@ -11600,3 +11600,1032 @@ fn remote_tools_are_explicit_and_role_scoped() {
             .allows_tool(crate::agent::AgentProfile::Coding, "remote_write")
     );
 }
+
+#[allow(clippy::too_many_arguments)]
+async fn begin_durable_journal(
+    engine: &Engine,
+    session: &vp_protocol::types::Session,
+    project_id: &str,
+    objective: &str,
+    provider: &str,
+    model: &str,
+    top_level: bool,
+    task_id: Option<&str>,
+) -> crate::run_journal::RunJournal {
+    crate::run_journal::RunJournal::begin(
+        engine,
+        session,
+        project_id,
+        "leader-id",
+        "Leader",
+        "leader",
+        task_id,
+        None,
+        objective,
+        provider,
+        model,
+        Path::new(session.worktree.as_deref().expect("session has a worktree")),
+        RunBudgetSnapshot::default(),
+        top_level,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_completed_leader_run_is_journaled_and_replays_consistently() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_read".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("journalled and done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "journal a run".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "journal a run").await.unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+
+    let runs = engine.session_runs(&session.id, 20).await.unwrap().runs;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, "completed");
+    assert!(runs[0].top_level);
+    assert_eq!(runs[0].agent_role, "leader");
+    let detail = engine.session_run_detail(&runs[0].run_id).await.unwrap();
+    assert!(
+        detail
+            .steps
+            .iter()
+            .any(|step| step.kind == "model_request" && step.status == "completed")
+    );
+    assert!(
+        detail
+            .steps
+            .iter()
+            .any(|step| step.kind == "tool_call" && step.status == "completed")
+    );
+    assert!(!detail.checkpoints.is_empty());
+    assert_eq!(detail.tool_calls.len(), 1);
+    assert_eq!(detail.tool_calls[0].status, "completed");
+
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
+    assert!(report.runs_match);
+    assert!(report.run_steps_match);
+    assert!(report.run_checkpoints_match);
+}
+
+#[tokio::test]
+async fn resumes_a_crashed_run_and_hard_blocks_a_completed_write() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call-dup".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"journal-duplicate.txt","content":"should-not-run"}"#
+                        .into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("resume finished".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut session = engine
+        .create_session(project.id, "crash and resume".into(), Some(100_000))
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+
+    let journal = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "crash and resume",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let input = serde_json::json!({"path": "journal-duplicate.txt", "content": "should-not-run"});
+    let (step, tool) = journal
+        .tool_intent(&engine, 1, "call-prior", "write_file", &input)
+        .await
+        .unwrap();
+    journal
+        .tool_completed(
+            &engine,
+            &step,
+            &tool,
+            &ToolOutput::ok("wrote journal-duplicate.txt (prior attempt)"),
+        )
+        .await
+        .unwrap();
+    let prior_run_id = journal.id().to_string();
+    drop(journal);
+    engine.recover_interrupted_sessions().await.unwrap();
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+
+    let resumed = service
+        .resume_session_run(&session.id, Some(&prior_run_id), None)
+        .await
+        .unwrap();
+    assert!(resumed.resumed);
+    assert_eq!(resumed.attempt, 2);
+    assert_eq!(
+        resumed.resumed_from_run_id.as_deref(),
+        Some(prior_run_id.as_str())
+    );
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+
+    let path = Path::new(session.worktree.as_deref().unwrap()).join("journal-duplicate.txt");
+    assert!(
+        !path.exists(),
+        "the journaled write must be returned, never executed a second time"
+    );
+    let runs = engine.session_runs(&session.id, 20).await.unwrap().runs;
+    assert_eq!(runs.len(), 2);
+    let old = runs.iter().find(|run| run.run_id == prior_run_id).unwrap();
+    assert_eq!(old.status, "resumed");
+    let new = runs
+        .iter()
+        .find(|run| run.run_id == resumed.run_id)
+        .unwrap();
+    assert_eq!(new.status, "completed");
+    let old_detail = engine.session_run_detail(&prior_run_id).await.unwrap();
+    assert_eq!(
+        old_detail.tool_calls[0].consumed_by_run_id.as_deref(),
+        Some(resumed.run_id.as_str())
+    );
+    {
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(
+            captured[1]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("[Durable run journal]"))
+        );
+        assert!(
+            captured[1]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("[durable journal]"))
+        );
+    }
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
+}
+
+#[tokio::test]
+async fn resume_reconstructs_persisted_assistant_messages_from_events() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("continued after event replay".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut session = engine
+        .create_session(project.id, "event replay".into(), None)
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .append_message(
+            &session.id,
+            "user",
+            "original request",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    let journal = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "event replay",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let request = ChatRequest::new("test", vec![ChatMessage::user("original request")]);
+    let _intent = journal.model_intent(&engine, 1, &request).await.unwrap();
+    engine
+        .append_message(
+            &session.id,
+            "assistant",
+            "persisted assistant response",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    let prior_run = journal.id().to_string();
+    drop(journal);
+    engine.recover_interrupted_sessions().await.unwrap();
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .resume_session_run(&session.id, Some(&prior_run), None)
+        .await
+        .unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let contents = captured[0]
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+    assert!(contents.contains(&"persisted assistant response"));
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("Durable run journal"))
+    );
+}
+
+#[tokio::test]
+async fn auto_resume_is_opt_in_and_bounded_by_the_project_policy() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("auto resumed".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut session = engine
+        .create_session(project.id, "auto resume".into(), None)
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let journal = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "auto resume",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let run_id = journal.id().to_string();
+    drop(journal);
+    engine.recover_interrupted_sessions().await.unwrap();
+    // Opt-in is off by default.
+    assert_eq!(service.auto_resume_interrupted_runs().await.unwrap(), 0);
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: true,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(service.auto_resume_interrupted_runs().await.unwrap(), 1);
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    let runs = engine.session_runs(&session.id, 20).await.unwrap().runs;
+    assert_eq!(runs.len(), 2);
+    assert!(
+        runs.iter()
+            .any(|run| run.run_id == run_id && run.status == "resumed")
+    );
+    assert!(
+        runs.iter()
+            .any(|run| run.status == "completed" && run.attempt == 2)
+    );
+    // A second tick must not create an additional attempt.
+    assert_eq!(service.auto_resume_interrupted_runs().await.unwrap(), 0);
+    assert_eq!(
+        engine
+            .session_runs(&session.id, 20)
+            .await
+            .unwrap()
+            .runs
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn cooperative_cancel_finishes_the_journal_as_cancelled_and_blocks_resume() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(GatedFinalProvider {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let provider_trait: Arc<dyn Provider> = provider.clone();
+    let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+    let session = engine
+        .create_session(project.id, "cancel me".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "cancel me").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), provider.started.notified())
+        .await
+        .unwrap();
+    let runs = engine.session_runs(&session.id, 10).await.unwrap().runs;
+    let running = runs.iter().find(|run| run.status == "running").unwrap();
+    let result = service
+        .cancel_session_run(&session.id, Some(&running.run_id))
+        .await
+        .unwrap();
+    assert!(result.cancelled);
+    provider.release.notify_one();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "cancelled");
+    let runs = engine.session_runs(&session.id, 10).await.unwrap().runs;
+    let cancelled = runs
+        .iter()
+        .find(|run| run.run_id == running.run_id)
+        .unwrap();
+    assert_eq!(cancelled.status, "interrupted");
+    assert_eq!(
+        cancelled
+            .failure
+            .as_ref()
+            .map(|failure| failure.kind.as_str()),
+        Some("cancelled")
+    );
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+    let error = service
+        .resume_session_run(&session.id, Some(&cancelled.run_id), None)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("cancelled"));
+}
+
+#[tokio::test]
+async fn resume_operation_receipts_replay_instead_of_starting_a_second_attempt() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("one resume".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut session = engine
+        .create_session(project.id, "resume receipt".into(), None)
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let journal = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "resume receipt",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let prior = journal.id().to_string();
+    drop(journal);
+    engine.recover_interrupted_sessions().await.unwrap();
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+    let first = service
+        .resume_session_run(&session.id, Some(&prior), Some("op-resume-once"))
+        .await
+        .unwrap();
+    let second = service
+        .resume_session_run(&session.id, Some(&prior), Some("op-resume-once"))
+        .await
+        .unwrap();
+    assert_eq!(first.run_id, second.run_id);
+    let _finished = wait_until_idle(&engine, &session).await;
+    let runs = engine.session_runs(&session.id, 20).await.unwrap().runs;
+    assert_eq!(
+        runs.len(),
+        2,
+        "receipt replay must not create another attempt"
+    );
+}
+
+#[tokio::test]
+async fn resume_fills_missing_tool_results_for_a_persisted_multi_call_assistant_turn() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("resumed multi-call".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut session = engine
+        .create_session(project.id, "multi call".into(), None)
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .append_message(
+            &session.id,
+            "user",
+            "do two things",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    let assistant_calls = vec![
+        ToolCall {
+            id: "call-write-missing".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path":"recovered.txt","content":"one"}"#.into(),
+        },
+        ToolCall {
+            id: "call-shell-missing".into(),
+            name: "shell".into(),
+            arguments: r#"{"command":"touch maybe"}"#.into(),
+        },
+    ];
+    engine
+        .append_message(
+            &session.id,
+            "assistant",
+            "I will use two tools.",
+            serde_json::to_value(&assistant_calls).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    let journal = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "multi call",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let (write_step, write_tool) = journal
+        .tool_intent(
+            &engine,
+            1,
+            "call-write-missing",
+            "write_file",
+            &serde_json::json!({"path": "recovered.txt", "content": "one"}),
+        )
+        .await
+        .unwrap();
+    journal
+        .tool_completed(
+            &engine,
+            &write_step,
+            &write_tool,
+            &ToolOutput::ok("wrote recovered.txt"),
+        )
+        .await
+        .unwrap();
+    let _ = journal
+        .tool_intent(
+            &engine,
+            1,
+            "call-shell-missing",
+            "shell",
+            &serde_json::json!({"command": "touch maybe"}),
+        )
+        .await
+        .unwrap();
+    let prior = journal.id().to_string();
+    drop(journal);
+    engine.recover_interrupted_sessions().await.unwrap();
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .resume_session_run(&session.id, Some(&prior), None)
+        .await
+        .unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let tool_messages = captured[0]
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| {
+            (
+                message.tool_call_id.clone().unwrap_or_default(),
+                message.content.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_messages.len(), 2);
+    let write = tool_messages
+        .iter()
+        .find(|(id, _)| id == "call-write-missing")
+        .unwrap();
+    assert!(write.1.contains("wrote recovered.txt"));
+    assert!(write.1.contains("not re-run"));
+    let shell = tool_messages
+        .iter()
+        .find(|(id, _)| id == "call-shell-missing")
+        .unwrap();
+    assert!(shell.1.contains("Unknown outcome"));
+    assert!(shell.1.contains("Verify"));
+}
+
+#[tokio::test]
+async fn resume_without_a_run_id_selects_the_newest_resumable_top_level_run() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("newest resumed".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut session = engine
+        .create_session(project.id, "newest run".into(), None)
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let first = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "older",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let first_id = first.id().to_string();
+    first
+        .finish_interrupted(&engine, "interrupted", "old crash")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let second = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "newer",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let second_id = second.id().to_string();
+    second
+        .finish_interrupted(&engine, "interrupted", "new crash")
+        .await
+        .unwrap();
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+    let resumed = service
+        .resume_session_run(&session.id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.resumed_from_run_id.as_deref(),
+        Some(second_id.as_str())
+    );
+    let _ = wait_until_idle(&engine, &session).await;
+    let runs = engine.session_runs(&session.id, 20).await.unwrap().runs;
+    let older = runs.iter().find(|run| run.run_id == first_id).unwrap();
+    assert_eq!(older.status, "interrupted");
+    let newer = runs.iter().find(|run| run.run_id == second_id).unwrap();
+    assert_eq!(newer.status, "resumed");
+}
+
+#[tokio::test]
+async fn task_scoped_runs_are_journaled_but_not_resumed_adhoc() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut session = engine
+        .create_session(project.id, "task scoped".into(), None)
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let journal = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "task scoped",
+        "queue",
+        "test",
+        false,
+        Some("T1"),
+    )
+    .await;
+    let run_id = journal.id().to_string();
+    journal
+        .finish_interrupted(&engine, "interrupted", "worker crash")
+        .await
+        .unwrap();
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+    let error = service
+        .resume_session_run(&session.id, Some(&run_id), None)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("task-scoped"));
+    let runs = engine.session_runs(&session.id, 10).await.unwrap().runs;
+    assert_eq!(runs[0].status, "interrupted");
+}
+
+#[tokio::test]
+async fn resume_requires_a_configured_provider() {
+    let dir = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    std::fs::write(repo.path().join("README.md"), "hello\n").unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(dir.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("unconfigured".to_string()),
+        )
+        .await
+        .unwrap();
+    let mut session = engine
+        .create_session(project.id, "no provider".into(), None)
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    let journal = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "no provider",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let run_id = journal.id().to_string();
+    journal
+        .finish_interrupted(&engine, "interrupted", "crash")
+        .await
+        .unwrap();
+    let service = AgentService::unconfigured(engine.clone());
+    let error = service
+        .resume_session_run(&session.id, Some(&run_id), None)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("not configured"));
+}
+
+#[tokio::test]
+async fn cancel_without_a_running_run_is_a_noop() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "nothing running".into(), None)
+        .await
+        .unwrap();
+    let result = service.cancel_session_run(&session.id, None).await.unwrap();
+    assert!(!result.cancelled);
+    assert!(result.run_id.is_none());
+    assert!(result.detail.contains("no running"));
+}
+
+#[tokio::test]
+async fn resumed_read_only_tools_re_run_instead_of_returning_a_journaled_result() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call-read-again".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("read after resume".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut session = engine
+        .create_session(project.id, "read again".into(), None)
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let journal = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "read again",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let (step, tool) = journal
+        .tool_intent(
+            &engine,
+            1,
+            "call-read-again",
+            "read_file",
+            &serde_json::json!({"path": "README.md"}),
+        )
+        .await
+        .unwrap();
+    journal
+        .tool_completed(
+            &engine,
+            &step,
+            &tool,
+            &ToolOutput::ok("STALE JOURNALED CONTENT"),
+        )
+        .await
+        .unwrap();
+    let prior = journal.id().to_string();
+    drop(journal);
+    engine.recover_interrupted_sessions().await.unwrap();
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .resume_session_run(&session.id, Some(&prior), None)
+        .await
+        .unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    let captured = requests.lock().unwrap();
+    let tool_result = captured[1]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == "tool" && message.tool_call_id.as_deref() == Some("call-read-again")
+        })
+        .expect("the resumed provider request contains the tool result");
+    assert!(tool_result.content.contains("hello from test"));
+    assert!(!tool_result.content.contains("STALE JOURNALED CONTENT"));
+    assert!(!tool_result.content.contains("[durable journal]"));
+}
+
+#[tokio::test]
+async fn a_new_prompt_supersedes_an_older_unresolved_run() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("new prompt completed".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut session = engine
+        .create_session(project.id, "supersede".into(), None)
+        .await
+        .unwrap();
+    session.status = "idle".to_string();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let old = begin_durable_journal(
+        &engine,
+        &session,
+        &session.project_id,
+        "crashed",
+        "queue",
+        "test",
+        true,
+        None,
+    )
+    .await;
+    let old_id = old.id().to_string();
+    old.finish_interrupted(&engine, "interrupted", "crash")
+        .await
+        .unwrap();
+    service.start(&session.id, "new prompt").await.unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    let runs = engine.session_runs(&session.id, 20).await.unwrap().runs;
+    let old = runs.iter().find(|run| run.run_id == old_id).unwrap();
+    assert_eq!(
+        old.failure.as_ref().map(|failure| failure.kind.as_str()),
+        Some("superseded")
+    );
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 2,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+    let error = service
+        .resume_session_run(&session.id, Some(&old_id), None)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("superseded"));
+}

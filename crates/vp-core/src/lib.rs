@@ -94,6 +94,7 @@ pub mod permissions;
 pub mod program;
 pub mod rebuild;
 pub mod remote;
+pub mod run_journal;
 pub mod scheduler;
 mod session_graph;
 pub mod skills;
@@ -128,6 +129,9 @@ struct ReplayData {
     recoveries: Vec<OrchestrationRecovery>,
     notes: Vec<OrchestrationNote>,
     decisions: Vec<OrchestrationDecision>,
+    runs: Vec<vp_protocol::types::SessionRun>,
+    run_steps: Vec<vp_protocol::types::RunStep>,
+    run_checkpoints: Vec<vp_protocol::types::RunCheckpoint>,
     events: Vec<Event>,
 }
 
@@ -6192,12 +6196,89 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.list_todos(&id)).await?
     }
 
+    pub async fn current_plan_revision(&self, session_id: &str) -> Result<u32> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.plan_revision_count(&session_id)).await?
+    }
+
+    pub async fn session_runs(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<vp_protocol::types::SessionRunsResult> {
+        let runs = crate::run_journal::session_runs(self, session_id, limit).await?;
+        Ok(vp_protocol::types::SessionRunsResult {
+            session_id: session_id.to_string(),
+            runs,
+        })
+    }
+
+    pub async fn session_run_detail(
+        &self,
+        run_id: &str,
+    ) -> Result<vp_protocol::types::SessionRunDetailResult> {
+        let (run, steps, tool_calls, checkpoints) =
+            crate::run_journal::run_detail(self, run_id).await?;
+        Ok(vp_protocol::types::SessionRunDetailResult {
+            run,
+            steps,
+            tool_calls,
+            checkpoints,
+        })
+    }
+
+    pub async fn session_run_policy(
+        &self,
+        project_id: &str,
+    ) -> Result<vp_protocol::types::SessionRunPolicyResult> {
+        let policy = crate::run_journal::policy(self, project_id).await?;
+        Ok(vp_protocol::types::SessionRunPolicyResult {
+            project_id: project_id.to_string(),
+            policy,
+        })
+    }
+
+    pub async fn set_session_run_policy(
+        &self,
+        project_id: &str,
+        policy: vp_protocol::types::SessionRunPolicy,
+    ) -> Result<vp_protocol::types::SessionRunPolicyResult> {
+        let policy = crate::run_journal::set_policy(self, project_id, &policy).await?;
+        Ok(vp_protocol::types::SessionRunPolicyResult {
+            project_id: project_id.to_string(),
+            policy,
+        })
+    }
+
+    /// Reconstruct the top-level conversation from the durable event stream,
+    /// not from a live in-memory vector. Malformed message events fail closed.
+    pub async fn conversation_from_events(
+        &self,
+        session_id: &str,
+    ) -> Result<(Vec<vp_providers::ChatMessage>, Vec<Option<String>>)> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let events = tokio::task::spawn_blocking(move || store.list_all_events(&id)).await??;
+        crate::agent::conversation_from_events(&events, session_id)
+    }
+
     pub async fn recover_interrupted_sessions(&self) -> Result<usize> {
         let store = self.store.clone();
         let (sessions, events) =
             tokio::task::spawn_blocking(move || store.recover_state()).await??;
         for event in events {
             let _ = self.events.send(event);
+        }
+        // Durable run journal recovery runs after session/agent status changes:
+        // every run left `running` by the previous process becomes
+        // `interrupted`, and its tool intents become unknown.
+        let interrupted_runs = crate::run_journal::interrupt_running_runs(self).await?;
+        if interrupted_runs > 0 {
+            tracing::warn!(
+                runs = interrupted_runs,
+                "marked durable runs interrupted after daemon recovery"
+            );
         }
         // An operation receipt that is still `pending` belongs to the previous
         // daemon process. Its side effect may or may not have landed, so it is
@@ -8811,6 +8892,9 @@ impl Engine {
             let recoveries = store.list_orchestration_recoveries(None, Some(&id))?;
             let notes = store.list_coordination_notes(&id, 2_000)?;
             let decisions = store.list_orchestration_decisions(&id, 2_000)?;
+            let runs = store.list_all_session_runs(&id)?;
+            let run_steps = store.list_session_run_steps(&id)?;
+            let run_checkpoints = store.list_session_run_checkpoints(&id)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -8832,6 +8916,9 @@ impl Engine {
                 recoveries,
                 notes,
                 decisions,
+                runs,
+                run_steps,
+                run_checkpoints,
                 events,
             })
         })
@@ -9590,6 +9677,46 @@ impl Engine {
             ));
         }
 
+        let expected_journal = crate::run_journal::projections_from_events(&data.events);
+        let (runs_match, run_steps_match, run_checkpoints_match) = match &expected_journal {
+            Some((runs, steps, checkpoints)) => (
+                crate::run_journal::runs_match(&data.runs, runs),
+                crate::run_journal::steps_match(&data.run_steps, steps),
+                crate::run_journal::checkpoints_match(&data.run_checkpoints, checkpoints),
+            ),
+            None => (false, false, false),
+        };
+        if !runs_match {
+            mismatches.push(format!(
+                "session runs: projection={}, replay={}",
+                data.runs.len(),
+                expected_journal
+                    .as_ref()
+                    .map(|value| value.0.len())
+                    .unwrap_or(0)
+            ));
+        }
+        if !run_steps_match {
+            mismatches.push(format!(
+                "run steps: projection={}, replay={}",
+                data.run_steps.len(),
+                expected_journal
+                    .as_ref()
+                    .map(|value| value.1.len())
+                    .unwrap_or(0)
+            ));
+        }
+        if !run_checkpoints_match {
+            mismatches.push(format!(
+                "run checkpoints: projection={}, replay={}",
+                data.run_checkpoints.len(),
+                expected_journal
+                    .as_ref()
+                    .map(|value| value.2.len())
+                    .unwrap_or(0)
+            ));
+        }
+
         let expected_artifacts = Self::expected_artifacts(data);
         let projected_artifacts = data
             .artifacts
@@ -9866,7 +9993,10 @@ impl Engine {
             && decisions_match
             && recoveries_match
             && steering_matches
-            && continuations_match;
+            && continuations_match
+            && runs_match
+            && run_steps_match
+            && run_checkpoints_match;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -9890,6 +10020,9 @@ impl Engine {
             recoveries_match,
             steering_matches,
             continuations_match,
+            runs_match,
+            run_steps_match,
+            run_checkpoints_match,
             consistent,
             repaired,
             rebuilt: false,
@@ -10163,6 +10296,7 @@ impl Engine {
             .and_then(|event| event.payload.get("priority"))
             .and_then(serde_json::Value::as_i64)
             .and_then(|value| i32::try_from(value).ok());
+        let journal = crate::run_journal::projections_from_events(&data.events);
         Ok(SessionRepair {
             status,
             priority,
@@ -10186,6 +10320,9 @@ impl Engine {
             steering: Some(replay_steering(&data.events)),
             continuations: Some(replay_continuations(&data.events)),
             recoveries: Some(crate::orchestration::recoveries_from_events(&data.events)),
+            runs: journal.as_ref().map(|value| value.0.clone()),
+            run_steps: journal.as_ref().map(|value| value.1.clone()),
+            run_checkpoints: journal.as_ref().map(|value| value.2.clone()),
             artifact_warnings,
         })
     }
@@ -10393,6 +10530,16 @@ impl Engine {
                 &events,
             )?;
             projection_store.replace_orchestration_recoveries(&projection_id, &recoveries)?;
+            if let Some((runs, steps, checkpoints)) =
+                crate::run_journal::projections_from_events(&events)
+            {
+                projection_store.replace_run_journal_projections(
+                    &projection_id,
+                    &runs,
+                    &steps,
+                    &checkpoints,
+                )?;
+            }
             Ok(())
         })
         .await??;
@@ -10505,6 +10652,9 @@ impl Engine {
             programs,
             program_milestones,
             program_events,
+            session_runs: data.runs,
+            run_steps: data.run_steps,
+            run_checkpoints: data.run_checkpoints,
         })
     }
 

@@ -90,6 +90,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             store.set_project_budget(&snapshot.project.id, &snapshot.budget)?;
             store
                 .set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
+            store.set_session_run_policy(&snapshot.project.id, &snapshot.session_run_policy)?;
             store.set_memory_policy(&snapshot.project.id, &snapshot.memory_policy)?;
             store.set_orchestration_policy(&snapshot.project.id, &snapshot.orchestration_policy)?;
             store.restore_approval_grants(&snapshot.project.id, &snapshot.approval_grants)?;
@@ -653,5 +654,116 @@ mod program_rebuild_tests {
         let controller = ProgramController::new(store);
         let replay = controller.replay(&program_id, false).unwrap();
         assert!(replay.consistent, "{:?}", replay.mismatches);
+    }
+}
+
+#[cfg(test)]
+mod run_journal_rebuild_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+    use vp_protocol::types::{RunBudgetSnapshot, SessionRunPolicy};
+    use vp_store::Store;
+
+    fn init_repo(path: &Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_restores_run_journal_policy_and_projections() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let (project_id, session_id, run_id) = {
+            let engine = Engine::new(Store::open(data.path()).unwrap());
+            let project = engine
+                .add_project(
+                    repo.path().to_string_lossy().to_string(),
+                    Some("rebuild journal".into()),
+                )
+                .await
+                .unwrap();
+            let session = engine
+                .create_session(project.id.clone(), "rebuild journal".into(), Some(10_000))
+                .await
+                .unwrap();
+            let worktree = session.worktree.clone().unwrap();
+            let journal = crate::run_journal::RunJournal::begin(
+                &engine,
+                &session,
+                &project.id,
+                "leader",
+                "Leader",
+                "leader",
+                None,
+                None,
+                "rebuild journal",
+                "test",
+                "test-model",
+                Path::new(&worktree),
+                RunBudgetSnapshot::default(),
+                true,
+            )
+            .await
+            .unwrap();
+            journal
+                .checkpoint(&engine, 1, RunBudgetSnapshot::default())
+                .await
+                .unwrap();
+            journal.finish_completed(&engine).await.unwrap();
+            engine
+                .set_session_run_policy(
+                    &project.id,
+                    SessionRunPolicy {
+                        auto_resume: true,
+                        max_attempts: 3,
+                        max_age_hours: 12,
+                    },
+                )
+                .await
+                .unwrap();
+            engine.record_project_manifest().await.unwrap();
+            (project.id, session.id, journal.id().to_string())
+        };
+
+        let report = rebuild_database(data.path(), false).await.unwrap();
+        assert_eq!(report.sessions, 1);
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let runs = engine.session_runs(&session_id, 10).await.unwrap().runs;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, run_id);
+        assert_eq!(runs[0].status, "completed");
+        let detail = engine.session_run_detail(&run_id).await.unwrap();
+        assert_eq!(detail.checkpoints.len(), 1);
+        let policy = engine.session_run_policy(&project_id).await.unwrap();
+        assert_eq!(
+            policy.policy,
+            SessionRunPolicy {
+                auto_resume: true,
+                max_attempts: 3,
+                max_age_hours: 12,
+            }
+        );
+        let replay = engine.replay_session(&session_id).await.unwrap();
+        assert!(replay.runs_match, "{:?}", replay.mismatches);
+        assert!(replay.run_checkpoints_match, "{:?}", replay.mismatches);
     }
 }

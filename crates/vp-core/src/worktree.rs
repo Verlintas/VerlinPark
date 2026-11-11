@@ -645,6 +645,25 @@ pub fn head_commit(worktree: &Path) -> Result<String> {
     git_output(worktree, &["rev-parse", "HEAD"])
 }
 
+/// True when `ancestor` is reachable from `descendant`. Used by crash resume to
+/// accept a worktree whose HEAD advanced only through commits layered on top of
+/// the recorded safe boundary. A missing object is an error, not a false.
+pub fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .context("checking git ancestry")?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(anyhow!(
+            "git merge-base --is-ancestor failed for {ancestor} -> {descendant}"
+        )),
+    }
+}
+
 pub fn reset_hard(worktree: &Path, commit: &str) -> Result<()> {
     run_git(worktree, &["reset", "--hard", commit])
 }
