@@ -11963,3 +11963,381 @@ fn recent_events_by_kind_is_bounded_and_newest_first() {
         .unwrap();
     assert_eq!(clamped.len(), 1);
 }
+
+#[test]
+fn gui_policy_defaults_round_trips_and_normalizes() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("gui policy"))
+        .unwrap();
+    let default = store.get_gui_policy(&project.id).unwrap();
+    assert_eq!(default, GuiPolicy::default());
+    let policy = GuiPolicy {
+        grace_secs: 12,
+        wait_ms: 2_500,
+        status_ttl_secs: 15,
+        sensitive_mode: vp_protocol::types::GuiSensitiveMode::RequireApproval,
+        sensitive_bundles: vec![" COM.Example.Vault ".into(), "".into()],
+        sensitive_titles: vec![" My Vault ".into()],
+    };
+    store.set_gui_policy(&project.id, &policy).unwrap();
+    let loaded = store.get_gui_policy(&project.id).unwrap();
+    assert_eq!(loaded.grace_secs, 12);
+    assert_eq!(loaded.wait_ms, 2_500);
+    assert_eq!(loaded.status_ttl_secs, 15);
+    assert_eq!(
+        loaded.sensitive_mode,
+        vp_protocol::types::GuiSensitiveMode::RequireApproval
+    );
+    assert_eq!(loaded.sensitive_bundles, vec!["com.example.vault"]);
+    assert_eq!(loaded.sensitive_titles, vec!["My Vault"]);
+
+    let session = store.create_session(&project.id, "gui session").unwrap();
+    assert_eq!(
+        store
+            .gui_policy_for_session(&session.id)
+            .unwrap()
+            .grace_secs,
+        12
+    );
+    assert_eq!(
+        store
+            .gui_policy_for_session("missing-session")
+            .unwrap()
+            .grace_secs,
+        45
+    );
+}
+
+#[test]
+fn project_manifest_carries_the_gui_policy() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("gui manifest"))
+        .unwrap();
+    let policy = GuiPolicy {
+        grace_secs: 5,
+        wait_ms: 700,
+        status_ttl_secs: 9,
+        sensitive_mode: vp_protocol::types::GuiSensitiveMode::Deny,
+        sensitive_bundles: vec!["com.example.Secret".into()],
+        sensitive_titles: vec!["Secret Vault".into()],
+    };
+    store.set_gui_policy(&project.id, &policy).unwrap();
+    store.record_project_manifest().unwrap();
+    let snapshots = read_project_manifest(data.path()).unwrap();
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.gui_policy, policy.clone().normalized());
+}
+
+#[test]
+fn legacy_browser_and_computer_leases_block_gui_and_can_be_retired() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("legacy lease"))
+        .unwrap();
+    let session = store.create_session(&project.id, "legacy").unwrap();
+    let legacy = store
+        .acquire_computer_lease("browser", "owner-a", &session.id, "agent-a", "Agent A", 60)
+        .unwrap();
+    let ComputerLeaseAttempt::Acquired { lease: legacy, .. } = legacy else {
+        panic!("legacy lease was busy");
+    };
+    assert_eq!(legacy.surface, "browser");
+    let blocked = store
+        .acquire_computer_lease("gui", "owner-b", &session.id, "agent-b", "Agent B", 60)
+        .unwrap();
+    match blocked {
+        ComputerLeaseAttempt::Busy { holder, .. } => {
+            let holder = holder.expect("legacy holder");
+            assert_eq!(holder.surface, "browser");
+            assert_eq!(holder.agent_name, "Agent A");
+        }
+        ComputerLeaseAttempt::Acquired { .. } => panic!("gui acquired over a legacy row"),
+    }
+    let holder = store.gui_lease_holder().unwrap().expect("holder");
+    assert_eq!(holder.surface, "browser");
+    let (removed, events) = store
+        .clear_legacy_gui_leases("legacy surfaces retired")
+        .unwrap();
+    assert_eq!(removed, 1);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "computer.lease.expired"
+                && event.payload["legacy_surface"] == true)
+    );
+    assert!(store.gui_lease_holder().unwrap().is_none());
+    let acquired = store
+        .acquire_computer_lease("gui", "owner-b", &session.id, "agent-b", "Agent B", 60)
+        .unwrap();
+    match acquired {
+        ComputerLeaseAttempt::Acquired { lease, .. } => assert_eq!(lease.surface, "gui"),
+        ComputerLeaseAttempt::Busy { .. } => panic!("gui should acquire after retirement"),
+    }
+}
+
+#[test]
+fn gui_actions_are_bounded_and_session_filtered() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("timeline"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    for (index, session) in [(0, &first), (1, &first), (2, &second)] {
+        let action = GuiActionInfo {
+            id: format!("action-{index}"),
+            session_id: session.id.clone(),
+            agent_id: "agent".into(),
+            agent_name: "Agent".into(),
+            surface: "computer".into(),
+            action: "click".into(),
+            target_app: Some("Example".into()),
+            target_bundle_id: Some("com.example.App".into()),
+            target_window: Some("Main".into()),
+            sensitive_target: false,
+            snapshot_generation: index as u64 + 1,
+            lease_generation: 1,
+            queued_ms: 0,
+            latency_ms: 5,
+            result: "ok".into(),
+            error_code: None,
+            occurred_at: format!("2026-11-11T00:00:0{index}Z"),
+        };
+        store
+            .append_event(
+                &session.id,
+                "gui.action",
+                serde_json::to_value(&action).unwrap(),
+            )
+            .unwrap();
+    }
+    store
+        .append_event(&first.id, "note", serde_json::json!({"text": "ignored"}))
+        .unwrap();
+    let all = store.recent_gui_actions(None, 2).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all.last().unwrap().id, "action-2");
+    let scoped = store.recent_gui_actions(Some(&first.id), 10).unwrap();
+    assert_eq!(scoped.len(), 2);
+    assert!(scoped.iter().all(|action| action.session_id == first.id));
+    assert_eq!(scoped[0].snapshot_generation, 1);
+    assert_eq!(store.recent_gui_actions(None, 0).unwrap().len(), 1);
+}
+
+#[test]
+fn computer_lease_generation_is_monotonic_and_survives_reopen() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("generation"))
+        .unwrap();
+    let session = store.create_session(&project.id, "generation").unwrap();
+    let first = match store
+        .acquire_computer_lease("gui", "owner-a", &session.id, "agent-a", "Agent A", 60)
+        .unwrap()
+    {
+        ComputerLeaseAttempt::Acquired { lease, .. } => lease,
+        ComputerLeaseAttempt::Busy { .. } => panic!("first lease was busy"),
+    };
+    assert_eq!(first.generation, 1);
+    store
+        .release_computer_lease(&first.lease_id, Some("owner-a"))
+        .unwrap();
+    let second = match store
+        .acquire_computer_lease("gui", "owner-a", &session.id, "agent-a", "Agent A", 60)
+        .unwrap()
+    {
+        ComputerLeaseAttempt::Acquired { lease, .. } => lease,
+        ComputerLeaseAttempt::Busy { .. } => panic!("second lease was busy"),
+    };
+    assert_eq!(second.generation, 2);
+    drop(store);
+    let reopened = Store::open(data.path()).unwrap();
+    let listed = reopened.list_computer_leases().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].generation, 2);
+    assert_eq!(reopened.gui_lease_holder().unwrap().unwrap().generation, 2);
+    reopened
+        .release_computer_lease(&second.lease_id, None)
+        .unwrap();
+    let third = match reopened
+        .acquire_computer_lease("gui", "owner-b", &session.id, "agent-b", "Agent B", 60)
+        .unwrap()
+    {
+        ComputerLeaseAttempt::Acquired { lease, .. } => lease,
+        ComputerLeaseAttempt::Busy { .. } => panic!("third lease was busy"),
+    };
+    assert_eq!(third.generation, 3);
+}
+
+#[test]
+fn gui_action_timeline_clamps_the_limit_at_five_hundred() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("timeline cap"))
+        .unwrap();
+    let session = store.create_session(&project.id, "cap").unwrap();
+    for index in 0..510 {
+        let action = GuiActionInfo {
+            id: format!("action-{index}"),
+            session_id: session.id.clone(),
+            agent_id: "agent".into(),
+            agent_name: "Agent".into(),
+            surface: "computer".into(),
+            action: "click".into(),
+            target_app: Some("Example".into()),
+            target_bundle_id: None,
+            target_window: None,
+            sensitive_target: false,
+            snapshot_generation: 1,
+            lease_generation: 1,
+            queued_ms: 0,
+            latency_ms: 1,
+            result: "ok".into(),
+            error_code: None,
+            occurred_at: format!("2026-11-11T00:00:00.{index:03}Z"),
+        };
+        store
+            .append_event(
+                &session.id,
+                "gui.action",
+                serde_json::to_value(action).unwrap(),
+            )
+            .unwrap();
+    }
+    let all = store.recent_gui_actions(None, 10_000).unwrap();
+    assert_eq!(all.len(), 500);
+    assert_eq!(all.last().unwrap().id, "action-509");
+    assert_eq!(all.first().unwrap().id, "action-10");
+}
+
+#[test]
+fn legacy_cleanup_preserves_a_current_gui_lease() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("legacy preserve"))
+        .unwrap();
+    let session = store.create_session(&project.id, "preserve").unwrap();
+    let current = match store
+        .acquire_computer_lease("gui", "owner", &session.id, "agent", "Agent", 60)
+        .unwrap()
+    {
+        ComputerLeaseAttempt::Acquired { lease, .. } => lease,
+        ComputerLeaseAttempt::Busy { .. } => panic!("gui lease was busy"),
+    };
+    // Simulate a legacy row from an older daemon. The unique-surface index only
+    // covers actual surfaces, so a raw insert is the only way to model both.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO computer_leases
+             (lease_id, surface, owner_id, session_id, agent_id, agent_name,
+              acquired_at, heartbeat_at, expires_at, generation)
+             VALUES ('legacy-1', 'browser', 'legacy-owner', ?1, 'legacy-agent',
+                     'Legacy Agent', ?2, ?2, ?3, 0)",
+            params![
+                &session.id,
+                now_rfc3339(),
+                "2099-01-01T00:00:00Z".to_string()
+            ],
+        )
+        .unwrap();
+    }
+    let (removed, events) = store.clear_legacy_gui_leases("retire").unwrap();
+    assert_eq!(removed, 1);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "computer.lease.expired")
+    );
+    let remaining = store.list_computer_leases().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].lease_id, current.lease_id);
+    assert_eq!(remaining[0].surface, "gui");
+    // Deleting the legacy row did not advance or reset the current generation.
+    assert_eq!(remaining[0].generation, current.generation);
+}
+
+#[test]
+fn gui_lease_holder_ignores_expired_rows() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("expiry"))
+        .unwrap();
+    let session = store.create_session(&project.id, "expiry").unwrap();
+    let lease = match store
+        .acquire_computer_lease("gui", "owner", &session.id, "agent", "Agent", 0)
+        .unwrap()
+    {
+        ComputerLeaseAttempt::Acquired { lease, .. } => lease,
+        ComputerLeaseAttempt::Busy { .. } => panic!("lease was busy"),
+    };
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    assert!(store.gui_lease_holder().unwrap().is_none());
+    let (removed, _) = store.clear_expired_computer_leases().unwrap();
+    assert_eq!(removed, 1);
+    assert!(store.computer_lease(&lease.lease_id).unwrap().is_none());
+}
+
+#[test]
+fn project_manifest_without_gui_policy_decodes_the_default() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("legacy manifest"))
+        .unwrap();
+    store
+        .set_gui_policy(&project.id, &GuiPolicy::default())
+        .unwrap();
+    store.record_project_manifest().unwrap();
+    let raw = std::fs::read_to_string(data.path().join("projects.jsonl")).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("gui_policy");
+    let snapshot: ProjectManifestSnapshot = serde_json::from_value(value).unwrap();
+    assert_eq!(snapshot.gui_policy, GuiPolicy::default());
+    assert_eq!(snapshot.project.id, project.id);
+}
+
+#[test]
+fn gui_lease_holder_reports_the_oldest_legacy_surface() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("legacy order"))
+        .unwrap();
+    let session = store.create_session(&project.id, "legacy order").unwrap();
+    {
+        let conn = store.lock().unwrap();
+        for (lease_id, surface, acquired) in [
+            ("legacy-browser", "browser", "2026-11-11T00:00:01Z"),
+            ("legacy-computer", "computer", "2026-11-11T00:00:02Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO computer_leases
+                 (lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                  acquired_at, heartbeat_at, expires_at, generation)
+                 VALUES (?1, ?2, 'legacy', ?3, 'legacy', 'Legacy', ?4, ?4,
+                         '2099-01-01T00:00:00Z', 0)",
+                params![lease_id, surface, &session.id, acquired],
+            )
+            .unwrap();
+        }
+    }
+    let holder = store.gui_lease_holder().unwrap().unwrap();
+    assert_eq!(holder.lease_id, "legacy-browser");
+    assert_eq!(holder.surface, "browser");
+    let blocked = store
+        .acquire_computer_lease("gui", "owner", &session.id, "agent", "Agent", 60)
+        .unwrap();
+    match blocked {
+        ComputerLeaseAttempt::Busy { holder, .. } => {
+            assert_eq!(holder.unwrap().lease_id, "legacy-browser");
+        }
+        ComputerLeaseAttempt::Acquired { .. } => panic!("gui acquired over legacy rows"),
+    }
+    let (removed, _) = store.clear_legacy_gui_leases("order").unwrap();
+    assert_eq!(removed, 2);
+    assert!(store.gui_lease_holder().unwrap().is_none());
+}

@@ -402,6 +402,7 @@ struct DashboardView: View {
             QuestionCenterCard()
         case .team:
             AgentsCard()
+            GuiSessionCard()
             ProgramsCard()
             IntakeTasksCard()
             OrchestrationOverviewCard()
@@ -445,6 +446,7 @@ struct DashboardView: View {
             if let project = model.selectedProject {
                 ShellPolicyCard(project: project)
                 IntegrationPolicyCard(project: project)
+                GuiPolicyCard(project: project)
             } else {
                 DashboardNoProjectCard(detail: "Select a project to edit policies.")
             }
@@ -491,6 +493,8 @@ struct DashboardView: View {
             await model.loadPendingQuestions()
         case .team:
             await model.loadAgents()
+            await model.loadGuiStatus()
+            await model.loadGuiTimeline()
             await model.loadTaskQueue()
             await model.loadIntakeTasks()
             await model.loadDashboardSnapshot()
@@ -519,6 +523,7 @@ struct DashboardView: View {
         case .policies:
             await model.loadShellPolicy()
             await model.loadIntegrationPolicy()
+            await model.loadGuiPolicy()
         case .diagnostics:
             await model.runDoctor()
         }

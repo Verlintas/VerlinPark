@@ -47,6 +47,7 @@ private struct ProjectStageView: View {
     @State private var draft = ""
     @State private var showingContext = false
     @State private var showingToolActivity = false
+    @State private var showingGui = false
     @State private var showingFork = false
     @State private var showingSteer = false
     @State private var showingDefer = false
@@ -215,6 +216,18 @@ private struct ProjectStageView: View {
                         if model.hasLongTaskAttention {
                             longTaskAttentionPill
                         }
+                        if let label = model.guiStageLabel {
+                            Button {
+                                showingGui.toggle()
+                            } label: {
+                                guiActivityPill(label)
+                            }
+                            .buttonStyle(.plain)
+                            .popover(isPresented: $showingGui, arrowEdge: .bottom) {
+                                GuiStagePopover()
+                                    .environment(model)
+                            }
+                        }
                     } else {
                         Text(project.root)
                             .lineLimit(1)
@@ -361,6 +374,35 @@ private struct ProjectStageView: View {
                 endPoint: .bottomTrailing
             )
         }
+    }
+
+    private func guiActivityPill(_ label: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: model.guiHeldBySelectedSession ? "macwindow.on.rectangle" : "macwindow")
+                .font(.system(size: 7.5, weight: .semibold))
+            Text(label)
+                .lineLimit(1)
+        }
+        .font(VPTheme.mono(7.5, weight: .semibold))
+        .foregroundStyle(model.guiHeldBySelectedSession ? VPTheme.accent : VPTheme.textTertiary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(
+            (model.guiHeldBySelectedSession ? VPTheme.accent : VPTheme.textTertiary).opacity(0.10),
+            in: Capsule()
+        )
+        .overlay {
+            Capsule()
+                .strokeBorder(
+                    (model.guiHeldBySelectedSession ? VPTheme.accent : VPTheme.textTertiary)
+                        .opacity(0.24),
+                    lineWidth: 1
+                )
+        }
+        .help(
+            "Unified browser/computer GUI lease. Generation, latency, and errors are in Manage Dash → Team."
+        )
+        .accessibilityLabel(L10n.t("GUI session activity"))
     }
 
     private var longTaskAttentionPill: some View {

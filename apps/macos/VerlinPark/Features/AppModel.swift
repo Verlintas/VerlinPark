@@ -104,6 +104,19 @@ final class AppModel {
     var integrationMaxTokensText = ""
     var integrationPolicyBusy = false
     var integrationPolicyStatus: String?
+    var guiPolicy = GuiPolicy.standard
+    var guiGraceSecs = 45
+    var guiWaitMs = 15000
+    var guiStatusTtlSecs = 30
+    var guiSensitiveMode: GuiSensitiveMode = .deny
+    var guiSensitiveBundlesText = ""
+    var guiSensitiveTitlesText = ""
+    var guiPolicyBusy = false
+    var guiPolicyStatus: String?
+    var guiStatus: GuiStatusResult?
+    var guiTimeline: [GuiActionInfo] = []
+    var guiStatusBusy = false
+    var guiStatusError: String?
     var toolOutputPolicy = ToolOutputPolicy.default
     var toolOutputEnabled = true
     var toolOutputSpillThresholdText = "16384"
@@ -823,6 +836,17 @@ final class AppModel {
             integrationMaxAutoAttempts = 1
             integrationMaxTokensText = ""
             integrationPolicyStatus = nil
+            guiPolicy = .standard
+            guiGraceSecs = 45
+            guiWaitMs = 15000
+            guiStatusTtlSecs = 30
+            guiSensitiveMode = .deny
+            guiSensitiveBundlesText = ""
+            guiSensitiveTitlesText = ""
+            guiPolicyStatus = nil
+            guiStatus = nil
+            guiTimeline = []
+            guiStatusError = nil
             artifactPolicy = .disabled
             artifactAutoGc = false
             artifactMaxBytesText = ""
@@ -972,6 +996,8 @@ final class AppModel {
         gitBaseCommit = nil
         gitSelectedCommit = nil
         gitShow = nil
+        guiTimeline = []
+        guiStatusError = nil
         workspaceEntries = []
         resetWorkspaceBrowser()
         workspaceSelectedPath = nil
@@ -979,6 +1005,8 @@ final class AppModel {
         workspaceFileError = nil
         Task { await loadShellPolicy() }
         Task { await loadIntegrationPolicy() }
+        Task { await loadGuiPolicy() }
+        Task { await loadGuiStatus() }
         Task { await loadArtifactPolicy() }
         Task { await loadMailboxPolicy() }
         Task { await loadProjectBudget() }
@@ -1051,6 +1079,8 @@ final class AppModel {
         gitBaseCommit = nil
         gitSelectedCommit = nil
         gitShow = nil
+        guiTimeline = []
+        guiStatusError = nil
         workspaceEntries = []
         resetWorkspaceBrowser()
         workspaceSelectedPath = nil
@@ -1077,6 +1107,7 @@ final class AppModel {
             await loadTeamPlan()
             await loadQuestions()
             await loadDiff()
+            await loadGuiTimeline()
         }
     }
 
@@ -3739,6 +3770,162 @@ final class AppModel {
             artifactPolicyStatus = error.localizedDescription
             handle(error)
         }
+    }
+
+    func loadGuiPolicy() async {
+        guard let projectID = selectedProjectID else {
+            guiPolicy = .standard
+            guiGraceSecs = 45
+            guiWaitMs = 15000
+            guiStatusTtlSecs = 30
+            guiSensitiveMode = .deny
+            guiSensitiveBundlesText = ""
+            guiSensitiveTitlesText = ""
+            guiPolicyStatus = nil
+            return
+        }
+        guiPolicyBusy = true
+        defer { guiPolicyBusy = false }
+        do {
+            let policy = try await core.guiPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            applyGuiPolicy(policy, status: nil)
+        } catch {
+            handle(error)
+        }
+    }
+
+    func saveGuiPolicy() async {
+        guard let projectID = selectedProjectID else {
+            guiPolicyStatus = "Select a project first."
+            return
+        }
+        guard guiGraceSecs >= 0, guiGraceSecs <= 600 else {
+            guiPolicyStatus = "Grace must be between 0 and 600 seconds."
+            return
+        }
+        guard guiWaitMs >= 0, guiWaitMs <= 60000 else {
+            guiPolicyStatus = "Wait must be between 0 and 60000 ms."
+            return
+        }
+        guard guiStatusTtlSecs >= 5, guiStatusTtlSecs <= 600 else {
+            guiPolicyStatus = "Status cache TTL must be between 5 and 600 seconds."
+            return
+        }
+        let bundles = guiSensitiveBundlesText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let titles = guiSensitiveTitlesText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guiPolicyBusy = true
+        defer { guiPolicyBusy = false }
+        do {
+            let policy = try await core.setGuiPolicy(
+                projectID: projectID,
+                policy: GuiPolicy(
+                    graceSecs: guiGraceSecs,
+                    waitMs: guiWaitMs,
+                    statusTtlSecs: guiStatusTtlSecs,
+                    sensitiveMode: guiSensitiveMode,
+                    sensitiveBundles: bundles,
+                    sensitiveTitles: titles
+                )
+            )
+            guard projectID == selectedProjectID else { return }
+            applyGuiPolicy(
+                policy,
+                status: "Saved · grace \(policy.graceSecs)s · wait \(policy.waitMs)ms"
+            )
+            await loadGuiStatus()
+        } catch {
+            guiPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func resetGuiPolicy() async {
+        guiGraceSecs = 45
+        guiWaitMs = 15000
+        guiStatusTtlSecs = 30
+        guiSensitiveMode = .deny
+        guiSensitiveBundlesText = ""
+        guiSensitiveTitlesText = ""
+        await saveGuiPolicy()
+    }
+
+    private func applyGuiPolicy(_ policy: GuiPolicy, status: String?) {
+        guiPolicy = policy
+        guiGraceSecs = policy.graceSecs
+        guiWaitMs = policy.waitMs
+        guiStatusTtlSecs = policy.statusTtlSecs
+        guiSensitiveMode = policy.sensitiveMode
+        guiSensitiveBundlesText = policy.sensitiveBundles.joined(separator: "\n")
+        guiSensitiveTitlesText = policy.sensitiveTitles.joined(separator: "\n")
+        guiPolicyStatus = status
+    }
+
+    func loadGuiStatus() async {
+        guiStatusBusy = true
+        defer { guiStatusBusy = false }
+        do {
+            let status = try await core.guiStatus(projectID: selectedProjectID)
+            guard selectedProjectID != nil || status.runtimeId.isEmpty == false else { return }
+            guiStatus = status
+            guiStatusError = nil
+        } catch {
+            guiStatusError = error.localizedDescription
+        }
+    }
+
+    func releaseGuiLease() async {
+        guard let leaseID = guiStatus?.holder?.leaseId else { return }
+        do {
+            _ = try await core.releaseComputerLease(leaseID: leaseID)
+            guiPolicyStatus = "Released GUI lease \(leaseID.prefix(8))"
+            await loadGuiStatus()
+            await loadGuiTimeline()
+        } catch {
+            guiStatusError = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadGuiTimeline() async {
+        guard let sessionID = selectedSessionID else {
+            guiTimeline = []
+            return
+        }
+        do {
+            let result = try await core.guiTimeline(sessionID: sessionID, limit: 80)
+            guard sessionID == selectedSessionID else { return }
+            guiTimeline = result.actions
+        } catch {
+            guiStatusError = error.localizedDescription
+        }
+    }
+
+    var guiHeldBySelectedSession: Bool {
+        guard let selectedSessionID, let holder = guiStatus?.holder else { return false }
+        return holder.sessionId == selectedSessionID
+    }
+
+    var guiLatestActivity: GuiActionInfo? {
+        guiTimeline.last
+    }
+
+    var guiStageLabel: String? {
+        if let holder = guiStatus?.holder {
+            if holder.sessionId == selectedSessionID {
+                return "GUI \(holder.surface) · gen \(holder.leaseGeneration)"
+            }
+            let agent = holder.agentName.isEmpty ? holder.sessionId.prefix(8) : Substring(holder.agentName)
+            return "GUI busy · \(agent)"
+        }
+        guard let action = guiTimeline.last else { return nil }
+        return "GUI \(action.action) · gen \(action.leaseGeneration)"
     }
 
     func resetIntegrationPolicy() async {
@@ -7449,6 +7636,23 @@ final class AppModel {
                 }
             default:
                 break
+            }
+        }
+
+        if event.type == "gui.action",
+           event.sessionId == selectedSessionID,
+           let data = try? JSONEncoder().encode(event.payload),
+           let decoded = try? JSONDecoder().decode(GuiActionInfo.self, from: data)
+        {
+            guiTimeline.append(decoded)
+            if guiTimeline.count > 80 {
+                guiTimeline.removeFirst(guiTimeline.count - 80)
+            }
+        }
+
+        if event.type.hasPrefix("computer.lease.") {
+            Task { [weak self] in
+                await self?.loadGuiStatus()
             }
         }
 

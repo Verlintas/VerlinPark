@@ -154,6 +154,24 @@ pub fn decide(
 }
 
 pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> PermissionAssessment {
+    assess_tool_call_with_gui(
+        name,
+        input,
+        worktree,
+        &vp_protocol::types::GuiPolicy::default(),
+    )
+}
+
+/// Assess a call with the project's GUI policy. The default wrapper is kept
+/// for callers that do not have a project context; the agent loop uses this
+/// version so project-added sensitive bundles/titles become Destructive or are
+/// denied outright instead of slipping through as an ordinary host action.
+pub fn assess_tool_call_with_gui(
+    name: &str,
+    input: &Value,
+    worktree: &Path,
+    gui_policy: &vp_protocol::types::GuiPolicy,
+) -> PermissionAssessment {
     match name {
         "write_file" | "edit_file" | "apply_patch" | "file_manage" => {
             let path = input
@@ -219,19 +237,37 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
                 .unwrap_or("snapshot")
                 .trim()
                 .to_ascii_lowercase();
+            let sensitive = crate::gui::input_names_sensitive_target(gui_policy, input);
+            if sensitive {
+                if gui_policy.sensitive_mode == vp_protocol::types::GuiSensitiveMode::Deny {
+                    return PermissionAssessment::blocked(
+                        "the target is a sensitive GUI surface (security settings or a password manager) and the project policy denies it",
+                    );
+                }
+                return PermissionAssessment::new(
+                    RiskLevel::Destructive,
+                    "the target is a sensitive GUI surface; explicit operator approval is required",
+                );
+            }
             match action.as_str() {
                 "close" => {
                     PermissionAssessment::new(RiskLevel::ReadOnly, "closes the computer helper")
                 }
-                "permissions" | "apps" | "windows" | "snapshot" | "wait" => {
+                "permissions" | "apps" | "windows" | "displays" | "snapshot" | "wait" => {
                     PermissionAssessment::new(
                         RiskLevel::External,
                         "reads host application, Accessibility, or screen state",
                     )
                 }
+                "screenshot" if input.get("target").and_then(Value::as_str) == Some("screen") => {
+                    PermissionAssessment::new(
+                        RiskLevel::HostState,
+                        "a full-screen capture can expose unrelated sensitive windows",
+                    )
+                }
                 "screenshot" => PermissionAssessment::new(
                     RiskLevel::External,
-                    "captures host screen content into a daemon artifact",
+                    "captures a single host window into a daemon artifact",
                 ),
                 "key" if crate::computer::destructive_key_input(input) => {
                     PermissionAssessment::new(
@@ -2164,5 +2200,83 @@ mod tests {
             &worktree,
         );
         assert_eq!(close.risk, RiskLevel::ReadOnly);
+    }
+
+    #[test]
+    fn sensitive_gui_targets_are_blocked_or_require_explicit_approval() {
+        use vp_protocol::types::{GuiPolicy, GuiSensitiveMode};
+        let worktree = worktree();
+        let deny: GuiPolicy = GuiPolicy::default();
+        let system_settings = assess_tool_call_with_gui(
+            "computer",
+            &serde_json::json!({"action": "click", "bundle_id": "com.apple.systempreferences"}),
+            &worktree,
+            &deny,
+        );
+        assert!(system_settings.blocked);
+        assert_eq!(system_settings.risk, RiskLevel::Destructive);
+        let keychain = assess_tool_call_with_gui(
+            "computer",
+            &serde_json::json!({"action": "snapshot", "window_title": "Keychain Access"}),
+            &worktree,
+            &deny,
+        );
+        assert!(keychain.blocked);
+
+        let mut approval = GuiPolicy {
+            sensitive_mode: GuiSensitiveMode::RequireApproval,
+            ..GuiPolicy::default()
+        };
+        let with_approval = assess_tool_call_with_gui(
+            "computer",
+            &serde_json::json!({"action": "type", "bundle_id": "com.1password.1password", "text": "x"}),
+            &worktree,
+            &approval,
+        );
+        assert!(!with_approval.blocked);
+        assert_eq!(with_approval.risk, RiskLevel::Destructive);
+        assert!(with_approval.reason.contains("sensitive GUI surface"));
+
+        approval.sensitive_bundles = vec!["com.example.Vault".into()];
+        let custom = assess_tool_call_with_gui(
+            "computer",
+            &serde_json::json!({"action": "snapshot", "bundle_id": "com.example.Vault"}),
+            &worktree,
+            &approval,
+        );
+        assert_eq!(custom.risk, RiskLevel::Destructive);
+
+        let non_sensitive = assess_tool_call_with_gui(
+            "computer",
+            &serde_json::json!({"action": "snapshot", "bundle_id": "com.apple.Safari"}),
+            &worktree,
+            &approval,
+        );
+        assert_eq!(non_sensitive.risk, RiskLevel::External);
+    }
+
+    #[test]
+    fn full_screen_screenshots_require_host_state_approval() {
+        let worktree = worktree();
+        let window = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "screenshot", "target": "window"}),
+            &worktree,
+        );
+        assert_eq!(window.risk, RiskLevel::External);
+        let screen = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "screenshot", "target": "screen"}),
+            &worktree,
+        );
+        assert_eq!(screen.risk, RiskLevel::HostState);
+        assert!(matches!(
+            decide(ApprovalMode::Smart, &screen, false),
+            ApprovalDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            decide(ApprovalMode::Unattended, &screen, false),
+            ApprovalDecision::Deny { .. }
+        ));
     }
 }

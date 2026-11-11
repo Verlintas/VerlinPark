@@ -106,7 +106,12 @@ private final class ComputerController {
             writer.send(ResponseEnvelope.ok(id: request.id, result: result))
         } catch let failure as ComputerFailure {
             writer.send(
-                ResponseEnvelope.error(id: request.id, code: failure.code, message: failure.message)
+                ResponseEnvelope.error(
+                    id: request.id,
+                    code: failure.code,
+                    message: failure.message,
+                    details: failure.details
+                )
             )
         } catch {
             writer.send(
@@ -122,26 +127,32 @@ private final class ComputerController {
         if request.action.requiresScreenRecording {
             try AccessibilityController.requireScreenRecording()
         }
+        let policy = try SensitiveTargetPolicy.parse(request.params)
+        let target = try sensitiveTarget(for: request, policy: policy)
+        let result: Any
         switch request.action {
         case .permissions:
             let permissions = AccessibilityController.permissions()
-            var result: [String: Any] = [
+            var payload: [String: Any] = [
                 "accessibility_trusted": permissions.accessibility,
                 "screen_recording": permissions.screenRecording,
                 "helper_version": protocolVersion,
                 "pid": ProcessInfo.processInfo.processIdentifier,
             ]
             if let detail = permissions.detail {
-                result["detail"] = detail
+                payload["detail"] = detail
             }
-            return result
+            result = payload
         case .apps:
             let includeBackground = try (ParamReader.optionalBool(
                 request.params,
                 "include_background"
             )) ?? false
             let apps = try accessibility.applications(includeBackground: includeBackground)
-            return ["apps": apps, "count": apps.count]
+            result = ["apps": apps, "count": apps.count]
+        case .displays:
+            let displays = accessibility.displays()
+            result = ["displays": displays, "count": displays.count]
         case .windows:
             let bundleID = try ParamReader.optionalString(request.params, "bundle_id", max: 200)
             let pid = try ParamReader.optionalInt(request.params, "pid").map { Int32(clamping: $0) }
@@ -154,9 +165,9 @@ private final class ComputerController {
                 pid: pid,
                 includeOffscreen: includeOffscreen
             )
-            return ["windows": windows, "count": windows.count]
+            result = ["windows": windows, "count": windows.count]
         case .focus:
-            return try accessibility.focus(FocusSpec.parse(request.params))
+            result = try accessibility.focus(FocusSpec.parse(request.params))
         case .snapshot:
             let bundleID = try ParamReader.optionalString(request.params, "bundle_id", max: 200)
             let pid = try ParamReader.optionalInt(request.params, "pid").map { Int32(clamping: $0) }
@@ -169,18 +180,18 @@ private final class ComputerController {
             } else {
                 windowID = nil
             }
-            return try accessibility.snapshot(
+            result = try accessibility.snapshot(
                 bundleID: bundleID,
                 pid: pid,
                 windowID: windowID,
                 limits: SnapshotLimits.parse(request.params)
             )
         case .screenshot:
-            return try screen.capture(ScreenshotSpec.parse(request.params))
+            result = try screen.capture(ScreenshotSpec.parse(request.params))
         case .click:
-            return try input.click(ClickSpec.parse(request.params))
+            result = try input.click(ClickSpec.parse(request.params))
         case .type:
-            return try input.typeText(TypeSpec.parse(request.params))
+            result = try input.typeText(TypeSpec.parse(request.params))
         case .key:
             let rawKey = try ParamReader.requiredString(request.params, "key", max: 32)
             let modifiers = try (ParamReader.optionalStringArray(
@@ -193,22 +204,92 @@ private final class ComputerController {
                 request.params,
                 "allow_destructive"
             )) ?? false
-            return try input.key(
+            result = try input.key(
                 KeySpec(key: rawKey, modifiers: modifiers),
                 allowDestructive: allowDestructive
             )
         case .scroll:
-            return try input.scroll(ScrollSpec.parse(request.params))
+            result = try input.scroll(ScrollSpec.parse(request.params))
         case .drag:
-            return try input.drag(DragSpec.parse(request.params))
+            result = try input.drag(DragSpec.parse(request.params))
         case .wait:
-            return try wait(WaitSpec.parse(request.params))
+            result = try wait(WaitSpec.parse(request.params))
         case .close:
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
                 exit(0)
             }
-            return ["closed": true]
+            result = ["closed": true]
         }
+        guard var payload = result as? [String: Any], let target else {
+            return result
+        }
+        payload["target"] = target
+        return payload
+    }
+
+    /// Resolve the target before any input or capture. `deny` refuses entirely;
+    /// `require_approval` allows only when the daemon marked an explicitly
+    /// named target (the approval layer could see it).
+    private func sensitiveTarget(
+        for request: ComputerRequest,
+        policy: SensitiveTargetPolicy
+    ) throws -> [String: Any]? {
+        let action = request.action
+        guard action == .snapshot || action == .screenshot || action == .focus
+            || action == .click || action == .type || action == .key
+            || action == .scroll || action == .drag
+        else {
+            return nil
+        }
+        let bundleID = try ParamReader.optionalNonEmptyString(
+            request.params,
+            "bundle_id",
+            max: 200
+        )
+        let pid = try ParamReader.optionalInt(request.params, "pid").map { Int32(clamping: $0) }
+        let windowID: UInt32?
+        if let value = try ParamReader.optionalInt(request.params, "window_id") {
+            guard value > 0, value <= Int(UInt32.max) else {
+                throw ComputerFailure.invalid("window_id is out of range")
+            }
+            windowID = UInt32(value)
+        } else {
+            windowID = nil
+        }
+        let ref = try ParamReader.optionalString(
+            request.params,
+            "ref",
+            max: ComputerProtocol.maxRefLength
+        )
+        let windowTitle = try ParamReader.optionalNonEmptyString(
+            request.params,
+            "window_title",
+            max: 200
+        )
+        var info = try accessibility.targetInfo(
+            bundleID: bundleID,
+            pid: pid,
+            windowID: windowID,
+            ref: ref,
+            windowTitle: windowTitle
+        )
+        let targetBundle = info["bundle_id"] as? String
+        let targetApp = info["app"] as? String
+        let targetTitle = info["window_title"] as? String
+        let sensitive = policy.matches(
+            bundleID: targetBundle,
+            app: targetApp,
+            title: targetTitle
+        )
+        info["sensitive"] = sensitive
+        if let refusal = policy.refusal(
+            bundleID: targetBundle,
+            app: targetApp,
+            title: targetTitle
+        ) {
+            throw refusal
+        }
+        return info
     }
 
     private func wait(_ spec: WaitSpec) throws -> [String: Any] {
@@ -218,22 +299,23 @@ private final class ComputerController {
         case .window, .appFrontmost:
             break
         }
-        let started = Date()
-        let deadline = started.addingTimeInterval(Double(spec.timeoutMilliseconds) / 1000.0)
-        let interval = Double(spec.intervalMilliseconds) / 1000.0
-        repeat {
-            if accessibility.waitMatches(spec.condition) {
-                return [
-                    "matched": true,
-                    "condition": Self.describe(spec.condition),
-                    "elapsed_ms": Int(Date().timeIntervalSince(started) * 1000),
-                ]
-            }
-            Thread.sleep(forTimeInterval: interval)
-        } while Date() < deadline
-        throw ComputerFailure.timeout(
-            "wait condition \(Self.describe(spec.condition)) did not match within \(spec.timeoutMilliseconds) ms"
+        let observation = accessibility.waitForCondition(
+            spec.condition,
+            timeoutMilliseconds: spec.timeoutMilliseconds,
+            intervalMilliseconds: spec.intervalMilliseconds
         )
+        guard observation.matched else {
+            throw ComputerFailure.timeout(
+                "wait condition \(Self.describe(spec.condition)) did not match within \(spec.timeoutMilliseconds) ms"
+            )
+        }
+        return [
+            "matched": true,
+            "condition": Self.describe(spec.condition),
+            "elapsed_ms": observation.elapsedMs,
+            "observed_by": observation.observedBy,
+            "polling_fallback": true,
+        ]
     }
 
     private static func describe(_ condition: WaitCondition) -> String {

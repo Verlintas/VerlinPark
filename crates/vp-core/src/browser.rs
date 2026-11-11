@@ -27,15 +27,14 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::ComputerLeaseGuard;
 use crate::Engine;
+use crate::gui::{self, GuiAcquire, GuiActionOutcome, GuiSurface};
 use crate::tooling::fs::{atomic_write, sha256_hex};
 use crate::tools::{ToolOutput, truncate};
 
 const HELPER_BINARY: &str = "VerlinParkBrowserHelper";
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const DEFAULT_HELPER_IDLE_SECS: u64 = 600;
-const LEASE_TTL_SECS: u64 = 120;
 const MAX_SCREENSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_NAVIGATION_URL_BYTES: usize = 4_096;
 const MAX_EVALUATE_BYTES: usize = 64 * 1024;
@@ -59,6 +58,18 @@ const BROWSER_SANDBOX_PROFILE: &str = r#"(version 1)
 (deny file-write* (subpath (param "WORKTREE")))
 (deny appleevent-send)
 "#;
+
+/// Browser helper availability. Unlike the computer status path this never
+/// spawns a helper; the browser helper has no TCC permission prompt of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserHelperStatus {
+    pub platform_supported: bool,
+    pub helper_available: bool,
+    pub helper_path: Option<String>,
+    pub sandbox_available: bool,
+    pub warm_helpers: usize,
+    pub error: Option<String>,
+}
 
 /// An action requested by an agent. Kept separate from JSON parsing so the
 /// same target can be reused by future GUI surfaces.
@@ -88,34 +99,12 @@ struct BrowserHelper {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     scratch: PathBuf,
-    lease: Option<ComputerLeaseGuard>,
     next_id: u64,
     last_used: Arc<AtomicU64>,
 }
 
 impl BrowserHelper {
-    async fn spawn(
-        helper_path: &Path,
-        scratch: &Path,
-        worktree: &Path,
-        lease: ComputerLeaseGuard,
-    ) -> Result<Self> {
-        let mut lease = Some(lease);
-        let result = Self::spawn_inner(helper_path, scratch, worktree, &mut lease).await;
-        if result.is_err()
-            && let Some(lease) = lease.take()
-        {
-            lease.release().await;
-        }
-        result
-    }
-
-    async fn spawn_inner(
-        helper_path: &Path,
-        scratch: &Path,
-        worktree: &Path,
-        lease: &mut Option<ComputerLeaseGuard>,
-    ) -> Result<Self> {
+    async fn spawn(helper_path: &Path, scratch: &Path, worktree: &Path) -> Result<Self> {
         if !Path::new(SANDBOX_EXEC).is_file() {
             bail!("browser helper sandbox is unavailable; refusing to run unsandboxed");
         }
@@ -186,7 +175,6 @@ impl BrowserHelper {
             stdin,
             stdout: BufReader::new(stdout),
             scratch,
-            lease: lease.take(),
             next_id: 1,
             last_used: Arc::new(AtomicU64::new(unix_now())),
         };
@@ -209,9 +197,6 @@ impl BrowserHelper {
                 stderr.push_str("helper exited during startup");
             }
             let _ = helper.child.start_kill();
-            if let Some(lease) = helper.lease.take() {
-                lease.release().await;
-            }
             bail!("browser helper did not become ready ({stderr})");
         }
         Ok(helper)
@@ -219,12 +204,6 @@ impl BrowserHelper {
 
     fn touch(&self) {
         self.last_used.store(unix_now(), Ordering::SeqCst);
-    }
-
-    fn lease_id(&self) -> Option<String> {
-        self.lease
-            .as_ref()
-            .map(|lease| lease.lease_id().to_string())
     }
 
     async fn request(&mut self, action: &str, params: Value, deadline: Duration) -> Result<Value> {
@@ -289,9 +268,6 @@ impl BrowserHelper {
         .await;
         let _ = timeout(Duration::from_secs(2), self.child.wait()).await;
         let _ = self.child.start_kill();
-        if let Some(lease) = self.lease.take() {
-            lease.release().await;
-        }
         let _ = tokio::fs::remove_dir_all(&self.scratch).await;
     }
 }
@@ -308,6 +284,8 @@ pub struct BrowserManager {
     helpers: Mutex<HashMap<String, Arc<AsyncMutex<BrowserHelper>>>>,
     spawn_lock: AsyncMutex<()>,
     data_dir: PathBuf,
+    #[cfg(test)]
+    helper_override: Option<PathBuf>,
 }
 
 impl BrowserManager {
@@ -316,7 +294,27 @@ impl BrowserManager {
             helpers: Mutex::new(HashMap::new()),
             spawn_lock: AsyncMutex::new(()),
             data_dir,
+            #[cfg(test)]
+            helper_override: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_helper(data_dir: PathBuf, helper: PathBuf) -> Self {
+        Self {
+            helpers: Mutex::new(HashMap::new()),
+            spawn_lock: AsyncMutex::new(()),
+            data_dir,
+            helper_override: Some(helper),
+        }
+    }
+
+    fn helper_path(&self) -> Result<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = &self.helper_override {
+            return Ok(path.clone());
+        }
+        find_helper_binary()
     }
 
     pub async fn action(
@@ -357,6 +355,7 @@ impl BrowserManager {
                 .lock()
                 .ok()
                 .and_then(|mut map| map.remove(&key));
+            let had_helper = helper.is_some();
             if let Some(helper) = helper {
                 {
                     let mut helper = helper.lock().await;
@@ -367,15 +366,19 @@ impl BrowserManager {
                 if let Some(parent) = scratch.parent() {
                     let _ = tokio::fs::remove_dir(parent).await;
                 }
-                return Ok(ToolOutput::ok_structured(
-                    "browser surface closed",
-                    json!({"action": "close", "closed": true}),
-                ));
             }
-            return Ok(ToolOutput::ok_structured(
-                "no browser surface was open",
-                json!({"action": "close", "closed": false}),
-            ));
+            let released = engine.gui_end_session(target.session_id, "close").await;
+            return Ok(if had_helper {
+                ToolOutput::ok_structured(
+                    "browser surface closed",
+                    json!({"action": "close", "closed": true, "lease_released": released}),
+                )
+            } else {
+                ToolOutput::ok_structured(
+                    "no browser surface was open",
+                    json!({"action": "close", "closed": false, "lease_released": released}),
+                )
+            });
         }
 
         let params = match self.params_for(&action, target, &input) {
@@ -391,34 +394,70 @@ impl BrowserManager {
                 ));
             }
         };
-        let helper = match self.ensure_helper(engine, target, &key).await {
+        let ticket = match engine
+            .gui_begin_action(
+                GuiSurface::Browser,
+                target.session_id,
+                target.agent_id,
+                target.agent_name,
+            )
+            .await
+        {
+            Ok(GuiAcquire::Acquired(ticket)) => ticket,
+            Ok(GuiAcquire::Busy(busy)) => {
+                return Ok(ToolOutput::error_structured(
+                    busy.message.clone(),
+                    busy.to_structured(&action),
+                ));
+            }
+            Err(error) => {
+                return Ok(ToolOutput::error_structured(
+                    format!("browser {action} unavailable: {error}"),
+                    json!({
+                        "code": "GUI_LEASE_FAILED",
+                        "action": action,
+                        "message": error.to_string(),
+                        "lease_surface": gui::GUI_SURFACE,
+                    }),
+                ));
+            }
+        };
+        let mut outcome = GuiActionOutcome::new(action.clone());
+        let helper = match self.ensure_helper(target, &key).await {
             Ok(helper) => helper,
             Err(error) => {
                 let message = error.to_string();
-                let code = if message.contains("busy") {
-                    "COMPUTER_BUSY"
-                } else if message.contains("is not installed") {
+                let code = if message.contains("is not installed") {
                     "BROWSER_HELPER_UNAVAILABLE"
                 } else if message.contains("sandbox is unavailable") {
                     "BROWSER_SANDBOX_UNAVAILABLE"
+                } else if message.contains("did not become ready") {
+                    "BROWSER_HELPER_START_FAILED"
                 } else {
                     "BROWSER_HELPER_FAILED"
                 };
+                outcome.result = "error".to_string();
+                outcome.error_code = Some(code.to_string());
+                engine.gui_finish_action(&ticket, outcome).await;
                 return Ok(ToolOutput::error_structured(
                     format!("browser {action} unavailable: {message}"),
                     json!({
                         "code": code,
                         "action": action,
                         "message": message,
+                        "retryable": false,
+                        "lease_surface": gui::GUI_SURFACE,
                     }),
                 ));
             }
         };
         let deadline = action_deadline(&action, &input);
+        let started = std::time::Instant::now();
         let result = {
             let mut helper = helper.lock().await;
             helper.request(&action, params, deadline).await
         };
+        outcome.latency_ms = started.elapsed().as_millis() as u64;
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -429,8 +468,8 @@ impl BrowserManager {
                 let keep_helper = protocol_error.is_some();
                 if !keep_helper {
                     // A timed-out or crashed helper is removed so the next
-                    // action starts from a clean process and lease. Script or
-                    // element errors keep the page alive for a retry.
+                    // action starts from a clean process. Script or element
+                    // errors keep the page alive for a retry.
                     let removed = self
                         .helpers
                         .lock()
@@ -441,54 +480,80 @@ impl BrowserManager {
                         helper.shutdown().await;
                     }
                 }
+                outcome.result = "error".to_string();
+                outcome.error_code = Some(code.clone());
+                outcome.target_window = non_empty(string_param(&input, "title", 200));
+                engine.gui_finish_action(&ticket, outcome).await;
                 return Ok(ToolOutput::error_structured(
                     format!("browser {action} failed: {error}"),
                     json!({
                         "code": code,
                         "action": action,
                         "message": error.to_string(),
+                        "retryable": false,
+                        "auto_retry": false,
+                        "lease_surface": gui::GUI_SURFACE,
                     }),
                 ));
             }
         };
-        self.render(action, &result, target, &input).await
+        let output = match self.render(action.clone(), &result, target, &input).await {
+            Ok(output) => output,
+            Err(error) => {
+                outcome.result = "error".to_string();
+                outcome.error_code = Some("BROWSER_RENDER_FAILED".to_string());
+                engine.gui_finish_action(&ticket, outcome).await;
+                return Ok(ToolOutput::error_structured(
+                    format!("browser {action} failed: {error}"),
+                    json!({
+                        "code": "BROWSER_RENDER_FAILED",
+                        "action": action,
+                        "message": error.to_string(),
+                        "retryable": false,
+                    }),
+                ));
+            }
+        };
+        outcome.target_window = result
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| non_empty(string_param(&input, "title", 200)));
+        outcome.result = if output.is_error { "error" } else { "ok" }.to_string();
+        outcome.error_code = output
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("code"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        engine.gui_finish_action(&ticket, outcome).await;
+        Ok(output)
     }
 
     async fn ensure_helper(
         &self,
-        engine: &Engine,
         target: &BrowserTarget<'_>,
         key: &str,
     ) -> Result<Arc<AsyncMutex<BrowserHelper>>> {
-        if let Some(helper) = self.existing_helper(engine, key).await? {
+        if let Some(helper) = self.existing_helper(key).await {
             return Ok(helper);
         }
         let _spawn = self.spawn_lock.lock().await;
-        if let Some(helper) = self.existing_helper(engine, key).await? {
+        if let Some(helper) = self.existing_helper(key).await {
             return Ok(helper);
         }
-        let helper_path = find_helper_binary()?;
+        let helper_path = self.helper_path()?;
         if !Path::new(SANDBOX_EXEC).is_file() {
             bail!("browser helper sandbox is unavailable on this platform");
         }
-        let lease = engine
-            .acquire_computer_lease(
-                "browser",
-                target.session_id,
-                target.agent_id,
-                target.agent_name,
-                Duration::from_secs(LEASE_TTL_SECS),
-            )
-            .await?;
         let scratch = self.helper_scratch(target);
-        let helper =
-            match BrowserHelper::spawn(&helper_path, &scratch, target.worktree, lease).await {
-                Ok(helper) => helper,
-                Err(error) => {
-                    let _ = tokio::fs::remove_dir_all(&scratch).await;
-                    return Err(error);
-                }
-            };
+        let helper = match BrowserHelper::spawn(&helper_path, &scratch, target.worktree).await {
+            Ok(helper) => helper,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&scratch).await;
+                return Err(error);
+            }
+        };
         let helper = Arc::new(AsyncMutex::new(helper));
         if let Ok(mut map) = self.helpers.lock() {
             map.insert(key.to_string(), helper.clone());
@@ -496,38 +561,50 @@ impl BrowserManager {
         Ok(helper)
     }
 
-    /// Return an existing helper only if its ComputerLease row still exists.
-    /// An operator release or a sweep that removed the row invalidates the
-    /// helper instead of allowing two sessions to drive the same surface.
-    async fn existing_helper(
-        &self,
-        engine: &Engine,
-        key: &str,
-    ) -> Result<Option<Arc<AsyncMutex<BrowserHelper>>>> {
-        let Some(helper) = self
+    /// Warm helpers survive GUI lease release. A crashed child is removed so
+    /// the next action spawns a fresh process and reacquires the lease.
+    async fn existing_helper(&self, key: &str) -> Option<Arc<AsyncMutex<BrowserHelper>>> {
+        let helper = self
             .helpers
             .lock()
             .ok()
-            .and_then(|map| map.get(key).cloned())
-        else {
-            return Ok(None);
-        };
-        let lease_id = {
-            let helper = helper.lock().await;
+            .and_then(|map| map.get(key).cloned())?;
+        let alive = {
+            let mut helper = helper.lock().await;
             helper.touch();
-            helper.lease_id()
+            helper.child.try_wait().ok().flatten().is_none()
         };
-        if let Some(lease_id) = lease_id
-            && engine.computer_lease_active(&lease_id).await?
-        {
-            return Ok(Some(helper));
+        if alive {
+            return Some(helper);
         }
         let stale = self.helpers.lock().ok().and_then(|mut map| map.remove(key));
         if let Some(stale) = stale {
             let mut helper = stale.lock().await;
             helper.shutdown().await;
         }
-        Ok(None)
+        None
+    }
+
+    pub fn warm_helpers(&self) -> usize {
+        self.helpers.lock().map(|map| map.len()).unwrap_or(0)
+    }
+
+    /// Cached-free inspection of helper installation and sandbox availability.
+    /// This never spawns a helper.
+    pub fn status(&self) -> BrowserHelperStatus {
+        let helper = self.helper_path();
+        BrowserHelperStatus {
+            platform_supported: cfg!(target_os = "macos"),
+            helper_available: helper.is_ok(),
+            helper_path: helper.ok().map(|path| path.to_string_lossy().to_string()),
+            sandbox_available: Path::new(SANDBOX_EXEC).is_file(),
+            warm_helpers: self.warm_helpers(),
+            error: if cfg!(target_os = "macos") {
+                None
+            } else {
+                Some("browser helper requires macOS".to_string())
+            },
+        }
     }
 
     fn helper_scratch(&self, target: &BrowserTarget<'_>) -> PathBuf {
@@ -953,6 +1030,10 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn non_empty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
 fn string_param(input: &Value, name: &str, max: usize) -> String {
     input
         .get(name)
@@ -1226,5 +1307,380 @@ mod tests {
         render_tree(&tree, 0, &mut output);
         assert!(output.contains("document"));
         assert!(output.contains("[e1] button \"Press\""));
+    }
+}
+
+#[cfg(test)]
+mod gui_status_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn browser_status_is_inspection_only_and_reports_platform_state() {
+        let data = TempDir::new().unwrap();
+        let manager = BrowserManager::new(data.path().to_path_buf());
+        let status = manager.status();
+        assert_eq!(status.platform_supported, cfg!(target_os = "macos"));
+        assert_eq!(status.warm_helpers, 0);
+        assert_eq!(status.sandbox_available, Path::new(SANDBOX_EXEC).is_file());
+        if !status.helper_available {
+            assert!(status.helper_path.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_initially_has_no_warm_helpers() {
+        let data = TempDir::new().unwrap();
+        let manager = BrowserManager::new(data.path().to_path_buf());
+        assert_eq!(manager.warm_helpers(), 0);
+        assert_eq!(manager.stop_session("missing-session").await, 0);
+        assert_eq!(
+            BrowserManager::idle_default().as_secs(),
+            DEFAULT_HELPER_IDLE_SECS
+        );
+    }
+}
+
+#[cfg(test)]
+mod gui_contention_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+    use vp_protocol::types::GuiPolicy;
+    use vp_store::Store;
+
+    fn init_repo(path: &Path) {
+        let status = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(path.join("README.md"), "browser lease\n").unwrap();
+        let status = Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn write_script(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_without_a_surface_reports_not_closed_and_releases_any_lease() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("browser close".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "close".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let manager = BrowserManager::new(data.path().to_path_buf());
+        let target = BrowserTarget {
+            session_id: &session.id,
+            worktree: &worktree,
+            agent_id: "agent",
+            agent_name: "Agent",
+        };
+        let policy = vp_protocol::types::GuiPolicy::default();
+        assert!(matches!(
+            engine
+                .gui_begin_action_with_policy(
+                    &policy,
+                    GuiSurface::Browser,
+                    &session.id,
+                    "agent",
+                    "Agent",
+                )
+                .await
+                .unwrap(),
+            GuiAcquire::Acquired(_)
+        ));
+        assert_eq!(engine.list_computer_leases().await.unwrap().len(), 1);
+        let output = manager
+            .action(&engine, &target, json!({"action": "close"}))
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.structured.as_ref().unwrap()["closed"], false);
+        assert_eq!(output.structured.as_ref().unwrap()["lease_released"], true);
+        assert!(engine.list_computer_leases().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn crashed_browser_helper_is_removed_and_respawned() {
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            eprintln!("skipping: sandbox-exec is not available");
+            return;
+        }
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let helper_path = data.path().join("fake-crashing-browser-helper.sh");
+        write_script(
+            &helper_path,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$2/pid"
+printf '{"event":"ready","version":"1","pid":%s}
+' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"snapshot"'*)
+      printf '{"id":"%s","ok":true,"result":{"url":"file:///tmp/index.html","title":"Fake","tree":{"ref":"e1","role":"link","name":"Home","children":[]},"text":"hello","node_count":1,"truncated":false}}
+' "$id"
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}
+' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"id":"%s","ok":true,"result":{}}
+' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("browser crash".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "crash".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let manager = BrowserManager::with_helper(data.path().to_path_buf(), helper_path);
+        let target = BrowserTarget {
+            session_id: &session.id,
+            worktree: &worktree,
+            agent_id: "agent",
+            agent_name: "Agent",
+        };
+        let first = manager
+            .action(&engine, &target, json!({"action": "snapshot"}))
+            .await
+            .unwrap();
+        assert!(!first.is_error, "{}", first.content);
+        let scratch = manager.helper_scratch(&target);
+        let first_pid: i32 = std::fs::read_to_string(scratch.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: the test owns the helper child and sends a normal SIGKILL.
+        unsafe {
+            libc::kill(first_pid, libc::SIGKILL);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = manager
+            .action(&engine, &target, json!({"action": "snapshot"}))
+            .await
+            .unwrap();
+        assert!(!second.is_error, "{}", second.content);
+        let second_pid: i32 = std::fs::read_to_string(scratch.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_ne!(first_pid, second_pid);
+        assert_eq!(manager.warm_helpers(), 1);
+        manager
+            .action(&engine, &target, json!({"action": "close"}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browser_and_computer_contend_for_one_gui_lease() {
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            eprintln!("skipping: sandbox-exec is not available");
+            return;
+        }
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let browser_path = data.path().join("fake-browser-helper.sh");
+        write_script(
+            &browser_path,
+            r#"#!/bin/sh
+echo spawn >> "$0.spawns"
+printf '{"event":"ready","version":"1","pid":%s}\n' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"snapshot"'*)
+      printf '{"id":"%s","ok":true,"result":{"url":"file:///tmp/index.html","title":"Fake","tree":{"ref":"e1","role":"link","name":"Home","children":[]},"text":"hello","node_count":1,"truncated":false}}\n' "$id"
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}\n' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"id":"%s","ok":true,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let computer_path = data.path().join("fake-computer-helper.sh");
+        write_script(
+            &computer_path,
+            r#"#!/bin/sh
+echo spawn >> "$0.spawns"
+printf '{"event":"ready","version":"1","pid":%s}\n' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"apps"'*)
+      printf '{"id":"%s","ok":true,"result":{"apps":[{"name":"Fake","pid":1,"frontmost":true}],"count":1}}\n' "$id"
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}\n' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"id":"%s","ok":true,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("browser computer".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "contend".into(), None)
+            .await
+            .unwrap();
+        let other = engine
+            .create_session(project.id.clone(), "other".into(), None)
+            .await
+            .unwrap();
+        engine
+            .set_gui_policy(
+                &project.id,
+                GuiPolicy {
+                    grace_secs: 30,
+                    wait_ms: 60,
+                    ..GuiPolicy::default()
+                },
+            )
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let other_worktree = PathBuf::from(other.worktree.clone().unwrap());
+        let browsers = BrowserManager::with_helper(data.path().to_path_buf(), browser_path.clone());
+        let computers = crate::computer::ComputerManager::with_helper(
+            data.path().to_path_buf(),
+            computer_path.clone(),
+        );
+        let browser_target = BrowserTarget {
+            session_id: &session.id,
+            worktree: &worktree,
+            agent_id: "browser-agent",
+            agent_name: "Browser Agent",
+        };
+        let computer_target = crate::computer::ComputerTarget {
+            session_id: &other.id,
+            worktree: &other_worktree,
+            agent_id: "computer-agent",
+            agent_name: "Computer Agent",
+            task_id: None,
+        };
+
+        let browser = browsers
+            .action(&engine, &browser_target, json!({"action": "snapshot"}))
+            .await
+            .unwrap();
+        assert!(!browser.is_error, "{}", browser.content);
+        assert_eq!(browsers.warm_helpers(), 1);
+        assert_eq!(engine.list_computer_leases().await.unwrap().len(), 1);
+
+        let blocked = computers
+            .action(&engine, &computer_target, json!({"action": "apps"}))
+            .await
+            .unwrap();
+        assert!(blocked.is_error);
+        let structured = blocked.structured.as_ref().unwrap();
+        assert_eq!(structured["code"], "GUI_BUSY");
+        assert_eq!(structured["holder"]["agent_name"], "Browser Agent");
+
+        assert!(engine.gui_end_session(&session.id, "handoff").await);
+        assert_eq!(browsers.warm_helpers(), 1);
+        let computer = computers
+            .action(&engine, &computer_target, json!({"action": "apps"}))
+            .await
+            .unwrap();
+        assert!(!computer.is_error, "{}", computer.content);
+        assert_eq!(computers.warm_helpers(), 1);
+        assert_eq!(engine.list_computer_leases().await.unwrap().len(), 1);
+
+        let blocked_browser = browsers
+            .action(&engine, &browser_target, json!({"action": "snapshot"}))
+            .await
+            .unwrap();
+        assert!(blocked_browser.is_error);
+        assert_eq!(
+            blocked_browser.structured.as_ref().unwrap()["code"],
+            "GUI_BUSY"
+        );
+
+        let closed_computer = computers
+            .action(&engine, &computer_target, json!({"action": "close"}))
+            .await
+            .unwrap();
+        assert!(!closed_computer.is_error);
+        assert_eq!(computers.warm_helpers(), 0);
+        assert!(engine.list_computer_leases().await.unwrap().is_empty());
+        assert_eq!(browsers.warm_helpers(), 1, "browser helper stays warm");
+        engine.gui_end_session(&other.id, "cleanup").await;
+
+        let closed_browser = browsers
+            .action(&engine, &browser_target, json!({"action": "close"}))
+            .await
+            .unwrap();
+        assert!(!closed_browser.is_error);
+        assert_eq!(browsers.warm_helpers(), 0);
+        assert_eq!(browsers.stop_session(&session.id).await, 0);
     }
 }

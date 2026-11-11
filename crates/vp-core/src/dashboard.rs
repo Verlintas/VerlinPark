@@ -148,6 +148,57 @@ impl Engine {
         let fork_roots = sessions.len().saturating_sub(fork_sessions);
 
         let mut alerts = Vec::new();
+        let (gui_holder, gui_queue) = self.gui_lease_snapshot().await;
+        let gui_queue_in_scope = gui_queue
+            .iter()
+            .filter(|waiter| session_ids.contains(&waiter.session_id))
+            .count();
+        if let Some(holder) = &gui_holder {
+            let holder_project = session_projects.get(&holder.session_id).cloned();
+            let in_scope = session_ids.contains(&holder.session_id);
+            if in_scope && gui_queue_in_scope > 0 {
+                alerts.push(alert(
+                    AlertKey {
+                        id: "gui:queue".to_string(),
+                        kind: "gui_queue",
+                        severity: "warning",
+                        action: "team",
+                    },
+                    format!(
+                        "GUI surface contended: {} waiting",
+                        gui_queue_in_scope
+                    ),
+                    format!(
+                        "{} holds the {} surface; {} session(s) are in the bounded wait queue. The lease is not distributed across hosts.",
+                        holder.agent_name,
+                        holder.surface,
+                        gui_queue_in_scope
+                    ),
+                    holder_project.clone(),
+                    Some(holder.session_id.clone()),
+                ));
+            }
+            if !in_scope {
+                alerts.push(alert(
+                    AlertKey {
+                        id: "gui:stale".to_string(),
+                        kind: "gui_stale_holder",
+                        severity: "warning",
+                        action: "team",
+                    },
+                    "GUI lease held by a session outside the active set".to_string(),
+                    format!(
+                        "{} ({}) holds the {} surface until {}. Inspect or release it from Manage Dash → Team.",
+                        holder.agent_name,
+                        holder.session_id,
+                        holder.surface,
+                        holder.expires_at
+                    ),
+                    holder_project,
+                    Some(holder.session_id.clone()),
+                ));
+            }
+        }
         for approval in &approvals {
             if let Some(project_id) = session_projects.get(&approval.session_id)
                 && let Some(summary) = project_summaries.get_mut(project_id)

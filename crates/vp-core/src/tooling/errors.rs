@@ -385,6 +385,11 @@ tool_error_codes! {
     COMPUTER_ERROR => "COMPUTER_ERROR", false, "computer", "Take a fresh snapshot and inspect the target app/window before retrying.";
     COMPUTER_PERMISSION_DENIED => "COMPUTER_PERMISSION_DENIED", false, "computer", "Ask the operator to grant the required macOS privacy permission; do not bypass TCC.";
     COMPUTER_BUSY => "COMPUTER_BUSY", true, "computer", "Wait for the GUI lease holder to finish, then retry with a fresh snapshot.";
+    GUI_BUSY => "GUI_BUSY", true, "computer", "Read the holder and retry_after_ms hint, wait for the bounded GUI queue, then retry with a fresh snapshot.";
+    GUI_LEASE_FAILED => "GUI_LEASE_FAILED", false, "computer", "Inspect the GUI lease error and runtime state; do not loop on a failed acquisition.";
+    SENSITIVE_TARGET => "SENSITIVE_TARGET", false, "computer", "The target app/window is protected by policy; ask the operator instead of automating it.";
+    COMPUTER_RENDER_FAILED => "COMPUTER_RENDER_FAILED", false, "computer", "Retry the capture after the screen settles, or use a DOM snapshot for localhost pages.";
+    BROWSER_RENDER_FAILED => "BROWSER_RENDER_FAILED", false, "browser", "Retry the screenshot after the page settles, or use a DOM snapshot instead of a viewport capture.";
     STALE_REF => "STALE_REF", true, "computer", "Take a fresh snapshot and use refs from that snapshot; never reuse stale refs.";
     WINDOW_NOT_FOUND => "WINDOW_NOT_FOUND", false, "computer", "List windows/apps again and choose a live target.";
     APPS_REJECTED => "APPS_REJECTED", false, "computer", "The helper rejected the app list; inspect the error and request a bounded apps action.";

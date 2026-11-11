@@ -83,6 +83,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             store.set_shell_policy(&snapshot.project.id, &snapshot.shell_policy)?;
             store.set_execution_host(&snapshot.project.id, &snapshot.execution_host)?;
             store.set_integration_policy(&snapshot.project.id, &snapshot.integration_policy)?;
+            store.set_gui_policy(&snapshot.project.id, &snapshot.gui_policy)?;
             store.set_artifact_policy(&snapshot.project.id, &snapshot.artifact_policy)?;
             crate::tool_output::validate_tool_output_policy(&snapshot.tool_output_policy)
                 .with_context(|| {

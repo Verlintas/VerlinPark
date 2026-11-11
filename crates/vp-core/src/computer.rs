@@ -38,14 +38,13 @@ use tokio::time::timeout;
 use uuid::Uuid;
 use vp_protocol::types::{ComputerPermissions, ComputerStatusResult};
 
-use crate::ComputerLeaseGuard;
 use crate::Engine;
+use crate::gui::{self, GuiAcquire, GuiActionOutcome, GuiSurface};
 use crate::tooling::fs::sha256_hex;
 use crate::tools::{ToolOutput, truncate};
 
 const HELPER_BINARY: &str = "VerlinParkComputerHelper";
 const DEFAULT_HELPER_IDLE_SECS: u64 = 600;
-const LEASE_TTL_SECS: u64 = 120;
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_SNAPSHOT_CHARS: usize = 60_000;
@@ -67,6 +66,7 @@ pub struct ComputerTarget<'a> {
 struct ComputerProtocolError {
     code: String,
     message: String,
+    details: Option<Value>,
 }
 
 impl std::fmt::Display for ComputerProtocolError {
@@ -90,6 +90,8 @@ struct HelperMessage {
 struct HelperErrorPayload {
     code: String,
     message: String,
+    #[serde(default)]
+    details: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,33 +106,18 @@ struct ComputerHelper {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     scratch: PathBuf,
-    lease: Option<ComputerLeaseGuard>,
     next_id: u64,
     pid: Option<i32>,
     last_used: Arc<AtomicU64>,
+    /// Last generation reported by the helper. Used for diagnostics and to
+    /// attach the expected generation to a snapshot result. The helper remains
+    /// the authority: it rejects a stale ref even if Rust forwards a newer
+    /// generation.
+    last_snapshot_generation: u64,
 }
 
 impl ComputerHelper {
-    async fn spawn(
-        helper_path: &Path,
-        scratch: &Path,
-        lease: Option<ComputerLeaseGuard>,
-    ) -> Result<Self> {
-        let mut lease = lease;
-        let result = Self::spawn_inner(helper_path, scratch, &mut lease).await;
-        if result.is_err()
-            && let Some(lease) = lease.take()
-        {
-            lease.release().await;
-        }
-        result
-    }
-
-    async fn spawn_inner(
-        helper_path: &Path,
-        scratch: &Path,
-        lease: &mut Option<ComputerLeaseGuard>,
-    ) -> Result<Self> {
+    async fn spawn(helper_path: &Path, scratch: &Path) -> Result<Self> {
         tokio::fs::create_dir_all(scratch.join("home")).await?;
         tokio::fs::create_dir_all(scratch.join("tmp")).await?;
         tokio::fs::create_dir_all(scratch.join("screenshots")).await?;
@@ -187,10 +174,10 @@ impl ComputerHelper {
             stdin,
             stdout: BufReader::new(stdout),
             scratch,
-            lease: lease.take(),
             next_id: 1,
             pid,
             last_used: Arc::new(AtomicU64::new(unix_now())),
+            last_snapshot_generation: 0,
         };
         let ready = timeout(
             READY_TIMEOUT,
@@ -211,9 +198,6 @@ impl ComputerHelper {
                 detail = format!("helper exited during startup with {status}");
             }
             helper.kill();
-            if let Some(lease) = helper.lease.take() {
-                lease.release().await;
-            }
             bail!("computer helper did not become ready ({detail})");
         }
         Ok(helper)
@@ -221,12 +205,6 @@ impl ComputerHelper {
 
     fn touch(&self) {
         self.last_used.store(unix_now(), Ordering::SeqCst);
-    }
-
-    fn lease_id(&self) -> Option<String> {
-        self.lease
-            .as_ref()
-            .map(|lease| lease.lease_id().to_string())
     }
 
     async fn request(&mut self, action: &str, params: Value, deadline: Duration) -> Result<Value> {
@@ -274,10 +252,12 @@ impl ComputerHelper {
             let error = message.error.unwrap_or(HelperErrorPayload {
                 code: "COMPUTER_ERROR".to_string(),
                 message: "computer helper returned an error".to_string(),
+                details: None,
             });
             return Err(ComputerProtocolError {
                 code: error.code,
                 message: error.message,
+                details: error.details,
             }
             .into());
         }
@@ -304,9 +284,6 @@ impl ComputerHelper {
         self.kill();
         let _ = self.child.wait().await;
         self.pid = None;
-        if let Some(lease) = self.lease.take() {
-            lease.release().await;
-        }
         let _ = tokio::fs::remove_dir_all(&self.scratch).await;
     }
 }
@@ -325,9 +302,16 @@ impl Drop for ComputerHelper {
 pub struct ComputerManager {
     helpers: Mutex<HashMap<String, Arc<AsyncMutex<ComputerHelper>>>>,
     spawn_lock: AsyncMutex<()>,
+    status_cache: AsyncMutex<Option<CachedStatus>>,
+    status_lock: AsyncMutex<()>,
     data_dir: PathBuf,
     #[cfg(test)]
     helper_override: Option<PathBuf>,
+}
+
+struct CachedStatus {
+    result: ComputerStatusResult,
+    fetched: std::time::Instant,
 }
 
 impl ComputerManager {
@@ -335,6 +319,8 @@ impl ComputerManager {
         Self {
             helpers: Mutex::new(HashMap::new()),
             spawn_lock: AsyncMutex::new(()),
+            status_cache: AsyncMutex::new(None),
+            status_lock: AsyncMutex::new(()),
             data_dir,
             #[cfg(test)]
             helper_override: None,
@@ -342,10 +328,12 @@ impl ComputerManager {
     }
 
     #[cfg(test)]
-    fn with_helper(data_dir: PathBuf, helper: PathBuf) -> Self {
+    pub(crate) fn with_helper(data_dir: PathBuf, helper: PathBuf) -> Self {
         Self {
             helpers: Mutex::new(HashMap::new()),
             spawn_lock: AsyncMutex::new(()),
+            status_cache: AsyncMutex::new(None),
+            status_lock: AsyncMutex::new(()),
             data_dir,
             helper_override: Some(helper),
         }
@@ -376,9 +364,15 @@ impl ComputerManager {
         };
         let key = helper_key(target);
         if action == "close" {
-            return Ok(self.close(&key).await);
+            let output = self.close(&key).await;
+            engine.gui_end_session(target.session_id, "close").await;
+            return Ok(output);
         }
-        let params = match self.params_for(action.as_str(), target, &input) {
+        let policy = engine
+            .gui_policy_for_session(target.session_id)
+            .await
+            .unwrap_or_default();
+        let mut params = match self.params_for(action.as_str(), target, &input) {
             Ok(params) => params,
             Err(error) => {
                 return Ok(ToolOutput::error_structured(
@@ -391,32 +385,99 @@ impl ComputerManager {
                 ));
             }
         };
-        let helper = match self.ensure_helper(engine, target, &key).await {
+        if action != "permissions" {
+            gui::helper_sensitive_params(&policy, &input, &mut params);
+        }
+        let ticket = match engine
+            .gui_begin_action_with_policy(
+                &policy,
+                GuiSurface::Computer,
+                target.session_id,
+                target.agent_id,
+                target.agent_name,
+            )
+            .await
+        {
+            Ok(GuiAcquire::Acquired(ticket)) => ticket,
+            Ok(GuiAcquire::Busy(busy)) => {
+                return Ok(ToolOutput::error_structured(
+                    busy.message.clone(),
+                    busy.to_structured(&action),
+                ));
+            }
+            Err(error) => {
+                return Ok(ToolOutput::error_structured(
+                    format!("computer {action} unavailable: {error}"),
+                    json!({
+                        "code": "GUI_LEASE_FAILED",
+                        "action": action,
+                        "message": error.to_string(),
+                        "lease_surface": gui::GUI_SURFACE,
+                    }),
+                ));
+            }
+        };
+        let mut outcome = GuiActionOutcome::new(action.clone());
+        let output = self
+            .run_action(
+                engine,
+                target,
+                &key,
+                &action,
+                &params,
+                &policy,
+                &input,
+                &mut outcome,
+            )
+            .await;
+        engine.gui_finish_action(&ticket, outcome).await;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_action(
+        &self,
+        engine: &Engine,
+        target: &ComputerTarget<'_>,
+        key: &str,
+        action: &str,
+        params: &Value,
+        policy: &vp_protocol::types::GuiPolicy,
+        input: &Value,
+        outcome: &mut GuiActionOutcome,
+    ) -> ToolOutput {
+        let helper = match self.ensure_helper(target, key).await {
             Ok(helper) => helper,
             Err(error) => {
                 let message = error.to_string();
-                let code = if message.contains("busy") {
-                    "COMPUTER_BUSY"
-                } else if message.contains("is not installed") {
+                let code = if message.contains("is not installed") {
                     "COMPUTER_HELPER_UNAVAILABLE"
+                } else if message.contains("did not become ready") {
+                    "COMPUTER_HELPER_START_FAILED"
                 } else {
                     "COMPUTER_HELPER_FAILED"
                 };
-                return Ok(ToolOutput::error_structured(
+                outcome.result = "error".to_string();
+                outcome.error_code = Some(code.to_string());
+                return ToolOutput::error_structured(
                     format!("computer {action} unavailable: {message}"),
                     json!({
                         "code": code,
                         "action": action,
                         "message": message,
+                        "retryable": false,
+                        "lease_surface": gui::GUI_SURFACE,
                     }),
-                ));
+                );
             }
         };
-        let deadline = action_deadline(&action, &input);
+        let deadline = action_deadline(action, input);
+        let started = std::time::Instant::now();
         let result = {
             let mut helper = helper.lock().await;
-            helper.request(&action, params, deadline).await
+            helper.request(action, params.clone(), deadline).await
         };
+        outcome.latency_ms = started.elapsed().as_millis() as u64;
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -426,27 +487,97 @@ impl ComputerManager {
                     .unwrap_or_else(|| "COMPUTER_ERROR".to_string());
                 let keep_helper = protocol_error.is_some();
                 if !keep_helper {
-                    let removed = self
-                        .helpers
-                        .lock()
-                        .ok()
-                        .and_then(|mut map| map.remove(&key));
+                    let removed = self.helpers.lock().ok().and_then(|mut map| map.remove(key));
                     if let Some(helper) = removed {
                         let mut helper = helper.lock().await;
                         helper.shutdown().await;
                     }
                 }
-                return Ok(ToolOutput::error_structured(
+                outcome.result = "error".to_string();
+                outcome.error_code = Some(code.clone());
+                outcome.target_app = string_param(input, "app", 200);
+                outcome.target_bundle_id = string_param(input, "bundle_id", 200);
+                outcome.target_window = string_param(input, "window_title", 200);
+                return ToolOutput::error_structured(
                     format!("computer {action} failed: {error}"),
-                    json!({
-                        "code": code,
-                        "action": action,
-                        "message": error.to_string(),
-                    }),
-                ));
+                    protocol_error_output(action, protocol_error, &error),
+                );
             }
         };
-        self.render(engine, action, &result, target, &input).await
+        if action == "snapshot"
+            && let Some(generation) = result.get("snapshot_generation").and_then(Value::as_u64)
+        {
+            let mut helper = helper.lock().await;
+            helper.last_snapshot_generation = generation;
+        }
+        let helper_generation = {
+            let helper = helper.lock().await;
+            helper.last_snapshot_generation
+        };
+        let output = match self
+            .render(engine, action.to_string(), &result, target, input)
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                outcome.result = "error".to_string();
+                outcome.error_code = Some("COMPUTER_RENDER_FAILED".to_string());
+                return ToolOutput::error_structured(
+                    format!("computer {action} failed: {error}"),
+                    json!({
+                        "code": "COMPUTER_RENDER_FAILED",
+                        "action": action,
+                        "message": error.to_string(),
+                        "retryable": false,
+                    }),
+                );
+            }
+        };
+        let target_info = result.get("target").cloned().unwrap_or(Value::Null);
+        let bundle_id = target_info
+            .get("bundle_id")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("bundle_id").and_then(Value::as_str))
+            .or_else(|| input.get("bundle_id").and_then(Value::as_str))
+            .map(str::to_string);
+        let app = target_info
+            .get("app")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("app").and_then(Value::as_str))
+            .map(str::to_string);
+        let window = target_info
+            .get("window_title")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("window_title").and_then(Value::as_str))
+            .map(str::to_string);
+        let sensitive = target_info
+            .get("sensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                gui::is_sensitive_target(
+                    policy,
+                    bundle_id.as_deref(),
+                    app.as_deref(),
+                    window.as_deref(),
+                )
+            });
+        outcome.target_app = app;
+        outcome.target_bundle_id = bundle_id;
+        outcome.target_window = if sensitive { None } else { window };
+        outcome.sensitive_target = sensitive;
+        outcome.snapshot_generation = result
+            .get("snapshot_generation")
+            .and_then(Value::as_u64)
+            .or_else(|| result.get("generation").and_then(Value::as_u64))
+            .unwrap_or(helper_generation);
+        outcome.result = if output.is_error { "error" } else { "ok" }.to_string();
+        outcome.error_code = output
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("code"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        output
     }
 
     async fn close(&self, key: &str) -> ToolOutput {
@@ -469,29 +600,19 @@ impl ComputerManager {
 
     async fn ensure_helper(
         &self,
-        engine: &Engine,
         target: &ComputerTarget<'_>,
         key: &str,
     ) -> Result<Arc<AsyncMutex<ComputerHelper>>> {
-        if let Some(helper) = self.existing_helper(engine, key).await? {
+        if let Some(helper) = self.existing_helper(key).await {
             return Ok(helper);
         }
         let _spawn = self.spawn_lock.lock().await;
-        if let Some(helper) = self.existing_helper(engine, key).await? {
+        if let Some(helper) = self.existing_helper(key).await {
             return Ok(helper);
         }
         let helper_path = self.helper_path()?;
-        let lease = engine
-            .acquire_computer_lease(
-                "computer",
-                target.session_id,
-                target.agent_id,
-                target.agent_name,
-                Duration::from_secs(LEASE_TTL_SECS),
-            )
-            .await?;
         let scratch = self.helper_scratch(target);
-        let helper = match ComputerHelper::spawn(&helper_path, &scratch, Some(lease)).await {
+        let helper = match ComputerHelper::spawn(&helper_path, &scratch).await {
             Ok(helper) => helper,
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&scratch).await;
@@ -505,35 +626,33 @@ impl ComputerManager {
         Ok(helper)
     }
 
-    async fn existing_helper(
-        &self,
-        engine: &Engine,
-        key: &str,
-    ) -> Result<Option<Arc<AsyncMutex<ComputerHelper>>>> {
-        let Some(helper) = self
+    /// Reuse a warm helper even when the GUI lease was released by grace. The
+    /// helper process is independent of the lease; a crashed child is removed
+    /// so the next call respawns it.
+    async fn existing_helper(&self, key: &str) -> Option<Arc<AsyncMutex<ComputerHelper>>> {
+        let helper = self
             .helpers
             .lock()
             .ok()
-            .and_then(|map| map.get(key).cloned())
-        else {
-            return Ok(None);
-        };
-        let lease_id = {
-            let helper = helper.lock().await;
+            .and_then(|map| map.get(key).cloned())?;
+        let alive = {
+            let mut helper = helper.lock().await;
             helper.touch();
-            helper.lease_id()
+            helper.child.try_wait().ok().flatten().is_none()
         };
-        if let Some(lease_id) = lease_id
-            && engine.computer_lease_active(&lease_id).await?
-        {
-            return Ok(Some(helper));
+        if alive {
+            return Some(helper);
         }
         let stale = self.helpers.lock().ok().and_then(|mut map| map.remove(key));
         if let Some(stale) = stale {
             let mut helper = stale.lock().await;
             helper.shutdown().await;
         }
-        Ok(None)
+        None
+    }
+
+    pub fn warm_helpers(&self) -> usize {
+        self.helpers.lock().map(|map| map.len()).unwrap_or(0)
     }
 
     fn helper_scratch(&self, target: &ComputerTarget<'_>) -> PathBuf {
@@ -556,6 +675,7 @@ impl ComputerManager {
             "apps" => Ok(json!({
                 "include_background": bool_param(input, "include_background").unwrap_or(false),
             })),
+            "displays" => Ok(json!({})),
             "windows" => {
                 let mut params = json!({
                     "include_offscreen": bool_param(input, "include_offscreen").unwrap_or(false),
@@ -634,6 +754,18 @@ impl ComputerManager {
                     "max_height": optional_u64(input, "max_height")?.unwrap_or(1_200).clamp(320, 2_560),
                     "output": format!("screenshots/computer-{}.png", short_id()),
                 });
+                if let Some(index) = optional_u64(input, "display_index")? {
+                    if index > 15 {
+                        bail!("display_index must be between 0 and 15");
+                    }
+                    params["display_index"] = json!(index);
+                }
+                if let Some(id) = optional_u64(input, "display_id")? {
+                    if id == 0 || id > u32::MAX as u64 {
+                        bail!("display_id is out of range");
+                    }
+                    params["display_id"] = json!(id);
+                }
                 if let Some(window_id) = optional_u64(input, "window_id")? {
                     if window_id == 0 || window_id > u32::MAX as u64 {
                         bail!("window_id is out of range");
@@ -650,6 +782,7 @@ impl ComputerManager {
                 match (reference, x, y) {
                     (Some(reference), None, None) => {
                         validate_ref(&reference)?;
+                        attach_ref_generation(&reference, &mut params);
                         params["ref"] = json!(reference);
                     }
                     (None, Some(x), Some(y)) => {
@@ -684,8 +817,10 @@ impl ComputerManager {
                 let mut params = json!({"text": text});
                 if let Some(reference) = string_param(input, "ref", 64) {
                     validate_ref(&reference)?;
+                    attach_ref_generation(&reference, &mut params);
                     params["ref"] = json!(reference);
                 }
+                apply_window_target(input, &mut params)?;
                 Ok(params)
             }
             "key" => {
@@ -696,14 +831,16 @@ impl ComputerManager {
                 validate_key(&key)?;
                 let modifiers = modifiers_param(input)?;
                 let destructive = destructive_key_combo(&key, &modifiers);
-                Ok(json!({
+                let mut params = json!({
                     "key": key,
                     "modifiers": modifiers,
                     // This path is reached only after the agent loop's
                     // permission decision. The helper additionally refuses a
                     // destructive shortcut when this flag is absent.
                     "allow_destructive": destructive,
-                }))
+                });
+                apply_window_target(input, &mut params)?;
+                Ok(params)
             }
             "scroll" => {
                 let dx = optional_i64(input, "dx")?.unwrap_or(0);
@@ -723,8 +860,10 @@ impl ComputerManager {
                 let mut params = json!({"dx": dx, "dy": dy, "unit": unit});
                 if let Some(reference) = string_param(input, "ref", 64) {
                     validate_ref(&reference)?;
+                    attach_ref_generation(&reference, &mut params);
                     params["ref"] = json!(reference);
                 }
+                apply_window_target(input, &mut params)?;
                 Ok(params)
             }
             "drag" => {
@@ -762,6 +901,7 @@ impl ComputerManager {
                     "ref" => {
                         let reference = required_string(input, "ref")?;
                         validate_ref(&reference)?;
+                        attach_ref_generation(&reference, &mut params);
                         params["ref"] = json!(reference);
                     }
                     "element" => {
@@ -892,6 +1032,42 @@ impl ComputerManager {
                     }),
                 ))
             }
+            "displays" => {
+                let displays = result
+                    .get("displays")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut text = String::new();
+                for display in displays.iter().take(16) {
+                    let index = display.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let id = display.get("id").and_then(Value::as_u64).unwrap_or(0);
+                    let width = display.get("width").and_then(Value::as_u64).unwrap_or(0);
+                    let height = display.get("height").and_then(Value::as_u64).unwrap_or(0);
+                    let name = display.get("name").and_then(Value::as_str).unwrap_or("");
+                    let main = display
+                        .get("main")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    text.push_str(&format!(
+                        "[{index}] id {id} {width}x{height}{} {name}\n",
+                        if main { " *main" } else { "" }
+                    ));
+                }
+                if text.is_empty() {
+                    text.push_str("(no displays)");
+                }
+                Ok(ToolOutput::ok_structured(
+                    truncate(text),
+                    json!({
+                        "ok": true,
+                        "action": "displays",
+                        "displays": displays.iter().take(16).cloned().collect::<Vec<_>>(),
+                        "count": displays.len().min(16),
+                        "truncated": displays.len() > 16,
+                    }),
+                ))
+            }
             "windows" => {
                 let validated = match validate_windows_result(result) {
                     Ok(validated) => validated,
@@ -953,6 +1129,10 @@ impl ComputerManager {
                     .unwrap_or(MAX_SNAPSHOT_CHARS as u64)
                     .clamp(500, MAX_SNAPSHOT_CHARS as u64) as usize;
                 let content = truncate(text.chars().take(max_chars).collect::<String>());
+                let snapshot_generation = result
+                    .get("snapshot_generation")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 Ok(ToolOutput::ok_structured(
                     content,
                     json!({
@@ -967,6 +1147,9 @@ impl ComputerManager {
                         "bytes": validated.bytes,
                         "truncated": validated.truncated,
                         "generation": result.get("generation").cloned().unwrap_or(Value::Null),
+                        "snapshot_generation": snapshot_generation,
+                        "ref_format": "ax-g<generation>-<hash>",
+                        "stale_ref_policy": "reject_without_retry",
                         "tree": validated.tree,
                     }),
                 ))
@@ -1095,10 +1278,52 @@ impl ComputerManager {
     /// Check the helper binary and its TCC permissions without taking the GUI
     /// lease. This is an inspection path for Settings/Manage Dash; it never
     /// clicks, types, focuses, or captures a screenshot.
-    pub async fn status(&self) -> ComputerStatusResult {
-        self.status_with_helper(find_helper_binary()).await
+    ///
+    /// The result is cached for `policy.status_ttl_secs` so a dashboard refresh
+    /// does not spawn a temporary helper on every poll. `refresh` bypasses the
+    /// cache explicitly.
+    pub async fn status(
+        &self,
+        policy: &vp_protocol::types::GuiPolicy,
+        refresh: bool,
+    ) -> ComputerStatusResult {
+        if !refresh && let Some(cached) = self.status_cache.lock().await.as_ref() {
+            let age = cached.fetched.elapsed();
+            if age < Duration::from_secs(policy.status_ttl_secs) {
+                let mut result = cached.result.clone();
+                result.cached = true;
+                result.cache_age_ms = Some(age.as_millis() as u64);
+                result.grace_secs = policy.grace_secs;
+                result.wait_ms = policy.wait_ms;
+                return result;
+            }
+        }
+        let _guard = self.status_lock.lock().await;
+        if !refresh && let Some(cached) = self.status_cache.lock().await.as_ref() {
+            let age = cached.fetched.elapsed();
+            if age < Duration::from_secs(policy.status_ttl_secs) {
+                let mut result = cached.result.clone();
+                result.cached = true;
+                result.cache_age_ms = Some(age.as_millis() as u64);
+                result.grace_secs = policy.grace_secs;
+                result.wait_ms = policy.wait_ms;
+                return result;
+            }
+        }
+        let mut result = self.status_with_helper(self.helper_path()).await;
+        result.cached = false;
+        result.cache_age_ms = Some(0);
+        result.grace_secs = policy.grace_secs;
+        result.wait_ms = policy.wait_ms;
+        result.snapshot_generations = true;
+        *self.status_cache.lock().await = Some(CachedStatus {
+            result: result.clone(),
+            fetched: std::time::Instant::now(),
+        });
+        result
     }
 
+    /// Bypass the cache and spawn the helper. Tests use this directly.
     async fn status_with_helper(&self, helper_path: Result<PathBuf>) -> ComputerStatusResult {
         let platform_supported = cfg!(target_os = "macos");
         let helper_path = match helper_path {
@@ -1110,8 +1335,9 @@ impl ComputerManager {
                     helper_path: None,
                     permissions: None,
                     permissions_checked: false,
-                    lease_surface: "computer".to_string(),
+                    lease_surface: gui::GUI_SURFACE.to_string(),
                     error: Some(error.to_string()),
+                    ..ComputerStatusResult::default()
                 };
             }
         };
@@ -1119,7 +1345,7 @@ impl ComputerManager {
             .data_dir
             .join("computer-status")
             .join(Uuid::now_v7().to_string());
-        let mut helper = match ComputerHelper::spawn(&helper_path, &scratch, None).await {
+        let mut helper = match ComputerHelper::spawn(&helper_path, &scratch).await {
             Ok(helper) => helper,
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&scratch).await;
@@ -1129,8 +1355,9 @@ impl ComputerManager {
                     helper_path: Some(helper_path.to_string_lossy().to_string()),
                     permissions: None,
                     permissions_checked: false,
-                    lease_surface: "computer".to_string(),
+                    lease_surface: gui::GUI_SURFACE.to_string(),
                     error: Some(error.to_string()),
+                    ..ComputerStatusResult::default()
                 };
             }
         };
@@ -1155,8 +1382,9 @@ impl ComputerManager {
             helper_path: Some(helper_path.to_string_lossy().to_string()),
             permissions_checked: permissions.is_some(),
             permissions,
-            lease_surface: "computer".to_string(),
+            lease_surface: gui::GUI_SURFACE.to_string(),
             error: None,
+            ..ComputerStatusResult::default()
         }
     }
 
@@ -1225,6 +1453,57 @@ impl ComputerManager {
     }
 }
 
+/// Structured helper failure. STALE_REF and SENSITIVE_TARGET are explicit
+/// contracts: neither is retried automatically, and a stale ref always carries
+/// the helper's current generation so the agent can take a fresh snapshot.
+fn protocol_error_output(
+    action: &str,
+    protocol: Option<&ComputerProtocolError>,
+    error: &anyhow::Error,
+) -> Value {
+    let code = protocol
+        .map(|error| error.code.as_str())
+        .unwrap_or("COMPUTER_ERROR");
+    let details = protocol.and_then(|error| error.details.clone());
+    let generation = details
+        .as_ref()
+        .and_then(|value| value.get("snapshot_generation"))
+        .and_then(Value::as_u64);
+    let hint = details
+        .as_ref()
+        .and_then(|value| value.get("hint"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| match code {
+            "STALE_REF" => Some(
+                "Take a fresh computer snapshot and use the new ref. The action was not retried."
+                    .to_string(),
+            ),
+            "SENSITIVE_TARGET" => Some(
+                "Sensitive targets require an explicit bundle_id/window target and operator approval, or a project policy that permits the target."
+                    .to_string(),
+            ),
+            "TARGET_MISMATCH" => Some(
+                "The named target does not match the element or window that would receive the action. Name the actual bundle/window."
+                    .to_string(),
+            ),
+            _ => None,
+        });
+    json!({
+        "ok": false,
+        "code": code,
+        "action": action,
+        "message": error.to_string(),
+        "retryable": code == "STALE_REF",
+        "auto_retry": false,
+        "fresh_snapshot_required": code == "STALE_REF",
+        "snapshot_generation": generation,
+        "hint": hint,
+        "details": details,
+        "lease_surface": gui::GUI_SURFACE,
+    })
+}
+
 fn helper_key(target: &ComputerTarget<'_>) -> String {
     format!(
         "{}\n{}",
@@ -1256,6 +1535,7 @@ fn normalize_action(input: &Value) -> Result<String> {
         "permissions"
             | "apps"
             | "windows"
+            | "displays"
             | "focus"
             | "snapshot"
             | "screenshot"
@@ -1335,13 +1615,37 @@ fn validate_normalized(value: f64, name: &str) -> Result<()> {
 
 fn validate_ref(reference: &str) -> Result<()> {
     if !reference.starts_with("ax-") || reference.len() > 64 {
-        bail!("ref must be an element reference such as ax-0123456789abcdef");
+        bail!("ref must be an element reference such as ax-00000007-0123456789abcdef");
     }
     let suffix = &reference[3..];
+    // Current helper refs bind the snapshot generation:
+    //   ax-<8 hex generation>-<16 hex hash>
+    // Legacy deterministic refs without a generation remain readable so a
+    // warm helper from an older build does not turn every ref into a protocol
+    // error. The helper still checks membership in its latest snapshot.
+    if let Some((generation, hash)) = suffix.split_once('-') {
+        let generation_ok =
+            generation.len() == 8 && generation.chars().all(|value| value.is_ascii_hexdigit());
+        let hash_ok =
+            (16..=32).contains(&hash.len()) && hash.chars().all(|value| value.is_ascii_hexdigit());
+        if generation_ok && hash_ok {
+            return Ok(());
+        }
+        bail!("ref must be an element reference such as ax-00000007-0123456789abcdef");
+    }
     if !(8..=32).contains(&suffix.len()) || !suffix.chars().all(|value| value.is_ascii_hexdigit()) {
-        bail!("ref must be an element reference such as ax-0123456789abcdef");
+        bail!("ref must be an element reference such as ax-00000007-0123456789abcdef");
     }
     Ok(())
+}
+
+/// Parse the snapshot generation embedded in a current ref. Legacy refs return
+/// `None`; the helper remains authoritative and rejects them when they are not
+/// in its latest snapshot.
+fn ref_generation(reference: &str) -> Option<u64> {
+    let suffix = reference.strip_prefix("ax-")?;
+    let (generation, _hash) = suffix.split_once('-')?;
+    u64::from_str_radix(generation, 16).ok()
 }
 
 fn modifiers_param(input: &Value) -> Result<Vec<String>> {
@@ -1498,9 +1802,18 @@ pub fn destructive_key_combo(key: &str, modifiers: &[String]) -> bool {
     false
 }
 
+fn attach_ref_generation(reference: &str, params: &mut Value) {
+    if let Some(generation) = ref_generation(reference) {
+        params["ref_generation"] = json!(generation);
+    }
+}
+
 fn apply_window_target(input: &Value, params: &mut Value) -> Result<()> {
     if let Some(bundle_id) = string_param(input, "bundle_id", 200) {
         params["bundle_id"] = json!(bundle_id);
+    }
+    if let Some(title) = string_param(input, "window_title", 200) {
+        params["window_title"] = json!(title);
     }
     if let Some(window_id) = optional_u64(input, "window_id")? {
         if window_id == 0 || window_id > u32::MAX as u64 {
@@ -2888,9 +3201,7 @@ done
 "#,
         );
         let scratch = data.path().join("scratch");
-        let mut helper = ComputerHelper::spawn(&helper_path, &scratch, None)
-            .await
-            .unwrap();
+        let mut helper = ComputerHelper::spawn(&helper_path, &scratch).await.unwrap();
         let error = helper
             .request("apps", json!({}), Duration::from_secs(2))
             .await
@@ -2931,9 +3242,7 @@ done
             "#!/bin/sh\nprintf '{\"event\":\"ready\",\"version\":\"1\",\"pid\":%s}\\n' \"$$\"\nsleep 5\n",
         );
         let scratch = data.path().join("scratch");
-        let mut helper = ComputerHelper::spawn(&helper_path, &scratch, None)
-            .await
-            .unwrap();
+        let mut helper = ComputerHelper::spawn(&helper_path, &scratch).await.unwrap();
         let error = helper
             .request("apps", json!({}), Duration::from_millis(100))
             .await
@@ -3006,9 +3315,7 @@ done
 "#,
         );
         let scratch = data.path().join("scratch");
-        let mut helper = ComputerHelper::spawn(&helper_path, &scratch, None)
-            .await
-            .unwrap();
+        let mut helper = ComputerHelper::spawn(&helper_path, &scratch).await.unwrap();
         let result = helper
             .request("permissions", json!({}), Duration::from_secs(5))
             .await
@@ -3794,5 +4101,757 @@ done
         assert!(error.to_string().contains("busy"));
         first.release().await;
         assert!(engine.list_computer_leases().await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gui_session_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+    use vp_store::Store;
+
+    fn init_repo(path: &Path) {
+        let status = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(path.join("README.md"), "gui session\n").unwrap();
+        let status = Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn write_script(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+
+    fn manager() -> (ComputerManager, TempDir) {
+        let data = TempDir::new().unwrap();
+        (ComputerManager::new(data.path().to_path_buf()), data)
+    }
+
+    fn target<'a>(session: &'a str, worktree: &'a Path) -> ComputerTarget<'a> {
+        ComputerTarget {
+            session_id: session,
+            worktree,
+            agent_id: "agent-1",
+            agent_name: "Agent One",
+            task_id: None,
+        }
+    }
+
+    fn spawn_count(path: &Path) -> usize {
+        std::fs::read_to_string(format!("{}.spawns", path.display()))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn request_log(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(format!("{}.requests", path.display()))
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn status_cache_avoids_spawning_a_helper_per_refresh() {
+        let data = TempDir::new().unwrap();
+        let helper_path = data.path().join("fake-status-cache-helper.sh");
+        write_script(
+            &helper_path,
+            r#"#!/bin/sh
+echo spawn >> "$0.spawns"
+printf '{"event":"ready","version":"1","pid":%s}\n' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"permissions"'*)
+      printf '{"id":"%s","ok":true,"result":{"accessibility_trusted":true,"screen_recording":true,"detail":"ok"}}\n' "$id"
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}\n' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"id":"%s","ok":true,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let manager = ComputerManager::with_helper(data.path().to_path_buf(), helper_path.clone());
+        let policy = vp_protocol::types::GuiPolicy {
+            status_ttl_secs: 60,
+            ..Default::default()
+        };
+        let first = manager.status(&policy, false).await;
+        assert!(first.permissions_checked);
+        assert!(!first.cached);
+        assert_eq!(first.grace_secs, policy.grace_secs);
+        assert_eq!(first.wait_ms, policy.wait_ms);
+        assert_eq!(spawn_count(&helper_path), 1);
+
+        let cached = manager.status(&policy, false).await;
+        assert!(cached.cached);
+        assert!(cached.cache_age_ms.is_some());
+        assert!(cached.permissions_checked);
+        assert_eq!(spawn_count(&helper_path), 1);
+
+        let refreshed = manager.status(&policy, true).await;
+        assert!(!refreshed.cached);
+        assert_eq!(spawn_count(&helper_path), 2);
+    }
+
+    #[tokio::test]
+    async fn warm_helper_survives_lease_grace_release_and_reacquires() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let helper_path = data.path().join("fake-warm-helper.sh");
+        write_script(
+            &helper_path,
+            r#"#!/bin/sh
+echo spawn >> "$0.spawns"
+printf '{"event":"ready","version":"1","pid":%s}\n' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"apps"'*)
+      printf '{"id":"%s","ok":true,"result":{"apps":[{"name":"Fake","pid":1,"frontmost":true}],"count":1}}\n' "$id"
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}\n' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"id":"%s","ok":true,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("warm helper".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "warm".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let manager = ComputerManager::with_helper(data.path().to_path_buf(), helper_path.clone());
+        let target = ComputerTarget {
+            session_id: &session.id,
+            worktree: &worktree,
+            agent_id: "agent-1",
+            agent_name: "Agent One",
+            task_id: None,
+        };
+        let first = manager
+            .action(&engine, &target, json!({"action": "apps"}))
+            .await
+            .unwrap();
+        assert!(!first.is_error, "{}", first.content);
+        assert_eq!(spawn_count(&helper_path), 1);
+        assert_eq!(manager.warm_helpers(), 1);
+        assert_eq!(engine.list_computer_leases().await.unwrap().len(), 1);
+        assert!(engine.gui_end_session(&session.id, "test_release").await);
+        assert!(engine.list_computer_leases().await.unwrap().is_empty());
+        assert_eq!(manager.warm_helpers(), 1);
+        assert_eq!(spawn_count(&helper_path), 1);
+
+        let second = manager
+            .action(&engine, &target, json!({"action": "apps"}))
+            .await
+            .unwrap();
+        assert!(!second.is_error, "{}", second.content);
+        assert_eq!(spawn_count(&helper_path), 1);
+        assert_eq!(engine.list_computer_leases().await.unwrap().len(), 1);
+        let closed = manager
+            .action(&engine, &target, json!({"action": "close"}))
+            .await
+            .unwrap();
+        assert!(!closed.is_error);
+        assert!(engine.list_computer_leases().await.unwrap().is_empty());
+        assert_eq!(manager.warm_helpers(), 0);
+    }
+
+    #[tokio::test]
+    async fn crashed_helper_is_removed_and_respawned() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let helper_path = data.path().join("fake-crash-helper.sh");
+        write_script(
+            &helper_path,
+            r#"#!/bin/sh
+echo spawn >> "$0.spawns"
+printf '{"event":"ready","version":"1","pid":%s}\n' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"apps"'*)
+      printf '{"id":"%s","ok":true,"result":{"apps":[],"count":0}}\n' "$id"
+      exit 0
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        );
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("crash helper".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "crash".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let manager = ComputerManager::with_helper(data.path().to_path_buf(), helper_path.clone());
+        let target = ComputerTarget {
+            session_id: &session.id,
+            worktree: &worktree,
+            agent_id: "agent-1",
+            agent_name: "Agent One",
+            task_id: None,
+        };
+        let first = manager
+            .action(&engine, &target, json!({"action": "apps"}))
+            .await
+            .unwrap();
+        assert!(!first.is_error, "{}", first.content);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let second = manager
+            .action(&engine, &target, json!({"action": "apps"}))
+            .await
+            .unwrap();
+        assert!(!second.is_error, "{}", second.content);
+        assert_eq!(spawn_count(&helper_path), 2);
+        assert_eq!(manager.warm_helpers(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_ref_error_is_structured_and_never_auto_retried() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let helper_path = data.path().join("fake-stale-helper.sh");
+        write_script(
+            &helper_path,
+            r#"#!/bin/sh
+printf '{"event":"ready","version":"1","pid":%s}\n' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"click"'*)
+      echo click >> "$0.clicks"
+      printf '{"id":"%s","ok":false,"error":{"code":"STALE_REF","message":"ref is from generation 3","details":{"snapshot_generation":7,"hint":"take a fresh snapshot","auto_retry":false}}}\n' "$id"
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}\n' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"id":"%s","ok":true,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("stale".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "stale".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let manager = ComputerManager::with_helper(data.path().to_path_buf(), helper_path.clone());
+        let target = ComputerTarget {
+            session_id: &session.id,
+            worktree: &worktree,
+            agent_id: "agent-1",
+            agent_name: "Agent One",
+            task_id: None,
+        };
+        let output = manager
+            .action(
+                &engine,
+                &target,
+                json!({"action": "click", "ref": "ax-00000003-0123456789abcdef"}),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let structured = output.structured.as_ref().unwrap();
+        assert_eq!(structured["code"], "STALE_REF");
+        assert_eq!(structured["snapshot_generation"], 7);
+        assert_eq!(structured["auto_retry"], false);
+        assert_eq!(structured["fresh_snapshot_required"], true);
+        assert!(
+            structured["hint"]
+                .as_str()
+                .unwrap()
+                .contains("fresh snapshot")
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.clicks", helper_path.display()))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "the daemon must not retry a stale-ref input action"
+        );
+        let timeline = engine.gui_timeline(Some(&session.id), 10).await.unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].action, "click");
+        assert_eq!(timeline[0].error_code.as_deref(), Some("STALE_REF"));
+    }
+
+    #[tokio::test]
+    async fn sensitive_policy_and_target_metadata_reach_the_helper() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let helper_path = data.path().join("fake-sensitive-helper.sh");
+        write_script(
+            &helper_path,
+            r#"#!/bin/sh
+printf '{"event":"ready","version":"1","pid":%s}\n' "$$"
+while IFS= read -r line; do
+  echo "$line" >> "$0.requests"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"snapshot"'*)
+      printf '{"id":"%s","ok":true,"result":{"app":"System Settings","bundle_id":"com.apple.systempreferences","pid":1,"window_title":"Privacy & Security","tree":{"ref":"ax-00000001-1111111111111111","role":"AXWindow","title":"Privacy & Security","children":[]},"snapshot_generation":1,"generation":1,"truncated":false,"target":{"app":"System Settings","bundle_id":"com.apple.systempreferences","window_title":"Privacy & Security","sensitive":true}}}\n' "$id"
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}\n' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"id":"%s","ok":true,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("sensitive".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "sensitive".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let manager = ComputerManager::with_helper(data.path().to_path_buf(), helper_path.clone());
+        let target = ComputerTarget {
+            session_id: &session.id,
+            worktree: &worktree,
+            agent_id: "agent-1",
+            agent_name: "Agent One",
+            task_id: None,
+        };
+        let output = manager
+            .action(
+                &engine,
+                &target,
+                json!({
+                    "action": "snapshot",
+                    "bundle_id": "com.apple.systempreferences",
+                    "window_title": "Privacy & Security"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let structured = output.structured.as_ref().unwrap();
+        assert_eq!(structured["snapshot_generation"], 1);
+        assert_eq!(structured["stale_ref_policy"], "reject_without_retry");
+        let requests = request_log(&helper_path);
+        let snapshot_request = requests
+            .iter()
+            .find(|line| line.contains("\"action\":\"snapshot\""))
+            .expect("snapshot request");
+        assert!(snapshot_request.contains("\"sensitive_mode\":\"deny\""));
+        assert!(snapshot_request.contains("\"sensitive_ack\":true"));
+        assert!(snapshot_request.contains("com.apple.securityagent"));
+        assert!(snapshot_request.contains("system settings"));
+        let timeline = engine.gui_timeline(Some(&session.id), 10).await.unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert!(timeline[0].sensitive_target);
+        assert!(timeline[0].target_window.is_none());
+        assert_eq!(timeline[0].snapshot_generation, 1);
+        assert_eq!(
+            timeline[0].target_bundle_id.as_deref(),
+            Some("com.apple.systempreferences")
+        );
+        let _ = project;
+    }
+
+    #[tokio::test]
+    async fn status_cache_also_caches_a_helper_start_failure() {
+        let data = TempDir::new().unwrap();
+        let helper_path = data.path().join("fake-broken-status-helper.sh");
+        write_script(
+            &helper_path,
+            "#!/bin/sh\necho spawn >> \"$0.spawns\"\nexit 7\n",
+        );
+        let manager = ComputerManager::with_helper(data.path().to_path_buf(), helper_path.clone());
+        let policy = vp_protocol::types::GuiPolicy {
+            status_ttl_secs: 60,
+            ..Default::default()
+        };
+        let first = manager.status(&policy, false).await;
+        assert!(first.helper_available);
+        assert!(first.permissions.is_none());
+        assert!(!first.cached);
+        assert!(
+            first
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("did not become ready")
+        );
+        let second = manager.status(&policy, false).await;
+        assert!(second.cached);
+        assert!(
+            second
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("did not become ready")
+        );
+        assert_eq!(spawn_count(&helper_path), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_status_refreshes_share_one_helper_spawn() {
+        let data = TempDir::new().unwrap();
+        let helper_path = data.path().join("fake-concurrent-status-helper.sh");
+        write_script(
+            &helper_path,
+            r#"#!/bin/sh
+echo spawn >> "$0.spawns"
+printf '{"event":"ready","version":"1","pid":%s}\n' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"permissions"'*)
+      printf '{"id":"%s","ok":true,"result":{"accessibility_trusted":true,"screen_recording":false}}\n' "$id"
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}\n' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"id":"%s","ok":true,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let manager = Arc::new(ComputerManager::with_helper(
+            data.path().to_path_buf(),
+            helper_path.clone(),
+        ));
+        let policy = vp_protocol::types::GuiPolicy {
+            status_ttl_secs: 60,
+            ..Default::default()
+        };
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let manager = manager.clone();
+            let policy = policy.clone();
+            tasks.push(tokio::spawn(
+                async move { manager.status(&policy, false).await },
+            ));
+        }
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+        assert_eq!(spawn_count(&helper_path), 1);
+        assert!(results.iter().all(|status| status.permissions_checked));
+        assert!(results.iter().any(|status| !status.cached));
+        assert_eq!(results.iter().filter(|status| status.cached).count(), 5);
+    }
+
+    #[test]
+    fn generation_bearing_refs_parse_but_invalid_forms_do_not() {
+        assert!(validate_ref("ax-00000007-0123456789abcdef").is_ok());
+        assert_eq!(ref_generation("ax-00000007-0123456789abcdef"), Some(7));
+        assert_eq!(ref_generation("ax-0123456789abcdef"), None);
+        assert!(validate_ref("ax-0000000-0123456789abcdef").is_err());
+        assert!(validate_ref("ax-00000007-0123456789abcdeg").is_err());
+        assert!(validate_ref("ax-00000007-0123456789abcd").is_err());
+        assert!(validate_ref("ax-00000007-0123456789abcdef00").is_ok());
+        assert!(ref_generation("not-a-ref").is_none());
+    }
+
+    #[tokio::test]
+    async fn close_without_a_warm_helper_still_releases_the_gui_lease() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("close lease".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "close".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let manager = ComputerManager::new(data.path().to_path_buf());
+        let policy = vp_protocol::types::GuiPolicy::default();
+        let ticket = engine
+            .gui_begin_action_with_policy(
+                &policy,
+                GuiSurface::Computer,
+                &session.id,
+                "agent",
+                "Agent",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(ticket, GuiAcquire::Acquired(_)));
+        assert_eq!(engine.list_computer_leases().await.unwrap().len(), 1);
+        let output = manager
+            .action(
+                &engine,
+                &ComputerTarget {
+                    session_id: &session.id,
+                    worktree: &worktree,
+                    agent_id: "agent",
+                    agent_name: "Agent",
+                    task_id: None,
+                },
+                json!({"action": "close"}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.structured.as_ref().unwrap()["closed"], false);
+        assert!(engine.list_computer_leases().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gui_busy_includes_holder_and_retry_hint() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("busy".into()),
+            )
+            .await
+            .unwrap();
+        let first = engine
+            .create_session(project.id.clone(), "holder".into(), None)
+            .await
+            .unwrap();
+        let second = engine
+            .create_session(project.id, "waiter".into(), None)
+            .await
+            .unwrap();
+        let policy = vp_protocol::types::GuiPolicy {
+            grace_secs: 30,
+            wait_ms: 100,
+            ..Default::default()
+        };
+        let held = engine
+            .gui_begin_action_with_policy(&policy, GuiSurface::Computer, &first.id, "a", "Agent A")
+            .await
+            .unwrap();
+        assert!(matches!(held, GuiAcquire::Acquired(_)));
+        let output = engine
+            .computers
+            .action(
+                &engine,
+                &ComputerTarget {
+                    session_id: &second.id,
+                    worktree: Path::new("/tmp/missing-worktree"),
+                    agent_id: "b",
+                    agent_name: "Agent B",
+                    task_id: None,
+                },
+                json!({"action": "apps"}),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let structured = output.structured.as_ref().unwrap();
+        assert_eq!(structured["code"], "GUI_BUSY");
+        assert_eq!(structured["holder"]["session_id"], first.id);
+        assert!(structured["retry_after_ms"].as_u64().unwrap() > 0);
+        assert_eq!(structured["lease_surface"], "gui");
+    }
+
+    #[test]
+    fn displays_action_and_screenshot_display_selectors_are_bounded() {
+        assert_eq!(
+            normalize_action(&json!({"action": "displays"})).unwrap(),
+            "displays"
+        );
+        let (manager, _data) = manager();
+        let target = target("ses", Path::new("/tmp/worktree"));
+        let params = manager
+            .params_for(
+                "screenshot",
+                &target,
+                &json!({
+                    "target": "screen",
+                    "display_index": 2,
+                    "display_id": 7,
+                    "max_width": 800,
+                    "max_height": 600
+                }),
+            )
+            .unwrap();
+        assert_eq!(params["display_index"], 2);
+        assert_eq!(params["display_id"], 7);
+        assert_eq!(params["target"], "screen");
+        assert!(
+            manager
+                .params_for("screenshot", &target, &json!({"display_index": 16}))
+                .is_err()
+        );
+        assert!(
+            manager
+                .params_for("screenshot", &target, &json!({"display_id": 0}))
+                .is_err()
+        );
+        assert_eq!(
+            manager.params_for("displays", &target, &json!({})).unwrap(),
+            json!({})
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_renders_displays_with_a_bound() {
+        let data = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
+        let (manager, _data) = manager();
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let target = target("ses", worktree.path());
+        let displays = (0..20)
+            .map(|index| {
+                json!({
+                    "index": index,
+                    "id": index + 1,
+                    "width": 1920,
+                    "height": 1080,
+                    "name": format!("Display {index}"),
+                    "main": index == 0
+                })
+            })
+            .collect::<Vec<_>>();
+        let output = manager
+            .render(
+                &engine,
+                "displays".to_string(),
+                &json!({"displays": displays}),
+                &target,
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert!(
+            output
+                .content
+                .contains("[0] id 1 1920x1080 *main Display 0")
+        );
+        let structured = output.structured.as_ref().unwrap();
+        assert_eq!(structured["count"], 16);
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["displays"].as_array().unwrap().len(), 16);
+    }
+
+    #[tokio::test]
+    async fn wait_results_report_the_observation_path() {
+        let data = TempDir::new().unwrap();
+        let worktree = TempDir::new().unwrap();
+        let (manager, _data) = manager();
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let target = target("ses", worktree.path());
+        let output = manager
+            .render(
+                &engine,
+                "wait".to_string(),
+                &json!({"matched": true, "elapsed_ms": 42, "observed_by": "ax_observer"}),
+                &target,
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert_eq!(
+            output.structured.as_ref().unwrap()["result"]["observed_by"],
+            "ax_observer"
+        );
+
+        let timeout = manager
+            .render(
+                &engine,
+                "wait".to_string(),
+                &json!({"matched": false}),
+                &target,
+                &json!({}),
+            )
+            .await;
+        // The renderer treats a helper success frame as a match; the helper
+        // returns TIMEOUT instead. This asserts the render path stays bounded.
+        assert!(timeout.is_ok());
     }
 }

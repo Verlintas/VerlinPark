@@ -95,8 +95,9 @@ use vp_protocol::types::{
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
     ComputerLeaseReleaseResult, ComputerLeaseSweepResult, ComputerStatusParams, DaemonInstanceInfo,
-    RuntimeLeaseAuditInfo, RuntimeLeaseHistoryParams, RuntimeLeaseHistoryResult, RuntimeLeaseInfo,
-    RuntimeLeaseListResult, RuntimeLeaseSweepResult,
+    GuiPolicyParams, GuiPolicyResult, GuiTimelineParams, GuiTimelineResult, RuntimeLeaseAuditInfo,
+    RuntimeLeaseHistoryParams, RuntimeLeaseHistoryResult, RuntimeLeaseInfo, RuntimeLeaseListResult,
+    RuntimeLeaseSweepResult, SetGuiPolicyParams,
 };
 use vp_protocol::types::{
     CoordinationNoteParams, CoordinationNoteResult, OrchestrationAdvanceParams,
@@ -166,6 +167,9 @@ async fn main() -> Result<()> {
             "marked sessions interrupted by the previous daemon as failed"
         );
     }
+    if let Err(error) = engine.retire_legacy_gui_leases().await {
+        tracing::warn!(%error, "failed to retire legacy GUI leases");
+    }
     if let Err(error) = engine.record_project_manifest().await {
         tracing::warn!(%error, "failed to write project manifest");
     }
@@ -203,6 +207,7 @@ async fn main() -> Result<()> {
     spawn_terminal_sweeper(state.engine.clone());
     spawn_browser_sweeper(state.engine.clone());
     spawn_computer_sweeper(state.engine.clone());
+    spawn_gui_grace_sweeper(state.engine.clone());
     spawn_task_stall_sweeper(state.engine.clone());
     spawn_stall_recovery_reconciler(state.agent.clone());
     spawn_orchestration_controller(state.engine.clone());
@@ -816,6 +821,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                             acquired_at: lease.acquired_at,
                             heartbeat_at: lease.heartbeat_at,
                             expires_at: lease.expires_at,
+                            generation: lease.generation,
                         })
                         .collect(),
                 },
@@ -1897,7 +1903,64 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "agent.info" => RpcResponse::success(id, state.agent.info()),
         "computer.status" => match parse_params::<ComputerStatusParams>(request.params) {
-            Ok(_params) => RpcResponse::success(id, state.engine.computer_status().await),
+            Ok(params) => RpcResponse::success(
+                id,
+                state
+                    .engine
+                    .computer_status_for(params.session_id.as_deref(), params.refresh)
+                    .await,
+            ),
+            Err(response) => response_with_id(id, response),
+        },
+        "gui.status" => match parse_params::<vp_protocol::types::GuiStatusParams>(request.params) {
+            Ok(params) => match state.engine.gui_status(params.project_id.as_deref()).await {
+                Ok(status) => RpcResponse::success(id, status),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "gui.timeline" => match parse_params::<GuiTimelineParams>(request.params) {
+            Ok(params) => {
+                let limit = params.limit.unwrap_or(100).clamp(1, 500);
+                match state
+                    .engine
+                    .gui_timeline(params.session_id.as_deref(), limit)
+                    .await
+                {
+                    Ok(actions) => RpcResponse::success(id, GuiTimelineResult { actions, limit }),
+                    Err(error) => internal_error(id, error),
+                }
+            }
+            Err(response) => response_with_id(id, response),
+        },
+        "gui.policy.get" => match parse_params::<GuiPolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_gui_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    GuiPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "gui.policy.set" => match parse_params::<SetGuiPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_gui_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    GuiPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
             Err(response) => response_with_id(id, response),
         },
         "agent.probe" => match state.agent.probe().await {
@@ -3668,6 +3731,24 @@ fn spawn_browser_sweeper(engine: Engine) {
             let browsers = engine.sweep_idle_browsers(idle).await;
             if browsers > 0 {
                 tracing::info!(browsers, "closed idle browser helpers");
+            }
+        }
+    });
+}
+
+/// Release the logical GUI lease shortly after its grace expires. Helpers stay
+/// warm for their own idle window; this sweeper only releases ownership so the
+/// next session can take the GUI without waiting for the 120s lease TTL.
+fn spawn_gui_grace_sweeper(engine: Engine) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let released = engine.sweep_gui_grace().await;
+            if released > 0 {
+                tracing::debug!(released, "released GUI lease after grace");
             }
         }
     });

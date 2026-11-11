@@ -11244,3 +11244,128 @@ async fn database_rebuild_preserves_context_checkpoint_policy() {
         1
     );
 }
+
+#[tokio::test]
+async fn dashboard_alerts_surface_gui_contention_and_out_of_scope_holders() {
+    use crate::gui::{GuiAcquire, GuiSurface};
+    use vp_protocol::types::GuiPolicy;
+
+    let data = TempDir::new().unwrap();
+    let repo_a = TempDir::new().unwrap();
+    let repo_b = TempDir::new().unwrap();
+    init_repo(repo_a.path());
+    init_repo(repo_b.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project_a = engine
+        .add_project(
+            repo_a.path().to_string_lossy().to_string(),
+            Some("gui alpha".into()),
+        )
+        .await
+        .unwrap();
+    let project_b = engine
+        .add_project(
+            repo_b.path().to_string_lossy().to_string(),
+            Some("gui beta".into()),
+        )
+        .await
+        .unwrap();
+    let holder = engine
+        .create_session(project_a.id.clone(), "holder".into(), None)
+        .await
+        .unwrap();
+    let waiter = engine
+        .create_session(project_a.id.clone(), "waiter".into(), None)
+        .await
+        .unwrap();
+    let other = engine
+        .create_session(project_b.id.clone(), "other".into(), None)
+        .await
+        .unwrap();
+    let policy = GuiPolicy {
+        grace_secs: 30,
+        wait_ms: 3_000,
+        ..GuiPolicy::default()
+    };
+    let ticket = match engine
+        .gui_begin_action_with_policy(
+            &policy,
+            GuiSurface::Computer,
+            &holder.id,
+            "agent-a",
+            "Agent A",
+        )
+        .await
+        .unwrap()
+    {
+        GuiAcquire::Acquired(ticket) => ticket,
+        GuiAcquire::Busy(busy) => panic!("holder was busy: {busy}"),
+    };
+    let waiter_engine = engine.clone();
+    let waiter_policy = policy.clone();
+    let waiter_session = waiter.id.clone();
+    let waiting = tokio::spawn(async move {
+        waiter_engine
+            .gui_begin_action_with_policy(
+                &waiter_policy,
+                GuiSurface::Browser,
+                &waiter_session,
+                "agent-b",
+                "Agent B",
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let snapshot = engine
+        .dashboard_snapshot(Some(&project_a.id))
+        .await
+        .unwrap();
+    let queue_alert = snapshot
+        .alerts
+        .iter()
+        .find(|alert| alert.kind == "gui_queue")
+        .expect("gui queue alert");
+    assert_eq!(queue_alert.severity, "warning");
+    assert_eq!(queue_alert.action, "team");
+    assert!(queue_alert.detail.contains("bounded wait queue"));
+    assert_eq!(queue_alert.session_id.as_deref(), Some(holder.id.as_str()));
+
+    // Filtering to the other project must not claim the held surface belongs
+    // to that project's active set.
+    let other_snapshot = engine
+        .dashboard_snapshot(Some(&project_b.id))
+        .await
+        .unwrap();
+    let stale = other_snapshot
+        .alerts
+        .iter()
+        .find(|alert| alert.kind == "gui_stale_holder")
+        .expect("stale holder alert");
+    // The filtered dashboard does not resolve the out-of-scope session's
+    // project; the holder session id and expiry are still actionable.
+    assert_eq!(stale.project_id, None);
+    assert!(stale.detail.contains("Agent A"));
+
+    assert!(engine.gui_end_session(&holder.id, "handoff").await);
+    let waiter_ticket = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match waiter_ticket {
+        GuiAcquire::Acquired(ticket) => assert_eq!(ticket.session_id, waiter.id),
+        GuiAcquire::Busy(busy) => panic!("waiter timed out: {busy}"),
+    }
+    engine.gui_end_session(&waiter.id, "cleanup").await;
+    let _ = (ticket, other);
+    let after = engine
+        .dashboard_snapshot(Some(&project_a.id))
+        .await
+        .unwrap();
+    assert!(
+        !after
+            .alerts
+            .iter()
+            .any(|alert| alert.kind == "gui_queue" || alert.kind == "gui_stale_holder")
+    );
+}

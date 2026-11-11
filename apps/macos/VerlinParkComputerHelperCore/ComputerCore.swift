@@ -58,10 +58,12 @@ public enum ComputerProtocol {
 public struct ComputerFailure: Error, CustomStringConvertible {
     public let code: String
     public let message: String
+    public let details: [String: Any]?
 
-    public init(_ code: String, _ message: String) {
+    public init(_ code: String, _ message: String, details: [String: Any]? = nil) {
         self.code = code
         self.message = message
+        self.details = details
     }
 
     public var description: String {
@@ -80,8 +82,55 @@ public struct ComputerFailure: Error, CustomStringConvertible {
         ComputerFailure("TIMEOUT", message)
     }
 
-    public static func staleRef(_ ref: String) -> ComputerFailure {
-        ComputerFailure("STALE_REF", "element reference \(ref) is not in the latest snapshot")
+    /// A stale ref carries the helper's current generation and an explicit
+    /// snapshot hint. The daemon surfaces this as a structured error and never
+    /// retries the input action automatically.
+    public static func staleRef(
+        _ ref: String,
+        generation: UInt64,
+        hint: String = "Take a fresh snapshot and use the new ref. The action was not retried."
+    ) -> ComputerFailure {
+        ComputerFailure(
+            "STALE_REF",
+            "element reference \(ref) is not in the latest snapshot (generation \(generation))",
+            details: [
+                "snapshot_generation": generation,
+                "ref_generation": ElementRef.generation(from: ref) ?? 0,
+                "action": "snapshot",
+                "hint": hint,
+                "auto_retry": false,
+            ]
+        )
+    }
+
+    public static func sensitiveTarget(
+        _ bundleID: String?,
+        app: String?,
+        title: String?,
+        requiresApproval: Bool
+    ) -> ComputerFailure {
+        var details: [String: Any] = [
+            "requires_approval": requiresApproval,
+            "auto_retry": false,
+            "hint": requiresApproval
+                ? "Re-issue the action with an explicit bundle_id or window_id so the daemon approval layer can classify the target."
+                :
+                "The project GUI policy denies this sensitive target. Change the policy or ask the operator.",
+        ]
+        if let bundleID, !bundleID.isEmpty {
+            details["bundle_id"] = String(bundleID.prefix(200))
+        }
+        if let app, !app.isEmpty {
+            details["app"] = String(app.prefix(200))
+        }
+        if let title, !title.isEmpty {
+            details["window_title"] = String(title.prefix(200))
+        }
+        return ComputerFailure(
+            "SENSITIVE_TARGET",
+            "the target is a sensitive GUI surface and the helper refused the action",
+            details: details
+        )
     }
 }
 
@@ -189,6 +238,7 @@ public enum ComputerAction: String, CaseIterable {
     case permissions
     case apps
     case windows
+    case displays
     case focus
     case snapshot
     case screenshot
@@ -211,7 +261,7 @@ public enum ComputerAction: String, CaseIterable {
     /// Actions that inspect the Accessibility tree or host application list.
     public var isReadOnlyInspection: Bool {
         switch self {
-        case .permissions, .apps, .windows, .snapshot, .wait, .close:
+        case .permissions, .apps, .windows, .displays, .snapshot, .wait, .close:
             true
         default:
             false
@@ -223,7 +273,7 @@ public enum ComputerAction: String, CaseIterable {
     /// they have their own Screen Recording preflight.
     public var requiresAccessibility: Bool {
         switch self {
-        case .permissions, .screenshot, .close:
+        case .permissions, .screenshot, .displays, .close:
             false
         case .apps, .windows, .focus, .snapshot, .click, .type, .key, .scroll, .drag, .wait:
             true
@@ -241,7 +291,7 @@ public enum ComputerAction: String, CaseIterable {
         switch self {
         case .focus, .click, .type, .key, .scroll, .drag:
             true
-        case .permissions, .apps, .windows, .snapshot, .screenshot, .wait, .close:
+        case .permissions, .apps, .windows, .displays, .snapshot, .screenshot, .wait, .close:
             false
         }
     }
@@ -317,14 +367,23 @@ public enum ResponseEnvelope {
         ]
     }
 
-    public static func error(id: String, code: String, message: String) -> [String: Any] {
-        [
+    public static func error(
+        id: String,
+        code: String,
+        message: String,
+        details: [String: Any]? = nil
+    ) -> [String: Any] {
+        var error: [String: Any] = [
+            "code": String(code.prefix(64)),
+            "message": String(message.prefix(4000)),
+        ]
+        if let details {
+            error["details"] = JSONSanitizer.sanitize(details)
+        }
+        return [
             "id": id,
             "ok": false,
-            "error": [
-                "code": String(code.prefix(64)),
-                "message": String(message.prefix(4000)),
-            ],
+            "error": error,
         ]
     }
 }
@@ -514,6 +573,8 @@ public enum ScreenshotOutput {
 public struct ScreenshotSpec {
     public let target: ScreenshotTarget
     public let windowID: UInt32?
+    public let displayIndex: Int?
+    public let displayID: UInt32?
     public let maxWidth: Int
     public let maxHeight: Int
     public let output: String
@@ -536,6 +597,24 @@ public struct ScreenshotSpec {
             // The helper falls back to the frontmost window; this is explicit
             // rather than a silent screen capture.
         }
+        let displayIndex: Int?
+        if let value = try ParamReader.optionalInt(params, "display_index") {
+            guard (0 ... 15).contains(value) else {
+                throw ComputerFailure.invalid("display_index must be between 0 and 15")
+            }
+            displayIndex = value
+        } else {
+            displayIndex = nil
+        }
+        let displayID: UInt32?
+        if let value = try ParamReader.optionalInt(params, "display_id") {
+            guard value > 0, value <= Int(UInt32.max) else {
+                throw ComputerFailure.invalid("display_id is out of range")
+            }
+            displayID = UInt32(value)
+        } else {
+            displayID = nil
+        }
         let maxWidth = try ((ParamReader.optionalInt(params, "max_width"))
             ?? ComputerProtocol.defaultScreenshotWidth)
             .clamped(to: ComputerProtocol.minScreenshotDimension ... ComputerProtocol.maxScreenshotDimension)
@@ -547,6 +626,8 @@ public struct ScreenshotSpec {
         return ScreenshotSpec(
             target: target,
             windowID: windowID,
+            displayIndex: displayIndex,
+            displayID: displayID,
             maxWidth: maxWidth,
             maxHeight: maxHeight,
             output: output
@@ -800,7 +881,18 @@ public enum SensitiveValuePolicy {
 }
 
 public enum ElementRef {
-    public static func make(pid: Int32, windowIndex: Int, path: [String]) -> String {
+    /// Current refs bind the snapshot generation:
+    ///   ax-<8 hex generation>-<16 hex hash>
+    /// A ref from an older generation is rejected even when the same element
+    /// still exists. Legacy refs without a generation remain parseable so a
+    /// warm helper from an older build does not reject every ref, but the
+    /// helper still checks membership in the latest snapshot.
+    public static func make(
+        pid: Int32,
+        windowIndex: Int,
+        path: [String],
+        generation: UInt64
+    ) -> String {
         var hash = FNV1a()
         hash.combine("pid=\(pid)")
         hash.combine("window=\(windowIndex)")
@@ -808,7 +900,12 @@ public enum ElementRef {
             hash.combine("|")
             hash.combine(component)
         }
-        return "ax-" + String(format: "%016llx", hash.value)
+        return "ax-" + String(format: "%08llx", generation & 0xFFFF_FFFF)
+            + "-" + String(format: "%016llx", hash.value)
+    }
+
+    public static func make(pid: Int32, windowIndex: Int, path: [String]) -> String {
+        make(pid: pid, windowIndex: windowIndex, path: path, generation: 0)
     }
 
     public static func isValid(_ ref: String) -> Bool {
@@ -816,8 +913,218 @@ public enum ElementRef {
             return false
         }
         let suffix = ref.dropFirst(3)
+        if let separator = suffix.firstIndex(of: "-") {
+            let generation = suffix[..<separator]
+            let hash = suffix[suffix.index(after: separator)...]
+            guard generation.count == 8, generation.allSatisfy(\.isHexDigit),
+                  (16 ... 32).contains(hash.count),
+                  hash.allSatisfy(\.isHexDigit)
+            else {
+                return false
+            }
+            return true
+        }
         guard (8 ... 32).contains(suffix.count) else { return false }
         return suffix.allSatisfy(\.isHexDigit)
+    }
+
+    /// Embedded generation, or nil for a legacy deterministic ref.
+    public static func generation(from ref: String) -> UInt64? {
+        guard ref.hasPrefix("ax-") else { return nil }
+        let suffix = ref.dropFirst(3)
+        guard let separator = suffix.firstIndex(of: "-") else { return nil }
+        let generation = suffix[..<separator]
+        guard generation.count == 8 else { return nil }
+        return UInt64(generation, radix: 16)
+    }
+}
+
+public struct SensitiveTargetPolicy: Equatable {
+    public enum Mode: String, Equatable {
+        case deny
+        case requireApproval = "require_approval"
+    }
+
+    public static let builtInBundles: [String] = [
+        "com.apple.systempreferences",
+        "com.apple.systemsettings",
+        "com.apple.securityagent",
+        "com.apple.keychainaccess",
+        "com.apple.passwords",
+        "com.apple.loginwindow",
+        "com.1password.1password",
+        "com.1password.1password7",
+        "com.agilebits.onepassword7",
+        "com.bitwarden.desktop",
+        "com.lastpass.lastpass",
+        "com.dashlane.dashlane",
+        "com.keepersecurity.passwordmanager",
+        "com.nordpass.nordpass",
+    ]
+
+    public static let builtInTitles: [String] = [
+        "system settings",
+        "system preferences",
+        "securityagent",
+        "keychain access",
+        "passwords",
+        "privacy & security",
+        "screen recording",
+        "full disk access",
+        "accessibility",
+        "authentication",
+        "1password",
+        "bitwarden",
+        "lastpass",
+        "dashlane",
+        "nordpass",
+    ]
+
+    public let mode: Mode
+    public let bundles: [String]
+    public let titles: [String]
+    public let acknowledged: Bool
+
+    public init(
+        mode: Mode,
+        bundles: [String] = [],
+        titles: [String] = [],
+        acknowledged: Bool = false
+    ) {
+        self.mode = mode
+        self.bundles = Self.normalizedBundles(bundles)
+        self.titles = Self.normalizedTitles(titles)
+        self.acknowledged = acknowledged
+    }
+
+    public static func parse(_ params: [String: Any]) throws -> SensitiveTargetPolicy {
+        let rawMode = try (ParamReader.optionalString(params, "sensitive_mode", max: 40)) ?? "deny"
+        let mode = Mode(rawValue: rawMode.lowercased()) ?? .deny
+        let bundles = try ParamReader.optionalStringArray(
+            params,
+            "sensitive_bundles",
+            maxItems: 64,
+            maxItemBytes: 200
+        ) ?? []
+        let titles = try ParamReader.optionalStringArray(
+            params,
+            "sensitive_titles",
+            maxItems: 64,
+            maxItemBytes: 200
+        ) ?? []
+        let acknowledged = try (ParamReader.optionalBool(params, "sensitive_ack")) ?? false
+        return SensitiveTargetPolicy(
+            mode: mode,
+            bundles: bundles,
+            titles: titles,
+            acknowledged: acknowledged
+        )
+    }
+
+    public static func normalizedBundles(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        var result: [String] = []
+        for value in values {
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !normalized.isEmpty, seen.insert(normalized).inserted {
+                result.append(normalized)
+            }
+        }
+        return result
+    }
+
+    public static func normalizedTitles(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        var result: [String] = []
+        for value in values {
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !normalized.isEmpty, seen.insert(normalized).inserted {
+                result.append(normalized)
+            }
+        }
+        return result
+    }
+
+    public var effectiveBundles: [String] {
+        var values = Self.builtInBundles
+        for bundle in bundles where !values.contains(bundle) {
+            values.append(bundle)
+        }
+        return values
+    }
+
+    public var effectiveTitles: [String] {
+        var values = Self.builtInTitles
+        for title in titles where !values.contains(title) {
+            values.append(title)
+        }
+        return values
+    }
+
+    public func matches(bundleID: String?, app: String?, title: String?) -> Bool {
+        if let bundleID, !bundleID.isEmpty {
+            let normalized = bundleID.lowercased()
+            if effectiveBundles.contains(normalized) {
+                return true
+            }
+        }
+        let haystacks = [app, title]
+            .compactMap { $0?.lowercased() }
+            .filter { !$0.isEmpty }
+        guard !haystacks.isEmpty else { return false }
+        return effectiveTitles.contains { candidate in
+            haystacks.contains { $0.contains(candidate) }
+        }
+    }
+
+    /// nil means the action may proceed. A failure means the helper refuses
+    /// before touching the target.
+    public func refusal(
+        bundleID: String?,
+        app: String?,
+        title: String?
+    ) -> ComputerFailure? {
+        guard matches(bundleID: bundleID, app: app, title: title) else {
+            return nil
+        }
+        switch mode {
+        case .deny:
+            return ComputerFailure.sensitiveTarget(
+                bundleID,
+                app: app,
+                title: title,
+                requiresApproval: false
+            )
+        case .requireApproval:
+            guard acknowledged else {
+                return ComputerFailure.sensitiveTarget(
+                    bundleID,
+                    app: app,
+                    title: title,
+                    requiresApproval: true
+                )
+            }
+            return nil
+        }
+    }
+}
+
+public struct SnapshotGenerationCounter {
+    public private(set) var generation: UInt64 = 0
+    public private(set) var refs: Set<String> = []
+
+    public init() {}
+
+    @discardableResult
+    public mutating func next(refs: Set<String>) -> UInt64 {
+        generation += 1
+        self.refs = refs
+        return generation
+    }
+
+    public func isCurrent(_ ref: String) -> Bool {
+        guard ElementRef.generation(from: ref) == generation else { return false }
+        return refs.contains(ref)
     }
 }
 
@@ -1135,6 +1442,43 @@ public enum WaitCondition: Equatable {
     }
 }
 
+/// Bounded wait arithmetic shared by the helper's AX observer and polling
+/// fallback. Keeping it pure makes the timeout/interval contract testable
+/// without a GUI session.
+public struct WaitDeadline: Equatable {
+    public let startedAt: Date
+    public let timeoutMilliseconds: Int
+
+    public init(startedAt: Date = Date(), timeoutMilliseconds: Int) {
+        self.startedAt = startedAt
+        self.timeoutMilliseconds = max(0, timeoutMilliseconds)
+    }
+
+    public var timeoutInterval: TimeInterval {
+        Double(timeoutMilliseconds) / 1000.0
+    }
+
+    public func remaining(at now: Date = Date()) -> TimeInterval {
+        max(0, timeoutInterval - now.timeIntervalSince(startedAt))
+    }
+
+    public func isExpired(at now: Date = Date()) -> Bool {
+        remaining(at: now) <= 0
+    }
+
+    public func sleepInterval(
+        intervalMilliseconds: Int,
+        at now: Date = Date()
+    ) -> TimeInterval {
+        let interval = Double(max(0, intervalMilliseconds)) / 1000.0
+        return min(interval, remaining(at: now))
+    }
+
+    public func elapsedMilliseconds(at now: Date = Date()) -> Int {
+        max(0, Int(now.timeIntervalSince(startedAt) * 1000))
+    }
+}
+
 public struct WaitSpec {
     public let condition: WaitCondition
     public let timeoutMilliseconds: Int
@@ -1248,6 +1592,7 @@ public struct ScreenshotMetadata: Codable, Equatable {
     public var sha256: String
     public var target: String
     public var windowID: UInt32?
+    public var displayID: UInt32?
 
     enum CodingKeys: String, CodingKey {
         case path
@@ -1257,7 +1602,20 @@ public struct ScreenshotMetadata: Codable, Equatable {
         case sha256
         case target
         case windowID = "window_id"
+        case displayID = "display_id"
     }
+}
+
+/// One physical display reported by `computer displays`. The index is stable
+/// only for the current helper process/session; `id` is the CGDirectDisplayID
+/// used by `screenshot.display_id`.
+public struct DisplayInfo: Codable, Equatable {
+    public let index: Int
+    public let id: UInt32
+    public let width: Int
+    public let height: Int
+    public let name: String
+    public let main: Bool
 }
 
 public extension Comparable {

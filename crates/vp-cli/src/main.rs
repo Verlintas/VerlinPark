@@ -688,6 +688,50 @@ enum Command {
         /// Report helper installation and Accessibility/Screen Recording state.
         #[arg(long)]
         status: bool,
+        /// Bypass the short-lived helper/TCC status cache.
+        #[arg(long)]
+        refresh: bool,
+        /// Use this session's project policy for status.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Show the unified GUI lease, holder, queue, helper status, and policy.
+    Gui {
+        /// Include the bounded GUI action timeline.
+        #[arg(long)]
+        timeline: bool,
+        /// Restrict the timeline to one session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Project whose GUI policy should be reported.
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show the project's GUI session policy.
+    GuiPolicy { project: String },
+    /// Update the project's GUI session policy (omitted fields stay unchanged).
+    GuiPolicySet {
+        project: String,
+        #[arg(long)]
+        grace_secs: Option<u64>,
+        #[arg(long)]
+        wait_ms: Option<u64>,
+        #[arg(long)]
+        status_ttl_secs: Option<u64>,
+        /// deny or require_approval.
+        #[arg(long)]
+        sensitive_mode: Option<String>,
+        /// Additional sensitive bundle id (repeatable).
+        #[arg(long = "sensitive-bundle")]
+        sensitive_bundle: Vec<String>,
+        /// Additional sensitive title/app pattern (repeatable).
+        #[arg(long = "sensitive-title")]
+        sensitive_title: Vec<String>,
+        /// Replace the additional sensitive lists instead of appending.
+        #[arg(long)]
+        replace_sensitive: bool,
     },
     /// Show the project's shell permission policy.
     ShellPolicy { project: String },
@@ -3072,9 +3116,16 @@ async fn main() -> Result<()> {
             sweep,
             release,
             status,
+            refresh,
+            session,
         } => {
             if status {
-                rpc(&discovery, "computer.status", json!({})).await?
+                rpc(
+                    &discovery,
+                    "computer.status",
+                    json!({"session_id": session, "refresh": refresh}),
+                )
+                .await?
             } else if let Some(lease_id) = release {
                 rpc(
                     &discovery,
@@ -3087,6 +3138,79 @@ async fn main() -> Result<()> {
             } else {
                 rpc(&discovery, "computer.leases", json!({})).await?
             }
+        }
+        Command::Gui {
+            timeline,
+            session,
+            project,
+            limit,
+        } => {
+            if timeline {
+                rpc(
+                    &discovery,
+                    "gui.timeline",
+                    json!({"session_id": session, "limit": limit}),
+                )
+                .await?
+            } else {
+                rpc(&discovery, "gui.status", json!({"project_id": project})).await?
+            }
+        }
+        Command::GuiPolicy { project } => {
+            rpc(&discovery, "gui.policy.get", json!({"project_id": project})).await?
+        }
+        Command::GuiPolicySet {
+            project,
+            grace_secs,
+            wait_ms,
+            status_ttl_secs,
+            sensitive_mode,
+            sensitive_bundle,
+            sensitive_title,
+            replace_sensitive,
+        } => {
+            let current = rpc(&discovery, "gui.policy.get", json!({"project_id": project})).await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(grace_secs) = grace_secs {
+                policy["grace_secs"] = json!(grace_secs);
+            }
+            if let Some(wait_ms) = wait_ms {
+                policy["wait_ms"] = json!(wait_ms);
+            }
+            if let Some(status_ttl_secs) = status_ttl_secs {
+                policy["status_ttl_secs"] = json!(status_ttl_secs);
+            }
+            if let Some(sensitive_mode) = sensitive_mode {
+                policy["sensitive_mode"] = json!(sensitive_mode);
+            }
+            if replace_sensitive {
+                policy["sensitive_bundles"] = json!([]);
+                policy["sensitive_titles"] = json!([]);
+            }
+            if !sensitive_bundle.is_empty() {
+                let mut bundles = policy
+                    .get("sensitive_bundles")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                bundles.extend(sensitive_bundle.into_iter().map(Value::String));
+                policy["sensitive_bundles"] = json!(bundles);
+            }
+            if !sensitive_title.is_empty() {
+                let mut titles = policy
+                    .get("sensitive_titles")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                titles.extend(sensitive_title.into_iter().map(Value::String));
+                policy["sensitive_titles"] = json!(titles);
+            }
+            rpc(
+                &discovery,
+                "gui.policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
         }
         Command::ShellPolicy { project } => {
             rpc(

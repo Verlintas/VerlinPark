@@ -22,7 +22,13 @@ final class ScreenController {
     func capture(_ spec: ScreenshotSpec) throws -> [String: Any] {
         try AccessibilityController.requireScreenRecording()
         let content = try shareableContent()
-        let source: (width: Int, height: Int, filter: SCContentFilter, windowID: UInt32?)
+        let source: (
+            width: Int,
+            height: Int,
+            filter: SCContentFilter,
+            windowID: UInt32?,
+            displayID: UInt32?
+        )
         switch spec.target {
         case .window:
             let window = try selectWindow(content: content, id: spec.windowID)
@@ -30,17 +36,17 @@ final class ScreenController {
                 Int(window.frame.width.rounded()),
                 Int(window.frame.height.rounded()),
                 SCContentFilter(desktopIndependentWindow: window),
-                window.windowID
+                window.windowID,
+                nil
             )
         case .screen:
-            guard let display = content.displays.first else {
-                throw ComputerFailure("SCREENSHOT_FAILED", "no shareable display is available")
-            }
+            let display = try selectDisplay(content: content, spec: spec)
             source = (
                 display.width,
                 display.height,
                 SCContentFilter(display: display, excludingWindows: []),
-                nil
+                nil,
+                display.displayID
             )
         }
         guard source.width > 0, source.height > 0 else {
@@ -87,7 +93,8 @@ final class ScreenController {
             bytes: encoded.data.count,
             sha256: digest,
             target: spec.target.rawValue,
-            windowID: source.windowID
+            windowID: source.windowID,
+            displayID: source.displayID
         )
         var result = Self.dictionary(metadata)
         result["source_width"] = source.width
@@ -158,6 +165,42 @@ final class ScreenController {
         case let .failure(error):
             throw ComputerFailure("SCREENSHOT_FAILED", "\(error)")
         }
+    }
+
+    private func selectDisplay(
+        content: SCShareableContent,
+        spec: ScreenshotSpec
+    ) throws -> SCDisplay {
+        if let id = spec.displayID {
+            guard let display = content.displays.first(where: { $0.displayID == id }) else {
+                throw ComputerFailure(
+                    "DISPLAY_NOT_FOUND",
+                    "display id \(id) is not shareable; run computer displays for the current list"
+                )
+            }
+            return display
+        }
+        if let index = spec.displayIndex {
+            guard index >= 0, index < content.displays.count else {
+                throw ComputerFailure(
+                    "DISPLAY_NOT_FOUND",
+                    "display index \(index) is out of range; run computer displays"
+                )
+            }
+            return content.displays[index]
+        }
+        let mainNumber = NSScreen.main?.deviceDescription[
+            NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber
+        if let mainID = mainNumber?.uint32Value,
+           let display = content.displays.first(where: { $0.displayID == mainID })
+        {
+            return display
+        }
+        guard let display = content.displays.first else {
+            throw ComputerFailure("SCREENSHOT_FAILED", "no shareable display is available")
+        }
+        return display
     }
 
     private func selectWindow(content: SCShareableContent, id: UInt32?) throws -> SCWindow {

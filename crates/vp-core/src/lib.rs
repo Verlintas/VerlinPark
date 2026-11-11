@@ -94,6 +94,7 @@ pub mod console;
 pub mod context;
 pub mod continuation;
 mod dashboard;
+pub mod gui;
 pub mod history;
 pub mod mcp;
 pub mod memory;
@@ -170,6 +171,7 @@ pub struct Engine {
     terminals: Arc<terminal::TerminalManager>,
     browsers: Arc<browser::BrowserManager>,
     computers: Arc<computer::ComputerManager>,
+    gui: Arc<gui::GuiCoordinator>,
     scheduler: Arc<scheduler::TaskScheduler>,
     runtime_id: String,
     continuation_claims: Arc<Mutex<HashMap<String, SessionContinuationClaim>>>,
@@ -745,6 +747,7 @@ impl Engine {
             terminals: Arc::new(terminal::TerminalManager::new()),
             browsers: Arc::new(browser::BrowserManager::new(data_dir.clone())),
             computers: Arc::new(computer::ComputerManager::new(data_dir)),
+            gui: Arc::new(gui::GuiCoordinator::new()),
             runtime_id,
             continuation_claims: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1188,6 +1191,223 @@ impl Engine {
             let _ = self.events.send(event);
         }
         Ok(removed)
+    }
+
+    /// Retire legacy `browser`/`computer` rows at daemon startup. Helper
+    /// processes are daemon children, so no legacy helper survives a restart.
+    pub async fn retire_legacy_gui_leases(&self) -> Result<usize> {
+        let store = self.store.clone();
+        let (removed, events) = tokio::task::spawn_blocking(move || {
+            store.clear_legacy_gui_leases("legacy GUI surface retired at daemon startup")
+        })
+        .await??;
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        if removed > 0 {
+            tracing::info!(removed, "retired legacy browser/computer GUI leases");
+        }
+        Ok(removed)
+    }
+
+    pub async fn gui_lease_holder(&self) -> Result<Option<vp_store::store::ComputerLease>> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.gui_lease_holder()).await?
+    }
+
+    pub async fn get_gui_policy(&self, project_id: &str) -> Result<vp_protocol::types::GuiPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_gui_policy(&project_id)).await?
+    }
+
+    pub async fn set_gui_policy(
+        &self,
+        project_id: &str,
+        policy: vp_protocol::types::GuiPolicy,
+    ) -> Result<vp_protocol::types::GuiPolicy> {
+        policy.validate().map_err(|error| anyhow::anyhow!(error))?;
+        let policy = policy.normalized();
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            move || store.get_project(&project)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let for_store = policy.clone();
+        let project = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.set_gui_policy(&project, &for_store)).await??;
+        if let Err(error) = self.record_project_manifest().await {
+            tracing::warn!(%error, "failed to record GUI policy in the project manifest");
+        }
+        Ok(policy)
+    }
+
+    pub async fn gui_policy_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<vp_protocol::types::GuiPolicy> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.gui_policy_for_session(&session_id)).await?
+    }
+
+    /// Acquire or wait for the single physical GUI surface. The wait is bounded
+    /// by the project policy; a timeout returns a typed `GUI_BUSY` with the
+    /// holder and retry hint. There is no hidden infinite wait.
+    pub async fn gui_begin_action(
+        &self,
+        surface: gui::GuiSurface,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+    ) -> Result<gui::GuiAcquire> {
+        let policy = self.gui_policy_for_session(session_id).await?;
+        self.gui_begin_action_with_policy(&policy, surface, session_id, agent_id, agent_name)
+            .await
+    }
+
+    /// Same acquisition with a policy the caller already loaded. Managers use
+    /// this so one action performs one project-policy lookup.
+    pub async fn gui_begin_action_with_policy(
+        &self,
+        policy: &vp_protocol::types::GuiPolicy,
+        surface: gui::GuiSurface,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+    ) -> Result<gui::GuiAcquire> {
+        self.gui
+            .begin(self, policy, surface, session_id, agent_id, agent_name)
+            .await
+    }
+
+    /// Record one bounded GUI action event. Screen content, typed text, and
+    /// element values are never included. A failed event append does not fail
+    /// the completed GUI action.
+    pub async fn gui_finish_action(
+        &self,
+        ticket: &gui::GuiActionTicket,
+        outcome: gui::GuiActionOutcome,
+    ) -> Option<vp_protocol::types::GuiActionInfo> {
+        let action = self.gui.finish(ticket, outcome).await;
+        let payload = match serde_json::to_value(&action) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(%error, "failed to serialize GUI action event");
+                return None;
+            }
+        };
+        if let Err(error) = self
+            .append_event(&ticket.session_id, "gui.action", payload)
+            .await
+        {
+            tracing::warn!(%error, "failed to append GUI action event");
+        }
+        Some(action)
+    }
+
+    /// Release the GUI lease immediately on close or session cleanup.
+    pub async fn gui_end_session(&self, session_id: &str, reason: &str) -> bool {
+        self.gui.release_session(session_id, reason).await
+    }
+
+    /// Release leases whose grace elapsed. Called by the short GUI sweeper.
+    pub async fn sweep_gui_grace(&self) -> usize {
+        self.gui.sweep().await
+    }
+
+    /// Lightweight holder/FIFO snapshot used by dashboard alerts. Unlike
+    /// `gui_status` this does not touch helper/TCC status.
+    pub async fn gui_lease_snapshot(
+        &self,
+    ) -> (
+        Option<vp_protocol::types::GuiLeaseInfo>,
+        Vec<vp_protocol::types::GuiQueueInfo>,
+    ) {
+        let (mut holder, queue) = self.gui.status().await;
+        if let Some(holder) = holder.as_mut() {
+            holder.owner_id = self.runtime_id.clone();
+        } else if let Ok(Some(lease)) = self.gui_lease_holder().await {
+            holder = Some(vp_protocol::types::GuiLeaseInfo {
+                lease_id: lease.lease_id,
+                owner_id: lease.owner_id,
+                session_id: lease.session_id,
+                agent_id: lease.agent_id,
+                agent_name: lease.agent_name,
+                surface: lease.surface,
+                lease_generation: lease.generation,
+                acquired_at: lease.acquired_at,
+                last_action_at: lease.heartbeat_at,
+                expires_at: lease.expires_at,
+                queue_position: None,
+            });
+        }
+        (holder, queue)
+    }
+
+    pub async fn gui_warm_helper_counts(&self) -> (usize, usize) {
+        (self.computers.warm_helpers(), self.browsers.warm_helpers())
+    }
+
+    pub async fn gui_timeline(
+        &self,
+        session_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<vp_protocol::types::GuiActionInfo>> {
+        let store = self.store.clone();
+        let session_id = session_id.map(str::to_string);
+        tokio::task::spawn_blocking(move || store.recent_gui_actions(session_id.as_deref(), limit))
+            .await?
+    }
+
+    /// Unified GUI status for Manage Dash, the CLI, and `gui.status`. The
+    /// computer status path is cached for the project `status_ttl_secs`.
+    pub async fn gui_status(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<vp_protocol::types::GuiStatusResult> {
+        let policy = match project_id {
+            Some(project_id) => self.get_gui_policy(project_id).await?,
+            None => vp_protocol::types::GuiPolicy::default(),
+        };
+        let computer = self.computers.status(&policy, false).await;
+        let browser = self.browsers.status();
+        let (mut holder, queue) = self.gui.status().await;
+        if let Some(holder) = holder.as_mut() {
+            holder.owner_id = self.runtime_id.clone();
+        } else if let Ok(Some(lease)) = self.gui_lease_holder().await {
+            holder = Some(vp_protocol::types::GuiLeaseInfo {
+                lease_id: lease.lease_id,
+                owner_id: lease.owner_id,
+                session_id: lease.session_id,
+                agent_id: lease.agent_id,
+                agent_name: lease.agent_name,
+                surface: lease.surface,
+                lease_generation: lease.generation,
+                acquired_at: lease.acquired_at,
+                last_action_at: lease.heartbeat_at,
+                expires_at: lease.expires_at,
+                queue_position: None,
+            });
+        }
+        let (warm_computer_helpers, warm_browser_helpers) = self.gui_warm_helper_counts().await;
+        Ok(vp_protocol::types::GuiStatusResult {
+            runtime_id: self.runtime_id.clone(),
+            lease_surface: gui::GUI_SURFACE.to_string(),
+            holder,
+            queue,
+            policy,
+            computer,
+            browser_helper_available: browser.helper_available,
+            browser_helper_path: browser.helper_path,
+            browser_sandbox_available: browser.sandbox_available,
+            warm_computer_helpers,
+            warm_browser_helpers,
+            stale_ref_supported: true,
+        })
     }
 
     pub(crate) fn git_mutex(&self) -> Arc<Mutex<()>> {
@@ -13852,8 +14072,9 @@ impl Engine {
     }
 
     /// Run one bounded browser action for an agent. The helper is session- and
-    /// worktree-scoped, uses a non-persistent WebKit store, and holds the
-    /// daemon-wide `browser` ComputerLease for its lifetime.
+    /// worktree-scoped and uses a non-persistent WebKit store. The physical GUI
+    /// is owned by the unified `gui` lease for the action plus its project
+    /// grace window; the warm helper itself holds no lease.
     pub async fn browser_action(
         &self,
         session_id: &str,
@@ -13871,8 +14092,10 @@ impl Engine {
         self.browsers.action(self, &target, input).await
     }
 
-    /// Stop browser helpers owned by a session before scratch cleanup.
+    /// Stop browser helpers owned by a session before scratch cleanup and
+    /// release the GUI lease immediately.
     pub async fn stop_session_browsers(&self, session_id: &str) -> usize {
+        self.gui_end_session(session_id, "session_cleanup").await;
         self.browsers.stop_session(session_id).await
     }
 
@@ -13882,8 +14105,8 @@ impl Engine {
     }
 
     /// Run one bounded native computer action for an agent. The helper is
-    /// session- and worktree-scoped, runs with the logged-in user's authority,
-    /// and holds the daemon-wide `computer` ComputerLease for its lifetime.
+    /// session- and worktree-scoped and runs with the logged-in user's
+    /// authority. The unified `gui` lease serializes it with the browser.
     pub async fn computer_action(
         &self,
         session_id: &str,
@@ -13906,11 +14129,30 @@ impl Engine {
     /// Inspect helper availability and TCC permissions without taking the GUI
     /// lease or posting any input.
     pub async fn computer_status(&self) -> vp_protocol::types::ComputerStatusResult {
-        self.computers.status().await
+        self.computer_status_for(None, false).await
     }
 
-    /// Stop computer helpers owned by a session before scratch cleanup.
+    /// Cached helper/TCC status. When `session_id` is present its project
+    /// policy controls the cache TTL and grace hint.
+    pub async fn computer_status_for(
+        &self,
+        session_id: Option<&str>,
+        refresh: bool,
+    ) -> vp_protocol::types::ComputerStatusResult {
+        let policy = match session_id {
+            Some(session_id) => self
+                .gui_policy_for_session(session_id)
+                .await
+                .unwrap_or_default(),
+            None => vp_protocol::types::GuiPolicy::default(),
+        };
+        self.computers.status(&policy, refresh).await
+    }
+
+    /// Stop computer helpers owned by a session before scratch cleanup and
+    /// release the GUI lease immediately.
     pub async fn stop_session_computers(&self, session_id: &str) -> usize {
+        self.gui_end_session(session_id, "session_cleanup").await;
         self.computers.stop_session(session_id).await
     }
 

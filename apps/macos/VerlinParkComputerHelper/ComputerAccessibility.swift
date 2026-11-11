@@ -11,9 +11,85 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
+/// AX change observer used by `computer wait`. Notifications are best-effort:
+/// AppKit does not promise a notification for every visual change, so the wait
+/// loop always re-checks the condition and treats the polling interval as the
+/// fallback. The observer is created only when a target pid is known.
+final class AccessibilityChangeObserver {
+    private var observer: AXObserver?
+    private var source: CFRunLoopSource?
+    private var changed = false
+    private let pid: Int32
+
+    init?(pid: Int32) {
+        self.pid = pid
+        var observer: AXObserver?
+        let status = AXObserverCreate(pid, accessibilityObserverCallback, &observer)
+        guard status == .success, let observer else {
+            return nil
+        }
+        self.observer = observer
+        let app = AXUIElementCreateApplication(pid)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let notifications: [String] = [
+            kAXFocusedWindowChangedNotification,
+            kAXWindowCreatedNotification,
+            kAXFocusedUIElementChangedNotification,
+            kAXSelectedChildrenChangedNotification,
+            kAXValueChangedNotification,
+            kAXTitleChangedNotification,
+            kAXUIElementDestroyedNotification,
+        ]
+        for notification in notifications {
+            AXObserverAddNotification(observer, app, notification as CFString, context)
+        }
+        source = AXObserverGetRunLoopSource(observer)
+        if let source {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .defaultMode)
+        }
+    }
+
+    func service(seconds: TimeInterval) {
+        let deadline = Date().addingTimeInterval(seconds)
+        repeat {
+            CFRunLoopRunInMode(.defaultMode, max(0.01, deadline.timeIntervalSinceNow), true)
+            if changed {
+                changed = false
+                return
+            }
+        } while Date() < deadline
+    }
+
+    func markChanged() {
+        changed = true
+        CFRunLoopStop(CFRunLoopGetCurrent())
+    }
+
+    deinit {
+        if let source {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .defaultMode)
+        }
+        _ = pid
+    }
+}
+
+private func accessibilityObserverCallback(
+    _: AXObserver,
+    _: AXUIElement,
+    _: CFString,
+    _ refcon: UnsafeMutableRawPointer?
+) {
+    guard let refcon else { return }
+    let watcher = Unmanaged<AccessibilityChangeObserver>
+        .fromOpaque(refcon)
+        .takeUnretainedValue()
+    watcher.markChanged()
+}
+
 final class AccessibilityController {
     private var refs: [String: AXUIElement] = [:]
     private var lastSnapshotPid: Int32?
+    private(set) var snapshotGeneration: UInt64 = 0
 
     // MARK: - Permissions
 
@@ -220,7 +296,13 @@ final class AccessibilityController {
         let budget = SnapshotBudget(limits: limits)
         var nextRefs: [String: AXUIElement] = [:]
         var visited: Set<CFHashCode> = []
-        let appRef = ElementRef.make(pid: pid, windowIndex: 0, path: ["app"])
+        let generation = snapshotGeneration + 1
+        let appRef = ElementRef.make(
+            pid: pid,
+            windowIndex: 0,
+            path: ["app"],
+            generation: generation
+        )
         let appNode = SnapshotNode(
             ref: appRef,
             role: "AXApplication",
@@ -250,7 +332,8 @@ final class AccessibilityController {
                 budget: budget,
                 limits: limits,
                 visited: &visited,
-                refs: &nextRefs
+                refs: &nextRefs,
+                generation: generation
             ) else {
                 appNode.truncated = true
                 continue
@@ -291,10 +374,13 @@ final class AccessibilityController {
             )
         }
         refs = nextRefs
+        snapshotGeneration = generation
         lastSnapshotPid = pid
         var result = payload
         result["bytes"] = bytes
         result["generation"] = Int(Date().timeIntervalSince1970 * 1000)
+        result["snapshot_generation"] = generation
+        result["ref_format"] = "ax-g<generation>-<hash>"
         return result
     }
 
@@ -339,7 +425,8 @@ final class AccessibilityController {
         budget: SnapshotBudget,
         limits: SnapshotLimits,
         visited: inout Set<CFHashCode>,
-        refs: inout [String: AXUIElement]
+        refs: inout [String: AXUIElement],
+        generation: UInt64
     ) -> SnapshotNode? {
         let hash = CFHash(element)
         if visited.contains(hash) {
@@ -359,7 +446,12 @@ final class AccessibilityController {
         let label = SensitiveValuePolicy.boundedLabel(rawDescription)
         let rawValue = isValueRole(role) ? stringAttribute(element, kAXValueAttribute) : nil
         let value = SensitiveValuePolicy.redactedValue(role: role, subrole: subrole, raw: rawValue)
-        let ref = ElementRef.make(pid: pid, windowIndex: windowIndex, path: path)
+        let ref = ElementRef.make(
+            pid: pid,
+            windowIndex: windowIndex,
+            path: path,
+            generation: generation
+        )
         let node = SnapshotNode(
             ref: ref,
             role: String(role.prefix(80)),
@@ -399,7 +491,8 @@ final class AccessibilityController {
                 budget: budget,
                 limits: limits,
                 visited: &visited,
-                refs: &refs
+                refs: &refs,
+                generation: generation
             ) {
                 kept.append(built)
             } else {
@@ -414,10 +507,141 @@ final class AccessibilityController {
         guard ElementRef.isValid(ref) else {
             throw ComputerFailure.invalid("ref is not a valid element reference")
         }
+        if let generation = ElementRef.generation(from: ref),
+           generation != snapshotGeneration
+        {
+            throw ComputerFailure.staleRef(ref, generation: snapshotGeneration)
+        }
         guard let element = refs[ref] else {
-            throw ComputerFailure.staleRef(ref)
+            throw ComputerFailure.staleRef(ref, generation: snapshotGeneration)
         }
         return element
+    }
+
+    // MARK: - Displays
+
+    /// Physical displays visible to AppKit. The index is for `screenshot`
+    /// convenience; `id` is the stable CGDirectDisplayID for this boot.
+    func displays() -> [[String: Any]] {
+        let main = NSScreen.main
+        return NSScreen.screens.enumerated().map { index, screen in
+            let number = screen.deviceDescription[
+                NSDeviceDescriptionKey("NSScreenNumber")
+            ] as? NSNumber
+            let id = number?.uint32Value ?? 0
+            let frame = screen.frame
+            return [
+                "index": index,
+                "id": Int(id),
+                "width": Int(frame.width.rounded()),
+                "height": Int(frame.height.rounded()),
+                "name": screen.localizedName,
+                "main": screen == main,
+            ]
+        }
+    }
+
+    // MARK: - Sensitive target preflight
+
+    /// Resolve the app/window that an action would touch before the helper
+    /// performs it. The daemon sends the same sensitive list; this method makes
+    /// the helper's decision independent of a stale daemon view.
+    func targetInfo(
+        bundleID: String?,
+        pid explicitPid: Int32?,
+        windowID: UInt32?,
+        ref: String?,
+        windowTitle: String? = nil
+    ) throws -> [String: Any] {
+        var pid = explicitPid
+        var title = windowTitle ?? ""
+        var resolvedWindowID = windowID
+        if let ref {
+            let element = try resolveRef(ref)
+            var elementPid: pid_t = 0
+            AXUIElementGetPid(element, &elementPid)
+            if elementPid > 0 {
+                pid = elementPid
+            }
+            title = self.windowTitle(for: element)
+        }
+        if let windowID, let info = Self.cgWindow(id: windowID) {
+            if pid == nil, info.pid > 0 {
+                pid = info.pid
+            }
+            if !info.title.isEmpty {
+                title = info.title
+            }
+            resolvedWindowID = windowID
+        }
+        let app: NSRunningApplication? = if let bundleID, !bundleID.isEmpty {
+            Self.runningApplication(bundleID: bundleID, pid: pid)
+        } else if let pid, pid > 0 {
+            NSRunningApplication(processIdentifier: pid)
+        } else {
+            NSWorkspace.shared.frontmostApplication
+        }
+        if title.isEmpty, let app, let focused = focusedWindowTitle(pid: app.processIdentifier) {
+            title = focused
+        }
+        if pid == nil {
+            pid = app?.processIdentifier
+        }
+        if resolvedWindowID == nil, let pid, pid > 0 {
+            resolvedWindowID = Self.cgWindowID(pid: pid, frame: focusedWindowFrame(pid: pid))
+        }
+        var result: [String: Any] = [
+            "pid": Int(pid ?? 0),
+            "app": app?.localizedName ?? app?.bundleIdentifier ?? "",
+            "bundle_id": app?.bundleIdentifier ?? "",
+            "window_title": String(title.prefix(200)),
+        ]
+        if let resolvedWindowID {
+            result["window_id"] = Int(resolvedWindowID)
+        }
+        return result
+    }
+
+    private static func runningApplication(
+        bundleID: String,
+        pid: Int32?
+    ) -> NSRunningApplication? {
+        let matches = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        if let pid {
+            return matches.first(where: { $0.processIdentifier == pid })
+        }
+        return matches.first
+    }
+
+    private func windowTitle(for element: AXUIElement) -> String {
+        var current: AXUIElement? = element
+        var depth = 0
+        while let node = current, depth < 32 {
+            if let role = stringAttribute(node, kAXRoleAttribute),
+               role == "AXWindow" || role == "AXSheet" || role == "AXDialog"
+            {
+                return stringAttribute(node, kAXTitleAttribute) ?? ""
+            }
+            current = axElement(attribute(node, kAXParentAttribute))
+            depth += 1
+        }
+        return ""
+    }
+
+    private func focusedWindowTitle(pid: Int32) -> String? {
+        let app = AXUIElementCreateApplication(pid)
+        guard let window = axElement(attribute(app, kAXFocusedWindowAttribute)) else {
+            return nil
+        }
+        return stringAttribute(window, kAXTitleAttribute)
+    }
+
+    private func focusedWindowFrame(pid: Int32) -> ComputerRect? {
+        let app = AXUIElementCreateApplication(pid)
+        guard let window = axElement(attribute(app, kAXFocusedWindowAttribute)) else {
+            return nil
+        }
+        return frame(of: window)
     }
 
     func frame(ofRef ref: String) throws -> ComputerRect {
@@ -508,6 +732,60 @@ final class AccessibilityController {
                 return false
             }
             return true
+        }
+    }
+
+    /// Bounded wait with an Accessibility observer where the process can
+    /// provide one, and an interval polling fallback otherwise. The observer
+    /// only shortens the re-check latency; it is not a guarantee that every
+    /// window change produces a notification. The deadline is always
+    /// authoritative.
+    func waitForCondition(
+        _ condition: WaitCondition,
+        timeoutMilliseconds: Int,
+        intervalMilliseconds: Int
+    ) -> (matched: Bool, elapsedMs: Int, observedBy: String) {
+        let deadline = WaitDeadline(timeoutMilliseconds: timeoutMilliseconds)
+        let observer = observerPid(for: condition).flatMap {
+            AccessibilityChangeObserver(pid: $0)
+        }
+        let observation = observer == nil ? "polling" : "ax_observer"
+        while true {
+            if waitMatches(condition) {
+                return (true, deadline.elapsedMilliseconds(), observation)
+            }
+            if deadline.isExpired() {
+                return (false, deadline.elapsedMilliseconds(), observation)
+            }
+            let slice = deadline.sleepInterval(intervalMilliseconds: intervalMilliseconds)
+            if slice <= 0 {
+                return (false, deadline.elapsedMilliseconds(), observation)
+            }
+            if let observer {
+                observer.service(seconds: slice)
+            } else {
+                Thread.sleep(forTimeInterval: slice)
+            }
+        }
+    }
+
+    private func observerPid(for condition: WaitCondition) -> Int32? {
+        switch condition {
+        case .ref:
+            return lastSnapshotPid ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+        case .element, .window:
+            return NSWorkspace.shared.frontmostApplication?.processIdentifier
+        case let .appFrontmost(bundleID, pid):
+            if let pid {
+                return pid
+            }
+            if let bundleID,
+               let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                   .first
+            {
+                return app.processIdentifier
+            }
+            return NSWorkspace.shared.frontmostApplication?.processIdentifier
         }
     }
 

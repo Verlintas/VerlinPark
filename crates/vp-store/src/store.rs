@@ -15,8 +15,8 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpTransport, AgentMessage, AgentRecord, Approval, ApprovalGrant,
     Artifact, ArtifactPolicy, ArtifactVersion, CheckpointRetentionPolicy, ContextCheckpoint,
-    ContextCheckpointPolicy, ContinuationOutcome, Event, IntakeTask, IntegrationPolicy,
-    MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryConflict,
+    ContextCheckpointPolicy, ContinuationOutcome, Event, GuiActionInfo, GuiPolicy, IntakeTask,
+    IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryConflict,
     MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
     MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy,
     MemoryStatCount, MergeQueueEntry, MetricCount, ModelPreset, OrchestrationDecision,
@@ -163,6 +163,9 @@ pub struct ComputerLease {
     pub acquired_at: String,
     pub heartbeat_at: String,
     pub expires_at: String,
+    /// Monotonic acquisition generation across the SQLite database. It
+    /// survives daemon restarts and is recorded in GUI action events.
+    pub generation: u64,
 }
 
 fn map_computer_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComputerLease> {
@@ -176,6 +179,7 @@ fn map_computer_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComputerLease
         acquired_at: row.get(6)?,
         heartbeat_at: row.get(7)?,
         expires_at: row.get(8)?,
+        generation: row.get::<_, i64>(9)?.max(0) as u64,
     })
 }
 
@@ -760,6 +764,10 @@ pub struct ProjectManifestSnapshot {
     pub project: Project,
     pub shell_policy: ShellPolicy,
     pub integration_policy: IntegrationPolicy,
+    /// Unified browser/computer GUI lease, grace, wait, and sensitive-target
+    /// policy. Older manifests decode as the bounded default.
+    #[serde(default)]
+    pub gui_policy: GuiPolicy,
     pub artifact_policy: ArtifactPolicy,
     #[serde(default)]
     pub tool_output_policy: ToolOutputPolicy,
@@ -1181,6 +1189,12 @@ impl Store {
                 max_auto_attempts  INTEGER NOT NULL,
                 max_resolve_tokens INTEGER,
                 updated_at         TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_gui_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -2338,7 +2352,8 @@ impl Store {
                 agent_name    TEXT NOT NULL,
                 acquired_at   TEXT NOT NULL,
                 heartbeat_at  TEXT NOT NULL,
-                expires_at    TEXT NOT NULL
+                expires_at    TEXT NOT NULL,
+                generation    INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_computer_leases_expiry
@@ -2477,6 +2492,12 @@ impl Store {
                  fencing_token INTEGER NOT NULL DEFAULT 0,
                  updated_at    TEXT NOT NULL
              );",
+        )?;
+        ensure_column(
+            &conn,
+            "computer_leases",
+            "generation",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "sources", "collection", "TEXT")?;
         ensure_column(
@@ -2889,6 +2910,7 @@ impl Store {
                 shell_policy: self.get_shell_policy(&project.id)?,
                 execution_host: self.get_execution_host(&project.id)?,
                 integration_policy: self.get_integration_policy(&project.id)?,
+                gui_policy: self.get_gui_policy(&project.id)?,
                 artifact_policy: self.get_artifact_policy(&project.id)?,
                 tool_output_policy: self.get_tool_output_policy(&project.id)?,
                 mailbox_policy: self.get_mailbox_policy(&project.id)?,
@@ -6251,6 +6273,59 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Project GUI session policy. A missing row decodes as the bounded
+    /// default: 45s grace, 15s wait, 30s status cache, sensitive targets
+    /// denied. Older databases gain the table on open.
+    pub fn get_gui_policy(&self, project_id: &str) -> Result<GuiPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT policy FROM project_gui_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(stored
+            .and_then(|raw| serde_json::from_str::<GuiPolicy>(&raw).ok())
+            .unwrap_or_default()
+            .normalized())
+    }
+
+    pub fn set_gui_policy(&self, project_id: &str, policy: &GuiPolicy) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_gui_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                serde_json::to_string(&policy.clone().normalized())?,
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve the GUI policy for the project that owns a session without
+    /// loading the whole session row in the caller.
+    pub fn gui_policy_for_session(&self, session_id: &str) -> Result<GuiPolicy> {
+        let conn = self.lock()?;
+        let project_id = conn
+            .query_row(
+                "SELECT project_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        drop(conn);
+        match project_id {
+            Some(project_id) => self.get_gui_policy(&project_id),
+            None => Ok(GuiPolicy::default()),
+        }
     }
 
     pub fn auto_resolve_attempts(&self, entry_id: &str) -> Result<u32> {
@@ -12024,6 +12099,50 @@ impl Store {
         Ok(events)
     }
 
+    /// Bounded GUI action timeline. Entries are derived from `gui.action`
+    /// events; only action/target/generation/latency/result metadata is
+    /// stored. Screen content and typed text are never included.
+    pub fn recent_gui_actions(
+        &self,
+        session_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<GuiActionInfo>> {
+        let limit = limit.clamp(1, 500);
+        let conn = self.lock()?;
+        let mut actions = Vec::new();
+        match session_id {
+            Some(session_id) => {
+                let mut statement = conn.prepare(
+                    "SELECT payload FROM events
+                     WHERE session_id = ?1 AND type = 'gui.action'
+                     ORDER BY seq DESC LIMIT ?2",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id, limit], |row| row.get::<_, String>(0))?;
+                for payload in rows {
+                    if let Ok(action) = serde_json::from_str::<GuiActionInfo>(&payload?) {
+                        actions.push(action);
+                    }
+                }
+            }
+            None => {
+                let mut statement = conn.prepare(
+                    "SELECT payload FROM events
+                     WHERE type = 'gui.action'
+                     ORDER BY created_at DESC LIMIT ?1",
+                )?;
+                let rows = statement.query_map(params![limit], |row| row.get::<_, String>(0))?;
+                for payload in rows {
+                    if let Ok(action) = serde_json::from_str::<GuiActionInfo>(&payload?) {
+                        actions.push(action);
+                    }
+                }
+            }
+        }
+        actions.reverse();
+        Ok(actions)
+    }
+
     pub fn list_events_by_kind(
         &self,
         session_id: &str,
@@ -16532,7 +16651,7 @@ impl Store {
             let expired = {
                 let mut stmt = tx.prepare(
                     "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
-                            acquired_at, heartbeat_at, expires_at
+                            acquired_at, heartbeat_at, expires_at, generation
                      FROM computer_leases WHERE julianday(expires_at) <= julianday(?1)
                      ORDER BY expires_at ASC, lease_id ASC",
                 )?;
@@ -16554,11 +16673,17 @@ impl Store {
                     }),
                 )?);
             }
+            // Browser, computer, and gui are one physical surface. A legacy
+            // row from an older daemon stays authoritative until it expires,
+            // so a new `gui` acquisition cannot drive the GUI concurrently
+            // with an old helper. Operators can release a stuck row.
             let holder = tx
                 .query_row(
                     "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
-                            acquired_at, heartbeat_at, expires_at
-                     FROM computer_leases WHERE surface = ?1",
+                            acquired_at, heartbeat_at, expires_at, generation
+                     FROM computer_leases
+                     WHERE surface = ?1 OR surface IN ('gui', 'browser', 'computer')
+                     ORDER BY acquired_at ASC, lease_id ASC LIMIT 1",
                     params![surface],
                     map_computer_lease,
                 )
@@ -16580,6 +16705,27 @@ impl Store {
                     events,
                 }
             } else {
+                let stored_generation = tx
+                    .query_row(
+                        "SELECT value FROM store_meta WHERE key = 'computer_lease_generation'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let table_generation = tx.query_row(
+                    "SELECT COALESCE(MAX(generation), 0) FROM computer_leases",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? as u64;
+                let generation = stored_generation.max(table_generation) + 1;
+                tx.execute(
+                    "INSERT INTO store_meta (key, value)
+                     VALUES ('computer_lease_generation', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![generation.to_string()],
+                )?;
                 let lease = ComputerLease {
                     lease_id: Uuid::now_v7().to_string(),
                     surface: surface.to_string(),
@@ -16590,12 +16736,13 @@ impl Store {
                     acquired_at: now_text.clone(),
                     heartbeat_at: now_text.clone(),
                     expires_at: expires_text,
+                    generation,
                 };
                 tx.execute(
                     "INSERT INTO computer_leases
                      (lease_id, surface, owner_id, session_id, agent_id, agent_name,
-                      acquired_at, heartbeat_at, expires_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                      acquired_at, heartbeat_at, expires_at, generation)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         &lease.lease_id,
                         &lease.surface,
@@ -16606,6 +16753,7 @@ impl Store {
                         &lease.acquired_at,
                         &lease.heartbeat_at,
                         &lease.expires_at,
+                        lease.generation as i64,
                     ],
                 )?;
                 events.push(insert_event_tx(
@@ -16666,7 +16814,7 @@ impl Store {
         let lease = tx
             .query_row(
                 "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
-                        acquired_at, heartbeat_at, expires_at
+                        acquired_at, heartbeat_at, expires_at, generation
                  FROM computer_leases WHERE lease_id = ?1",
                 params![lease_id],
                 map_computer_lease,
@@ -16706,7 +16854,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
-                    acquired_at, heartbeat_at, expires_at
+                    acquired_at, heartbeat_at, expires_at, generation
              FROM computer_leases ORDER BY surface ASC, acquired_at ASC",
         )?;
         let rows = stmt.query_map([], map_computer_lease)?;
@@ -16717,13 +16865,75 @@ impl Store {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
-                    acquired_at, heartbeat_at, expires_at
+                    acquired_at, heartbeat_at, expires_at, generation
              FROM computer_leases WHERE lease_id = ?1",
             params![lease_id],
             map_computer_lease,
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Lowest unexpired lease on the shared physical GUI surface, including
+    /// legacy `browser`/`computer` rows. The coordinator uses this to produce
+    /// a typed busy error with a holder and retry hint.
+    pub fn gui_lease_holder(&self) -> Result<Option<ComputerLease>> {
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                    acquired_at, heartbeat_at, expires_at, generation
+             FROM computer_leases
+             WHERE surface IN ('gui', 'browser', 'computer')
+               AND julianday(expires_at) > julianday(?1)
+             ORDER BY acquired_at ASC, lease_id ASC LIMIT 1",
+            params![now],
+            map_computer_lease,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Retire legacy per-helper lease rows at daemon startup. Helper processes
+    /// are children of the daemon, so no legacy helper survives a restart. The
+    /// rows are still audited rather than deleted silently.
+    pub fn clear_legacy_gui_leases(&self, reason: &str) -> Result<(usize, Vec<Event>)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let legacy = {
+            let mut stmt = tx.prepare(
+                "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
+                        acquired_at, heartbeat_at, expires_at, generation
+                 FROM computer_leases WHERE surface IN ('browser', 'computer')
+                 ORDER BY acquired_at ASC, lease_id ASC",
+            )?;
+            let rows = stmt.query_map([], map_computer_lease)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut events = Vec::new();
+        for lease in &legacy {
+            tx.execute(
+                "DELETE FROM computer_leases WHERE lease_id = ?1",
+                params![&lease.lease_id],
+            )?;
+            events.push(insert_event_tx(
+                &tx,
+                &lease.session_id,
+                "computer.lease.expired",
+                serde_json::json!({
+                    "lease": lease,
+                    "reason": reason,
+                    "legacy_surface": true,
+                }),
+            )?);
+        }
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append legacy GUI lease expiry mirror");
+            }
+        }
+        Ok((legacy.len(), events))
     }
 
     /// Remove expired computer leases and return their audit events. The
@@ -16735,7 +16945,7 @@ impl Store {
         let expired = {
             let mut stmt = tx.prepare(
                 "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
-                        acquired_at, heartbeat_at, expires_at
+                        acquired_at, heartbeat_at, expires_at, generation
                  FROM computer_leases WHERE julianday(expires_at) <= julianday(?1)
                  ORDER BY expires_at ASC, lease_id ASC",
             )?;
@@ -17297,7 +17507,7 @@ impl Store {
         let interrupted_computer_leases = {
             let mut stmt = tx.prepare(
                 "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
-                        acquired_at, heartbeat_at, expires_at
+                        acquired_at, heartbeat_at, expires_at, generation
                  FROM computer_leases ORDER BY acquired_at ASC, lease_id ASC",
             )?;
             let rows = stmt.query_map([], map_computer_lease)?;

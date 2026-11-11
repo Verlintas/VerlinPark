@@ -64,6 +64,335 @@ struct IntegrationPolicyResult: Codable, Sendable {
     }
 }
 
+enum GuiSensitiveMode: String, Codable, Hashable, Sendable {
+    case deny
+    case requireApproval = "require_approval"
+
+    var label: String {
+        switch self {
+        case .deny: "Deny"
+        case .requireApproval: "Require approval"
+        }
+    }
+}
+
+struct GuiPolicy: Codable, Hashable, Sendable {
+    var graceSecs: Int
+    var waitMs: Int
+    var statusTtlSecs: Int
+    var sensitiveMode: GuiSensitiveMode
+    var sensitiveBundles: [String]
+    var sensitiveTitles: [String]
+
+    static let standard = GuiPolicy(
+        graceSecs: 45,
+        waitMs: 15000,
+        statusTtlSecs: 30,
+        sensitiveMode: .deny,
+        sensitiveBundles: [],
+        sensitiveTitles: []
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case graceSecs = "grace_secs"
+        case waitMs = "wait_ms"
+        case statusTtlSecs = "status_ttl_secs"
+        case sensitiveMode = "sensitive_mode"
+        case sensitiveBundles = "sensitive_bundles"
+        case sensitiveTitles = "sensitive_titles"
+    }
+
+    init(
+        graceSecs: Int,
+        waitMs: Int,
+        statusTtlSecs: Int,
+        sensitiveMode: GuiSensitiveMode,
+        sensitiveBundles: [String],
+        sensitiveTitles: [String]
+    ) {
+        self.graceSecs = graceSecs
+        self.waitMs = waitMs
+        self.statusTtlSecs = statusTtlSecs
+        self.sensitiveMode = sensitiveMode
+        self.sensitiveBundles = sensitiveBundles
+        self.sensitiveTitles = sensitiveTitles
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        graceSecs = try container.decodeIfPresent(Int.self, forKey: .graceSecs) ?? 45
+        waitMs = try container.decodeIfPresent(Int.self, forKey: .waitMs) ?? 15000
+        statusTtlSecs = try container.decodeIfPresent(Int.self, forKey: .statusTtlSecs) ?? 30
+        if let raw = try? container.decodeIfPresent(String.self, forKey: .sensitiveMode),
+           let mode = GuiSensitiveMode(rawValue: raw)
+        {
+            sensitiveMode = mode
+        } else {
+            sensitiveMode = .deny
+        }
+        sensitiveBundles = try container.decodeIfPresent([String].self, forKey: .sensitiveBundles) ?? []
+        sensitiveTitles = try container.decodeIfPresent([String].self, forKey: .sensitiveTitles) ?? []
+    }
+}
+
+struct GuiPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: GuiPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
+struct GuiLeaseInfo: Codable, Hashable, Sendable {
+    var leaseId: String
+    var ownerId: String
+    var sessionId: String
+    var agentId: String
+    var agentName: String
+    var surface: String
+    var leaseGeneration: Int
+    var acquiredAt: String
+    var lastActionAt: String
+    var expiresAt: String
+    var queuePosition: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case leaseId = "lease_id"
+        case ownerId = "owner_id"
+        case sessionId = "session_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case surface
+        case leaseGeneration = "lease_generation"
+        case acquiredAt = "acquired_at"
+        case lastActionAt = "last_action_at"
+        case expiresAt = "expires_at"
+        case queuePosition = "queue_position"
+    }
+}
+
+struct GuiQueueInfo: Codable, Hashable, Sendable {
+    var sessionId: String
+    var agentId: String
+    var agentName: String
+    var surface: String
+    var position: Int
+    var waitingMs: Int
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case surface
+        case position
+        case waitingMs = "waiting_ms"
+    }
+}
+
+struct GuiComputerStatus: Codable, Hashable, Sendable {
+    var platformSupported: Bool?
+    var helperAvailable: Bool?
+    var helperPath: String?
+    var permissionsChecked: Bool?
+    var accessibility: Bool?
+    var screenRecording: Bool?
+    var error: String?
+    var cached: Bool?
+    var cacheAgeMs: Int?
+    var graceSecs: Int?
+    var waitMs: Int?
+    var snapshotGenerations: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case platformSupported = "platform_supported"
+        case helperAvailable = "helper_available"
+        case helperPath = "helper_path"
+        case permissionsChecked = "permissions_checked"
+        case permissions
+        case error
+        case cached
+        case cacheAgeMs = "cache_age_ms"
+        case graceSecs = "grace_secs"
+        case waitMs = "wait_ms"
+        case snapshotGenerations = "snapshot_generations"
+    }
+
+    enum PermissionKeys: String, CodingKey {
+        case accessibility
+        case screenRecording = "screen_recording"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        platformSupported = try container.decodeIfPresent(Bool.self, forKey: .platformSupported)
+        helperAvailable = try container.decodeIfPresent(Bool.self, forKey: .helperAvailable)
+        helperPath = try container.decodeIfPresent(String.self, forKey: .helperPath)
+        permissionsChecked = try container.decodeIfPresent(Bool.self, forKey: .permissionsChecked)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        cached = try container.decodeIfPresent(Bool.self, forKey: .cached)
+        cacheAgeMs = try container.decodeIfPresent(Int.self, forKey: .cacheAgeMs)
+        graceSecs = try container.decodeIfPresent(Int.self, forKey: .graceSecs)
+        waitMs = try container.decodeIfPresent(Int.self, forKey: .waitMs)
+        snapshotGenerations = try container.decodeIfPresent(Bool.self, forKey: .snapshotGenerations)
+        if let permissions = try? container.nestedContainer(
+            keyedBy: PermissionKeys.self,
+            forKey: .permissions
+        ) {
+            accessibility = try permissions.decodeIfPresent(Bool.self, forKey: .accessibility)
+            screenRecording = try permissions.decodeIfPresent(Bool.self, forKey: .screenRecording)
+        } else {
+            accessibility = nil
+            screenRecording = nil
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(platformSupported, forKey: .platformSupported)
+        try container.encodeIfPresent(helperAvailable, forKey: .helperAvailable)
+        try container.encodeIfPresent(helperPath, forKey: .helperPath)
+        try container.encodeIfPresent(permissionsChecked, forKey: .permissionsChecked)
+        try container.encodeIfPresent(error, forKey: .error)
+        try container.encodeIfPresent(cached, forKey: .cached)
+        try container.encodeIfPresent(cacheAgeMs, forKey: .cacheAgeMs)
+        try container.encodeIfPresent(graceSecs, forKey: .graceSecs)
+        try container.encodeIfPresent(waitMs, forKey: .waitMs)
+        try container.encodeIfPresent(snapshotGenerations, forKey: .snapshotGenerations)
+        if accessibility != nil || screenRecording != nil {
+            var permissions = container.nestedContainer(
+                keyedBy: PermissionKeys.self,
+                forKey: .permissions
+            )
+            try permissions.encodeIfPresent(accessibility, forKey: .accessibility)
+            try permissions.encodeIfPresent(screenRecording, forKey: .screenRecording)
+        }
+    }
+}
+
+struct GuiStatusResult: Codable, Sendable {
+    var runtimeId: String
+    var leaseSurface: String
+    var holder: GuiLeaseInfo?
+    var queue: [GuiQueueInfo]
+    var policy: GuiPolicy
+    var computer: GuiComputerStatus?
+    var browserHelperAvailable: Bool
+    var browserHelperPath: String?
+    var browserSandboxAvailable: Bool
+    var warmComputerHelpers: Int
+    var warmBrowserHelpers: Int
+    var staleRefSupported: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case runtimeId = "runtime_id"
+        case leaseSurface = "lease_surface"
+        case holder
+        case queue
+        case policy
+        case computer
+        case browserHelperAvailable = "browser_helper_available"
+        case browserHelperPath = "browser_helper_path"
+        case browserSandboxAvailable = "browser_sandbox_available"
+        case warmComputerHelpers = "warm_computer_helpers"
+        case warmBrowserHelpers = "warm_browser_helpers"
+        case staleRefSupported = "stale_ref_supported"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        runtimeId = try container.decodeIfPresent(String.self, forKey: .runtimeId) ?? ""
+        leaseSurface = try container.decodeIfPresent(String.self, forKey: .leaseSurface) ?? "gui"
+        holder = try container.decodeIfPresent(GuiLeaseInfo.self, forKey: .holder)
+        queue = try container.decodeIfPresent([GuiQueueInfo].self, forKey: .queue) ?? []
+        policy = try container.decodeIfPresent(GuiPolicy.self, forKey: .policy) ?? .standard
+        computer = try container.decodeIfPresent(GuiComputerStatus.self, forKey: .computer)
+        browserHelperAvailable = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .browserHelperAvailable
+        ) ?? false
+        browserHelperPath = try container.decodeIfPresent(String.self, forKey: .browserHelperPath)
+        browserSandboxAvailable = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .browserSandboxAvailable
+        ) ?? false
+        warmComputerHelpers = try container.decodeIfPresent(Int.self, forKey: .warmComputerHelpers) ?? 0
+        warmBrowserHelpers = try container.decodeIfPresent(Int.self, forKey: .warmBrowserHelpers) ?? 0
+        staleRefSupported = try container.decodeIfPresent(Bool.self, forKey: .staleRefSupported) ?? true
+    }
+}
+
+struct GuiActionInfo: Codable, Hashable, Sendable {
+    var id: String
+    var sessionId: String
+    var agentId: String
+    var agentName: String
+    var surface: String
+    var action: String
+    var targetApp: String?
+    var targetBundleId: String?
+    var targetWindow: String?
+    var sensitiveTarget: Bool
+    var snapshotGeneration: Int
+    var leaseGeneration: Int
+    var queuedMs: Int
+    var latencyMs: Int
+    var result: String
+    var errorCode: String?
+    var occurredAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case surface
+        case action
+        case targetApp = "target_app"
+        case targetBundleId = "target_bundle_id"
+        case targetWindow = "target_window"
+        case sensitiveTarget = "sensitive_target"
+        case snapshotGeneration = "snapshot_generation"
+        case leaseGeneration = "lease_generation"
+        case queuedMs = "queued_ms"
+        case latencyMs = "latency_ms"
+        case result
+        case errorCode = "error_code"
+        case occurredAt = "occurred_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        agentId = try container.decodeIfPresent(String.self, forKey: .agentId) ?? ""
+        agentName = try container.decodeIfPresent(String.self, forKey: .agentName) ?? ""
+        surface = try container.decodeIfPresent(String.self, forKey: .surface) ?? "computer"
+        action = try container.decodeIfPresent(String.self, forKey: .action) ?? ""
+        targetApp = try container.decodeIfPresent(String.self, forKey: .targetApp)
+        targetBundleId = try container.decodeIfPresent(String.self, forKey: .targetBundleId)
+        targetWindow = try container.decodeIfPresent(String.self, forKey: .targetWindow)
+        sensitiveTarget = try container.decodeIfPresent(Bool.self, forKey: .sensitiveTarget) ?? false
+        snapshotGeneration = try container.decodeIfPresent(Int.self, forKey: .snapshotGeneration) ?? 0
+        leaseGeneration = try container.decodeIfPresent(Int.self, forKey: .leaseGeneration) ?? 0
+        queuedMs = try container.decodeIfPresent(Int.self, forKey: .queuedMs) ?? 0
+        latencyMs = try container.decodeIfPresent(Int.self, forKey: .latencyMs) ?? 0
+        result = try container.decodeIfPresent(String.self, forKey: .result) ?? "ok"
+        errorCode = try container.decodeIfPresent(String.self, forKey: .errorCode)
+        occurredAt = try container.decodeIfPresent(String.self, forKey: .occurredAt) ?? ""
+    }
+}
+
+struct GuiTimelineResult: Codable, Sendable {
+    var actions: [GuiActionInfo]
+    var limit: Int
+}
+
+struct ComputerLeaseReleaseResult: Codable, Sendable {
+    var released: Bool
+}
+
 struct ArtifactPolicy: Codable, Hashable, Sendable {
     var autoGc: Bool
     var maxBytes: Int?

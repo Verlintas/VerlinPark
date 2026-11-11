@@ -36,8 +36,7 @@ use crate::RuntimeLeaseGuard;
 use crate::acp;
 use crate::budget::{BudgetReason, Rejection, ScopeRequest, Spend};
 use crate::permissions::{
-    ApprovalDecision, RiskLevel, assess_acp_permission, assess_remote_acp_delegation,
-    assess_tool_call, decide,
+    ApprovalDecision, RiskLevel, assess_acp_permission, assess_remote_acp_delegation, decide,
 };
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::worktree;
@@ -4885,8 +4884,11 @@ impl AgentService {
             });
         }
         let cancelled = self.cancel(session_id);
-        if cancelled
-            && let Err(error) = self
+        if cancelled {
+            // A cancelled run must not retain the physical GUI. Grace is for
+            // normal multi-step interaction, not for an operator cancellation.
+            self.engine.gui_end_session(session_id, "cancelled").await;
+            if let Err(error) = self
                 .engine
                 .append_event(
                     session_id,
@@ -4894,8 +4896,9 @@ impl AgentService {
                     serde_json::json!({"run_id": run.run_id}),
                 )
                 .await
-        {
-            tracing::warn!(%error, run_id = %run.run_id, "failed to record durable cancel intent");
+            {
+                tracing::warn!(%error, run_id = %run.run_id, "failed to record durable cancel intent");
+            }
         }
         Ok(SessionRunCancelResult {
             session_id: session_id.to_string(),
@@ -12048,6 +12051,10 @@ async fn run_loop_body(
                         .is_none_or(|skill| skill_allows_tool(skill, &call.name))
                     && (config.tools.get(&call.name).is_some() || call.name == "read_tool_output")
             });
+        let gui_policy = engine
+            .gui_policy_for_session(&session.id)
+            .await
+            .unwrap_or_default();
         if safe_parallel_batch {
             let mut prepared = Vec::new();
             for (index, call) in tool_calls.iter().enumerate() {
@@ -12058,7 +12065,12 @@ async fn run_loop_body(
                 };
                 let input: serde_json::Value =
                     serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
-                let assessment = assess_tool_call(&call.name, &input, &spec.worktree);
+                let assessment = crate::permissions::assess_tool_call_with_gui(
+                    &call.name,
+                    &input,
+                    &spec.worktree,
+                    &gui_policy,
+                );
                 if !matches!(
                     decide(config.approval_mode, &assessment, spec.auto_approve),
                     ApprovalDecision::Allow { .. }
@@ -12370,7 +12382,12 @@ async fn run_loop_body(
                 .tools
                 .get(&call.name)
                 .filter(|_| spec.role.allows_tool(spec.profile, &call.name));
-            let mut assessment = assess_tool_call(&call.name, &input, &spec.worktree);
+            let mut assessment = crate::permissions::assess_tool_call_with_gui(
+                &call.name,
+                &input,
+                &spec.worktree,
+                &gui_policy,
+            );
             if dynamic_mcp_tool.is_some() {
                 assessment = crate::permissions::PermissionAssessment::new(
                     RiskLevel::HostState,
@@ -16145,7 +16162,7 @@ fn tool_schemas(
     if role.allows_tool(profile, "browser") {
         tools.push(ToolSchema {
             name: "browser".to_string(),
-            description: "Drive a sandboxed local WKWebView: open localhost or worktree pages, inspect the accessibility/DOM tree, click/type/press/select, wait, read console logs, and save screenshots. External navigation is refused. The browser surface is serialized by the daemon ComputerLease. Use evaluate only when the user approves JavaScript execution."
+            description: "Drive a sandboxed local WKWebView: open localhost or worktree pages, inspect the accessibility/DOM tree, click/type/press/select, wait, read console logs, and save screenshots. External navigation is refused. The browser and native computer helpers share one daemon-wide GUI lease; a second session waits briefly and then receives GUI_BUSY with the holder and retry hint. Use evaluate only when the user approves JavaScript execution."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -16177,20 +16194,20 @@ fn tool_schemas(
     if role.allows_tool(profile, "computer") {
         tools.push(ToolSchema {
             name: "computer".to_string(),
-            description: "Drive native macOS applications through the daemon-owned Accessibility/CGEvent helper. Inspect permissions, apps, windows, and a bounded AX tree; focus; click/type/key/scroll/drag; wait; and capture a bounded screenshot artifact. Every action is serialized by the daemon ComputerLease and risk-classified. Native GUI control is not sandboxed and requires Accessibility (and Screen Recording for screenshots) permission for VerlinParkComputerHelper. Prefer browser for web pages."
+            description: "Drive native macOS applications through the daemon-owned Accessibility/CGEvent helper. Inspect permissions, apps, windows, and a bounded AX tree; focus; click/type/key/scroll/drag; wait; and capture a bounded screenshot artifact. Snapshot results include snapshot_generation; refs are bound to it. A ref from an older snapshot returns STALE_REF with the current generation and is never retried automatically: take a fresh snapshot. Every action shares the daemon-wide gui lease with the browser and is risk-classified. Sensitive targets such as System Settings, SecurityAgent, and password managers are denied or require explicit approval by project policy. Native GUI control is not sandboxed and requires Accessibility (and Screen Recording for screenshots) permission for VerlinParkComputerHelper. Prefer browser for web pages."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["permissions", "apps", "windows", "focus", "snapshot", "screenshot", "click", "type", "key", "scroll", "drag", "wait", "close"]
+                        "enum": ["permissions", "apps", "windows", "displays", "focus", "snapshot", "screenshot", "click", "type", "key", "scroll", "drag", "wait", "close"]
                     },
                     "bundle_id": {"type": "string", "description": "Target application bundle id; defaults to the frontmost app for snapshot/windows"},
                     "pid": {"type": "integer", "minimum": 1, "description": "Target process id alternative to bundle_id"},
                     "window_id": {"type": "integer", "minimum": 1, "description": "CGWindow id from windows"},
                     "window_title": {"type": "string", "description": "focus: substring of the window title"},
-                    "ref": {"type": "string", "description": "Element reference from snapshot, e.g. ax-0123456789abcdef"},
+                    "ref": {"type": "string", "description": "Element reference from the latest snapshot, e.g. ax-00000007-0123456789abcdef; a ref from an older snapshot returns STALE_REF"},
                     "x": {"type": "number", "minimum": 0, "maximum": 1, "description": "click: normalized x within the target window"},
                     "y": {"type": "number", "minimum": 0, "maximum": 1, "description": "click: normalized y within the target window"},
                     "button": {"type": "string", "enum": ["left", "right"]},
@@ -16224,6 +16241,8 @@ fn tool_schemas(
                     "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 262144},
                     "max_chars": {"type": "integer", "minimum": 500, "maximum": 60000, "description": "snapshot: rendered transcript cap"},
                     "target": {"type": "string", "enum": ["window", "screen"], "description": "screenshot target; defaults to window"},
+                    "display_index": {"type": "integer", "minimum": 0, "maximum": 15, "description": "screen screenshot: display index from computer displays"},
+                    "display_id": {"type": "integer", "minimum": 1, "description": "screen screenshot: CGDirectDisplayID from computer displays"},
                     "max_width": {"type": "integer", "minimum": 320, "maximum": 2560},
                     "max_height": {"type": "integer", "minimum": 320, "maximum": 2560},
                     "name": {"type": "string", "description": "screenshot artifact display name"}

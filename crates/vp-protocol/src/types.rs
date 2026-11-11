@@ -183,6 +183,276 @@ pub struct SchedulerStatusResult {
     pub projects: Vec<SchedulerProjectStatus>,
 }
 
+fn default_gui_grace_secs() -> u64 {
+    45
+}
+
+fn default_gui_wait_ms() -> u64 {
+    15_000
+}
+
+fn default_gui_status_ttl_secs() -> u64 {
+    30
+}
+
+/// How the daemon handles native GUI targets that commonly expose credentials
+/// or security decisions. The default is a hard denial: an agent never
+/// silently automates System Settings, SecurityAgent, or a password manager.
+/// `require_approval` relies on the existing HostState/Destructive approval
+/// decision for input actions and still denies read capture of a sensitive
+/// target unless the call names that target explicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuiSensitiveMode {
+    #[default]
+    Deny,
+    RequireApproval,
+}
+
+impl GuiSensitiveMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::RequireApproval => "require_approval",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "deny" => Some(Self::Deny),
+            "require_approval" | "require-approval" | "approval" => Some(Self::RequireApproval),
+            _ => None,
+        }
+    }
+}
+
+/// Project-scoped GUI session policy: grace, bounded wait, helper status cache,
+/// and the sensitive-target list. All fields are additive and defaulted so an
+/// older daemon payload decodes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuiPolicy {
+    /// Retain the logical `gui` lease this long after the last action. Helpers
+    /// stay warm for their own idle window and do not hold the lease.
+    #[serde(default = "default_gui_grace_secs")]
+    pub grace_secs: u64,
+    /// Bounded wait before a second session receives a typed `GUI_BUSY`.
+    #[serde(default = "default_gui_wait_ms")]
+    pub wait_ms: u64,
+    /// Cache helper/TCC status for this long so dashboard refreshes do not
+    /// spawn a temporary helper.
+    #[serde(default = "default_gui_status_ttl_secs")]
+    pub status_ttl_secs: u64,
+    #[serde(default)]
+    pub sensitive_mode: GuiSensitiveMode,
+    /// Additional bundle identifiers appended to the built-in sensitive list.
+    #[serde(default)]
+    pub sensitive_bundles: Vec<String>,
+    /// Additional case-insensitive title/application patterns appended to the
+    /// built-in sensitive list.
+    #[serde(default)]
+    pub sensitive_titles: Vec<String>,
+}
+
+impl Default for GuiPolicy {
+    fn default() -> Self {
+        Self {
+            grace_secs: default_gui_grace_secs(),
+            wait_ms: default_gui_wait_ms(),
+            status_ttl_secs: default_gui_status_ttl_secs(),
+            sensitive_mode: GuiSensitiveMode::Deny,
+            sensitive_bundles: Vec::new(),
+            sensitive_titles: Vec::new(),
+        }
+    }
+}
+
+impl GuiPolicy {
+    pub const MAX_GRACE_SECS: u64 = 600;
+    pub const MAX_WAIT_MS: u64 = 60_000;
+    pub const MIN_STATUS_TTL_SECS: u64 = 5;
+    pub const MAX_STATUS_TTL_SECS: u64 = 600;
+    pub const MAX_SENSITIVE_ENTRIES: usize = 64;
+    pub const MAX_SENSITIVE_ENTRY_CHARS: usize = 200;
+
+    /// Clamp user input into the ranges the daemon enforces. Validation is
+    /// separate so an invalid RPC value is rejected instead of silently
+    /// changing behavior.
+    pub fn normalized(mut self) -> Self {
+        self.grace_secs = self.grace_secs.min(Self::MAX_GRACE_SECS);
+        self.wait_ms = self.wait_ms.min(Self::MAX_WAIT_MS);
+        self.status_ttl_secs = self
+            .status_ttl_secs
+            .clamp(Self::MIN_STATUS_TTL_SECS, Self::MAX_STATUS_TTL_SECS);
+        self.sensitive_bundles = self
+            .sensitive_bundles
+            .into_iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .take(Self::MAX_SENSITIVE_ENTRIES)
+            .collect();
+        self.sensitive_titles = self
+            .sensitive_titles
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .take(Self::MAX_SENSITIVE_ENTRIES)
+            .collect();
+        self
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.grace_secs > Self::MAX_GRACE_SECS {
+            return Err(format!(
+                "gui grace_secs must be at most {}",
+                Self::MAX_GRACE_SECS
+            ));
+        }
+        if self.wait_ms > Self::MAX_WAIT_MS {
+            return Err(format!("gui wait_ms must be at most {}", Self::MAX_WAIT_MS));
+        }
+        if !(Self::MIN_STATUS_TTL_SECS..=Self::MAX_STATUS_TTL_SECS).contains(&self.status_ttl_secs)
+        {
+            return Err(format!(
+                "gui status_ttl_secs must be between {} and {}",
+                Self::MIN_STATUS_TTL_SECS,
+                Self::MAX_STATUS_TTL_SECS
+            ));
+        }
+        for (name, values) in [
+            ("sensitive_bundles", &self.sensitive_bundles),
+            ("sensitive_titles", &self.sensitive_titles),
+        ] {
+            if values.len() > Self::MAX_SENSITIVE_ENTRIES {
+                return Err(format!(
+                    "{name} supports at most {} entries",
+                    Self::MAX_SENSITIVE_ENTRIES
+                ));
+            }
+            if values.iter().any(|value| {
+                value.trim().is_empty() || value.chars().count() > Self::MAX_SENSITIVE_ENTRY_CHARS
+            }) {
+                return Err(format!(
+                    "{name} entries must be 1-{} characters",
+                    Self::MAX_SENSITIVE_ENTRY_CHARS
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuiPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetGuiPolicyParams {
+    pub project_id: String,
+    pub policy: GuiPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GuiPolicyResult {
+    pub project_id: String,
+    pub policy: GuiPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuiLeaseInfo {
+    pub lease_id: String,
+    pub owner_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub surface: String,
+    pub lease_generation: u64,
+    pub acquired_at: String,
+    pub last_action_at: String,
+    pub expires_at: String,
+    #[serde(default)]
+    pub queue_position: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuiQueueInfo {
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub surface: String,
+    pub position: u32,
+    pub waiting_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GuiStatusParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+/// Unified GUI surface status. `computer` keeps the original status payload;
+/// `holder`/`queue` describe the single `gui` lease, not a worktree write
+/// scope. A bounded `gui` queue is local to one daemon and is never claimed
+/// across hosts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GuiStatusResult {
+    pub runtime_id: String,
+    pub lease_surface: String,
+    #[serde(default)]
+    pub holder: Option<GuiLeaseInfo>,
+    #[serde(default)]
+    pub queue: Vec<GuiQueueInfo>,
+    pub policy: GuiPolicy,
+    pub computer: ComputerStatusResult,
+    pub browser_helper_available: bool,
+    #[serde(default)]
+    pub browser_helper_path: Option<String>,
+    pub browser_sandbox_available: bool,
+    pub warm_computer_helpers: usize,
+    pub warm_browser_helpers: usize,
+    pub stale_ref_supported: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuiActionInfo {
+    pub id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub surface: String,
+    pub action: String,
+    #[serde(default)]
+    pub target_app: Option<String>,
+    #[serde(default)]
+    pub target_bundle_id: Option<String>,
+    #[serde(default)]
+    pub target_window: Option<String>,
+    #[serde(default)]
+    pub sensitive_target: bool,
+    pub snapshot_generation: u64,
+    pub lease_generation: u64,
+    pub queued_ms: u64,
+    pub latency_ms: u64,
+    pub result: String,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GuiTimelineParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GuiTimelineResult {
+    pub actions: Vec<GuiActionInfo>,
+    pub limit: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IntegrationPolicy {
     #[serde(default)]
@@ -6501,6 +6771,10 @@ pub struct ComputerLeaseInfo {
     pub acquired_at: String,
     pub heartbeat_at: String,
     pub expires_at: String,
+    /// Monotonic acquisition generation; survives daemon restart because it
+    /// lives in SQLite. Older daemon payloads decode as zero.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7190,12 +7464,48 @@ pub struct ComputerStatusResult {
     pub lease_surface: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// True when this payload came from the short-lived status cache and no
+    /// helper process was spawned.
+    #[serde(default)]
+    pub cached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_age_ms: Option<u64>,
+    /// The logical lease surface is `gui`. Kept as a separate field so older
+    /// clients that expected `computer` can still read the payload.
+    #[serde(default)]
+    pub grace_secs: u64,
+    #[serde(default)]
+    pub wait_ms: u64,
+    #[serde(default)]
+    pub snapshot_generations: bool,
+}
+
+impl Default for ComputerStatusResult {
+    fn default() -> Self {
+        Self {
+            platform_supported: cfg!(target_os = "macos"),
+            helper_available: false,
+            helper_path: None,
+            permissions: None,
+            permissions_checked: false,
+            lease_surface: "gui".to_string(),
+            error: None,
+            cached: false,
+            cache_age_ms: None,
+            grace_secs: 0,
+            wait_ms: 0,
+            snapshot_generations: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ComputerStatusParams {
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Bypass the short-lived helper/TCC status cache.
+    #[serde(default)]
+    pub refresh: bool,
 }
 
 #[cfg(test)]
@@ -8021,8 +8331,13 @@ mod tests {
                 detail: Some("enable Screen Recording".into()),
             }),
             permissions_checked: true,
-            lease_surface: "computer".into(),
+            lease_surface: "gui".into(),
             error: None,
+            cached: true,
+            cache_age_ms: Some(1200),
+            grace_secs: 45,
+            wait_ms: 15_000,
+            snapshot_generations: true,
         };
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["permissions"]["screen_recording"], false);
@@ -9625,5 +9940,197 @@ mod context_checkpoint_bundle_tests {
         value.as_object_mut().unwrap().remove("context_checkpoints");
         let bundle: SessionBundle = serde_json::from_value(value).unwrap();
         assert!(bundle.context_checkpoints.is_empty());
+    }
+
+    #[test]
+    fn gui_policy_defaults_and_legacy_payloads_decode() {
+        let policy = GuiPolicy::default();
+        assert_eq!(policy.grace_secs, 45);
+        assert_eq!(policy.wait_ms, 15_000);
+        assert_eq!(policy.status_ttl_secs, 30);
+        assert_eq!(policy.sensitive_mode, GuiSensitiveMode::Deny);
+        let legacy: GuiPolicy = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(legacy, policy);
+        let decoded: GuiPolicy = serde_json::from_value(json!({
+            "grace_secs": 0,
+            "wait_ms": 2500,
+            "status_ttl_secs": 10,
+            "sensitive_mode": "require_approval",
+            "sensitive_bundles": ["com.example.Vault"],
+            "sensitive_titles": ["Vault"]
+        }))
+        .unwrap();
+        assert_eq!(decoded.sensitive_mode, GuiSensitiveMode::RequireApproval);
+        assert_eq!(decoded.grace_secs, 0);
+        assert_eq!(decoded.wait_ms, 2500);
+        assert_eq!(decoded.sensitive_bundles, vec!["com.example.Vault"]);
+        assert!(GuiSensitiveMode::parse("APPROVAL").is_some());
+        assert!(GuiSensitiveMode::parse("unknown").is_none());
+    }
+
+    #[test]
+    fn gui_status_and_timeline_round_trip_with_defaults() {
+        let status = GuiStatusResult {
+            runtime_id: "runtime-1".into(),
+            lease_surface: "gui".into(),
+            holder: Some(GuiLeaseInfo {
+                lease_id: "lease-1".into(),
+                owner_id: "owner-1".into(),
+                session_id: "ses-1".into(),
+                agent_id: "agent-1".into(),
+                agent_name: "Agent One".into(),
+                surface: "computer".into(),
+                lease_generation: 4,
+                acquired_at: "2026-11-11T00:00:00Z".into(),
+                last_action_at: "2026-11-11T00:00:01Z".into(),
+                expires_at: "2026-11-11T00:00:46Z".into(),
+                queue_position: None,
+            }),
+            queue: vec![GuiQueueInfo {
+                session_id: "ses-2".into(),
+                agent_id: "agent-2".into(),
+                agent_name: "Agent Two".into(),
+                surface: "browser".into(),
+                position: 1,
+                waiting_ms: 1200,
+            }],
+            policy: GuiPolicy::default(),
+            computer: ComputerStatusResult {
+                lease_surface: "gui".into(),
+                ..ComputerStatusResult::default()
+            },
+            browser_helper_available: true,
+            browser_helper_path: Some("/tmp/VerlinParkBrowserHelper".into()),
+            browser_sandbox_available: true,
+            warm_computer_helpers: 1,
+            warm_browser_helpers: 2,
+            stale_ref_supported: true,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["holder"]["lease_generation"], 4);
+        assert_eq!(value["queue"][0]["position"], 1);
+        let decoded: GuiStatusResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, status);
+
+        let action = GuiActionInfo {
+            id: "action-1".into(),
+            session_id: "ses-1".into(),
+            agent_id: "agent-1".into(),
+            agent_name: "Agent One".into(),
+            surface: "computer".into(),
+            action: "snapshot".into(),
+            target_app: Some("Example".into()),
+            target_bundle_id: Some("com.example.App".into()),
+            target_window: Some("Main".into()),
+            sensitive_target: false,
+            snapshot_generation: 7,
+            lease_generation: 4,
+            queued_ms: 0,
+            latency_ms: 18,
+            result: "ok".into(),
+            error_code: None,
+            occurred_at: "2026-11-11T00:00:02Z".into(),
+        };
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(value["snapshot_generation"], 7);
+        let legacy: GuiActionInfo = serde_json::from_value(json!({
+            "id": "a",
+            "session_id": "s",
+            "agent_id": "g",
+            "agent_name": "A",
+            "surface": "computer",
+            "action": "apps",
+            "snapshot_generation": 0,
+            "lease_generation": 1,
+            "queued_ms": 0,
+            "latency_ms": 2,
+            "result": "ok",
+            "occurred_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(legacy.target_app.is_none());
+        assert!(!legacy.sensitive_target);
+    }
+
+    #[test]
+    fn computer_status_tolerates_legacy_fields_and_reports_gui_defaults() {
+        let status: ComputerStatusResult = serde_json::from_value(json!({
+            "platform_supported": true,
+            "helper_available": true,
+            "permissions_checked": false,
+            "lease_surface": "computer"
+        }))
+        .unwrap();
+        assert!(!status.cached);
+        assert!(status.cache_age_ms.is_none());
+        assert_eq!(status.grace_secs, 0);
+        assert_eq!(status.wait_ms, 0);
+        assert!(!status.snapshot_generations);
+    }
+
+    #[test]
+    fn computer_lease_info_tolerates_a_missing_generation() {
+        let info: ComputerLeaseInfo = serde_json::from_value(json!({
+            "lease_id": "lease-1",
+            "surface": "computer",
+            "owner_id": "owner-1",
+            "session_id": "ses-1",
+            "agent_id": "agent-1",
+            "agent_name": "Agent One",
+            "acquired_at": "2026-11-11T00:00:00Z",
+            "heartbeat_at": "2026-11-11T00:00:01Z",
+            "expires_at": "2026-11-11T00:00:30Z"
+        }))
+        .unwrap();
+        assert_eq!(info.generation, 0);
+        let current = ComputerLeaseInfo {
+            generation: 9,
+            ..info
+        };
+        let value = serde_json::to_value(&current).unwrap();
+        assert_eq!(value["generation"], 9);
+    }
+
+    #[test]
+    fn gui_policy_validation_rejects_out_of_range_values_and_long_entries() {
+        let mut policy = GuiPolicy {
+            grace_secs: 601,
+            ..GuiPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+        policy.grace_secs = 0;
+        policy.wait_ms = 60_001;
+        assert!(policy.validate().is_err());
+        policy.wait_ms = 0;
+        policy.status_ttl_secs = 4;
+        assert!(policy.validate().is_err());
+        policy.status_ttl_secs = 601;
+        assert!(policy.validate().is_err());
+        policy.status_ttl_secs = 30;
+        policy.sensitive_titles = vec!["x".repeat(201)];
+        assert!(policy.validate().is_err());
+        policy.sensitive_titles = vec!["ok".into()];
+        policy.sensitive_bundles = (0..65).map(|index| format!("b{index}")).collect();
+        assert!(policy.validate().is_err());
+        policy.sensitive_bundles = vec![" ".into()];
+        assert!(policy.validate().is_err());
+        policy.sensitive_bundles.clear();
+        assert!(policy.validate().is_ok());
+        let normalized = policy.normalized();
+        assert_eq!(normalized.status_ttl_secs, 30);
+    }
+
+    #[test]
+    fn gui_request_params_default_to_no_scope() {
+        let status: GuiStatusParams = serde_json::from_value(json!({})).unwrap();
+        assert!(status.project_id.is_none());
+        let timeline: GuiTimelineParams = serde_json::from_value(json!({})).unwrap();
+        assert!(timeline.session_id.is_none());
+        assert!(timeline.limit.is_none());
+        let status: GuiStatusParams = serde_json::from_value(json!({
+            "project_id": "prj-1"
+        }))
+        .unwrap();
+        assert_eq!(status.project_id.as_deref(), Some("prj-1"));
     }
 }

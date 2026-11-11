@@ -493,6 +493,57 @@ actor CoreClient {
             .policy
     }
 
+    func guiStatus(projectID: String?) async throws -> GuiStatusResult {
+        var params: [String: JSONValue] = [:]
+        if let projectID {
+            params["project_id"] = .string(projectID)
+        }
+        return try await request(method: "gui.status", params: params)
+            .decode(GuiStatusResult.self)
+    }
+
+    func guiTimeline(sessionID: String?, limit: Int = 100) async throws -> GuiTimelineResult {
+        var params: [String: JSONValue] = ["limit": .number(Double(limit))]
+        if let sessionID {
+            params["session_id"] = .string(sessionID)
+        }
+        return try await request(method: "gui.timeline", params: params)
+            .decode(GuiTimelineResult.self)
+    }
+
+    func releaseComputerLease(leaseID: String) async throws -> Bool {
+        try await request(
+            method: "computer.leases.release",
+            params: ["lease_id": .string(leaseID)]
+        )
+        .decode(ComputerLeaseReleaseResult.self)
+        .released
+    }
+
+    func guiPolicy(projectID: String) async throws -> GuiPolicy {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "gui.policy.get", params: params)
+            .decode(GuiPolicyResult.self)
+            .policy
+    }
+
+    func setGuiPolicy(projectID: String, policy: GuiPolicy) async throws -> GuiPolicy {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object([
+                "grace_secs": .number(Double(policy.graceSecs)),
+                "wait_ms": .number(Double(policy.waitMs)),
+                "status_ttl_secs": .number(Double(policy.statusTtlSecs)),
+                "sensitive_mode": .string(policy.sensitiveMode.rawValue),
+                "sensitive_bundles": .array(policy.sensitiveBundles.map(JSONValue.string)),
+                "sensitive_titles": .array(policy.sensitiveTitles.map(JSONValue.string)),
+            ]),
+        ]
+        return try await request(method: "gui.policy.set", params: params)
+            .decode(GuiPolicyResult.self)
+            .policy
+    }
+
     func addProject(root: String, name: String?) async throws -> Project {
         let params: [String: JSONValue] = [
             "root": .string(root),
