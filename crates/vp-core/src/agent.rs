@@ -1054,6 +1054,7 @@ impl AgentRole {
                         | "remote_exec"
                         | "remote_git"
                         | "remote_worktree"
+                        | "computer"
                 ),
                 AgentProfile::Research => matches!(
                     name,
@@ -10053,6 +10054,8 @@ async fn run_loop_body(
                 && matches!(spec.role, AgentRole::Leader | AgentRole::Manager);
             let is_browser =
                 call.name == "browser" && spec.role.allows_tool(spec.profile, "browser");
+            let is_computer =
+                call.name == "computer" && spec.role.allows_tool(spec.profile, "computer");
             let dynamic_mcp_tool = dynamic_mcp_tools
                 .iter()
                 .find(|binding| binding.exposed_name == call.name);
@@ -10418,6 +10421,33 @@ async fn run_loop_body(
                 {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("browser error: {error}")),
+                }
+            } else if is_computer {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match engine
+                    .computer_action(
+                        &session.id,
+                        &spec.worktree,
+                        &spec.id,
+                        &spec.name,
+                        spec.task_id.as_deref(),
+                        input.clone(),
+                    )
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("computer error: {error}")),
                 }
             } else if is_mailbox_tool {
                 emit(
@@ -13424,6 +13454,65 @@ fn tool_schemas(
                     "path": {"type": "string", "description": "screenshot: worktree-relative output path; defaults under .verlinpark/browser"},
                     "full_page": {"type": "boolean", "description": "screenshot: accepted for compatibility; v1 captures the viewport"},
                     "script": {"type": "string", "description": "evaluate: explicit approval-gated JavaScript"}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    if role.allows_tool(profile, "computer") {
+        tools.push(ToolSchema {
+            name: "computer".to_string(),
+            description: "Drive native macOS applications through the daemon-owned Accessibility/CGEvent helper. Inspect permissions, apps, windows, and a bounded AX tree; focus; click/type/key/scroll/drag; wait; and capture a bounded screenshot artifact. Every action is serialized by the daemon ComputerLease and risk-classified. Native GUI control is not sandboxed and requires Accessibility (and Screen Recording for screenshots) permission for VerlinParkComputerHelper. Prefer browser for web pages."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["permissions", "apps", "windows", "focus", "snapshot", "screenshot", "click", "type", "key", "scroll", "drag", "wait", "close"]
+                    },
+                    "bundle_id": {"type": "string", "description": "Target application bundle id; defaults to the frontmost app for snapshot/windows"},
+                    "pid": {"type": "integer", "minimum": 1, "description": "Target process id alternative to bundle_id"},
+                    "window_id": {"type": "integer", "minimum": 1, "description": "CGWindow id from windows"},
+                    "window_title": {"type": "string", "description": "focus: substring of the window title"},
+                    "ref": {"type": "string", "description": "Element reference from snapshot, e.g. ax-0123456789abcdef"},
+                    "x": {"type": "number", "minimum": 0, "maximum": 1, "description": "click: normalized x within the target window"},
+                    "y": {"type": "number", "minimum": 0, "maximum": 1, "description": "click: normalized y within the target window"},
+                    "button": {"type": "string", "enum": ["left", "right"]},
+                    "click_count": {"type": "integer", "minimum": 1, "maximum": 2},
+                    "text": {"type": "string", "description": "type: text to enter (max 10 KiB)"},
+                    "key": {"type": "string", "description": "key: whitelisted key such as Return, Tab, Escape, ArrowDown, q"},
+                    "modifiers": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {"type": "string", "enum": ["command", "shift", "option", "control", "cmd", "alt", "ctrl"]}
+                    },
+                    "dx": {"type": "integer", "minimum": -1000, "maximum": 1000, "description": "scroll: horizontal delta"},
+                    "dy": {"type": "integer", "minimum": -1000, "maximum": 1000, "description": "scroll: vertical delta"},
+                    "unit": {"type": "string", "enum": ["line", "pixel"]},
+                    "from_x": {"type": "number", "minimum": 0, "maximum": 1},
+                    "from_y": {"type": "number", "minimum": 0, "maximum": 1},
+                    "to_x": {"type": "number", "minimum": 0, "maximum": 1},
+                    "to_y": {"type": "number", "minimum": 0, "maximum": 1},
+                    "duration_ms": {"type": "integer", "minimum": 0, "maximum": 2000},
+                    "steps": {"type": "integer", "minimum": 1, "maximum": 60},
+                    "condition": {"type": "string", "enum": ["ref", "element", "window", "app_frontmost"]},
+                    "role": {"type": "string", "description": "wait element condition: AX role"},
+                    "identifier": {"type": "string", "description": "wait element condition: AX identifier"},
+                    "title": {"type": "string", "description": "wait element/window title"},
+                    "timeout_ms": {"type": "integer", "minimum": 50, "maximum": 30000},
+                    "interval_ms": {"type": "integer", "minimum": 50, "maximum": 1000},
+                    "include_background": {"type": "boolean", "description": "apps: include accessory/background applications"},
+                    "include_offscreen": {"type": "boolean", "description": "windows: include off-screen windows"},
+                    "max_depth": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "max_elements": {"type": "integer", "minimum": 1, "maximum": 1200},
+                    "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 262144},
+                    "max_chars": {"type": "integer", "minimum": 500, "maximum": 60000, "description": "snapshot: rendered transcript cap"},
+                    "target": {"type": "string", "enum": ["window", "screen"], "description": "screenshot target; defaults to window"},
+                    "max_width": {"type": "integer", "minimum": 320, "maximum": 2560},
+                    "max_height": {"type": "integer", "minimum": 320, "maximum": 2560},
+                    "name": {"type": "string", "description": "screenshot artifact display name"}
                 },
                 "required": ["action"],
                 "additionalProperties": false

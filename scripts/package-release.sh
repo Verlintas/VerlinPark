@@ -53,6 +53,13 @@ if [[ -x "$BROWSER_HELPER" ]]; then
 else
   echo "warning: VerlinParkBrowserHelper not built; browser tool will report unavailable" >&2
 fi
+COMPUTER_HELPER="$ROOT/apps/macos/build/Build/Products/Release/VerlinParkComputerHelper"
+if [[ -x "$COMPUTER_HELPER" ]]; then
+  cp "$COMPUTER_HELPER" "$HELPER_DIR/VerlinParkComputerHelper"
+  chmod +x "$HELPER_DIR/VerlinParkComputerHelper"
+else
+  echo "warning: VerlinParkComputerHelper not built; computer tool will report unavailable" >&2
+fi
 
 if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
   echo "==> Developer ID signing: $SIGN_IDENTITY"

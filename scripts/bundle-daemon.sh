@@ -25,4 +25,15 @@ else
   echo "warning: VerlinParkBrowserHelper not built; browser tool will report unavailable" >&2
 fi
 
+# The computer helper uses the user's Accessibility, CGEvent, and
+# ScreenCaptureKit privileges. It is daemon-launched and deliberately not
+# Seatbelt-confined; see ADR-0158 for the trust model.
+COMPUTER_HELPER="$ROOT/apps/macos/build/Build/Products/Debug/VerlinParkComputerHelper"
+if [[ -x "$COMPUTER_HELPER" ]]; then
+  cp "$COMPUTER_HELPER" "$HELPER_DIR/VerlinParkComputerHelper"
+  chmod +x "$HELPER_DIR/VerlinParkComputerHelper"
+else
+  echo "warning: VerlinParkComputerHelper not built; computer tool will report unavailable" >&2
+fi
+
 echo "bundled verlinpadd into $HELPER_DIR"

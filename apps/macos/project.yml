@@ -60,12 +60,35 @@ targets:
         PRODUCT_NAME: VerlinParkBrowserHelper
         PRODUCT_BUNDLE_IDENTIFIER: com.verlintas.VerlinParkBrowserHelper
         GENERATE_INFOPLIST_FILE: YES
+  VerlinParkComputerHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: VerlinParkComputerHelper
+      - path: VerlinParkComputerHelperCore
+    settings:
+      base:
+        PRODUCT_NAME: VerlinParkComputerHelper
+        PRODUCT_BUNDLE_IDENTIFIER: com.verlintas.VerlinParkComputerHelper
+        GENERATE_INFOPLIST_FILE: YES
+  VerlinParkComputerHelperTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: VerlinParkComputerHelperCore
+      - path: VerlinParkComputerHelperTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.verlintas.VerlinParkComputerHelperTests
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   VerlinPark:
     build:
       targets:
         VerlinPark: all
         VerlinParkBrowserHelper: all
+        VerlinParkComputerHelper: all
     test:
       targets:
         - VerlinParkTests
+        - VerlinParkComputerHelperTests

@@ -85,8 +85,8 @@ use vp_protocol::types::{
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
-    ComputerLeaseReleaseResult, ComputerLeaseSweepResult, RuntimeLeaseInfo, RuntimeLeaseListResult,
-    RuntimeLeaseSweepResult,
+    ComputerLeaseReleaseResult, ComputerLeaseSweepResult, ComputerStatusParams, RuntimeLeaseInfo,
+    RuntimeLeaseListResult, RuntimeLeaseSweepResult,
 };
 use vp_protocol::types::{
     CoordinationNoteParams, CoordinationNoteResult, OrchestrationAdvanceParams,
@@ -185,6 +185,7 @@ async fn main() -> Result<()> {
     spawn_memory_conflict_scanner(state.engine.clone());
     spawn_terminal_sweeper(state.engine.clone());
     spawn_browser_sweeper(state.engine.clone());
+    spawn_computer_sweeper(state.engine.clone());
     spawn_task_stall_sweeper(state.engine.clone());
     spawn_stall_recovery_reconciler(state.agent.clone());
     spawn_orchestration_controller(state.engine.clone());
@@ -1828,6 +1829,10 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "agent.info" => RpcResponse::success(id, state.agent.info()),
+        "computer.status" => match parse_params::<ComputerStatusParams>(request.params) {
+            Ok(_params) => RpcResponse::success(id, state.engine.computer_status().await),
+            Err(response) => response_with_id(id, response),
+        },
         "agent.probe" => match state.agent.probe().await {
             Ok(result) => RpcResponse::success(id, result),
             Err(error) => internal_error(id, error),
@@ -3203,6 +3208,25 @@ fn spawn_browser_sweeper(engine: Engine) {
             let browsers = engine.sweep_idle_browsers(idle).await;
             if browsers > 0 {
                 tracing::info!(browsers, "closed idle browser helpers");
+            }
+        }
+    });
+}
+
+fn spawn_computer_sweeper(engine: Engine) {
+    let idle = vp_core::computer::ComputerManager::idle_default();
+    if idle.is_zero() {
+        return;
+    }
+    let interval_secs = (idle.as_secs() / 4).clamp(15, 300);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let computers = engine.sweep_idle_computers(idle).await;
+            if computers > 0 {
+                tracing::info!(computers, "closed idle computer helpers");
             }
         }
     });

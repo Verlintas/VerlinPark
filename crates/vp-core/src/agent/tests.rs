@@ -2230,6 +2230,26 @@ async fn scout_tool_schema_is_read_only() {
     }
 }
 
+#[tokio::test]
+async fn computer_tool_schema_is_limited_to_leader_and_coding_workers() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service.config.read().unwrap().as_ref().unwrap().clone();
+    let names = |role: AgentRole, profile: AgentProfile| {
+        tool_schemas(&config, role, profile, true)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    assert!(names(AgentRole::Leader, AgentProfile::Coding).contains("computer"));
+    assert!(names(AgentRole::Worker, AgentProfile::Coding).contains("computer"));
+    assert!(names(AgentRole::Labour, AgentProfile::Coding).contains("computer"));
+    assert!(!names(AgentRole::Manager, AgentProfile::Coding).contains("computer"));
+    assert!(!names(AgentRole::Verifier, AgentProfile::Verification).contains("computer"));
+    assert!(!names(AgentRole::Scout, AgentProfile::Research).contains("computer"));
+    assert!(!names(AgentRole::Worker, AgentProfile::Research).contains("computer"));
+}
+
 #[test]
 fn scout_input_is_bounded() {
     assert!(parse_scout(&serde_json::json!({"objective": ""})).is_err());
@@ -9152,16 +9172,21 @@ fn tool_role_matrix_matches_the_tooling_roadmap() {
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "apply_patch"));
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "run_project_task"));
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "browser"));
+    assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "computer"));
 
     assert!(AgentRole::Verifier.allows_tool(AgentProfile::Verification, "run_project_task"));
     assert!(!AgentRole::Verifier.allows_tool(AgentProfile::Verification, "apply_patch"));
     assert!(!AgentRole::Verifier.allows_tool(AgentProfile::Verification, "browser"));
+    assert!(!AgentRole::Verifier.allows_tool(AgentProfile::Verification, "computer"));
 
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "apply_patch"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "file_manage"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "git"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "browser"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "computer"));
+    assert!(AgentRole::Labour.allows_tool(AgentProfile::Coding, "computer"));
     assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "browser"));
+    assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "computer"));
     assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "apply_patch"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Research, "read_files"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Research, "web_search"));

@@ -42,12 +42,12 @@ test:
 
 fmt:
     cargo fmt --all
-    swiftformat apps/macos/VerlinPark apps/macos/VerlinParkTests apps/macos/VerlinParkBrowserHelper
+    swiftformat apps/macos/VerlinPark apps/macos/VerlinParkTests apps/macos/VerlinParkBrowserHelper apps/macos/VerlinParkComputerHelper apps/macos/VerlinParkComputerHelperCore apps/macos/VerlinParkComputerHelperTests
 
 lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
-    swiftformat --lint apps/macos/VerlinPark apps/macos/VerlinParkTests apps/macos/VerlinParkBrowserHelper
+    swiftformat --lint apps/macos/VerlinPark apps/macos/VerlinParkTests apps/macos/VerlinParkBrowserHelper apps/macos/VerlinParkComputerHelper apps/macos/VerlinParkComputerHelperCore apps/macos/VerlinParkComputerHelperTests
 
 clean:
     cargo clean

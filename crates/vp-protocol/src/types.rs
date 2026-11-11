@@ -5508,6 +5508,39 @@ pub fn rebuild_program_from_events(
     (program, milestones)
 }
 
+/// Accessibility and Screen Recording state reported by the packaged computer
+/// helper. These are permissions, not approval decisions: the daemon approval
+/// policy still decides whether a particular host-state action may run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ComputerPermissions {
+    pub accessibility: bool,
+    pub screen_recording: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Result of `computer.status`. The status path launches the helper only to
+/// preflight TCC permissions; it never takes the GUI lease or posts input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ComputerStatusResult {
+    pub platform_supported: bool,
+    pub helper_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<ComputerPermissions>,
+    pub permissions_checked: bool,
+    pub lease_surface: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ComputerStatusParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6108,6 +6141,50 @@ mod tests {
         let legacy: DaemonMetrics = serde_json::from_value(value).unwrap();
         assert_eq!(legacy.cache_hit_ratio, 0.0);
         assert!(legacy.preamble_tokens_estimate.is_none());
+    }
+
+    #[test]
+    fn computer_status_serializes_permissions_and_optional_fields() {
+        let status = ComputerStatusResult {
+            platform_supported: true,
+            helper_available: true,
+            helper_path: Some("/tmp/VerlinParkComputerHelper".into()),
+            permissions: Some(ComputerPermissions {
+                accessibility: true,
+                screen_recording: false,
+                detail: Some("enable Screen Recording".into()),
+            }),
+            permissions_checked: true,
+            lease_surface: "computer".into(),
+            error: None,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["permissions"]["screen_recording"], false);
+        assert!(value.get("error").is_none());
+        let decoded: ComputerStatusResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn computer_status_tolerates_older_daemon_payloads() {
+        let status: ComputerStatusResult = serde_json::from_value(serde_json::json!({
+            "platform_supported": true,
+            "helper_available": false,
+            "permissions_checked": false,
+            "lease_surface": "computer"
+        }))
+        .unwrap();
+        assert!(status.permissions.is_none());
+        assert!(status.helper_path.is_none());
+        assert!(status.error.is_none());
+        let params: ComputerStatusParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(params.session_id.is_none());
+        let permissions: ComputerPermissions = serde_json::from_value(serde_json::json!({
+            "accessibility": true,
+            "screen_recording": false
+        }))
+        .unwrap();
+        assert!(permissions.detail.is_none());
     }
 }
 

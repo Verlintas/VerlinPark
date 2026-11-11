@@ -2,6 +2,8 @@
 //!
 //! M1 adds the Leader agent loop, tool registry, approvals, and event stream.
 
+#![recursion_limit = "512"]
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -79,6 +81,7 @@ pub mod agent;
 pub mod backup;
 pub mod browser;
 pub mod budget;
+pub mod computer;
 pub mod console;
 pub mod continuation;
 mod dashboard;
@@ -149,6 +152,7 @@ pub struct Engine {
     consoles: Arc<console::ConsoleManager>,
     terminals: Arc<terminal::TerminalManager>,
     browsers: Arc<browser::BrowserManager>,
+    computers: Arc<computer::ComputerManager>,
     scheduler: Arc<scheduler::TaskScheduler>,
     runtime_id: String,
 }
@@ -560,7 +564,8 @@ impl Engine {
             remote: Arc::new(remote::RemoteManager::new(data_dir.clone())),
             consoles: Arc::new(console::ConsoleManager::new()),
             terminals: Arc::new(terminal::TerminalManager::new()),
-            browsers: Arc::new(browser::BrowserManager::new(data_dir)),
+            browsers: Arc::new(browser::BrowserManager::new(data_dir.clone())),
+            computers: Arc::new(computer::ComputerManager::new(data_dir)),
             runtime_id: Uuid::now_v7().to_string(),
         }
     }
@@ -7319,6 +7324,59 @@ impl Engine {
         Ok(artifact)
     }
 
+    /// Publish in-memory bytes as a binary artifact. This is the sanctioned path
+    /// for daemon-produced screenshots: the source lives in daemon scratch, not
+    /// in the agent worktree, and the 5 MiB cap matches `publish_artifact_file`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_artifact_binary(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<String>,
+        name: &str,
+        kind: &str,
+        mime_type: &str,
+        data: &[u8],
+    ) -> Result<Artifact> {
+        if data.is_empty() {
+            anyhow::bail!("binary artifact is empty");
+        }
+        if data.len() > 5 * 1024 * 1024 {
+            anyhow::bail!("binary artifact exceeds 5 MiB");
+        }
+        let name = name.trim();
+        if name.is_empty() || name.len() > 200 {
+            anyhow::bail!("artifact name must be 1-200 characters");
+        }
+        let sha256 = crate::tooling::fs::sha256_hex(data);
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+        let agent_name = agent_name.to_string();
+        let name = name.to_string();
+        let kind = kind.to_string();
+        let mime_type = mime_type.to_string();
+        let data = data.to_vec();
+        let (artifact, event) = tokio::task::spawn_blocking(move || {
+            store.create_artifact_file_with_event(
+                &session_id,
+                &agent_id,
+                &agent_name,
+                task_id.as_deref(),
+                &name,
+                &kind,
+                &mime_type,
+                &data,
+                &sha256,
+            )
+        })
+        .await??;
+        let _ = self.events.send(event);
+        self.auto_gc_restarted_artifact(&artifact.session_id).await;
+        Ok(artifact)
+    }
+
     async fn auto_gc_restarted_artifact(&self, session_id: &str) {
         let store = self.store.clone();
         let session_id = session_id.to_string();
@@ -11630,6 +11688,44 @@ impl Engine {
         self.browsers.sweep_idle(idle).await
     }
 
+    /// Run one bounded native computer action for an agent. The helper is
+    /// session- and worktree-scoped, runs with the logged-in user's authority,
+    /// and holds the daemon-wide `computer` ComputerLease for its lifetime.
+    pub async fn computer_action(
+        &self,
+        session_id: &str,
+        worktree: &std::path::Path,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<&str>,
+        input: serde_json::Value,
+    ) -> Result<ToolOutput> {
+        let target = computer::ComputerTarget {
+            session_id,
+            worktree,
+            agent_id,
+            agent_name,
+            task_id,
+        };
+        self.computers.action(self, &target, input).await
+    }
+
+    /// Inspect helper availability and TCC permissions without taking the GUI
+    /// lease or posting any input.
+    pub async fn computer_status(&self) -> vp_protocol::types::ComputerStatusResult {
+        self.computers.status().await
+    }
+
+    /// Stop computer helpers owned by a session before scratch cleanup.
+    pub async fn stop_session_computers(&self, session_id: &str) -> usize {
+        self.computers.stop_session(session_id).await
+    }
+
+    /// Stop computer helpers idle beyond the configured TTL.
+    pub async fn sweep_idle_computers(&self, idle: std::time::Duration) -> usize {
+        self.computers.sweep_idle(idle).await
+    }
+
     pub async fn console_open(&self, session_id: &str) -> Result<ConsoleOpenResult> {
         let store = self.store.clone();
         let id = session_id.to_string();
@@ -12091,6 +12187,7 @@ impl Engine {
             let path = PathBuf::from(&worktree);
             if !path.exists() {
                 self.stop_session_browsers(&session.id).await;
+                self.stop_session_computers(&session.id).await;
                 let sandbox = sandbox_root.join(&session.id);
                 let _ =
                     tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&sandbox)).await?;
@@ -12137,6 +12234,7 @@ impl Engine {
             crate::tooling::process::stop_worktree_processes(&path);
             crate::tooling::lsp::stop_lsp_servers(&path);
             self.stop_session_browsers(&session.id).await;
+            self.stop_session_computers(&session.id).await;
             match tokio::task::spawn_blocking({
                 let root = project_root.clone();
                 let path = path.clone();

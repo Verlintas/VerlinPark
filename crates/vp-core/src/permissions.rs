@@ -212,6 +212,45 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
             RiskLevel::WorkspaceWrite,
             "task control changes the persisted plan state",
         ),
+        "computer" => {
+            let action = input
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("snapshot")
+                .trim()
+                .to_ascii_lowercase();
+            match action.as_str() {
+                "close" => {
+                    PermissionAssessment::new(RiskLevel::ReadOnly, "closes the computer helper")
+                }
+                "permissions" | "apps" | "windows" | "snapshot" | "wait" => {
+                    PermissionAssessment::new(
+                        RiskLevel::External,
+                        "reads host application, Accessibility, or screen state",
+                    )
+                }
+                "screenshot" => PermissionAssessment::new(
+                    RiskLevel::External,
+                    "captures host screen content into a daemon artifact",
+                ),
+                "key" if crate::computer::destructive_key_input(input) => {
+                    PermissionAssessment::new(
+                        RiskLevel::Destructive,
+                        "destructive system key combination can quit or log out applications",
+                    )
+                }
+                "focus" | "click" | "type" | "key" | "scroll" | "drag" => {
+                    PermissionAssessment::new(
+                        RiskLevel::HostState,
+                        "native GUI input changes host application state",
+                    )
+                }
+                _ => PermissionAssessment::new(
+                    RiskLevel::HostState,
+                    "unknown computer action fails closed",
+                ),
+            }
+        }
         "browser" => {
             let action = input
                 .get("action")
@@ -2014,5 +2053,64 @@ mod tests {
             &worktree,
         );
         assert_eq!(evaluate.risk, RiskLevel::HostState);
+    }
+
+    #[test]
+    fn computer_actions_are_risk_classified_by_effect() {
+        let worktree = worktree();
+        let snapshot = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "snapshot"}),
+            &worktree,
+        );
+        assert_eq!(snapshot.risk, RiskLevel::External);
+        let permissions = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "permissions"}),
+            &worktree,
+        );
+        assert_eq!(permissions.risk, RiskLevel::External);
+        let screenshot = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "screenshot"}),
+            &worktree,
+        );
+        assert_eq!(screenshot.risk, RiskLevel::External);
+        let click = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "click", "ref": "ax-0123456789abcdef"}),
+            &worktree,
+        );
+        assert_eq!(click.risk, RiskLevel::HostState);
+        let focus = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "focus", "bundle_id": "com.example.App"}),
+            &worktree,
+        );
+        assert_eq!(focus.risk, RiskLevel::HostState);
+        let typing = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "type", "text": "hello"}),
+            &worktree,
+        );
+        assert_eq!(typing.risk, RiskLevel::HostState);
+        let quit = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "key", "key": "q", "modifiers": ["cmd"]}),
+            &worktree,
+        );
+        assert_eq!(quit.risk, RiskLevel::Destructive);
+        let safe_key = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "key", "key": "Tab"}),
+            &worktree,
+        );
+        assert_eq!(safe_key.risk, RiskLevel::HostState);
+        let close = assess_tool_call(
+            "computer",
+            &serde_json::json!({"action": "close"}),
+            &worktree,
+        );
+        assert_eq!(close.risk, RiskLevel::ReadOnly);
     }
 }
