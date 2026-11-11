@@ -21,7 +21,7 @@
 | **Current** | [CONTEXT_OWNERSHIP_MEMORY_BENCH_PLAN.md](CONTEXT_OWNERSHIP_MEMORY_BENCH_PLAN.md) | C1–C4 长任务第二轮计划与实现记录：tool-output paging/compaction、cross-process fencing、hybrid memory、cost-per-solved-task harness；已完成 +38k 行验收 |
 | **Current** | [CONTEXT_CHECKPOINT_ACP_ANN_BACKUP_PLAN.md](CONTEXT_CHECKPOINT_ACP_ANN_BACKUP_PLAN.md) | D1–D4 第三轮计划与实现记录：context checkpoint/restore、ACP HTTP/WS、IVF ANN memory、encrypted incremental backup；已完成 +35k 行验收 |
 | **Current** | [QUALITY_CACHE_GUI_TOOLING_PLAN.md](QUALITY_CACHE_GUI_TOOLING_PLAN.md) | Q1–Q4 质量轮计划与实现记录：cache-first prompt、GUI session layer、tool errors/recipes、LSP-first code intelligence；已完成 +32.6k 行验收 |
-| **Current** | [SCALING_PROCESS_SOURCE_REMOTE_BUDGET_PLAN.md](SCALING_PROCESS_SOURCE_REMOTE_BUDGET_PLAN.md) | F1–F5 第五轮计划：deterministic scaling、durable process supervisor、semantic sources、remote worktree integration、budget/critical-path governor；本轮 30k 行验收 |
+| **Current** | [SCALING_PROCESS_SOURCE_REMOTE_BUDGET_PLAN.md](SCALING_PROCESS_SOURCE_REMOTE_BUDGET_PLAN.md) | F1–F5 第五轮计划与实现记录：deterministic scaling、durable process supervisor、semantic sources、remote worktree integration、budget/critical-path governor；已完成 +37.0k 行验收 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |
 | **Contributing** | [../CONTRIBUTING.md](../CONTRIBUTING.md) | 构建、测试、提交约定 |

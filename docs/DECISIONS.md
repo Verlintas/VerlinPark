@@ -181,6 +181,11 @@
 | [0169](adr/0169-gui-session-lease-and-snapshot-generations.md) | Unified GUI lease with grace/queue, snapshot generations, stale refs, and sensitive-target policy | Accepted | Runtime/GUI/Security |
 | [0170](adr/0170-tool-error-contract-and-recipes.md) | Uniform tool failure contract, static recipes, and bounded tool activity metrics | Accepted | Runtime/Agent UX |
 | [0171](adr/0171-lsp-first-code-intelligence.md) | Optional LSP backend for symbol/reference/diagnostic tools with labeled lexical/build fallback | Accepted | Runtime/Code Intelligence |
+| [0172](adr/0172-deterministic-org-scaling.md) | Deterministic project scaling policy for Worker/Labour slots; Managers remain plan-owned | Accepted | Runtime/Orchestration |
+| [0173](adr/0173-durable-process-supervisor.md) | Durable supervised processes with full-identity reattach, bounded output rotation, and explicit stop | Accepted | Runtime/Agent Tools |
+| [0174](adr/0174-semantic-project-source-index.md) | Opt-in source embeddings with generation-scoped jobs and exact-cosine RRF hybrid retrieval | Accepted | Runtime/Store/Sources |
+| [0175](adr/0175-remote-worktree-integration.md) | Bounded remote Git bundle import into the local Verifier and deterministic merge queue | Accepted | Runtime/Remote/Merge |
+| [0176](adr/0176-budget-critical-path-governor.md) | Deterministic critical-path reserve and admission policy over plan-task budgets | Accepted | Runtime/Budget |
 
 ---
 

@@ -1,12 +1,155 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
 
 ---
+
+## 2026-11-12 Scaling, process supervision, semantic sources, remote integration, and budget governance
+
+这一轮补齐五个长任务 runtime 缺口，全部保持 deterministic Rust、事件先行，
+不绕过 approval / Seatbelt / path jail / write scope / Verifier / merge /
+capacity / budget gate。计划与验收见
+[SCALING_PROCESS_SOURCE_REMOTE_BUDGET_PLAN.md](SCALING_PROCESS_SOURCE_REMOTE_BUDGET_PLAN.md)，
+决策见 ADR-0172–0176。基线 `9d8cdad`，本轮 **+36,951 / -1,098 行，81 个文件**。
+
+### F1 deterministic org scaling
+
+- 项目级 `ScalingPolicy`：enabled（默认 false）、Worker/Labour min/max、
+  ready threshold、critical delay、scale-down idle、cooldown、max step、
+  budget headroom；SQLite + manifest + `db-rebuild`，带归一化/边界校验。
+- `scaling.rs` 纯控制器根据 plan revision、task 状态/依赖/优先级/scope、
+  active slots、global capacity、budget headroom、上次决策时间做确定性判断：
+  Hold / ExpandWorkers / ExpandLabour / ScaleDownLabour / ScaleDownWorkers。
+- 扩缩容规则：只在有 ready work、slot 饱和、阈值满足、cooldown 已过、
+  `max_step` 内、global capacity 可用、budget headroom 足够时扩张；缩容先
+  Labour 后 Workers，必须有 idle 窗口，绝不删除 running agent，不低于 plan
+  demand 或 policy minimum。
+- Manager 始终由 plan 拥有；控制器只写 `manager_recommended` 证据，不创建/
+  重排 Manager、不改写 plan。
+- `ScalingSlots` 与 `SessionBudget` 共用同一 mutex，target 变更不能与 slot
+  acquisition 竞争；legacy `auto_expand_workers` 在 managed 模式下让位。
+- 事件 `scaling.decision` + `scaling_decisions` 投影，replay/repair/bundle/
+  `db-rebuild` 覆盖；同一 revision/policy/tick 幂等。
+- RPC `scaling.policy.get/set`、`scaling.preview`、`scaling.status`；
+  CLI `vp scaling`、`scaling-preview`、`scaling-policy*`；Manage Dash/Stage。
+- 限制：target 是 daemon 进程内存；tick 粒度；demand 是确定性估算；global
+  capacity 只观察不预留；不跨主机、不自动扩 Manager、不按模型 sizing。
+
+### F2 durable process supervisor
+
+- `supervised_processes`：session/worktree、argv/command/cwd、env/command hash、
+  state、pid/pgid、nonce、start/heartbeat/finish、exit/signal、output
+  path/size/rotation、owner instance、retention、idle TTL、policy caps。
+- 复用现有 Seatbelt 写沙箱、HOME/read jail、network policy、env allowlist；
+  子进程独立 process group、detached stdio、`kill_on_drop(false)`、私有
+  append-only 日志（有界 byte/line 轮转）。
+- 重启重连必须同时满足：PID 存活、`ps` start time 精确匹配、per-spawn nonce
+  匹配、command hash 匹配；缺一项为 `unknown`，PID 复用/已死为 `lost`；
+  imported session 不 adopt；不自动重启任何命令。
+- Stop：对 process group 发 SIGTERM，有界等待后 SIGKILL；unverified/unknown
+  行绝不发送信号；idle sweep 先重新验证身份，且受 project policy 和 daemon
+ 开关约束。
+- 事件 `process.starting/started/adopted/exited/lost/unknown/stopped/pruned`；
+  replay/repair/bundle/db-rebuild 重建生命周期；输出正文不进入事件/bundle。
+- `ProcessPolicy` 持久化；RPC `session.processes/logs/stop`、
+  `process.policy.get/set`；CLI `vp processes`、`process-logs`（含 bounded
+  `--follow`）、`process-stop`、`process-policy*`；Swift Preview/Stage。
+- 限制：同主机单 daemon；不是主机重启持久化；只对当前 daemon spawn 的子进程
+  可观察 exit；旋转在并发写下有少量竞态；stdin detached；unknown 行 fail closed。
+
+### F3 semantic project-source index
+
+- 可选 `SourceEmbeddingPolicy`：enabled（默认 false）、endpoint_env、
+  api_key_env、model、dimensions、batch_size、max_chunks_per_source、
+  retention_days、timeout；secret 只存环境变量名；SQLite + manifest +
+  `db-rebuild`。
+- `source_embedding_state`、`source_embeddings`、`source_embedding_jobs`、
+  `source_embedding_usage`：向量按 source snapshot generation 隔离，旧向量
+  标 stale，每源 chunk 上限有界。
+- Refresh/reindex 推进 generation、标记旧向量、排队有界 job；旧 generation 的
+  迟到响应被丢弃。Job 生命周期 pending→running→done/failed/dead，持久化
+  chunk 进度、指数退避、5 次 dead-letter、900s running reclaim；配置失败不
+  消耗重试。
+- Daemon reconciler `VERLINPARK_SOURCE_EMBEDDING_SECS`（默认 45，0 关闭）。
+- 检索：`search_sources` 支持 `mode: lexical|semantic|hybrid`（enabled 时默认
+  hybrid）；hybrid 用确定性 RRF（K=10）；semantic 为 bounded exact cosine
+  （≤512 current vectors），不声称 ANN。每 hit 带 `source`、`origins`、
+  `confidence`、lexical/semantic score；结果带 `mode`、`requested_mode`、
+  `candidates_scanned`、`semantic_unavailable`。lexical 模式保持原有 FTS/
+  literal 排序。
+- Citation 仍只为实际返回 chunk 生成 `[cN]`；向量不进入 tool/RPC/UI；成本
+  单独核算为 project infrastructure，不计入 session token/USD。
+- RPC `source.embedding.status/reindex/policy.*`；CLI `vp source-embedding*`、
+  `source-search --mode`；Swift Sources status card 和 search-mode picker。
+- 限制：exact scan、每源语义 chunk 上限、每次查询一次 embedding、无 rerank/
+  query expansion、endpoint 是受信任 operator 配置、向量/job 不进入 bundle/
+  replay。
+
+### F4 remote worktree integration
+
+- Helper 新增 `git_bundle_create/read/delete` 与可选 `git.bundle` capability：
+  canonical-root scratch、0700、30 分钟 TTL、最多 4 个 active export；流式
+  `git bundle create -`，边写边限 `max_bundle_bytes`（默认 256 MiB），失败/
+  shutdown 清理 partial 和 ref。
+- Chunked base64 + per-chunk/total SHA-256；支持 thin bundle `--not <base>`。
+  Daemon 重新校验 chunk 元数据、解码长度、per-chunk hash、total hash、cap、
+  本地文件大小、`git bundle verify` 和 advertised head。
+- 只导入到 `refs/verlinpark/remote/<session>/<import_id>`，不碰 session
+  branch/worktree；拒绝 malformed/tampered/thin-without-prereq/wrong-head/
+  SHA mismatch。
+- 导入 commit 走现有 isolated detached clone + `submit_verdict` Verifier；通过
+  后进入同一个 persisted merge queue 和确定性 `--no-ff` Integrator，没有第二条
+  merge 路径。Queue row 增加 `source`、`remote_host`、`remote_branch`、
+  `bundle_sha256`、`imported_ref`、verifier verdict/summary、environment
+  caveat。冲突/失败保留 imported ref 供 retry；成功后按 policy 清理 temp refs。
+- `RemoteIntegrationPolicy`：enabled 默认 false、max_bundle_bytes、
+  require_verifier 默认 true、allowed_hosts 精确匹配、keep_import_refs；
+  SQLite + manifest + `db-rebuild`。启用需显式确认 + 至少一个 host；
+  `remote.integrate` 需 operator confirmation 并记 host-state risk。
+- RPC `remote.integrate`、`remote.integration.status/cleanup/policy.*`；
+  CLI `vp remote-integrate`、`remote-integration*`；Manage Dash Git 卡片。
+- 限制：operator-triggered，无自动跨主机调度；remote host 是受信任基础设施；
+  本地验证不复制远程工具/环境/网络，caveat 写入事件/队列/状态/UI；远程测试
+  不能替代本地 Verifier；无分布式 scheduler/fencing/remote daemon。
+
+### F5 budget / critical-path governor
+
+- `critical_path.rs`：plan DAG 上确定性最长剩余依赖链；权重取声明 token
+  budget，否则 `max(priority,1) × 1000`，上限 100M；完成/skipped/cancelled
+  移除，failed/blocked/interrupted/queued/running/pending 保留；tie 按更小
+  task-id 序列；cycle/重复 id/未知依赖/>100 nodes/>1000 edges fail closed。
+- `CriticalPathPolicy`：enabled 默认 false、reserve_ratio 0–1（默认 0.25）、
+  throttle_at_ratio、critical_boost、min_task_budget；SQLite + manifest +
+  `db-rebuild`。
+- `protected = min(remaining, path_weight + ceil(remaining × reserve_ratio))`；
+  `free = remaining - protected`。压力下 critical 优先；非关键超过 `free` 返回
+  `BUDGET_RESERVED`，throttle 区返回 `BUDGET_THROTTLED`，低于 `min_task_budget`
+  返回 `BUDGET_EXHAUSTED`；critical 可绕过 reserve 但不绕过 hard budget。
+- Provider pre-flight 对非关键任务把 output clamp 到 `remaining - protected -
+  input`；低于 64 token 返回 task-scoped、非 abortive budget stop。
+- 事件 `budget.governor.decision`（admission + provider-deferral），bounded
+  100 条；`governor.preview` 无 provider call；RPC
+  `session.budget.governor`、`governor.preview`、`critical_path.policy.get/set`；
+  CLI `vp governor`、`critical-path`、`governor-preview`、`governor-policy*`；
+  Swift Efficiency/Stage。
+- 限制：单 daemon/单项目 admission；一条最重链，不是多路径公平分配；权重不是
+  实际消耗；running critical task 到下次评估前保持满权重；preview 不含
+  scheduler 的 live `next_attempt_at`；不是跨主机经济控制器，不改 model routing。
+
+### 验收
+
+- `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings` 通过。
+- `cargo test --workspace`：**2,261 passed / 0 failed / 6 ignored**。
+- `swiftformat --lint`：0/94 文件需要格式化。
+- `xcodegen generate` + `xcodebuild test`：**284 app + 132 helper = 416 passed / 0 failed**。
+- `just bundle` 通过，`verlinpadd` 已打包。
+- 合并时修复了 3 个真实的 RFC3339 字符串排序问题（context checkpoint 列表、
+  global GUI action timeline、message 列表），改为 `julianday(created_at)` +
+  确定性 tie-breaker，而不是放宽测试。
 
 ## 2026-11-11 Quality round: cache-first prompt, GUI session, tool errors, LSP intelligence
 

@@ -817,3 +817,46 @@ gate。四条线都已合入 `main`（`0e204d4` Q4 → `46eb570` Q3 → `8006dd7
   跨 host cache 共享、测试结果缓存/impact map、工具 timeline 的持久时序库，
   以及本文既有的分布式 scheduler/fencing、完整 shell read/network
   confinement、默认自动冲突解决等。
+
+## 9. 2026-11-12 Scaling / process / semantic sources / remote integration / budget round
+
+这一轮补齐五个长任务 runtime 缺口，不放宽任何安全或合并 gate。五条线都已
+合入 `main`（基线 `9d8cdad`；`edd30ac` F3 → `16b89a8` F2 → `39e1892` F1 →
+`4afb0c9` F5 → `e3a8712` F4），新增 +36,951 / -1,098 行。
+
+- **Deterministic scaling 已交付**：项目 `ScalingPolicy`、纯控制器、Worker/
+  Labour 扩缩容、cool-down/max-step/idle 安全规则、`ScalingSlots` 与
+  `SessionBudget` 同锁、事件/preview/RPC/CLI/UI。限制：target 是 daemon 内存；
+  tick 粒度；global capacity 只观察；不自动创建/重排 Manager；不跨主机。
+- **Durable process supervisor 已交付**：持久 `supervised_processes`、Seatbelt
+  下 detached process group、有界输出轮转、PID+start time+nonce+command hash
+  四重校验重连、显式 stop、事件/replay、RPC/CLI/UI。限制：同主机单 daemon；
+  不是主机重启持久化；只对当前 daemon spawn 的子进程可观察 exit；unknown 行
+  fail closed；stdin detached；并发旋转有少量字节竞态。
+- **Semantic project-source index 已交付**：可选 source embedding policy、
+  generation-scoped vectors/jobs、daemon reconciler、exact-cosine semantic、
+  确定性 RRF hybrid、`lexical|semantic|hybrid` 标签和 fallback、独立成本核算、
+  RPC/CLI/Swift。限制：exact scan ≤512 vectors、每源 chunk 上限、每次查询一次
+  embedding、无 ANN/rerank/query expansion；向量/job 是 derived operational
+  state，不进入 bundle/replay；endpoint 是受信任配置。
+- **Remote worktree integration 已交付**：bounded chunked Git bundle export/
+  import、per-chunk/total SHA-256、byte cap、`git bundle verify`、head 校验、
+  临时 ref 命名空间、local detached-clone Verifier、现有 merge queue/
+  Integrator、queue provenance/caveat、explicit policy/confirmation、RPC/CLI/
+  UI。限制：operator-triggered；remote host 是受信任基础设施；本地验证不复制
+  远程环境；远程测试不能替代本地 Verifier；无分布式 scheduler/fencing。
+- **Budget / critical-path governor 已交付**：纯 DAG longest-path、reserve/
+  throttle/admission、`BUDGET_RESERVED`/`BUDGET_THROTTLED`/`BUDGET_EXHAUSTED`、
+  provider pre-flight clamp、事件/preview/RPC/CLI/UI。限制：单 daemon/单项目；
+  一条最重链；权重不是实际消耗；不是跨主机经济控制器，不改 model routing。
+- **排序修复**：完整测试暴露出三处 RFC3339 字符串排序不等于时间排序的问题
+  （context checkpoint 列表、global GUI timeline、message 列表）；已改为
+  `julianday(created_at)` + 确定性 tie-breaker，并保留回归测试。
+- **验证**：Rust 2,261 passed / 0 failed / 6 ignored；Swift 416 passed
+  （284 app + 132 helper）；`cargo fmt/clippy`、`swiftformat --lint`、
+  `xcodebuild test`、`just bundle` 通过。
+- **仍未解决**：跨主机/分布式 scaling、process 与 lease fencing；host-reboot
+  进程持久化与自动重启；source ANN/rerank/query expansion；自动跨主机
+  scheduling/remote test reproduction；多路径 budget fairness；F6 approval/
+  attention optimizer；test-result cache；以及本文既有的完整 shell read/
+  network confinement、默认自动冲突解决等。

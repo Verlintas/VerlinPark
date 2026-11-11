@@ -1,6 +1,6 @@
 # Scaling, Process Supervision, Semantic Sources, Remote Integration, and Budget Governance Plan
 
-> **Status:** active implementation plan.
+> **Status:** implemented and verified (2026-11-12).
 > **Created:** 2026-11-11
 > **Base:** `c6540c3` (quality round Q1–Q4 complete).
 > **Goal:** close the next five runtime gaps: deterministic org scaling,
@@ -15,48 +15,48 @@
 
 ### Scaling
 
-- [ ] Team size is configured per session/project, but there is no deterministic
+- [x] Team size is configured per session/project, but there is no deterministic
       controller that expands Workers/Labour from observed ready-queue pressure.
-- [ ] Worker auto-expansion is opt-in and only raises the Worker count; there is
+- [x] Worker auto-expansion is opt-in and only raises the Worker count; there is
       no Labour expansion and no scale-down.
-- [ ] No expansion cooldown, max-step, minimum-idle, or scale-down safety rules;
+- [x] No expansion cooldown, max-step, minimum-idle, or scale-down safety rules;
       no event-backed decision trail or preview.
-- [ ] Manager expansion would require a plan revision; treating it as automatic
+- [x] Manager expansion would require a plan revision; treating it as automatic
       would silently rewrite department ownership.
 
 ### Process supervision
 
-- [ ] `process` is a per-run child; it does not survive daemon restart, has no
+- [x] `process` is a per-run child; it does not survive daemon restart, has no
       durable handle, and its output is not continuously captured.
-- [ ] Long builds/servers cannot be inspected after a provider turn or crash.
-- [ ] There is no PID-identity verification, so reattaching after restart would
+- [x] Long builds/servers cannot be inspected after a provider turn or crash.
+- [x] There is no PID-identity verification, so reattaching after restart would
       be unsafe by construction.
-- [ ] No bounded output rotation/retention for supervised processes.
+- [x] No bounded output rotation/retention for supervised processes.
 
 ### Semantic sources
 
-- [ ] Project sources are lexical FTS5 + LIKE only; `search_sources` cannot
+- [x] Project sources are lexical FTS5 + LIKE only; `search_sources` cannot
       answer paraphrase queries.
-- [ ] Hybrid memory has embeddings/IVF, but sources do not reuse that path.
-- [ ] No source-embedding jobs, generation invalidation, retry, health, or
+- [x] Hybrid memory has embeddings/IVF, but sources do not reuse that path.
+- [x] No source-embedding jobs, generation invalidation, retry, health, or
       separate cost accounting.
-- [ ] No explicit lexical/semantic/hybrid result labels or fallback state.
+- [x] No explicit lexical/semantic/hybrid result labels or fallback state.
 
 ### Remote integration
 
-- [ ] Remote worktrees can be created and inspected, but their commits cannot
+- [x] Remote worktrees can be created and inspected, but their commits cannot
       enter the local Verifier → merge queue path.
-- [ ] There is no bounded, integrity-checked way to import a remote commit.
-- [ ] Remote branches cannot be verified/merged without trusting an
+- [x] There is no bounded, integrity-checked way to import a remote commit.
+- [x] Remote branches cannot be verified/merged without trusting an
       out-of-band push; conflict/retry is undefined.
 
 ### Budget governance
 
-- [ ] Budgets are per session/task/department with reservations, but allocation
+- [x] Budgets are per session/task/department with reservations, but allocation
       is unaware of the plan's critical path.
-- [ ] Non-critical tasks can consume budget that the blocking path needs.
-- [ ] No deterministic throttle/defer policy, decision events, or preview.
-- [ ] No starvation or revision-change guarantees.
+- [x] Non-critical tasks can consume budget that the blocking path needs.
+- [x] No deterministic throttle/defer policy, decision events, or preview.
+- [x] No starvation or revision-change guarantees.
 
 ### Deferred backlog (unchanged)
 
@@ -295,3 +295,44 @@ the merge queue/Integrator; F5 lands after F1 so both read the same plan state.
 - No ANN index for sources in this round; exact cosine only.
 - No remote test execution as a substitute for local Verifier evidence.
 - No test-result cache/impact map, approval optimizer, or Bitbucket adapter.
+
+---
+
+## 7. Implementation record
+
+Implemented on `main` from base `9d8cdad` in five commits:
+
+```text
+edd30ac feat(sources): semantic project-source index with exact-cosine RRF retrieval (F3)
+16b89a8 feat(process): durable process supervisor (F2)
+39e1892 feat(scaling): deterministic org scaling controller (F1)
+4afb0c9 feat(budget): critical-path budget governor (F5)
+e3a8712 feat(remote): remote worktree integration through bounded Git bundles (F4)
+```
+
+- Diff: **+36,951 / -1,098 lines across 81 files** (target +30,000).
+- Rust: `cargo test --workspace` **2,261 passed / 0 failed / 6 ignored**;
+  `cargo fmt --check` and `cargo clippy -D warnings` pass.
+- Swift: `xcodebuild test` **284 app + 132 helper = 416 passed / 0 failed**;
+  `swiftformat --lint` passes (0/94).
+- `just bundle` builds the Debug app and bundles `verlinpadd`.
+- ADR-0172–0176 record the five decisions.
+
+Merge-resolution notes:
+
+- Shared CLI helper/test tails and store test tails were reconstructed from the
+  pre-merge versions so no side's tests were dropped.
+- Three timestamp-ordering bugs surfaced under the larger parallel suite and
+  were fixed in the store rather than papered over: context-checkpoint listing,
+  the global GUI action timeline, and message listing now order by
+  `julianday(created_at)` with deterministic tie-breakers instead of comparing
+  RFC3339 strings whose fractional seconds may be trimmed.
+- F2 and F4 both add daemon sweeper/error helpers; both are retained.
+- F1 and F5 both touch `SessionBudget`; the merged order is scaling slots →
+  critical-path admission, preserving both gates.
+
+Explicit limits are recorded in AGENTS.md, README.md, PROGRESS.md, and AUDIT.md:
+single-daemon slot/process/lease control, no host-reboot process persistence,
+exact-cosine source retrieval only, remote integration is operator-triggered and
+does not reproduce the remote environment locally, and the governor is not a
+cross-host economic controller.
