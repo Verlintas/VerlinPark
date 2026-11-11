@@ -21,3 +21,6 @@ vp-bench = { path = "../vp-bench" }
 vp-core = { path = "../vp-core" }
 vp-protocol = { path = "../vp-protocol" }
 vp-store = { path = "../vp-store" }
+
+[dev-dependencies]
+tempfile = "3"

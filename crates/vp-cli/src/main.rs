@@ -8,6 +8,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::fs::OpenOptions;
+use vp_core::backup::repository::{
+    Compression, KdfConfig, Passphrase, RepositoryBackupOptions, RepositoryEncryption,
+};
 use vp_protocol::discovery::Discovery;
 use vp_protocol::rpc::RpcResponse;
 use vp_store::paths;
@@ -163,23 +166,86 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Back up the local data directory to a checksummed ZIP archive.
+    /// Back up the local data directory to a v1 ZIP or a v2 encrypted repository.
     Backup {
-        /// Destination ZIP path.
+        /// Destination ZIP path (v1 format). Conflicts with --repository.
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
+        /// V2 backup repository directory. Created on the first backup.
+        #[arg(long, conflicts_with = "output")]
+        repository: Option<PathBuf>,
         /// Include content-addressed artifact blobs.
         #[arg(long)]
         include_artifacts: bool,
+        /// Reuse blobs from the latest snapshot (repository mode only).
+        #[arg(long)]
+        incremental: bool,
+        /// Write an explicitly unencrypted repository (repository mode only).
+        #[arg(long, conflicts_with_all = ["passphrase_env", "passphrase_file"])]
+        plaintext: bool,
+        /// Read the repository passphrase from this environment variable.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        passphrase_env: Option<String>,
+        /// Read the repository passphrase from a 0600 file.
+        #[arg(long, conflicts_with = "passphrase_env")]
+        passphrase_file: Option<PathBuf>,
+        /// Store repository blobs without zstd compression.
+        #[arg(long)]
+        no_compress: bool,
     },
     /// Restore a data-directory backup. The daemon must be stopped.
     Restore {
-        /// Backup ZIP path.
+        /// Backup ZIP path (v1 format). Conflicts with --repository.
         #[arg(short, long)]
-        input: PathBuf,
+        input: Option<PathBuf>,
+        /// V2 backup repository directory.
+        #[arg(long, conflicts_with = "input")]
+        repository: Option<PathBuf>,
+        /// Snapshot id to restore from a repository.
+        #[arg(long)]
+        snapshot: Option<String>,
         /// Replace an existing database, instance lock, or non-empty target.
         #[arg(long)]
         force: bool,
+        /// Read the repository passphrase from this environment variable.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        passphrase_env: Option<String>,
+        /// Read the repository passphrase from a 0600 file.
+        #[arg(long, conflicts_with = "passphrase_env")]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// List and validate snapshots in a v2 backup repository.
+    BackupList {
+        /// V2 backup repository directory.
+        #[arg(long)]
+        repository: PathBuf,
+        /// Decrypt and hash every referenced blob.
+        #[arg(long)]
+        verify: bool,
+        /// Read the repository passphrase from this environment variable.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        passphrase_env: Option<String>,
+        /// Read the repository passphrase from a 0600 file.
+        #[arg(long, conflicts_with = "passphrase_env")]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// Prune old v2 backup snapshots, retaining the latest N.
+    BackupPrune {
+        /// V2 backup repository directory.
+        #[arg(long)]
+        repository: PathBuf,
+        /// Number of latest snapshots to retain.
+        #[arg(long)]
+        keep: usize,
+        /// Report what would be removed without modifying the repository.
+        #[arg(long)]
+        dry_run: bool,
+        /// Read the repository passphrase from this environment variable.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        passphrase_env: Option<String>,
+        /// Read the repository passphrase from a 0600 file.
+        #[arg(long, conflicts_with = "passphrase_env")]
+        passphrase_file: Option<PathBuf>,
     },
     /// Send a tiny live request to the configured provider.
     ProviderTest,
@@ -1582,27 +1648,174 @@ async fn main() -> Result<()> {
     }
     if let Command::Backup {
         output,
+        repository,
         include_artifacts,
+        incremental,
+        plaintext,
+        passphrase_env,
+        passphrase_file,
+        no_compress,
     } = &cli.command
     {
         let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
-        let report = vp_core::backup::create_backup(&data_dir, output, *include_artifacts)?;
-        let value = serde_json::to_value(report)?;
-        if cli.json {
-            print_json(&value)?;
-        } else {
-            print_human(&value);
+        match (output, repository) {
+            (Some(output), None) => {
+                if *incremental
+                    || *plaintext
+                    || passphrase_env.is_some()
+                    || passphrase_file.is_some()
+                    || *no_compress
+                {
+                    bail!(
+                        "--incremental, --plaintext, --passphrase-env, --passphrase-file, and --no-compress are repository-only options; use --repository"
+                    );
+                }
+                let report = vp_core::backup::create_backup(&data_dir, output, *include_artifacts)?;
+                let value = serde_json::to_value(report)?;
+                if cli.json {
+                    print_json(&value)?;
+                } else {
+                    print_human(&value);
+                }
+            }
+            (None, Some(repository)) => {
+                let passphrase =
+                    resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
+                let encryption = match (plaintext, passphrase) {
+                    (true, Some(_)) => {
+                        bail!("--plaintext conflicts with a repository passphrase")
+                    }
+                    (true, None) => RepositoryEncryption::Plaintext,
+                    (false, Some(passphrase)) => RepositoryEncryption::Encrypted(passphrase),
+                    (false, None) => bail!(
+                        "repository backups are encrypted by default; pass --passphrase-env NAME or --passphrase-file PATH, or --plaintext to write an unencrypted repository"
+                    ),
+                };
+                let options = RepositoryBackupOptions {
+                    incremental: *incremental,
+                    include_artifacts: *include_artifacts,
+                    compression: if *no_compress {
+                        Compression::None
+                    } else {
+                        Compression::Zstd
+                    },
+                    encryption,
+                    kdf: KdfConfig::default(),
+                };
+                let report = vp_core::backup::repository::create_repository_backup(
+                    &data_dir, repository, options,
+                )?;
+                let value = serde_json::to_value(report)?;
+                if cli.json {
+                    print_json(&value)?;
+                } else {
+                    print_repository_backup(&value);
+                }
+            }
+            (Some(_), Some(_)) => {
+                bail!("pass exactly one of --output or --repository")
+            }
+            (None, None) => {
+                bail!(
+                    "pass --output <zip> for a v1 backup or --repository <dir> for a v2 repository"
+                )
+            }
         }
         return Ok(());
     }
-    if let Command::Restore { input, force } = &cli.command {
+    if let Command::Restore {
+        input,
+        repository,
+        snapshot,
+        force,
+        passphrase_env,
+        passphrase_file,
+    } = &cli.command
+    {
         let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
-        let report = vp_core::backup::restore_backup(input, &data_dir, *force)?;
+        match (input, repository) {
+            (Some(input), None) => {
+                if snapshot.is_some() || passphrase_env.is_some() || passphrase_file.is_some() {
+                    bail!(
+                        "--snapshot, --passphrase-env, and --passphrase-file are repository-only options; use --repository"
+                    );
+                }
+                let report = vp_core::backup::restore_backup(input, &data_dir, *force)?;
+                let value = serde_json::to_value(report)?;
+                if cli.json {
+                    print_json(&value)?;
+                } else {
+                    print_human(&value);
+                }
+            }
+            (None, Some(repository)) => {
+                let snapshot = snapshot.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--repository restore requires --snapshot <id>")
+                })?;
+                let passphrase =
+                    resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
+                let report = vp_core::backup::repository::restore_repository_snapshot(
+                    repository,
+                    snapshot,
+                    &data_dir,
+                    *force,
+                    passphrase.as_ref(),
+                )?;
+                let value = serde_json::to_value(report)?;
+                if cli.json {
+                    print_json(&value)?;
+                } else {
+                    print_repository_restore(&value);
+                }
+            }
+            (Some(_), Some(_)) => bail!("pass exactly one of --input or --repository"),
+            (None, None) => bail!(
+                "pass --input <zip> for a v1 restore or --repository <dir> --snapshot <id> for a v2 restore"
+            ),
+        }
+        return Ok(());
+    }
+    if let Command::BackupList {
+        repository,
+        verify,
+        passphrase_env,
+        passphrase_file,
+    } = &cli.command
+    {
+        let passphrase = resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
+        let report = vp_core::backup::repository::list_repository_snapshots(
+            repository,
+            passphrase.as_ref(),
+            *verify,
+        )?;
         let value = serde_json::to_value(report)?;
         if cli.json {
             print_json(&value)?;
         } else {
-            print_human(&value);
+            print_repository_list(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupPrune {
+        repository,
+        keep,
+        dry_run,
+        passphrase_env,
+        passphrase_file,
+    } = &cli.command
+    {
+        let passphrase = resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
+        let report = vp_core::backup::repository::prune_repository(
+            repository,
+            *keep,
+            *dry_run,
+            passphrase.as_ref(),
+        )?;
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_repository_prune(&value);
         }
         return Ok(());
     }
@@ -1611,6 +1824,8 @@ async fn main() -> Result<()> {
         Command::DbRebuild { .. } => unreachable!("db rebuild is handled before discovery"),
         Command::Backup { .. } => unreachable!("backup is handled before discovery"),
         Command::Restore { .. } => unreachable!("restore is handled before discovery"),
+        Command::BackupList { .. } => unreachable!("backup-list is handled before discovery"),
+        Command::BackupPrune { .. } => unreachable!("backup-prune is handled before discovery"),
         Command::Bench { .. } => unreachable!("bench is handled before discovery"),
         Command::Ping => {
             let result = rpc(&discovery, "ping", json!({})).await?;
@@ -4490,6 +4705,216 @@ async fn rpc(discovery: &Discovery, method: &str, params: Value) -> Result<Value
         bail!("{} (code {})", error.message, error.code);
     }
     Ok(response.result.unwrap_or(Value::Null))
+}
+
+fn resolve_passphrase(
+    environment: Option<&str>,
+    file: Option<&Path>,
+) -> Result<Option<Passphrase>> {
+    match (environment, file) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => {
+            bail!("pass only one of --passphrase-env or --passphrase-file")
+        }
+        (Some(name), None) => {
+            if name.is_empty() {
+                bail!("--passphrase-env requires a non-empty environment variable name");
+            }
+            let value = std::env::var(name).with_context(|| {
+                format!("backup passphrase environment variable {name} is not set or is not UTF-8")
+            })?;
+            Ok(Some(Passphrase::new(value.into_bytes())?))
+        }
+        (None, Some(path)) => {
+            let metadata = std::fs::symlink_metadata(path)
+                .with_context(|| format!("reading backup passphrase file {}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "refusing symlinked backup passphrase file {}",
+                    path.display()
+                );
+            }
+            if !metadata.is_file() {
+                bail!(
+                    "backup passphrase file {} is not a regular file",
+                    path.display()
+                );
+            }
+            if metadata.len() == 0 || metadata.len() > 4097 {
+                bail!(
+                    "backup passphrase file {} must contain 1..=4096 bytes",
+                    path.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    bail!(
+                        "backup passphrase file {} must not be accessible by group or others (mode {:04o})",
+                        path.display(),
+                        mode
+                    );
+                }
+            }
+            let mut bytes = std::fs::read(path)
+                .with_context(|| format!("reading backup passphrase file {}", path.display()))?;
+            if bytes.last() == Some(&b'\n') {
+                bytes.pop();
+                if bytes.last() == Some(&b'\r') {
+                    bytes.pop();
+                }
+            }
+            Ok(Some(Passphrase::new(bytes)?))
+        }
+    }
+}
+
+fn print_repository_backup(value: &Value) {
+    println!(
+        "snapshot {}  sequence {}  parent {}",
+        value["snapshot_id"].as_str().unwrap_or("?"),
+        value["sequence"].as_u64().unwrap_or(0),
+        value["parent"].as_str().unwrap_or("-")
+    );
+    println!(
+        "  {}  encrypted={}  incremental={}  artifacts={}  compression={}",
+        value["repository"].as_str().unwrap_or("?"),
+        value["encrypted"].as_bool().unwrap_or(false),
+        value["incremental"].as_bool().unwrap_or(false),
+        value["includes_artifacts"].as_bool().unwrap_or(false),
+        value["compression"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  entries {} ({} sessions, {} artifacts)  logical {} bytes",
+        value["entries"].as_u64().unwrap_or(0),
+        value["sessions"].as_u64().unwrap_or(0),
+        value["artifacts"].as_u64().unwrap_or(0),
+        value["bytes"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  written {} bytes  deduplicated {} bytes ({} parent, {} store)  stored blob bytes {}",
+        value["written_bytes"].as_u64().unwrap_or(0),
+        value["deduplicated_bytes"].as_u64().unwrap_or(0),
+        value["deduplicated_from_parent_bytes"]
+            .as_u64()
+            .unwrap_or(0),
+        value["deduplicated_from_store_bytes"].as_u64().unwrap_or(0),
+        value["stored_bytes"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  blobs written {}  reused {}  manifest {} bytes  sha256 {}",
+        value["blobs_written"].as_u64().unwrap_or(0),
+        value["blobs_reused"].as_u64().unwrap_or(0),
+        value["manifest_bytes"].as_u64().unwrap_or(0),
+        value["manifest_sha256"].as_str().unwrap_or("?")
+    );
+}
+
+fn print_repository_restore(value: &Value) {
+    println!(
+        "restored {}  sequence {}  -> {}",
+        value["snapshot_id"].as_str().unwrap_or("?"),
+        value["sequence"].as_u64().unwrap_or(0),
+        value["output"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  entries {} ({} sessions, {} artifacts)  {} bytes  encrypted={}  replaced_existing={}",
+        value["entries"].as_u64().unwrap_or(0),
+        value["sessions"].as_u64().unwrap_or(0),
+        value["artifacts"].as_u64().unwrap_or(0),
+        value["bytes"].as_u64().unwrap_or(0),
+        value["encrypted"].as_bool().unwrap_or(false),
+        value["replaced_existing"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  validated blobs {}  stored blob bytes {}",
+        value["validated_blobs"].as_u64().unwrap_or(0),
+        value["stored_blob_bytes"].as_u64().unwrap_or(0)
+    );
+}
+
+fn print_repository_list(value: &Value) {
+    println!(
+        "{}  {} snapshots  encrypted={}  blobs={}  logical {} bytes",
+        value["repository"].as_str().unwrap_or("?"),
+        value["snapshot_count"].as_u64().unwrap_or(0),
+        value["encrypted"].as_bool().unwrap_or(false),
+        value["unique_blobs"].as_u64().unwrap_or(0),
+        value["logical_bytes"].as_u64().unwrap_or(0)
+    );
+    let validation = &value["validation"];
+    println!(
+        "  validation valid={}  blobs present={} missing={} verified={} corrupt={}  mode={}",
+        validation["valid"].as_bool().unwrap_or(false),
+        validation["blobs_present"].as_u64().unwrap_or(0),
+        validation["blobs_missing"].as_u64().unwrap_or(0),
+        validation["blobs_verified"].as_u64().unwrap_or(0),
+        validation["blobs_corrupt"].as_u64().unwrap_or(0),
+        validation["blob_verification"].as_str().unwrap_or("?")
+    );
+    if let Some(issues) = validation["issues"].as_array()
+        && !issues.is_empty()
+    {
+        for issue in issues {
+            println!("  issue: {}", issue.as_str().unwrap_or("?"));
+        }
+    }
+    if let Some(snapshots) = value["snapshots"].as_array() {
+        for snapshot in snapshots {
+            println!(
+                "{}  seq {:<4} parent {:<36} {:<8} {} bytes  {} entries  sha256 {}",
+                snapshot["snapshot_id"].as_str().unwrap_or("?"),
+                snapshot["sequence"].as_u64().unwrap_or(0),
+                snapshot["parent"].as_str().unwrap_or("-"),
+                if snapshot["incremental"].as_bool().unwrap_or(false) {
+                    "incr"
+                } else {
+                    "full"
+                },
+                snapshot["bytes"].as_u64().unwrap_or(0),
+                snapshot["entries"].as_u64().unwrap_or(0),
+                snapshot["manifest_sha256"].as_str().unwrap_or("?")
+            );
+        }
+    }
+}
+
+fn print_repository_prune(value: &Value) {
+    println!(
+        "{}  keep {}  dry_run={}  applied={}",
+        value["repository"].as_str().unwrap_or("?"),
+        value["keep"].as_u64().unwrap_or(0),
+        value["dry_run"].as_bool().unwrap_or(false),
+        value["applied"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  snapshots total {}  kept {}  pruned {}  blobs kept {}  pruned {}",
+        value["snapshots_total"].as_u64().unwrap_or(0),
+        value["snapshots_kept"].as_u64().unwrap_or(0),
+        value["snapshots_pruned"]
+            .as_array()
+            .map(|entries| entries.len())
+            .unwrap_or(0),
+        value["blobs_kept"].as_u64().unwrap_or(0),
+        value["blobs_pruned"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  reclaimed {} bytes  protected {} bytes",
+        value["reclaimed_bytes"].as_u64().unwrap_or(0),
+        value["protected_bytes"].as_u64().unwrap_or(0)
+    );
+    if let Some(snapshots) = value["snapshots_pruned"].as_array() {
+        for snapshot in snapshots {
+            println!(
+                "  prune {}  seq {}  {} bytes",
+                snapshot["snapshot_id"].as_str().unwrap_or("?"),
+                snapshot["sequence"].as_u64().unwrap_or(0),
+                snapshot["bytes"].as_u64().unwrap_or(0)
+            );
+        }
+    }
 }
 
 fn print_json(value: &Value) -> Result<()> {
