@@ -759,6 +759,18 @@ pub fn tracked_changes(root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Full worktree status including untracked paths. Used by read-only agents to
+/// prove that a run did not add tracked or untracked changes.
+pub(crate) fn status_snapshot(root: &Path) -> Result<Vec<String>> {
+    let output = git_output(root, &["status", "--porcelain", "--untracked-files=all"])?;
+    Ok(output
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Discard tracked modifications made by a Verifier. Untracked files are left
 /// alone because they may be legitimate test artifacts.
 pub fn reset_tracked_changes(root: &Path) -> Result<()> {

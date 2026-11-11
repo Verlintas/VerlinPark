@@ -238,6 +238,8 @@ pub struct RoleModels {
     pub verifier: RoleModelConfig,
     #[serde(default)]
     pub labour: RoleModelConfig,
+    #[serde(default)]
+    pub scout: RoleModelConfig,
 }
 
 impl RoleModels {
@@ -247,6 +249,7 @@ impl RoleModels {
             "worker" => &self.worker,
             "verifier" => &self.verifier,
             "labour" => &self.labour,
+            "scout" => &self.scout,
             _ => &self.leader,
         }
     }

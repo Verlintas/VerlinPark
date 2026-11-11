@@ -217,6 +217,94 @@ impl Provider for SlowProvider {
     }
 }
 
+struct ScoutGuardProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    paused: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Provider for ScoutGuardProvider {
+    fn id(&self) -> &str {
+        "scout-guard"
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let events = match call {
+            0 => vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_scout".into(),
+                    name: "scout".into(),
+                    arguments: serde_json::json!({
+                        "objective": "map the readme",
+                        "files": ["README.md"],
+                        "max_steps": 3
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            1 => vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_read".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            2 => {
+                self.paused.notify_one();
+                self.resume.notified().await;
+                vec![
+                    StreamEvent::TextDelta("README.md:1 has the test greeting.".into()),
+                    StreamEvent::Done,
+                ]
+            }
+            _ => vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ],
+        };
+        Ok(Box::pin(futures_util::stream::iter(
+            events.into_iter().map(Ok),
+        )))
+    }
+}
+
+struct ScoutCancelProvider {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for ScoutCancelProvider {
+    fn id(&self) -> &str {
+        "scout-cancel"
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            return Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::ToolCall(ToolCall {
+                    id: "call_scout".into(),
+                    name: "scout".into(),
+                    arguments: serde_json::json!({
+                        "objective": "map the readme",
+                        "max_steps": 2
+                    })
+                    .to_string(),
+                })),
+                Ok(StreamEvent::Done),
+            ])));
+        }
+        Ok(Box::pin(futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(StreamEvent::TextDelta("late".into()))
+        })))
+    }
+}
+
 struct ScriptedStreamProvider {
     responses: Mutex<VecDeque<Vec<Result<StreamEvent, ProviderError>>>>,
 }
@@ -2071,6 +2159,484 @@ async fn rejects_a_verifier_that_modifies_tracked_files() {
                 .as_str()
                 .is_some_and(|summary| summary.contains("modified tracked files"))
     }));
+}
+
+#[tokio::test]
+async fn scout_tool_schema_is_read_only() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service.config.read().unwrap().as_ref().unwrap().clone();
+    let names = |role: AgentRole, profile: AgentProfile, allow: bool| {
+        tool_schemas(&config, role, profile, allow)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let scout = names(AgentRole::Scout, AgentProfile::Research, false);
+    for required in [
+        "read_file",
+        "read_files",
+        "find_files",
+        "file_info",
+        "grep",
+        "list_dir",
+        "repo_map",
+        "find_symbol",
+        "find_references",
+        "dependency_graph",
+        "affected_tests",
+        "code_diagnostics",
+        "build_context",
+        "git",
+        "list_sources",
+        "search_sources",
+        "read_source",
+        "recall",
+        "team_status",
+    ] {
+        assert!(scout.contains(required), "Scout is missing {required}");
+    }
+    for forbidden in [
+        "shell",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "file_manage",
+        "process",
+        "wait_for",
+        "delegate",
+        "delegate_many",
+        "delegate_acp",
+        "mcp",
+        "browser",
+        "remember",
+        "publish_artifact",
+        "publish_artifact_file",
+        "send_message",
+        "ask_user",
+        "coordinate",
+        "use_skill",
+        "scout",
+    ] {
+        assert!(
+            !scout.contains(forbidden),
+            "Scout must not advertise {forbidden}"
+        );
+        assert!(!AgentRole::Scout.allows_tool(AgentProfile::Research, forbidden));
+    }
+    for role in [AgentRole::Leader, AgentRole::Manager] {
+        let tools = names(role, AgentProfile::Coding, true);
+        assert!(tools.contains("scout"), "{role:?} cannot call scout");
+    }
+}
+
+#[test]
+fn scout_input_is_bounded() {
+    assert!(parse_scout(&serde_json::json!({"objective": ""})).is_err());
+    assert!(parse_scout(&serde_json::json!({"objective": "x".repeat(4_001)})).is_err());
+    let default = parse_scout(&serde_json::json!({"objective": "map it"})).unwrap();
+    assert_eq!(default.max_steps, 6);
+    assert_eq!(
+        parse_scout(&serde_json::json!({"objective": "map it", "max_steps": 99}))
+            .unwrap()
+            .max_steps,
+        12
+    );
+    assert_eq!(
+        parse_scout(&serde_json::json!({"objective": "map it", "max_steps": 0}))
+            .unwrap()
+            .max_steps,
+        1
+    );
+    let files = (0..21)
+        .map(|index| format!("src/{index}.rs"))
+        .collect::<Vec<_>>();
+    assert!(parse_scout(&serde_json::json!({"objective": "map it", "files": files})).is_err());
+}
+
+#[tokio::test]
+async fn scout_returns_a_bounded_brief_without_a_worktree_or_merge_entry() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_scout".into(),
+                    name: "scout".into(),
+                    arguments: serde_json::json!({
+                        "objective": "map the readme",
+                        "files": ["README.md"],
+                        "max_steps": 3
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_read".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("README.md:1 contains the test greeting.".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "scout the readme".into(), None)
+        .await
+        .unwrap();
+    let session_worktree = session.worktree.clone().unwrap();
+    let session_branch = session.branch.clone().unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "scout the readme")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let agents = engine.list_agents(&session.id).await.unwrap();
+    let scout = agents
+        .iter()
+        .find(|agent| agent.role == "scout")
+        .expect("a Scout agent record");
+    assert_eq!(scout.status, "idle");
+    assert_eq!(scout.title.as_deref(), Some("Scout"));
+    assert_eq!(scout.profile.as_deref(), Some("research"));
+    assert_eq!(scout.worktree.as_deref(), Some(session_worktree.as_str()));
+    assert_eq!(scout.branch.as_deref(), Some(session_branch.as_str()));
+    assert!(scout.task_id.is_none());
+    let leader = agents.iter().find(|agent| agent.role == "leader").unwrap();
+    assert_eq!(scout.parent_id.as_deref(), Some(leader.id.as_str()));
+    assert!(
+        engine
+            .list_merge_queue(&session.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a Scout must never enqueue a merge"
+    );
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.spawned"
+            && event.payload["agent_role"] == "scout"
+            && event.payload["read_only"] == true
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.started"
+            && event.payload["agent_role"] == "scout"
+            && event.payload["read_only"] == true
+            && event.payload["max_steps"] == 3
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.finished"
+            && event.payload["agent_role"] == "scout"
+            && event.payload["status"] == "idle"
+    }));
+    let completed = events
+        .iter()
+        .find(|event| event.kind == "scout.completed")
+        .expect("scout.completed event");
+    assert_eq!(completed.payload["agent_role"], "scout");
+    assert_eq!(completed.payload["status"], "completed");
+    assert_eq!(completed.payload["cancelled"], false);
+    assert!(
+        completed.payload["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("README.md:1"))
+    );
+    assert!(completed.payload["usage"]["input_tokens"].as_u64().unwrap() > 0);
+    assert!(
+        completed.payload["usage"]["output_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(completed.payload["usage"]["calls"].as_u64().unwrap() >= 2);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "merge_queue.enqueued")
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+}
+
+#[tokio::test]
+async fn scout_cannot_execute_write_or_shell_tools() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_scout".into(),
+                    name: "scout".into(),
+                    arguments: serde_json::json!({
+                        "objective": "try to write",
+                        "max_steps": 3
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_shell".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "printf 'tampered\\n' > scout-denied.txt"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_write".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "scout-denied.txt",
+                        "content": "tampered\n"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("I cannot write as a read-only Scout.".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "scout write attempt".into(), None)
+        .await
+        .unwrap();
+    let worktree = session.worktree.clone().unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "scout write attempt")
+        .await
+        .unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+    assert!(
+        !std::path::Path::new(&worktree)
+            .join("scout-denied.txt")
+            .exists(),
+        "a Scout tool call must not write"
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    for tool in ["shell", "write_file"] {
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.finished"
+                && event.payload["agent_role"] == "scout"
+                && event.payload["name"] == tool
+                && event.payload["is_error"] == true
+                && event.payload["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("not available to Scout"))
+        }));
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "approval.requested"),
+        "Scout policy denials must not ask the user for approval"
+    );
+    let scout = engine
+        .list_agents(&session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|agent| agent.role == "scout")
+        .unwrap();
+    assert_eq!(scout.status, "idle");
+}
+
+#[tokio::test]
+async fn scout_post_run_guard_rejects_worktree_changes() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(ScoutGuardProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        paused: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let trait_provider: Arc<dyn Provider> = provider.clone();
+    let (engine, service, project) = test_service_with_provider(&dir, trait_provider);
+    let session = engine
+        .create_session(project.id, "scout guard".into(), None)
+        .await
+        .unwrap();
+    let worktree = session.worktree.clone().unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "scout guard").await.unwrap();
+    provider.paused.notified().await;
+    std::fs::write(
+        std::path::Path::new(&worktree).join("README.md"),
+        "tampered\n",
+    )
+    .unwrap();
+    std::fs::write(
+        std::path::Path::new(&worktree).join("scout-untracked.txt"),
+        "untracked\n",
+    )
+    .unwrap();
+    provider.resume.notify_one();
+    let _ = wait_until_idle(&engine, &session).await;
+
+    let scout = engine
+        .list_agents(&session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|agent| agent.role == "scout")
+        .unwrap();
+    assert_eq!(scout.status, "failed");
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let completed = events
+        .iter()
+        .find(|event| event.kind == "scout.completed")
+        .expect("scout.completed event");
+    assert_eq!(completed.payload["status"], "rejected");
+    assert_eq!(completed.payload["guard_failed"], true);
+    let modified = completed.payload["modified_paths"]
+        .as_array()
+        .expect("modified paths");
+    assert!(
+        modified
+            .iter()
+            .any(|path| path.as_str().is_some_and(|path| path.contains("README.md")))
+    );
+    assert!(modified.iter().any(|path| {
+        path.as_str()
+            .is_some_and(|path| path.contains("scout-untracked.txt"))
+    }));
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&worktree).join("README.md")).unwrap(),
+        "tampered\n"
+    );
+    assert!(
+        engine
+            .list_merge_queue(&session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_the_parent_cancels_a_running_scout() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(ScoutCancelProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let trait_provider: Arc<dyn Provider> = provider.clone();
+    let (engine, service, project) = test_service_with_provider(&dir, trait_provider);
+    let session = engine
+        .create_session(project.id, "cancel scout".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "cancel scout").await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        if agents
+            .iter()
+            .any(|agent| agent.role == "scout" && agent.status == "running")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Scout did not start: {agents:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(service.cancel(&session.id));
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "cancelled");
+    let scout = engine
+        .list_agents(&session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|agent| agent.role == "scout")
+        .unwrap();
+    assert_eq!(scout.status, "cancelled");
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "scout.completed"
+            && event.payload["cancelled"] == true
+            && event.payload["status"] == "cancelled"
+    }));
+}
+
+#[test]
+fn scout_slots_and_tokens_share_the_session_budget() {
+    let caps = AgentCaps {
+        managers: 1,
+        workers: 1,
+        labour: 1,
+    };
+    let budget = SessionBudget::new(Some(100), 0, caps);
+    let first = budget.reserve_slot(AgentRole::Scout).unwrap();
+    let second = budget.reserve_slot(AgentRole::Scout).unwrap();
+    let third = budget.reserve_slot(AgentRole::Scout).unwrap();
+    assert!(
+        budget.reserve_slot(AgentRole::Scout).is_none(),
+        "the Scout cap must be bounded"
+    );
+    assert_eq!(budget.available(AgentRole::Scout), 0);
+    drop(third);
+    assert_eq!(budget.available(AgentRole::Scout), 1);
+    assert!(
+        budget.reserve_tokens(101).is_none(),
+        "Scout calls must respect the session token budget"
+    );
+    let reservation = budget.reserve_tokens(100).unwrap();
+    assert_eq!(budget.available_tokens(), Some(0));
+    drop(reservation);
+    drop(second);
+    drop(first);
+    assert_eq!(budget.available(AgentRole::Scout), 3);
 }
 
 #[test]
@@ -4290,6 +4856,9 @@ async fn role_models_override_the_base_model() {
     config.role_models.worker.output_usd_per_million = Some(4.0);
     assert_eq!(model_for(&config, AgentRole::Worker), "worker-model");
     assert_eq!(model_for(&config, AgentRole::Manager), "test");
+    assert_eq!(model_for(&config, AgentRole::Scout), "test");
+    config.role_models.scout.model = Some("scout-model".into());
+    assert_eq!(model_for(&config, AgentRole::Scout), "scout-model");
     let worker_prices = role_prices(&config, AgentRole::Worker);
     assert_eq!(worker_prices, prices(2.0, 4.0));
     config.role_models.worker.cache_read_usd_per_million = Some(0.2);

@@ -365,7 +365,10 @@ impl CapacityController {
 
     fn try_acquire(&self, role: AgentRole, session_id: &str) -> Option<CapacityPermit> {
         match role {
-            AgentRole::Worker => self.workers.try_acquire(session_id),
+            // Scouts are read-only but still make provider calls. They account
+            // against the Worker lane so a team cannot bypass daemon-wide
+            // capacity by spawning assistants.
+            AgentRole::Worker | AgentRole::Scout => self.workers.try_acquire(session_id),
             AgentRole::Labour => self.labour.try_acquire(session_id),
             _ => None,
         }
@@ -379,7 +382,9 @@ impl CapacityController {
         control: &RunControl,
     ) -> Option<CapacityPermit> {
         match role {
-            AgentRole::Worker => self.workers.acquire(session_id, priority, control).await,
+            AgentRole::Worker | AgentRole::Scout => {
+                self.workers.acquire(session_id, priority, control).await
+            }
             AgentRole::Labour => self.labour.acquire(session_id, priority, control).await,
             _ => None,
         }
@@ -866,6 +871,10 @@ enum AgentRole {
     Worker,
     Verifier,
     Labour,
+    /// Auxiliary read-only exploration agent. It is not part of the
+    /// Leader → Manager → Worker → Labour delegation chain and never owns a
+    /// task worktree, merge entry, or commit.
+    Scout,
 }
 
 impl AgentRole {
@@ -876,6 +885,7 @@ impl AgentRole {
             Self::Worker => "worker",
             Self::Verifier => "verifier",
             Self::Labour => "labour",
+            Self::Scout => "scout",
         }
     }
 
@@ -886,6 +896,7 @@ impl AgentRole {
             "worker" => Some(Self::Worker),
             "verifier" => Some(Self::Verifier),
             "labour" => Some(Self::Labour),
+            "scout" => Some(Self::Scout),
             _ => None,
         }
     }
@@ -897,6 +908,7 @@ impl AgentRole {
             Self::Worker => "Worker",
             Self::Verifier => "Verifier",
             Self::Labour => "Labour",
+            Self::Scout => "Scout",
         }
     }
 
@@ -905,7 +917,7 @@ impl AgentRole {
             Self::Leader => Some(Self::Manager),
             Self::Manager => Some(Self::Worker),
             Self::Worker => Some(Self::Labour),
-            Self::Verifier | Self::Labour => None,
+            Self::Verifier | Self::Labour | Self::Scout => None,
         }
     }
 
@@ -968,6 +980,30 @@ impl AgentRole {
                 ) || (profile == AgentProfile::Research
                     && matches!(name, "fetch_url" | "web_search"))
             }
+            Self::Scout => matches!(
+                name,
+                "read_file"
+                    | "list_dir"
+                    | "grep"
+                    | "find_files"
+                    | "file_info"
+                    | "read_files"
+                    | "git"
+                    | "repo_map"
+                    | "find_symbol"
+                    | "find_references"
+                    | "dependency_graph"
+                    | "affected_tests"
+                    | "code_diagnostics"
+                    | "build_context"
+                    // Read-only context tools. There is deliberately no shell,
+                    // write, process, delegation, merge, MCP, or network tool.
+                    | "list_sources"
+                    | "search_sources"
+                    | "read_source"
+                    | "recall"
+                    | "team_status"
+            ),
             Self::Worker | Self::Labour => match profile {
                 AgentProfile::Coding => matches!(
                     name,
@@ -1128,7 +1164,9 @@ enum ContextStrategy {
 fn context_strategy(role: AgentRole) -> ContextStrategy {
     match role {
         AgentRole::Leader | AgentRole::Manager => ContextStrategy::Summarize,
-        AgentRole::Worker | AgentRole::Labour | AgentRole::Verifier => ContextStrategy::Trim,
+        AgentRole::Worker | AgentRole::Labour | AgentRole::Verifier | AgentRole::Scout => {
+            ContextStrategy::Trim
+        }
     }
 }
 
@@ -1203,6 +1241,15 @@ const MAX_DYNAMIC_MCP_TOOLS: usize = 32;
 
 const HARD_WORKER_CAP: usize = 10;
 
+/// Concurrent read-only Scouts allowed per session run. Scout runs are cheap
+/// but not free: the cap keeps a team from fanning out unbounded provider calls
+/// while the session token budget and global Worker capacity still apply.
+const SCOUT_CAP: usize = 3;
+
+/// Hard bound on the final Scout brief returned to the parent. The full
+/// transcript stays in the event stream; the parent receives this slice.
+const SCOUT_SUMMARY_MAX_CHARS: usize = 6_000;
+
 struct SessionBudget {
     limit: Option<u64>,
     cost_limit: Option<f64>,
@@ -1235,6 +1282,7 @@ struct BudgetState {
     workers: usize,
     verifiers: usize,
     labour: usize,
+    scouts: usize,
     warned_tokens: bool,
     warned_cost: bool,
     warned_time: bool,
@@ -1286,6 +1334,7 @@ impl SessionBudget {
                 workers: 0,
                 verifiers: 0,
                 labour: 0,
+                scouts: 0,
                 warned_tokens: false,
                 warned_cost: false,
                 warned_time: false,
@@ -1512,6 +1561,7 @@ impl SessionBudget {
             AgentRole::Worker => (&mut state.workers, self.worker_cap.load(Ordering::SeqCst)),
             AgentRole::Verifier => (&mut state.verifiers, 100),
             AgentRole::Labour => (&mut state.labour, self.caps.labour),
+            AgentRole::Scout => (&mut state.scouts, SCOUT_CAP),
             AgentRole::Leader => return None,
         };
         if *counter >= cap {
@@ -1535,6 +1585,7 @@ impl SessionBudget {
             AgentRole::Worker => &mut state.workers,
             AgentRole::Verifier => &mut state.verifiers,
             AgentRole::Labour => &mut state.labour,
+            AgentRole::Scout => &mut state.scouts,
             AgentRole::Leader => return,
         };
         *counter = counter.saturating_sub(1);
@@ -1549,6 +1600,7 @@ impl SessionBudget {
             AgentRole::Worker => (state.workers, self.worker_cap.load(Ordering::SeqCst)),
             AgentRole::Verifier => (state.verifiers, 100),
             AgentRole::Labour => (state.labour, self.caps.labour),
+            AgentRole::Scout => (state.scouts, SCOUT_CAP),
             AgentRole::Leader => return 0,
         };
         cap.saturating_sub(active)
@@ -8854,59 +8906,63 @@ async fn run_loop_body(
         0
     };
     let capacity_priority = task_capacity_priority(session.priority, task_priority);
-    let _capacity_permit =
-        if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
-            match config.capacity.try_acquire(spec.role, &session.id) {
-                Some(permit) => Some(permit),
-                None => {
-                    let snapshot = config.capacity.snapshot();
-                    emit(
-                        engine,
-                        &session.id,
-                        spec,
-                        "agent.capacity_wait",
-                        serde_json::json!({
-                            "role": spec.role.as_str(),
-                            "limit": if spec.role == AgentRole::Worker {
-                                snapshot.worker_limit
-                            } else {
-                                snapshot.labour_limit
-                            },
-                            "available": if spec.role == AgentRole::Worker {
-                                snapshot.worker_available
-                            } else {
-                                snapshot.labour_available
-                            },
-                        }),
-                    )
-                    .await?;
-                    engine.update_agent_status(&spec.id, "queued").await?;
-                    let permit = match config
-                        .capacity
-                        .acquire(spec.role, &session.id, capacity_priority, control)
-                        .await
-                    {
-                        Some(permit) => permit,
-                        None => return Ok(LoopOutcome::Cancelled),
-                    };
-                    engine.update_agent_status(&spec.id, "running").await?;
-                    emit(
-                        engine,
-                        &session.id,
-                        spec,
-                        "agent.capacity_ready",
-                        serde_json::json!({
-                            "role": spec.role.as_str(),
-                            "waited": true,
-                        }),
-                    )
-                    .await?;
-                    Some(permit)
-                }
+    let _capacity_permit = if matches!(
+        spec.role,
+        AgentRole::Worker | AgentRole::Labour | AgentRole::Scout
+    ) && !spec.auto_approve
+    {
+        let worker_lane = matches!(spec.role, AgentRole::Worker | AgentRole::Scout);
+        match config.capacity.try_acquire(spec.role, &session.id) {
+            Some(permit) => Some(permit),
+            None => {
+                let snapshot = config.capacity.snapshot();
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "agent.capacity_wait",
+                    serde_json::json!({
+                        "role": spec.role.as_str(),
+                        "limit": if worker_lane {
+                            snapshot.worker_limit
+                        } else {
+                            snapshot.labour_limit
+                        },
+                        "available": if worker_lane {
+                            snapshot.worker_available
+                        } else {
+                            snapshot.labour_available
+                        },
+                    }),
+                )
+                .await?;
+                engine.update_agent_status(&spec.id, "queued").await?;
+                let permit = match config
+                    .capacity
+                    .acquire(spec.role, &session.id, capacity_priority, control)
+                    .await
+                {
+                    Some(permit) => permit,
+                    None => return Ok(LoopOutcome::Cancelled),
+                };
+                engine.update_agent_status(&spec.id, "running").await?;
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "agent.capacity_ready",
+                    serde_json::json!({
+                        "role": spec.role.as_str(),
+                        "waited": true,
+                    }),
+                )
+                .await?;
+                Some(permit)
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
     let _scope_guard = if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) {
         match config
             .scope_locks
@@ -8953,10 +9009,16 @@ async fn run_loop_body(
         stable_prefix.push_str("\n\nIndexed project sources (use search_sources for content):\n");
         stable_prefix.push_str(&source_brief);
     }
-    let skill_catalog = engine
-        .skill_catalog(&project.id, spec.role.as_str(), spec.profile.as_str())
-        .await
-        .unwrap_or_default();
+    let skill_catalog = if spec.role == AgentRole::Scout {
+        // Scout has no use_skill tool. Do not advertise skills it cannot
+        // activate, and keep its stable prefix small.
+        String::new()
+    } else {
+        engine
+            .skill_catalog(&project.id, spec.role.as_str(), spec.profile.as_str())
+            .await
+            .unwrap_or_default()
+    };
     if !skill_catalog.is_empty() {
         stable_prefix.push_str("\n\nProject skills (call use_skill with the exact name):\n");
         stable_prefix.push_str(&skill_catalog);
@@ -9711,6 +9773,9 @@ async fn run_loop_body(
                 && matches!(spec.role, AgentRole::Leader | AgentRole::Manager);
             let is_tool_search = call.name == "tool_search";
             let is_artifact_file = call.name == "publish_artifact_file";
+            let is_scout = call.name == "scout"
+                && spec.allow_delegation
+                && matches!(spec.role, AgentRole::Leader | AgentRole::Manager);
             let is_browser =
                 call.name == "browser" && spec.role.allows_tool(spec.profile, "browser");
             let dynamic_mcp_tool = dynamic_mcp_tools
@@ -9727,12 +9792,23 @@ async fn run_loop_body(
                     "dynamic MCP tool execution can change host or remote state",
                 );
             }
+            let scout_blocked =
+                spec.role == AgentRole::Scout && !spec.role.allows_tool(spec.profile, &call.name);
             let granted = !spec.auto_approve
+                && !scout_blocked
                 && engine
                     .approval_grant_matches(&session.project_id, &call.name, &input)
                     .await
                     .unwrap_or(false);
-            let decision = if granted {
+            let decision = if scout_blocked {
+                // Do not prompt for a tool the Scout can never execute, and do
+                // not route it through the permission broker. The tool is not
+                // in the Scout schema; this is the execution-time backstop.
+                crate::permissions::ApprovalDecision::Allow {
+                    risk: RiskLevel::ReadOnly,
+                    reason: "tool is outside the Scout read-only policy".to_string(),
+                }
+            } else if granted {
                 crate::permissions::ApprovalDecision::Allow {
                     risk: assessment.risk,
                     reason: "matched a project approval grant".to_string(),
@@ -9740,7 +9816,8 @@ async fn run_loop_body(
             } else {
                 decide(config.approval_mode, &assessment, spec.auto_approve)
             };
-            let mut denied_reason: Option<String> = None;
+            let mut denied_reason: Option<String> =
+                scout_blocked.then(|| format!("tool '{}' is not available to Scout", call.name));
             match decision {
                 ApprovalDecision::Allow { risk, reason } => {
                     if risk >= RiskLevel::External {
@@ -10323,6 +10400,33 @@ async fn run_loop_body(
                         return Ok(LoopOutcome::BudgetExceeded(stop));
                     }
                 }
+            } else if is_scout {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_scout(
+                    engine, config, session, project, control, budget, spec, &input,
+                )
+                .await?
+                {
+                    ScoutRunResult::Output(output) => output,
+                    ScoutRunResult::Cancelled => return Ok(LoopOutcome::Cancelled),
+                    ScoutRunResult::BudgetExceeded(stop) => {
+                        if stop.is_abortive() {
+                            return Ok(LoopOutcome::BudgetExceeded(stop));
+                        }
+                        ToolOutput::error(stop.summary())
+                    }
+                }
             } else if is_delegate {
                 emit(
                     engine,
@@ -10396,7 +10500,7 @@ async fn run_loop_body(
                                             spec.base_commit.clone(),
                                             spec.write_scope.clone(),
                                         ),
-                                        AgentRole::Leader => (
+                                        AgentRole::Leader | AgentRole::Scout => (
                                             spec.session_worktree.clone(),
                                             spec.session_branch.clone(),
                                             spec.base_commit.clone(),
@@ -11101,13 +11205,14 @@ async fn run_team_status(
         session.status, session.goal
     ));
     lines.push(format!(
-        "Agents: {} leader · {} managers · {} workers ({} running) · {} verifiers · {} labour",
+        "Agents: {} leader · {} managers · {} workers ({} running) · {} verifiers · {} labour · {} scouts",
         role_count("leader"),
         role_count("manager"),
         role_count("worker"),
         running,
         role_count("verifier"),
-        role_count("labour")
+        role_count("labour"),
+        role_count("scout")
     ));
     if plan.is_some() {
         lines.push(format!(
@@ -12105,8 +12210,11 @@ async fn run_memory_tool(
 ) -> Result<ToolOutput> {
     match name {
         "remember" => {
-            if spec.role == AgentRole::Verifier {
-                return Ok(ToolOutput::error("Verifier cannot write project memory"));
+            if matches!(spec.role, AgentRole::Verifier | AgentRole::Scout) {
+                return Ok(ToolOutput::error(format!(
+                    "{} cannot write project memory",
+                    spec.role.default_name()
+                )));
             }
             let kind = input
                 .get("kind")
@@ -12504,6 +12612,93 @@ fn is_parallel_safe_tool(name: &str) -> bool {
     )
 }
 
+fn source_tool_schemas() -> Vec<ToolSchema> {
+    vec![
+        ToolSchema {
+            name: "search_sources".to_string(),
+            description: "Search the project's indexed knowledge sources. Returns ranked chunks with citation keys such as [c1]. Cite every used chunk with its exact key.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "maxLength": 400},
+                    "source_ids": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string"}
+                    },
+                    "collections": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string"},
+                        "description": "Restrict to these collections; an empty string selects uncollected sources"
+                    },
+                    "labels": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string"},
+                        "description": "Restrict to sources with any of these labels"
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolSchema {
+            name: "read_source".to_string(),
+            description: "Read one project source chunk in full. The returned citation key must be used when quoting it.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source_id": {"type": "string"},
+                    "chunk_no": {"type": "integer", "minimum": 1},
+                    "max_chars": {"type": "integer", "minimum": 300, "maximum": 20000}
+                },
+                "required": ["source_id"]
+            }),
+        },
+        ToolSchema {
+            name: "list_sources".to_string(),
+            description:
+                "List indexed project sources and their ids. Use search_sources to read content."
+                    .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+                }
+            }),
+        },
+    ]
+}
+
+fn recall_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: "recall".to_string(),
+        description: "Search project memories recorded by any session or agent.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "kind": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+            }
+        }),
+    }
+}
+
+fn team_status_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: "team_status".to_string(),
+        description: "Read the current team board: agents by role, task progress, ready/blocked tasks, merge queue, and recent coordination notes. Read-only.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+            }
+        }),
+    }
+}
+
 fn tool_schemas(
     config: &AgentConfig,
     role: AgentRole,
@@ -12516,6 +12711,15 @@ fn tool_schemas(
         .into_iter()
         .filter(|tool| role.allows_tool(profile, &tool.name))
         .collect::<Vec<_>>();
+    // Scouts receive a deliberately small, stable read-only bundle. Keeping
+    // this branch before the special tools below makes writes and shell absent
+    // from the schema instead of merely denied when called.
+    if role == AgentRole::Scout {
+        tools.extend(source_tool_schemas());
+        tools.push(recall_tool_schema());
+        tools.push(team_status_tool_schema());
+        return tools;
+    }
     tools.push(ToolSchema {
         name: "send_message".to_string(),
         description: "Send a typed message to another agent in this session. Do not address the human user; put the final answer in the normal assistant response.".to_string(),
@@ -12573,60 +12777,7 @@ fn tool_schemas(
             "required": ["artifact_id"]
         }),
     });
-    tools.push(ToolSchema {
-        name: "search_sources".to_string(),
-        description: "Search the project's indexed knowledge sources. Returns ranked chunks with citation keys such as [c1]. Cite every used chunk with its exact key.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "maxLength": 400},
-                "source_ids": {
-                    "type": "array",
-                    "maxItems": 20,
-                    "items": {"type": "string"}
-                },
-                "collections": {
-                    "type": "array",
-                    "maxItems": 20,
-                    "items": {"type": "string"},
-                    "description": "Restrict to these collections; an empty string selects uncollected sources"
-                },
-                "labels": {
-                    "type": "array",
-                    "maxItems": 20,
-                    "items": {"type": "string"},
-                    "description": "Restrict to sources with any of these labels"
-                },
-                "limit": {"type": "integer", "minimum": 1, "maximum": 20}
-            },
-            "required": ["query"]
-        }),
-    });
-    tools.push(ToolSchema {
-        name: "read_source".to_string(),
-        description: "Read one project source chunk in full. The returned citation key must be used when quoting it.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "source_id": {"type": "string"},
-                "chunk_no": {"type": "integer", "minimum": 1},
-                "max_chars": {"type": "integer", "minimum": 300, "maximum": 20000}
-            },
-            "required": ["source_id"]
-        }),
-    });
-    tools.push(ToolSchema {
-        name: "list_sources".to_string(),
-        description:
-            "List indexed project sources and their ids. Use search_sources to read content."
-                .to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50}
-            }
-        }),
-    });
+    tools.extend(source_tool_schemas());
     tools.push(ToolSchema {
         name: "use_skill".to_string(),
         description: "Activate a project skill by its exact name. Returns the full instructions and any tool constraints; calling another skill replaces the active one.".to_string(),
@@ -12638,18 +12789,7 @@ fn tool_schemas(
             "required": ["name"]
         }),
     });
-    tools.push(ToolSchema {
-        name: "recall".to_string(),
-        description: "Search project memories recorded by any session or agent.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "kind": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 20}
-            }
-        }),
-    });
+    tools.push(recall_tool_schema());
     if role != AgentRole::Verifier {
         tools.push(ToolSchema {
             name: "remember".to_string(),
@@ -12712,16 +12852,7 @@ fn tool_schemas(
             }),
         });
     }
-    tools.push(ToolSchema {
-        name: "team_status".to_string(),
-        description: "Read the current team board: agents by role, task progress, ready/blocked tasks, merge queue, and recent coordination notes. Read-only.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100}
-            }
-        }),
-    });
+    tools.push(team_status_tool_schema());
     let mcp_actions = if matches!(role, AgentRole::Manager | AgentRole::Verifier) {
         serde_json::json!([
             "list",
@@ -12957,6 +13088,38 @@ fn tool_schemas(
             }),
         });
     }
+    if matches!(role, AgentRole::Leader | AgentRole::Manager) && allow_delegation {
+        tools.push(ToolSchema {
+            name: "scout".to_string(),
+            description: "Run a read-only Scout in a fresh context: it explores the session worktree and returns bounded file:line evidence without writing, running shell, delegating, committing, or merging. Use it to map code or answer a focused question without polluting this conversation with raw file dumps. Not a coder."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4000,
+                        "description": "The focused question or map to produce"
+                    },
+                    "files": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string"},
+                        "description": "Optional files or directories to start from"
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 12,
+                        "description": "Maximum provider turns for the Scout; default 6"
+                    }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+            }),
+        });
+    }
     if role.allows_tool(profile, "browser") {
         tools.push(ToolSchema {
             name: "browser".to_string(),
@@ -13188,7 +13351,9 @@ fn parse_delegate(
             }
         }
         AgentRole::Worker => requested_profile.unwrap_or(parent_profile),
-        AgentRole::Labour | AgentRole::Verifier | AgentRole::Leader => parent_profile,
+        AgentRole::Labour | AgentRole::Verifier | AgentRole::Leader | AgentRole::Scout => {
+            parent_profile
+        }
     };
     Ok((role, name, objective, title, profile))
 }
@@ -13219,6 +13384,576 @@ fn parse_write_scope(input: &serde_json::Value) -> Result<Vec<String>> {
         scopes.push(scope);
     }
     Ok(scopes)
+}
+
+struct ScoutRequest {
+    objective: String,
+    files: Vec<String>,
+    max_steps: u32,
+}
+
+enum ScoutRunResult {
+    Output(ToolOutput),
+    Cancelled,
+    BudgetExceeded(BudgetStop),
+}
+
+fn parse_scout(input: &serde_json::Value) -> Result<ScoutRequest> {
+    let objective = input
+        .get("objective")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|objective| {
+            let chars = objective.chars().count();
+            (1..=4000).contains(&chars)
+        })
+        .ok_or_else(|| anyhow!("objective is required (1 to 4000 chars)"))?
+        .to_string();
+    let mut files = Vec::new();
+    if let Some(values) = input.get("files") {
+        let values = values
+            .as_array()
+            .ok_or_else(|| anyhow!("files must be an array"))?;
+        if values.len() > 20 {
+            return Err(anyhow!("at most 20 files may be suggested"));
+        }
+        for value in values {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow!("files entries must be strings"))?
+                .trim();
+            if value.is_empty() {
+                continue;
+            }
+            if value.chars().count() > 400 {
+                return Err(anyhow!("file hints are limited to 400 chars"));
+            }
+            if !files.iter().any(|existing| existing == value) {
+                files.push(value.to_string());
+            }
+        }
+    }
+    let max_steps = input
+        .get("max_steps")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(6)
+        .clamp(1, 12) as u32;
+    Ok(ScoutRequest {
+        objective,
+        files,
+        max_steps,
+    })
+}
+
+fn scout_brief(parent: &AgentSpec, request: &ScoutRequest, steps: u32) -> String {
+    let files = if request.files.is_empty() {
+        "No specific files were provided; locate the relevant files with find_files, grep, or repo_map.".to_string()
+    } else {
+        request
+            .files
+            .iter()
+            .map(|file| format!("- {file}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Read-only Scout task from {parent}.\n\
+         Objective: {objective}\n\
+         Suggested starting points:\n{files}\n\n\
+         Rules:\n\
+         - Do not modify files. Do not run shell commands, write, edit, apply patches, delegate, commit, or merge.\n\
+         - Use only the read-only tools advertised to you. If a tool is not advertised, it is not available.\n\
+         - Every code claim must cite an exact path:line reference. Prefer the smallest useful excerpt over a file dump.\n\
+         - For indexed project sources, cite the source title and chunk number; do not return a bare [cN] key the parent cannot resolve.\n\
+         - If the evidence is missing, ambiguous, or cannot be obtained with read-only tools, say so explicitly.\n\
+         - Return a concise brief with findings first and open questions last.\n\
+         You have at most {steps} turns. When you have enough evidence, reply with the final brief and no tool calls.",
+        parent = parent.name,
+        objective = request.objective,
+        steps = steps,
+    )
+}
+
+async fn scout_usage(engine: &Engine, session_id: &str, agent_id: &str) -> serde_json::Value {
+    let ledger = match engine.usage_ledger(session_id).await {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            tracing::warn!(%error, %agent_id, "could not read Scout usage");
+            return serde_json::json!({
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+            });
+        }
+    };
+    let entries = ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.agent_id == agent_id);
+    let mut calls = 0u64;
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut cache_read_tokens = 0u64;
+    let mut cache_write_tokens = 0u64;
+    let mut cost_usd = 0.0f64;
+    for entry in entries {
+        calls = calls.saturating_add(1);
+        input_tokens = input_tokens.saturating_add(entry.input_tokens);
+        output_tokens = output_tokens.saturating_add(entry.output_tokens);
+        cache_read_tokens = cache_read_tokens.saturating_add(entry.cache_read_tokens);
+        cache_write_tokens = cache_write_tokens.saturating_add(entry.cache_write_tokens);
+        cost_usd += entry.cost_usd;
+    }
+    serde_json::json!({
+        "calls": calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "total_tokens": input_tokens.saturating_add(output_tokens),
+        "cost_usd": cost_usd,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_scout(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    control: &RunControl,
+    budget: &SessionBudget,
+    parent: &AgentSpec,
+    input: &serde_json::Value,
+) -> Result<ScoutRunResult> {
+    let request = match parse_scout(input) {
+        Ok(request) => request,
+        Err(error) => return Ok(ScoutRunResult::Output(ToolOutput::error(error.to_string()))),
+    };
+    let Some((ordinal, _slot)) = budget.reserve_slot(AgentRole::Scout) else {
+        return Ok(ScoutRunResult::Output(ToolOutput::error(format!(
+            "the Scout cap for this session has been reached (max {SCOUT_CAP})"
+        ))));
+    };
+    if control.is_cancelled() {
+        return Ok(ScoutRunResult::Cancelled);
+    }
+    let worktree = parent.session_worktree.clone();
+    let before = match tokio::task::spawn_blocking({
+        let worktree = worktree.clone();
+        move || worktree::status_snapshot(&worktree)
+    })
+    .await?
+    {
+        Ok(before) => before,
+        Err(error) => {
+            return Ok(ScoutRunResult::Output(ToolOutput::error(format!(
+                "could not inspect the session worktree before the Scout run: {error}"
+            ))));
+        }
+    };
+    let existing_scouts = engine
+        .list_agents(&session.id)
+        .await?
+        .iter()
+        .filter(|agent| agent.role == AgentRole::Scout.as_str())
+        .count();
+    let scout_name = format!("Scout {}", existing_scouts.saturating_add(ordinal));
+    let child = engine
+        .create_agent(
+            &session.id,
+            AgentRole::Scout.as_str(),
+            &scout_name,
+            Some("Scout".to_string()),
+            Some(parent.id.clone()),
+            &model_for(config, AgentRole::Scout),
+        )
+        .await?;
+    engine
+        .set_agent_profile(&child.id, AgentProfile::Research.as_str())
+        .await?;
+    engine
+        .set_agent_worktree(
+            &child.id,
+            &worktree.to_string_lossy(),
+            &parent.session_branch,
+        )
+        .await?;
+    engine
+        .set_agent_task(&child.id, parent.task_id.clone(), parent.department.clone())
+        .await?;
+    engine.update_agent_status(&child.id, "running").await?;
+    let child_spec = AgentSpec {
+        id: child.id.clone(),
+        role: AgentRole::Scout,
+        name: scout_name.clone(),
+        depth: parent.depth.saturating_add(1),
+        parent_name: Some(parent.name.clone()),
+        title: Some("Scout".to_string()),
+        task_id: parent.task_id.clone(),
+        department: parent.department.clone(),
+        profile: AgentProfile::Research,
+        allow_delegation: false,
+        auto_approve: false,
+        worktree: worktree.clone(),
+        branch: parent.session_branch.clone(),
+        session_worktree: worktree.clone(),
+        session_branch: parent.session_branch.clone(),
+        write_scope: Vec::new(),
+        base_commit: parent.base_commit.clone(),
+    };
+    emit(
+        engine,
+        &session.id,
+        &child_spec,
+        "agent.spawned",
+        serde_json::json!({
+            "parent_id": parent.id,
+            "parent_name": parent.name,
+            "objective": truncate_to(&request.objective, 1_000),
+            "read_only": true,
+        }),
+    )
+    .await?;
+    emit(
+        engine,
+        &session.id,
+        &child_spec,
+        "agent.started",
+        serde_json::json!({
+            "parent_id": parent.id,
+            "parent_name": parent.name,
+            "objective": truncate_to(&request.objective, 1_000),
+            "files": request.files,
+            "max_steps": request.max_steps,
+            "model": model_for(config, AgentRole::Scout),
+            "worktree": child_spec.worktree,
+            "branch": child_spec.branch,
+            "read_only": true,
+        }),
+    )
+    .await?;
+    // Never raise the configured global turn limit; `max_steps` can only
+    // narrow the Scout's run.
+    let scout_turns = config.max_turns.min(request.max_steps);
+    let brief = scout_brief(parent, &request, scout_turns);
+    let mut conversation = vec![ChatMessage::user(brief.clone())];
+    let mut scout_config = config.clone();
+    scout_config.max_turns = scout_turns;
+    let result = run_loop(
+        engine,
+        &scout_config,
+        session,
+        project,
+        control,
+        budget,
+        &child_spec,
+        &brief,
+        &mut conversation,
+        None,
+        false,
+    )
+    .await;
+    let usage = scout_usage(engine, &session.id, &child.id).await;
+    let completed = |status: &str, summary: &str, extra: serde_json::Value| {
+        let mut payload = serde_json::json!({
+            "agent_id": child.id,
+            "parent_id": parent.id,
+            "status": status,
+            "summary": truncate_to(summary, SCOUT_SUMMARY_MAX_CHARS),
+            "usage": usage,
+            "cancelled": status == "cancelled",
+            "read_only": true,
+        });
+        if let (Some(object), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        payload
+    };
+    match result {
+        Ok(LoopOutcome::Verdict(_)) => {
+            let summary = "Scout returned an unexpected verdict.".to_string();
+            engine.update_agent_status(&child.id, "failed").await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.finished",
+                serde_json::json!({"status": "failed", "summary": summary}),
+            )
+            .await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "scout.completed",
+                completed("failed", &summary, serde_json::json!({})),
+            )
+            .await?;
+            Ok(ScoutRunResult::Output(ToolOutput::error(summary)))
+        }
+        Ok(LoopOutcome::Final(summary)) => {
+            let summary = if summary.trim().is_empty() {
+                "The Scout completed without a brief.".to_string()
+            } else {
+                summary
+            };
+            let after_result = tokio::task::spawn_blocking({
+                let worktree = worktree.clone();
+                move || worktree::status_snapshot(&worktree)
+            })
+            .await;
+            let after = match after_result {
+                Ok(Ok(after)) => after,
+                Ok(Err(error)) => {
+                    let summary = format!(
+                        "could not inspect the session worktree after the Scout run: {error}"
+                    );
+                    engine.update_agent_status(&child.id, "failed").await?;
+                    emit(
+                        engine,
+                        &session.id,
+                        &child_spec,
+                        "agent.finished",
+                        serde_json::json!({"status": "failed", "summary": summary}),
+                    )
+                    .await?;
+                    emit(
+                        engine,
+                        &session.id,
+                        &child_spec,
+                        "scout.completed",
+                        completed(
+                            "failed",
+                            &summary,
+                            serde_json::json!({"guard_failed": true}),
+                        ),
+                    )
+                    .await?;
+                    return Ok(ScoutRunResult::Output(ToolOutput::error_structured(
+                        summary.clone(),
+                        serde_json::json!({
+                            "agent_id": child.id,
+                            "agent_name": scout_name,
+                            "summary": summary,
+                            "usage": usage,
+                            "cancelled": false,
+                            "guard_failed": true,
+                        }),
+                    )));
+                }
+                Err(error) => {
+                    let summary = format!(
+                        "could not inspect the session worktree after the Scout run: {error}"
+                    );
+                    engine.update_agent_status(&child.id, "failed").await?;
+                    emit(
+                        engine,
+                        &session.id,
+                        &child_spec,
+                        "agent.finished",
+                        serde_json::json!({"status": "failed", "summary": summary}),
+                    )
+                    .await?;
+                    emit(
+                        engine,
+                        &session.id,
+                        &child_spec,
+                        "scout.completed",
+                        completed(
+                            "failed",
+                            &summary,
+                            serde_json::json!({"guard_failed": true}),
+                        ),
+                    )
+                    .await?;
+                    return Ok(ScoutRunResult::Output(ToolOutput::error_structured(
+                        summary.clone(),
+                        serde_json::json!({
+                            "agent_id": child.id,
+                            "agent_name": scout_name,
+                            "summary": summary,
+                            "usage": usage,
+                            "cancelled": false,
+                            "guard_failed": true,
+                        }),
+                    )));
+                }
+            };
+            let changed = after
+                .into_iter()
+                .filter(|line| !before.contains(line))
+                .collect::<Vec<_>>();
+            if !changed.is_empty() {
+                let detail = format!(
+                    "Scout modified the session worktree: {}",
+                    truncate_to(&changed.join("; "), 500)
+                );
+                engine.update_agent_status(&child.id, "failed").await?;
+                emit(
+                    engine,
+                    &session.id,
+                    &child_spec,
+                    "agent.finished",
+                    serde_json::json!({
+                        "status": "failed",
+                        "summary": detail,
+                        "modified_paths": changed,
+                        "guard_failed": true,
+                    }),
+                )
+                .await?;
+                emit(
+                    engine,
+                    &session.id,
+                    &child_spec,
+                    "scout.completed",
+                    completed(
+                        "rejected",
+                        &summary,
+                        serde_json::json!({
+                            "guard_failed": true,
+                            "modified_paths": changed,
+                        }),
+                    ),
+                )
+                .await?;
+                return Ok(ScoutRunResult::Output(ToolOutput::error_structured(
+                    detail,
+                    serde_json::json!({
+                        "agent_id": child.id,
+                        "agent_name": scout_name,
+                        "summary": truncate_to(&summary, SCOUT_SUMMARY_MAX_CHARS),
+                        "usage": usage,
+                        "cancelled": false,
+                        "guard_failed": true,
+                        "modified_paths": changed,
+                    }),
+                )));
+            }
+            let bounded = truncate_to(&summary, SCOUT_SUMMARY_MAX_CHARS);
+            engine.update_agent_status(&child.id, "idle").await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "idle",
+                    "summary": bounded,
+                    "worktree": child_spec.worktree,
+                    "branch": child_spec.branch,
+                }),
+            )
+            .await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "scout.completed",
+                completed("completed", &bounded, serde_json::json!({})),
+            )
+            .await?;
+            let content = format!(
+                "{} ({}) completed.\nObjective: {}\nUsage: {} input + {} output tokens ({} calls).\n\n{}",
+                scout_name,
+                child.id,
+                truncate_to(&request.objective, 400),
+                usage["input_tokens"].as_u64().unwrap_or(0),
+                usage["output_tokens"].as_u64().unwrap_or(0),
+                usage["calls"].as_u64().unwrap_or(0),
+                bounded
+            );
+            Ok(ScoutRunResult::Output(ToolOutput::ok_structured(
+                content,
+                serde_json::json!({
+                    "agent_id": child.id,
+                    "agent_name": scout_name,
+                    "summary": bounded,
+                    "usage": usage,
+                    "cancelled": false,
+                    "read_only": true,
+                }),
+            )))
+        }
+        Ok(LoopOutcome::Cancelled) => {
+            engine.update_agent_status(&child.id, "cancelled").await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.finished",
+                serde_json::json!({"status": "cancelled"}),
+            )
+            .await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "scout.completed",
+                completed("cancelled", "", serde_json::json!({})),
+            )
+            .await?;
+            Ok(ScoutRunResult::Cancelled)
+        }
+        Ok(LoopOutcome::BudgetExceeded(stop)) => {
+            let summary = stop.summary();
+            engine.update_agent_status(&child.id, "failed").await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.finished",
+                serde_json::json!({"status": "failed", "summary": summary}),
+            )
+            .await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "scout.completed",
+                completed("budget_exceeded", &summary, serde_json::json!({})),
+            )
+            .await?;
+            Ok(ScoutRunResult::BudgetExceeded(stop))
+        }
+        Err(error) => {
+            let summary = truncate_to(&error.to_string(), SCOUT_SUMMARY_MAX_CHARS);
+            engine.update_agent_status(&child.id, "failed").await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.finished",
+                serde_json::json!({"status": "failed", "summary": summary}),
+            )
+            .await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "scout.completed",
+                completed("failed", &summary, serde_json::json!({})),
+            )
+            .await?;
+            Ok(ScoutRunResult::Output(ToolOutput::error_structured(
+                format!("{scout_name} failed: {summary}"),
+                serde_json::json!({
+                    "agent_id": child.id,
+                    "agent_name": scout_name,
+                    "summary": summary,
+                    "usage": usage,
+                    "cancelled": false,
+                }),
+            )))
+        }
+    }
 }
 
 struct ParallelTask {
@@ -15421,7 +16156,9 @@ fn role_system_prompt(
     objective: &str,
 ) -> RoleSystemPrompt {
     let worktree = spec.worktree.to_string_lossy();
-    let scope_note = if spec.write_scope.is_empty() {
+    let scope_note = if role == AgentRole::Scout {
+        "read-only; no writes are permitted".to_string()
+    } else if spec.write_scope.is_empty() {
         "unrestricted within the worktree".to_string()
     } else {
         format!(
@@ -15429,15 +16166,22 @@ fn role_system_prompt(
             spec.write_scope.join(", ")
         )
     };
-    let profile_note = match spec.profile {
-        AgentProfile::Research => {
-            "research. Use read/search/fetch_url and cite evidence; do not claim facts without sources."
+    let profile_note = if role == AgentRole::Scout {
+        "read-only research. Use reads, search, repository maps, and Git inspection; \
+         cite file:line evidence and explicitly mark missing evidence."
+    } else {
+        match spec.profile {
+            AgentProfile::Research => {
+                "research. Use read/search/fetch_url and cite evidence; do not claim facts without sources."
+            }
+            AgentProfile::Coding => {
+                "coding. Inspect the code, make focused changes, and run tests."
+            }
+            AgentProfile::Verification => {
+                "verification. Review evidence and run checks; do not edit files."
+            }
+            AgentProfile::Generic => "generic. Read and search; do not assume write access.",
         }
-        AgentProfile::Coding => "coding. Inspect the code, make focused changes, and run tests.",
-        AgentProfile::Verification => {
-            "verification. Review evidence and run checks; do not edit files."
-        }
-        AgentProfile::Generic => "generic. Read and search; do not assume write access.",
     };
     let charter = match role {
         AgentRole::Leader => {
@@ -15492,6 +16236,14 @@ fn role_system_prompt(
              directly in the worktree and return a concise report. If you are blocked, use \
              coordinate action=blocker with the task id and a concrete reason. You cannot delegate \
              to other agents."
+            .to_string(),
+        AgentRole::Scout => "You are Scout, a read-only exploration agent with a fresh context. \
+             Answer the assigned objective by reading and searching the session worktree. You \
+             cannot modify files, run shell commands, write project memory, delegate, activate \
+             skills, commit, or merge, and you have no task worktree. Return a concise brief: findings first, every \
+             code claim tied to a path:line reference, then open questions. If the evidence is \
+             missing, ambiguous, or cannot be obtained with read-only tools, say that explicitly \
+             instead of guessing. Do not return raw file dumps; return the smallest useful evidence."
             .to_string(),
     };
     let stable_prefix = format!(

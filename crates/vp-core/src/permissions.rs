@@ -279,6 +279,7 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
         | "delegate"
         | "delegate_many"
         | "delegate_acp"
+        | "scout"
         | "submit_verdict"
         | "submit_team_plan"
         | "run_team_plan"
