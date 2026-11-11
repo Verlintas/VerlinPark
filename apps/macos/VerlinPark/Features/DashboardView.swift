@@ -416,6 +416,7 @@ struct DashboardView: View {
             RuntimeLeaseCard()
         case .usage:
             if let project = model.selectedProject {
+                EfficiencyCard(project: project)
                 ProjectUsageCard(project: project)
                 ProjectBudgetCard(project: project)
             } else {
@@ -493,7 +494,7 @@ struct DashboardView: View {
             await model.refreshAgentInfo()
             await model.refreshLongTaskState()
         case .usage:
-            await model.loadProjectUsage()
+            await model.loadEfficiency()
             await model.loadProjectBudget()
         case .git:
             await model.loadProjectForkForest()

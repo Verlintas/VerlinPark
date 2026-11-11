@@ -819,7 +819,7 @@ struct PreviewPanelView: View {
                                 Text(
                                     "Cache read \(cacheRead) · write \(ledger.totals.cacheWriteTokens ?? 0)"
                                 )
-                                if let hitRate = ledger.totals.cacheHitRate {
+                                if let hitRate = EfficiencyMetrics.cacheHitRatio(ledger.totals) {
                                     Text(String(format: "· %.1f%% hit rate", hitRate * 100))
                                 }
                             }

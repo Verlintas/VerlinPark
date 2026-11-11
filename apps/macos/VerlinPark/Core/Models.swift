@@ -1189,6 +1189,9 @@ struct UsageTotals: Codable, Sendable {
     let outputTokens: Int
     let cacheReadTokens: Int?
     let cacheWriteTokens: Int?
+    /// Daemon-computed cache read share. Optional so an older daemon that only
+    /// reports token counters still decodes.
+    let cacheHitRatio: Double?
     let costUsd: Double
     let byRole: [UsageBucket]
     let byModel: [UsageBucket]
@@ -1196,6 +1199,8 @@ struct UsageTotals: Codable, Sendable {
     let byTask: [UsageBucket]
     let byDepartment: [UsageBucket]?
 
+    /// Legacy read share used by older surfaces. `inputTokens` already includes
+    /// cache reads and writes under ADR-0138, so this remains a read/total ratio.
     var cacheHitRate: Double? {
         guard let cacheReadTokens, inputTokens > 0 else {
             return nil
@@ -1209,6 +1214,7 @@ struct UsageTotals: Codable, Sendable {
         case outputTokens = "output_tokens"
         case cacheReadTokens = "cache_read_tokens"
         case cacheWriteTokens = "cache_write_tokens"
+        case cacheHitRatio = "cache_hit_ratio"
         case costUsd = "cost_usd"
         case byRole = "by_role"
         case byModel = "by_model"
@@ -1698,6 +1704,111 @@ struct AgentInfo: Codable, Sendable {
     }
 }
 
+struct SessionCacheStatus: Codable, Sendable {
+    let sessionID: String?
+    let inputTokens: Int?
+    let uncachedInputTokens: Int?
+    let cacheReadTokens: Int?
+    let cacheWriteTokens: Int?
+    let cacheHitRatio: Double?
+    let lastCallAt: String?
+    let promptPrefixHash: String?
+    let preambleTokensEstimate: Int?
+
+    /// `session.cache` may report either total provider input (which already
+    /// includes cache reads/writes) or an explicit uncached count. Prefer the
+    /// explicit count, otherwise normalize the total before deriving a ratio.
+    var resolvedUncachedInputTokens: Int? {
+        if let uncachedInputTokens {
+            return max(0, uncachedInputTokens)
+        }
+        guard let inputTokens else { return nil }
+        let cacheTotal = max(0, cacheReadTokens ?? 0) + max(0, cacheWriteTokens ?? 0)
+        guard cacheTotal <= inputTokens else { return max(0, inputTokens) }
+        return max(0, inputTokens - cacheTotal)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case inputTokens = "input_tokens"
+        case uncachedInputTokens = "uncached_input_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
+        case cacheHitRatio = "cache_hit_ratio"
+        case lastCallAt = "last_call_at"
+        case promptPrefixHash = "prompt_prefix_hash"
+        case preambleTokensEstimate = "preamble_tokens_estimate"
+    }
+
+    private struct CacheKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? {
+            nil
+        }
+
+        init(_ string: String) {
+            stringValue = string
+        }
+
+        init?(stringValue: String) {
+            self.init(stringValue)
+        }
+
+        init?(intValue _: Int) {
+            nil
+        }
+    }
+
+    /// The cache RPC is newer than the client. Decode every field independently
+    /// and accept the event field names (`prefix_hash`, `cache_generation`) so a
+    /// daemon-side naming change does not break the whole dashboard.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CacheKey.self)
+
+        func string(_ names: String...) -> String? {
+            for name in names {
+                if let value = try? container.decode(String.self, forKey: CacheKey(name)) {
+                    return value
+                }
+            }
+            return nil
+        }
+
+        func int(_ names: String...) -> Int? {
+            for name in names {
+                if let value = try? container.decode(Int.self, forKey: CacheKey(name)) {
+                    return value
+                }
+                if let value = try? container.decode(Double.self, forKey: CacheKey(name)),
+                   value.isFinite
+                {
+                    return Int(exactly: value)
+                }
+            }
+            return nil
+        }
+
+        func double(_ names: String...) -> Double? {
+            for name in names {
+                if let value = try? container.decode(Double.self, forKey: CacheKey(name)) {
+                    return value
+                }
+            }
+            return nil
+        }
+
+        sessionID = string("session_id")
+        inputTokens = int("input_tokens")
+        uncachedInputTokens = int("uncached_input_tokens")
+        cacheReadTokens = int("cache_read_tokens")
+        cacheWriteTokens = int("cache_write_tokens")
+        cacheHitRatio = double("cache_hit_ratio")
+        lastCallAt = string("last_call_at", "last_call")
+        promptPrefixHash = string("prompt_prefix_hash", "prefix_hash", "cache_generation")
+        preambleTokensEstimate = int("preamble_tokens_estimate", "estimated_preamble_tokens")
+    }
+}
+
 struct ContextUsage: Codable, Sendable {
     let estimatedTokens: Int
     let contextWindow: Int
@@ -1705,6 +1816,9 @@ struct ContextUsage: Codable, Sendable {
     let hardLimitTokens: Int
     let messages: Int
     let calibration: Double?
+    /// Estimated tokens in the stable system/tool preamble. Optional because
+    /// preamble telemetry arrived after the original context snapshot.
+    let preambleTokensEstimate: Int?
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -1714,6 +1828,7 @@ struct ContextUsage: Codable, Sendable {
         case hardLimitTokens = "hard_limit_tokens"
         case messages
         case calibration
+        case preambleTokensEstimate = "preamble_tokens_estimate"
         case createdAt = "created_at"
     }
 }

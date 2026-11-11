@@ -637,6 +637,14 @@ actor CoreClient {
         .decode(SessionContextStatus.self)
     }
 
+    func sessionCache(sessionID: String) async throws -> SessionCacheStatus {
+        try await request(
+            method: "session.cache",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionCacheStatus.self)
+    }
+
     func resumePlan(sessionID: String) async throws -> Bool {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.plan_resume", params: params)

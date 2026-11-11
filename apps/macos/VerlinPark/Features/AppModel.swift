@@ -88,6 +88,9 @@ final class AppModel {
     var citationAudit: CitationAudit?
     var usageLedger: UsageLedgerResult?
     var usageStatus: String?
+    var sessionCacheStatus: SessionCacheStatus?
+    var efficiencyBusy = false
+    var efficiencyStatus: String?
     var shellPolicy = ShellPolicy.allow
     var shellPolicyNetwork = "allow"
     var shellPolicyRestrictHome = false
@@ -274,6 +277,7 @@ final class AppModel {
     var continuationActionBusyID: String?
     private var orchestrationRefreshTask: Task<Void, Never>?
     private var longTaskRefreshTask: Task<Void, Never>?
+    private var efficiencyRefreshTask: Task<Void, Never>?
     var taskActionBusyID: String?
     var taskActionStatus: String?
     var taskSchedulerPolicy = TaskSchedulerPolicy.disabled
@@ -515,6 +519,34 @@ final class AppModel {
         sessions.first { $0.id == selectedSessionID }
     }
 
+    /// Dashboard/popover view of the selected run, assembled from real RPC
+    /// results. `session.cache` is optional until the daemon ships it.
+    var efficiencySnapshot: EfficiencySnapshot? {
+        EfficiencyMetrics.makeSnapshot(
+            projectUsage: projectUsage,
+            usage: usageLedger,
+            context: contextStatus,
+            cache: sessionCacheStatus,
+            eventTypes: events.map(\.type),
+            latestPrefixHash: latestPromptPrefixHash
+        )
+    }
+
+    var latestPromptPrefixHash: String? {
+        guard let selectedSessionID else { return nil }
+        for event in events.reversed() where event.sessionId == selectedSessionID {
+            guard event.type == "context.prompt_prefix" else { continue }
+            let payload = event.payload.objectValue
+            if let hash = payload?["prefix_hash"]?.stringValue {
+                return hash
+            }
+            if let hash = payload?["cache_generation"]?.stringValue {
+                return hash
+            }
+        }
+        return nil
+    }
+
     private func isCurrent(sessionID: String, generation: Int) -> Bool {
         selectedSessionID == sessionID && selectionGeneration == generation
     }
@@ -533,6 +565,13 @@ final class AppModel {
         steeringCancelBusyID = nil
         continuationSubmitBusy = false
         continuationActionBusyID = nil
+    }
+
+    private func resetEfficiencyState() {
+        efficiencyRefreshTask?.cancel()
+        sessionCacheStatus = nil
+        efficiencyBusy = false
+        efficiencyStatus = nil
     }
 
     func start() async {
@@ -676,6 +715,7 @@ final class AppModel {
             artifacts = []
             usageLedger = nil
             usageStatus = nil
+            resetEfficiencyState()
             shellPolicy = .allow
             shellPolicyNetwork = "allow"
             shellPolicyRestrictHome = false
@@ -754,6 +794,7 @@ final class AppModel {
         artifacts = []
         usageLedger = nil
         usageStatus = nil
+        resetEfficiencyState()
         shellPolicy = .allow
         shellPolicyNetwork = "allow"
         shellPolicyRestrictHome = false
@@ -834,7 +875,7 @@ final class AppModel {
         Task { await loadArtifactPolicy() }
         Task { await loadMailboxPolicy() }
         Task { await loadProjectBudget() }
-        Task { await loadProjectUsage() }
+        Task { await loadEfficiency() }
         Task { await loadProjectForkForest() }
         Task { await loadDashboardSnapshot() }
         Task { await loadMemories() }
@@ -891,6 +932,7 @@ final class AppModel {
         artifacts = []
         usageLedger = nil
         usageStatus = nil
+        resetEfficiencyState()
         questions = []
         pendingQuestions = []
         gitCommits = []
@@ -911,7 +953,7 @@ final class AppModel {
         lastPullRequest = nil
         Task {
             await loadEvents()
-            await loadContextStatus()
+            await loadEfficiency()
             await loadCheckpoints()
             await loadLineage()
             await loadTodos()
@@ -2763,6 +2805,100 @@ final class AppModel {
             projectUsageStatus = nil
         } catch {
             projectUsageStatus = error.localizedDescription
+        }
+    }
+
+    /// Loads the read-only efficiency surface: project totals, the selected
+    /// session ledger, context usage, and the optional `session.cache` status.
+    /// Older daemons do not implement `session.cache`; the dashboard then falls
+    /// back to ratios derived from `session.usage` instead of failing.
+    func loadEfficiency() async {
+        guard let projectID = selectedProjectID else {
+            projectUsage = nil
+            projectUsageStatus = nil
+            usageLedger = nil
+            usageStatus = nil
+            contextStatus = nil
+            resetEfficiencyState()
+            return
+        }
+        let generation = selectionGeneration
+        let sessionID = selectedSessionID
+        efficiencyBusy = true
+        efficiencyStatus = nil
+        defer {
+            if generation == selectionGeneration {
+                efficiencyBusy = false
+            }
+        }
+
+        do {
+            let usage = try await core.projectUsage(projectID: projectID)
+            guard projectID == selectedProjectID, generation == selectionGeneration else {
+                return
+            }
+            projectUsage = usage
+            projectUsageStatus = nil
+        } catch {
+            guard projectID == selectedProjectID, generation == selectionGeneration else {
+                return
+            }
+            projectUsageStatus = error.localizedDescription
+            efficiencyStatus = error.localizedDescription
+        }
+
+        guard let sessionID,
+              selectedSessionID == sessionID,
+              generation == selectionGeneration
+        else {
+            usageLedger = nil
+            usageStatus = nil
+            contextStatus = nil
+            sessionCacheStatus = nil
+            return
+        }
+
+        do {
+            let ledger = try await core.usageLedger(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            usageLedger = ledger
+            usageStatus = nil
+        } catch {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                usageStatus = error.localizedDescription
+            }
+        }
+
+        do {
+            let status = try await core.contextStatus(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            contextStatus = status
+        } catch {
+            // Context status is diagnostic; keep the last successful snapshot.
+        }
+
+        do {
+            let cache = try await core.sessionCache(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionCacheStatus = cache
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionCacheStatus = nil
+            if usageLedger == nil, let usageStatus {
+                efficiencyStatus = usageStatus
+            } else if efficiencyStatus == nil {
+                efficiencyStatus =
+                    "session.cache is unavailable; cache values are derived from session.usage."
+            }
+        }
+    }
+
+    private func refreshEfficiencySoon() {
+        efficiencyRefreshTask?.cancel()
+        efficiencyRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await self?.loadEfficiency()
         }
     }
 
@@ -6335,6 +6471,16 @@ final class AppModel {
            ["context.usage", "context.compacted", "context.measured"].contains(event.type)
         {
             Task { await self.loadContextStatus() }
+        }
+
+        if ["usage.recorded", "agent.usage", "agent.cost"].contains(event.type) {
+            refreshEfficiencySoon()
+        }
+        if event.sessionId == selectedSessionID,
+           ["context.usage", "context.measured", "context.compacted", "context.cache",
+            "context.prompt_prefix"].contains(event.type)
+        {
+            refreshEfficiencySoon()
         }
 
         if event.sessionId == selectedSessionID,

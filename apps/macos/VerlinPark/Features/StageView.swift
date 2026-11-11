@@ -696,6 +696,26 @@ private struct ContextPopoverView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                if let snapshot = model.efficiencySnapshot,
+                   snapshot.cacheHitRatio != nil || snapshot.promptPrefixHash != nil
+                {
+                    HStack(spacing: 8) {
+                        if let ratio = snapshot.cacheHitRatio {
+                            CacheHitPill(ratio: ratio)
+                        }
+                        if let prefix = EfficiencyMetrics.shortHash(snapshot.promptPrefixHash) {
+                            Text("prefix \(prefix)…")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .textSelection(.enabled)
+                        }
+                        Spacer()
+                    }
+                    Text("Cache reads are billed, not free; this is a hit ratio, not a discount.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+
                 if let measurement = status.lastMeasurement {
                     Divider()
                     Text("LAST PROVIDER CALL")
