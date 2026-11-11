@@ -418,7 +418,10 @@ final class EfficiencyDashboardTests: XCTestCase {
           "compaction_count": 2,
           "last_compaction_latency_ms": 42,
           "compaction_background_reuse": true,
-          "compaction_fallback_to_sync": false
+          "compaction_fallback_to_sync": false,
+          "checkpoint_count": 2,
+          "latest_checkpoint_id": "ctx-2",
+          "latest_checkpoint_at": "2026-11-11T00:00:00Z"
         }
         """
         let context = try JSONDecoder().decode(SessionContextStatus.self, from: Data(contextJSON.utf8))
@@ -450,6 +453,8 @@ final class EfficiencyDashboardTests: XCTestCase {
             latestPrefixHash: nil
         )
         XCTAssertEqual(snapshot?.compactionCount, 2)
+        XCTAssertEqual(snapshot?.checkpointCount, 2)
+        XCTAssertEqual(snapshot?.latestCheckpointID, "ctx-2")
         XCTAssertEqual(snapshot?.compactionLatencyMs, 42)
         XCTAssertTrue(snapshot?.compactionBackgroundReuse == true)
         XCTAssertEqual(snapshot?.toolOutputEntries, 2)

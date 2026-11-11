@@ -772,6 +772,10 @@ private struct ContextPopoverView: View {
 
                 Divider()
 
+                ContextCheckpointSection(style: .popover)
+
+                Divider()
+
                 HStack(spacing: 10) {
                     Button(model.compactBusy ? "Compacting…" : "Compact now") {
                         Task { await model.compactSession() }

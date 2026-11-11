@@ -416,6 +416,11 @@ final class AppModel {
     var toolOutputStatus: ToolOutputStatus?
     var compactBusy = false
     var compactNotice: String?
+    var contextCheckpoints: [ContextCheckpoint] = []
+    var contextCheckpointDetails: [String: ContextCheckpointDetailResult] = [:]
+    var contextCheckpointPolicy: ContextCheckpointPolicy?
+    var contextCheckpointBusy = false
+    var contextCheckpointNotice: String?
     var forkBusy = false
     var checkpoints: [SessionCheckpoint] = []
     var checkpointBusy = false
@@ -771,6 +776,10 @@ final class AppModel {
             events = []
             contextStatus = nil
             compactNotice = nil
+            contextCheckpoints = []
+            contextCheckpointDetails = [:]
+            contextCheckpointPolicy = nil
+            contextCheckpointNotice = nil
             checkpoints = []
             checkpointNotice = nil
             checkpointStats = nil
@@ -843,6 +852,10 @@ final class AppModel {
         events = []
         contextStatus = nil
         compactNotice = nil
+        contextCheckpoints = []
+        contextCheckpointDetails = [:]
+        contextCheckpointPolicy = nil
+        contextCheckpointNotice = nil
         checkpoints = []
         checkpointNotice = nil
         checkpointStats = nil
@@ -996,6 +1009,10 @@ final class AppModel {
         streamingText = ""
         contextStatus = nil
         compactNotice = nil
+        contextCheckpoints = []
+        contextCheckpointDetails = [:]
+        contextCheckpointPolicy = nil
+        contextCheckpointNotice = nil
         checkpoints = []
         checkpointNotice = nil
         checkpointStats = nil
@@ -6662,6 +6679,9 @@ final class AppModel {
     func loadContextStatus() async {
         guard let sessionID = selectedSessionID else {
             contextStatus = nil
+            contextCheckpoints = []
+            contextCheckpointDetails = [:]
+            contextCheckpointPolicy = nil
             return
         }
         let generation = selectionGeneration
@@ -6672,6 +6692,182 @@ final class AppModel {
             }
         } catch {
             // Context status is diagnostic; do not surface a transient RPC error.
+        }
+        await loadContextCheckpoints()
+    }
+
+    func loadContextCheckpoints() async {
+        guard let sessionID = selectedSessionID else {
+            contextCheckpoints = []
+            contextCheckpointDetails = [:]
+            contextCheckpointPolicy = nil
+            return
+        }
+        let generation = selectionGeneration
+        do {
+            let result = try await core.contextCheckpoints(sessionID: sessionID, limit: 50)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            contextCheckpoints = result.checkpoints
+            contextCheckpointPolicy = result.policy
+        } catch {
+            // Context checkpoints are diagnostic; keep the last successful list.
+        }
+    }
+
+    func loadContextCheckpointDetail(_ checkpointID: String) async -> ContextCheckpointDetailResult? {
+        guard let sessionID = selectedSessionID else { return nil }
+        let generation = selectionGeneration
+        do {
+            let detail = try await core.contextCheckpointDetail(
+                sessionID: sessionID,
+                checkpointID: checkpointID
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return nil }
+            contextCheckpointDetails[checkpointID] = detail
+            return detail
+        } catch {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                contextCheckpointNotice = error.localizedDescription
+            }
+            return nil
+        }
+    }
+
+    func createContextCheckpoint() async {
+        guard let sessionID = selectedSessionID else { return }
+        contextCheckpointBusy = true
+        contextCheckpointNotice = nil
+        defer { contextCheckpointBusy = false }
+        do {
+            let checkpoint = try await core.createContextCheckpoint(
+                sessionID: sessionID,
+                label: nil
+            )
+            guard sessionID == selectedSessionID else { return }
+            contextCheckpointNotice = "Captured \(checkpoint.mode) · \(checkpoint.label)"
+            await loadContextStatus()
+            await loadEvents()
+        } catch {
+            if sessionID == selectedSessionID {
+                contextCheckpointNotice = "Checkpoint failed: \(error.localizedDescription)"
+            }
+            handle(error)
+        }
+    }
+
+    func restoreContextCheckpoint(_ checkpointID: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        contextCheckpointBusy = true
+        contextCheckpointNotice = nil
+        defer { contextCheckpointBusy = false }
+        do {
+            let detail = try await core.contextCheckpointDetail(
+                sessionID: sessionID,
+                checkpointID: checkpointID
+            )
+            guard sessionID == selectedSessionID else { return }
+            contextCheckpointDetails[checkpointID] = detail
+            if let error = detail.preflight.errors.first {
+                contextCheckpointNotice = "Restore refused: \(error)"
+                return
+            }
+            // A threshold warning is advisory: the model still asks for an
+            // explicit restore, and the daemon records `forced=true`.
+            let force = !detail.preflight.warnings.isEmpty
+            let result = try await core.restoreContextCheckpoint(
+                sessionID: sessionID,
+                checkpointID: checkpointID,
+                force: force
+            )
+            guard sessionID == selectedSessionID else { return }
+            let warning = result.warning.map { " · \($0)" } ?? ""
+            contextCheckpointNotice =
+                "Restored \(result.mode) boundary · \(result.activeMessages) messages\(warning)"
+            await loadContextStatus()
+            await loadEvents()
+        } catch {
+            if sessionID == selectedSessionID {
+                contextCheckpointNotice = "Restore failed: \(error.localizedDescription)"
+            }
+            handle(error)
+        }
+    }
+
+    func deleteContextCheckpoint(_ checkpointID: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        contextCheckpointBusy = true
+        contextCheckpointNotice = nil
+        defer { contextCheckpointBusy = false }
+        do {
+            let result = try await core.deleteContextCheckpoint(
+                sessionID: sessionID,
+                checkpointID: checkpointID
+            )
+            guard sessionID == selectedSessionID else { return }
+            contextCheckpointNotice = result.removed ? "Checkpoint deleted" : "Checkpoint already gone"
+            contextCheckpointDetails.removeValue(forKey: checkpointID)
+            await loadContextStatus()
+        } catch {
+            if sessionID == selectedSessionID {
+                contextCheckpointNotice = "Delete failed: \(error.localizedDescription)"
+            }
+            handle(error)
+        }
+    }
+
+    func setContextCheckpointRetention(
+        enabled: Bool? = nil,
+        maxCheckpoints: Int? = nil,
+        maxAgeDays: Int? = nil
+    ) async {
+        guard let projectID = selectedProjectID else { return }
+        let current = contextCheckpointPolicy
+            ?? ContextCheckpointPolicy(enabled: false, maxCheckpoints: 20, maxAgeDays: 30)
+        let next = ContextCheckpointPolicy(
+            enabled: enabled ?? current.enabled,
+            maxCheckpoints: maxCheckpoints ?? current.maxCheckpoints,
+            maxAgeDays: maxAgeDays ?? current.maxAgeDays
+        )
+        contextCheckpointBusy = true
+        contextCheckpointNotice = nil
+        defer { contextCheckpointBusy = false }
+        do {
+            let result = try await core.setContextCheckpointPolicy(
+                projectID: projectID,
+                policy: next
+            )
+            guard projectID == selectedProjectID else { return }
+            contextCheckpointPolicy = result.policy
+            contextCheckpointNotice =
+                "Retention: sweep \(result.policy.enabled ? "on" : "off") · max \(result.policy.maxCheckpoints) · age \(result.policy.maxAgeDays)d"
+        } catch {
+            if projectID == selectedProjectID {
+                contextCheckpointNotice = "Retention update failed: \(error.localizedDescription)"
+            }
+            handle(error)
+        }
+    }
+
+    func pruneContextCheckpoints(keepLatest: Int = 1) async {
+        guard let sessionID = selectedSessionID else { return }
+        contextCheckpointBusy = true
+        contextCheckpointNotice = nil
+        defer { contextCheckpointBusy = false }
+        do {
+            let result = try await core.pruneContextCheckpoints(
+                sessionID: sessionID,
+                olderThanDays: 0,
+                keepLatest: keepLatest,
+                dryRun: false
+            )
+            guard sessionID == selectedSessionID else { return }
+            contextCheckpointNotice = "Pruned \(result.removed) of \(result.candidates)"
+            await loadContextStatus()
+        } catch {
+            if sessionID == selectedSessionID {
+                contextCheckpointNotice = "Prune failed: \(error.localizedDescription)"
+            }
+            handle(error)
         }
     }
 

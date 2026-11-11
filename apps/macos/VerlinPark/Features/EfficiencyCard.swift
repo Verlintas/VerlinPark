@@ -19,6 +19,10 @@ struct EfficiencyCard: View {
                 tokenRow(snapshot)
                 costRow(snapshot)
                 contextRow(snapshot)
+                if model.selectedSession != nil {
+                    Divider()
+                    ContextCheckpointSection(style: .dashboard)
+                }
                 footer(snapshot)
             } else if let status = model.efficiencyStatus {
                 Text(status)
@@ -164,6 +168,14 @@ struct EfficiencyCard: View {
                             "Compactions",
                             "\(compactionCount)",
                             detail: "observed in this session"
+                        )
+                    }
+                    if let checkpointCount = snapshot.checkpointCount {
+                        metric(
+                            "Checkpoints",
+                            "\(checkpointCount)",
+                            detail: snapshot.latestCheckpointID.map { "latest \($0.prefix(8))" }
+                                ?? "durable context boundaries"
                         )
                     }
                     if let preamble = snapshot.preambleTokensEstimate {

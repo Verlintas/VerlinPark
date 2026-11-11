@@ -10443,3 +10443,804 @@ async fn session_lease_events_and_public_leases_never_carry_tokens() {
     assert!(released.payload.get("lease_token").is_none());
     assert_eq!(released.payload["lease_lost"], false);
 }
+
+fn durable_context_checkpoint(
+    session: &Session,
+    project_id: &str,
+    id: &str,
+    through_message_id: Option<&str>,
+) -> vp_protocol::types::ContextCheckpoint {
+    vp_protocol::types::ContextCheckpoint {
+        id: id.into(),
+        session_id: session.id.clone(),
+        project_id: project_id.into(),
+        label: format!("checkpoint {id}"),
+        mode: if through_message_id.is_some() {
+            "summary".into()
+        } else {
+            "manual".into()
+        },
+        summary: through_message_id.map(|_| "Earlier conversation summary\n\nstate".to_string()),
+        through_message_id: through_message_id.map(str::to_string),
+        message_cursor: usize::from(through_message_id.is_some()),
+        plan_revision: 0,
+        provider: "queue".into(),
+        model: "test".into(),
+        prompt_prefix_hash: "prefix-hash".into(),
+        worktree_head: String::new(),
+        tokens_before: 5_000,
+        tokens_after: 500,
+        structured_state: Some(vp_protocol::types::ContextStructuredState {
+            goal: "durable context".into(),
+            plan_revision: 0,
+            ..vp_protocol::types::ContextStructuredState::default()
+        }),
+        source_compaction_seq: None,
+        automatic: false,
+        created_at: vp_protocol::now_rfc3339(),
+    }
+}
+
+#[tokio::test]
+async fn context_checkpoints_replay_repair_and_event_log_restore() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("context checkpoints".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "replay checkpoints".into(), None)
+        .await
+        .unwrap();
+    let message = engine
+        .append_message(
+            &session.id,
+            "user",
+            "boundary message",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    let checkpoint = durable_context_checkpoint(
+        &session,
+        &project.id,
+        "ctx-replay-1",
+        Some(message.id.as_str()),
+    );
+    let event = engine
+        .record_context_checkpoint(checkpoint.clone())
+        .await
+        .unwrap();
+    assert_eq!(event.kind, "context.checkpointed");
+    assert_eq!(
+        event.payload["checkpoint_id"].as_str(),
+        Some(checkpoint.id.as_str())
+    );
+    let stored = engine
+        .list_context_checkpoints(&session.id, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(stored.checkpoints.len(), 1);
+    assert_eq!(stored.checkpoints[0].message_cursor, 1);
+    assert_eq!(
+        stored.checkpoints[0].structured_state,
+        checkpoint.structured_state
+    );
+
+    // Append a restore boundary and verify event ordering and message safety.
+    let message_count = engine.list_messages(&session.id).await.unwrap().len();
+    let (compacted, restored) = engine
+        .append_context_restore_events(
+            &session.id,
+            serde_json::json!({
+                "mode": "summary",
+                "through_message_id": message.id,
+                "summary": "Earlier conversation summary\n\nstate",
+                "estimated_tokens_before": 5_000,
+                "estimated_tokens_after": 500,
+                "context_checkpoint_id": checkpoint.id,
+                "restored_from_checkpoint": checkpoint.id,
+                "restored": true
+            }),
+            serde_json::json!({
+                "checkpoint_id": checkpoint.id,
+                "mode": "summary"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.seq, compacted.seq + 1);
+    assert_eq!(restored.payload["compaction_seq"], compacted.seq);
+    assert_eq!(
+        engine.list_messages(&session.id).await.unwrap().len(),
+        message_count
+    );
+
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.context_checkpoints_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+
+    // Dropping the projection is repaired from the full-payload events.
+    engine
+        .store()
+        .replace_context_checkpoints(&session.id, &[])
+        .unwrap();
+    let drifted = engine.replay_session(&session.id).await.unwrap();
+    assert!(!drifted.context_checkpoints_match);
+    assert!(!drifted.consistent);
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(
+        repaired.context_checkpoints_match,
+        "{:?}",
+        repaired.mismatches
+    );
+    assert!(repaired.consistent, "{:?}", repaired.mismatches);
+    assert_eq!(
+        engine
+            .list_context_checkpoints(&session.id, Some(10))
+            .await
+            .unwrap()
+            .checkpoints
+            .len(),
+        1
+    );
+
+    // The full event table can also be restored from its JSONL mirror.
+    engine.store().replace_events(&session.id, &[]).unwrap();
+    let restored_log = engine.restore_session_log(&session.id).await.unwrap();
+    assert!(restored_log.matches, "{restored_log:?}");
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.context_checkpoints_match, "{:?}", report.mismatches);
+    assert_eq!(
+        engine
+            .list_context_checkpoints(&session.id, Some(10))
+            .await
+            .unwrap()
+            .checkpoints
+            .len(),
+        1
+    );
+    let status = engine.session_context_status(&session.id).await.unwrap();
+    assert_eq!(status.checkpoint_count, 1);
+    assert_eq!(status.latest_checkpoint_id.as_deref(), Some("ctx-replay-1"));
+}
+
+#[tokio::test]
+async fn context_checkpoints_travel_in_bundles_and_survive_database_rebuild() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let session_id = {
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("context bundle".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "bundle checkpoints".into(), None)
+            .await
+            .unwrap();
+        let message = engine
+            .append_message(
+                &session.id,
+                "user",
+                "bundle boundary message",
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        let checkpoint = durable_context_checkpoint(
+            &session,
+            &project.id,
+            "ctx-bundle-1",
+            Some(message.id.as_str()),
+        );
+        engine.record_context_checkpoint(checkpoint).await.unwrap();
+        engine.record_project_manifest().await.unwrap();
+
+        let bundle = engine.export_session(&session.id).await.unwrap();
+        assert_eq!(bundle.context_checkpoints.len(), 1);
+        assert_eq!(bundle.context_checkpoints[0].id, "ctx-bundle-1");
+        assert!(
+            bundle
+                .events
+                .iter()
+                .any(|event| event.kind == "context.checkpointed")
+        );
+
+        let import_data = TempDir::new().unwrap();
+        let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
+        imported_engine.import_session(bundle).await.unwrap();
+        let imported = imported_engine
+            .list_context_checkpoints(&session.id, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(imported.checkpoints.len(), 1);
+        assert_eq!(imported.checkpoints[0].id, "ctx-bundle-1");
+        assert_eq!(
+            imported_engine
+                .store()
+                .get_session(&session.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "imported"
+        );
+        let imported_replay = imported_engine.replay_session(&session.id).await.unwrap();
+        assert!(
+            imported_replay.context_checkpoints_match,
+            "{:?}",
+            imported_replay.mismatches
+        );
+        session.id.clone()
+    };
+
+    let report = crate::rebuild::rebuild_database(data.path(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.projects, 1);
+    assert_eq!(report.sessions, 1);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    let store = Store::open(data.path()).unwrap();
+    let rows = store.list_context_checkpoints(&session_id, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "ctx-bundle-1");
+    assert_eq!(
+        rows[0].summary.as_deref(),
+        Some("Earlier conversation summary\n\nstate")
+    );
+    assert_eq!(
+        rows[0].structured_state.as_ref().unwrap().goal,
+        "durable context"
+    );
+}
+
+#[tokio::test]
+async fn context_checkpoint_policy_is_project_scoped_and_bounded() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("context policy".into()),
+        )
+        .await
+        .unwrap();
+    let policy = engine
+        .get_context_checkpoint_policy(&project.id)
+        .await
+        .unwrap();
+    assert!(!policy.enabled);
+    assert_eq!(policy.max_checkpoints, 20);
+    assert_eq!(policy.max_age_days, 30);
+    let saved = engine
+        .set_context_checkpoint_policy(
+            &project.id,
+            &vp_protocol::types::ContextCheckpointPolicy {
+                enabled: true,
+                max_checkpoints: 5,
+                max_age_days: 7,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(saved.policy.enabled);
+    assert_eq!(saved.policy.max_checkpoints, 5);
+    assert_eq!(saved.policy.max_age_days, 7);
+    engine.record_project_manifest().await.unwrap();
+    let snapshots = vp_store::read_project_manifest(data.path()).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert!(snapshots[0].context_checkpoint_policy.enabled);
+    assert_eq!(snapshots[0].context_checkpoint_policy.max_checkpoints, 5);
+    let error = engine
+        .set_context_checkpoint_policy(
+            &project.id,
+            &vp_protocol::types::ContextCheckpointPolicy {
+                enabled: true,
+                max_checkpoints: 0,
+                max_age_days: 7,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("between 1 and"), "{error}");
+    let error = engine
+        .set_context_checkpoint_policy(
+            &project.id,
+            &vp_protocol::types::ContextCheckpointPolicy {
+                enabled: true,
+                max_checkpoints: 5,
+                max_age_days: 366,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("at most 365"), "{error}");
+}
+
+#[tokio::test]
+async fn session_transcript_lists_context_checkpoints_and_the_active_boundary() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("transcript checkpoints".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "transcript checkpoints".into(), None)
+        .await
+        .unwrap();
+    let message = engine
+        .append_message(
+            &session.id,
+            "user",
+            "checkpoint transcript message",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    let initial = engine.session_transcript(&session.id).await.unwrap();
+    assert!(!initial.markdown.contains("## Context Checkpoints"));
+
+    let checkpoint = durable_context_checkpoint(
+        &session,
+        &project.id,
+        "ctx-transcript-1",
+        Some(message.id.as_str()),
+    );
+    engine
+        .record_context_checkpoint(checkpoint.clone())
+        .await
+        .unwrap();
+    engine
+        .append_context_restore_events(
+            &session.id,
+            serde_json::json!({
+                "mode": "summary",
+                "through_message_id": message.id,
+                "summary": "Earlier conversation summary",
+                "context_checkpoint_id": checkpoint.id,
+                "restored_from_checkpoint": checkpoint.id
+            }),
+            serde_json::json!({"checkpoint_id": checkpoint.id}),
+        )
+        .await
+        .unwrap();
+    let transcript = engine.session_transcript(&session.id).await.unwrap();
+    assert!(transcript.markdown.contains("## Context Checkpoints"));
+    assert!(transcript.markdown.contains("ctx-transcript-1"));
+    assert!(
+        transcript
+            .markdown
+            .contains("| summary | 0 | 5000 → 500 | yes |")
+    );
+    assert!(transcript.markdown.contains("do not reset the worktree"));
+}
+
+#[tokio::test]
+async fn importing_a_bundle_without_the_checkpoint_row_rebuilds_it_from_events() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("bundle rebuild".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "bundle rebuild".into(), None)
+        .await
+        .unwrap();
+    let message = engine
+        .append_message(
+            &session.id,
+            "user",
+            "bundle rebuild message",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    let checkpoint = durable_context_checkpoint(
+        &session,
+        &project.id,
+        "ctx-bundle-rebuild",
+        Some(message.id.as_str()),
+    );
+    engine.record_context_checkpoint(checkpoint).await.unwrap();
+    let mut bundle = engine.export_session(&session.id).await.unwrap();
+    assert_eq!(bundle.context_checkpoints.len(), 1);
+    // Simulate a producer that predates the projection field but still carries
+    // the full checkpoint event.
+    bundle.context_checkpoints.clear();
+
+    let import_data = TempDir::new().unwrap();
+    let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
+    imported_engine.import_session(bundle).await.unwrap();
+    let rebuilt = imported_engine
+        .list_context_checkpoints(&session.id, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.checkpoints.len(), 1);
+    assert_eq!(rebuilt.checkpoints[0].id, "ctx-bundle-rebuild");
+    let replay = imported_engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.context_checkpoints_match, "{:?}", replay.mismatches);
+}
+
+#[tokio::test]
+async fn malformed_context_checkpoint_events_fail_replay_closed() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("malformed checkpoint".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "malformed checkpoint".into(), None)
+        .await
+        .unwrap();
+    let checkpoint = durable_context_checkpoint(&session, &project.id, "ctx-valid-1", None);
+    engine.record_context_checkpoint(checkpoint).await.unwrap();
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
+    engine
+        .append_event(
+            &session.id,
+            "context.checkpointed",
+            serde_json::json!({"id": "ctx-malformed"}),
+        )
+        .await
+        .unwrap();
+    let drifted = engine.replay_session(&session.id).await.unwrap();
+    assert!(!drifted.context_checkpoints_match);
+    assert!(!drifted.consistent);
+    assert!(
+        drifted
+            .mismatches
+            .iter()
+            .any(|mismatch| mismatch.starts_with("context checkpoints:"))
+    );
+    // Repair cannot invent a row from a malformed event; the mismatch stays.
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(!repaired.context_checkpoints_match);
+    assert!(!repaired.consistent);
+}
+
+#[tokio::test]
+async fn restore_events_rewind_the_active_conversation_and_can_be_superseded() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("restore events".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "restore events".into(), None)
+        .await
+        .unwrap();
+    let mut messages = Vec::new();
+    for index in 0..5 {
+        messages.push(
+            engine
+                .append_message(
+                    &session.id,
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    &format!("message {index}"),
+                    serde_json::json!([]),
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let first = durable_context_checkpoint(
+        &session,
+        &project.id,
+        "ctx-early",
+        Some(messages[1].id.as_str()),
+    );
+    let second = durable_context_checkpoint(
+        &session,
+        &project.id,
+        "ctx-late",
+        Some(messages[3].id.as_str()),
+    );
+    engine
+        .record_context_checkpoint(first.clone())
+        .await
+        .unwrap();
+    engine
+        .record_context_checkpoint(second.clone())
+        .await
+        .unwrap();
+
+    for (checkpoint, expected_start) in [(&first, 2), (&second, 4)] {
+        engine
+            .append_context_restore_events(
+                &session.id,
+                serde_json::json!({
+                    "mode": "summary",
+                    "through_message_id": checkpoint.through_message_id.clone(),
+                    "summary": checkpoint.summary.clone(),
+                    "context_checkpoint_id": checkpoint.id.clone(),
+                    "restored_from_checkpoint": checkpoint.id.clone(),
+                    "restored": true
+                }),
+                serde_json::json!({"checkpoint_id": checkpoint.id}),
+            )
+            .await
+            .unwrap();
+        let events = engine.all_events(&session.id).await.unwrap();
+        let (active, ids) = crate::agent::conversation_from_events(&events, &session.id).unwrap();
+        assert_eq!(active[0].content, checkpoint.summary.clone().unwrap());
+        assert_eq!(active.len(), 1 + (5 - expected_start));
+        assert!(ids[0].is_none());
+        assert_eq!(
+            ids[1].as_deref(),
+            Some(messages[expected_start].id.as_str())
+        );
+    }
+    assert_eq!(engine.list_messages(&session.id).await.unwrap().len(), 5);
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.context_checkpoints_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+    let active_id = engine
+        .all_events(&session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|event| event.kind == "context.compacted")
+        .and_then(|event| {
+            event
+                .payload
+                .get("restored_from_checkpoint")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    assert_eq!(active_id.as_deref(), Some(second.id.as_str()));
+}
+
+#[tokio::test]
+async fn deleting_a_context_checkpoint_does_not_rewind_or_change_messages() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("delete restore".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "delete restore".into(), None)
+        .await
+        .unwrap();
+    let message = engine
+        .append_message(
+            &session.id,
+            "user",
+            "delete restore message",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    let checkpoint = durable_context_checkpoint(
+        &session,
+        &project.id,
+        "ctx-delete-restore",
+        Some(message.id.as_str()),
+    );
+    engine
+        .record_context_checkpoint(checkpoint.clone())
+        .await
+        .unwrap();
+    engine
+        .append_context_restore_events(
+            &session.id,
+            serde_json::json!({
+                "mode": "summary",
+                "through_message_id": message.id,
+                "summary": "Earlier conversation summary",
+                "restored_from_checkpoint": checkpoint.id
+            }),
+            serde_json::json!({"checkpoint_id": checkpoint.id}),
+        )
+        .await
+        .unwrap();
+    let before = engine.all_events(&session.id).await.unwrap();
+    let (before_active, _) = crate::agent::conversation_from_events(&before, &session.id).unwrap();
+    let deleted = engine
+        .delete_context_checkpoint(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert!(deleted.removed);
+    let after = engine.all_events(&session.id).await.unwrap();
+    let (after_active, _) = crate::agent::conversation_from_events(&after, &session.id).unwrap();
+    assert_eq!(
+        before_active
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        after_active
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(engine.list_messages(&session.id).await.unwrap().len(), 1);
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.context_checkpoints_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+    assert!(
+        engine
+            .list_context_checkpoints(&session.id, Some(10))
+            .await
+            .unwrap()
+            .checkpoints
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn bundle_round_trip_preserves_checkpoint_state_and_source_sequence() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("checkpoint state".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "checkpoint state".into(), None)
+        .await
+        .unwrap();
+    let mut checkpoint = durable_context_checkpoint(&session, &project.id, "ctx-state-1", None);
+    checkpoint.structured_state = Some(vp_protocol::types::ContextStructuredState {
+        goal: "preserve state".into(),
+        plan_revision: 3,
+        active_task_id: Some("T3".into()),
+        active_task_title: Some("state task".into()),
+        active_task_department: Some("runtime".into()),
+        active_task_acceptance: vec!["tests".into(), "adr".into()],
+        active_task_write_scope: vec!["crates/vp-core".into()],
+        recent_completed_task_ids: vec!["T1".into(), "T2".into()],
+        generated_at: "2026-11-11T00:00:00Z".into(),
+    });
+    checkpoint.plan_revision = 3;
+    checkpoint.source_compaction_seq = Some(17);
+    engine
+        .record_context_checkpoint(checkpoint.clone())
+        .await
+        .unwrap();
+    let bundle = engine.export_session(&session.id).await.unwrap();
+    let bundled = bundle
+        .context_checkpoints
+        .iter()
+        .find(|row| row.id == "ctx-state-1")
+        .unwrap();
+    assert_eq!(bundled.plan_revision, 3);
+    assert_eq!(bundled.source_compaction_seq, Some(17));
+    assert_eq!(
+        bundled
+            .structured_state
+            .as_ref()
+            .unwrap()
+            .active_task_acceptance,
+        vec!["tests".to_string(), "adr".to_string()]
+    );
+
+    let import_data = TempDir::new().unwrap();
+    let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
+    imported_engine.import_session(bundle).await.unwrap();
+    let imported = imported_engine
+        .list_context_checkpoints(&session.id, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(imported.checkpoints[0].plan_revision, 3);
+    assert_eq!(imported.checkpoints[0].source_compaction_seq, Some(17));
+    assert_eq!(
+        imported.checkpoints[0]
+            .structured_state
+            .as_ref()
+            .unwrap()
+            .active_task_id
+            .as_deref(),
+        Some("T3")
+    );
+}
+
+#[tokio::test]
+async fn database_rebuild_preserves_context_checkpoint_policy() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let session_id = {
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("policy rebuild".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "policy rebuild".into(), None)
+            .await
+            .unwrap();
+        engine
+            .set_context_checkpoint_policy(
+                &project.id,
+                &vp_protocol::types::ContextCheckpointPolicy {
+                    enabled: true,
+                    max_checkpoints: 9,
+                    max_age_days: 14,
+                },
+            )
+            .await
+            .unwrap();
+        let checkpoint =
+            durable_context_checkpoint(&session, &project.id, "ctx-policy-rebuild", None);
+        engine.record_context_checkpoint(checkpoint).await.unwrap();
+        engine.record_project_manifest().await.unwrap();
+        session.id
+    };
+    let report = crate::rebuild::rebuild_database(data.path(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.sessions, 1);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    let store = Store::open(data.path()).unwrap();
+    let projects = store.list_projects().unwrap();
+    let policy = store
+        .get_context_checkpoint_policy(&projects[0].id)
+        .unwrap();
+    assert!(policy.enabled);
+    assert_eq!(policy.max_checkpoints, 9);
+    assert_eq!(policy.max_age_days, 14);
+    assert_eq!(
+        store
+            .list_context_checkpoints(&session_id, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}

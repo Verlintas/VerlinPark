@@ -89,6 +89,7 @@ pub mod browser;
 pub mod budget;
 pub mod computer;
 pub mod console;
+pub mod context;
 pub mod continuation;
 mod dashboard;
 pub mod history;
@@ -141,6 +142,7 @@ struct ReplayData {
     runs: Vec<vp_protocol::types::SessionRun>,
     run_steps: Vec<vp_protocol::types::RunStep>,
     run_checkpoints: Vec<vp_protocol::types::RunCheckpoint>,
+    context_checkpoints: Vec<vp_protocol::types::ContextCheckpoint>,
     events: Vec<Event>,
 }
 
@@ -3927,6 +3929,298 @@ impl Engine {
             project_id: project_id.to_string(),
             policy: saved,
         })
+    }
+
+    pub async fn get_context_checkpoint_policy(
+        &self,
+        project_id: &str,
+    ) -> Result<vp_protocol::types::ContextCheckpointPolicy> {
+        let store = self.store.clone();
+        let id = project_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            store
+                .get_project(&id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {id}"))?;
+            store.get_context_checkpoint_policy(&id)
+        })
+        .await?
+    }
+
+    pub async fn set_context_checkpoint_policy(
+        &self,
+        project_id: &str,
+        policy: &vp_protocol::types::ContextCheckpointPolicy,
+    ) -> Result<vp_protocol::types::ContextCheckpointPolicyResult> {
+        crate::context::validate_context_checkpoint_policy(policy)?;
+        let store = self.store.clone();
+        let id = project_id.to_string();
+        let policy = policy.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            store
+                .get_project(&id)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {id}"))?;
+            store.set_context_checkpoint_policy(&id, &policy)?;
+            store.get_context_checkpoint_policy(&id)
+        })
+        .await??;
+        Ok(vp_protocol::types::ContextCheckpointPolicyResult {
+            project_id: project_id.to_string(),
+            policy: saved,
+        })
+    }
+
+    /// Insert a context checkpoint row and its full-payload event atomically.
+    /// Used by automatic compaction, the manual checkpoint command, and tests.
+    pub(crate) async fn record_context_checkpoint(
+        &self,
+        checkpoint: vp_protocol::types::ContextCheckpoint,
+    ) -> Result<Event> {
+        let checkpoint = crate::context::bound_context_checkpoint(checkpoint)?;
+        let store = self.store.clone();
+        let session_id = checkpoint.session_id.clone();
+        let event = tokio::task::spawn_blocking(move || {
+            store.record_context_checkpoint_with_event(&session_id, &checkpoint)
+        })
+        .await??;
+        let _ = self.events.send(event.clone());
+        Ok(event)
+    }
+
+    /// Append a successful compaction and its automatic checkpoint atomically.
+    pub(crate) async fn append_context_compaction_with_checkpoint(
+        &self,
+        checkpoint: vp_protocol::types::ContextCheckpoint,
+        compaction_payload: serde_json::Value,
+    ) -> Result<(Event, Event)> {
+        let checkpoint = crate::context::bound_context_checkpoint(checkpoint)?;
+        let store = self.store.clone();
+        let session_id = checkpoint.session_id.clone();
+        let (compaction, checkpoint_event) = tokio::task::spawn_blocking(move || {
+            store.append_context_compaction_with_checkpoint(
+                &session_id,
+                compaction_payload,
+                &checkpoint,
+            )
+        })
+        .await??;
+        let _ = self.events.send(compaction.clone());
+        let _ = self.events.send(checkpoint_event.clone());
+        Ok((compaction, checkpoint_event))
+    }
+
+    /// Append the reconstructed compaction boundary and the restore audit
+    /// event. This does not touch messages, checkpoints, or the worktree.
+    pub(crate) async fn append_context_restore_events(
+        &self,
+        session_id: &str,
+        compaction_payload: serde_json::Value,
+        restored_payload: serde_json::Value,
+    ) -> Result<(Event, Event)> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let (compaction, restored) = tokio::task::spawn_blocking(move || {
+            store.append_context_restore_events(&session_id, compaction_payload, restored_payload)
+        })
+        .await??;
+        let _ = self.events.send(compaction.clone());
+        let _ = self.events.send(restored.clone());
+        Ok((compaction, restored))
+    }
+
+    pub async fn list_context_checkpoints(
+        &self,
+        session_id: &str,
+        limit: Option<u32>,
+    ) -> Result<vp_protocol::types::ContextCheckpointListResult> {
+        let limit = limit
+            .unwrap_or(50)
+            .clamp(1, crate::context::MAX_CONTEXT_CHECKPOINT_LIST_LIMIT);
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (session, checkpoints) = tokio::task::spawn_blocking(move || {
+            let session = store
+                .get_session(&id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
+            let checkpoints = store.list_context_checkpoints(&id, limit)?;
+            Ok::<_, anyhow::Error>((session, checkpoints))
+        })
+        .await??;
+        let policy = self
+            .get_context_checkpoint_policy(&session.project_id)
+            .await?;
+        let latest_id = checkpoints.last().map(|checkpoint| checkpoint.id.clone());
+        Ok(vp_protocol::types::ContextCheckpointListResult {
+            session_id: session.id,
+            checkpoints,
+            latest_id,
+            policy,
+            limit,
+        })
+    }
+
+    pub async fn delete_context_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<vp_protocol::types::ContextCheckpointDeleteResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let active = is_active_session_status(&session.status);
+        let latest = {
+            let store = self.store.clone();
+            let id = session_id.to_string();
+            tokio::task::spawn_blocking(move || store.latest_context_checkpoint(&id)).await??
+        };
+        if active && latest.as_ref().is_some_and(|row| row.id == checkpoint_id) {
+            anyhow::bail!(
+                "cannot delete the latest context checkpoint while the session is active"
+            );
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let checkpoint_id_owned = checkpoint_id.to_string();
+        let event = tokio::task::spawn_blocking(move || {
+            store.delete_context_checkpoint_with_event(&id, &checkpoint_id_owned, "manual")
+        })
+        .await??;
+        if let Some(event) = event {
+            let _ = self.events.send(event);
+            return Ok(vp_protocol::types::ContextCheckpointDeleteResult {
+                session_id: session_id.to_string(),
+                checkpoint_id: checkpoint_id.to_string(),
+                removed: true,
+            });
+        }
+        Ok(vp_protocol::types::ContextCheckpointDeleteResult {
+            session_id: session_id.to_string(),
+            checkpoint_id: checkpoint_id.to_string(),
+            removed: false,
+        })
+    }
+
+    /// Oldest-first retention. The latest checkpoint of an active run is
+    /// always protected, even when `keep_latest` is zero.
+    pub async fn prune_context_checkpoints(
+        &self,
+        session_id: &str,
+        older_than_days: Option<u32>,
+        keep_latest: Option<u32>,
+        dry_run: bool,
+    ) -> Result<vp_protocol::types::ContextCheckpointPruneResult> {
+        if older_than_days.is_some_and(|days| days > 365) {
+            anyhow::bail!("context checkpoint older_than_days must be at most 365");
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let policy = self
+            .get_context_checkpoint_policy(&session.project_id)
+            .await?;
+        let keep_latest = keep_latest
+            .unwrap_or(policy.max_checkpoints)
+            .min(crate::context::MAX_CONTEXT_CHECKPOINT_POLICY_ITEMS)
+            as usize;
+        let age_days = match older_than_days {
+            Some(0) => None,
+            Some(days) => Some(days),
+            None if policy.max_age_days == 0 => None,
+            None => Some(policy.max_age_days),
+        };
+        let cutoff = age_days
+            .map(|days| time::OffsetDateTime::now_utc() - time::Duration::days(i64::from(days)));
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let checkpoints =
+            tokio::task::spawn_blocking(move || store.list_context_checkpoints(&id, 10_000))
+                .await??;
+        let active = is_active_session_status(&session.status);
+        let mut candidates = Vec::new();
+        for (index, checkpoint) in checkpoints.iter().enumerate() {
+            let protected_by_count = index >= checkpoints.len().saturating_sub(keep_latest);
+            let protected_active = active && index + 1 == checkpoints.len();
+            let old = cutoff.is_none_or(|cutoff| {
+                time::OffsetDateTime::parse(
+                    &checkpoint.created_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .map(|created_at| created_at < cutoff)
+                .unwrap_or(false)
+            });
+            if !protected_by_count && !protected_active && old {
+                candidates.push(checkpoint.clone());
+            }
+        }
+        if dry_run {
+            return Ok(vp_protocol::types::ContextCheckpointPruneResult {
+                session_id: session_id.to_string(),
+                candidates: candidates.len(),
+                removed: 0,
+                dry_run: true,
+                checkpoints: candidates,
+            });
+        }
+        let mut removed = 0usize;
+        for checkpoint in &candidates {
+            let store = self.store.clone();
+            let id = session_id.to_string();
+            let checkpoint_id = checkpoint.id.clone();
+            let event = tokio::task::spawn_blocking(move || {
+                store.delete_context_checkpoint_with_event(&id, &checkpoint_id, "prune")
+            })
+            .await??;
+            if let Some(event) = event {
+                let _ = self.events.send(event);
+                removed += 1;
+            }
+        }
+        Ok(vp_protocol::types::ContextCheckpointPruneResult {
+            session_id: session_id.to_string(),
+            candidates: candidates.len(),
+            removed,
+            dry_run: false,
+            checkpoints: candidates,
+        })
+    }
+
+    /// Run the opt-in context checkpoint retention policy for every project.
+    pub async fn sweep_context_checkpoint_retention(&self) -> Result<usize> {
+        let store = self.store.clone();
+        let policies =
+            tokio::task::spawn_blocking(move || store.list_enabled_context_checkpoint_policies())
+                .await??;
+        let mut removed = 0usize;
+        for (project_id, policy) in policies {
+            let store = self.store.clone();
+            let sessions =
+                tokio::task::spawn_blocking(move || store.list_sessions(Some(&project_id)))
+                    .await??;
+            for session in sessions {
+                if session.status == "imported" {
+                    continue;
+                }
+                let result = self
+                    .prune_context_checkpoints(
+                        &session.id,
+                        (policy.max_age_days > 0).then_some(policy.max_age_days),
+                        Some(policy.max_checkpoints),
+                        false,
+                    )
+                    .await?;
+                removed = removed.saturating_add(result.removed);
+            }
+        }
+        Ok(removed)
     }
 
     /// Run the opt-in checkpoint retention policy for every project. Deletes
@@ -10228,6 +10522,51 @@ impl Engine {
             }
         }
 
+        let store = self.store.clone();
+        let checkpoint_session = session.id.clone();
+        let context_checkpoints = tokio::task::spawn_blocking(move || {
+            store.list_context_checkpoints(&checkpoint_session, 200)
+        })
+        .await??;
+        if !context_checkpoints.is_empty() {
+            let _ = writeln!(out, "\n## Context Checkpoints\n");
+            let _ = writeln!(
+                out,
+                "Context restores rewind the active summary boundary only. They do not reset the worktree or create a run.\n"
+            );
+            let _ = writeln!(
+                out,
+                "| id | mode | plan | tokens | active? | label | created |"
+            );
+            let _ = writeln!(out, "|---|---|---|---|---|---|---|");
+            let active_id = {
+                let events = self.all_events(&session.id).await?;
+                crate::context::active_context_checkpoint_id(&events)
+            };
+            for checkpoint in &context_checkpoints {
+                let label = checkpoint
+                    .label
+                    .replace('|', "\\|")
+                    .replace(['\n', '\r'], " ");
+                let _ = writeln!(
+                    out,
+                    "| `{}` | {} | {} | {} → {} | {} | {} | {} |",
+                    checkpoint.id,
+                    checkpoint.mode,
+                    checkpoint.plan_revision,
+                    checkpoint.tokens_before,
+                    checkpoint.tokens_after,
+                    if active_id.as_deref() == Some(checkpoint.id.as_str()) {
+                        "yes"
+                    } else {
+                        ""
+                    },
+                    label,
+                    checkpoint.created_at
+                );
+            }
+        }
+
         let _ = writeln!(out, "\n## Conversation\n");
         if messages.is_empty() {
             let _ = writeln!(out, "_No messages yet._");
@@ -10363,6 +10702,15 @@ impl Engine {
         let compaction_fallback_to_sync = last_compaction
             .as_ref()
             .is_some_and(|summary| summary.fallback_to_sync);
+        let store = self.store.clone();
+        let checkpoint_session = session_id.to_string();
+        let (checkpoint_count, latest_checkpoint) = tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>((
+                store.context_checkpoint_count(&checkpoint_session)?,
+                store.latest_context_checkpoint(&checkpoint_session)?,
+            ))
+        })
+        .await??;
         Ok(SessionContextStatus {
             session_id: session_id.to_string(),
             usage,
@@ -10374,6 +10722,11 @@ impl Engine {
             last_compaction_tokens_after,
             compaction_background_reuse,
             compaction_fallback_to_sync,
+            checkpoint_count,
+            latest_checkpoint_id: latest_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.id.clone()),
+            latest_checkpoint_at: latest_checkpoint.map(|checkpoint| checkpoint.created_at),
         })
     }
 
@@ -10416,6 +10769,7 @@ impl Engine {
             let runs = store.list_all_session_runs(&id)?;
             let run_steps = store.list_session_run_steps(&id)?;
             let run_checkpoints = store.list_session_run_checkpoints(&id)?;
+            let context_checkpoints = store.list_context_checkpoints(&id, 10_000)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -10440,6 +10794,7 @@ impl Engine {
                 runs,
                 run_steps,
                 run_checkpoints,
+                context_checkpoints,
                 events,
             })
         })
@@ -11238,6 +11593,18 @@ impl Engine {
             ));
         }
 
+        let expected_checkpoints = crate::context::checkpoints_from_events(&data.events);
+        let context_checkpoints_match = expected_checkpoints.as_ref().is_some_and(|expected| {
+            crate::context::context_checkpoints_match(&data.context_checkpoints, expected)
+        });
+        if !context_checkpoints_match {
+            mismatches.push(format!(
+                "context checkpoints: projection={}, replay={}",
+                data.context_checkpoints.len(),
+                expected_checkpoints.as_ref().map(Vec::len).unwrap_or(0)
+            ));
+        }
+
         let expected_artifacts = Self::expected_artifacts(data);
         let projected_artifacts = data
             .artifacts
@@ -11517,7 +11884,8 @@ impl Engine {
             && continuations_match
             && runs_match
             && run_steps_match
-            && run_checkpoints_match;
+            && run_checkpoints_match
+            && context_checkpoints_match;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -11544,6 +11912,7 @@ impl Engine {
             runs_match,
             run_steps_match,
             run_checkpoints_match,
+            context_checkpoints_match,
             consistent,
             repaired,
             rebuilt: false,
@@ -11818,6 +12187,7 @@ impl Engine {
             .and_then(serde_json::Value::as_i64)
             .and_then(|value| i32::try_from(value).ok());
         let journal = crate::run_journal::projections_from_events(&data.events);
+        let context_checkpoints = crate::context::checkpoints_from_events(&data.events);
         Ok(SessionRepair {
             status,
             priority,
@@ -11844,6 +12214,7 @@ impl Engine {
             runs: journal.as_ref().map(|value| value.0.clone()),
             run_steps: journal.as_ref().map(|value| value.1.clone()),
             run_checkpoints: journal.as_ref().map(|value| value.2.clone()),
+            context_checkpoints,
             artifact_warnings,
         })
     }
@@ -12061,6 +12432,22 @@ impl Engine {
                     &checkpoints,
                 )?;
             }
+            let has_context_checkpoint_events = events.iter().any(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    crate::context::CONTEXT_CHECKPOINT_CREATED_EVENT
+                        | crate::context::CONTEXT_CHECKPOINT_DELETED_EVENT
+                )
+            });
+            // A legacy projection-only bundle may carry rows without the
+            // matching audit events. Preserve those rows; when events exist
+            // they are authoritative and rebuild (or tombstone) the projection.
+            if has_context_checkpoint_events
+                && let Some(context_checkpoints) = crate::context::checkpoints_from_events(&events)
+            {
+                projection_store
+                    .replace_context_checkpoints(&projection_id, &context_checkpoints)?;
+            }
             Ok(())
         })
         .await??;
@@ -12176,6 +12563,7 @@ impl Engine {
             session_runs: data.runs,
             run_steps: data.run_steps,
             run_checkpoints: data.run_checkpoints,
+            context_checkpoints: data.context_checkpoints,
         })
     }
 
@@ -15473,6 +15861,10 @@ fn build_intake_draft(params: &IntakeCreateParams) -> Result<NewIntakeTask> {
         origin: origin.to_string(),
         labels,
     })
+}
+
+pub(crate) fn is_active_session_status(status: &str) -> bool {
+    matches!(status, "queued" | "running" | "paused" | "waiting_input")
 }
 
 pub(crate) fn ensure_session_quiescent(session: &Session, action: &str) -> Result<()> {

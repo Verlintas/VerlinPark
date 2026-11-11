@@ -1256,6 +1256,52 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List durable active-context checkpoints for a session.
+    ContextCheckpoints {
+        session: String,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Capture the current active-context boundary without running a prompt.
+    ContextCheckpoint {
+        session: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Show one context checkpoint and its deterministic restore preflight.
+    ContextCheckpointDetail { session: String, checkpoint: String },
+    /// Restore an idle session's active conversation to a context checkpoint.
+    ContextRestore {
+        session: String,
+        checkpoint: String,
+        /// Accept an above-threshold token estimate. Safety checks still apply.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete one context checkpoint. Messages and worktree state are kept.
+    ContextCheckpointDelete { session: String, checkpoint: String },
+    /// Prune old context checkpoints, protecting the latest active checkpoint.
+    ContextCheckpointPrune {
+        session: String,
+        #[arg(long)]
+        older_than_days: Option<u32>,
+        #[arg(long)]
+        keep_latest: Option<u32>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the project-scoped context checkpoint retention policy.
+    ContextCheckpointPolicy { project: String },
+    /// Set the project-scoped context checkpoint retention policy.
+    ContextCheckpointPolicySet {
+        project: String,
+        #[arg(long)]
+        enabled: bool,
+        #[arg(long, default_value_t = 20)]
+        max_checkpoints: u32,
+        #[arg(long, default_value_t = 30)]
+        max_age_days: u32,
+    },
     /// Fork a new session from the latest checkpoint (or --checkpoint).
     Fork {
         session: String,
@@ -4072,6 +4118,106 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::ContextCheckpoints { session, limit } => {
+            rpc(
+                &discovery,
+                "session.context.checkpoints",
+                json!({"session_id": session, "limit": limit}),
+            )
+            .await?
+        }
+        Command::ContextCheckpoint { session, label } => {
+            rpc(
+                &discovery,
+                "session.context.checkpoint",
+                json!({"session_id": session, "label": label}),
+            )
+            .await?
+        }
+        Command::ContextCheckpointDetail {
+            session,
+            checkpoint,
+        } => {
+            rpc(
+                &discovery,
+                "session.context.checkpoint.detail",
+                json!({"session_id": session, "checkpoint_id": checkpoint}),
+            )
+            .await?
+        }
+        Command::ContextRestore {
+            session,
+            checkpoint,
+            force,
+        } => {
+            rpc(
+                &discovery,
+                "session.context.restore",
+                json!({
+                    "session_id": session,
+                    "checkpoint_id": checkpoint,
+                    "force": force
+                }),
+            )
+            .await?
+        }
+        Command::ContextCheckpointDelete {
+            session,
+            checkpoint,
+        } => {
+            rpc(
+                &discovery,
+                "session.context.checkpoint.delete",
+                json!({"session_id": session, "checkpoint_id": checkpoint}),
+            )
+            .await?
+        }
+        Command::ContextCheckpointPrune {
+            session,
+            older_than_days,
+            keep_latest,
+            dry_run,
+        } => {
+            rpc(
+                &discovery,
+                "session.context.checkpoint.prune",
+                json!({
+                    "session_id": session,
+                    "older_than_days": older_than_days,
+                    "keep_latest": keep_latest,
+                    "dry_run": dry_run
+                }),
+            )
+            .await?
+        }
+        Command::ContextCheckpointPolicy { project } => {
+            rpc(
+                &discovery,
+                "session.context.policy",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ContextCheckpointPolicySet {
+            project,
+            enabled,
+            max_checkpoints,
+            max_age_days,
+        } => {
+            rpc(
+                &discovery,
+                "session.context.policy.set",
+                json!({
+                    "project_id": project,
+                    "policy": {
+                        "enabled": enabled,
+                        "max_checkpoints": max_checkpoints,
+                        "max_age_days": max_age_days
+                    }
+                }),
+            )
+            .await?
+        }
         Command::Fork {
             session,
             checkpoint,
@@ -5378,7 +5524,166 @@ fn print_program_line(program: &Value) {
     }
 }
 
+/// Human rendering for the durable context checkpoint surface. Returns
+/// `None` for every other RPC shape so the generic printer owns them.
+fn context_checkpoint_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(checkpoints) = value.get("checkpoints").and_then(Value::as_array)
+        && value.get("latest_id").is_some()
+    {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "context checkpoints for {} ({} shown, latest {})",
+            value["session_id"].as_str().unwrap_or("?"),
+            checkpoints.len(),
+            value["latest_id"].as_str().unwrap_or("none")
+        ));
+        let policy = &value["policy"];
+        lines.push(format!(
+            "retention: sweep {} · max {} · age {}d",
+            if policy["enabled"].as_bool().unwrap_or(false) {
+                "on"
+            } else {
+                "off"
+            },
+            policy["max_checkpoints"].as_u64().unwrap_or(20),
+            policy["max_age_days"].as_u64().unwrap_or(30)
+        ));
+        for checkpoint in checkpoints {
+            let before = checkpoint["tokens_before"].as_u64().unwrap_or(0);
+            let after = checkpoint["tokens_after"].as_u64().unwrap_or(0);
+            let delta = before.saturating_sub(after);
+            let summary = checkpoint["summary"]
+                .as_str()
+                .or_else(|| checkpoint["label"].as_str())
+                .unwrap_or("")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let preview = if summary.chars().count() > 80 {
+                format!("{}…", summary.chars().take(80).collect::<String>())
+            } else {
+                summary
+            };
+            lines.push(format!(
+                "{}  {:<8} rev {:<3} {:>7}→{:<7} −{:<7} {}  {}",
+                checkpoint["id"].as_str().unwrap_or("?"),
+                checkpoint["mode"].as_str().unwrap_or("?"),
+                checkpoint["plan_revision"].as_u64().unwrap_or(0),
+                before,
+                after,
+                delta,
+                checkpoint["created_at"].as_str().unwrap_or(""),
+                preview
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(checkpoint) = value.get("checkpoint").filter(|checkpoint| {
+        checkpoint.get("mode").is_some() && checkpoint.get("tokens_after").is_some()
+    }) && let Some(preflight) = value.get("preflight")
+    {
+        let mut lines = vec![format!(
+            "{}  {}  {}  rev {}  {} → {} tokens",
+            checkpoint["id"].as_str().unwrap_or("?"),
+            checkpoint["mode"].as_str().unwrap_or("?"),
+            checkpoint["label"].as_str().unwrap_or(""),
+            checkpoint["plan_revision"].as_u64().unwrap_or(0),
+            checkpoint["tokens_before"].as_u64().unwrap_or(0),
+            checkpoint["tokens_after"].as_u64().unwrap_or(0)
+        )];
+        lines.push(format!(
+            "active boundary: {} · messages {} · estimate {} / hard {}",
+            if value["is_active"].as_bool().unwrap_or(false) {
+                "yes"
+            } else {
+                "no"
+            },
+            preflight["active_messages"].as_u64().unwrap_or(0),
+            preflight["estimated_tokens"].as_u64().unwrap_or(0),
+            preflight["hard_limit_tokens"].as_u64().unwrap_or(0)
+        ));
+        for error in preflight["errors"].as_array().into_iter().flatten() {
+            if let Some(error) = error.as_str() {
+                lines.push(format!("error: {error}"));
+            }
+        }
+        for warning in preflight["warnings"].as_array().into_iter().flatten() {
+            if let Some(warning) = warning.as_str() {
+                lines.push(format!("warning: {warning}"));
+            }
+        }
+        return Some(lines);
+    }
+    if let Some(restored) = value.get("restored_event_seq") {
+        return Some(vec![format!(
+            "restored {} ({}) · {} active messages · {} tokens · events {}/{}",
+            value["checkpoint_id"].as_str().unwrap_or("?"),
+            value["mode"].as_str().unwrap_or("?"),
+            value["active_messages"].as_u64().unwrap_or(0),
+            value["estimated_tokens"].as_u64().unwrap_or(0),
+            value["compaction_event_seq"].as_u64().unwrap_or(0),
+            restored.as_u64().unwrap_or(0)
+        )]);
+    }
+    if value.get("removed").is_some()
+        && let Some(checkpoint_id) = value.get("checkpoint_id").and_then(Value::as_str)
+        && value.get("session_id").is_some()
+    {
+        return Some(vec![format!(
+            "{} {}",
+            checkpoint_id,
+            if value["removed"].as_bool().unwrap_or(false) {
+                "deleted"
+            } else {
+                "not found"
+            }
+        )]);
+    }
+    if let Some(candidates) = value.get("candidates").and_then(Value::as_u64)
+        && value.get("session_id").is_some()
+        && value
+            .get("checkpoints")
+            .and_then(Value::as_array)
+            .is_some_and(|rows| rows.iter().any(|row| row.get("tokens_before").is_some()))
+    {
+        return Some(vec![format!(
+            "{}pruned {} of {} candidate context checkpoint(s)",
+            if value["dry_run"].as_bool().unwrap_or(false) {
+                "dry run: "
+            } else {
+                ""
+            },
+            value["removed"].as_u64().unwrap_or(0),
+            candidates
+        )]);
+    }
+    if let Some(project_id) = value.get("project_id").and_then(Value::as_str)
+        && let Some(policy) = value
+            .get("policy")
+            .filter(|policy| policy.get("max_checkpoints").is_some())
+    {
+        return Some(vec![format!(
+            "{}: context checkpoint sweep {} · max {} · age {}d",
+            project_id,
+            if policy["enabled"].as_bool().unwrap_or(false) {
+                "on"
+            } else {
+                "off"
+            },
+            policy["max_checkpoints"].as_u64().unwrap_or(20),
+            policy["max_age_days"].as_u64().unwrap_or(30)
+        )]);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = context_checkpoint_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(programs) = value.get("programs").and_then(Value::as_array) {
         if programs.is_empty() {
             println!("No programs.");
@@ -8474,5 +8779,332 @@ mod hybrid_memory_cli_tests {
                 .get("x")
                 .is_some_and(|value| value == "a=b")
         );
+    }
+}
+
+#[cfg(test)]
+mod context_checkpoint_cli_tests {
+    use super::*;
+
+    #[test]
+    fn context_checkpoint_commands_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["vp", "context-checkpoints", "ses-1", "--limit", "12"])
+                        .unwrap();
+                match cli.command {
+                    Command::ContextCheckpoints { session, limit } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(limit, Some(12));
+                    }
+                    other => panic!("expected context-checkpoints, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "context-checkpoint",
+                    "ses-1",
+                    "--label",
+                    "before refactor",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ContextCheckpoint { session, label } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(label.as_deref(), Some("before refactor"));
+                    }
+                    other => panic!("expected context-checkpoint, got {other:?}"),
+                }
+
+                let cli =
+                    Cli::try_parse_from(["vp", "context-checkpoint-detail", "ses-1", "ctx-1"])
+                        .unwrap();
+                match cli.command {
+                    Command::ContextCheckpointDetail {
+                        session,
+                        checkpoint,
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(checkpoint, "ctx-1");
+                    }
+                    other => panic!("expected context-checkpoint-detail, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from(["vp", "context-restore", "ses-1", "ctx-1"]).unwrap();
+                match cli.command {
+                    Command::ContextRestore {
+                        session,
+                        checkpoint,
+                        force,
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(checkpoint, "ctx-1");
+                        assert!(!force);
+                    }
+                    other => panic!("expected context-restore, got {other:?}"),
+                }
+                let cli =
+                    Cli::try_parse_from(["vp", "context-restore", "ses-1", "ctx-1", "--force"])
+                        .unwrap();
+                match cli.command {
+                    Command::ContextRestore { force, .. } => assert!(force),
+                    other => panic!("expected forced context-restore, got {other:?}"),
+                }
+
+                let cli =
+                    Cli::try_parse_from(["vp", "context-checkpoint-delete", "ses-1", "ctx-1"])
+                        .unwrap();
+                match cli.command {
+                    Command::ContextCheckpointDelete {
+                        session,
+                        checkpoint,
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(checkpoint, "ctx-1");
+                    }
+                    other => panic!("expected context-checkpoint-delete, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "context-checkpoint-prune",
+                    "ses-1",
+                    "--older-than-days",
+                    "7",
+                    "--keep-latest",
+                    "2",
+                    "--dry-run",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ContextCheckpointPrune {
+                        session,
+                        older_than_days,
+                        keep_latest,
+                        dry_run,
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(older_than_days, Some(7));
+                        assert_eq!(keep_latest, Some(2));
+                        assert!(dry_run);
+                    }
+                    other => panic!("expected context-checkpoint-prune, got {other:?}"),
+                }
+
+                let cli =
+                    Cli::try_parse_from(["vp", "context-checkpoint-policy", "prj-1"]).unwrap();
+                match cli.command {
+                    Command::ContextCheckpointPolicy { project } => {
+                        assert_eq!(project, "prj-1")
+                    }
+                    other => panic!("expected context-checkpoint-policy, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "context-checkpoint-policy-set",
+                    "prj-1",
+                    "--enabled",
+                    "--max-checkpoints",
+                    "4",
+                    "--max-age-days",
+                    "9",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ContextCheckpointPolicySet {
+                        project,
+                        enabled,
+                        max_checkpoints,
+                        max_age_days,
+                    } => {
+                        assert_eq!(project, "prj-1");
+                        assert!(enabled);
+                        assert_eq!(max_checkpoints, 4);
+                        assert_eq!(max_age_days, 9);
+                    }
+                    other => panic!("expected context-checkpoint-policy-set, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod context_checkpoint_human_tests {
+    use super::*;
+
+    #[test]
+    fn context_checkpoint_list_renders_token_deltas_and_previews() {
+        let value = json!({
+            "session_id": "ses-1",
+            "latest_id": "ctx-2",
+            "limit": 50,
+            "policy": {"enabled": false, "max_checkpoints": 20, "max_age_days": 30},
+            "checkpoints": [
+                {
+                    "id": "ctx-1",
+                    "mode": "summary",
+                    "label": "auto summary #1",
+                    "summary": "Earlier conversation summary with enough text to become a preview",
+                    "plan_revision": 2,
+                    "tokens_before": 90000,
+                    "tokens_after": 12000,
+                    "created_at": "2026-11-11T00:00:00Z"
+                },
+                {
+                    "id": "ctx-2",
+                    "mode": "manual",
+                    "label": "manual",
+                    "plan_revision": 2,
+                    "tokens_before": 12000,
+                    "tokens_after": 12000,
+                    "created_at": "2026-11-11T00:01:00Z"
+                }
+            ]
+        });
+        let lines = context_checkpoint_lines(&value).unwrap();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].contains("ses-1"));
+        assert!(lines[0].contains("latest ctx-2"));
+        assert!(lines[1].contains("sweep off"));
+        assert!(lines[2].contains("ctx-1"));
+        assert!(lines[2].contains("−78000"));
+        assert!(lines[2].contains("Earlier conversation summary"));
+        assert!(lines[3].contains("ctx-2"));
+        assert!(lines[3].contains("−0"));
+    }
+
+    #[test]
+    fn context_checkpoint_detail_and_actions_render() {
+        let detail = json!({
+            "checkpoint": {
+                "id": "ctx-1",
+                "mode": "summary",
+                "label": "before",
+                "plan_revision": 1,
+                "tokens_before": 5000,
+                "tokens_after": 500
+            },
+            "preflight": {
+                "errors": ["plan revision changed"],
+                "warnings": ["estimate above threshold"],
+                "active_messages": 4,
+                "estimated_tokens": 1200,
+                "hard_limit_tokens": 32000
+            },
+            "is_active": false,
+            "summary_preview": "before"
+        });
+        let lines = context_checkpoint_lines(&detail).unwrap();
+        assert!(lines[0].contains("ctx-1"));
+        assert!(lines[1].contains("active boundary: no"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "error: plan revision changed")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "warning: estimate above threshold")
+        );
+
+        let restore = json!({
+            "session_id": "ses-1",
+            "checkpoint_id": "ctx-1",
+            "mode": "summary",
+            "active_messages": 3,
+            "estimated_tokens": 500,
+            "compaction_event_seq": 11,
+            "restored_event_seq": 12
+        });
+        let lines = context_checkpoint_lines(&restore).unwrap();
+        assert!(lines[0].contains("restored ctx-1"));
+        assert!(lines[0].contains("events 11/12"));
+
+        let delete = json!({
+            "session_id": "ses-1",
+            "checkpoint_id": "ctx-1",
+            "removed": true
+        });
+        assert_eq!(
+            context_checkpoint_lines(&delete).unwrap(),
+            vec!["ctx-1 deleted".to_string()]
+        );
+
+        let prune = json!({
+            "session_id": "ses-1",
+            "candidates": 2,
+            "removed": 1,
+            "dry_run": true,
+            "checkpoints": [{"id": "ctx-1", "tokens_before": 10}]
+        });
+        assert_eq!(
+            context_checkpoint_lines(&prune).unwrap(),
+            vec!["dry run: pruned 1 of 2 candidate context checkpoint(s)".to_string()]
+        );
+
+        let policy = json!({
+            "project_id": "prj-1",
+            "policy": {"enabled": true, "max_checkpoints": 5, "max_age_days": 7}
+        });
+        assert_eq!(
+            context_checkpoint_lines(&policy).unwrap(),
+            vec!["prj-1: context checkpoint sweep on · max 5 · age 7d".to_string()]
+        );
+    }
+
+    #[test]
+    fn unrelated_results_are_left_to_the_generic_printer() {
+        assert!(context_checkpoint_lines(&json!({"checkpoints": []})).is_none());
+        assert!(
+            context_checkpoint_lines(&json!({
+                "session_id": "ses-1",
+                "removed": false
+            }))
+            .is_none()
+        );
+        assert!(
+            context_checkpoint_lines(&json!({
+                "project_id": "prj-1",
+                "policy": {"enabled": true, "older_than_secs": 100, "keep_latest": 5}
+            }))
+            .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_checkpoint_preview_tests {
+    use super::*;
+
+    #[test]
+    fn long_summaries_are_truncated_in_the_human_list() {
+        let summary = "word ".repeat(40);
+        let value = json!({
+            "session_id": "ses-1",
+            "latest_id": "ctx-1",
+            "policy": {"enabled": true, "max_checkpoints": 20, "max_age_days": 30},
+            "checkpoints": [{
+                "id": "ctx-1",
+                "mode": "summary",
+                "label": "long",
+                "summary": summary,
+                "plan_revision": 0,
+                "tokens_before": 100,
+                "tokens_after": 50,
+                "created_at": "2026-11-11T00:00:00Z"
+            }]
+        });
+        let lines = context_checkpoint_lines(&value).unwrap();
+        let checkpoint_line = lines.last().unwrap();
+        assert!(checkpoint_line.ends_with('…'), "{checkpoint_line}");
+        assert!(checkpoint_line.chars().count() < 180);
+        assert!(lines[1].contains("sweep on"));
     }
 }

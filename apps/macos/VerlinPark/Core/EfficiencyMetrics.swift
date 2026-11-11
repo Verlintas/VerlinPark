@@ -24,6 +24,8 @@ struct EfficiencySnapshot: Equatable, Sendable {
     let contextHardLimitTokens: Int?
     let contextMessages: Int?
     let compactionCount: Int?
+    let checkpointCount: Int?
+    let latestCheckpointID: String?
     let compactionLatencyMs: Int?
     let compactionTokensBefore: Int?
     let compactionTokensAfter: Int?
@@ -191,6 +193,8 @@ enum EfficiencyMetrics {
                 eventTypes: eventTypes,
                 hasLastCompaction: context?.lastCompaction != nil
             ),
+            checkpointCount: context?.checkpointCount,
+            latestCheckpointID: context?.latestCheckpointID,
             compactionLatencyMs: context?.lastCompaction?.latencyMs
                 ?? context?.lastCompactionLatencyMs,
             compactionTokensBefore: context?.lastCompaction?.estimatedTokensBefore

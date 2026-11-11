@@ -14,9 +14,10 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpTransport, AgentMessage, AgentRecord, Approval, ApprovalGrant,
-    Artifact, ArtifactPolicy, ArtifactVersion, CheckpointRetentionPolicy, ContinuationOutcome,
-    Event, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport,
-    MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
+    Artifact, ArtifactPolicy, ArtifactVersion, CheckpointRetentionPolicy, ContextCheckpoint,
+    ContextCheckpointPolicy, ContinuationOutcome, Event, IntakeTask, IntegrationPolicy,
+    MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryConflict,
+    MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
     MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy,
     MemoryStatCount, MergeQueueEntry, MetricCount, ModelPreset, OrchestrationDecision,
     OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, Program,
@@ -551,6 +552,9 @@ pub struct SessionRepair {
     pub runs: Option<Vec<SessionRun>>,
     pub run_steps: Option<Vec<RunStep>>,
     pub run_checkpoints: Option<Vec<RunCheckpoint>>,
+    /// Event-backed durable context checkpoint rows. `None` leaves the
+    /// projection untouched.
+    pub context_checkpoints: Option<Vec<ContextCheckpoint>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -763,6 +767,10 @@ pub struct ProjectManifestSnapshot {
     pub worktree_policy: WorktreeRetentionPolicy,
     #[serde(default)]
     pub checkpoint_policy: CheckpointRetentionPolicy,
+    /// Project-scoped active-context checkpoint retention. Older manifests
+    /// decode as the bounded default (sweep disabled).
+    #[serde(default)]
+    pub context_checkpoint_policy: ContextCheckpointPolicy,
     pub budget: ProjectBudget,
     #[serde(default)]
     pub task_scheduler_policy: TaskSchedulerPolicy,
@@ -1073,6 +1081,27 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
                 checkpoint.checkpoint_id
             ));
         }
+    }
+    let mut context_checkpoint_ids = std::collections::HashSet::new();
+    for checkpoint in &bundle.context_checkpoints {
+        ensure_bundle_session(
+            "context checkpoint",
+            &checkpoint.session_id,
+            &bundle.session.id,
+        )?;
+        if checkpoint.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle context checkpoint {} belongs to a different project",
+                checkpoint.id
+            ));
+        }
+        if !context_checkpoint_ids.insert(checkpoint.id.clone()) {
+            return Err(anyhow!(
+                "bundle context checkpoint {} is duplicated",
+                checkpoint.id
+            ));
+        }
+        validate_context_checkpoint_row(checkpoint)?;
     }
     Ok(())
 }
@@ -2085,6 +2114,41 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_run_checkpoints_run
                 ON run_checkpoints(run_id, seq);
 
+            -- Durable active-context boundaries. The full checkpoint is also
+            -- carried by context.checkpointed events, so this table is an
+            -- event-backed projection that replay/repair can rebuild.
+            CREATE TABLE IF NOT EXISTS context_checkpoints (
+                id                  TEXT PRIMARY KEY,
+                session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                project_id          TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                label               TEXT NOT NULL DEFAULT '',
+                mode                TEXT NOT NULL DEFAULT 'manual',
+                summary             TEXT,
+                through_message_id  TEXT,
+                message_cursor      INTEGER NOT NULL DEFAULT 0,
+                plan_revision       INTEGER NOT NULL DEFAULT 0,
+                provider            TEXT NOT NULL DEFAULT '',
+                model               TEXT NOT NULL DEFAULT '',
+                prompt_prefix_hash  TEXT NOT NULL DEFAULT '',
+                worktree_head       TEXT NOT NULL DEFAULT '',
+                tokens_before       INTEGER NOT NULL DEFAULT 0,
+                tokens_after        INTEGER NOT NULL DEFAULT 0,
+                structured_state    TEXT,
+                source_compaction_seq INTEGER,
+                automatic           INTEGER NOT NULL DEFAULT 0,
+                created_at          TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_context_checkpoints_session
+                ON context_checkpoints(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS project_context_checkpoint_policies (
+                project_id       TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled          INTEGER NOT NULL DEFAULT 0,
+                max_checkpoints  INTEGER NOT NULL DEFAULT 20,
+                max_age_days     INTEGER NOT NULL DEFAULT 30
+            );
+
             CREATE TABLE IF NOT EXISTS session_continuations (
                 id              TEXT PRIMARY KEY,
                 session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -2830,6 +2894,7 @@ impl Store {
                 mailbox_policy: self.get_mailbox_policy(&project.id)?,
                 worktree_policy: self.get_worktree_policy(&project.id)?,
                 checkpoint_policy: self.get_checkpoint_policy(&project.id)?,
+                context_checkpoint_policy: self.get_context_checkpoint_policy(&project.id)?,
                 budget: self.get_project_budget(&project.id)?,
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 session_run_policy: self.get_session_run_policy(&project.id)?,
@@ -7823,6 +7888,331 @@ impl Store {
             policies.push(row?);
         }
         Ok(policies)
+    }
+
+    pub fn get_context_checkpoint_policy(
+        &self,
+        project_id: &str,
+    ) -> Result<ContextCheckpointPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT enabled, max_checkpoints, max_age_days
+                 FROM project_context_checkpoint_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(ContextCheckpointPolicy {
+                        enabled: row.get::<_, i64>(0)? != 0,
+                        max_checkpoints: row.get::<_, i64>(1)?.clamp(1, 100) as u32,
+                        max_age_days: row.get::<_, i64>(2)?.clamp(0, 365) as u32,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    pub fn set_context_checkpoint_policy(
+        &self,
+        project_id: &str,
+        policy: &ContextCheckpointPolicy,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_context_checkpoint_policies
+             (project_id, enabled, max_checkpoints, max_age_days)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                max_checkpoints = excluded.max_checkpoints,
+                max_age_days = excluded.max_age_days",
+            params![
+                project_id,
+                i64::from(policy.enabled),
+                i64::from(policy.max_checkpoints),
+                i64::from(policy.max_age_days)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_enabled_context_checkpoint_policies(
+        &self,
+    ) -> Result<Vec<(String, ContextCheckpointPolicy)>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT project_id, enabled, max_checkpoints, max_age_days
+             FROM project_context_checkpoint_policies WHERE enabled = 1",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ContextCheckpointPolicy {
+                    enabled: row.get::<_, i64>(1)? != 0,
+                    max_checkpoints: row.get::<_, i64>(2)?.clamp(1, 100) as u32,
+                    max_age_days: row.get::<_, i64>(3)?.clamp(0, 365) as u32,
+                },
+            ))
+        })?;
+        let mut policies = Vec::new();
+        for row in rows {
+            policies.push(row?);
+        }
+        Ok(policies)
+    }
+
+    /// Record a manual checkpoint row and its full-payload event in one
+    /// transaction. The event is inserted before the projection row so a
+    /// crash between the two statements cannot leave a projection with no
+    /// audit event.
+    pub fn record_context_checkpoint_with_event(
+        &self,
+        session_id: &str,
+        checkpoint: &ContextCheckpoint,
+    ) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut checkpoint = checkpoint.clone();
+        if checkpoint.session_id != session_id {
+            return Err(anyhow!(
+                "context checkpoint belongs to a different session: {}",
+                checkpoint.session_id
+            ));
+        }
+        checkpoint.message_cursor = context_message_cursor_tx(
+            &tx,
+            session_id,
+            checkpoint.through_message_id.as_deref(),
+            checkpoint.message_cursor,
+        )?;
+        validate_context_checkpoint_row(&checkpoint)?;
+        let payload = serde_json::to_value(&checkpoint)?;
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "context.checkpointed",
+            payload_with_checkpoint_id(payload, &checkpoint.id)?,
+        )?;
+        insert_context_checkpoint_tx(&tx, &checkpoint)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
+    /// Append a successful compaction and its automatic checkpoint in one
+    /// transaction. The compaction event is first (it is the compatibility
+    /// boundary used by `load_conversation`), then the full checkpoint event,
+    /// then the projection row.
+    pub fn append_context_compaction_with_checkpoint(
+        &self,
+        session_id: &str,
+        mut compaction_payload: serde_json::Value,
+        checkpoint: &ContextCheckpoint,
+    ) -> Result<(Event, Event)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut checkpoint = checkpoint.clone();
+        if checkpoint.session_id != session_id {
+            return Err(anyhow!(
+                "context checkpoint belongs to a different session: {}",
+                checkpoint.session_id
+            ));
+        }
+        if let Some(object) = compaction_payload.as_object_mut() {
+            object.insert(
+                "context_checkpoint_id".into(),
+                serde_json::json!(checkpoint.id),
+            );
+        }
+        let compaction = insert_event_tx(&tx, session_id, "context.compacted", compaction_payload)?;
+        if checkpoint.source_compaction_seq.is_none() {
+            checkpoint.source_compaction_seq = Some(compaction.seq);
+        }
+        checkpoint.message_cursor = context_message_cursor_tx(
+            &tx,
+            session_id,
+            checkpoint.through_message_id.as_deref(),
+            checkpoint.message_cursor,
+        )?;
+        validate_context_checkpoint_row(&checkpoint)?;
+        let payload = serde_json::to_value(&checkpoint)?;
+        let checkpoint_event = insert_event_tx(
+            &tx,
+            session_id,
+            "context.checkpointed",
+            payload_with_checkpoint_id(payload, &checkpoint.id)?,
+        )?;
+        insert_context_checkpoint_tx(&tx, &checkpoint)?;
+        tx.commit()?;
+        for event in [&compaction, &checkpoint_event] {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((compaction, checkpoint_event))
+    }
+
+    /// Append a reconstructed compaction boundary and the restore audit event.
+    /// No checkpoint row, message row, or worktree state is modified.
+    pub fn append_context_restore_events(
+        &self,
+        session_id: &str,
+        compaction_payload: serde_json::Value,
+        mut restored_payload: serde_json::Value,
+    ) -> Result<(Event, Event)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let compaction = insert_event_tx(&tx, session_id, "context.compacted", compaction_payload)?;
+        if let Some(object) = restored_payload.as_object_mut() {
+            object.insert("compaction_seq".into(), serde_json::json!(compaction.seq));
+        }
+        let restored = insert_event_tx(&tx, session_id, "context.restored", restored_payload)?;
+        tx.commit()?;
+        for event in [&compaction, &restored] {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok((compaction, restored))
+    }
+
+    pub fn list_context_checkpoints(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ContextCheckpoint>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT id, session_id, project_id, label, mode, summary,
+                    through_message_id, message_cursor, plan_revision, provider,
+                    model, prompt_prefix_hash, worktree_head, tokens_before,
+                    tokens_after, structured_state, source_compaction_seq,
+                    automatic, created_at
+             FROM context_checkpoints
+             WHERE session_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![session_id, i64::from(limit.clamp(1, 10_000))],
+            map_context_checkpoint,
+        )?;
+        // The limit means "most recent N"; callers receive them oldest-first
+        // so prune, replay comparison, and the UI all share one ordering.
+        let mut rows = rows.collect::<Result<Vec<_>, _>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    pub fn get_context_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<ContextCheckpoint>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, session_id, project_id, label, mode, summary,
+                    through_message_id, message_cursor, plan_revision, provider,
+                    model, prompt_prefix_hash, worktree_head, tokens_before,
+                    tokens_after, structured_state, source_compaction_seq,
+                    automatic, created_at
+             FROM context_checkpoints
+             WHERE session_id = ?1 AND id = ?2",
+            params![session_id, checkpoint_id],
+            map_context_checkpoint,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn context_checkpoint_count(&self, session_id: &str) -> Result<u64> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM context_checkpoints WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    pub fn latest_context_checkpoint(&self, session_id: &str) -> Result<Option<ContextCheckpoint>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, session_id, project_id, label, mode, summary,
+                    through_message_id, message_cursor, plan_revision, provider,
+                    model, prompt_prefix_hash, worktree_head, tokens_before,
+                    tokens_after, structured_state, source_compaction_seq,
+                    automatic, created_at
+             FROM context_checkpoints
+             WHERE session_id = ?1
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![session_id],
+            map_context_checkpoint,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Remove one checkpoint row and append its deletion event atomically.
+    /// Messages and worktree state are untouched.
+    pub fn delete_context_checkpoint_with_event(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+        reason: &str,
+    ) -> Result<Option<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let existing = tx
+            .query_row(
+                "SELECT id, session_id, project_id, label, mode, summary,
+                        through_message_id, message_cursor, plan_revision, provider,
+                        model, prompt_prefix_hash, worktree_head, tokens_before,
+                        tokens_after, structured_state, source_compaction_seq,
+                        automatic, created_at
+                 FROM context_checkpoints WHERE session_id = ?1 AND id = ?2",
+                params![session_id, checkpoint_id],
+                map_context_checkpoint,
+            )
+            .optional()?;
+        let Some(checkpoint) = existing else {
+            return Ok(None);
+        };
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "context.checkpoint.deleted",
+            serde_json::json!({
+                "checkpoint_id": checkpoint_id,
+                "label": checkpoint.label,
+                "reason": reason,
+                "checkpoint": checkpoint,
+            }),
+        )?;
+        tx.execute(
+            "DELETE FROM context_checkpoints WHERE session_id = ?1 AND id = ?2",
+            params![session_id, checkpoint_id],
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
+    /// Replace the event-backed checkpoint projection during replay/repair.
+    pub fn replace_context_checkpoints(
+        &self,
+        session_id: &str,
+        checkpoints: &[ContextCheckpoint],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        replace_context_checkpoints_tx(&tx, session_id, checkpoints)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_artifact_policy(&self, project_id: &str) -> Result<ArtifactPolicy> {
@@ -17374,6 +17764,9 @@ impl Store {
                 repair.run_checkpoints.as_deref().unwrap_or(&[]),
             )?;
         }
+        if let Some(context_checkpoints) = &repair.context_checkpoints {
+            replace_context_checkpoints_tx(&tx, session_id, context_checkpoints)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -17896,6 +18289,23 @@ impl Store {
             &bundle.run_steps,
             &bundle.run_checkpoints,
         )?;
+        replace_context_checkpoints_tx(&tx, &bundle.session.id, &bundle.context_checkpoints)?;
+        let has_context_checkpoint_events = bundle.events.iter().any(|event| {
+            matches!(
+                event.kind.as_str(),
+                "context.checkpointed" | "context.checkpoint.deleted"
+            )
+        });
+        if !has_context_checkpoint_events {
+            // A pre-D1 producer could carry only the projection. Synthesize
+            // the full-payload event so the imported archive remains
+            // event-replayable instead of holding an orphaned row.
+            for checkpoint in &bundle.context_checkpoints {
+                let payload =
+                    payload_with_checkpoint_id(serde_json::to_value(checkpoint)?, &checkpoint.id)?;
+                insert_event_tx(&tx, &bundle.session.id, "context.checkpointed", payload)?;
+            }
+        }
         let status_event = insert_event_tx(
             &tx,
             &bundle.session.id,
@@ -19030,6 +19440,159 @@ fn map_run_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunToolCall> {
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
     })
+}
+
+fn map_context_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextCheckpoint> {
+    let structured_state: Option<String> = row.get(15)?;
+    Ok(ContextCheckpoint {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        project_id: row.get(2)?,
+        label: row.get(3)?,
+        mode: row.get(4)?,
+        summary: row.get(5)?,
+        through_message_id: row.get(6)?,
+        message_cursor: row.get::<_, i64>(7)?.max(0) as usize,
+        plan_revision: row.get::<_, i64>(8)?.max(0) as u32,
+        provider: row.get(9)?,
+        model: row.get(10)?,
+        prompt_prefix_hash: row.get(11)?,
+        worktree_head: row.get(12)?,
+        tokens_before: row.get::<_, i64>(13)?.max(0) as u64,
+        tokens_after: row.get::<_, i64>(14)?.max(0) as u64,
+        structured_state: structured_state.and_then(|value| serde_json::from_str(&value).ok()),
+        source_compaction_seq: row
+            .get::<_, Option<i64>>(16)?
+            .map(|value| value.max(0) as u64),
+        automatic: row.get::<_, i64>(17)? != 0,
+        created_at: row.get(18)?,
+    })
+}
+
+fn insert_context_checkpoint_tx(
+    tx: &Transaction<'_>,
+    checkpoint: &ContextCheckpoint,
+) -> Result<()> {
+    let structured_state = checkpoint
+        .structured_state
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    tx.execute(
+        "INSERT INTO context_checkpoints
+         (id, session_id, project_id, label, mode, summary, through_message_id,
+          message_cursor, plan_revision, provider, model, prompt_prefix_hash,
+          worktree_head, tokens_before, tokens_after, structured_state,
+          source_compaction_seq, automatic, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19)",
+        params![
+            checkpoint.id,
+            checkpoint.session_id,
+            checkpoint.project_id,
+            checkpoint.label,
+            checkpoint.mode,
+            checkpoint.summary,
+            checkpoint.through_message_id,
+            checkpoint.message_cursor as i64,
+            i64::from(checkpoint.plan_revision),
+            checkpoint.provider,
+            checkpoint.model,
+            checkpoint.prompt_prefix_hash,
+            checkpoint.worktree_head,
+            checkpoint.tokens_before as i64,
+            checkpoint.tokens_after as i64,
+            structured_state,
+            checkpoint.source_compaction_seq.map(|value| value as i64),
+            if checkpoint.automatic { 1 } else { 0 },
+            checkpoint.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn replace_context_checkpoints_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    checkpoints: &[ContextCheckpoint],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM context_checkpoints WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    for checkpoint in checkpoints {
+        if checkpoint.session_id != session_id {
+            return Err(anyhow!(
+                "context checkpoint {} belongs to a different session",
+                checkpoint.id
+            ));
+        }
+        insert_context_checkpoint_tx(tx, checkpoint)?;
+    }
+    Ok(())
+}
+
+fn context_message_cursor_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    through_message_id: Option<&str>,
+    fallback: usize,
+) -> Result<usize> {
+    let Some(through_message_id) = through_message_id else {
+        return Ok(fallback);
+    };
+    let cursor = tx
+        .query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE session_id = ?1
+               AND rowid <= (SELECT rowid FROM messages WHERE session_id = ?1 AND id = ?2)",
+            params![session_id, through_message_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(cursor.unwrap_or(fallback as i64).max(0) as usize)
+}
+
+fn payload_with_checkpoint_id(
+    mut payload: serde_json::Value,
+    checkpoint_id: &str,
+) -> Result<serde_json::Value> {
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("context checkpoint payload must be an object"))?;
+    object.insert("checkpoint_id".into(), serde_json::json!(checkpoint_id));
+    Ok(payload)
+}
+
+fn validate_context_checkpoint_row(checkpoint: &ContextCheckpoint) -> Result<()> {
+    if checkpoint.id.trim().is_empty()
+        || checkpoint.session_id.trim().is_empty()
+        || checkpoint.project_id.trim().is_empty()
+    {
+        return Err(anyhow!("context checkpoint row is missing required ids"));
+    }
+    if !matches!(checkpoint.mode.as_str(), "summary" | "trim" | "manual") {
+        return Err(anyhow!(
+            "unsupported context checkpoint mode: {}",
+            checkpoint.mode
+        ));
+    }
+    if checkpoint
+        .summary
+        .as_ref()
+        .is_some_and(|summary| summary.len() > 128 * 1024)
+    {
+        return Err(anyhow!("context checkpoint summary exceeds 128 KiB"));
+    }
+    if let Some(state) = &checkpoint.structured_state {
+        let encoded = serde_json::to_vec(state)?;
+        if encoded.len() > 16 * 1024 {
+            return Err(anyhow!(
+                "context checkpoint structured state exceeds 16 KiB"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn map_run_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunCheckpoint> {

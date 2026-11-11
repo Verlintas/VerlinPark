@@ -3702,6 +3702,13 @@ pub struct SessionContextStatus {
     pub last_compaction_tokens_after: u64,
     pub compaction_background_reuse: bool,
     pub compaction_fallback_to_sync: bool,
+    /// Number of live (non-deleted) durable context checkpoints.
+    #[serde(default)]
+    pub checkpoint_count: u64,
+    #[serde(default)]
+    pub latest_checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub latest_checkpoint_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3752,6 +3759,242 @@ pub struct SessionCompactResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionCompactParams {
     pub session_id: String,
+}
+
+/// A durable, inspectable snapshot of the active-context boundary. It records
+/// exactly what the latest `context.compacted` event used: mode, summary,
+/// through-message cursor, plan revision, provider/model/prefix identity,
+/// worktree head, and the authoritative structured task state. Restoring a
+/// checkpoint rewrites the active boundary; it never rewrites stored messages
+/// or worktree content.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCheckpoint {
+    pub id: String,
+    pub session_id: String,
+    pub project_id: String,
+    #[serde(default)]
+    pub label: String,
+    /// `summary`, `trim`, or `manual`.
+    #[serde(default)]
+    pub mode: String,
+    /// Prefixed summary injected at the head of the active conversation.
+    /// Bounded; no additional prompt text is captured beyond the summary that
+    /// already exists in `context.compacted`.
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub through_message_id: Option<String>,
+    /// Number of stored messages at or before the boundary. Kept as durable
+    /// evidence even when the referenced message id is later unavailable.
+    #[serde(default)]
+    pub message_cursor: usize,
+    #[serde(default)]
+    pub plan_revision: u32,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    /// Hash only; never prompt text.
+    #[serde(default)]
+    pub prompt_prefix_hash: String,
+    #[serde(default)]
+    pub worktree_head: String,
+    #[serde(default)]
+    pub tokens_before: u64,
+    #[serde(default)]
+    pub tokens_after: u64,
+    #[serde(default)]
+    pub structured_state: Option<ContextStructuredState>,
+    /// Sequence of the compaction event this checkpoint was captured from.
+    #[serde(default)]
+    pub source_compaction_seq: Option<u64>,
+    /// True when created automatically after a successful compaction.
+    #[serde(default)]
+    pub automatic: bool,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextCheckpointListParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextCheckpointListResult {
+    pub session_id: String,
+    pub checkpoints: Vec<ContextCheckpoint>,
+    pub latest_id: Option<String>,
+    pub policy: ContextCheckpointPolicy,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextCheckpointDetailParams {
+    pub session_id: String,
+    pub checkpoint_id: String,
+}
+
+/// Deterministic restore preflight. Errors are safety refusals; warnings are
+/// token-estimate advisories that `force` may bypass without weakening a
+/// model, plan, worktree, import, or budget check.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextRestorePreflight {
+    pub restorable: bool,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub estimated_tokens: u64,
+    #[serde(default)]
+    pub hard_limit_tokens: u64,
+    #[serde(default)]
+    pub threshold_tokens: u64,
+    #[serde(default)]
+    pub active_messages: usize,
+    #[serde(default)]
+    pub plan_revision: u32,
+    #[serde(default)]
+    pub checkpoint_plan_revision: u32,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub worktree_head: String,
+    #[serde(default)]
+    pub current_worktree_head: Option<String>,
+    #[serde(default)]
+    pub worktree_descendant: bool,
+    #[serde(default)]
+    pub budget_exhausted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextCheckpointDetailResult {
+    pub checkpoint: ContextCheckpoint,
+    pub preflight: ContextRestorePreflight,
+    /// True when this checkpoint is the boundary the latest compaction event
+    /// points at (a restore would be a no-op rewrite of the same boundary).
+    pub is_active: bool,
+    /// One-line, bounded preview of the stored summary for UI/CLI.
+    #[serde(default)]
+    pub summary_preview: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextCheckpointCreateParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextRestoreParams {
+    pub session_id: String,
+    pub checkpoint_id: String,
+    /// Bypasses only the token-threshold advisory. Hard-limit, model, plan,
+    /// worktree, import, and budget safety checks always apply.
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextRestoreResult {
+    pub session_id: String,
+    pub checkpoint_id: String,
+    pub mode: String,
+    pub through_message_id: Option<String>,
+    pub active_messages: usize,
+    pub estimated_tokens: u64,
+    pub hard_limit_tokens: u64,
+    pub warning: Option<String>,
+    pub compaction_event_seq: u64,
+    pub restored_event_seq: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextCheckpointDeleteParams {
+    pub session_id: String,
+    pub checkpoint_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextCheckpointDeleteResult {
+    pub session_id: String,
+    pub checkpoint_id: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextCheckpointPruneParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+    #[serde(default)]
+    pub keep_latest: Option<u32>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextCheckpointPruneResult {
+    pub session_id: String,
+    pub candidates: usize,
+    pub removed: usize,
+    pub dry_run: bool,
+    pub checkpoints: Vec<ContextCheckpoint>,
+}
+
+/// Project-scoped retention for context checkpoints. The daemon sweep is
+/// opt-in; manual prune is always available. `max_age_days = 0` disables the
+/// age arm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCheckpointPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_context_checkpoint_max")]
+    pub max_checkpoints: u32,
+    #[serde(default = "default_context_checkpoint_age")]
+    pub max_age_days: u32,
+}
+
+fn default_context_checkpoint_max() -> u32 {
+    20
+}
+
+fn default_context_checkpoint_age() -> u32 {
+    30
+}
+
+impl Default for ContextCheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_checkpoints: default_context_checkpoint_max(),
+            max_age_days: default_context_checkpoint_age(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextCheckpointPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetContextCheckpointPolicyParams {
+    pub project_id: String,
+    pub policy: ContextCheckpointPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextCheckpointPolicyResult {
+    pub project_id: String,
+    pub policy: ContextCheckpointPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4715,6 +4958,9 @@ pub struct SessionBundle {
     pub run_steps: Vec<RunStep>,
     #[serde(default)]
     pub run_checkpoints: Vec<RunCheckpoint>,
+    /// Durable active-context boundaries. Older bundles decode as empty.
+    #[serde(default)]
+    pub context_checkpoints: Vec<ContextCheckpoint>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -5021,6 +5267,9 @@ pub struct SessionReplayReport {
     pub run_steps_match: bool,
     #[serde(default)]
     pub run_checkpoints_match: bool,
+    /// Event-backed durable context checkpoint projection.
+    #[serde(default)]
+    pub context_checkpoints_match: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -8662,6 +8911,9 @@ mod program_wire_tests {
             last_compaction_tokens_after: 3_000,
             compaction_background_reuse: true,
             compaction_fallback_to_sync: false,
+            checkpoint_count: 2,
+            latest_checkpoint_id: Some("ctx-1".into()),
+            latest_checkpoint_at: Some("2026-11-11T00:00:00Z".into()),
         };
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["compaction_count"], 3);
@@ -8670,6 +8922,8 @@ mod program_wire_tests {
         assert_eq!(value["last_compaction_tokens_after"], 3_000);
         assert_eq!(value["compaction_background_reuse"], true);
         assert_eq!(value["last_compaction"], Value::Null);
+        assert_eq!(value["checkpoint_count"], 2);
+        assert_eq!(value["latest_checkpoint_id"], "ctx-1");
     }
 
     #[test]
@@ -8719,5 +8973,460 @@ mod program_wire_tests {
         let encoded = serde_json::to_string(&state).unwrap();
         let decoded: ContextStructuredState = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn context_checkpoint_round_trips_and_decodes_with_defaults() {
+        let checkpoint = ContextCheckpoint {
+            id: "ctx-1".into(),
+            session_id: "ses-1".into(),
+            project_id: "prj-1".into(),
+            label: "before refactor".into(),
+            mode: "summary".into(),
+            summary: Some("Earlier conversation summary\n\nwork".into()),
+            through_message_id: Some("msg-9".into()),
+            message_cursor: 10,
+            plan_revision: 3,
+            provider: "openai-compatible".into(),
+            model: "test-model".into(),
+            prompt_prefix_hash: "abc123".into(),
+            worktree_head: "deadbeef".into(),
+            tokens_before: 90_000,
+            tokens_after: 12_000,
+            structured_state: Some(ContextStructuredState {
+                goal: "ship D1".into(),
+                plan_revision: 3,
+                ..ContextStructuredState::default()
+            }),
+            source_compaction_seq: Some(42),
+            automatic: true,
+            created_at: "2026-11-11T00:00:00Z".into(),
+        };
+        let encoded = serde_json::to_string(&checkpoint).unwrap();
+        let decoded: ContextCheckpoint = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, checkpoint);
+
+        let minimal: ContextCheckpoint = serde_json::from_value(json!({
+            "id": "ctx-2",
+            "session_id": "ses-1",
+            "project_id": "prj-1"
+        }))
+        .unwrap();
+        assert_eq!(minimal.id, "ctx-2");
+        assert_eq!(minimal.mode, "");
+        assert_eq!(minimal.message_cursor, 0);
+        assert_eq!(minimal.tokens_after, 0);
+        assert!(minimal.summary.is_none());
+        assert!(!minimal.automatic);
+    }
+
+    #[test]
+    fn context_checkpoint_policy_defaults_and_clamps_are_typed() {
+        let policy = ContextCheckpointPolicy::default();
+        assert!(!policy.enabled);
+        assert_eq!(policy.max_checkpoints, 20);
+        assert_eq!(policy.max_age_days, 30);
+        let decoded: ContextCheckpointPolicy =
+            serde_json::from_value(json!({"enabled": true})).unwrap();
+        assert!(decoded.enabled);
+        assert_eq!(decoded.max_checkpoints, 20);
+        assert_eq!(decoded.max_age_days, 30);
+        let custom: ContextCheckpointPolicy = serde_json::from_value(json!({
+            "enabled": true,
+            "max_checkpoints": 5,
+            "max_age_days": 0
+        }))
+        .unwrap();
+        assert_eq!(custom.max_checkpoints, 5);
+        assert_eq!(custom.max_age_days, 0);
+    }
+
+    #[test]
+    fn context_restore_params_and_results_are_backward_compatible() {
+        let params: ContextRestoreParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "checkpoint_id": "ctx-1"
+        }))
+        .unwrap();
+        assert!(!params.force);
+        let forced: ContextRestoreParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "checkpoint_id": "ctx-1",
+            "force": true
+        }))
+        .unwrap();
+        assert!(forced.force);
+        let result = ContextRestoreResult {
+            session_id: "ses-1".into(),
+            checkpoint_id: "ctx-1".into(),
+            mode: "summary".into(),
+            through_message_id: Some("msg-9".into()),
+            active_messages: 4,
+            estimated_tokens: 3_000,
+            hard_limit_tokens: 32_000,
+            warning: None,
+            compaction_event_seq: 43,
+            restored_event_seq: 44,
+        };
+        assert_eq!(result.active_messages, 4);
+        assert_eq!(result.compaction_event_seq, 43);
+        assert_eq!(result.restored_event_seq, 44);
+    }
+
+    #[test]
+    fn older_session_bundle_decodes_with_empty_context_checkpoints() {
+        let value = json!({
+            "version": 1,
+            "exported_at": "2026-11-11T00:00:00Z",
+            "project": {
+                "id": "prj-1",
+                "name": "p",
+                "root": "/tmp/p",
+                "default_branch": "main",
+                "created_at": "2026-11-11T00:00:00Z"
+            },
+            "session": {
+                "id": "ses-1",
+                "project_id": "prj-1",
+                "goal": "g",
+                "status": "idle",
+                "priority": 0,
+                "worktree": null,
+                "branch": null,
+                "token_budget": null,
+                "cost_budget_usd": null,
+                "time_budget_secs": null,
+                "unlimited": false,
+                "cost_spent_usd": 0.0,
+                "base_commit": null,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "created_at": "2026-11-11T00:00:00Z"
+            },
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        });
+        let bundle: SessionBundle = serde_json::from_value(value).unwrap();
+        assert!(bundle.context_checkpoints.is_empty());
+        assert!(bundle.session_runs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod context_checkpoint_protocol_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn checkpoint(id: &str) -> ContextCheckpoint {
+        ContextCheckpoint {
+            id: id.into(),
+            session_id: "ses-1".into(),
+            project_id: "prj-1".into(),
+            label: format!("checkpoint {id}"),
+            mode: "summary".into(),
+            summary: Some("Earlier conversation summary".into()),
+            through_message_id: Some("msg-1".into()),
+            message_cursor: 1,
+            plan_revision: 2,
+            provider: "queue".into(),
+            model: "test".into(),
+            prompt_prefix_hash: "prefix".into(),
+            worktree_head: "head".into(),
+            tokens_before: 9_000,
+            tokens_after: 900,
+            structured_state: Some(ContextStructuredState::default()),
+            source_compaction_seq: Some(4),
+            automatic: true,
+            created_at: "2026-11-11T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn context_checkpoint_list_serializes_policy_and_latest_id() {
+        let result = ContextCheckpointListResult {
+            session_id: "ses-1".into(),
+            checkpoints: vec![checkpoint("ctx-1")],
+            latest_id: Some("ctx-1".into()),
+            policy: ContextCheckpointPolicy {
+                enabled: true,
+                max_checkpoints: 5,
+                max_age_days: 7,
+            },
+            limit: 50,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["session_id"], "ses-1");
+        assert_eq!(value["latest_id"], "ctx-1");
+        assert_eq!(value["checkpoints"][0]["mode"], "summary");
+        assert_eq!(value["checkpoints"][0]["tokens_before"], 9_000);
+        assert_eq!(value["policy"]["max_checkpoints"], 5);
+        assert_eq!(value["limit"], 50);
+    }
+
+    #[test]
+    fn context_checkpoint_detail_serializes_preflight_and_preview() {
+        let result = ContextCheckpointDetailResult {
+            checkpoint: checkpoint("ctx-1"),
+            preflight: ContextRestorePreflight {
+                restorable: false,
+                errors: vec!["plan revision changed".into()],
+                warnings: vec!["above threshold".into()],
+                estimated_tokens: 1_200,
+                hard_limit_tokens: 32_000,
+                threshold_tokens: 1_000,
+                active_messages: 4,
+                plan_revision: 3,
+                checkpoint_plan_revision: 2,
+                provider: "queue".into(),
+                model: "test".into(),
+                worktree_head: "head".into(),
+                current_worktree_head: Some("head".into()),
+                worktree_descendant: true,
+                budget_exhausted: false,
+            },
+            is_active: false,
+            summary_preview: "Earlier conversation summary".into(),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["preflight"]["restorable"], false);
+        assert_eq!(value["preflight"]["errors"][0], "plan revision changed");
+        assert_eq!(value["preflight"]["checkpoint_plan_revision"], 2);
+        assert_eq!(value["is_active"], false);
+        assert_eq!(value["summary_preview"], "Earlier conversation summary");
+
+        let decoded: ContextRestorePreflight = serde_json::from_value(json!({
+            "restorable": true,
+            "errors": [],
+            "warnings": []
+        }))
+        .unwrap();
+        assert!(decoded.restorable);
+        assert_eq!(decoded.estimated_tokens, 0);
+        assert_eq!(decoded.active_messages, 0);
+        assert!(!decoded.worktree_descendant);
+        assert!(decoded.current_worktree_head.is_none());
+    }
+
+    #[test]
+    fn context_checkpoint_action_params_decode_with_defaults() {
+        let list: ContextCheckpointListParams =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert!(list.limit.is_none());
+        let create: ContextCheckpointCreateParams =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert!(create.label.is_none());
+
+        let detail: ContextCheckpointDetailParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "checkpoint_id": "ctx-1"
+        }))
+        .unwrap();
+        assert_eq!(detail.checkpoint_id, "ctx-1");
+
+        let delete: ContextCheckpointDeleteParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "checkpoint_id": "ctx-1"
+        }))
+        .unwrap();
+        assert_eq!(delete.session_id, "ses-1");
+
+        let prune: ContextCheckpointPruneParams = serde_json::from_value(json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert!(prune.older_than_days.is_none());
+        assert!(prune.keep_latest.is_none());
+        assert!(!prune.dry_run);
+        let prune: ContextCheckpointPruneParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "older_than_days": 7,
+            "keep_latest": 2,
+            "dry_run": true
+        }))
+        .unwrap();
+        assert_eq!(prune.older_than_days, Some(7));
+        assert_eq!(prune.keep_latest, Some(2));
+        assert!(prune.dry_run);
+
+        let policy: SetContextCheckpointPolicyParams = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "policy": {"enabled": true, "max_checkpoints": 4, "max_age_days": 0}
+        }))
+        .unwrap();
+        assert_eq!(policy.project_id, "prj-1");
+        assert!(policy.policy.enabled);
+        assert_eq!(policy.policy.max_age_days, 0);
+    }
+
+    #[test]
+    fn context_checkpoint_prune_and_delete_results_are_stable_shapes() {
+        let prune = ContextCheckpointPruneResult {
+            session_id: "ses-1".into(),
+            candidates: 3,
+            removed: 2,
+            dry_run: false,
+            checkpoints: vec![checkpoint("ctx-1")],
+        };
+        let value: Value = serde_json::to_value(&prune).unwrap();
+        assert_eq!(value["candidates"], 3);
+        assert_eq!(value["removed"], 2);
+        assert_eq!(value["checkpoints"][0]["id"], "ctx-1");
+        let delete = ContextCheckpointDeleteResult {
+            session_id: "ses-1".into(),
+            checkpoint_id: "ctx-1".into(),
+            removed: true,
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(value["checkpoint_id"], "ctx-1");
+        assert_eq!(value["removed"], true);
+    }
+
+    #[test]
+    fn context_restore_result_is_additive_and_typed() {
+        let result = ContextRestoreResult {
+            session_id: "ses-1".into(),
+            checkpoint_id: "ctx-1".into(),
+            mode: "summary".into(),
+            through_message_id: None,
+            active_messages: 2,
+            estimated_tokens: 500,
+            hard_limit_tokens: 32_000,
+            warning: Some("threshold".into()),
+            compaction_event_seq: 11,
+            restored_event_seq: 12,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["through_message_id"], Value::Null);
+        assert_eq!(value["warning"], "threshold");
+        assert_eq!(value["compaction_event_seq"], 11);
+        assert_eq!(value["restored_event_seq"], 12);
+    }
+}
+
+#[cfg(test)]
+mod context_checkpoint_bundle_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn session_bundle_round_trips_context_checkpoints() {
+        let bundle = SessionBundle {
+            version: 1,
+            exported_at: "2026-11-11T00:00:00Z".into(),
+            project: Project {
+                id: "prj-1".into(),
+                name: "p".into(),
+                root: "/tmp/p".into(),
+                default_branch: "main".into(),
+                created_at: "2026-11-11T00:00:00Z".into(),
+            },
+            session: Session {
+                id: "ses-1".into(),
+                project_id: "prj-1".into(),
+                goal: "g".into(),
+                status: "idle".into(),
+                priority: 0,
+                worktree: None,
+                branch: None,
+                token_budget: None,
+                cost_budget_usd: None,
+                time_budget_secs: None,
+                unlimited: false,
+                cost_spent_usd: 0.0,
+                base_commit: None,
+                tokens_in: 0,
+                tokens_out: 0,
+                created_at: "2026-11-11T00:00:00Z".into(),
+            },
+            events: Vec::new(),
+            agents: Vec::new(),
+            messages: Vec::new(),
+            team_plan: None,
+            todos: Vec::new(),
+            approvals: Vec::new(),
+            merge_queue: Vec::new(),
+            agent_messages: Vec::new(),
+            artifacts: Vec::new(),
+            usage: Vec::new(),
+            memories: Vec::new(),
+            memory_conflicts: Vec::new(),
+            questions: Vec::new(),
+            tasks: Vec::new(),
+            steering: Vec::new(),
+            continuations: Vec::new(),
+            recoveries: Vec::new(),
+            programs: Vec::new(),
+            program_milestones: Vec::new(),
+            program_events: Vec::new(),
+            session_runs: Vec::new(),
+            run_steps: Vec::new(),
+            run_checkpoints: Vec::new(),
+            context_checkpoints: vec![ContextCheckpoint {
+                id: "ctx-1".into(),
+                session_id: "ses-1".into(),
+                project_id: "prj-1".into(),
+                label: "bundle".into(),
+                mode: "summary".into(),
+                summary: Some("summary".into()),
+                through_message_id: Some("msg-1".into()),
+                message_cursor: 1,
+                plan_revision: 1,
+                provider: "queue".into(),
+                model: "test".into(),
+                prompt_prefix_hash: "prefix".into(),
+                worktree_head: "head".into(),
+                tokens_before: 10,
+                tokens_after: 1,
+                structured_state: None,
+                source_compaction_seq: Some(3),
+                automatic: true,
+                created_at: "2026-11-11T00:00:00Z".into(),
+            }],
+        };
+        let encoded = serde_json::to_string(&bundle).unwrap();
+        let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.context_checkpoints, bundle.context_checkpoints);
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["context_checkpoints"][0]["id"], "ctx-1");
+        assert_eq!(value["context_checkpoints"][0]["source_compaction_seq"], 3);
+        assert_eq!(value["context_checkpoints"][0]["automatic"], true);
+    }
+
+    #[test]
+    fn session_bundle_defaults_absent_context_checkpoints() {
+        let mut value = json!({
+            "version": 1,
+            "exported_at": "2026-11-11T00:00:00Z",
+            "project": {
+                "id": "prj-1",
+                "name": "p",
+                "root": "/tmp/p",
+                "default_branch": "main",
+                "created_at": "2026-11-11T00:00:00Z"
+            },
+            "session": {
+                "id": "ses-1",
+                "project_id": "prj-1",
+                "goal": "g",
+                "status": "idle",
+                "priority": 0,
+                "unlimited": false,
+                "cost_spent_usd": 0.0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "created_at": "2026-11-11T00:00:00Z"
+            },
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        });
+        value.as_object_mut().unwrap().remove("context_checkpoints");
+        let bundle: SessionBundle = serde_json::from_value(value).unwrap();
+        assert!(bundle.context_checkpoints.is_empty());
     }
 }

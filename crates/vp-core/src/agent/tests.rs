@@ -14472,3 +14472,2084 @@ async fn two_continuation_reconcilers_deliver_one_child() {
     assert!(replay.continuations_match, "{:?}", replay.mismatches);
     assert!(replay.consistent, "{:?}", replay.mismatches);
 }
+
+fn set_context_window(
+    service: &AgentService,
+    context_window: u64,
+    compact_after_tokens: u64,
+    keep_messages: usize,
+    keep_tokens: u64,
+) {
+    let mut config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service is configured")
+        .clone();
+    config.context_window = context_window;
+    config.compact_after_tokens = compact_after_tokens;
+    config.compact_keep_messages = keep_messages;
+    config.compact_keep_tokens = keep_tokens;
+    *service.config.write().unwrap() = Some(config);
+}
+
+async fn append_context_messages(engine: &Engine, session_id: &str, count: usize, content: &str) {
+    for index in 0..count {
+        engine
+            .append_message(
+                session_id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("message {index}: {content}"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+async fn set_session_idle(engine: &Engine, session_id: &str) {
+    engine
+        .update_session_status(session_id, "idle")
+        .await
+        .unwrap();
+}
+
+async fn first_context_checkpoint(engine: &Engine, session_id: &str) -> ContextCheckpoint {
+    engine
+        .list_context_checkpoints(session_id, Some(200))
+        .await
+        .unwrap()
+        .checkpoints
+        .into_iter()
+        .next()
+        .expect("a context checkpoint")
+}
+
+#[tokio::test]
+async fn automatic_compaction_creates_a_durable_context_checkpoint() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("automatic checkpoint summary".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 3, 1_000_000);
+    let session = engine
+        .create_session(project.id, "automatic checkpoint".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(
+        &engine,
+        &session.id,
+        14,
+        "the release pipeline investigation includes enough detail to exceed the tiny test threshold",
+    )
+    .await;
+    let result = service.compact_now(&session.id).await.unwrap();
+    assert!(result.compacted);
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let compacted = events
+        .iter()
+        .find(|event| event.kind == "context.compacted")
+        .expect("context.compacted");
+    let checkpointed = events
+        .iter()
+        .find(|event| event.kind == "context.checkpointed")
+        .expect("context.checkpointed");
+    let checkpoint =
+        crate::context::context_checkpoint_from_event(checkpointed).expect("checkpoint payload");
+
+    assert!(checkpoint.automatic);
+    assert_eq!(checkpoint.source_compaction_seq, Some(compacted.seq));
+    assert_eq!(
+        checkpoint.summary.as_deref(),
+        compacted.payload["summary"].as_str()
+    );
+    assert_eq!(
+        checkpoint.through_message_id.as_deref(),
+        compacted.payload["through_message_id"].as_str()
+    );
+    assert_eq!(
+        checkpoint.tokens_before,
+        compacted.payload["estimated_tokens_before"]
+            .as_u64()
+            .unwrap()
+    );
+    assert_eq!(
+        checkpoint.tokens_after,
+        compacted.payload["estimated_tokens_after"]
+            .as_u64()
+            .unwrap()
+    );
+    assert_eq!(
+        compacted.payload["context_checkpoint_id"].as_str(),
+        Some(checkpoint.id.as_str())
+    );
+    assert!(checkpoint.message_cursor > 0);
+    assert!(!checkpoint.worktree_head.is_empty());
+    assert_eq!(checkpoint.provider, "queue");
+    assert_eq!(checkpoint.model, "test");
+    assert_eq!(
+        checkpoint
+            .structured_state
+            .as_ref()
+            .map(|state| state.plan_revision),
+        Some(checkpoint.plan_revision)
+    );
+
+    let listed = engine
+        .list_context_checkpoints(&session.id, Some(20))
+        .await
+        .unwrap();
+    assert_eq!(listed.checkpoints.len(), 1);
+    assert_eq!(listed.latest_id.as_deref(), Some(checkpoint.id.as_str()));
+
+    let status = engine.session_context_status(&session.id).await.unwrap();
+    assert_eq!(status.checkpoint_count, 1);
+    assert_eq!(
+        status.latest_checkpoint_id.as_deref(),
+        Some(checkpoint.id.as_str())
+    );
+    assert!(status.latest_checkpoint_at.is_some());
+}
+
+#[tokio::test]
+async fn manual_context_checkpoint_captures_the_active_boundary() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "manual checkpoint".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 6, "manual boundary content").await;
+    set_session_idle(&engine, &session.id).await;
+
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, Some("before the refactor".into()))
+        .await
+        .unwrap();
+    assert_eq!(checkpoint.label, "before the refactor");
+    assert_eq!(checkpoint.mode, "manual");
+    assert!(!checkpoint.automatic);
+    assert!(checkpoint.summary.is_none());
+    assert!(checkpoint.through_message_id.is_none());
+    assert_eq!(checkpoint.plan_revision, 0);
+    assert!(checkpoint.message_cursor == 0);
+    assert!(checkpoint.tokens_before > 0);
+    assert_eq!(checkpoint.tokens_before, checkpoint.tokens_after);
+    assert!(!checkpoint.worktree_head.is_empty());
+    assert_eq!(checkpoint.provider, "queue");
+    assert_eq!(checkpoint.model, "test");
+
+    let detail = service
+        .context_checkpoint_detail(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert!(detail.preflight.restorable, "{:?}", detail.preflight.errors);
+    assert!(!detail.is_active);
+    assert!(detail.summary_preview.is_empty());
+
+    // A manual checkpoint after a compaction captures that exact boundary.
+    let second_dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("manual summary boundary".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine2, service2, project2) = test_service_with_provider(&second_dir, provider);
+    set_context_window(&service2, 32_000, 1_000, 3, 1_000_000);
+    let session2 = engine2
+        .create_session(project2.id, "manual after compaction".into(), None)
+        .await
+        .unwrap();
+    engine2
+        .create_leader_agent(&session2.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine2, &session2.id, 12, "compacted content").await;
+    service2.compact_now(&session2.id).await.unwrap();
+    set_session_idle(&engine2, &session2.id).await;
+    let manual = service2
+        .context_checkpoint_now(&session2.id, None)
+        .await
+        .unwrap();
+    assert_eq!(manual.mode, "summary");
+    assert!(manual.summary.is_some());
+    assert!(manual.through_message_id.is_some());
+    assert!(!manual.automatic);
+    assert!(manual.source_compaction_seq.is_some());
+}
+
+#[tokio::test]
+async fn restore_rewinds_active_context_and_keeps_originals_searchable() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("first boundary".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("second boundary".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 2, 1_000_000);
+    let session = engine
+        .create_session(project.id.clone(), "restore boundary".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .append_message(
+            &session.id,
+            "user",
+            "original-needle: keep this searchable after compaction",
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 10, "first round content").await;
+    assert!(service.compact_now(&session.id).await.unwrap().compacted);
+    let checkpoints = engine
+        .list_context_checkpoints(&session.id, Some(20))
+        .await
+        .unwrap();
+    let first = checkpoints.checkpoints[0].clone();
+    append_context_messages(&engine, &session.id, 10, "second round content").await;
+    assert!(service.compact_now(&session.id).await.unwrap().compacted);
+    let checkpoints = engine
+        .list_context_checkpoints(&session.id, Some(20))
+        .await
+        .unwrap();
+    assert_eq!(checkpoints.checkpoints.len(), 2);
+    let second = checkpoints.checkpoints[1].clone();
+    assert_ne!(first.id, second.id);
+
+    set_session_idle(&engine, &session.id).await;
+    let messages_before = engine.list_messages(&session.id).await.unwrap().len();
+    let head_before = worktree::head_commit(&PathBuf::from(
+        engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .worktree
+            .clone()
+            .unwrap(),
+    ))
+    .unwrap();
+
+    let restored = service
+        .restore_context_checkpoint_now(&session.id, &first.id, true)
+        .await
+        .unwrap();
+    assert_eq!(restored.checkpoint_id, first.id);
+    assert_eq!(restored.mode, "summary");
+    assert!(
+        restored.warning.is_some(),
+        "the boundary estimate is above the low test threshold and force accepted it"
+    );
+    assert!(restored.estimated_tokens <= restored.hard_limit_tokens);
+
+    let loaded = load_conversation(&engine, &session.id).await.unwrap();
+    assert!(
+        loaded.messages[0]
+            .content
+            .starts_with("Earlier conversation summary")
+    );
+    assert!(loaded.messages[0].content.contains("first boundary"));
+    assert!(!loaded.messages[0].content.contains("second boundary"));
+    let messages_after = engine.list_messages(&session.id).await.unwrap().len();
+    assert_eq!(
+        messages_before, messages_after,
+        "restore never rewrites message rows"
+    );
+    let head_after = worktree::head_commit(&PathBuf::from(
+        engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .worktree
+            .clone()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        head_before, head_after,
+        "context restore never resets the worktree"
+    );
+    let session_after = engine.store().get_session(&session.id).unwrap().unwrap();
+    assert_eq!(session_after.status, "idle");
+
+    let hits = engine
+        .search("original-needle", Some(&project.id), 10)
+        .await
+        .unwrap();
+    assert!(hits.hits.iter().any(|hit| hit.session_id == session.id));
+
+    // Idempotent: the same restore produces the same active context and a
+    // second audit event, without duplicate message rows.
+    let restored_again = service
+        .restore_context_checkpoint_now(&session.id, &first.id, true)
+        .await
+        .unwrap();
+    assert_eq!(restored_again.estimated_tokens, restored.estimated_tokens);
+    assert_eq!(restored_again.active_messages, restored.active_messages);
+    let loaded_again = load_conversation(&engine, &session.id).await.unwrap();
+    assert_eq!(
+        loaded
+            .messages
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect::<Vec<_>>(),
+        loaded_again
+            .messages
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        engine.list_messages(&session.id).await.unwrap().len(),
+        messages_before
+    );
+    let restore_events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "context.restored")
+        .count();
+    assert_eq!(restore_events, 2);
+
+    // No agent run or merge was created by either restore.
+    let kinds = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(!kinds.iter().any(|event| event.kind == "agent.run.started"));
+    assert!(
+        !kinds
+            .iter()
+            .any(|event| event.kind == "merge_queue.enqueued")
+    );
+}
+
+#[tokio::test]
+async fn restore_accepts_a_clean_descendant_without_resetting_the_worktree() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("descendant boundary".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 2, 1_000_000);
+    let session = engine
+        .create_session(project.id, "descendant restore".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 10, "descendant content").await;
+    service.compact_now(&session.id).await.unwrap();
+    let checkpoint = first_context_checkpoint(&engine, &session.id).await;
+    set_session_idle(&engine, &session.id).await;
+    let worktree = PathBuf::from(
+        engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .worktree
+            .clone()
+            .unwrap(),
+    );
+    std::fs::write(worktree.join("after-checkpoint.txt"), "kept\n").unwrap();
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args(["commit", "-q", "-m", "after checkpoint"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let head = worktree::head_commit(&worktree).unwrap();
+
+    let restored = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap();
+    assert_eq!(restored.checkpoint_id, checkpoint.id);
+    assert_eq!(worktree::head_commit(&worktree).unwrap(), head);
+    assert!(worktree.join("after-checkpoint.txt").is_file());
+    let detail = service
+        .context_checkpoint_detail(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert!(detail.preflight.worktree_descendant);
+    assert!(detail.is_active);
+    assert!(detail.preflight.restorable, "{:?}", detail.preflight.errors);
+}
+
+#[tokio::test]
+async fn restore_refuses_plan_revision_model_provider_and_dirty_worktree_changes() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "mismatch restore".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 4, "mismatch content").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+
+    // Plan revision mismatch.
+    engine
+        .set_team_plan(&session.id, &continuation_test_plan())
+        .await
+        .unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, false)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("plan revision changed"),
+        "{error}"
+    );
+
+    // Restore the plan state by capturing a matching checkpoint after the
+    // revision. The original checkpoint must still refuse.
+    let matching = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    assert_eq!(matching.plan_revision, 1);
+
+    // Model mismatch.
+    let original_model = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .model
+        .clone();
+    {
+        let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+        config.model = "different-model".into();
+        *service.config.write().unwrap() = Some(config);
+    }
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &matching.id, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("model changed"), "{error}");
+    {
+        let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+        config.model = original_model;
+        *service.config.write().unwrap() = Some(config);
+    }
+
+    // Provider mismatch.
+    {
+        let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+        config.provider_name = "another-provider".into();
+        *service.config.write().unwrap() = Some(config);
+    }
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &matching.id, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("provider changed"), "{error}");
+    {
+        let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+        config.provider_name = "queue".into();
+        *service.config.write().unwrap() = Some(config);
+    }
+
+    // Dirty worktree.
+    let worktree = PathBuf::from(
+        engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .worktree
+            .clone()
+            .unwrap(),
+    );
+    std::fs::write(worktree.join("dirty.txt"), "uncommitted\n").unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &matching.id, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("uncommitted changes"), "{error}");
+    std::fs::remove_file(worktree.join("dirty.txt")).unwrap();
+    service
+        .restore_context_checkpoint_now(&session.id, &matching.id, false)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn restore_refuses_rehydrated_imported_and_exhausted_budget_sessions() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "import guard".into(), Some(1))
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 4, "import guard content").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+
+    // Rehydrated sessions carry a session.rehydrated event.
+    engine
+        .append_event(&session.id, "session.rehydrated", serde_json::json!({}))
+        .await
+        .unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, false)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("imported or rehydrated"),
+        "{error}"
+    );
+
+    // Imported status is rejected before any provider call.
+    engine
+        .update_session_status(&session.id, "imported")
+        .await
+        .unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("read-only archives"), "{error}");
+
+    // Exhausted token budget on a fresh session/checkpoint.
+    let budget_session = engine
+        .create_session(project.id, "budget guard".into(), Some(1))
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&budget_session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &budget_session.id, 3, "budget content").await;
+    set_session_idle(&engine, &budget_session.id).await;
+    let budget_checkpoint = service
+        .context_checkpoint_now(&budget_session.id, None)
+        .await
+        .unwrap();
+    engine
+        .record_agent_usage(
+            &budget_session.id,
+            "leader",
+            "Leader",
+            "leader",
+            None,
+            None,
+            "test",
+            5,
+            5,
+            false,
+            0.0,
+        )
+        .await
+        .unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&budget_session.id, &budget_checkpoint.id, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("budget is exhausted"), "{error}");
+}
+
+#[tokio::test]
+async fn restore_hard_limit_is_absolute_and_force_only_bypasses_the_threshold_warning() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "hard limit".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 10, &"x".repeat(2_000)).await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+
+    // Above the hard limit: force cannot bypass it.
+    set_context_window(&service, 2_000, 0, 4, 1_000_000);
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("hard limit"), "{error}");
+
+    // Between threshold and hard limit: refuse without force, accept with it.
+    set_context_window(&service, 32_000, 1, 4, 1_000_000);
+    let detail = service
+        .context_checkpoint_detail(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert!(
+        detail.preflight.restorable,
+        "threshold is a warning, not a safety error: {:?}",
+        detail.preflight.errors
+    );
+    assert!(!detail.preflight.warnings.is_empty());
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("pass force=true"), "{error}");
+    let restored = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap();
+    assert!(restored.warning.is_some());
+    assert!(restored.estimated_tokens <= restored.hard_limit_tokens);
+}
+
+#[tokio::test]
+async fn delete_prune_and_retention_protect_the_latest_active_checkpoint() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "retention".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 4, "retention content").await;
+    set_session_idle(&engine, &session.id).await;
+    let first = service
+        .context_checkpoint_now(&session.id, Some("first".into()))
+        .await
+        .unwrap();
+    let second = service
+        .context_checkpoint_now(&session.id, Some("second".into()))
+        .await
+        .unwrap();
+    let third = service
+        .context_checkpoint_now(&session.id, Some("third".into()))
+        .await
+        .unwrap();
+    let message_count = engine.list_messages(&session.id).await.unwrap().len();
+
+    let deleted = engine
+        .delete_context_checkpoint(&session.id, &first.id)
+        .await
+        .unwrap();
+    assert!(deleted.removed);
+    let again = engine
+        .delete_context_checkpoint(&session.id, &first.id)
+        .await
+        .unwrap();
+    assert!(!again.removed);
+    assert_eq!(
+        engine.list_messages(&session.id).await.unwrap().len(),
+        message_count
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "context.checkpoint.deleted"
+                && event.payload["checkpoint_id"] == first.id)
+    );
+
+    // Count-only prune: keep the latest one.
+    let pruned = engine
+        .prune_context_checkpoints(&session.id, Some(0), Some(1), false)
+        .await
+        .unwrap();
+    assert_eq!(pruned.removed, 1);
+    assert_eq!(pruned.candidates, 1);
+    let remaining = engine
+        .list_context_checkpoints(&session.id, Some(20))
+        .await
+        .unwrap();
+    assert_eq!(remaining.checkpoints.len(), 1);
+    assert_eq!(remaining.checkpoints[0].id, third.id);
+    assert_eq!(
+        engine.list_messages(&session.id).await.unwrap().len(),
+        message_count
+    );
+
+    // Recreate two more checkpoints, then mark the session active. The latest
+    // checkpoint of an active run is protected even with keep_latest = 0.
+    let fourth = service
+        .context_checkpoint_now(&session.id, Some("fourth".into()))
+        .await
+        .unwrap();
+    let fifth = service
+        .context_checkpoint_now(&session.id, Some("fifth".into()))
+        .await
+        .unwrap();
+    assert_ne!(second.id, fourth.id);
+    engine
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    let error = engine
+        .delete_context_checkpoint(&session.id, &fifth.id)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("latest context checkpoint"),
+        "{error}"
+    );
+    let pruned = engine
+        .prune_context_checkpoints(&session.id, Some(0), Some(0), false)
+        .await
+        .unwrap();
+    assert_eq!(pruned.removed, 2);
+    let remaining = engine
+        .list_context_checkpoints(&session.id, Some(20))
+        .await
+        .unwrap();
+    assert_eq!(remaining.checkpoints.len(), 1);
+    assert_eq!(remaining.checkpoints[0].id, fifth.id);
+    assert_eq!(
+        engine.list_messages(&session.id).await.unwrap().len(),
+        message_count
+    );
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+    let dry = engine
+        .prune_context_checkpoints(&session.id, Some(0), Some(0), true)
+        .await
+        .unwrap();
+    assert!(dry.dry_run);
+    assert_eq!(dry.removed, 0);
+    assert_eq!(
+        engine
+            .list_context_checkpoints(&session.id, Some(20))
+            .await
+            .unwrap()
+            .checkpoints
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn manual_full_history_checkpoint_restores_every_message_without_a_summary() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "full history".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 3, "before the marker").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, Some("full history".into()))
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 4, "after the marker").await;
+    let total = engine.list_messages(&session.id).await.unwrap().len();
+    assert_eq!(total, 7);
+
+    service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, false)
+        .await
+        .unwrap();
+    let loaded = load_conversation(&engine, &session.id).await.unwrap();
+    assert_eq!(loaded.messages.len(), 7);
+    assert!(
+        !loaded.messages[0]
+            .content
+            .starts_with("Earlier conversation summary")
+    );
+    assert!(loaded.messages[0].content.contains("before the marker"));
+    assert!(loaded.messages[6].content.contains("after the marker"));
+    let latest = engine
+        .latest_event_of_kind(&session.id, "context.compacted")
+        .await
+        .unwrap()
+        .expect("restore compaction");
+    assert_eq!(latest.payload["mode"], "trim");
+    assert!(latest.payload["through_message_id"].is_null());
+}
+
+#[tokio::test]
+async fn trim_compaction_creates_a_summaryless_checkpoint_that_restores() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![Err(ProviderError::Stream(
+            "summarizer unavailable".into(),
+        ))]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 2, 1_000_000);
+    let session = engine
+        .create_session(project.id, "trim boundary".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 12, &"y".repeat(400)).await;
+    let result = service.compact_now(&session.id).await.unwrap();
+    assert!(result.compacted);
+    assert_eq!(
+        result
+            .compaction
+            .as_ref()
+            .map(|summary| summary.mode.as_str()),
+        Some("trim")
+    );
+    let checkpoint = first_context_checkpoint(&engine, &session.id).await;
+    assert_eq!(checkpoint.mode, "trim");
+    assert!(
+        checkpoint.summary.is_some(),
+        "trim carries the authoritative state block"
+    );
+    assert!(checkpoint.through_message_id.is_some());
+    set_session_idle(&engine, &session.id).await;
+    let restored = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap();
+    assert_eq!(restored.mode, "trim");
+    let loaded = load_conversation(&engine, &session.id).await.unwrap();
+    assert!(
+        !loaded.messages[0]
+            .content
+            .starts_with("Earlier conversation summary")
+    );
+    assert!(loaded.messages.len() < 12);
+}
+
+#[tokio::test]
+async fn restore_refuses_a_checkpoint_whose_through_message_is_missing() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "missing through".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 3, "missing through content").await;
+    set_session_idle(&engine, &session.id).await;
+    let mut checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    checkpoint.id = "ctx-missing-through".into();
+    checkpoint.summary = Some("Earlier conversation summary\n\nstate".into());
+    checkpoint.mode = "summary".into();
+    checkpoint.through_message_id = Some("message-that-does-not-exist".into());
+    checkpoint.created_at = vp_protocol::now_rfc3339();
+    engine
+        .record_context_checkpoint(checkpoint.clone())
+        .await
+        .unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("through message is missing"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn context_checkpoint_list_returns_the_most_recent_rows_first() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "list order".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "list order content").await;
+    set_session_idle(&engine, &session.id).await;
+    let first = service
+        .context_checkpoint_now(&session.id, Some("one".into()))
+        .await
+        .unwrap();
+    let second = service
+        .context_checkpoint_now(&session.id, Some("two".into()))
+        .await
+        .unwrap();
+    let third = service
+        .context_checkpoint_now(&session.id, Some("three".into()))
+        .await
+        .unwrap();
+    let limited = engine
+        .list_context_checkpoints(&session.id, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(limited.limit, 2);
+    assert_eq!(limited.checkpoints.len(), 2);
+    assert_eq!(limited.checkpoints[0].id, second.id);
+    assert_eq!(limited.checkpoints[1].id, third.id);
+    assert_eq!(limited.latest_id.as_deref(), Some(third.id.as_str()));
+    let all = engine
+        .list_context_checkpoints(&session.id, Some(50))
+        .await
+        .unwrap();
+    assert_eq!(all.checkpoints.len(), 3);
+    assert_eq!(all.checkpoints[0].id, first.id);
+    assert_eq!(all.checkpoints[2].id, third.id);
+}
+
+#[tokio::test]
+async fn automatic_checkpoint_tracks_plan_revision_and_authoritative_state() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("planned summary".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 2, 1_000_000);
+    let session = engine
+        .create_session(project.id, "plan checkpoint".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &continuation_test_plan())
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 10, "planned content").await;
+    service.compact_now(&session.id).await.unwrap();
+    let checkpoint = first_context_checkpoint(&engine, &session.id).await;
+    assert_eq!(checkpoint.plan_revision, 1);
+    let state = checkpoint.structured_state.as_ref().unwrap();
+    assert_eq!(state.plan_revision, 1);
+    assert_eq!(state.goal, "deferred continuation");
+    assert_eq!(state.active_task_title.as_deref(), Some("Foundation"));
+    assert_eq!(state.active_task_write_scope, vec!["src/one".to_string()]);
+    let detail = service
+        .context_checkpoint_detail(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(detail.preflight.plan_revision, 1);
+    assert_eq!(detail.preflight.checkpoint_plan_revision, 1);
+    assert_eq!(detail.preflight.provider, "queue");
+    assert_eq!(detail.preflight.model, "test");
+    assert!(detail.preflight.worktree_head == checkpoint.worktree_head);
+}
+
+#[tokio::test]
+async fn restore_preflight_reports_missing_worktree_head_without_panicking() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "no head".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "no head content").await;
+    set_session_idle(&engine, &session.id).await;
+    let mut checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    checkpoint.id = "ctx-no-head".into();
+    checkpoint.worktree_head.clear();
+    checkpoint.created_at = vp_protocol::now_rfc3339();
+    engine
+        .record_context_checkpoint(checkpoint.clone())
+        .await
+        .unwrap();
+    let detail = service
+        .context_checkpoint_detail(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert!(!detail.preflight.restorable);
+    assert!(
+        detail
+            .preflight
+            .errors
+            .iter()
+            .any(|error| error.contains("does not record a worktree head"))
+    );
+}
+
+#[tokio::test]
+async fn context_checkpoint_sweep_honors_the_project_policy_and_skips_imported_archives() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "sweep".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "sweep content").await;
+    set_session_idle(&engine, &session.id).await;
+    for index in 0..3 {
+        service
+            .context_checkpoint_now(&session.id, Some(format!("sweep {index}")))
+            .await
+            .unwrap();
+    }
+    engine
+        .set_context_checkpoint_policy(
+            &project.id,
+            &vp_protocol::types::ContextCheckpointPolicy {
+                enabled: true,
+                max_checkpoints: 1,
+                max_age_days: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let removed = engine.sweep_context_checkpoint_retention().await.unwrap();
+    assert_eq!(removed, 2);
+    let remaining = engine
+        .list_context_checkpoints(&session.id, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(remaining.checkpoints.len(), 1);
+    assert_eq!(remaining.checkpoints[0].label, "sweep 2");
+
+    // An imported archive may keep rows, but the sweep must skip it rather
+    // than failing the whole project pass.
+    let imported = engine
+        .create_session(project.id.clone(), "imported".into(), None)
+        .await
+        .unwrap();
+    let mut checkpoint = remaining.checkpoints[0].clone();
+    checkpoint.id = "ctx-imported-row".into();
+    checkpoint.session_id = imported.id.clone();
+    checkpoint.label = "imported".into();
+    checkpoint.created_at = vp_protocol::now_rfc3339();
+    engine.record_context_checkpoint(checkpoint).await.unwrap();
+    engine
+        .update_session_status(&imported.id, "imported")
+        .await
+        .unwrap();
+    let removed = engine.sweep_context_checkpoint_retention().await.unwrap();
+    assert_eq!(removed, 0);
+    assert!(
+        engine
+            .list_context_checkpoints(&imported.id, Some(10))
+            .await
+            .unwrap()
+            .checkpoints
+            .iter()
+            .any(|row| row.id == "ctx-imported-row")
+    );
+}
+
+#[tokio::test]
+async fn context_checkpoint_creation_and_restore_refuse_active_or_imported_sessions() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "active guard".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "active guard content").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    let error = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("idle, failed, or cancelled"),
+        "{error}"
+    );
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("idle, failed, or cancelled"),
+        "{error}"
+    );
+    engine
+        .update_session_status(&session.id, "imported")
+        .await
+        .unwrap();
+    let error = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("read-only archives"), "{error}");
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("read-only archives"), "{error}");
+}
+
+#[tokio::test]
+async fn force_never_bypasses_a_dirty_worktree_or_cost_budget() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "force safety".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 3, "force safety content").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(
+        engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .worktree
+            .unwrap(),
+    );
+    std::fs::write(worktree.join("force-dirty.txt"), "dirty\n").unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("uncommitted changes"), "{error}");
+    std::fs::remove_file(worktree.join("force-dirty.txt")).unwrap();
+
+    let budget_session = engine
+        .create_session_with_limits(project.id, "cost force".into(), None, Some(0.01), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&budget_session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &budget_session.id, 2, "cost force content").await;
+    set_session_idle(&engine, &budget_session.id).await;
+    let cost_checkpoint = service
+        .context_checkpoint_now(&budget_session.id, None)
+        .await
+        .unwrap();
+    engine
+        .record_agent_usage(
+            &budget_session.id,
+            "leader",
+            "Leader",
+            "leader",
+            None,
+            None,
+            "test",
+            1,
+            1,
+            false,
+            0.02,
+        )
+        .await
+        .unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&budget_session.id, &cost_checkpoint.id, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("budget is exhausted"), "{error}");
+}
+
+#[tokio::test]
+async fn restore_events_record_forced_restore_and_keep_checkpoint_rows() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "forced restore".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 8, &"z".repeat(1_500)).await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    set_context_window(&service, 32_000, 1, 4, 1_000_000);
+    let result = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap();
+    assert!(result.warning.is_some());
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let restored = events
+        .iter()
+        .find(|event| event.kind == "context.restored")
+        .expect("context.restored");
+    assert_eq!(restored.payload["checkpoint_id"], checkpoint.id);
+    assert_eq!(restored.payload["forced"], true);
+    assert_eq!(restored.payload["warning"], result.warning.clone().unwrap());
+    assert_eq!(
+        restored.payload["compaction_seq"],
+        result.compaction_event_seq
+    );
+    assert_eq!(
+        restored.payload["checkpoint"]["id"].as_str(),
+        Some(checkpoint.id.as_str())
+    );
+    assert_eq!(
+        restored.payload["checkpoint"]["mode"].as_str(),
+        Some(checkpoint.mode.as_str())
+    );
+    let still_listed = engine
+        .list_context_checkpoints(&session.id, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(still_listed.checkpoints.len(), 1);
+    assert_eq!(still_listed.checkpoints[0].id, checkpoint.id);
+}
+
+#[tokio::test]
+async fn deleting_the_latest_idle_checkpoint_updates_status_without_touching_messages() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "delete latest".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "delete latest content").await;
+    set_session_idle(&engine, &session.id).await;
+    let first = service
+        .context_checkpoint_now(&session.id, Some("first".into()))
+        .await
+        .unwrap();
+    let second = service
+        .context_checkpoint_now(&session.id, Some("second".into()))
+        .await
+        .unwrap();
+    let messages = engine.list_messages(&session.id).await.unwrap().len();
+    let deleted = engine
+        .delete_context_checkpoint(&session.id, &second.id)
+        .await
+        .unwrap();
+    assert!(deleted.removed);
+    let status = engine.session_context_status(&session.id).await.unwrap();
+    assert_eq!(status.checkpoint_count, 1);
+    assert_eq!(
+        status.latest_checkpoint_id.as_deref(),
+        Some(first.id.as_str())
+    );
+    assert_eq!(
+        engine.list_messages(&session.id).await.unwrap().len(),
+        messages
+    );
+    assert!(
+        !engine
+            .list_context_checkpoints(&session.id, Some(10))
+            .await
+            .unwrap()
+            .checkpoints
+            .iter()
+            .any(|row| row.id == second.id)
+    );
+}
+
+#[tokio::test]
+async fn context_checkpoint_missing_ids_and_deleted_checkpoints_fail_closed() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "missing ids".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "missing ids content").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    engine
+        .delete_context_checkpoint(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not found"), "{error}");
+    let error = service
+        .context_checkpoint_detail(&session.id, &checkpoint.id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not found"), "{error}");
+    let error = engine
+        .list_context_checkpoints("missing-session", Some(10))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("session not found"), "{error}");
+    let error = service
+        .context_checkpoint_now("missing-session", None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("session not found"), "{error}");
+    let error = engine
+        .prune_context_checkpoints("missing-session", Some(0), Some(1), false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("session not found"), "{error}");
+}
+
+#[tokio::test]
+async fn restore_requires_a_configured_provider_but_detail_still_reports_the_boundary() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "unconfigured".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "unconfigured content").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    let unconfigured = AgentService::unconfigured(engine.clone());
+    let error = unconfigured
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, false)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("provider is not configured"),
+        "{error}"
+    );
+    let detail = unconfigured
+        .context_checkpoint_detail(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert_eq!(detail.checkpoint.id, checkpoint.id);
+    assert!(!detail.preflight.restorable);
+    assert!(
+        detail
+            .preflight
+            .errors
+            .iter()
+            .any(|error| error.contains("provider is not configured"))
+    );
+}
+
+#[tokio::test]
+async fn restore_refuses_a_missing_worktree_and_detail_stays_diagnostic() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "missing worktree".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "missing worktree content").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    let worktree = PathBuf::from(
+        engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .worktree
+            .unwrap(),
+    );
+    let moved = worktree.with_extension("moved");
+    std::fs::rename(&worktree, &moved).unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("worktree is missing"), "{error}");
+    let detail = service
+        .context_checkpoint_detail(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert!(
+        detail
+            .preflight
+            .errors
+            .iter()
+            .any(|error| error.contains("worktree is missing"))
+    );
+    std::fs::rename(&moved, &worktree).unwrap();
+    service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, false)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn prune_and_delete_reject_imported_archives_and_invalid_retention() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "imported pruning".into(), None)
+        .await
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "imported")
+        .await
+        .unwrap();
+    let error = engine
+        .prune_context_checkpoints(&session.id, Some(0), Some(1), false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("read-only archives"), "{error}");
+    let error = engine
+        .delete_context_checkpoint(&session.id, "missing")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("read-only archives"), "{error}");
+    let error = engine
+        .prune_context_checkpoints(&session.id, Some(366), Some(1), false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("at most 365"), "{error}");
+}
+
+#[tokio::test]
+async fn checkpoint_labels_are_normalized_and_defaulted_by_the_daemon_path() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "labels".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "labels content").await;
+    set_session_idle(&engine, &session.id).await;
+    let normalized = service
+        .context_checkpoint_now(&session.id, Some("  before    the\nrefactor  ".into()))
+        .await
+        .unwrap();
+    assert_eq!(normalized.label, "before the refactor");
+    let fallback = service
+        .context_checkpoint_now(&session.id, Some("   ".into()))
+        .await
+        .unwrap();
+    assert!(fallback.label.starts_with("context checkpoint "));
+    assert!(fallback.label.len() <= 120);
+}
+
+#[tokio::test]
+async fn a_running_agent_compaction_creates_an_automatic_checkpoint_and_restores() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("automatic run summary".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("compaction complete".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 3, 1_000_000);
+    let session = engine
+        .create_session(project.id, "automatic run checkpoint".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..20 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!(
+                    "message {index}: the automatic checkpoint investigation includes enough detail to exceed the tiny threshold"
+                ),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    service
+        .start(&session.id, "finish after automatic compaction")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let checkpoints = engine
+        .list_context_checkpoints(&session.id, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(checkpoints.checkpoints.len(), 1);
+    let checkpoint = checkpoints.checkpoints[0].clone();
+    assert!(checkpoint.automatic);
+    assert_eq!(checkpoint.mode, "summary");
+    assert!(checkpoint.summary.is_some());
+    assert!(checkpoint.through_message_id.is_some());
+    assert!(checkpoint.source_compaction_seq.is_some());
+    let compacted = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "context.compacted")
+        .expect("context.compacted");
+    assert_eq!(
+        compacted.payload["context_checkpoint_id"].as_str(),
+        Some(checkpoint.id.as_str())
+    );
+    assert_eq!(
+        compacted.payload["summary"].as_str(),
+        checkpoint.summary.as_deref()
+    );
+
+    let messages = engine.list_messages(&session.id).await.unwrap().len();
+    let restored = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap();
+    assert_eq!(restored.checkpoint_id, checkpoint.id);
+    assert_eq!(
+        engine.list_messages(&session.id).await.unwrap().len(),
+        messages
+    );
+    let loaded = load_conversation(&engine, &session.id).await.unwrap();
+    assert!(
+        loaded.messages[0]
+            .content
+            .starts_with("Earlier conversation summary")
+    );
+}
+
+#[tokio::test]
+async fn restore_refuses_a_non_descendant_worktree_head() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("non descendant boundary".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 2, 1_000_000);
+    let session = engine
+        .create_session(project.id, "non descendant".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 10, "non descendant content").await;
+    service.compact_now(&session.id).await.unwrap();
+    let checkpoint = first_context_checkpoint(&engine, &session.id).await;
+    set_session_idle(&engine, &session.id).await;
+    let worktree = PathBuf::from(
+        engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .worktree
+            .unwrap(),
+    );
+    let tree = Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args(["rev-parse", "HEAD^{tree}"])
+        .output()
+        .unwrap();
+    assert!(tree.status.success());
+    let tree = String::from_utf8(tree.stdout).unwrap().trim().to_string();
+    let orphan = Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args(["commit-tree", &tree, "-m", "unrelated root"])
+        .output()
+        .unwrap();
+    assert!(orphan.status.success());
+    let orphan = String::from_utf8(orphan.stdout).unwrap().trim().to_string();
+    let mut unrelated = checkpoint.clone();
+    unrelated.id = "ctx-non-descendant".into();
+    unrelated.worktree_head = orphan;
+    unrelated.created_at = vp_protocol::now_rfc3339();
+    engine
+        .record_context_checkpoint(unrelated.clone())
+        .await
+        .unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &unrelated.id, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not a descendant"), "{error}");
+    let detail = service
+        .context_checkpoint_detail(&session.id, &unrelated.id)
+        .await
+        .unwrap();
+    assert!(!detail.preflight.worktree_descendant);
+    assert!(
+        detail
+            .preflight
+            .errors
+            .iter()
+            .any(|error| error.contains("not a descendant"))
+    );
+}
+
+#[tokio::test]
+async fn restore_preflight_aggregates_plan_model_and_worktree_errors() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "aggregate errors".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 3, "aggregate errors content").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, None)
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &continuation_test_plan())
+        .await
+        .unwrap();
+    {
+        let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+        config.model = "other-model".into();
+        *service.config.write().unwrap() = Some(config);
+    }
+    let worktree = PathBuf::from(
+        engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .worktree
+            .unwrap(),
+    );
+    std::fs::write(worktree.join("aggregate-dirty.txt"), "dirty\n").unwrap();
+    let error = service
+        .restore_context_checkpoint_now(&session.id, &checkpoint.id, true)
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("plan revision changed"), "{message}");
+    assert!(message.contains("model changed"), "{message}");
+    assert!(message.contains("uncommitted changes"), "{message}");
+}
+
+#[tokio::test]
+async fn manual_checkpoint_after_compaction_preserves_state_and_source_sequence() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("manual state summary".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 2, 1_000_000);
+    let session = engine
+        .create_session(project.id, "manual state".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &continuation_test_plan())
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 10, "manual state content").await;
+    service.compact_now(&session.id).await.unwrap();
+    set_session_idle(&engine, &session.id).await;
+    let auto = first_context_checkpoint(&engine, &session.id).await;
+    let manual = service
+        .context_checkpoint_now(&session.id, Some("manual copy".into()))
+        .await
+        .unwrap();
+    assert_eq!(manual.mode, auto.mode);
+    assert_eq!(manual.summary, auto.summary);
+    assert_eq!(manual.through_message_id, auto.through_message_id);
+    assert_eq!(manual.plan_revision, auto.plan_revision);
+    assert_eq!(manual.structured_state, auto.structured_state);
+    assert_eq!(manual.source_compaction_seq, auto.source_compaction_seq);
+    assert_eq!(manual.tokens_before, auto.tokens_before);
+    assert_eq!(manual.tokens_after, auto.tokens_after);
+    assert!(!manual.automatic);
+    let detail = service
+        .context_checkpoint_detail(&session.id, &manual.id)
+        .await
+        .unwrap();
+    assert!(
+        !detail.is_active,
+        "the auto checkpoint is the active reference"
+    );
+    assert!(
+        detail
+            .summary_preview
+            .contains("Earlier conversation summary")
+    );
+}
+
+#[tokio::test]
+async fn a_newer_compaction_makes_the_older_checkpoint_inactive_but_restorable() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("first inactive boundary".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("second active boundary".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 2, 1_000_000);
+    let session = engine
+        .create_session(project.id, "inactive boundary".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 10, "first inactive content").await;
+    service.compact_now(&session.id).await.unwrap();
+    let first = first_context_checkpoint(&engine, &session.id).await;
+    append_context_messages(&engine, &session.id, 10, "second active content").await;
+    service.compact_now(&session.id).await.unwrap();
+    let checkpoints = engine
+        .list_context_checkpoints(&session.id, Some(10))
+        .await
+        .unwrap();
+    let second = checkpoints.checkpoints.last().unwrap().clone();
+    assert_ne!(first.id, second.id);
+    set_session_idle(&engine, &session.id).await;
+    let first_detail = service
+        .context_checkpoint_detail(&session.id, &first.id)
+        .await
+        .unwrap();
+    assert!(!first_detail.is_active);
+    let second_detail = service
+        .context_checkpoint_detail(&session.id, &second.id)
+        .await
+        .unwrap();
+    assert!(second_detail.is_active);
+    let restored = service
+        .restore_context_checkpoint_now(&session.id, &first.id, true)
+        .await
+        .unwrap();
+    assert_eq!(restored.checkpoint_id, first.id);
+    let after = service
+        .context_checkpoint_detail(&session.id, &first.id)
+        .await
+        .unwrap();
+    assert!(after.is_active);
+    let second_after = service
+        .context_checkpoint_detail(&session.id, &second.id)
+        .await
+        .unwrap();
+    assert!(!second_after.is_active);
+    assert_eq!(
+        engine
+            .list_context_checkpoints(&session.id, Some(10))
+            .await
+            .unwrap()
+            .checkpoints
+            .len(),
+        2,
+        "restore never deletes checkpoint rows"
+    );
+}
+
+#[tokio::test]
+async fn automatic_checkpoint_message_cursor_matches_the_stored_boundary() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("cursor summary".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_context_window(&service, 32_000, 1_000, 3, 1_000_000);
+    let session = engine
+        .create_session(project.id, "cursor boundary".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 12, "cursor boundary content").await;
+    service.compact_now(&session.id).await.unwrap();
+    let checkpoint = first_context_checkpoint(&engine, &session.id).await;
+    let messages = engine.list_messages(&session.id).await.unwrap();
+    let position = messages
+        .iter()
+        .position(|message| Some(&message.id) == checkpoint.through_message_id.as_ref())
+        .expect("through message");
+    assert_eq!(checkpoint.message_cursor, position + 1);
+}
+
+#[tokio::test]
+async fn prune_uses_the_project_policy_defaults_when_arguments_are_omitted() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "policy prune".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "policy prune content").await;
+    set_session_idle(&engine, &session.id).await;
+    for index in 0..4 {
+        service
+            .context_checkpoint_now(&session.id, Some(format!("policy {index}")))
+            .await
+            .unwrap();
+    }
+    engine
+        .set_context_checkpoint_policy(
+            &project.id,
+            &vp_protocol::types::ContextCheckpointPolicy {
+                enabled: false,
+                max_checkpoints: 2,
+                max_age_days: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let result = engine
+        .prune_context_checkpoints(&session.id, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(result.candidates, 2);
+    assert_eq!(result.removed, 2);
+    let rows = engine
+        .list_context_checkpoints(&session.id, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(rows.checkpoints.len(), 2);
+    assert_eq!(rows.checkpoints[0].label, "policy 2");
+    assert_eq!(rows.checkpoints[1].label, "policy 3");
+}
+
+#[tokio::test]
+async fn fresh_sessions_report_zero_context_checkpoints() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "fresh status".into(), None)
+        .await
+        .unwrap();
+    let status = engine.session_context_status(&session.id).await.unwrap();
+    assert_eq!(status.checkpoint_count, 0);
+    assert!(status.latest_checkpoint_id.is_none());
+    assert!(status.latest_checkpoint_at.is_none());
+    let listed = engine
+        .list_context_checkpoints(&session.id, Some(10))
+        .await
+        .unwrap();
+    assert!(listed.checkpoints.is_empty());
+    assert!(listed.latest_id.is_none());
+    assert_eq!(listed.limit, 10);
+}
+
+#[tokio::test]
+async fn manual_checkpoint_works_without_an_explicit_leader_agent_row() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "fallback leader".into(), None)
+        .await
+        .unwrap();
+    append_context_messages(&engine, &session.id, 2, "fallback leader content").await;
+    set_session_idle(&engine, &session.id).await;
+    let checkpoint = service
+        .context_checkpoint_now(&session.id, Some("fallback".into()))
+        .await
+        .unwrap();
+    assert_eq!(checkpoint.provider, "queue");
+    assert_eq!(checkpoint.model, "test");
+    assert!(!checkpoint.worktree_head.is_empty());
+    let detail = service
+        .context_checkpoint_detail(&session.id, &checkpoint.id)
+        .await
+        .unwrap();
+    assert!(detail.preflight.restorable, "{:?}", detail.preflight.errors);
+}
+
+#[tokio::test]
+async fn deleting_a_missing_context_checkpoint_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "missing delete".into(), None)
+        .await
+        .unwrap();
+    let result = engine
+        .delete_context_checkpoint(&session.id, "ctx-does-not-exist")
+        .await
+        .unwrap();
+    assert!(!result.removed);
+    assert_eq!(result.checkpoint_id, "ctx-does-not-exist");
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "context.checkpoint.deleted")
+    );
+}
+
+#[tokio::test]
+async fn context_checkpoint_list_limit_is_clamped_to_the_protocol_ceiling() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "limit clamp".into(), None)
+        .await
+        .unwrap();
+    let listed = engine
+        .list_context_checkpoints(&session.id, Some(10_000))
+        .await
+        .unwrap();
+    assert_eq!(listed.limit, 200);
+}

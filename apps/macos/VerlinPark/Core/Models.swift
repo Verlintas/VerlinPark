@@ -2787,6 +2787,9 @@ struct SessionContextStatus: Codable, Sendable {
     let lastCompactionTokensAfter: Int?
     let compactionBackgroundReuse: Bool?
     let compactionFallbackToSync: Bool?
+    let checkpointCount: Int?
+    let latestCheckpointID: String?
+    let latestCheckpointAt: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
@@ -2799,6 +2802,276 @@ struct SessionContextStatus: Codable, Sendable {
         case lastCompactionTokensAfter = "last_compaction_tokens_after"
         case compactionBackgroundReuse = "compaction_background_reuse"
         case compactionFallbackToSync = "compaction_fallback_to_sync"
+        case checkpointCount = "checkpoint_count"
+        case latestCheckpointID = "latest_checkpoint_id"
+        case latestCheckpointAt = "latest_checkpoint_at"
+    }
+}
+
+struct ContextCheckpointPolicy: Codable, Sendable, Equatable {
+    var enabled: Bool
+    var maxCheckpoints: Int
+    var maxAgeDays: Int
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case maxCheckpoints = "max_checkpoints"
+        case maxAgeDays = "max_age_days"
+    }
+}
+
+struct ContextCheckpoint: Codable, Sendable, Identifiable, Equatable {
+    let id: String
+    let sessionID: String
+    let projectID: String
+    let label: String
+    let mode: String
+    let summary: String?
+    let throughMessageID: String?
+    let messageCursor: Int
+    let planRevision: Int
+    let provider: String
+    let model: String
+    let promptPrefixHash: String
+    let worktreeHead: String
+    let tokensBefore: Int
+    let tokensAfter: Int
+    let structuredState: JSONValue?
+    let sourceCompactionSeq: Int?
+    let automatic: Bool
+    let createdAt: String
+
+    var tokenDelta: Int {
+        max(0, tokensBefore - tokensAfter)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionID = "session_id"
+        case projectID = "project_id"
+        case label
+        case mode
+        case summary
+        case throughMessageID = "through_message_id"
+        case messageCursor = "message_cursor"
+        case planRevision = "plan_revision"
+        case provider
+        case model
+        case promptPrefixHash = "prompt_prefix_hash"
+        case worktreeHead = "worktree_head"
+        case tokensBefore = "tokens_before"
+        case tokensAfter = "tokens_after"
+        case structuredState = "structured_state"
+        case sourceCompactionSeq = "source_compaction_seq"
+        case automatic
+        case createdAt = "created_at"
+    }
+}
+
+struct ContextCheckpointListResult: Codable, Sendable {
+    let sessionID: String
+    let checkpoints: [ContextCheckpoint]
+    let latestID: String?
+    let policy: ContextCheckpointPolicy
+    let limit: Int
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case checkpoints
+        case latestID = "latest_id"
+        case policy
+        case limit
+    }
+}
+
+struct ContextRestorePreflight: Codable, Sendable, Equatable {
+    let restorable: Bool
+    let errors: [String]
+    let warnings: [String]
+    let estimatedTokens: Int
+    let hardLimitTokens: Int
+    let thresholdTokens: Int
+    let activeMessages: Int
+    let planRevision: Int
+    let checkpointPlanRevision: Int
+    let provider: String
+    let model: String
+    let worktreeHead: String
+    let currentWorktreeHead: String?
+    let worktreeDescendant: Bool
+    let budgetExhausted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case restorable
+        case errors
+        case warnings
+        case estimatedTokens = "estimated_tokens"
+        case hardLimitTokens = "hard_limit_tokens"
+        case thresholdTokens = "threshold_tokens"
+        case activeMessages = "active_messages"
+        case planRevision = "plan_revision"
+        case checkpointPlanRevision = "checkpoint_plan_revision"
+        case provider
+        case model
+        case worktreeHead = "worktree_head"
+        case currentWorktreeHead = "current_worktree_head"
+        case worktreeDescendant = "worktree_descendant"
+        case budgetExhausted = "budget_exhausted"
+    }
+}
+
+struct ContextCheckpointDetailResult: Codable, Sendable, Equatable {
+    let checkpoint: ContextCheckpoint
+    let preflight: ContextRestorePreflight
+    let isActive: Bool
+    let summaryPreview: String
+
+    enum CodingKeys: String, CodingKey {
+        case checkpoint
+        case preflight
+        case isActive = "is_active"
+        case summaryPreview = "summary_preview"
+    }
+}
+
+struct ContextRestoreResult: Codable, Sendable {
+    let sessionID: String
+    let checkpointID: String
+    let mode: String
+    let throughMessageID: String?
+    let activeMessages: Int
+    let estimatedTokens: Int
+    let hardLimitTokens: Int
+    let warning: String?
+    let compactionEventSeq: Int
+    let restoredEventSeq: Int
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case checkpointID = "checkpoint_id"
+        case mode
+        case throughMessageID = "through_message_id"
+        case activeMessages = "active_messages"
+        case estimatedTokens = "estimated_tokens"
+        case hardLimitTokens = "hard_limit_tokens"
+        case warning
+        case compactionEventSeq = "compaction_event_seq"
+        case restoredEventSeq = "restored_event_seq"
+    }
+}
+
+struct ContextCheckpointDeleteResult: Codable, Sendable {
+    let sessionID: String
+    let checkpointID: String
+    let removed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case checkpointID = "checkpoint_id"
+        case removed
+    }
+}
+
+struct ContextCheckpointPruneResult: Codable, Sendable {
+    let sessionID: String
+    let candidates: Int
+    let removed: Int
+    let dryRun: Bool
+    let checkpoints: [ContextCheckpoint]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case candidates
+        case removed
+        case dryRun = "dry_run"
+        case checkpoints
+    }
+}
+
+struct ContextCheckpointPolicyResult: Codable, Sendable {
+    let projectID: String
+    let policy: ContextCheckpointPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case policy
+    }
+}
+
+extension ContextCheckpointPolicy {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        maxCheckpoints = try container.decodeIfPresent(Int.self, forKey: .maxCheckpoints) ?? 20
+        maxAgeDays = try container.decodeIfPresent(Int.self, forKey: .maxAgeDays) ?? 30
+    }
+}
+
+extension ContextCheckpoint {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        sessionID = try container.decode(String.self, forKey: .sessionID)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        label = try container.decodeIfPresent(String.self, forKey: .label) ?? ""
+        mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "manual"
+        summary = try container.decodeIfPresent(String.self, forKey: .summary)
+        throughMessageID = try container.decodeIfPresent(String.self, forKey: .throughMessageID)
+        messageCursor = try container.decodeIfPresent(Int.self, forKey: .messageCursor) ?? 0
+        planRevision = try container.decodeIfPresent(Int.self, forKey: .planRevision) ?? 0
+        provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? ""
+        model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
+        promptPrefixHash = try container.decodeIfPresent(String.self, forKey: .promptPrefixHash) ?? ""
+        worktreeHead = try container.decodeIfPresent(String.self, forKey: .worktreeHead) ?? ""
+        tokensBefore = try container.decodeIfPresent(Int.self, forKey: .tokensBefore) ?? 0
+        tokensAfter = try container.decodeIfPresent(Int.self, forKey: .tokensAfter) ?? 0
+        structuredState = try container.decodeIfPresent(JSONValue.self, forKey: .structuredState)
+        sourceCompactionSeq = try container.decodeIfPresent(Int.self, forKey: .sourceCompactionSeq)
+        automatic = try container.decodeIfPresent(Bool.self, forKey: .automatic) ?? false
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+    }
+}
+
+extension ContextCheckpointListResult {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decode(String.self, forKey: .sessionID)
+        checkpoints = try container.decodeIfPresent([ContextCheckpoint].self, forKey: .checkpoints) ?? []
+        latestID = try container.decodeIfPresent(String.self, forKey: .latestID)
+        policy = try container.decodeIfPresent(ContextCheckpointPolicy.self, forKey: .policy)
+            ?? ContextCheckpointPolicy(enabled: false, maxCheckpoints: 20, maxAgeDays: 30)
+        limit = try container.decodeIfPresent(Int.self, forKey: .limit) ?? 50
+    }
+}
+
+extension ContextRestorePreflight {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        restorable = try container.decodeIfPresent(Bool.self, forKey: .restorable) ?? false
+        errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? []
+        warnings = try container.decodeIfPresent([String].self, forKey: .warnings) ?? []
+        estimatedTokens = try container.decodeIfPresent(Int.self, forKey: .estimatedTokens) ?? 0
+        hardLimitTokens = try container.decodeIfPresent(Int.self, forKey: .hardLimitTokens) ?? 0
+        thresholdTokens = try container.decodeIfPresent(Int.self, forKey: .thresholdTokens) ?? 0
+        activeMessages = try container.decodeIfPresent(Int.self, forKey: .activeMessages) ?? 0
+        planRevision = try container.decodeIfPresent(Int.self, forKey: .planRevision) ?? 0
+        checkpointPlanRevision = try container.decodeIfPresent(Int.self, forKey: .checkpointPlanRevision) ?? 0
+        provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? ""
+        model = try container.decodeIfPresent(String.self, forKey: .model) ?? ""
+        worktreeHead = try container.decodeIfPresent(String.self, forKey: .worktreeHead) ?? ""
+        currentWorktreeHead = try container.decodeIfPresent(String.self, forKey: .currentWorktreeHead)
+        worktreeDescendant = try container.decodeIfPresent(Bool.self, forKey: .worktreeDescendant) ?? false
+        budgetExhausted = try container.decodeIfPresent(Bool.self, forKey: .budgetExhausted) ?? false
+    }
+}
+
+extension ContextCheckpointDetailResult {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        checkpoint = try container.decode(ContextCheckpoint.self, forKey: .checkpoint)
+        preflight = try container.decode(ContextRestorePreflight.self, forKey: .preflight)
+        isActive = try container.decodeIfPresent(Bool.self, forKey: .isActive) ?? false
+        summaryPreview = try container.decodeIfPresent(String.self, forKey: .summaryPreview) ?? ""
     }
 }
 

@@ -11315,3 +11315,612 @@ fn tool_output_blob_path_is_hash_only_and_case_sensitive() {
             .is_err()
     );
 }
+
+fn context_checkpoint_row(
+    session: &Session,
+    project_id: &str,
+    id: &str,
+    through_message_id: Option<&str>,
+) -> ContextCheckpoint {
+    ContextCheckpoint {
+        id: id.into(),
+        session_id: session.id.clone(),
+        project_id: project_id.into(),
+        label: format!("row {id}"),
+        mode: if through_message_id.is_some() {
+            "summary".into()
+        } else {
+            "manual".into()
+        },
+        summary: through_message_id.map(|_| "Earlier conversation summary".into()),
+        through_message_id: through_message_id.map(str::to_string),
+        message_cursor: 0,
+        plan_revision: 2,
+        provider: "queue".into(),
+        model: "test".into(),
+        prompt_prefix_hash: "prefix".into(),
+        worktree_head: "head".into(),
+        tokens_before: 9_000,
+        tokens_after: 900,
+        structured_state: Some(vp_protocol::types::ContextStructuredState {
+            goal: "store context".into(),
+            plan_revision: 2,
+            ..vp_protocol::types::ContextStructuredState::default()
+        }),
+        source_compaction_seq: None,
+        automatic: true,
+        created_at: now_rfc3339(),
+    }
+}
+
+#[test]
+fn context_checkpoint_rows_round_trip_and_compute_message_cursor() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "checkpoint rows")
+        .unwrap();
+    let first = store
+        .append_message(&session.id, "user", "one", &serde_json::json!([]), None)
+        .unwrap();
+    let second = store
+        .append_message(
+            &session.id,
+            "assistant",
+            "two",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    let checkpoint = context_checkpoint_row(
+        &session,
+        &project.id,
+        "ctx-store-1",
+        Some(second.id.as_str()),
+    );
+    let event = store
+        .record_context_checkpoint_with_event(&session.id, &checkpoint)
+        .unwrap();
+    assert_eq!(event.kind, "context.checkpointed");
+    assert_eq!(event.payload["checkpoint_id"], "ctx-store-1");
+    let listed = store.list_context_checkpoints(&session.id, 10).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].message_cursor, 2);
+    assert_eq!(
+        listed[0].through_message_id.as_deref(),
+        Some(second.id.as_str())
+    );
+    assert_eq!(listed[0].structured_state, checkpoint.structured_state);
+    assert!(listed[0].automatic);
+    assert_eq!(store.context_checkpoint_count(&session.id).unwrap(), 1);
+    assert_eq!(
+        store
+            .latest_context_checkpoint(&session.id)
+            .unwrap()
+            .unwrap()
+            .id,
+        "ctx-store-1"
+    );
+    assert_eq!(
+        store
+            .get_context_checkpoint(&session.id, "ctx-store-1")
+            .unwrap()
+            .unwrap()
+            .message_cursor,
+        2
+    );
+    assert!(
+        store
+            .get_context_checkpoint(&session.id, "missing")
+            .unwrap()
+            .is_none()
+    );
+    let _ = first;
+}
+
+#[test]
+fn context_checkpoint_compaction_and_restore_events_are_ordered() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "event order").unwrap();
+    let message = store
+        .append_message(
+            &session.id,
+            "user",
+            "boundary",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    let checkpoint = context_checkpoint_row(
+        &session,
+        &project.id,
+        "ctx-order-1",
+        Some(message.id.as_str()),
+    );
+    let (compacted, checkpointed) = store
+        .append_context_compaction_with_checkpoint(
+            &session.id,
+            serde_json::json!({
+                "mode": "summary",
+                "through_message_id": message.id,
+                "summary": "Earlier conversation summary",
+                "estimated_tokens_before": 9_000,
+                "estimated_tokens_after": 900,
+            }),
+            &checkpoint,
+        )
+        .unwrap();
+    assert_eq!(compacted.kind, "context.compacted");
+    assert_eq!(compacted.payload["context_checkpoint_id"], "ctx-order-1");
+    assert_eq!(checkpointed.seq, compacted.seq + 1);
+    let stored = store
+        .get_context_checkpoint(&session.id, "ctx-order-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.source_compaction_seq, Some(compacted.seq));
+    assert_eq!(stored.message_cursor, 1);
+
+    let (restored_compaction, restored) = store
+        .append_context_restore_events(
+            &session.id,
+            serde_json::json!({
+                "mode": "summary",
+                "through_message_id": message.id,
+                "restored_from_checkpoint": "ctx-order-1"
+            }),
+            serde_json::json!({"checkpoint_id": "ctx-order-1"}),
+        )
+        .unwrap();
+    assert_eq!(restored_compaction.seq, checkpointed.seq + 1);
+    assert_eq!(restored.seq, restored_compaction.seq + 1);
+    assert_eq!(restored.kind, "context.restored");
+    assert_eq!(restored.payload["compaction_seq"], restored_compaction.seq);
+    assert_eq!(store.list_messages(&session.id).unwrap().len(), 1);
+}
+
+#[test]
+fn context_checkpoint_delete_is_event_backed_and_idempotent() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "delete").unwrap();
+    let checkpoint = context_checkpoint_row(&session, &project.id, "ctx-delete-1", None);
+    store
+        .record_context_checkpoint_with_event(&session.id, &checkpoint)
+        .unwrap();
+    let event = store
+        .delete_context_checkpoint_with_event(&session.id, "ctx-delete-1", "manual")
+        .unwrap()
+        .expect("deletion event");
+    assert_eq!(event.kind, "context.checkpoint.deleted");
+    assert_eq!(event.payload["checkpoint_id"], "ctx-delete-1");
+    assert_eq!(event.payload["reason"], "manual");
+    assert_eq!(event.payload["checkpoint"]["mode"], "manual");
+    assert_eq!(event.payload["checkpoint"]["plan_revision"], 2);
+    assert!(
+        store
+            .get_context_checkpoint(&session.id, "ctx-delete-1")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .delete_context_checkpoint_with_event(&session.id, "ctx-delete-1", "manual")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn context_checkpoint_projection_can_be_replaced_from_replay() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "replace").unwrap();
+    let first = context_checkpoint_row(&session, &project.id, "ctx-replace-1", None);
+    let second = context_checkpoint_row(&session, &project.id, "ctx-replace-2", None);
+    store
+        .record_context_checkpoint_with_event(&session.id, &first)
+        .unwrap();
+    store
+        .replace_context_checkpoints(&session.id, &[first.clone(), second.clone()])
+        .unwrap();
+    let rows = store.list_context_checkpoints(&session.id, 10).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, first.id);
+    assert_eq!(rows[1].id, second.id);
+    // Replacing with a row from another session is refused.
+    let other_session = store.create_session(&project.id, "other").unwrap();
+    let mut wrong = context_checkpoint_row(&other_session, &project.id, "ctx-wrong", None);
+    wrong.session_id = other_session.id.clone();
+    let error = store
+        .replace_context_checkpoints(&session.id, &[wrong])
+        .unwrap_err();
+    assert!(error.to_string().contains("different session"));
+}
+
+#[test]
+fn context_checkpoint_rows_reject_oversized_and_mismatched_payloads() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "bounds").unwrap();
+    let mut checkpoint = context_checkpoint_row(&session, &project.id, "ctx-big", None);
+    checkpoint.summary = Some("x".repeat(129 * 1024));
+    let error = store
+        .record_context_checkpoint_with_event(&session.id, &checkpoint)
+        .unwrap_err();
+    assert!(error.to_string().contains("128 KiB"), "{error}");
+
+    let mut checkpoint = context_checkpoint_row(&session, &project.id, "ctx-mode", None);
+    checkpoint.mode = "unknown".into();
+    assert!(
+        store
+            .record_context_checkpoint_with_event(&session.id, &checkpoint)
+            .is_err()
+    );
+
+    let other = store.create_session(&project.id, "other").unwrap();
+    let checkpoint = context_checkpoint_row(&other, &project.id, "ctx-other", None);
+    let error = store
+        .record_context_checkpoint_with_event(&session.id, &checkpoint)
+        .unwrap_err();
+    assert!(error.to_string().contains("different session"));
+}
+
+#[test]
+fn context_checkpoint_policy_round_trips_and_is_bounded_in_storage() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    assert_eq!(
+        store.get_context_checkpoint_policy(&project.id).unwrap(),
+        ContextCheckpointPolicy::default()
+    );
+    store
+        .set_context_checkpoint_policy(
+            &project.id,
+            &ContextCheckpointPolicy {
+                enabled: true,
+                max_checkpoints: 4,
+                max_age_days: 9,
+            },
+        )
+        .unwrap();
+    let policy = store.get_context_checkpoint_policy(&project.id).unwrap();
+    assert!(policy.enabled);
+    assert_eq!(policy.max_checkpoints, 4);
+    assert_eq!(policy.max_age_days, 9);
+    let enabled = store.list_enabled_context_checkpoint_policies().unwrap();
+    assert_eq!(enabled.len(), 1);
+    assert_eq!(enabled[0].0, project.id);
+    store
+        .set_context_checkpoint_policy(
+            &project.id,
+            &ContextCheckpointPolicy {
+                enabled: false,
+                max_checkpoints: 1,
+                max_age_days: 0,
+            },
+        )
+        .unwrap();
+    assert!(
+        store
+            .list_enabled_context_checkpoint_policies()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn context_checkpoint_bundle_validation_checks_session_and_project() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "bundle").unwrap();
+    let checkpoint = context_checkpoint_row(&session, &project.id, "ctx-bundle", None);
+    let mut bundle = SessionBundle {
+        version: 1,
+        exported_at: now_rfc3339(),
+        project: project.clone(),
+        session: session.clone(),
+        events: Vec::new(),
+        agents: Vec::new(),
+        messages: Vec::new(),
+        team_plan: None,
+        todos: Vec::new(),
+        approvals: Vec::new(),
+        merge_queue: Vec::new(),
+        agent_messages: Vec::new(),
+        artifacts: Vec::new(),
+        usage: Vec::new(),
+        memories: Vec::new(),
+        memory_conflicts: Vec::new(),
+        questions: Vec::new(),
+        tasks: Vec::new(),
+        steering: Vec::new(),
+        continuations: Vec::new(),
+        recoveries: Vec::new(),
+        programs: Vec::new(),
+        program_milestones: Vec::new(),
+        program_events: Vec::new(),
+        session_runs: Vec::new(),
+        run_steps: Vec::new(),
+        run_checkpoints: Vec::new(),
+        context_checkpoints: vec![checkpoint.clone()],
+    };
+    validate_session_bundle(&bundle).unwrap();
+    bundle.context_checkpoints[0].project_id = "other-project".into();
+    let error = validate_session_bundle(&bundle).unwrap_err();
+    assert!(error.to_string().contains("different project"), "{error}");
+    bundle.context_checkpoints[0].project_id = project.id.clone();
+    bundle.context_checkpoints[0].session_id = "other-session".into();
+    let error = validate_session_bundle(&bundle).unwrap_err();
+    assert!(error.to_string().contains("belongs to session"), "{error}");
+    bundle.context_checkpoints[0].session_id = session.id.clone();
+    bundle.context_checkpoints.push(checkpoint);
+    let error = validate_session_bundle(&bundle).unwrap_err();
+    assert!(error.to_string().contains("duplicated"), "{error}");
+}
+
+#[test]
+fn context_checkpoint_list_limit_returns_the_newest_rows_oldest_first() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "list limit").unwrap();
+    for index in 0..5 {
+        let mut checkpoint =
+            context_checkpoint_row(&session, &project.id, &format!("ctx-limit-{index}"), None);
+        checkpoint.created_at = format!("2026-11-11T00:00:0{index}Z");
+        store
+            .record_context_checkpoint_with_event(&session.id, &checkpoint)
+            .unwrap();
+    }
+    let newest = store.list_context_checkpoints(&session.id, 2).unwrap();
+    assert_eq!(newest.len(), 2);
+    assert_eq!(newest[0].id, "ctx-limit-3");
+    assert_eq!(newest[1].id, "ctx-limit-4");
+    let all = store.list_context_checkpoints(&session.id, 100).unwrap();
+    assert_eq!(all.len(), 5);
+    assert_eq!(all[0].id, "ctx-limit-0");
+    assert_eq!(
+        store
+            .latest_context_checkpoint(&session.id)
+            .unwrap()
+            .unwrap()
+            .id,
+        "ctx-limit-4"
+    );
+}
+
+#[test]
+fn context_checkpoint_replacement_clears_old_rows() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "replace clears").unwrap();
+    let first = context_checkpoint_row(&session, &project.id, "ctx-old", None);
+    store
+        .record_context_checkpoint_with_event(&session.id, &first)
+        .unwrap();
+    let replacement = context_checkpoint_row(&session, &project.id, "ctx-new", None);
+    store
+        .replace_context_checkpoints(&session.id, std::slice::from_ref(&replacement))
+        .unwrap();
+    let rows = store.list_context_checkpoints(&session.id, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "ctx-new");
+    store.replace_context_checkpoints(&session.id, &[]).unwrap();
+    assert!(
+        store
+            .list_context_checkpoints(&session.id, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.context_checkpoint_count(&session.id).unwrap(), 0);
+    assert!(
+        store
+            .latest_context_checkpoint(&session.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn context_checkpoint_message_cursor_handles_first_middle_and_missing_boundaries() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "cursor").unwrap();
+    let first = store
+        .append_message(&session.id, "user", "one", &serde_json::json!([]), None)
+        .unwrap();
+    let middle = store
+        .append_message(
+            &session.id,
+            "assistant",
+            "two",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    let last = store
+        .append_message(&session.id, "user", "three", &serde_json::json!([]), None)
+        .unwrap();
+
+    for (id, boundary, expected) in [
+        ("ctx-first", first.id.as_str(), 1),
+        ("ctx-middle", middle.id.as_str(), 2),
+        ("ctx-last", last.id.as_str(), 3),
+        ("ctx-missing", "missing-message", 0),
+    ] {
+        let checkpoint = context_checkpoint_row(&session, &project.id, id, Some(boundary));
+        store
+            .record_context_checkpoint_with_event(&session.id, &checkpoint)
+            .unwrap();
+        let stored = store
+            .get_context_checkpoint(&session.id, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.message_cursor, expected, "{id}");
+    }
+}
+
+#[test]
+fn context_checkpoint_events_reach_the_jsonl_mirror() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "mirror").unwrap();
+    let checkpoint = context_checkpoint_row(&session, &project.id, "ctx-mirror", None);
+    store
+        .record_context_checkpoint_with_event(&session.id, &checkpoint)
+        .unwrap();
+    store
+        .delete_context_checkpoint_with_event(&session.id, "ctx-mirror", "prune")
+        .unwrap();
+    let mirror = store.read_event_mirror(&session.id).unwrap().unwrap();
+    assert!(
+        mirror
+            .iter()
+            .any(|event| event.kind == "context.checkpointed")
+    );
+    assert!(
+        mirror
+            .iter()
+            .any(|event| event.kind == "context.checkpoint.deleted")
+    );
+    assert!(mirror.iter().any(|event| {
+        event.kind == "context.checkpointed"
+            && event.payload["checkpoint_id"] == "ctx-mirror"
+            && event.payload["mode"] == "manual"
+    }));
+}
+
+#[test]
+fn context_compaction_checkpoint_preserves_a_provided_source_sequence() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store.create_session(&project.id, "source seq").unwrap();
+    let mut checkpoint = context_checkpoint_row(&session, &project.id, "ctx-source", None);
+    checkpoint.source_compaction_seq = Some(99);
+    let (compacted, checkpointed) = store
+        .append_context_compaction_with_checkpoint(
+            &session.id,
+            serde_json::json!({"mode": "trim"}),
+            &checkpoint,
+        )
+        .unwrap();
+    assert_eq!(compacted.payload["context_checkpoint_id"], "ctx-source");
+    assert_eq!(checkpointed.kind, "context.checkpointed");
+    let stored = store
+        .get_context_checkpoint(&session.id, "ctx-source")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.source_compaction_seq, Some(99));
+}
+
+#[test]
+fn context_checkpoint_policy_read_clamps_storage_corruption() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO project_context_checkpoint_policies
+             (project_id, enabled, max_checkpoints, max_age_days)
+             VALUES (?1, 1, 0, 999)",
+            params![project.id],
+        )
+        .unwrap();
+    }
+    let policy = store.get_context_checkpoint_policy(&project.id).unwrap();
+    assert!(policy.enabled);
+    assert_eq!(policy.max_checkpoints, 1);
+    assert_eq!(policy.max_age_days, 365);
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE project_context_checkpoint_policies
+             SET max_checkpoints = 500, max_age_days = 0
+             WHERE project_id = ?1",
+            params![project.id],
+        )
+        .unwrap();
+    }
+    let policy = store.get_context_checkpoint_policy(&project.id).unwrap();
+    assert_eq!(policy.max_checkpoints, 100);
+    assert_eq!(policy.max_age_days, 0);
+}
+
+#[test]
+fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "projection import")
+        .unwrap();
+    let checkpoint = context_checkpoint_row(&session, &project.id, "ctx-projection-only", None);
+    let bundle = SessionBundle {
+        version: 1,
+        exported_at: now_rfc3339(),
+        project: project.clone(),
+        session: session.clone(),
+        events: Vec::new(),
+        agents: Vec::new(),
+        messages: Vec::new(),
+        team_plan: None,
+        todos: Vec::new(),
+        approvals: Vec::new(),
+        merge_queue: Vec::new(),
+        agent_messages: Vec::new(),
+        artifacts: Vec::new(),
+        usage: Vec::new(),
+        memories: Vec::new(),
+        memory_conflicts: Vec::new(),
+        questions: Vec::new(),
+        tasks: Vec::new(),
+        steering: Vec::new(),
+        continuations: Vec::new(),
+        recoveries: Vec::new(),
+        programs: Vec::new(),
+        program_milestones: Vec::new(),
+        program_events: Vec::new(),
+        session_runs: Vec::new(),
+        run_steps: Vec::new(),
+        run_checkpoints: Vec::new(),
+        context_checkpoints: vec![checkpoint.clone()],
+    };
+    let imported = Store::open(data.path().join("imported")).unwrap();
+    imported.import_session_bundle(&bundle).unwrap();
+    let events = imported.list_all_events(&session.id).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "context.checkpointed"
+            && event.payload["checkpoint_id"] == "ctx-projection-only"
+            && event.payload["label"] == checkpoint.label
+    }));
+    let rows = imported.list_context_checkpoints(&session.id, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "ctx-projection-only");
+}

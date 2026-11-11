@@ -828,6 +828,122 @@ actor CoreClient {
         .decode(SessionContextStatus.self)
     }
 
+    func contextCheckpoints(
+        sessionID: String,
+        limit: Int? = nil
+    ) async throws -> ContextCheckpointListResult {
+        try await request(
+            method: "session.context.checkpoints",
+            params: [
+                "session_id": .string(sessionID),
+                "limit": limit.map { .number(Double($0)) } ?? .null,
+            ]
+        )
+        .decode(ContextCheckpointListResult.self)
+    }
+
+    func contextCheckpointDetail(
+        sessionID: String,
+        checkpointID: String
+    ) async throws -> ContextCheckpointDetailResult {
+        try await request(
+            method: "session.context.checkpoint.detail",
+            params: [
+                "session_id": .string(sessionID),
+                "checkpoint_id": .string(checkpointID),
+            ]
+        )
+        .decode(ContextCheckpointDetailResult.self)
+    }
+
+    func createContextCheckpoint(
+        sessionID: String,
+        label: String?
+    ) async throws -> ContextCheckpoint {
+        try await request(
+            method: "session.context.checkpoint",
+            params: [
+                "session_id": .string(sessionID),
+                "label": label.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(ContextCheckpoint.self)
+    }
+
+    func restoreContextCheckpoint(
+        sessionID: String,
+        checkpointID: String,
+        force: Bool
+    ) async throws -> ContextRestoreResult {
+        try await request(
+            method: "session.context.restore",
+            params: [
+                "session_id": .string(sessionID),
+                "checkpoint_id": .string(checkpointID),
+                "force": .bool(force),
+            ]
+        )
+        .decode(ContextRestoreResult.self)
+    }
+
+    func deleteContextCheckpoint(
+        sessionID: String,
+        checkpointID: String
+    ) async throws -> ContextCheckpointDeleteResult {
+        try await request(
+            method: "session.context.checkpoint.delete",
+            params: [
+                "session_id": .string(sessionID),
+                "checkpoint_id": .string(checkpointID),
+            ]
+        )
+        .decode(ContextCheckpointDeleteResult.self)
+    }
+
+    func pruneContextCheckpoints(
+        sessionID: String,
+        olderThanDays: Int?,
+        keepLatest: Int?,
+        dryRun: Bool
+    ) async throws -> ContextCheckpointPruneResult {
+        try await request(
+            method: "session.context.checkpoint.prune",
+            params: [
+                "session_id": .string(sessionID),
+                "older_than_days": olderThanDays.map { .number(Double($0)) } ?? .null,
+                "keep_latest": keepLatest.map { .number(Double($0)) } ?? .null,
+                "dry_run": .bool(dryRun),
+            ]
+        )
+        .decode(ContextCheckpointPruneResult.self)
+    }
+
+    func contextCheckpointPolicy(projectID: String) async throws -> ContextCheckpointPolicyResult {
+        try await request(
+            method: "session.context.policy",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ContextCheckpointPolicyResult.self)
+    }
+
+    func setContextCheckpointPolicy(
+        projectID: String,
+        policy: ContextCheckpointPolicy
+    ) async throws -> ContextCheckpointPolicyResult {
+        try await request(
+            method: "session.context.policy.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": .object([
+                    "enabled": .bool(policy.enabled),
+                    "max_checkpoints": .number(Double(policy.maxCheckpoints)),
+                    "max_age_days": .number(Double(policy.maxAgeDays)),
+                ]),
+            ]
+        )
+        .decode(ContextCheckpointPolicyResult.self)
+    }
+
     func sessionCache(sessionID: String) async throws -> SessionCacheStatus {
         try await request(
             method: "session.cache",
