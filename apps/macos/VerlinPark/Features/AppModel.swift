@@ -599,6 +599,9 @@ final class AppModel {
     var updateDownloadBusy = false
     var updateDownloadResult: UpdateDownloadResult?
     var updateDownloadError: String?
+    var backupStatus: BackupStatusResult?
+    var backupStatusBusy = false
+    var backupStatusError: String?
     var doctorReport: DoctorReport?
     var doctorBusy = false
     var doctorStatus: String?
@@ -7344,6 +7347,17 @@ final class AppModel {
             updateResult = try await core.checkForUpdates()
         } catch {
             updateError = error.localizedDescription
+        }
+    }
+
+    func refreshBackupStatus() async {
+        backupStatusBusy = true
+        backupStatusError = nil
+        defer { backupStatusBusy = false }
+        do {
+            backupStatus = try await core.backupStatus()
+        } catch {
+            backupStatusError = error.localizedDescription
         }
     }
 

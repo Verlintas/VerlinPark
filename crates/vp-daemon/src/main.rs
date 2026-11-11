@@ -3070,6 +3070,15 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "backup.status" => {
+            match parse_params::<vp_protocol::types::BackupStatusParams>(request.params) {
+                Ok(_) => match backup_status(&state.data_dir) {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "dashboard.snapshot" => match parse_params::<DashboardParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -4179,6 +4188,66 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
     response
 }
 
+/// Read-only backup signing status. Never returns private key material.
+fn backup_status(data_dir: &Path) -> Result<vp_protocol::types::BackupStatusResult> {
+    use vp_core::backup::anchor::AnchorStore;
+    use vp_core::backup::signing::{Keyring, default_key_dir};
+    use vp_protocol::types::{BackupAnchorStatus, BackupSigningKeyStatus, BackupStatusResult};
+
+    let anchor = AnchorStore::new(data_dir).summary()?;
+    let key_dir = default_key_dir();
+    let keyring_path = key_dir.join("keyring.json");
+    let keyring = Keyring::load_optional(&key_dir)?;
+    let (keyring_present, active_key_id, keys) = match &keyring {
+        Some(keyring) => {
+            let summary = keyring.summary();
+            (
+                true,
+                summary.active_key_id.clone(),
+                summary
+                    .keys
+                    .into_iter()
+                    .map(|key| BackupSigningKeyStatus {
+                        key_id: key.key_id,
+                        algorithm: key.algorithm,
+                        public_key_b64: key.public_key_b64,
+                        created_at: key.created_at,
+                        retired_at: key.retired_at,
+                        active: key.active,
+                    })
+                    .collect(),
+            )
+        }
+        None => (false, None, Vec::new()),
+    };
+    Ok(BackupStatusResult {
+        anchor_path: anchor.path,
+        anchor_present: anchor.present,
+        anchor_updated_at: anchor.updated_at,
+        repositories: anchor
+            .repositories
+            .into_iter()
+            .map(|entry| BackupAnchorStatus {
+                repository_id: entry.repository_id,
+                repository_path: entry.repository_path,
+                highest_generation: entry.highest_generation,
+                last_verified_generation: entry.last_verified_generation,
+                last_snapshot_id: entry.last_snapshot_id,
+                last_operation: entry.last_operation,
+                first_seen_at: entry.first_seen_at,
+                last_verified_at: entry.last_verified_at,
+            })
+            .collect(),
+        keyring_path: keyring_path.display().to_string(),
+        keyring_present,
+        active_key_id,
+        key_count: keys.len(),
+        keys,
+        signed_repository_formats: vec![3],
+        note: "Backup signing, verification, and restore are CLI operations. The local anchor is not tamper-proof against this OS user or root and is not remote attestation, KMS, escrow, or a signed timestamp.".to_string(),
+    })
+}
+
 fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> std::result::Result<T, RpcError> {
     serde_json::from_value(params)
         .map_err(|error| RpcError::new(codes::INVALID_PARAMS, error.to_string()))
@@ -5058,6 +5127,27 @@ mod process_rpc_tests {
         )
         .await;
         assert!(missing.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn backup_status_reports_anchor_without_secret_material() {
+        let data = TempDir::new().unwrap();
+        let repository_id = "0190f000-0000-7000-8000-000000000000";
+        let anchor = vp_core::backup::anchor::AnchorStore::new(data.path());
+        anchor
+            .record_verified(repository_id, "/backups/repo", None, 4, "verify", false)
+            .unwrap();
+        let status = backup_status(data.path()).unwrap();
+        assert!(status.anchor_present);
+        assert_eq!(status.repositories.len(), 1);
+        assert_eq!(status.repositories[0].highest_generation, 4);
+        assert_eq!(status.repositories[0].last_verified_generation, 4);
+        assert_eq!(status.signed_repository_formats, vec![3]);
+        assert!(status.note.contains("not tamper-proof"));
+        let rendered = serde_json::to_string(&status).unwrap();
+        assert!(!rendered.contains("seed_b64"));
+        assert!(!rendered.contains("private_key"));
+        assert!(!rendered.contains("passphrase"));
     }
 }
 

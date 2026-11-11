@@ -1755,6 +1755,76 @@ struct AboutSettingsView: View {
             }
             .font(.system(size: 11, design: .monospaced))
 
+            Divider().opacity(0.3).frame(maxWidth: 360)
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 8) {
+                    Label(L10n.t("Backup integrity"), systemImage: "checkmark.shield")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    Spacer()
+                    Button {
+                        Task { await model.refreshBackupStatus() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.mini)
+                    .help(L10n.t("Refresh backup status"))
+                    .disabled(model.backupStatusBusy)
+                }
+                if model.backupStatusBusy, model.backupStatus == nil {
+                    ProgressView().controlSize(.small)
+                } else if let status = model.backupStatus {
+                    Text(
+                        "Signed repositories: format v\(status.signedRepositoryFormats.map(String.init).joined(separator: ", ")) · unsigned v2 remains readable"
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    Text(
+                        status.activeKeyID.map { "Active signing key: \($0)" } ?? L10n
+                            .t("No signing key configured")
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    Text(
+                        status.keyringPresent
+                            ? "Keyring: \(status.keyCount) public key\(status.keyCount == 1 ? "" : "s")"
+                            : L10n.t("No keyring yet")
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    if let latest = status.repositories
+                        .max(by: { $0.highestGeneration < $1.highestGeneration })
+                    {
+                        Text(
+                            status.anchorPresent
+                                ? "Local anchor: generation \(latest.highestGeneration) · \(status.repositories.count) repositor\(status.repositories.count == 1 ? "y" : "ies")"
+                                : L10n.t("No verified backup anchor yet")
+                        )
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    } else {
+                        Text(L10n.t("No verified backup anchor yet"))
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(status.note)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: 420, alignment: .leading)
+                } else if let error = model.backupStatusError {
+                    Text(error)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: 420, alignment: .leading)
+                }
+            }
+            .frame(maxWidth: 420, alignment: .leading)
+            .onAppear {
+                if model.backupStatus == nil, !model.backupStatusBusy {
+                    Task { await model.refreshBackupStatus() }
+                }
+            }
+
             Divider().opacity(0.3).frame(maxWidth: 320)
             VStack(spacing: 8) {
                 HStack(spacing: 10) {

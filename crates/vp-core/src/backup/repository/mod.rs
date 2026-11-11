@@ -1,4 +1,4 @@
-//! V2 backup repository: encrypted, incremental, content-addressed snapshots.
+//! V2/V3 backup repository: encrypted, incremental, content-addressed snapshots.
 //!
 //! # What this adds
 //!
@@ -12,10 +12,15 @@
 //!   when the caller explicitly asks);
 //! - writes immutable snapshot manifests with a linear parent chain and a
 //!   monotonic sequence number;
+//! - optionally signs repository metadata and every snapshot manifest with
+//!   Ed25519 (format v3), while v2 repositories remain readable and are
+//!   reported as unsigned;
 //! - reuses existing blobs for incremental snapshots and reports exact
 //!   logical, stored, and deduplicated byte counts;
-//! - validates the entire chain and every blob before an atomic data-directory
-//!   restore;
+//! - validates the entire chain, signatures, and every blob before an atomic
+//!   data-directory restore;
+//! - records the verified generation in a local anti-rollback anchor and
+//!   rejects older generations unless explicitly allowed;
 //! - prunes old snapshots only after validating retained references, with a
 //!   dry-run and tombstone-based parent handling.
 //!
@@ -25,7 +30,9 @@
 //! and zeroized. The CLI never accepts a passphrase argument: it reads an
 //! environment variable selected by name or a permissions-checked file. No
 //! passphrase, derived key, or plaintext key material is written to repository
-//! metadata, manifests, logs, nonce records, or error messages.
+//! metadata, manifests, logs, nonce records, or error messages. Ed25519 signing
+//! keys are owned by [`crate::backup::signing`]; only public key ids and
+//! signatures enter the repository.
 //!
 //! # Offline and daemon safety
 //!
@@ -58,6 +65,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 
+use crate::backup::anchor::{AnchorStore, AnchorUpdate, RollbackCheck};
+use crate::backup::signing::{Keyring, KeyringSummary, SigningCredential};
 use crate::backup::{
     ArchiveKind, DATABASE_FILENAME, ScratchPath, classify_archive_path, collect_backup_sources,
     copy_private, daemon_appears_running, hash_file, non_empty_parent, unique_sibling,
@@ -69,8 +78,18 @@ use super::crypto::{KdfParameters, RepositoryCrypto, sha256_hex};
 
 mod blob;
 mod format;
+mod signing;
+mod verify;
 
+pub use crate::backup::error::{BackupSecurityCode, BackupSecurityError};
 pub use blob::Compression;
+pub use signing::{ManifestSignature, SignatureCheck, SignatureStatus};
+pub use verify::{RepositoryVerifyOptions, RepositoryVerifyReport, verify_repository};
+
+use signing::{
+    build_head, check_signed_head, configure_signing, entries_sha256, sign_repository_metadata,
+    sign_snapshot_manifest, signing_summary, tombstones_sha256,
+};
 
 use blob::{
     BLOB_CHUNK_RECORD_BYTES, BLOB_HEADER_BYTES, inspect_blob, materialize_blob, seal_blob_file,
@@ -78,11 +97,11 @@ use blob::{
 };
 use format::{
     BLOBS_DIR, EVENTS_FILENAME, LOCK_FILENAME, MAX_KEEP, METADATA_FILENAME, NONCES_FILENAME,
-    PrunedSnapshot, REPOSITORY_FORMAT_VERSION, RepositoryMetadata, SNAPSHOT_FORMAT_VERSION,
-    SNAPSHOTS_DIR, SnapshotEntry, SnapshotManifest, SnapshotTotals, TEMP_DIR, blob_hash_from_name,
-    blob_path, canonical_metadata_bytes, find_snapshot, is_snapshot_id, load_snapshot,
-    new_metadata, parse_metadata, read_metadata_bytes, scan_blob_hashes, scan_snapshots,
-    sign_metadata, snapshot_manifest_id_from_name, snapshot_manifest_path, validate_chain,
+    PrunedSnapshot, RepositoryMetadata, SNAPSHOT_FORMAT_VERSION, SNAPSHOTS_DIR, SnapshotEntry,
+    SnapshotManifest, SnapshotTotals, TEMP_DIR, blob_hash_from_name, blob_path,
+    canonical_metadata_bytes, find_snapshot, is_snapshot_id, load_snapshot, new_metadata,
+    parse_metadata, read_metadata_bytes, scan_blob_hashes, scan_snapshots, sign_metadata,
+    snapshot_manifest_id_from_name, snapshot_manifest_path, validate_chain,
     verify_metadata_authenticity, write_metadata_atomic,
 };
 
@@ -107,6 +126,27 @@ pub struct RepositoryBackupOptions {
     pub compression: Compression,
     pub encryption: RepositoryEncryption,
     pub kdf: KdfConfig,
+    /// Sign the repository with Ed25519. `None` keeps a v2 unsigned repository
+    /// (or refuses to append to an existing v3 signed repository).
+    pub signing: Option<RepositorySigningOptions>,
+}
+
+/// Keyring-backed signing selection for a new or existing repository.
+#[derive(Clone)]
+pub struct RepositorySigningOptions {
+    pub keyring: Keyring,
+    /// Explicit key id; `None` selects the keyring's active key.
+    pub key_id: Option<String>,
+}
+
+impl std::fmt::Debug for RepositorySigningOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepositorySigningOptions")
+            .field("keyring", &self.keyring.summary().path)
+            .field("key_id", &self.key_id)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for RepositoryBackupOptions {
@@ -124,6 +164,7 @@ impl std::fmt::Debug for RepositoryBackupOptions {
                 },
             )
             .field("kdf", &self.kdf)
+            .field("signing", &self.signing)
             .finish()
     }
 }
@@ -161,6 +202,14 @@ pub struct RepositoryBackupReport {
     pub kdf: Option<KdfSummary>,
     pub app_version: String,
     pub protocol_version: u32,
+    #[serde(default)]
+    pub signed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_algorithm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_update: Option<AnchorUpdate>,
 }
 
 /// Summary of one snapshot for `backup-list`.
@@ -180,6 +229,12 @@ pub struct RepositorySnapshotSummary {
     pub unique_blobs: usize,
     pub manifest_bytes: u64,
     pub manifest_sha256: String,
+    #[serde(default)]
+    pub signed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
+    #[serde(default)]
+    pub signature_status: String,
 }
 
 /// Validation results exposed by list and prune reports.
@@ -195,6 +250,14 @@ pub struct RepositoryValidationReport {
     pub blobs_verified: usize,
     pub blobs_corrupt: usize,
     pub issues: Vec<String>,
+    #[serde(default)]
+    pub signature_verification: String,
+    #[serde(default)]
+    pub signed_snapshots: usize,
+    #[serde(default)]
+    pub unsigned_snapshots: usize,
+    #[serde(default)]
+    pub metadata_signature: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -214,6 +277,12 @@ pub struct RepositoryListReport {
     pub unreferenced_blob_bytes: u64,
     pub nonce_records: usize,
     pub validation: RepositoryValidationReport,
+    #[serde(default)]
+    pub signed: bool,
+    #[serde(default)]
+    pub signing_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyring: Option<KeyringSummary>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,6 +305,27 @@ pub struct RepositoryRestoreReport {
     pub stored_blob_bytes: u64,
     pub replaced_existing: bool,
     pub kdf: Option<KdfSummary>,
+    #[serde(default)]
+    pub signed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
+    #[serde(default)]
+    pub signature_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<RollbackCheck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_update: Option<AnchorUpdate>,
+    #[serde(default)]
+    pub head_issues: Vec<String>,
+}
+
+/// Options for a verified repository restore.
+#[derive(Default)]
+pub struct RepositoryRestoreOptions<'a> {
+    pub passphrase: Option<&'a Passphrase>,
+    pub keyring: Option<&'a Keyring>,
+    pub anchor: Option<&'a AnchorStore>,
+    pub allow_rollback: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -262,6 +352,10 @@ pub struct RepositoryPruneReport {
     pub protected_bytes: u64,
     pub reclaimed_bytes: u64,
     pub validation: RepositoryValidationReport,
+    #[serde(default)]
+    pub signed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
 }
 
 /// Create one snapshot in a v2 repository.
@@ -284,8 +378,29 @@ pub fn create_repository_backup(
     reject_repository_inside_data(&repository_candidate, &data_canonical)?;
     let root = repository_root(repository, true)?;
     reject_repository_inside_data(&root, &data_canonical)?;
-    let session = open_for_write(&root, &options)?;
-    let snapshots = scan_snapshots(&session.root, &session.metadata, session.crypto.as_ref())?;
+    let credential = match &options.signing {
+        Some(signing) => Some(
+            signing
+                .keyring
+                .signing_credential(signing.key_id.as_deref())
+                .context("loading the backup signing credential")?,
+        ),
+        None => None,
+    };
+    let keyring = options.signing.as_ref().map(|signing| &signing.keyring);
+    let mut session = open_for_write(
+        &root,
+        &options.encryption,
+        options.kdf,
+        keyring,
+        credential.as_ref(),
+    )?;
+    let snapshots = scan_snapshots(
+        &session.root,
+        &session.metadata,
+        session.crypto.as_ref(),
+        session.keyring.as_ref(),
+    )?;
     let latest = snapshots.last();
     if options.incremental && latest.is_none() {
         bail!(
@@ -293,6 +408,9 @@ pub fn create_repository_backup(
              run a full repository backup first",
             session.root.display()
         );
+    }
+    if session.metadata.format_version >= 3 && credential.is_none() {
+        return Err(BackupSecurityError::SigningRequired.into());
     }
     let parent = latest.map(|snapshot| snapshot.manifest.snapshot_id.clone());
     let parent_hashes: BTreeSet<String> = latest
@@ -460,7 +578,7 @@ pub fn create_repository_backup(
         bail!("backup written bytes exceed logical bytes");
     }
     let deduplicated_bytes = bytes - written_bytes;
-    let manifest = SnapshotManifest {
+    let mut manifest = SnapshotManifest {
         kind: format::SNAPSHOT_KIND.to_string(),
         format_version: SNAPSHOT_FORMAT_VERSION,
         snapshot_id: snapshot_id.clone(),
@@ -483,8 +601,12 @@ pub fn create_repository_backup(
             entries: relatives.len() as u64,
             bytes,
         },
+        signature: None,
     };
     format::validate_manifest(&manifest, &session.metadata)?;
+    if let Some(credential) = credential.as_ref() {
+        sign_snapshot_manifest(&session.metadata.repository_id, credential, &mut manifest)?;
+    }
 
     let manifest_json =
         serde_json::to_vec(&manifest).context("serializing backup snapshot manifest")?;
@@ -519,6 +641,32 @@ pub fn create_repository_backup(
     publish_immutable(&manifest_path, &mut manifest_scratch)?;
     let manifest_sha256 = sha256_hex(&sealed_manifest.bytes);
 
+    if let Some(credential) = credential.as_ref() {
+        let required = session
+            .metadata
+            .signing
+            .as_ref()
+            .map(|signing| signing.required)
+            .unwrap_or(false);
+        configure_signing(&mut session.metadata, credential, required);
+        let head = format::RepositoryHead {
+            generation: sequence,
+            latest_snapshot_id: manifest.snapshot_id.clone(),
+            latest_manifest_sha256: manifest_sha256.clone(),
+            latest_parent: parent.clone(),
+            latest_entries_sha256: entries_sha256(&manifest)?,
+            tombstones_sha256: tombstones_sha256(&session.metadata)?,
+            updated_at: now_rfc3339(),
+        };
+        if let Some(signing) = session.metadata.signing.as_mut() {
+            signing.head = Some(head);
+        }
+        format::sign_metadata(&mut session.metadata, session.crypto.as_ref())?;
+        sign_repository_metadata(&mut session.metadata, credential)?;
+        format::write_metadata_atomic(&session.root, &session.metadata)?;
+    }
+    let (signed, signing_key_id, signature_algorithm) = signing_summary(&session.metadata);
+
     let sessions = manifest
         .entries
         .iter()
@@ -534,9 +682,30 @@ pub fn create_repository_backup(
             )
         })
         .count();
+    let anchor_update = match AnchorStore::new(&data_canonical).record_verified(
+        &session.metadata.repository_id,
+        &session.root.to_string_lossy(),
+        Some(&manifest.snapshot_id),
+        sequence,
+        "backup",
+        // A newly written snapshot is an authored event, not a replay. It may
+        // have a lower sequence after an explicit rollback restore; record it
+        // without lowering the high-water mark.
+        true,
+    ) {
+        Ok(update) => Some(update),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "backup snapshot {} was written but the anti-rollback anchor could not be updated",
+                    manifest.snapshot_id
+                )
+            });
+        }
+    };
     let report = RepositoryBackupReport {
         repository: session.root.to_string_lossy().to_string(),
-        format_version: REPOSITORY_FORMAT_VERSION,
+        format_version: session.metadata.format_version,
         snapshot_format_version: SNAPSHOT_FORMAT_VERSION,
         snapshot_id: manifest.snapshot_id.clone(),
         sequence,
@@ -563,6 +732,10 @@ pub fn create_repository_backup(
         kdf: session.metadata.encryption.summary(),
         app_version: manifest.app_version.clone(),
         protocol_version: manifest.protocol_version,
+        signed,
+        signing_key_id: signing_key_id.clone(),
+        signature_algorithm,
+        anchor_update,
     };
     if let Err(error) = append_event(
         &session.root,
@@ -583,6 +756,8 @@ pub fn create_repository_backup(
             "manifest_plaintext_sha256": report.manifest_plaintext_sha256,
             "app_version": report.app_version,
             "protocol_version": report.protocol_version,
+            "signed": report.signed,
+            "signing_key_id": report.signing_key_id,
         }),
     ) {
         tracing::warn!(%error, "backup snapshot written but its audit event could not be appended");
@@ -600,16 +775,38 @@ pub fn list_repository_snapshots(
     passphrase: Option<&Passphrase>,
     verify_blobs: bool,
 ) -> Result<RepositoryListReport> {
+    list_repository_snapshots_with_keyring(repository, passphrase, None, verify_blobs)
+}
+
+/// List and validate snapshots with an optional public-key keyring.
+pub fn list_repository_snapshots_with_keyring(
+    repository: &Path,
+    passphrase: Option<&Passphrase>,
+    keyring: Option<&Keyring>,
+    verify_blobs: bool,
+) -> Result<RepositoryListReport> {
     let root = repository_root(repository, false)?;
-    let session = open_for_read(&root, passphrase)?;
-    let snapshots = scan_snapshots(&session.root, &session.metadata, session.crypto.as_ref())?;
+    let session = open_for_read(&root, passphrase, keyring)?;
+    let snapshots = scan_snapshots(
+        &session.root,
+        &session.metadata,
+        session.crypto.as_ref(),
+        session.keyring.as_ref(),
+    )?;
     let on_disk = scan_blob_hashes(&session.root)?;
     let mut issues = Vec::new();
     let mut summaries = Vec::with_capacity(snapshots.len());
     let mut referenced: BTreeMap<String, (u64, Compression)> = BTreeMap::new();
     let mut logical_bytes = 0u64;
+    let mut signed_snapshots = 0usize;
+    let mut unsigned_snapshots = 0usize;
     for snapshot in &snapshots {
         let blobs = snapshot.blob_hashes();
+        if snapshot.signature_check.is_verified() {
+            signed_snapshots += 1;
+        } else {
+            unsigned_snapshots += 1;
+        }
         for entry in &snapshot.manifest.entries {
             logical_bytes = logical_bytes
                 .checked_add(entry.size)
@@ -648,6 +845,9 @@ pub fn list_repository_snapshots(
             unique_blobs: blobs.len(),
             manifest_bytes: snapshot.manifest_envelope_bytes,
             manifest_sha256: snapshot.manifest_sha256.clone(),
+            signed: snapshot.signature_check.is_verified(),
+            signing_key_id: snapshot.signing_key_id().map(str::to_string),
+            signature_status: snapshot.signature_status().to_string(),
         });
     }
 
@@ -698,6 +898,10 @@ pub fn list_repository_snapshots(
         .fold(0u64, |total, (_, size)| total.saturating_add(**size));
     let unique_plaintext_bytes = referenced.values().map(|(size, _)| *size).sum();
     let nonce_table_valid = true;
+    let metadata_check =
+        signing::verify_metadata_signature(&session.metadata, session.keyring.as_ref())?;
+    let signed = session.metadata.format_version >= 3;
+    let signing_status = if signed { "signed" } else { "unsigned" }.to_string();
     let valid = blobs_missing == 0 && blobs_corrupt == 0 && issues.is_empty();
     Ok(RepositoryListReport {
         repository: session.root.to_string_lossy().to_string(),
@@ -725,7 +929,18 @@ pub fn list_repository_snapshots(
             blobs_verified,
             blobs_corrupt,
             issues,
+            signature_verification: if signed {
+                "manifest-signatures".to_string()
+            } else {
+                "unsigned".to_string()
+            },
+            signed_snapshots,
+            unsigned_snapshots,
+            metadata_signature: metadata_check.status,
         },
+        signed,
+        signing_status,
+        keyring: session.keyring.as_ref().map(Keyring::summary),
     })
 }
 
@@ -737,14 +952,87 @@ pub fn restore_repository_snapshot(
     force: bool,
     passphrase: Option<&Passphrase>,
 ) -> Result<RepositoryRestoreReport> {
+    restore_repository_snapshot_checked(
+        repository,
+        snapshot_id,
+        data_dir,
+        force,
+        RepositoryRestoreOptions {
+            passphrase,
+            ..RepositoryRestoreOptions::default()
+        },
+    )
+}
+
+/// Restore with signature verification, rollback protection, and an audit anchor.
+pub fn restore_repository_snapshot_checked(
+    repository: &Path,
+    snapshot_id: &str,
+    data_dir: &Path,
+    force: bool,
+    options: RepositoryRestoreOptions<'_>,
+) -> Result<RepositoryRestoreReport> {
     if !is_snapshot_id(snapshot_id) {
         bail!("invalid backup snapshot id {snapshot_id:?}");
     }
     let root = repository_root(repository, false)?;
-    let session = open_for_read(&root, passphrase)?;
-    let snapshots = scan_snapshots(&session.root, &session.metadata, session.crypto.as_ref())?;
+    let session = open_for_read(&root, options.passphrase, options.keyring)?;
+    let snapshots = scan_snapshots(
+        &session.root,
+        &session.metadata,
+        session.crypto.as_ref(),
+        session.keyring.as_ref(),
+    )?;
     let snapshot = find_snapshot(&snapshots, snapshot_id)?;
+    let head_issues = check_signed_head(&session.metadata, &snapshots);
+    let rollback = match options.anchor {
+        Some(anchor) => match anchor.check(
+            &session.metadata.repository_id,
+            snapshot.sequence(),
+            options.allow_rollback,
+        ) {
+            Ok(check) => Some(check),
+            Err(error) => {
+                if error
+                    .downcast_ref::<BackupSecurityError>()
+                    .is_some_and(|error| {
+                        matches!(error, BackupSecurityError::RollbackDetected { .. })
+                    })
+                    && let Err(event_error) = append_event(
+                        &session.root,
+                        "snapshot.rollback_rejected",
+                        json!({
+                            "repository_id": session.metadata.repository_id,
+                            "generation": snapshot.sequence(),
+                            "operation": "restore",
+                            "allow_rollback": options.allow_rollback,
+                            "issues": format!("{error:#}"),
+                        }),
+                    )
+                {
+                    tracing::warn!(%event_error, "rollback rejection audit event could not be appended");
+                }
+                return Err(error);
+            }
+        },
+        None => None,
+    };
     let data_dir = absolute_path(data_dir)?;
+    // The anchor normally lives inside the data directory. A restore swaps the
+    // whole directory, so preserve the anchor bytes across the swap before
+    // recording the restored generation; otherwise an explicit rollback would
+    // accidentally reset the high-water mark.
+    let preserved_anchor = match options.anchor {
+        Some(anchor) => {
+            let anchor_path = absolute_path(anchor.path())?;
+            if anchor_path.starts_with(&data_dir) {
+                Some(anchor.read()?)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
     let future_target = resolve_future_path(&data_dir)?;
     reject_repository_inside_data(&session.root, &future_target)?;
     let (existing, target_parent) = prepare_restore_target(&data_dir, force)?;
@@ -827,6 +1115,25 @@ pub fn restore_repository_snapshot(
             "restored data but could not remove the previous target"
         );
     }
+    let anchor_update = match options.anchor {
+        Some(anchor) => {
+            if let Some(preserved) = &preserved_anchor {
+                anchor.write(preserved).with_context(
+                    || "restoring the anti-rollback anchor after the data-directory swap",
+                )?;
+            }
+            Some(anchor.record_verified(
+                &session.metadata.repository_id,
+                &session.root.to_string_lossy(),
+                Some(snapshot.id()),
+                snapshot.sequence(),
+                "restore",
+                options.allow_rollback,
+            )?)
+        }
+        None => None,
+    };
+    let (signed, signing_key_id, _) = signing_summary(&session.metadata);
     let report = RepositoryRestoreReport {
         repository: session.root.to_string_lossy().to_string(),
         snapshot_id: snapshot.id().to_string(),
@@ -846,6 +1153,12 @@ pub fn restore_repository_snapshot(
         stored_blob_bytes,
         replaced_existing,
         kdf: session.metadata.encryption.summary(),
+        signed,
+        signing_key_id,
+        signature_status: snapshot.signature_status().to_string(),
+        rollback,
+        anchor_update,
+        head_issues,
     };
     if let Err(error) = append_event(
         &session.root,
@@ -857,6 +1170,9 @@ pub fn restore_repository_snapshot(
             "replaced_existing": report.replaced_existing,
             "entries": report.entries,
             "bytes": report.bytes,
+            "signed": report.signed,
+            "signing_key_id": report.signing_key_id,
+            "rollback_allowed": report.rollback.as_ref().map(|rollback| rollback.rollback),
         }),
     ) {
         tracing::warn!(%error, "restore completed but its audit event could not be appended");
@@ -875,6 +1191,18 @@ pub fn prune_repository(
     dry_run: bool,
     passphrase: Option<&Passphrase>,
 ) -> Result<RepositoryPruneReport> {
+    prune_repository_with_signing(repository, keep, dry_run, passphrase, None, None)
+}
+
+/// Prune snapshots and re-sign the repository metadata when it is signed.
+pub fn prune_repository_with_signing(
+    repository: &Path,
+    keep: usize,
+    dry_run: bool,
+    passphrase: Option<&Passphrase>,
+    keyring: Option<&Keyring>,
+    signing_key: Option<&SigningCredential>,
+) -> Result<RepositoryPruneReport> {
     if keep == 0 {
         bail!("--keep must be at least 1; prune never removes the latest snapshot boundary");
     }
@@ -883,11 +1211,19 @@ pub fn prune_repository(
     }
     let root = repository_root(repository, false)?;
     let session = if dry_run {
-        open_for_read(&root, passphrase)?
+        open_for_read(&root, passphrase, keyring)?
     } else {
-        open_for_write_existing(&root, passphrase)?
+        open_for_write_existing(&root, passphrase, keyring)?
     };
-    let snapshots = scan_snapshots(&session.root, &session.metadata, session.crypto.as_ref())?;
+    let snapshots = scan_snapshots(
+        &session.root,
+        &session.metadata,
+        session.crypto.as_ref(),
+        session.keyring.as_ref(),
+    )?;
+    if !dry_run && session.metadata.format_version >= 3 && signing_key.is_none() {
+        return Err(BackupSecurityError::SigningRequired.into());
+    }
     if snapshots.is_empty() {
         bail!("backup repository has no snapshots to prune");
     }
@@ -946,6 +1282,11 @@ pub fn prune_repository(
         .map(|snapshot| snapshot.manifest_envelope_bytes)
         .sum::<u64>()
         .saturating_add(unreferenced_bytes);
+    let signed_snapshots = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.signature_check.is_verified())
+        .count();
+    let unsigned_snapshots = snapshots.len() - signed_snapshots;
     let validation = RepositoryValidationReport {
         valid: true,
         manifests_valid: true,
@@ -957,7 +1298,20 @@ pub fn prune_repository(
         blobs_verified: 0,
         blobs_corrupt: 0,
         issues: Vec::new(),
+        signature_verification: if session.metadata.format_version >= 3 {
+            "manifest-signatures".to_string()
+        } else {
+            "unsigned".to_string()
+        },
+        signed_snapshots,
+        unsigned_snapshots,
+        metadata_signature: if session.metadata.format_version >= 3 {
+            "verified".to_string()
+        } else {
+            "unsigned".to_string()
+        },
     };
+    let (signed, signing_key_id, _) = signing_summary(&session.metadata);
     let report = RepositoryPruneReport {
         repository: session.root.to_string_lossy().to_string(),
         keep,
@@ -971,6 +1325,8 @@ pub fn prune_repository(
         protected_bytes,
         reclaimed_bytes,
         validation,
+        signed,
+        signing_key_id,
     };
     if dry_run {
         return Ok(report);
@@ -995,8 +1351,25 @@ pub fn prune_repository(
             bail!("backup repository prune history exceeds the supported bound");
         }
         metadata.updated_at = pruned_at.clone();
-        sign_metadata(&mut metadata, session.crypto.as_ref())?;
         format::validate_chain(&metadata, &snapshots[split..])?;
+        if metadata.format_version >= 3 {
+            let credential = signing_key
+                .ok_or_else(|| anyhow::Error::from(BackupSecurityError::SigningRequired))?;
+            let required = metadata
+                .signing
+                .as_ref()
+                .map(|signing| signing.required)
+                .unwrap_or(true);
+            configure_signing(&mut metadata, credential, required);
+            let head = build_head(&metadata, kept.last())?;
+            if let Some(signing) = metadata.signing.as_mut() {
+                signing.head = head;
+            }
+            sign_metadata(&mut metadata, session.crypto.as_ref())?;
+            sign_repository_metadata(&mut metadata, credential)?;
+        } else {
+            sign_metadata(&mut metadata, session.crypto.as_ref())?;
+        }
         write_metadata_atomic(&session.root, &metadata)?;
     }
     // Metadata is now the logical commit point. Files below are cleanup; a
@@ -1070,6 +1443,7 @@ struct RepositorySession {
     root: PathBuf,
     metadata: RepositoryMetadata,
     crypto: Option<RepositoryCrypto>,
+    keyring: Option<Keyring>,
     nonce_records: usize,
     _lock: RepositoryLock,
 }
@@ -1192,10 +1566,16 @@ fn reject_repository_inside_data(repository: &Path, data_dir: &Path) -> Result<(
     Ok(())
 }
 
-fn open_for_write(root: &Path, options: &RepositoryBackupOptions) -> Result<RepositorySession> {
+fn open_for_write(
+    root: &Path,
+    encryption: &RepositoryEncryption,
+    kdf: KdfConfig,
+    keyring: Option<&Keyring>,
+    credential: Option<&SigningCredential>,
+) -> Result<RepositorySession> {
     let lock = RepositoryLock::acquire(root, LockMode::Exclusive)?;
     cleanup_stale_metadata_temps(root)?;
-    let passphrase = match &options.encryption {
+    let passphrase = match encryption {
         RepositoryEncryption::Encrypted(passphrase) => Some(passphrase),
         RepositoryEncryption::Plaintext => None,
     };
@@ -1212,21 +1592,28 @@ fn open_for_write(root: &Path, options: &RepositoryBackupOptions) -> Result<Repo
         Some(metadata) => {
             let crypto = unlock_repository(&metadata, passphrase)?;
             verify_metadata_authenticity(&metadata, crypto.as_ref())?;
+            signing::verify_metadata_signature(&metadata, keyring)?;
             ensure_layout(root)?;
             (metadata, crypto)
         }
         None => {
             ensure_empty_for_initialization(root)?;
-            let encryption = match &options.encryption {
+            let encryption_metadata = match encryption {
                 RepositoryEncryption::Encrypted(_) => {
-                    let kdf = KdfParameters::generate(options.kdf)?;
+                    let kdf = KdfParameters::generate(kdf)?;
                     format::EncryptionMetadata::encrypted(kdf)
                 }
                 RepositoryEncryption::Plaintext => format::EncryptionMetadata::plaintext(),
             };
-            let mut metadata = new_metadata(encryption);
+            let mut metadata = new_metadata(encryption_metadata);
             let crypto = unlock_repository(&metadata, passphrase)?;
-            sign_metadata(&mut metadata, crypto.as_ref())?;
+            if let Some(credential) = credential {
+                configure_signing(&mut metadata, credential, true);
+                sign_metadata(&mut metadata, crypto.as_ref())?;
+                sign_repository_metadata(&mut metadata, credential)?;
+            } else {
+                sign_metadata(&mut metadata, crypto.as_ref())?;
+            }
             write_metadata_atomic(root, &metadata)?;
             ensure_layout(root)?;
             if let Err(error) = append_event(
@@ -1238,6 +1625,8 @@ fn open_for_write(root: &Path, options: &RepositoryBackupOptions) -> Result<Repo
                     "kdf": metadata.encryption.summary(),
                     "app_version": metadata.app_version,
                     "protocol_version": metadata.protocol_version,
+                    "signed": metadata.format_version >= 3,
+                    "signing_key_id": metadata.signing.as_ref().map(|signing| signing.active_key_id.clone()),
                 }),
             ) {
                 tracing::warn!(%error, "backup repository created but its audit event could not be appended");
@@ -1250,6 +1639,7 @@ fn open_for_write(root: &Path, options: &RepositoryBackupOptions) -> Result<Repo
         root: root.to_path_buf(),
         metadata,
         crypto,
+        keyring: keyring.cloned(),
         nonce_records,
         _lock: lock,
     })
@@ -1258,6 +1648,7 @@ fn open_for_write(root: &Path, options: &RepositoryBackupOptions) -> Result<Repo
 fn open_for_write_existing(
     root: &Path,
     passphrase: Option<&Passphrase>,
+    keyring: Option<&Keyring>,
 ) -> Result<RepositorySession> {
     let lock = RepositoryLock::acquire(root, LockMode::Exclusive)?;
     cleanup_stale_metadata_temps(root)?;
@@ -1265,29 +1656,37 @@ fn open_for_write_existing(
     let metadata = parse_metadata(&bytes)?;
     let crypto = unlock_repository(&metadata, passphrase)?;
     verify_metadata_authenticity(&metadata, crypto.as_ref())?;
+    signing::verify_metadata_signature(&metadata, keyring)?;
     ensure_layout(root)?;
     let nonce_records = read_nonce_table(root, metadata.encryption.enabled)?;
     Ok(RepositorySession {
         root: root.to_path_buf(),
         metadata,
         crypto,
+        keyring: keyring.cloned(),
         nonce_records,
         _lock: lock,
     })
 }
 
-fn open_for_read(root: &Path, passphrase: Option<&Passphrase>) -> Result<RepositorySession> {
+fn open_for_read(
+    root: &Path,
+    passphrase: Option<&Passphrase>,
+    keyring: Option<&Keyring>,
+) -> Result<RepositorySession> {
     let lock = RepositoryLock::acquire(root, LockMode::Shared)?;
     let bytes = read_metadata_bytes(root)
         .with_context(|| format!("{} is not an initialized backup repository", root.display()))?;
     let metadata = parse_metadata(&bytes)?;
     let crypto = unlock_repository(&metadata, passphrase)?;
     verify_metadata_authenticity(&metadata, crypto.as_ref())?;
+    signing::verify_metadata_signature(&metadata, keyring)?;
     let nonce_records = read_nonce_table(root, metadata.encryption.enabled)?;
     Ok(RepositorySession {
         root: root.to_path_buf(),
         metadata,
         crypto,
+        keyring: keyring.cloned(),
         nonce_records,
         _lock: lock,
     })
@@ -1783,5 +2182,7 @@ fn _format_symbols() {
     );
 }
 
+#[cfg(test)]
+mod security_tests;
 #[cfg(test)]
 mod tests;

@@ -19,8 +19,11 @@ use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+pub mod anchor;
 pub mod crypto;
+pub mod error;
 pub mod repository;
+pub mod signing;
 
 pub const BACKUP_FORMAT_VERSION: u32 = 1;
 pub const DATABASE_FILENAME: &str = "verlinpark.db";

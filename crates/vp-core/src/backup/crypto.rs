@@ -1,4 +1,4 @@
-//! Authenticated encryption for the v2 backup repository.
+//! Authenticated encryption for the v2/v3 backup repository.
 //!
 //! The v1 ZIP format is unencrypted and remains supported by [`super`]. This
 //! module implements the cryptographic primitives used by the repository

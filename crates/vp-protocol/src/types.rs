@@ -13765,3 +13765,48 @@ mod approval_optimizer_tests {
         assert_eq!(decoded, event);
     }
 }
+
+/// Parameters for `backup.status` (none today).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BackupStatusParams {}
+
+/// One repository's local anti-rollback high-water mark.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupAnchorStatus {
+    pub repository_id: String,
+    pub repository_path: String,
+    pub highest_generation: u64,
+    pub last_verified_generation: u64,
+    pub last_snapshot_id: Option<String>,
+    pub last_operation: String,
+    pub first_seen_at: String,
+    pub last_verified_at: String,
+}
+
+/// One public backup signing key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupSigningKeyStatus {
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key_b64: String,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+    pub active: bool,
+}
+
+/// Secret-free backup signing and anti-rollback status for the desktop client.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupStatusResult {
+    pub anchor_path: String,
+    pub anchor_present: bool,
+    pub anchor_updated_at: Option<String>,
+    pub repositories: Vec<BackupAnchorStatus>,
+    pub keyring_path: String,
+    pub keyring_present: bool,
+    pub active_key_id: Option<String>,
+    pub key_count: usize,
+    pub keys: Vec<BackupSigningKeyStatus>,
+    pub signed_repository_formats: Vec<u32>,
+    /// Always present: explains local-anchor and no-escrow limits.
+    pub note: String,
+}

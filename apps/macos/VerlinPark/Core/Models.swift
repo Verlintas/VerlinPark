@@ -7671,3 +7671,79 @@ struct SessionUnlimitedResult: Codable, Sendable {
         case unlimited
     }
 }
+
+struct BackupAnchorStatus: Codable, Sendable, Identifiable {
+    let repositoryID: String
+    let repositoryPath: String
+    let highestGeneration: UInt64
+    let lastVerifiedGeneration: UInt64
+    let lastSnapshotID: String?
+    let lastOperation: String
+    let firstSeenAt: String
+    let lastVerifiedAt: String
+
+    var id: String {
+        repositoryID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case repositoryID = "repository_id"
+        case repositoryPath = "repository_path"
+        case highestGeneration = "highest_generation"
+        case lastVerifiedGeneration = "last_verified_generation"
+        case lastSnapshotID = "last_snapshot_id"
+        case lastOperation = "last_operation"
+        case firstSeenAt = "first_seen_at"
+        case lastVerifiedAt = "last_verified_at"
+    }
+}
+
+struct BackupSigningKeyStatus: Codable, Sendable, Identifiable {
+    let keyID: String
+    let algorithm: String
+    let publicKeyB64: String
+    let createdAt: String
+    let retiredAt: String?
+    let active: Bool
+
+    var id: String {
+        keyID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case keyID = "key_id"
+        case algorithm
+        case publicKeyB64 = "public_key_b64"
+        case createdAt = "created_at"
+        case retiredAt = "retired_at"
+        case active
+    }
+}
+
+struct BackupStatusResult: Codable, Sendable {
+    let anchorPath: String
+    let anchorPresent: Bool
+    let anchorUpdatedAt: String?
+    let repositories: [BackupAnchorStatus]
+    let keyringPath: String
+    let keyringPresent: Bool
+    let activeKeyID: String?
+    let keyCount: Int
+    let keys: [BackupSigningKeyStatus]
+    let signedRepositoryFormats: [Int]
+    let note: String
+
+    enum CodingKeys: String, CodingKey {
+        case anchorPath = "anchor_path"
+        case anchorPresent = "anchor_present"
+        case anchorUpdatedAt = "anchor_updated_at"
+        case repositories
+        case keyringPath = "keyring_path"
+        case keyringPresent = "keyring_present"
+        case activeKeyID = "active_key_id"
+        case keyCount = "key_count"
+        case keys
+        case signedRepositoryFormats = "signed_repository_formats"
+        case note
+    }
+}

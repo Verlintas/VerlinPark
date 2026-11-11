@@ -37,6 +37,7 @@ fn options(encrypted: bool, incremental: bool, include_artifacts: bool) -> Repos
             RepositoryEncryption::Plaintext
         },
         kdf: fast_kdf(),
+        signing: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn plain_options(incremental: bool, include_artifacts: bool) -> RepositoryBackup
         compression: Compression::None,
         encryption: RepositoryEncryption::Plaintext,
         kdf: fast_kdf(),
+        signing: None,
     }
 }
 
@@ -145,7 +147,7 @@ fn manifest_for(repo: &Path, snapshot_id: &str, encrypted: bool) -> format::Snap
     } else {
         None
     };
-    load_snapshot(repo, &metadata, crypto.as_ref(), snapshot_id)
+    load_snapshot(repo, &metadata, crypto.as_ref(), None, snapshot_id)
         .unwrap()
         .manifest
 }
@@ -1249,6 +1251,7 @@ fn compression_mode_is_recorded_per_entry_and_reused_blobs_keep_their_encoding()
             compression: Compression::None,
             encryption: RepositoryEncryption::Plaintext,
             kdf: fast_kdf(),
+            signing: None,
         },
     )
     .unwrap();
@@ -1268,6 +1271,7 @@ fn compression_mode_is_recorded_per_entry_and_reused_blobs_keep_their_encoding()
             compression: Compression::Zstd,
             encryption: RepositoryEncryption::Plaintext,
             kdf: fast_kdf(),
+            signing: None,
         },
     )
     .unwrap();

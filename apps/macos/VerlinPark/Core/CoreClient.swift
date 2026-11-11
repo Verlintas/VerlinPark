@@ -772,6 +772,11 @@ actor CoreClient {
         .decode(UpdateCheckResult.self)
     }
 
+    func backupStatus() async throws -> BackupStatusResult {
+        try await request(method: "backup.status", params: [:])
+            .decode(BackupStatusResult.self)
+    }
+
     func listModelPresets() async throws -> [ModelPreset] {
         try await request(method: "model.preset.list", params: [:])
             .decode(ModelPresetListResult.self)

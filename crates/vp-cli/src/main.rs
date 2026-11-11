@@ -8,9 +8,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::fs::OpenOptions;
+use vp_core::backup::anchor::AnchorStore;
 use vp_core::backup::repository::{
     Compression, KdfConfig, Passphrase, RepositoryBackupOptions, RepositoryEncryption,
+    RepositoryRestoreOptions, RepositorySigningOptions, RepositoryVerifyOptions, verify_repository,
 };
+use vp_core::backup::signing::{Keyring, SecretSource, default_key_dir};
 use vp_protocol::discovery::Discovery;
 use vp_protocol::remote::RemoteIntegrationPolicy;
 use vp_protocol::rpc::RpcResponse;
@@ -282,6 +285,15 @@ enum Command {
         /// Store repository blobs without zstd compression.
         #[arg(long)]
         no_compress: bool,
+        /// Sign with this key id from the keyring (creates/upgrades a v3 repository).
+        #[arg(long = "signing-key")]
+        signing_key: Option<String>,
+        /// Sign with the keyring's active key.
+        #[arg(long)]
+        sign: bool,
+        /// Keyring directory (defaults to ~/.verlinpark/backup-keys).
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
     },
     /// Restore a data-directory backup. The daemon must be stopped.
     Restore {
@@ -303,10 +315,19 @@ enum Command {
         /// Read the repository passphrase from a 0600 file.
         #[arg(long, conflicts_with = "passphrase_env")]
         passphrase_file: Option<PathBuf>,
+        /// Keyring directory used to verify signatures.
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Accept a repository generation older than the local anchor.
+        #[arg(long = "allow-rollback")]
+        allow_rollback: bool,
+        /// Anchor file override (defaults to <data-dir>/backup-anchor.json).
+        #[arg(long = "anchor-file")]
+        anchor_file: Option<PathBuf>,
     },
-    /// List and validate snapshots in a v2 backup repository.
+    /// List and validate snapshots in a v2/v3 backup repository.
     BackupList {
-        /// V2 backup repository directory.
+        /// V2/V3 backup repository directory.
         #[arg(long)]
         repository: PathBuf,
         /// Decrypt and hash every referenced blob.
@@ -318,10 +339,13 @@ enum Command {
         /// Read the repository passphrase from a 0600 file.
         #[arg(long, conflicts_with = "passphrase_env")]
         passphrase_file: Option<PathBuf>,
+        /// Keyring directory used to verify signatures.
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
     },
-    /// Prune old v2 backup snapshots, retaining the latest N.
+    /// Prune old backup snapshots, retaining the latest N.
     BackupPrune {
-        /// V2 backup repository directory.
+        /// V2/V3 backup repository directory.
         #[arg(long)]
         repository: PathBuf,
         /// Number of latest snapshots to retain.
@@ -336,6 +360,108 @@ enum Command {
         /// Read the repository passphrase from a 0600 file.
         #[arg(long, conflicts_with = "passphrase_env")]
         passphrase_file: Option<PathBuf>,
+        /// Keyring directory used to verify and re-sign a v3 repository.
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Sign the post-prune metadata with this key id.
+        #[arg(long = "signing-key")]
+        signing_key: Option<String>,
+        /// Sign the post-prune metadata with the active key.
+        #[arg(long)]
+        sign: bool,
+    },
+    /// Verify a repository's signatures, chain, tombstones, generation, and blobs.
+    BackupVerify {
+        /// V2/V3 backup repository directory.
+        #[arg(long)]
+        repository: PathBuf,
+        /// Read the repository passphrase from this environment variable.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        passphrase_env: Option<String>,
+        /// Read the repository passphrase from a 0600 file.
+        #[arg(long, conflicts_with = "passphrase_env")]
+        passphrase_file: Option<PathBuf>,
+        /// Keyring directory used to verify signatures.
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Accept a repository generation older than the local anchor.
+        #[arg(long = "allow-rollback")]
+        allow_rollback: bool,
+        /// Anchor file override (defaults to <data-dir>/backup-anchor.json).
+        #[arg(long = "anchor-file")]
+        anchor_file: Option<PathBuf>,
+        /// Check blob presence and sizes without decrypting every blob.
+        #[arg(long = "presence-only")]
+        presence_only: bool,
+    },
+    /// Generate an Ed25519 backup signing key and add it to the keyring.
+    BackupKeyGenerate {
+        key_id: String,
+        /// Keyring directory (defaults to ~/.verlinpark/backup-keys).
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Do not change the active key; the first key is always active.
+        #[arg(long)]
+        inactive: bool,
+        /// Register the seed already present in this environment variable
+        /// instead of generating a key file.
+        #[arg(long = "from-env")]
+        from_env: Option<String>,
+    },
+    /// List backup signing key ids and public keys.
+    BackupKeyList {
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+    },
+    /// Rotate the active backup signing key, keeping old public keys.
+    BackupKeyRotate {
+        key_id: String,
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Activate an existing key instead of generating a new one.
+        #[arg(long = "use-existing")]
+        use_existing: bool,
+        /// Register and activate the seed already present in this environment variable.
+        #[arg(long = "from-env")]
+        from_env: Option<String>,
+    },
+    /// Export one public signing key without any private material.
+    BackupKeyExportPublic {
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Key id to export; defaults to the active key.
+        #[arg(long = "key-id")]
+        key_id: Option<String>,
+        /// Write the public-key JSON to this path instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Import an existing 32-byte Ed25519 seed as a 0600 key file.
+    BackupKeyImport {
+        key_id: String,
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// 0600 file containing a JSON key file or a bare base64 seed.
+        #[arg(long = "seed-file")]
+        seed_file: Option<PathBuf>,
+        /// Register a seed from this environment variable instead of a file.
+        #[arg(long = "from-env")]
+        from_env: Option<String>,
+        #[arg(long)]
+        inactive: bool,
+    },
+    /// Show the keyring summary (never private material).
+    BackupKeyring {
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+    },
+    /// Show or reset the local anti-rollback anchor.
+    BackupAnchor {
+        #[arg(long = "anchor-file")]
+        anchor_file: Option<PathBuf>,
+        /// Remove the anchor file (discards local rollback protection).
+        #[arg(long)]
+        reset: bool,
     },
     /// Send a tiny live request to the configured provider.
     ProviderTest,
@@ -2316,9 +2442,30 @@ fn normalize_cache_warm_args(mut args: Vec<String>) -> Vec<String> {
     args
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse_from(normalize_cache_warm_args(std::env::args().collect()));
+/// The generated clap parser and the command dispatch future have both grown
+/// with the CLI surface. Run them on a dedicated, generous stack instead of the
+/// platform's default main-thread stack; the tokio workers get the same budget.
+const CLI_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    let worker = std::thread::Builder::new()
+        .name("vp-cli".into())
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(|| -> Result<()> {
+            let cli = Cli::parse_from(normalize_cache_warm_args(std::env::args().collect()));
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(CLI_STACK_BYTES)
+                .build()?
+                .block_on(run(cli))
+        })?;
+    match worker.join() {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("vp CLI thread panicked"),
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     if let Command::Bench { command } = &cli.command {
         match vp_bench::cli::execute(command.clone(), cli.json).await {
             Ok(outcome) => {
@@ -2378,6 +2525,9 @@ async fn main() -> Result<()> {
         passphrase_env,
         passphrase_file,
         no_compress,
+        signing_key,
+        sign,
+        keyring_dir,
     } = &cli.command
     {
         let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
@@ -2388,9 +2538,12 @@ async fn main() -> Result<()> {
                     || passphrase_env.is_some()
                     || passphrase_file.is_some()
                     || *no_compress
+                    || signing_key.is_some()
+                    || *sign
+                    || keyring_dir.is_some()
                 {
                     bail!(
-                        "--incremental, --plaintext, --passphrase-env, --passphrase-file, and --no-compress are repository-only options; use --repository"
+                        "--incremental, --plaintext, --passphrase-env, --passphrase-file, --no-compress, --signing-key, --sign, and --keyring-dir are repository-only options; use --repository"
                     );
                 }
                 let report = vp_core::backup::create_backup(&data_dir, output, *include_artifacts)?;
@@ -2424,6 +2577,11 @@ async fn main() -> Result<()> {
                     },
                     encryption,
                     kdf: KdfConfig::default(),
+                    signing: resolve_signing_options(
+                        keyring_dir.as_deref(),
+                        signing_key.as_deref(),
+                        *sign,
+                    )?,
                 };
                 let report = vp_core::backup::repository::create_repository_backup(
                     &data_dir, repository, options,
@@ -2453,14 +2611,23 @@ async fn main() -> Result<()> {
         force,
         passphrase_env,
         passphrase_file,
+        keyring_dir,
+        allow_rollback,
+        anchor_file,
     } = &cli.command
     {
         let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
         match (input, repository) {
             (Some(input), None) => {
-                if snapshot.is_some() || passphrase_env.is_some() || passphrase_file.is_some() {
+                if snapshot.is_some()
+                    || passphrase_env.is_some()
+                    || passphrase_file.is_some()
+                    || keyring_dir.is_some()
+                    || *allow_rollback
+                    || anchor_file.is_some()
+                {
                     bail!(
-                        "--snapshot, --passphrase-env, and --passphrase-file are repository-only options; use --repository"
+                        "--snapshot, --passphrase-env, --passphrase-file, --keyring-dir, --allow-rollback, and --anchor-file are repository-only options; use --repository"
                     );
                 }
                 let report = vp_core::backup::restore_backup(input, &data_dir, *force)?;
@@ -2477,12 +2644,19 @@ async fn main() -> Result<()> {
                 })?;
                 let passphrase =
                     resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
-                let report = vp_core::backup::repository::restore_repository_snapshot(
+                let keyring = load_keyring_optional(keyring_dir.as_deref())?;
+                let anchor = anchor_store(&data_dir, anchor_file.as_deref());
+                let report = vp_core::backup::repository::restore_repository_snapshot_checked(
                     repository,
                     snapshot,
                     &data_dir,
                     *force,
-                    passphrase.as_ref(),
+                    RepositoryRestoreOptions {
+                        passphrase: passphrase.as_ref(),
+                        keyring: keyring.as_ref(),
+                        anchor: Some(&anchor),
+                        allow_rollback: *allow_rollback,
+                    },
                 )?;
                 let value = serde_json::to_value(report)?;
                 if cli.json {
@@ -2493,7 +2667,7 @@ async fn main() -> Result<()> {
             }
             (Some(_), Some(_)) => bail!("pass exactly one of --input or --repository"),
             (None, None) => bail!(
-                "pass --input <zip> for a v1 restore or --repository <dir> --snapshot <id> for a v2 restore"
+                "pass --input <zip> for a v1 restore or --repository <dir> --snapshot <id> for a repository restore"
             ),
         }
         return Ok(());
@@ -2503,12 +2677,15 @@ async fn main() -> Result<()> {
         verify,
         passphrase_env,
         passphrase_file,
+        keyring_dir,
     } = &cli.command
     {
         let passphrase = resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
-        let report = vp_core::backup::repository::list_repository_snapshots(
+        let keyring = load_keyring_optional(keyring_dir.as_deref())?;
+        let report = vp_core::backup::repository::list_repository_snapshots_with_keyring(
             repository,
             passphrase.as_ref(),
+            keyring.as_ref(),
             *verify,
         )?;
         let value = serde_json::to_value(report)?;
@@ -2525,20 +2702,271 @@ async fn main() -> Result<()> {
         dry_run,
         passphrase_env,
         passphrase_file,
+        keyring_dir,
+        signing_key,
+        sign,
     } = &cli.command
     {
         let passphrase = resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
-        let report = vp_core::backup::repository::prune_repository(
+        let signing =
+            resolve_signing_options(keyring_dir.as_deref(), signing_key.as_deref(), *sign)?;
+        let fallback_keyring;
+        let keyring = match signing.as_ref() {
+            Some(signing) => Some(&signing.keyring),
+            None => {
+                fallback_keyring = load_keyring_optional(None)?;
+                fallback_keyring.as_ref()
+            }
+        };
+        let credential = match signing.as_ref() {
+            Some(signing) => Some(
+                signing
+                    .keyring
+                    .signing_credential(signing.key_id.as_deref())?,
+            ),
+            None => None,
+        };
+        let report = vp_core::backup::repository::prune_repository_with_signing(
             repository,
             *keep,
             *dry_run,
             passphrase.as_ref(),
+            keyring,
+            credential.as_ref(),
         )?;
         let value = serde_json::to_value(report)?;
         if cli.json {
             print_json(&value)?;
         } else {
             print_repository_prune(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupVerify {
+        repository,
+        passphrase_env,
+        passphrase_file,
+        keyring_dir,
+        allow_rollback,
+        anchor_file,
+        presence_only,
+    } = &cli.command
+    {
+        let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
+        let passphrase = resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
+        let keyring = load_keyring_optional(keyring_dir.as_deref())?;
+        let anchor = anchor_store(&data_dir, anchor_file.as_deref());
+        let report = verify_repository(
+            repository,
+            RepositoryVerifyOptions {
+                passphrase: passphrase.as_ref(),
+                keyring: keyring.as_ref(),
+                anchor: Some(&anchor),
+                allow_rollback: *allow_rollback,
+                verify_blobs: !*presence_only,
+            },
+        )?;
+        let value = serde_json::to_value(report)?;
+        let valid = value["valid"].as_bool().unwrap_or(false);
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_repository_verify(&value);
+        }
+        if !valid {
+            return Err(vp_core::backup::error::BackupSecurityError::VerificationFailed.into());
+        }
+        return Ok(());
+    }
+    if let Command::BackupKeyGenerate {
+        key_id,
+        keyring_dir,
+        inactive,
+        from_env,
+    } = &cli.command
+    {
+        let dir = keyring_dir.clone().unwrap_or_else(default_key_dir);
+        let report = match from_env {
+            Some(variable) => {
+                Keyring::register_environment_key(&dir, key_id, variable, !*inactive)?
+            }
+            None => Keyring::generate_key(
+                &dir,
+                key_id,
+                !*inactive,
+                SecretSource::File {
+                    name: format!("{key_id}.key"),
+                },
+            )?,
+        };
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_backup_key_generation(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupKeyList { keyring_dir } = &cli.command {
+        let summary =
+            load_keyring_optional(keyring_dir.as_deref())?.map(|keyring| keyring.summary());
+        let value = match summary {
+            Some(summary) => serde_json::to_value(summary)?,
+            None => json!({
+                "path": keyring_dir.clone().unwrap_or_else(default_key_dir).join("keyring.json").display().to_string(),
+                "active_key_id": null,
+                "key_count": 0,
+                "keys": [],
+                "present": false,
+            }),
+        };
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_backup_keyring(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupKeyRotate {
+        key_id,
+        keyring_dir,
+        use_existing,
+        from_env,
+    } = &cli.command
+    {
+        let dir = keyring_dir.clone().unwrap_or_else(default_key_dir);
+        let report = if let Some(variable) = from_env {
+            Keyring::register_environment_key(&dir, key_id, variable, false)?;
+            let mut keyring = Keyring::load(&dir)?;
+            keyring.rotate_to(key_id)?
+        } else if *use_existing {
+            let mut keyring = Keyring::load(&dir)?;
+            keyring.rotate_to(key_id)?
+        } else {
+            Keyring::generate_key(
+                &dir,
+                key_id,
+                false,
+                SecretSource::File {
+                    name: format!("{key_id}.key"),
+                },
+            )?;
+            let mut keyring = Keyring::load(&dir)?;
+            keyring.rotate_to(key_id)?
+        };
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_backup_key_rotation(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupKeyExportPublic {
+        keyring_dir,
+        key_id,
+        output,
+    } = &cli.command
+    {
+        let keyring = load_keyring_required(keyring_dir.as_deref())?;
+        let export = keyring.export_public(key_id.as_deref())?;
+        let value = serde_json::to_value(export)?;
+        if let Some(output) = output {
+            if output.exists() {
+                bail!("public key output already exists at {}", output.display());
+            }
+            let bytes = serde_json::to_vec_pretty(&value)?;
+            let parent = output.parent().unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            std::fs::write(output, bytes)?;
+            if cli.json {
+                print_json(&value)?;
+            } else {
+                println!(
+                    "exported {} public key to {}",
+                    value["key_id"].as_str().unwrap_or("?"),
+                    output.display()
+                );
+            }
+        } else if cli.json {
+            print_json(&value)?;
+        } else {
+            println!(
+                "{}  {}  fingerprint {}",
+                value["key_id"].as_str().unwrap_or("?"),
+                value["public_key_b64"].as_str().unwrap_or("?"),
+                value["fingerprint"].as_str().unwrap_or("?")
+            );
+        }
+        return Ok(());
+    }
+    if let Command::BackupKeyImport {
+        key_id,
+        keyring_dir,
+        seed_file,
+        from_env,
+        inactive,
+    } = &cli.command
+    {
+        let dir = keyring_dir.clone().unwrap_or_else(default_key_dir);
+        let report = match (seed_file, from_env) {
+            (Some(path), None) => Keyring::import_key_file(&dir, key_id, path, !*inactive)?,
+            (None, Some(variable)) => {
+                Keyring::register_environment_key(&dir, key_id, variable, !*inactive)?
+            }
+            _ => bail!("pass exactly one of --seed-file or --from-env"),
+        };
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_backup_key_generation(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupKeyring { keyring_dir } = &cli.command {
+        let summary =
+            load_keyring_optional(keyring_dir.as_deref())?.map(|keyring| keyring.summary());
+        let value = match summary {
+            Some(summary) => serde_json::to_value(summary)?,
+            None => json!({
+                "path": keyring_dir.clone().unwrap_or_else(default_key_dir).join("keyring.json").display().to_string(),
+                "active_key_id": null,
+                "key_count": 0,
+                "keys": [],
+                "present": false,
+            }),
+        };
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_backup_keyring(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupAnchor { anchor_file, reset } = &cli.command {
+        let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
+        let anchor = anchor_store(&data_dir, anchor_file.as_deref());
+        if *reset {
+            let removed = anchor.reset()?;
+            let value = json!({"reset": removed, "path": anchor.path().display().to_string()});
+            if cli.json {
+                print_json(&value)?;
+            } else {
+                println!(
+                    "{} {}",
+                    if removed { "removed" } else { "no anchor at" },
+                    anchor.path().display()
+                );
+            }
+            return Ok(());
+        }
+        let summary = anchor.summary()?;
+        let value = serde_json::to_value(summary)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_backup_anchor(&value);
         }
         return Ok(());
     }
@@ -2577,6 +3005,24 @@ async fn main() -> Result<()> {
         Command::Restore { .. } => unreachable!("restore is handled before discovery"),
         Command::BackupList { .. } => unreachable!("backup-list is handled before discovery"),
         Command::BackupPrune { .. } => unreachable!("backup-prune is handled before discovery"),
+        Command::BackupVerify { .. } => unreachable!("backup-verify is handled before discovery"),
+        Command::BackupKeyGenerate { .. } => {
+            unreachable!("backup-key-generate is handled before discovery")
+        }
+        Command::BackupKeyList { .. } => {
+            unreachable!("backup-key-list is handled before discovery")
+        }
+        Command::BackupKeyRotate { .. } => {
+            unreachable!("backup-key-rotate is handled before discovery")
+        }
+        Command::BackupKeyExportPublic { .. } => {
+            unreachable!("backup-key-export-public is handled before discovery")
+        }
+        Command::BackupKeyImport { .. } => {
+            unreachable!("backup-key-import is handled before discovery")
+        }
+        Command::BackupKeyring { .. } => unreachable!("backup-keyring is handled before discovery"),
+        Command::BackupAnchor { .. } => unreachable!("backup-anchor is handled before discovery"),
         Command::Bench { .. } => unreachable!("bench is handled before discovery"),
         Command::ToolCodes { .. } => unreachable!("tool-codes is handled before discovery"),
         Command::Ping => {
@@ -7033,6 +7479,55 @@ async fn rpc(discovery: &Discovery, method: &str, params: Value) -> Result<Value
     Ok(response.result.unwrap_or(Value::Null))
 }
 
+fn load_keyring_optional(directory: Option<&Path>) -> Result<Option<Keyring>> {
+    match directory {
+        Some(directory) => Ok(Some(Keyring::load(directory)?)),
+        None => Keyring::load_optional(&default_key_dir()),
+    }
+}
+
+fn load_keyring_required(directory: Option<&Path>) -> Result<Keyring> {
+    match directory {
+        Some(directory) => Keyring::load(directory),
+        None => Keyring::load(&default_key_dir()),
+    }
+}
+
+/// Resolve signing options from CLI flags.
+///
+/// Signing is explicit: no flag means an unsigned v2 repository. Passing
+/// `--signing-key`, `--sign`, or `--keyring-dir` loads the keyring and signs
+/// with the requested or active key.
+fn resolve_signing_options(
+    keyring_dir: Option<&Path>,
+    signing_key: Option<&str>,
+    sign: bool,
+) -> Result<Option<RepositorySigningOptions>> {
+    if keyring_dir.is_none() && signing_key.is_none() && !sign {
+        return Ok(None);
+    }
+    if sign && signing_key.is_some() {
+        bail!("pass only one of --signing-key or --sign");
+    }
+    let keyring = load_keyring_required(keyring_dir)?;
+    if let Some(key_id) = signing_key {
+        keyring.public_key(key_id)?;
+    } else {
+        keyring.resolve_key_id(None)?;
+    }
+    Ok(Some(RepositorySigningOptions {
+        keyring,
+        key_id: signing_key.map(str::to_string),
+    }))
+}
+
+fn anchor_store(data_dir: &Path, anchor_file: Option<&Path>) -> AnchorStore {
+    match anchor_file {
+        Some(path) => AnchorStore::from_file(path),
+        None => AnchorStore::new(data_dir),
+    }
+}
+
 fn resolve_passphrase(
     environment: Option<&str>,
     file: Option<&Path>,
@@ -7136,6 +7631,15 @@ fn print_repository_backup(value: &Value) {
         value["manifest_bytes"].as_u64().unwrap_or(0),
         value["manifest_sha256"].as_str().unwrap_or("?")
     );
+    println!(
+        "  signed={}  key={}  algorithm={}  anchor generation {}",
+        value["signed"].as_bool().unwrap_or(false),
+        value["signing_key_id"].as_str().unwrap_or("-"),
+        value["signature_algorithm"].as_str().unwrap_or("-"),
+        value["anchor_update"]["highest_generation"]
+            .as_u64()
+            .unwrap_or(0)
+    );
 }
 
 fn print_repository_restore(value: &Value) {
@@ -7159,6 +7663,27 @@ fn print_repository_restore(value: &Value) {
         value["validated_blobs"].as_u64().unwrap_or(0),
         value["stored_blob_bytes"].as_u64().unwrap_or(0)
     );
+    println!(
+        "  signed={}  key={}  signature={}  anchor highest={}",
+        value["signed"].as_bool().unwrap_or(false),
+        value["signing_key_id"].as_str().unwrap_or("-"),
+        value["signature_status"].as_str().unwrap_or("-"),
+        value["anchor_update"]["highest_generation"]
+            .as_u64()
+            .unwrap_or(0)
+    );
+    if value["rollback"]["rollback"].as_bool().unwrap_or(false) {
+        println!(
+            "  rollback accepted explicitly: restored generation {} below anchor {}",
+            value["rollback"]["generation"].as_u64().unwrap_or(0),
+            value["rollback"]["anchor_generation"].as_u64().unwrap_or(0)
+        );
+    }
+    if let Some(issues) = value["head_issues"].as_array() {
+        for issue in issues {
+            println!("  signed-head issue: {}", issue.as_str().unwrap_or("?"));
+        }
+    }
 }
 
 fn print_repository_list(value: &Value) {
@@ -7169,6 +7694,13 @@ fn print_repository_list(value: &Value) {
         value["encrypted"].as_bool().unwrap_or(false),
         value["unique_blobs"].as_u64().unwrap_or(0),
         value["logical_bytes"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  signed={}  status={}  format v{}  active key={}",
+        value["signed"].as_bool().unwrap_or(false),
+        value["signing_status"].as_str().unwrap_or("unsigned"),
+        value["format_version"].as_u64().unwrap_or(0),
+        value["keyring"]["active_key_id"].as_str().unwrap_or("-")
     );
     let validation = &value["validation"];
     println!(
@@ -7190,7 +7722,7 @@ fn print_repository_list(value: &Value) {
     if let Some(snapshots) = value["snapshots"].as_array() {
         for snapshot in snapshots {
             println!(
-                "{}  seq {:<4} parent {:<36} {:<8} {} bytes  {} entries  sha256 {}",
+                "{}  seq {:<4} parent {:<36} {:<8} {} bytes  {} entries  signed={} key={}  sha256 {}",
                 snapshot["snapshot_id"].as_str().unwrap_or("?"),
                 snapshot["sequence"].as_u64().unwrap_or(0),
                 snapshot["parent"].as_str().unwrap_or("-"),
@@ -7201,6 +7733,8 @@ fn print_repository_list(value: &Value) {
                 },
                 snapshot["bytes"].as_u64().unwrap_or(0),
                 snapshot["entries"].as_u64().unwrap_or(0),
+                snapshot["signed"].as_bool().unwrap_or(false),
+                snapshot["signing_key_id"].as_str().unwrap_or("-"),
                 snapshot["manifest_sha256"].as_str().unwrap_or("?")
             );
         }
@@ -7231,6 +7765,11 @@ fn print_repository_prune(value: &Value) {
         value["reclaimed_bytes"].as_u64().unwrap_or(0),
         value["protected_bytes"].as_u64().unwrap_or(0)
     );
+    println!(
+        "  signed={}  key={}",
+        value["signed"].as_bool().unwrap_or(false),
+        value["signing_key_id"].as_str().unwrap_or("-")
+    );
     if let Some(snapshots) = value["snapshots_pruned"].as_array() {
         for snapshot in snapshots {
             println!(
@@ -7238,6 +7777,156 @@ fn print_repository_prune(value: &Value) {
                 snapshot["snapshot_id"].as_str().unwrap_or("?"),
                 snapshot["sequence"].as_u64().unwrap_or(0),
                 snapshot["bytes"].as_u64().unwrap_or(0)
+            );
+        }
+    }
+}
+
+fn print_repository_verify(value: &Value) {
+    println!(
+        "{}  format v{}  generation {}  snapshots {}",
+        value["repository"].as_str().unwrap_or("?"),
+        value["format_version"].as_u64().unwrap_or(0),
+        value["generation"].as_u64().unwrap_or(0),
+        value["snapshot_count"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  valid={}  authenticity={}  signed={}  verified snapshots {}  unsigned {}",
+        value["valid"].as_bool().unwrap_or(false),
+        value["authenticity"].as_str().unwrap_or("?"),
+        value["signed"].as_bool().unwrap_or(false),
+        value["signed_snapshots"].as_u64().unwrap_or(0),
+        value["unsigned_snapshots"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  metadata signature={} key={}  head_consistent={}",
+        value["metadata_signature"]["status"]
+            .as_str()
+            .unwrap_or("?"),
+        value["metadata_signature"]["key_id"]
+            .as_str()
+            .unwrap_or("-"),
+        value["signed_head_consistent"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  chain_valid={}  tombstones_valid={}  entries_valid={}  blobs present={} missing={} verified={} corrupt={}",
+        value["chain_valid"].as_bool().unwrap_or(false),
+        value["tombstones_valid"].as_bool().unwrap_or(false),
+        value["entries_valid"].as_bool().unwrap_or(false),
+        value["blobs_present"].as_u64().unwrap_or(0),
+        value["blobs_missing"].as_u64().unwrap_or(0),
+        value["blobs_verified"].as_u64().unwrap_or(0),
+        value["blobs_corrupt"].as_u64().unwrap_or(0)
+    );
+    if value["rollback"].is_object() {
+        println!(
+            "  anchor generation={}  accepted={}  rollback={}  allow_rollback={}",
+            value["rollback"]["anchor_generation"]
+                .as_u64()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            value["rollback"]["accepted"].as_bool().unwrap_or(false),
+            value["rollback"]["rollback"].as_bool().unwrap_or(false),
+            value["rollback"]["allow_rollback"]
+                .as_bool()
+                .unwrap_or(false)
+        );
+    }
+    if let Some(issues) = value["issues"].as_array() {
+        for issue in issues {
+            println!("  issue: {}", issue.as_str().unwrap_or("?"));
+        }
+    }
+    if let Some(issues) = value["head_issues"].as_array() {
+        for issue in issues {
+            println!("  signed-head issue: {}", issue.as_str().unwrap_or("?"));
+        }
+    }
+}
+
+fn print_backup_key_generation(value: &Value) {
+    println!(
+        "key {}  active={}  algorithm={}  fingerprint {}",
+        value["key_id"].as_str().unwrap_or("?"),
+        value["active"].as_bool().unwrap_or(false),
+        value["algorithm"].as_str().unwrap_or("?"),
+        value["fingerprint"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  public key {}",
+        value["public_key_b64"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  keyring {}  source {}",
+        value["keyring"].as_str().unwrap_or("?"),
+        value["source"].as_str().unwrap_or("?")
+    );
+}
+
+fn print_backup_key_rotation(value: &Value) {
+    println!(
+        "active key {}  previous {}  changed={}",
+        value["key_id"].as_str().unwrap_or("?"),
+        value["previous_key_id"].as_str().unwrap_or("-"),
+        value["changed"].as_bool().unwrap_or(false)
+    );
+    let retired = value["retired_public_keys"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    println!(
+        "  retired public keys retained for verification: {}",
+        if retired.is_empty() { "-" } else { &retired }
+    );
+    println!("  keyring {}", value["keyring"].as_str().unwrap_or("?"));
+}
+
+fn print_backup_keyring(value: &Value) {
+    println!(
+        "{}  {} keys  active={}",
+        value["path"].as_str().unwrap_or("?"),
+        value["key_count"].as_u64().unwrap_or(0),
+        value["active_key_id"].as_str().unwrap_or("-")
+    );
+    if let Some(keys) = value["keys"].as_array() {
+        for key in keys {
+            println!(
+                "  {}  {}  active={}  retired={}  public {}",
+                key["key_id"].as_str().unwrap_or("?"),
+                key["algorithm"].as_str().unwrap_or("?"),
+                key["active"].as_bool().unwrap_or(false),
+                key["retired_at"].as_str().unwrap_or("-"),
+                key["public_key_b64"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    if value["key_count"].as_u64().unwrap_or(0) == 0 {
+        println!("  no signing keys yet; run `vp backup-key-generate <key-id>`");
+    }
+}
+
+fn print_backup_anchor(value: &Value) {
+    println!(
+        "{}  present={}  updated={}",
+        value["path"].as_str().unwrap_or("?"),
+        value["present"].as_bool().unwrap_or(false),
+        value["updated_at"].as_str().unwrap_or("-")
+    );
+    if let Some(repositories) = value["repositories"].as_array() {
+        for repository in repositories {
+            println!(
+                "  {}  highest generation {}  last verified {}  operation {}  at {}",
+                repository["repository_id"].as_str().unwrap_or("?"),
+                repository["highest_generation"].as_u64().unwrap_or(0),
+                repository["last_verified_generation"].as_u64().unwrap_or(0),
+                repository["last_operation"].as_str().unwrap_or("?"),
+                repository["last_verified_at"].as_str().unwrap_or("?")
             );
         }
     }
@@ -13726,6 +14415,161 @@ mod remote_integration_cli_tests {
         let text = lines.join("\n");
         assert!(text.contains("removed 1 ref(s)"));
         assert!(text.contains("requires force"));
+    }
+
+    #[test]
+    fn backup_signing_flags_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "backup",
+                    "--repository",
+                    "/tmp/repo",
+                    "--signing-key",
+                    "primary",
+                    "--keyring-dir",
+                    "/tmp/keys",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::Backup {
+                        signing_key,
+                        keyring_dir,
+                        sign,
+                        ..
+                    } => {
+                        assert_eq!(signing_key.as_deref(), Some("primary"));
+                        assert_eq!(keyring_dir.as_deref(), Some(Path::new("/tmp/keys")));
+                        assert!(!sign);
+                    }
+                    other => panic!("expected backup, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "restore",
+                    "--repository",
+                    "/tmp/repo",
+                    "--snapshot",
+                    "0190f000-0000-7000-8000-000000000000",
+                    "--allow-rollback",
+                    "--keyring-dir",
+                    "/tmp/keys",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::Restore {
+                        allow_rollback,
+                        keyring_dir,
+                        ..
+                    } => {
+                        assert!(allow_rollback);
+                        assert_eq!(keyring_dir.as_deref(), Some(Path::new("/tmp/keys")));
+                    }
+                    other => panic!("expected restore, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "backup-verify",
+                    "--repository",
+                    "/tmp/repo",
+                    "--presence-only",
+                    "--allow-rollback",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::BackupVerify {
+                        presence_only,
+                        allow_rollback,
+                        ..
+                    } => {
+                        assert!(presence_only);
+                        assert!(allow_rollback);
+                    }
+                    other => panic!("expected backup-verify, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "backup-key-generate",
+                    "primary",
+                    "--keyring-dir",
+                    "/tmp/keys",
+                    "--inactive",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::BackupKeyGenerate {
+                        key_id,
+                        inactive,
+                        from_env,
+                        ..
+                    } => {
+                        assert_eq!(key_id, "primary");
+                        assert!(inactive);
+                        assert!(from_env.is_none());
+                    }
+                    other => panic!("expected backup-key-generate, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn signing_options_are_explicit_and_keyring_backed() {
+        // No signing flags keeps the v2 unsigned path.
+        assert!(
+            resolve_signing_options(None, None, false)
+                .unwrap()
+                .is_none()
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+        let error = resolve_signing_options(Some(&missing), None, false).unwrap_err();
+        assert!(format!("{error:#}").contains("BACKUP_KEYRING_NOT_FOUND"));
+
+        let keys = dir.path().join("keys");
+        Keyring::generate_key(
+            &keys,
+            "primary",
+            true,
+            SecretSource::File {
+                name: "primary.key".to_string(),
+            },
+        )
+        .unwrap();
+        let signing = resolve_signing_options(Some(&keys), None, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(signing.keyring.active_key_id(), Some("primary"));
+        assert!(signing.key_id.is_none());
+
+        let signing = resolve_signing_options(Some(&keys), Some("primary"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(signing.key_id.as_deref(), Some("primary"));
+
+        let error = resolve_signing_options(Some(&keys), Some("missing"), false).unwrap_err();
+        assert!(format!("{error:#}").contains("BACKUP_KEY_NOT_FOUND"));
+
+        let error = resolve_signing_options(Some(&keys), Some("primary"), true).unwrap_err();
+        assert!(format!("{error:#}").contains("only one of"));
+    }
+
+    #[test]
+    fn anchor_store_resolution_honors_an_explicit_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let default = anchor_store(dir.path(), None);
+        assert_eq!(default.path(), dir.path().join("backup-anchor.json"));
+        let explicit = dir.path().join("custom-anchor.json");
+        let store = anchor_store(dir.path(), Some(&explicit));
+        assert_eq!(store.path(), explicit);
     }
 }
 

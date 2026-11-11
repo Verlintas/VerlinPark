@@ -1,4 +1,4 @@
-//! On-disk types and validation for the v2 backup repository.
+//! On-disk types and validation for the v2/v3 backup repository.
 //!
 //! Everything in this module is deterministic and offline. The repository has
 //! no daemon RPC surface: a snapshot is written by a CLI process, and restore
@@ -46,11 +46,16 @@ use super::blob::{
 use crate::backup::crypto::{
     KdfParameters, KdfSummary, MAX_MANIFEST_PLAINTEXT_BYTES, RepositoryCrypto, sha256_hex,
 };
+use crate::backup::repository::signing::{
+    ManifestSignature, SignatureCheck, verify_snapshot_signature,
+};
+use crate::backup::signing::Keyring;
 use crate::backup::{
     ArchiveKind, DATABASE_FILENAME, ScratchPath, classify_archive_path, write_private,
 };
 
-pub(crate) const REPOSITORY_FORMAT_VERSION: u32 = 2;
+pub(crate) const REPOSITORY_FORMAT_VERSION: u32 = 3;
+pub(crate) const REPOSITORY_FORMAT_VERSION_MIN: u32 = 2;
 pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 pub(crate) const REPOSITORY_KIND: &str = "verlinpark-backup-repository";
 pub(crate) const SNAPSHOT_KIND: &str = "verlinpark-backup-snapshot";
@@ -86,6 +91,41 @@ pub(crate) struct RepositoryMetadata {
     pub pruned_snapshots: Vec<PrunedSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_mac: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<RepositorySigning>,
+}
+
+/// Ed25519 signing configuration for a v3 repository.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RepositorySigning {
+    pub active_key_id: String,
+    /// When true, every snapshot in the repository must carry a valid
+    /// signature. Upgraded v2 chains set this to false and report historical
+    /// snapshots as unsigned.
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_signature: Option<String>,
+    pub signed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<RepositoryHead>,
+}
+
+/// Signed summary of the latest retained snapshot.
+///
+/// It is part of the signed metadata, so verification can bind the head
+/// generation, parent, entry digest, and tombstone digest without re-reading
+/// every manifest. `backup-verify` recomputes and compares these values.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RepositoryHead {
+    pub generation: u64,
+    pub latest_snapshot_id: String,
+    pub latest_manifest_sha256: String,
+    pub latest_parent: Option<String>,
+    pub latest_entries_sha256: String,
+    pub tombstones_sha256: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +199,8 @@ pub(crate) struct SnapshotManifest {
     pub kdf_fingerprint: Option<String>,
     pub entries: Vec<SnapshotEntry>,
     pub totals: SnapshotTotals,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<ManifestSignature>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,9 +232,21 @@ pub(crate) struct ValidatedSnapshot {
     pub manifest_sha256: String,
     pub manifest_envelope_bytes: u64,
     pub encrypted: bool,
+    pub signature_check: SignatureCheck,
 }
 
 impl ValidatedSnapshot {
+    pub(crate) fn signature_status(&self) -> &str {
+        &self.signature_check.status
+    }
+
+    pub(crate) fn signing_key_id(&self) -> Option<&str> {
+        self.manifest
+            .signature
+            .as_ref()
+            .map(|signature| signature.key_id.as_str())
+    }
+
     pub(crate) fn id(&self) -> &str {
         &self.manifest.snapshot_id
     }
@@ -239,7 +293,7 @@ pub(crate) fn new_metadata(encryption: EncryptionMetadata) -> RepositoryMetadata
     let now = now_rfc3339();
     RepositoryMetadata {
         kind: REPOSITORY_KIND.to_string(),
-        format_version: REPOSITORY_FORMAT_VERSION,
+        format_version: REPOSITORY_FORMAT_VERSION_MIN,
         repository_id: Uuid::now_v7().to_string(),
         created_at: now.clone(),
         updated_at: now,
@@ -248,6 +302,7 @@ pub(crate) fn new_metadata(encryption: EncryptionMetadata) -> RepositoryMetadata
         encryption,
         pruned_snapshots: Vec::new(),
         metadata_mac: None,
+        signing: None,
     }
 }
 
@@ -256,11 +311,16 @@ impl RepositoryMetadata {
         if self.kind != REPOSITORY_KIND {
             bail!("not a VerlinPark backup repository (kind {:?})", self.kind);
         }
-        if self.format_version != REPOSITORY_FORMAT_VERSION {
-            bail!(
-                "unsupported backup repository format version {}; this build supports {}",
-                self.format_version,
-                REPOSITORY_FORMAT_VERSION
+        if !(REPOSITORY_FORMAT_VERSION_MIN..=REPOSITORY_FORMAT_VERSION)
+            .contains(&self.format_version)
+        {
+            return Err(
+                crate::backup::error::BackupSecurityError::RepositoryFormat {
+                    format_version: self.format_version,
+                    minimum: REPOSITORY_FORMAT_VERSION_MIN,
+                    maximum: REPOSITORY_FORMAT_VERSION,
+                }
+                .into(),
             );
         }
         if !is_snapshot_id(&self.repository_id) {
@@ -313,6 +373,69 @@ impl RepositoryMetadata {
         if !self.encryption.enabled && self.metadata_mac.is_some() {
             bail!("unencrypted backup repository must not have a metadata MAC");
         }
+        self.validate_signing()?;
+        Ok(())
+    }
+
+    fn validate_signing(&self) -> Result<()> {
+        match self.format_version {
+            2 => {
+                if self.signing.is_some() {
+                    bail!("v2 backup repository must not contain signing metadata");
+                }
+            }
+            3 => {
+                let Some(signing) = &self.signing else {
+                    return Err(
+                        crate::backup::error::BackupSecurityError::SignatureMissing {
+                            object: "repository metadata".to_string(),
+                        }
+                        .into(),
+                    );
+                };
+                crate::backup::signing::validate_key_id(&signing.active_key_id)?;
+                if signing.signed_at.is_empty() || signing.signed_at.len() > 64 {
+                    bail!("backup repository signed_at is malformed");
+                }
+                if let Some(signature) = &signing.metadata_signature {
+                    let bytes = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        signature.as_bytes(),
+                    )
+                    .context("backup repository metadata signature is not valid base64")?;
+                    if bytes.len() != crate::backup::signing::SIGNATURE_BYTES {
+                        bail!(
+                            "backup repository metadata signature is {} bytes; expected {}",
+                            bytes.len(),
+                            crate::backup::signing::SIGNATURE_BYTES
+                        );
+                    }
+                }
+                if let Some(head) = &signing.head {
+                    if head.generation == 0 {
+                        bail!("backup repository signed head generation must be positive");
+                    }
+                    if !is_snapshot_id(&head.latest_snapshot_id) {
+                        bail!("backup repository signed head snapshot id is not a canonical UUID");
+                    }
+                    if !is_sha256_hex(&head.latest_manifest_sha256)
+                        || !is_sha256_hex(&head.latest_entries_sha256)
+                        || !is_sha256_hex(&head.tombstones_sha256)
+                    {
+                        bail!("backup repository signed head contains an invalid digest");
+                    }
+                    if let Some(parent) = &head.latest_parent
+                        && !is_snapshot_id(parent)
+                    {
+                        bail!("backup repository signed head parent is not a canonical UUID");
+                    }
+                    if head.updated_at.is_empty() || head.updated_at.len() > 64 {
+                        bail!("backup repository signed head timestamp is malformed");
+                    }
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -331,6 +454,11 @@ impl RepositoryMetadata {
 pub(crate) fn canonical_metadata_bytes(metadata: &RepositoryMetadata) -> Result<Vec<u8>> {
     let mut copy = metadata.clone();
     copy.metadata_mac = None;
+    if let Some(signing) = &mut copy.signing {
+        // The signature itself is excluded so the MAC can be computed before
+        // signing and verified after. The signature covers the MAC value.
+        signing.metadata_signature = None;
+    }
     serde_json::to_vec(&copy).context("serializing backup repository metadata")
 }
 
@@ -485,6 +613,7 @@ pub(crate) fn load_snapshot(
     repository: &Path,
     metadata: &RepositoryMetadata,
     crypto: Option<&RepositoryCrypto>,
+    keyring: Option<&Keyring>,
     snapshot_id: &str,
 ) -> Result<ValidatedSnapshot> {
     let path = snapshot_manifest_path(repository, snapshot_id)?;
@@ -540,11 +669,14 @@ pub(crate) fn load_snapshot(
         );
     }
     validate_manifest(&manifest, metadata)?;
+    let signature_check = verify_snapshot_signature(metadata, keyring, &manifest)
+        .with_context(|| format!("verifying signature of backup snapshot {snapshot_id}"))?;
     Ok(ValidatedSnapshot {
         manifest,
         manifest_sha256: sha256_hex(&envelope),
         manifest_envelope_bytes: envelope.len() as u64,
         encrypted: opened.encrypted,
+        signature_check,
     })
 }
 
@@ -690,6 +822,11 @@ pub(crate) fn validate_manifest(
             total_bytes
         );
     }
+    if let Some(signature) = &manifest.signature {
+        signature
+            .validate_shape()
+            .context("backup snapshot signature is malformed")?;
+    }
     Ok(())
 }
 
@@ -697,6 +834,7 @@ pub(crate) fn scan_snapshots(
     repository: &Path,
     metadata: &RepositoryMetadata,
     crypto: Option<&RepositoryCrypto>,
+    keyring: Option<&Keyring>,
 ) -> Result<Vec<ValidatedSnapshot>> {
     let directory = repository.join(SNAPSHOTS_DIR);
     let mut ids = Vec::new();
@@ -743,7 +881,7 @@ pub(crate) fn scan_snapshots(
         if metadata.is_pruned(&id).is_some() {
             continue;
         }
-        snapshots.push(load_snapshot(repository, metadata, crypto, &id)?);
+        snapshots.push(load_snapshot(repository, metadata, crypto, keyring, &id)?);
     }
     snapshots.sort_by_key(|snapshot| snapshot.sequence());
     validate_chain(metadata, &snapshots)?;
@@ -899,6 +1037,8 @@ pub(crate) fn scan_blob_hashes(repository: &Path) -> Result<BTreeMap<String, u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
 
     fn plain_metadata() -> RepositoryMetadata {
         new_metadata(EncryptionMetadata::plaintext())
@@ -931,6 +1071,7 @@ mod tests {
                 bytes: 4096,
             },
             entries,
+            signature: None,
         }
     }
 
@@ -940,6 +1081,7 @@ mod tests {
             manifest_sha256: "b".repeat(64),
             manifest_envelope_bytes: 100,
             encrypted: false,
+            signature_check: crate::backup::repository::signing::SignatureCheck::unsigned("test"),
         }
     }
 
@@ -947,7 +1089,7 @@ mod tests {
     fn metadata_structure_and_canonical_signing() {
         let metadata = plain_metadata();
         metadata.validate_structure().unwrap();
-        assert_eq!(metadata.format_version, REPOSITORY_FORMAT_VERSION);
+        assert_eq!(metadata.format_version, REPOSITORY_FORMAT_VERSION_MIN);
         assert_eq!(metadata.kind, REPOSITORY_KIND);
         assert!(is_snapshot_id(&metadata.repository_id));
         assert!(metadata.metadata_mac.is_none());
@@ -1166,6 +1308,66 @@ mod tests {
         assert!(blob_hash_from_name("../escape.blob").is_none());
         assert!(is_sha256_hex(&"f".repeat(64)));
         assert!(!is_sha256_hex(&"f".repeat(63)));
+    }
+
+    #[test]
+    fn signing_metadata_is_version_bound_and_head_is_validated() {
+        let mut metadata = plain_metadata();
+        assert_eq!(metadata.format_version, REPOSITORY_FORMAT_VERSION_MIN);
+        metadata.signing = Some(RepositorySigning {
+            active_key_id: "primary".to_string(),
+            required: false,
+            metadata_signature: None,
+            signed_at: now_rfc3339(),
+            head: None,
+        });
+        assert!(
+            metadata.validate_structure().is_err(),
+            "v2 must not carry signing"
+        );
+
+        let mut metadata = plain_metadata();
+        metadata.format_version = 3;
+        assert!(metadata.validate_structure().is_err(), "v3 needs signing");
+        metadata.signing = Some(RepositorySigning {
+            active_key_id: "primary".to_string(),
+            required: true,
+            metadata_signature: Some(BASE64.encode([1u8; 64])),
+            signed_at: now_rfc3339(),
+            head: None,
+        });
+        metadata.validate_structure().unwrap();
+
+        metadata.signing.as_mut().unwrap().head = Some(RepositoryHead {
+            generation: 1,
+            latest_snapshot_id: Uuid::now_v7().to_string(),
+            latest_manifest_sha256: "a".repeat(64),
+            latest_parent: None,
+            latest_entries_sha256: "b".repeat(64),
+            tombstones_sha256: "c".repeat(64),
+            updated_at: now_rfc3339(),
+        });
+        metadata.validate_structure().unwrap();
+        metadata
+            .signing
+            .as_mut()
+            .unwrap()
+            .head
+            .as_mut()
+            .unwrap()
+            .latest_manifest_sha256 = "not-a-hash".to_string();
+        assert!(metadata.validate_structure().is_err());
+
+        let mut metadata = plain_metadata();
+        metadata.format_version = 3;
+        metadata.signing = Some(RepositorySigning {
+            active_key_id: "../escape".to_string(),
+            required: true,
+            metadata_signature: None,
+            signed_at: now_rfc3339(),
+            head: None,
+        });
+        assert!(metadata.validate_structure().is_err());
     }
 
     #[test]

@@ -799,3 +799,9 @@
 "Inline data exceeds the 100 MB preview limit." = "内联数据超过 100 MB 预览上限。";
 "Invalid inline base64 data." = "内联 base64 数据无效。";
 "The daemon returned an invalid artifact path." = "守护进程返回了无效的产物路径。";
+
+"Backup integrity" = "备份完整性";
+"Refresh backup status" = "刷新备份状态";
+"No signing key configured" = "未配置签名密钥";
+"No keyring yet" = "尚未创建密钥环";
+"No verified backup anchor yet" = "尚无已校验的备份锚点";
