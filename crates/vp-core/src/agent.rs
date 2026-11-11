@@ -31,6 +31,7 @@ use vp_providers::{
 use vp_store::Store;
 
 use crate::Engine;
+use crate::RuntimeLeaseGuard;
 use crate::acp;
 use crate::budget::{BudgetReason, Rejection, ScopeRequest, Spend};
 use crate::permissions::{
@@ -510,6 +511,14 @@ pub struct AgentService {
     task_scheduler_started: Arc<AtomicBool>,
     global_slots: Arc<AdmissionGate>,
     capacity: Arc<CapacityController>,
+}
+
+fn continuation_claim_secs() -> u64 {
+    env::var("VERLINPARK_CONTINUATION_CLAIM_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(120)
+        .clamp(10, 3_600)
 }
 
 fn continuation_retry_backoff_secs(attempts: u32) -> i64 {
@@ -4078,7 +4087,7 @@ impl AgentService {
                 };
                 continuation = ready;
             }
-            if continuation.status != "ready" {
+            if !matches!(continuation.status.as_str(), "ready" | "delivering") {
                 continue;
             }
             if let Some(next_attempt_at) = continuation.next_attempt_at.as_deref()
@@ -4111,15 +4120,19 @@ impl AgentService {
             }
 
             attempted_sessions.insert(continuation.session_id.clone());
-            let Some(continuation) = self
+            let Some(claim) = self
                 .engine
-                .claim_session_continuation(&continuation.id)
+                .claim_session_continuation_for_delivery(
+                    &continuation.id,
+                    continuation_claim_secs(),
+                )
                 .await?
             else {
-                // Another reconciliation pass already claimed this row. It is
-                // now `delivering`; this pass must not start a duplicate run.
+                // Another reconciliation pass owns a live claim. It is now
+                // `delivering`; this pass must not start a duplicate run.
                 continue;
             };
+            let continuation = claim.continuation.clone();
             let reason = continuation.wake_reason.as_deref().unwrap_or("watch");
             let prompt = crate::continuation::render_prompt(&crate::continuation::PromptContext {
                 id: &continuation.id,
@@ -4131,29 +4144,93 @@ impl AgentService {
                 reason,
                 outcomes: &continuation.outcomes,
             });
-            match self.start(&continuation.session_id, &prompt).await {
-                Ok(()) => {
-                    self.engine
-                        .mark_session_continuation_delivered(&continuation.id)
-                        .await?;
-                    started = started.saturating_add(1);
-                }
+            // The operation receipt binds this continuation to the normal
+            // start path. If the daemon crashed after starting but before the
+            // claim was acknowledged, a reclaimed owner sees `unknown` and
+            // fails closed instead of starting a second run.
+            let operation_id = format!("continuation-delivery:{}", continuation.id);
+            match self
+                .start_with_operation(
+                    &continuation.session_id,
+                    &prompt,
+                    Some(operation_id.as_str()),
+                )
+                .await
+            {
+                Ok(()) => match self.engine.ack_session_continuation_delivered(&claim).await {
+                    Ok(Some(_)) => {
+                        started = started.saturating_add(1);
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            continuation_id = %continuation.id,
+                            "continuation delivered but its acknowledgement was not applied"
+                        );
+                    }
+                    Err(crate::SessionContinuationAckError::Lost { .. }) => {
+                        tracing::warn!(
+                            continuation_id = %continuation.id,
+                            "continuation delivery claim was reclaimed before acknowledgement"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            continuation_id = %continuation.id,
+                            "continuation delivery acknowledgement failed"
+                        );
+                    }
+                },
                 Err(error) => {
                     let error = format!("start failed: {error}");
                     let attempts = continuation.attempts.saturating_add(1);
                     if attempts >= continuation.max_attempts.max(1) {
-                        self.engine
-                            .fail_session_continuation(&continuation.id, &error)
-                            .await?;
+                        match self
+                            .engine
+                            .ack_session_continuation_failed(&claim, &error)
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(crate::SessionContinuationAckError::Lost { .. }) => {
+                                tracing::warn!(
+                                    continuation_id = %continuation.id,
+                                    "stale continuation owner could not record failure"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    continuation_id = %continuation.id,
+                                    "continuation failure acknowledgement failed"
+                                );
+                            }
+                        }
                     } else {
                         let next = now
                             + time::Duration::seconds(continuation_retry_backoff_secs(attempts));
                         let next_attempt_at = next
                             .format(&time::format_description::well_known::Rfc3339)
                             .map_err(|error| anyhow!("formatting retry time: {error}"))?;
-                        self.engine
-                            .retry_session_continuation(&continuation.id, &error, &next_attempt_at)
-                            .await?;
+                        match self
+                            .engine
+                            .ack_session_continuation_retry(&claim, &error, &next_attempt_at)
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(crate::SessionContinuationAckError::Lost { .. }) => {
+                                tracing::warn!(
+                                    continuation_id = %continuation.id,
+                                    "stale continuation owner could not schedule a retry"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    continuation_id = %continuation.id,
+                                    "continuation retry acknowledgement failed"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -7043,19 +7120,25 @@ async fn process_merge_entry(
             std::time::Duration::from_secs(900),
         )
         .await?;
-    let result = process_merge_entry_inner(engine, session, spec, entry, integration_command).await;
+    let result =
+        process_merge_entry_fenced(engine, session, spec, entry, integration_command, &lease).await;
     lease.release().await;
     result
 }
 
-/// Merge and integration-check an existing queue entry. The entry must already
-/// have a valid `base_commit` (the session HEAD before this merge).
-async fn process_merge_entry_inner(
+/// Merge and integration-check an existing queue entry under an already-held
+/// integration lease. The entry must already have a valid `base_commit` (the
+/// session HEAD before this merge). The fence is checked immediately before
+/// the queue row starts `merging` and again inside the Git critical section
+/// immediately before `git merge`; a stale integrator never mutates the
+/// session branch.
+async fn process_merge_entry_fenced(
     engine: &Engine,
     session: &Session,
     spec: &AgentSpec,
     entry: &MergeQueueEntry,
     integration_command: Option<&str>,
+    lease: &RuntimeLeaseGuard,
 ) -> Result<String> {
     let (_, project) = load_session_project(engine.store().clone(), &session.id).await?;
     let preflight_worktree = spec.session_worktree.clone();
@@ -7096,6 +7179,28 @@ async fn process_merge_entry_inner(
             return Err(anyhow!(detail));
         }
     };
+    if let Err(error) = lease.assert_held().await {
+        let detail = truncate(&format!(
+            "integration lease lost before merge: {error}; session branch was not changed"
+        ));
+        engine
+            .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+            .await?;
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "integrator.finished",
+            serde_json::json!({
+                "entry_id": entry.id,
+                "status": "failed",
+                "detail": detail,
+                "reason": "lease_lost_before_merge",
+            }),
+        )
+        .await?;
+        return Err(anyhow!(detail));
+    }
     engine
         .begin_merge_queue_entry(&entry.id, &preflight)
         .await?;
@@ -7119,8 +7224,17 @@ async fn process_merge_entry_inner(
     let merge_commit = entry.commit.clone();
     let expected_base = preflight.clone();
     let message = format!("merge {}", spec.name);
+    let fence_store = engine.store().clone();
+    let fence_key = lease.lease_key.clone();
+    let fence_owner = lease.owner_id.clone();
+    let fence_token = lease.token().clone();
     let merge_result = tokio::task::spawn_blocking(move || -> Result<String> {
         let _guard = git_lock.lock().map_err(|_| anyhow!("git mutex poisoned"))?;
+        // Effect-boundary fence: this is the last read before the session
+        // branch is mutated. A stale generation aborts without running merge.
+        fence_store
+            .assert_runtime_lease(&fence_key, &fence_owner, &fence_token)
+            .map_err(|error| anyhow!("integration lease lost before merge: {error}"))?;
         let actual_base = worktree::head_commit(&merge_worktree)?;
         if actual_base != expected_base {
             tracing::warn!(
@@ -7164,6 +7278,41 @@ async fn process_merge_entry_inner(
         }
     };
 
+    // The row could expire during the merge itself. Roll the branch back to
+    // the pre-merge HEAD before touching the queue state so a newer owner
+    // never observes a half-finished integration from a stale generation.
+    if let Err(error) = lease.assert_held().await {
+        let reset_worktree = spec.session_worktree.clone();
+        let reset_base = actual_base.clone();
+        let reset =
+            tokio::task::spawn_blocking(move || worktree::reset_hard(&reset_worktree, &reset_base))
+                .await?;
+        let detail = truncate(&match reset {
+            Ok(()) => {
+                format!("integration lease lost after merge: {error}; rolled back to {actual_base}")
+            }
+            Err(reset_error) => format!(
+                "integration lease lost after merge: {error}; rollback failed: {reset_error}"
+            ),
+        });
+        engine
+            .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+            .await?;
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "integrator.finished",
+            serde_json::json!({
+                "entry_id": entry.id,
+                "status": "failed",
+                "detail": detail,
+                "reason": "lease_lost_after_merge",
+            }),
+        )
+        .await?;
+        return Err(anyhow!(detail));
+    }
     engine
         .update_merge_queue_entry(&entry.id, "checking", None)
         .await?;
@@ -7194,17 +7343,32 @@ async fn process_merge_entry_inner(
     let integration_detail = match check_result {
         Ok(detail) => detail,
         Err(error) => {
-            let detail = format!("integration check failed: {error}");
-            let reset_worktree = spec.session_worktree.clone();
-            let reset_base = actual_base.clone();
-            let reset = tokio::task::spawn_blocking(move || {
-                worktree::reset_hard(&reset_worktree, &reset_base)
-            })
-            .await?;
-            let detail = truncate(&match reset {
-                Ok(()) => detail,
-                Err(reset_error) => format!("{detail}; rollback failed: {reset_error}"),
-            });
+            let mut detail = format!("integration check failed: {error}");
+            // A new owner may have merged on top while the check command was
+            // running. Only the generation that owns the key may reset its own
+            // merge; otherwise leave the worktree for operator inspection.
+            let owned = match lease.assert_held().await {
+                Ok(_) => true,
+                Err(lease_error) => {
+                    detail = format!(
+                        "{detail}; rollback skipped because the integration lease was lost: {lease_error}"
+                    );
+                    false
+                }
+            };
+            if owned {
+                let reset_worktree = spec.session_worktree.clone();
+                let reset_base = actual_base.clone();
+                let reset = tokio::task::spawn_blocking(move || {
+                    worktree::reset_hard(&reset_worktree, &reset_base)
+                })
+                .await?;
+                detail = match reset {
+                    Ok(()) => detail,
+                    Err(reset_error) => format!("{detail}; rollback failed: {reset_error}"),
+                };
+            }
+            let detail = truncate(&detail);
             engine
                 .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
                 .await?;
@@ -7224,6 +7388,41 @@ async fn process_merge_entry_inner(
         }
     };
     let integration_detail = truncate(&integration_detail);
+    // Final effect-boundary check: the integration command may have run for
+    // minutes. If ownership moved, discard this generation's merge instead of
+    // publishing a merged entry that a newer owner cannot reason about.
+    if let Err(error) = lease.assert_held().await {
+        let reset_worktree = spec.session_worktree.clone();
+        let reset_base = actual_base.clone();
+        let reset =
+            tokio::task::spawn_blocking(move || worktree::reset_hard(&reset_worktree, &reset_base))
+                .await?;
+        let detail = truncate(&match reset {
+            Ok(()) => format!(
+                "integration lease lost before finalize: {error}; rolled back to {actual_base}"
+            ),
+            Err(reset_error) => format!(
+                "integration lease lost before finalize: {error}; rollback failed: {reset_error}"
+            ),
+        });
+        engine
+            .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+            .await?;
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "integrator.finished",
+            serde_json::json!({
+                "entry_id": entry.id,
+                "status": "failed",
+                "detail": detail,
+                "reason": "lease_lost_before_finalize",
+            }),
+        )
+        .await?;
+        return Err(anyhow!(detail));
+    }
     engine
         .update_merge_queue_entry(&entry.id, "merged", Some(integration_detail.clone()))
         .await?;

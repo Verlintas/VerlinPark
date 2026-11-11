@@ -4456,6 +4456,18 @@ pub struct SessionContinuation {
     /// at the count of its parent, and delivery increments it.
     #[serde(default)]
     pub run_count: u32,
+    /// Process owner currently holding the delivery claim, if any. This is
+    /// operational ownership metadata, not an agent identity; it is cleared on
+    /// delivery, retry, cancellation, or expiry recovery.
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+    /// Expiry of the delivery claim. A live foreign claim must not be touched.
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+    /// Number of delivery claims attempted, including reclaimed expired
+    /// claims. It is distinct from `attempts`, which counts failed starts.
+    #[serde(default)]
+    pub delivery_attempt: u32,
 }
 
 fn default_continuation_watch_mode() -> String {
@@ -4535,6 +4547,48 @@ pub struct SessionContinuationsResult {
 pub struct SessionContinuationCancelResult {
     pub cancelled: bool,
     pub continuation: SessionContinuation,
+}
+
+/// Token-free visibility into a continuation delivery claim. `live` is derived
+/// from expiry at response time; the owner is diagnostic, not a liveness
+/// proof.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionContinuationClaimInfo {
+    pub status: String,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub delivery_attempt: u32,
+    #[serde(default)]
+    pub live: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionContinuationStatusParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionContinuationStatusResult {
+    pub continuation: SessionContinuation,
+    #[serde(default)]
+    pub claim: Option<SessionContinuationClaimInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionContinuationReclaimParams {
+    pub id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionContinuationReclaimResult {
+    pub reclaimed: bool,
+    #[serde(default)]
+    pub continuation: Option<SessionContinuation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5091,22 +5145,77 @@ pub struct CoordinationNoteResult {
 pub struct RuntimeLeaseInfo {
     pub lease_key: String,
     pub owner_id: String,
+    /// Process-scoped instance (`instance_id:pid`) that owns the row.
+    #[serde(default)]
+    pub owner_instance: String,
     pub kind: String,
     pub session_id: Option<String>,
+    /// Monotonic per-key generation. Never reused across reacquisition.
+    #[serde(default)]
+    pub fencing_token: u64,
     pub acquired_at: String,
     pub heartbeat_at: String,
+    #[serde(default)]
+    pub renewed_at: String,
     pub expires_at: String,
+    #[serde(default)]
+    pub released_at: Option<String>,
+    /// Derived `live`, `stale`, or `released`.
+    #[serde(default)]
+    pub state: String,
+}
+
+/// Stable, non-secret daemon identity for one data directory. `pid` is the
+/// creator's pid for diagnostics; it is not a liveness probe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonInstanceInfo {
+    pub instance_id: String,
+    pub pid: u32,
+    pub started_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeLeaseListResult {
     pub runtime_id: String,
+    #[serde(default)]
+    pub daemon_instance: Option<DaemonInstanceInfo>,
     pub leases: Vec<RuntimeLeaseInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeLeaseSweepResult {
     pub removed: usize,
+}
+
+/// Token-free history row for one runtime lease key. `detail` never includes
+/// the acquisition token.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeLeaseAuditInfo {
+    pub id: i64,
+    pub lease_key: String,
+    pub kind: String,
+    pub action: String,
+    pub owner_id: String,
+    pub owner_instance: String,
+    pub fencing_token: u64,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeLeaseHistoryParams {
+    #[serde(default)]
+    pub lease_key: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeLeaseHistoryResult {
+    #[serde(default)]
+    pub lease_key: Option<String>,
+    pub entries: Vec<RuntimeLeaseAuditInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -6803,5 +6912,128 @@ mod program_wire_tests {
         let encoded = serde_json::to_string(&policy).unwrap();
         let decoded: SessionRunPolicy = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, policy);
+    }
+
+    #[test]
+    fn runtime_lease_info_describes_fencing_without_a_token() {
+        let lease = RuntimeLeaseInfo {
+            lease_key: "integration:s1".into(),
+            owner_id: "instance:42:nonce".into(),
+            owner_instance: "instance:42".into(),
+            kind: "integration".into(),
+            session_id: Some("s1".into()),
+            fencing_token: 7,
+            acquired_at: "2026-11-11T00:00:00Z".into(),
+            heartbeat_at: "2026-11-11T00:01:00Z".into(),
+            renewed_at: "2026-11-11T00:01:00Z".into(),
+            expires_at: "2026-11-11T00:16:00Z".into(),
+            released_at: None,
+            state: "live".into(),
+        };
+        let value = serde_json::to_value(&lease).unwrap();
+        assert_eq!(value["fencing_token"], 7);
+        assert_eq!(value["owner_instance"], "instance:42");
+        assert_eq!(value["state"], "live");
+        assert!(value.get("lease_token").is_none());
+        assert!(value.get("token").is_none());
+        // Legacy clients omit the new fields; the additive protocol still
+        // decodes them with safe defaults.
+        let legacy: RuntimeLeaseInfo = serde_json::from_value(serde_json::json!({
+            "lease_key": "session:s1",
+            "owner_id": "daemon-a",
+            "kind": "session",
+            "session_id": "s1",
+            "acquired_at": "2026-11-09T09:00:00Z",
+            "heartbeat_at": "2026-11-09T09:01:00Z",
+            "expires_at": "2026-11-09T09:03:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy.fencing_token, 0);
+        assert!(legacy.owner_instance.is_empty());
+        assert!(legacy.released_at.is_none());
+        assert!(legacy.state.is_empty());
+    }
+
+    #[test]
+    fn runtime_lease_history_is_token_free_and_additive() {
+        let entry = RuntimeLeaseAuditInfo {
+            id: 1,
+            lease_key: "integration:s1".into(),
+            kind: "integration".into(),
+            action: "acquired".into(),
+            owner_id: "instance:42:nonce".into(),
+            owner_instance: "instance:42".into(),
+            fencing_token: 3,
+            detail: Some("expired predecessor generation 2".into()),
+            occurred_at: "2026-11-11T00:00:00Z".into(),
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["action"], "acquired");
+        assert_eq!(value["fencing_token"], 3);
+        assert!(value.get("lease_token").is_none());
+        assert!(value.get("token").is_none());
+        let decoded: RuntimeLeaseAuditInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn continuation_status_and_reclaim_wire_shapes_are_token_free() {
+        let continuation: SessionContinuation = serde_json::from_value(serde_json::json!({
+            "id": "cont-1",
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "body": "continue",
+            "status": "delivering",
+            "created_at": "2026-11-11T00:00:00Z",
+            "updated_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        let status = SessionContinuationStatusResult {
+            continuation,
+            claim: Some(SessionContinuationClaimInfo {
+                status: "delivering".into(),
+                owner_id: Some("instance:42:nonce".into()),
+                expires_at: Some("2026-11-11T00:02:00Z".into()),
+                delivery_attempt: 2,
+                live: true,
+            }),
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["claim"]["delivery_attempt"], 2);
+        assert_eq!(value["claim"]["live"], true);
+        assert!(!value.to_string().contains("lease_token"));
+        let reclaim = SessionContinuationReclaimResult {
+            reclaimed: true,
+            continuation: Some(status.continuation),
+        };
+        assert_eq!(serde_json::to_value(reclaim).unwrap()["reclaimed"], true);
+    }
+
+    #[test]
+    fn continuation_claim_fields_decode_as_additive_defaults() {
+        let legacy: SessionContinuation = serde_json::from_value(serde_json::json!({
+            "id": "cont-legacy",
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "body": "continue",
+            "status": "delivering",
+            "created_at": "2026-11-11T00:00:00Z",
+            "updated_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(legacy.lease_owner.is_none());
+        assert!(legacy.lease_expires_at.is_none());
+        assert_eq!(legacy.delivery_attempt, 0);
+
+        let value = serde_json::to_value(SessionContinuation {
+            lease_owner: Some("instance:42:nonce".into()),
+            lease_expires_at: Some("2026-11-11T00:02:00Z".into()),
+            delivery_attempt: 2,
+            ..legacy
+        })
+        .unwrap();
+        assert_eq!(value["delivery_attempt"], 2);
+        assert_eq!(value["lease_owner"], "instance:42:nonce");
+        assert!(value.get("lease_token").is_none());
     }
 }

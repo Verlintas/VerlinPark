@@ -48,10 +48,11 @@ use vp_protocol::types::{
     SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
     SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
     SessionCompareResult, SessionContextStatus, SessionContinuation,
-    SessionContinuationCancelResult, SessionContinuationsResult, SessionDeferResult, SessionDiff,
-    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
-    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
-    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
+    SessionContinuationCancelResult, SessionContinuationClaimInfo,
+    SessionContinuationReclaimResult, SessionContinuationStatusResult, SessionContinuationsResult,
+    SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode, SessionForkTreeResult,
+    SessionImportResult, SessionLandResult, SessionLineageEntry, SessionLineageResult,
+    SessionLogStatus, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
     SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
     SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
     SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
@@ -71,7 +72,8 @@ use vp_protocol::types::{
 use vp_store::Store;
 use vp_store::store::{
     DeliveredSteering, MemoryCandidate, NewIntakeTask, NewMemory, NewSessionContinuation,
-    SessionRepair, SourceSearchQuery, SourceSnapshot,
+    RuntimeLeaseAcquisition, RuntimeLeaseToken, SessionContinuationAckError,
+    SessionContinuationClaim, SessionRepair, SourceSearchQuery, SourceSnapshot,
 };
 
 use crate::budget::BudgetRegistry;
@@ -159,35 +161,81 @@ pub struct Engine {
     computers: Arc<computer::ComputerManager>,
     scheduler: Arc<scheduler::TaskScheduler>,
     runtime_id: String,
+    continuation_claims: Arc<Mutex<HashMap<String, SessionContinuationClaim>>>,
 }
 
 /// A held cross-process session lease. Dropping without calling `release`
-/// aborts the heartbeat and lets the TTL expire after a crash.
+/// aborts the heartbeat and performs a best-effort fenced release; a process
+/// abort still leaves the row to expire after the TTL.
 pub struct SessionLease {
     store: Store,
     events: broadcast::Sender<Event>,
     pub lease_key: String,
     pub owner_id: String,
+    pub owner_instance: String,
     pub session_id: String,
+    pub fencing_token: u64,
+    token: RuntimeLeaseToken,
+    lost: Arc<AtomicBool>,
+    released: bool,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SessionLease {
-    pub async fn release(mut self) {
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    fn abort_heartbeat(&mut self) {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
         }
-        let store = self.store.clone();
-        let key = self.lease_key.clone();
-        let owner = self.owner_id.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || store.release_runtime_lease(&key, &owner)).await;
+    }
+
+    fn release_sync(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.abort_heartbeat();
+        let _ = self
+            .store
+            .release_runtime_lease(&self.lease_key, &self.owner_id, &self.token);
+    }
+
+    pub async fn release(mut self) {
+        self.abort_heartbeat();
+        if self.released {
+            return;
+        }
+        let failed = {
+            let store = self.store.clone();
+            let key = self.lease_key.clone();
+            let owner = self.owner_id.clone();
+            let token = self.token.clone();
+            tokio::task::spawn_blocking(move || {
+                store.release_runtime_lease(&key, &owner, &token).is_err()
+            })
+            .await
+            .unwrap_or(true)
+        };
+        self.released = true;
+        if failed {
+            tracing::warn!(
+                lease_key = %self.lease_key,
+                owner_id = %self.owner_id,
+                "session lease was already lost before explicit release"
+            );
+        }
         if let Ok(event) = self.store.append_event(
             &self.session_id,
             "session.lease.released",
             serde_json::json!({
                 "lease_key": self.lease_key,
                 "owner_id": self.owner_id,
+                "owner_instance": self.owner_instance,
+                "fencing_token": self.fencing_token,
+                "lease_lost": failed,
             }),
         ) {
             let _ = self.events.send(event);
@@ -197,41 +245,153 @@ impl SessionLease {
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.abort();
-        }
+        self.release_sync();
     }
 }
 
 /// A generic daemon-wide lease used for integration and other serialized
-/// operations. Unlike a session lease it has no session event stream; it still
-/// uses the same SQLite ownership, heartbeat, and expiry rules.
+/// operations. It carries the unpredictable acquisition token and monotonic
+/// generation. Renewal is fenced; a failed heartbeat marks the guard lost so
+/// the critical section can stop before its next external effect.
 pub struct RuntimeLeaseGuard {
     store: Store,
     pub lease_key: String,
     pub kind: String,
     pub owner_id: String,
+    pub owner_instance: String,
+    pub fencing_token: u64,
+    token: RuntimeLeaseToken,
+    lost: Arc<AtomicBool>,
+    lost_notify: Arc<tokio::sync::Notify>,
+    released: bool,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RuntimeLeaseGuard {
-    pub async fn release(mut self) {
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.abort();
+    fn from_acquisition(store: Store, acquisition: RuntimeLeaseAcquisition) -> Self {
+        let (lease, token) = acquisition.into_parts();
+        Self {
+            store,
+            lease_key: lease.lease_key,
+            kind: lease.kind,
+            owner_id: lease.owner_id,
+            owner_instance: lease.owner_instance,
+            fencing_token: lease.fencing_token,
+            token,
+            lost: Arc::new(AtomicBool::new(false)),
+            lost_notify: Arc::new(tokio::sync::Notify::new()),
+            released: false,
+            heartbeat: None,
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.fencing_token
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn token(&self) -> &RuntimeLeaseToken {
+        &self.token
+    }
+
+    /// Cheap local check for code that cannot await. The authoritative check
+    /// is [`Self::assert_held`] at the effect boundary.
+    pub fn assert_not_lost(&self) -> Result<()> {
+        if self.is_lost() {
+            anyhow::bail!(
+                "runtime lease {} generation {} was lost",
+                self.lease_key,
+                self.fencing_token
+            );
+        }
+        Ok(())
+    }
+
+    /// Query the database and fail if the row is missing, expired, released,
+    /// or owned by a newer token. This is the fence the Integrator uses before
+    /// mutating the session branch.
+    pub async fn assert_held(&self) -> Result<vp_store::store::RuntimeLease> {
+        self.assert_not_lost()?;
         let store = self.store.clone();
         let key = self.lease_key.clone();
         let owner = self.owner_id.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || store.release_runtime_lease(&key, &owner)).await;
+        let token = self.token.clone();
+        let result =
+            tokio::task::spawn_blocking(move || store.assert_runtime_lease(&key, &owner, &token))
+                .await?;
+        match result {
+            Ok(lease) => Ok(lease),
+            Err(error) => {
+                self.lost.store(true, Ordering::SeqCst);
+                self.lost_notify.notify_waiters();
+                Err(anyhow!(error))
+            }
+        }
+    }
+
+    /// Await the moment this guard loses ownership. The future returns
+    /// immediately when the flag is already set. Timers and cancellation are
+    /// the caller's responsibility; this is a notification, not a queue.
+    pub async fn lost_signal(&self) {
+        if self.is_lost() {
+            return;
+        }
+        self.lost_notify.notified().await;
+    }
+
+    fn abort_heartbeat(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+    }
+
+    fn release_sync(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.abort_heartbeat();
+        let _ = self
+            .store
+            .release_runtime_lease(&self.lease_key, &self.owner_id, &self.token);
+    }
+
+    pub async fn release(mut self) {
+        self.abort_heartbeat();
+        if self.released {
+            return;
+        }
+        let failed = {
+            let store = self.store.clone();
+            let key = self.lease_key.clone();
+            let owner = self.owner_id.clone();
+            let token = self.token.clone();
+            tokio::task::spawn_blocking(move || {
+                store.release_runtime_lease(&key, &owner, &token).is_err()
+            })
+            .await
+            .unwrap_or(true)
+        };
+        self.released = true;
+        if failed {
+            tracing::warn!(
+                lease_key = %self.lease_key,
+                owner_id = %self.owner_id,
+                generation = self.fencing_token,
+                "runtime lease was already lost before explicit release"
+            );
+        }
     }
 }
 
 impl Drop for RuntimeLeaseGuard {
     fn drop(&mut self) {
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.abort();
-        }
+        // Best effort: normal callers await `release`, but a dropped guard
+        // (including a panic unwind) should not pin the key until TTL.
+        self.release_sync();
     }
 }
 
@@ -555,6 +715,7 @@ impl Engine {
     pub fn new(store: Store) -> Self {
         let (events, _) = broadcast::channel(2048);
         let data_dir = store.data_dir().to_path_buf();
+        let runtime_id = store.owner_id_for_nonce(&Uuid::now_v7().to_string());
         Self {
             scheduler: Arc::new(scheduler::TaskScheduler::new(store.clone())),
             store,
@@ -570,8 +731,17 @@ impl Engine {
             terminals: Arc::new(terminal::TerminalManager::new()),
             browsers: Arc::new(browser::BrowserManager::new(data_dir.clone())),
             computers: Arc::new(computer::ComputerManager::new(data_dir)),
-            runtime_id: Uuid::now_v7().to_string(),
+            runtime_id,
+            continuation_claims: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn daemon_identity(&self) -> &vp_store::store::DaemonIdentity {
+        self.store.daemon_identity()
+    }
+
+    pub fn owner_instance(&self) -> String {
+        self.store.process_owner_instance()
     }
 
     pub fn budget_registry(&self) -> &Arc<BudgetRegistry> {
@@ -628,6 +798,8 @@ impl Engine {
     }
 
     /// Acquire a named runtime lease (for example `integration:{session}`).
+    /// The returned guard carries the random acquisition token and monotonic
+    /// generation; all later renew/release/assert operations are fenced.
     pub async fn acquire_runtime_lease(
         &self,
         kind: &str,
@@ -637,34 +809,31 @@ impl Engine {
         let ttl_secs = ttl.as_secs().clamp(10, 86_400);
         let lease_key = format!("{kind}:{resource}");
         let owner_id = self.runtime_id.clone();
+        let owner_instance = self.owner_instance();
         let store = self.store.clone();
         let key = lease_key.clone();
         let owner = owner_id.clone();
+        let instance = owner_instance.clone();
         let kind_owned = kind.to_string();
         let resource_owned = resource.to_string();
-        let acquired = tokio::task::spawn_blocking(move || {
-            store.try_acquire_runtime_lease(
+        let acquisition = tokio::task::spawn_blocking(move || {
+            store.acquire_runtime_lease(
                 &key,
                 &owner,
+                &instance,
                 &kind_owned,
                 Some(&resource_owned),
                 ttl_secs,
             )
         })
         .await??;
-        if !acquired {
-            let store = self.store.clone();
-            let key = lease_key.clone();
-            let holder =
-                tokio::task::spawn_blocking(move || store.runtime_lease_owner(&key)).await??;
-            let detail = holder
-                .map(|lease| format!("held by {} until {}", lease.owner_id, lease.expires_at))
-                .unwrap_or_else(|| "held by another process".to_string());
-            anyhow::bail!("{kind} lease for {resource} is busy ({detail})");
-        }
+        let mut guard = RuntimeLeaseGuard::from_acquisition(self.store.clone(), acquisition);
         let heartbeat_store = self.store.clone();
-        let heartbeat_key = lease_key.clone();
-        let heartbeat_owner = owner_id.clone();
+        let heartbeat_key = guard.lease_key.clone();
+        let heartbeat_owner = guard.owner_id.clone();
+        let heartbeat_token = guard.token.clone();
+        let heartbeat_lost = guard.lost.clone();
+        let heartbeat_notify = guard.lost_notify.clone();
         let heartbeat_secs = (ttl_secs / 3).max(5);
         let heartbeat = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
@@ -675,25 +844,23 @@ impl Engine {
                 let store = heartbeat_store.clone();
                 let key = heartbeat_key.clone();
                 let owner = heartbeat_owner.clone();
+                let token = heartbeat_token.clone();
                 let renewed = tokio::task::spawn_blocking(move || {
-                    store.renew_runtime_lease(&key, &owner, ttl_secs)
+                    store
+                        .renew_runtime_lease(&key, &owner, &token, ttl_secs)
+                        .is_ok()
                 })
                 .await
-                .ok()
-                .and_then(Result::ok)
                 .unwrap_or(false);
                 if !renewed {
+                    heartbeat_lost.store(true, Ordering::SeqCst);
+                    heartbeat_notify.notify_waiters();
                     break;
                 }
             }
         });
-        Ok(RuntimeLeaseGuard {
-            store: self.store.clone(),
-            lease_key,
-            kind: kind.to_string(),
-            owner_id,
-            heartbeat: Some(heartbeat),
-        })
+        guard.heartbeat = Some(heartbeat);
+        Ok(guard)
     }
 
     /// Acquire the cross-process lease for a session run. The database row is
@@ -708,24 +875,42 @@ impl Engine {
         let ttl_secs = ttl.as_secs().clamp(10, 86_400);
         let lease_key = format!("session:{session_id}");
         let owner_id = self.runtime_id.clone();
+        let owner_instance = self.owner_instance();
         let store = self.store.clone();
         let key = lease_key.clone();
         let owner = owner_id.clone();
+        let instance = owner_instance.clone();
         let session = session_id.to_string();
-        let acquired = tokio::task::spawn_blocking(move || {
-            store.try_acquire_runtime_lease(&key, &owner, "session", Some(&session), ttl_secs)
+        let acquisition = match tokio::task::spawn_blocking(move || {
+            store.acquire_runtime_lease(
+                &key,
+                &owner,
+                &instance,
+                "session",
+                Some(&session),
+                ttl_secs,
+            )
         })
-        .await??;
-        if !acquired {
-            let store = self.store.clone();
-            let key = lease_key.clone();
-            let holder =
-                tokio::task::spawn_blocking(move || store.runtime_lease_owner(&key)).await??;
-            let detail = holder
-                .map(|lease| format!("held by {} until {}", lease.owner_id, lease.expires_at))
-                .unwrap_or_else(|| "held by another daemon".to_string());
-            anyhow::bail!("session {session_id} is already running ({detail})");
-        }
+        .await?
+        {
+            Ok(acquisition) => acquisition,
+            Err(vp_store::store::RuntimeLeaseError::Busy {
+                holder: Some(holder),
+            }) => {
+                anyhow::bail!(
+                    "session {session_id} is already running (held by {} on {} until {})",
+                    holder.owner_id,
+                    holder.owner_instance,
+                    holder.expires_at
+                );
+            }
+            Err(vp_store::store::RuntimeLeaseError::Busy { holder: None }) => {
+                anyhow::bail!("session {session_id} is already running");
+            }
+            Err(error) => return Err(anyhow!(error)),
+        };
+        let fencing_token = acquisition.fencing_token();
+        let token = acquisition.token().clone();
         let event = self
             .append_event(
                 session_id,
@@ -733,14 +918,29 @@ impl Engine {
                 serde_json::json!({
                     "lease_key": lease_key,
                     "owner_id": owner_id,
+                    "owner_instance": owner_instance,
+                    "fencing_token": fencing_token,
                     "ttl_secs": ttl_secs,
                 }),
             )
-            .await?;
-        let _ = event;
+            .await;
+        if let Err(error) = event {
+            let release_store = self.store.clone();
+            let release_key = lease_key.clone();
+            let release_owner = owner_id.clone();
+            let release_token = token.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                release_store.release_runtime_lease(&release_key, &release_owner, &release_token)
+            })
+            .await;
+            return Err(error);
+        }
+        let lost = Arc::new(AtomicBool::new(false));
         let heartbeat_store = self.store.clone();
         let heartbeat_key = lease_key.clone();
         let heartbeat_owner = owner_id.clone();
+        let heartbeat_token = token.clone();
+        let heartbeat_lost = lost.clone();
         let heartbeat_secs = (ttl_secs / 3).max(5);
         let heartbeat = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
@@ -751,14 +951,16 @@ impl Engine {
                 let store = heartbeat_store.clone();
                 let key = heartbeat_key.clone();
                 let owner = heartbeat_owner.clone();
+                let token = heartbeat_token.clone();
                 let renewed = tokio::task::spawn_blocking(move || {
-                    store.renew_runtime_lease(&key, &owner, ttl_secs)
+                    store
+                        .renew_runtime_lease(&key, &owner, &token, ttl_secs)
+                        .is_ok()
                 })
                 .await
-                .ok()
-                .and_then(Result::ok)
                 .unwrap_or(false);
                 if !renewed {
+                    heartbeat_lost.store(true, Ordering::SeqCst);
                     break;
                 }
             }
@@ -768,9 +970,49 @@ impl Engine {
             events: self.events.clone(),
             lease_key,
             owner_id,
+            owner_instance,
             session_id: session_id.to_string(),
+            fencing_token,
+            token,
+            lost,
+            released: false,
             heartbeat: Some(heartbeat),
         })
+    }
+
+    /// Acquire a runtime lease at an explicit clock for deterministic tests and
+    /// recovery drills. Production callers use `acquire_runtime_lease`.
+    #[cfg(test)]
+    pub(crate) async fn acquire_runtime_lease_at_for_test(
+        &self,
+        kind: &str,
+        resource: &str,
+        ttl_secs: u64,
+        now: time::OffsetDateTime,
+    ) -> Result<RuntimeLeaseGuard> {
+        let lease_key = format!("{kind}:{resource}");
+        let store = self.store.clone();
+        let key = lease_key.clone();
+        let owner = self.runtime_id.clone();
+        let instance = self.owner_instance();
+        let kind_owned = kind.to_string();
+        let resource_owned = resource.to_string();
+        let acquisition = tokio::task::spawn_blocking(move || {
+            store.acquire_runtime_lease_at(
+                &key,
+                &owner,
+                &instance,
+                &kind_owned,
+                Some(&resource_owned),
+                ttl_secs,
+                now,
+            )
+        })
+        .await??;
+        Ok(RuntimeLeaseGuard::from_acquisition(
+            self.store.clone(),
+            acquisition,
+        ))
     }
 
     pub async fn orchestration_candidates(&self, limit: u32) -> Result<Vec<String>> {
@@ -786,6 +1028,30 @@ impl Engine {
     pub async fn sweep_runtime_leases(&self) -> Result<usize> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.clear_expired_runtime_leases()).await?
+    }
+
+    /// Token-free lease history for operators. The audit is operational state,
+    /// not a replay projection.
+    pub async fn runtime_lease_audit(
+        &self,
+        lease_key: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<vp_store::store::RuntimeLeaseAuditEntry>> {
+        let store = self.store.clone();
+        let lease_key = lease_key.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            store.list_runtime_lease_audit(lease_key.as_deref(), limit)
+        })
+        .await?
+    }
+
+    /// Bound the operational lease audit table. Defaults to 30 days and runs
+    /// from the daemon's existing lease sweep loop.
+    pub async fn prune_runtime_lease_audit(&self, retention_days: u64) -> Result<usize> {
+        let days = retention_days.clamp(1, 365);
+        let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(days as i64);
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.prune_runtime_lease_audit(cutoff)).await?
     }
 
     /// Acquire the daemon-wide browser/GUI surface lease. The SQLite row is
@@ -5540,6 +5806,57 @@ impl Engine {
         })
     }
 
+    /// Token-free status for one continuation delivery claim. The scheduler
+    /// and operators use it to distinguish a live foreign claim from an
+    /// expired row that is safe to reclaim.
+    pub async fn session_continuation_status(
+        &self,
+        id: &str,
+    ) -> Result<SessionContinuationStatusResult> {
+        let store = self.store.clone();
+        let id_owned = id.to_string();
+        let continuation =
+            tokio::task::spawn_blocking(move || store.get_session_continuation(&id_owned))
+                .await??
+                .ok_or_else(|| anyhow!("continuation not found: {id}"))?;
+        let store = self.store.clone();
+        let id_owned = id.to_string();
+        let claim =
+            tokio::task::spawn_blocking(move || store.session_continuation_claim_status(&id_owned))
+                .await??;
+        Ok(SessionContinuationStatusResult {
+            continuation,
+            claim: claim.map(|claim| SessionContinuationClaimInfo {
+                status: claim.status,
+                owner_id: claim.owner_id,
+                expires_at: claim.expires_at,
+                delivery_attempt: claim.delivery_attempt,
+                live: claim.live,
+            }),
+        })
+    }
+
+    /// Explicitly reclaim an expired delivery claim. This is the same
+    /// operation startup recovery and the scheduler use; it cannot reclaim a
+    /// live claim or a terminal row.
+    pub async fn reclaim_session_continuation(
+        &self,
+        id: &str,
+        reason: Option<&str>,
+    ) -> Result<SessionContinuationReclaimResult> {
+        let reason = reason
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("claim expired before acknowledgement");
+        let reclaimed = self
+            .reclaim_expired_session_continuation(id, reason)
+            .await?;
+        Ok(SessionContinuationReclaimResult {
+            reclaimed: reclaimed.is_some(),
+            continuation: reclaimed,
+        })
+    }
+
     pub async fn cancel_session_continuation(
         &self,
         id: &str,
@@ -5584,34 +5901,72 @@ impl Engine {
         Ok(Some(continuation))
     }
 
-    /// Atomically claim a ready row for one delivery attempt. Returns `None`
-    /// when another pass already claimed or completed it.
+    /// Atomically claim a ready row, or reclaim an expired delivery claim,
+    /// with a new process owner and token. The scheduler uses this path and
+    /// acknowledges with the returned claim. A live foreign claim returns
+    /// `None` and is never touched.
+    pub async fn claim_session_continuation_for_delivery(
+        &self,
+        id: &str,
+        ttl_secs: u64,
+    ) -> Result<Option<SessionContinuationClaim>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        let owner_id = self.runtime_id.clone();
+        let claim = tokio::task::spawn_blocking(move || {
+            store.claim_session_continuation_for_delivery_with_event(&id, &owner_id, ttl_secs)
+        })
+        .await??;
+        let Some(claim) = claim else {
+            return Ok(None);
+        };
+        let _ = self.events.send(claim.event.clone());
+        Ok(Some(claim))
+    }
+
+    /// Backwards-compatible claim used by tests and older internal callers. It
+    /// records the token in the Engine's in-memory claim map so the un-fenced
+    /// acknowledgement helpers stay safe within this process. New code should
+    /// call `claim_session_continuation_for_delivery` and pass the claim.
     pub async fn claim_session_continuation(
         &self,
         id: &str,
     ) -> Result<Option<SessionContinuation>> {
-        let store = self.store.clone();
-        let id = id.to_string();
-        let result =
-            tokio::task::spawn_blocking(move || store.claim_session_continuation_with_event(&id))
-                .await??;
-        let Some((continuation, event)) = result else {
+        let Some(claim) = self
+            .claim_session_continuation_for_delivery(id, 120)
+            .await?
+        else {
             return Ok(None);
         };
-        let _ = self.events.send(event);
+        let continuation = claim.continuation.clone();
+        if let Ok(mut claims) = self.continuation_claims.lock() {
+            claims.insert(id.to_string(), claim);
+        }
         Ok(Some(continuation))
     }
 
-    pub async fn mark_session_continuation_delivered(
+    fn take_continuation_claim(&self, id: &str) -> Option<SessionContinuationClaim> {
+        self.continuation_claims
+            .lock()
+            .ok()
+            .and_then(|mut claims| claims.remove(id))
+    }
+
+    /// Fenced delivery acknowledgement. A stale owner receives a typed
+    /// `SessionContinuationAckError::Lost` and no terminal row is written.
+    pub async fn ack_session_continuation_delivered(
         &self,
-        id: &str,
-    ) -> Result<Option<SessionContinuation>> {
+        claim: &SessionContinuationClaim,
+    ) -> std::result::Result<Option<SessionContinuation>, SessionContinuationAckError> {
         let store = self.store.clone();
-        let id = id.to_string();
+        let id = claim.continuation.id.clone();
+        let owner = claim.owner_id.clone();
+        let token = claim.token().clone();
         let result = tokio::task::spawn_blocking(move || {
-            store.mark_session_continuation_delivered_with_event(&id)
+            store.mark_session_continuation_delivered_with_event(&id, &owner, &token)
         })
-        .await??;
+        .await
+        .map_err(|error| SessionContinuationAckError::Internal(error.to_string()))??;
         let Some(delivery) = result else {
             return Ok(None);
         };
@@ -5621,18 +5976,120 @@ impl Engine {
         Ok(Some(delivery.delivered))
     }
 
+    pub async fn ack_session_continuation_retry(
+        &self,
+        claim: &SessionContinuationClaim,
+        error: &str,
+        next_attempt_at: &str,
+    ) -> std::result::Result<Option<SessionContinuation>, SessionContinuationAckError> {
+        let store = self.store.clone();
+        let id = claim.continuation.id.clone();
+        let owner = claim.owner_id.clone();
+        let token = claim.token().clone();
+        let error = error.to_string();
+        let next_attempt_at = next_attempt_at.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.retry_session_continuation_with_event(
+                &id,
+                &owner,
+                &token,
+                &error,
+                &next_attempt_at,
+            )
+        })
+        .await
+        .map_err(|error| SessionContinuationAckError::Internal(error.to_string()))??;
+        let Some((continuation, event)) = result else {
+            return Ok(None);
+        };
+        let _ = self.events.send(event);
+        Ok(Some(continuation))
+    }
+
+    pub async fn ack_session_continuation_failed(
+        &self,
+        claim: &SessionContinuationClaim,
+        error: &str,
+    ) -> std::result::Result<Option<SessionContinuation>, SessionContinuationAckError> {
+        let store = self.store.clone();
+        let id = claim.continuation.id.clone();
+        let owner = claim.owner_id.clone();
+        let token = claim.token().clone();
+        let error = error.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            store.fail_session_continuation_with_event(&id, &owner, &token, &error)
+        })
+        .await
+        .map_err(|error| SessionContinuationAckError::Internal(error.to_string()))??;
+        let Some((continuation, event)) = result else {
+            return Ok(None);
+        };
+        let _ = self.events.send(event);
+        Ok(Some(continuation))
+    }
+
+    /// Idempotent legacy acknowledgement. A repeated terminal write or a stale
+    /// in-memory claim returns `Ok(None)` instead of rewriting the row.
+    pub async fn mark_session_continuation_delivered(
+        &self,
+        id: &str,
+    ) -> Result<Option<SessionContinuation>> {
+        let Some(claim) = self.take_continuation_claim(id) else {
+            return Ok(None);
+        };
+        match self.ack_session_continuation_delivered(&claim).await {
+            Ok(delivered) => Ok(delivered),
+            Err(SessionContinuationAckError::Lost { .. }) => Ok(None),
+            Err(error) => Err(anyhow!(error)),
+        }
+    }
+
     pub async fn retry_session_continuation(
         &self,
         id: &str,
         error: &str,
         next_attempt_at: &str,
     ) -> Result<Option<SessionContinuation>> {
+        let Some(claim) = self.take_continuation_claim(id) else {
+            return Ok(None);
+        };
+        match self
+            .ack_session_continuation_retry(&claim, error, next_attempt_at)
+            .await
+        {
+            Ok(retried) => Ok(retried),
+            Err(SessionContinuationAckError::Lost { .. }) => Ok(None),
+            Err(error) => Err(anyhow!(error)),
+        }
+    }
+
+    pub async fn fail_session_continuation(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<Option<SessionContinuation>> {
+        if let Some(claim) = self.take_continuation_claim(id) {
+            return match self.ack_session_continuation_failed(&claim, error).await {
+                Ok(failed) => Ok(failed),
+                Err(SessionContinuationAckError::Lost { .. }) => Ok(None),
+                Err(error) => Err(anyhow!(error)),
+            };
+        }
+        self.fail_unclaimed_session_continuation(id, error).await
+    }
+
+    /// Fail a pending/ready row, or an expired delivery claim, without a token.
+    /// A live foreign claim is left untouched.
+    pub async fn fail_unclaimed_session_continuation(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<Option<SessionContinuation>> {
         let store = self.store.clone();
         let id = id.to_string();
         let error = error.to_string();
-        let next_attempt_at = next_attempt_at.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            store.retry_session_continuation_with_event(&id, &error, &next_attempt_at)
+            store.fail_unclaimed_session_continuation_with_event(&id, &error)
         })
         .await??;
         let Some((continuation, event)) = result else {
@@ -5642,16 +6099,19 @@ impl Engine {
         Ok(Some(continuation))
     }
 
-    pub async fn fail_session_continuation(
+    /// Reclaim one expired claim at startup or from an operator drill. The
+    /// delivery operation receipt makes a retry safe when the old process may
+    /// already have started a run.
+    pub async fn reclaim_expired_session_continuation(
         &self,
         id: &str,
-        error: &str,
+        reason: &str,
     ) -> Result<Option<SessionContinuation>> {
         let store = self.store.clone();
         let id = id.to_string();
-        let error = error.to_string();
+        let reason = reason.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            store.fail_session_continuation_with_event(&id, &error)
+            store.reclaim_expired_session_continuation_with_event(&id, &reason)
         })
         .await??;
         let Some((continuation, event)) = result else {
@@ -13016,6 +13476,7 @@ fn replay_continuations(events: &[Event]) -> Vec<SessionContinuation> {
             "session.continuation.created"
                 | "session.continuation.ready"
                 | "session.continuation.delivering"
+                | "session.continuation.reclaimed"
                 | "session.continuation.retrying"
                 | "session.continuation.delivered"
                 | "session.continuation.scheduled"

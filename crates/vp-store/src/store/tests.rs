@@ -2134,86 +2134,181 @@ fn plan_revision_is_stored_with_an_event() {
 }
 
 #[test]
-fn runtime_leases_are_owned_renewable_and_releasable() {
+fn runtime_leases_are_owned_fenced_renewable_and_releasable() {
     let (_data, store, _repo) = test_store();
-    assert!(
+    let first = store
+        .acquire_runtime_lease(
+            "session:s1",
+            "daemon-a",
+            "instance-a:1",
+            "session",
+            Some("s1"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(first.fencing_token(), 1);
+    // A live lease rejects a competitor with a typed busy error.
+    let busy = store
+        .acquire_runtime_lease(
+            "session:s1",
+            "daemon-b",
+            "instance-b:2",
+            "session",
+            Some("s1"),
+            60,
+        )
+        .unwrap_err();
+    assert!(matches!(busy, RuntimeLeaseError::Busy { .. }));
+    assert_eq!(
         store
-            .try_acquire_runtime_lease("session:s1", "daemon-a", "session", Some("s1"), 60)
+            .runtime_lease_owner("session:s1")
             .unwrap()
-    );
-    // The same owner can refresh, another owner cannot take an unexpired lease.
-    assert!(
-        store
-            .try_acquire_runtime_lease("session:s1", "daemon-a", "session", Some("s1"), 60)
             .unwrap()
+            .owner_id,
+        "daemon-a"
     );
-    assert!(
-        !store
-            .try_acquire_runtime_lease("session:s1", "daemon-b", "session", Some("s1"), 60)
-            .unwrap()
-    );
-    let lease = store.runtime_lease_owner("session:s1").unwrap().unwrap();
-    assert_eq!(lease.owner_id, "daemon-a");
-    assert_eq!(lease.kind, "session");
-    assert_eq!(lease.session_id.as_deref(), Some("s1"));
 
+    // Renewal is fenced on the acquisition token.
+    let renewed = store
+        .renew_runtime_lease("session:s1", "daemon-a", first.token(), 120)
+        .unwrap();
+    assert_eq!(renewed.fencing_token, 1);
+    assert!(!renewed.renewed_at.is_empty());
+
+    // Reacquisition by the same owner creates a new generation and token; the
+    // previous guard becomes stale immediately.
+    let second = store
+        .acquire_runtime_lease(
+            "session:s1",
+            "daemon-a",
+            "instance-a:1",
+            "session",
+            Some("s1"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(second.fencing_token(), 2);
+    assert!(matches!(
+        store
+            .renew_runtime_lease("session:s1", "daemon-a", first.token(), 60)
+            .unwrap_err(),
+        RuntimeLeaseError::Lost {
+            reason: LeaseLostReason::TokenMismatch,
+            ..
+        }
+    ));
+    assert!(matches!(
+        store
+            .release_runtime_lease("session:s1", "daemon-a", first.token())
+            .unwrap_err(),
+        RuntimeLeaseError::Lost {
+            reason: LeaseLostReason::TokenMismatch,
+            ..
+        }
+    ));
+
+    // Release is a tombstone internally, so it cannot erase the generation.
     assert!(
         store
-            .renew_runtime_lease("session:s1", "daemon-a", 120)
-            .unwrap()
-    );
-    assert!(
-        !store
-            .renew_runtime_lease("session:s1", "daemon-b", 120)
-            .unwrap()
-    );
-    assert_eq!(store.list_runtime_leases().unwrap().len(), 1);
-    assert!(
-        !store
-            .release_runtime_lease("session:s1", "daemon-b")
-            .unwrap()
-    );
-    assert!(
-        store
-            .release_runtime_lease("session:s1", "daemon-a")
+            .release_runtime_lease("session:s1", "daemon-a", second.token())
             .unwrap()
     );
     assert!(store.runtime_lease_owner("session:s1").unwrap().is_none());
+    assert!(store.list_runtime_leases().unwrap().is_empty());
+    assert_eq!(
+        store.runtime_lease_fencing_token("session:s1").unwrap(),
+        Some(2)
+    );
+
+    let third = store
+        .acquire_runtime_lease(
+            "session:s1",
+            "daemon-b",
+            "instance-b:2",
+            "session",
+            Some("s1"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(third.fencing_token(), 3);
+    assert_eq!(store.list_runtime_leases().unwrap().len(), 1);
+    // Releasing with the previous generation must not delete the new owner.
     assert!(
         store
-            .try_acquire_runtime_lease("session:s1", "daemon-b", "session", Some("s1"), 60)
-            .unwrap()
+            .release_runtime_lease("session:s1", "daemon-a", second.token())
+            .is_err()
     );
+    assert_eq!(
+        store
+            .runtime_lease_owner("session:s1")
+            .unwrap()
+            .unwrap()
+            .owner_id,
+        "daemon-b"
+    );
+
+    // The public projection never carries the token.
+    let encoded =
+        serde_json::to_value(store.runtime_lease_owner("session:s1").unwrap().unwrap()).unwrap();
+    assert!(encoded.get("lease_token").is_none());
+    assert!(encoded.get("token").is_none());
+    assert_eq!(encoded["fencing_token"], 3);
 }
 
 #[test]
 fn expired_runtime_leases_can_be_swept_or_taken_over() {
     let (_data, store, _repo) = test_store();
-    assert!(
+    let first = store
+        .acquire_runtime_lease(
+            "session:s2",
+            "daemon-a",
+            "instance-a:1",
+            "session",
+            Some("s2"),
+            0,
+        )
+        .unwrap();
+    assert_eq!(first.fencing_token(), 1);
+    assert_eq!(
         store
-            .try_acquire_runtime_lease("session:s2", "daemon-a", "session", Some("s2"), 0)
+            .runtime_lease_owner("session:s2")
             .unwrap()
-    );
-    // A zero-TTL lease is effectively expired; a second owner can take it.
-    assert!(
-        store
-            .try_acquire_runtime_lease("session:s2", "daemon-b", "session", Some("s2"), 60)
             .unwrap()
+            .state(),
+        RuntimeLeaseState::Stale
     );
+    // A zero-TTL lease is effectively expired immediately; a second owner can
+    // take it over without waiting for a sweep.
+    let second = store
+        .acquire_runtime_lease(
+            "session:s2",
+            "daemon-b",
+            "instance-b:2",
+            "session",
+            Some("s2"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(second.fencing_token(), 2);
     let lease = store.runtime_lease_owner("session:s2").unwrap().unwrap();
     assert_eq!(lease.owner_id, "daemon-b");
-    let removed = store.clear_expired_runtime_leases().unwrap();
-    assert_eq!(removed, 0);
+    assert_eq!(lease.state(), RuntimeLeaseState::Live);
+    assert_eq!(store.clear_expired_runtime_leases().unwrap(), 0);
 }
 
 #[test]
 fn lease_expiry_comparison_handles_rfc3339_fractional_seconds() {
     let (_data, store, _repo) = test_store();
-    assert!(
-        store
-            .try_acquire_runtime_lease("session:fractional", "daemon-a", "session", Some("s"), 60)
-            .unwrap()
-    );
+    store
+        .acquire_runtime_lease(
+            "session:fractional",
+            "daemon-a",
+            "instance-a:1",
+            "session",
+            Some("s"),
+            60,
+        )
+        .unwrap();
     {
         let conn = store.lock().unwrap();
         // RFC3339 may include fractional seconds. A plain string comparison
@@ -2226,28 +2321,33 @@ fn lease_expiry_comparison_handles_rfc3339_fractional_seconds() {
         )
         .unwrap();
     }
-    assert!(
-        store
-            .try_acquire_runtime_lease("session:fractional", "daemon-b", "session", Some("s"), 60)
-            .unwrap()
-    );
+    let second = store
+        .acquire_runtime_lease(
+            "session:fractional",
+            "daemon-b",
+            "instance-b:2",
+            "session",
+            Some("s"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(second.fencing_token(), 2);
     let lease = store
         .runtime_lease_owner("session:fractional")
         .unwrap()
         .unwrap();
     assert_eq!(lease.owner_id, "daemon-b");
 
-    assert!(
-        store
-            .try_acquire_runtime_lease(
-                "session:fractional-2",
-                "daemon-a",
-                "session",
-                Some("s2"),
-                60
-            )
-            .unwrap()
-    );
+    store
+        .acquire_runtime_lease(
+            "session:fractional-2",
+            "daemon-a",
+            "instance-a:1",
+            "session",
+            Some("s2"),
+            60,
+        )
+        .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -2264,6 +2364,164 @@ fn lease_expiry_comparison_handles_rfc3339_fractional_seconds() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn concurrent_runtime_lease_acquisition_has_exactly_one_winner() {
+    let data = TempDir::new().unwrap();
+    Store::open(data.path()).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let data = data.path().to_path_buf();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&data).unwrap();
+            barrier.wait();
+            store.acquire_runtime_lease(
+                "session:race",
+                &format!("daemon-{index}"),
+                &format!("instance-{index}:{index}"),
+                "session",
+                Some("race"),
+                60,
+            )
+        }));
+    }
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    let winners = results.iter().filter(|result| result.is_ok()).count();
+    let busy = results
+        .iter()
+        .filter(|result| matches!(result, Err(RuntimeLeaseError::Busy { .. })))
+        .count();
+    assert_eq!(winners, 1, "{results:?}");
+    assert_eq!(busy, 7);
+    let store = Store::open(data.path()).unwrap();
+    let leases = store.list_runtime_leases().unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].fencing_token, 1);
+}
+
+#[test]
+fn stale_assert_renew_and_release_fail_after_reacquisition() {
+    let (_data, store, _repo) = test_store();
+    let stale = store
+        .acquire_runtime_lease(
+            "integration:s1",
+            "daemon-a",
+            "instance-a:1",
+            "integration",
+            Some("s1"),
+            0,
+        )
+        .unwrap();
+    let current = store
+        .acquire_runtime_lease(
+            "integration:s1",
+            "daemon-b",
+            "instance-b:2",
+            "integration",
+            Some("s1"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(current.fencing_token(), 2);
+    assert!(matches!(
+        store
+            .assert_runtime_lease("integration:s1", "daemon-a", stale.token())
+            .unwrap_err(),
+        RuntimeLeaseError::Lost { .. }
+    ));
+    assert!(
+        store
+            .renew_runtime_lease("integration:s1", "daemon-a", stale.token(), 60)
+            .is_err()
+    );
+    assert!(
+        store
+            .release_runtime_lease("integration:s1", "daemon-a", stale.token())
+            .is_err()
+    );
+    let holder = store
+        .assert_runtime_lease("integration:s1", "daemon-b", current.token())
+        .unwrap();
+    assert_eq!(holder.owner_id, "daemon-b");
+}
+
+#[test]
+fn fencing_generation_survives_row_cleanup() {
+    let (_data, store, _repo) = test_store();
+    store
+        .acquire_runtime_lease(
+            "session:s3",
+            "daemon-a",
+            "instance-a:1",
+            "session",
+            Some("s3"),
+            0,
+        )
+        .unwrap();
+    assert_eq!(store.clear_expired_runtime_leases().unwrap(), 1);
+    assert!(store.runtime_lease_owner("session:s3").unwrap().is_none());
+    let next = store
+        .acquire_runtime_lease(
+            "session:s3",
+            "daemon-b",
+            "instance-b:2",
+            "session",
+            Some("s3"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(next.fencing_token(), 2);
+}
+
+#[test]
+fn startup_cleanup_only_removes_this_process_leases() {
+    let (_data, store, _repo) = test_store();
+    let own_instance = store.process_owner_instance();
+    store
+        .acquire_runtime_lease(
+            "session:own",
+            "daemon-a",
+            &own_instance,
+            "session",
+            Some("own"),
+            60,
+        )
+        .unwrap();
+    store
+        .acquire_runtime_lease(
+            "session:foreign",
+            "daemon-b",
+            "foreign-instance:999",
+            "session",
+            Some("foreign"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(store.clear_own_process_runtime_leases().unwrap(), 1);
+    assert!(store.runtime_lease_owner("session:own").unwrap().is_none());
+    assert!(
+        store
+            .runtime_lease_owner("session:foreign")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn daemon_identity_is_stable_across_store_instances() {
+    let data = TempDir::new().unwrap();
+    let first = Store::open(data.path()).unwrap();
+    let second = Store::open(data.path()).unwrap();
+    assert_eq!(first.daemon_identity(), second.daemon_identity());
+    assert_eq!(first.daemon_identity().instance_id.len(), 36);
+    assert!(!first.owner_id_for_nonce("nonce").is_empty());
+    assert_ne!(first.owner_id_for_nonce("a"), first.owner_id_for_nonce("b"));
 }
 
 #[test]
@@ -5201,4 +5459,2479 @@ fn execution_host_defaults_are_independent_per_project() {
     );
     assert!(!store.remove_execution_host(&second.id).unwrap());
     assert_eq!(store.list_execution_hosts().unwrap().len(), 2);
+}
+
+fn ready_continuation(store: &Store, repo: &TempDir, label: &str) -> (String, String) {
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some(label))
+        .unwrap();
+    let session = store.create_session(&project.id, label).unwrap();
+    let (continuation, _) = store
+        .create_session_continuation_with_event(&NewSessionContinuation {
+            session_id: session.id.clone(),
+            project_id: project.id.clone(),
+            body: "continue the task".into(),
+            watch_task_ids: Vec::new(),
+            watch_mode: "all".into(),
+            deadline_at: None,
+            max_attempts: 3,
+            series_id: None,
+            parent_continuation_id: None,
+            recurrence_every_secs: None,
+            recurrence_max_runs: 1,
+            run_count: 0,
+        })
+        .unwrap();
+    store
+        .mark_session_continuation_ready_with_event(&continuation.id, "deadline", &[])
+        .unwrap()
+        .unwrap();
+    (session.id, continuation.id)
+}
+
+#[test]
+fn continuation_claim_is_atomic_fenced_and_cleared_on_delivery() {
+    let (_data, store, repo) = test_store();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "continuation claim");
+    let claim = store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "daemon-a:1:nonce-a",
+            60,
+        )
+        .unwrap()
+        .expect("first claim wins");
+    assert_eq!(claim.owner_id, "daemon-a:1:nonce-a");
+    assert_eq!(claim.delivery_attempt, 1);
+    assert!(!claim.reclaimed);
+    assert_eq!(
+        claim.continuation.status, "delivering",
+        "claim is a projection transition"
+    );
+    assert_eq!(
+        claim.continuation.lease_owner.as_deref(),
+        Some("daemon-a:1:nonce-a")
+    );
+    assert!(claim.continuation.lease_expires_at.is_some());
+
+    // A live claim is not stealable by another process.
+    assert!(
+        store
+            .claim_session_continuation_for_delivery_with_event(
+                &continuation_id,
+                "daemon-b:2:nonce-b",
+                60,
+            )
+            .unwrap()
+            .is_none()
+    );
+    // Even the same owner cannot double-claim while the current token is live.
+    assert!(
+        store
+            .claim_session_continuation_for_delivery_with_event(
+                &continuation_id,
+                "daemon-a:1:nonce-a",
+                60,
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    // Wrong owner with the right token is a stale ack, not a terminal write.
+    let wrong_owner = store
+        .mark_session_continuation_delivered_with_event(
+            &continuation_id,
+            "daemon-b:2:nonce-b",
+            claim.token(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        wrong_owner,
+        SessionContinuationAckError::Lost {
+            reason: ContinuationAckLostReason::OwnerMismatch,
+            ..
+        }
+    ));
+    assert_eq!(
+        store
+            .list_session_continuations(&session_id, Some("delivering"), Some(10))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let delivery = store
+        .mark_session_continuation_delivered_with_event(
+            &continuation_id,
+            &claim.owner_id,
+            claim.token(),
+        )
+        .unwrap()
+        .expect("owner can acknowledge");
+    assert_eq!(delivery.delivered.status, "delivered");
+    assert_eq!(delivery.delivered.run_count, 1);
+    assert!(delivery.delivered.lease_owner.is_none());
+    assert!(delivery.delivered.lease_expires_at.is_none());
+    assert!(
+        delivery
+            .events
+            .iter()
+            .any(|event| event.kind == "session.continuation.delivered")
+    );
+
+    // Repeated acknowledgement is stale and cannot increment run_count twice.
+    let repeated = store
+        .mark_session_continuation_delivered_with_event(
+            &continuation_id,
+            &claim.owner_id,
+            claim.token(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        repeated,
+        SessionContinuationAckError::Lost {
+            reason: ContinuationAckLostReason::AlreadyTerminal,
+            ..
+        }
+    ));
+    let rows = store
+        .list_session_continuations(&session_id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows[0].run_count, 1);
+}
+
+#[test]
+fn expired_continuation_claim_is_reclaimed_and_old_owner_cannot_ack() {
+    let (_data, store, repo) = test_store();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "expired claim");
+    let stale = store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "daemon-a:1:nonce-a",
+            0,
+        )
+        .unwrap()
+        .expect("first claim wins");
+    assert!(stale.expires_at.ends_with('Z'));
+
+    let current = store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "daemon-b:2:nonce-b",
+            60,
+        )
+        .unwrap()
+        .expect("expired claim is reclaimable");
+    assert!(current.reclaimed);
+    assert_eq!(current.delivery_attempt, 2);
+
+    for result in [
+        store
+            .mark_session_continuation_delivered_with_event(
+                &continuation_id,
+                &stale.owner_id,
+                stale.token(),
+            )
+            .map(|_| ()),
+        store
+            .retry_session_continuation_with_event(
+                &continuation_id,
+                &stale.owner_id,
+                stale.token(),
+                "stale retry",
+                "2999-01-01T00:00:00Z",
+            )
+            .map(|_| ()),
+        store
+            .fail_session_continuation_with_event(
+                &continuation_id,
+                &stale.owner_id,
+                stale.token(),
+                "stale failure",
+            )
+            .map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(SessionContinuationAckError::Lost {
+                reason: ContinuationAckLostReason::OwnerMismatch,
+                ..
+            })
+        ));
+    }
+    let rows = store
+        .list_session_continuations(&session_id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows[0].status, "delivering");
+    assert_eq!(rows[0].delivery_attempt, 2);
+    assert_eq!(rows[0].lease_owner.as_deref(), Some("daemon-b:2:nonce-b"));
+
+    store
+        .mark_session_continuation_delivered_with_event(
+            &continuation_id,
+            &current.owner_id,
+            current.token(),
+        )
+        .unwrap()
+        .unwrap();
+    let rows = store
+        .list_session_continuations(&session_id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows[0].status, "delivered");
+}
+
+#[test]
+fn concurrent_continuation_claim_has_exactly_one_winner() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let setup = Store::open(data.path()).unwrap();
+    let (_session_id, continuation_id) = ready_continuation(&setup, &repo, "claim race");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let data = data.path().to_path_buf();
+        let barrier = barrier.clone();
+        let continuation_id = continuation_id.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&data).unwrap();
+            barrier.wait();
+            store
+                .claim_session_continuation_for_delivery_with_event(
+                    &continuation_id,
+                    &format!("daemon-{index}:{index}:nonce"),
+                    60,
+                )
+                .unwrap()
+                .is_some()
+        }));
+    }
+    let winners = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(|winner| *winner)
+        .count();
+    assert_eq!(winners, 1);
+    let claim = setup
+        .session_continuation_claim_status(&continuation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.status, "delivering");
+    assert!(claim.live);
+    assert_eq!(claim.delivery_attempt, 1);
+}
+
+#[test]
+fn continuation_retry_clears_claim_and_next_claim_gets_a_new_token() {
+    let (_data, store, repo) = test_store();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "retry claim");
+    let first = store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "daemon-a:1:nonce-a",
+            60,
+        )
+        .unwrap()
+        .unwrap();
+    let (retried, _) = store
+        .retry_session_continuation_with_event(
+            &continuation_id,
+            &first.owner_id,
+            first.token(),
+            "provider unavailable",
+            "2999-01-01T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried.status, "ready");
+    assert_eq!(retried.attempts, 1);
+    assert!(retried.lease_owner.is_none());
+    assert!(retried.lease_expires_at.is_none());
+
+    // The first token cannot acknowledge after the retry cleared it.
+    assert!(matches!(
+        store
+            .mark_session_continuation_delivered_with_event(
+                &continuation_id,
+                &first.owner_id,
+                first.token(),
+            )
+            .unwrap_err(),
+        SessionContinuationAckError::Lost { .. }
+    ));
+    let second = store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "daemon-b:2:nonce-b",
+            60,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.delivery_attempt, 2);
+    assert_eq!(
+        store
+            .list_session_continuations(&session_id, Some("delivering"), Some(10))
+            .unwrap()[0]
+            .lease_owner
+            .as_deref(),
+        Some("daemon-b:2:nonce-b")
+    );
+}
+
+#[test]
+fn continuation_failure_is_fenced_and_clears_the_claim() {
+    let (_data, store, repo) = test_store();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "failure claim");
+    let claim = store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "daemon-a:1:nonce-a",
+            60,
+        )
+        .unwrap()
+        .unwrap();
+    let (failed, _) = store
+        .fail_session_continuation_with_event(
+            &continuation_id,
+            &claim.owner_id,
+            claim.token(),
+            "start failed three times",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.attempts, 1);
+    assert!(failed.lease_owner.is_none());
+    assert_eq!(
+        failed.last_error.as_deref(),
+        Some("start failed three times")
+    );
+    // A second stale failure does not change the row.
+    assert!(matches!(
+        store
+            .fail_session_continuation_with_event(
+                &continuation_id,
+                &claim.owner_id,
+                claim.token(),
+                "again",
+            )
+            .unwrap_err(),
+        SessionContinuationAckError::Lost {
+            reason: ContinuationAckLostReason::AlreadyTerminal,
+            ..
+        }
+    ));
+    assert_eq!(
+        store
+            .list_session_continuations(&session_id, None, Some(10))
+            .unwrap()[0]
+            .status,
+        "failed"
+    );
+}
+
+#[test]
+fn reclaim_expired_continuation_emits_ready_event_and_clears_owner() {
+    let (_data, store, repo) = test_store();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "reclaim event");
+    store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "daemon-a:1:nonce-a",
+            0,
+        )
+        .unwrap()
+        .unwrap();
+    let later = time::OffsetDateTime::now_utc() + time::Duration::seconds(5);
+    let (reclaimed, event) = store
+        .reclaim_expired_session_continuation_at(
+            &continuation_id,
+            "claim expired before ack",
+            later,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed.status, "ready");
+    assert!(reclaimed.lease_owner.is_none());
+    assert!(reclaimed.lease_expires_at.is_none());
+    assert_eq!(
+        reclaimed.last_error.as_deref(),
+        Some("claim expired before ack")
+    );
+    assert_eq!(event.kind, "session.continuation.reclaimed");
+    assert_eq!(event.payload["reason"], "claim expired before ack");
+    // Reclaim is a compare-and-set: a second call sees no expired claim.
+    assert!(
+        store
+            .reclaim_expired_session_continuation_at(&continuation_id, "again", later)
+            .unwrap()
+            .is_none()
+    );
+    let events = store.recent_events(&session_id, 20).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "session.continuation.reclaimed")
+    );
+}
+
+#[test]
+fn live_continuation_claim_survives_unclaimed_failure_and_recovery() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "live recovery");
+    let claim = store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "foreign-daemon:99:nonce",
+            60,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .fail_unclaimed_session_continuation_with_event(&continuation_id, "operator fail")
+            .unwrap()
+            .is_none()
+    );
+    let (_sessions, events) = store.recover_state().unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "session.continuation.failed"
+                || event.kind == "session.continuation.reclaimed")
+    );
+    let rows = store
+        .list_session_continuations(&session_id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows[0].status, "delivering");
+    assert_eq!(
+        rows[0].lease_owner.as_deref(),
+        Some(claim.owner_id.as_str())
+    );
+
+    // The same live claim is untouched by a second Store opening the dir.
+    let second = Store::open(data.path()).unwrap();
+    assert!(
+        second
+            .claim_session_continuation_for_delivery_with_event(
+                &continuation_id,
+                "second-daemon:100:nonce",
+                60,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        second
+            .list_session_continuations(&session_id, None, Some(10))
+            .unwrap()[0]
+            .status,
+        "delivering"
+    );
+}
+
+#[test]
+fn recovery_reclaims_only_expired_continuation_claims() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "expired recovery");
+    let expired = store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "foreign-daemon:99:nonce",
+            0,
+        )
+        .unwrap()
+        .unwrap();
+    let (_sessions, events) = store.recover_state().unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.continuation.reclaimed"
+            && event.session_id == session_id
+            && event.payload["reason"] == "delivery claim expired before acknowledgement"
+    }));
+    let rows = store
+        .list_session_continuations(&session_id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows[0].status, "ready");
+    assert!(rows[0].lease_owner.is_none());
+    assert!(rows[0].lease_expires_at.is_none());
+    assert!(
+        store
+            .mark_session_continuation_delivered_with_event(
+                &continuation_id,
+                &expired.owner_id,
+                expired.token(),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn continuation_claim_status_never_exposes_the_token() {
+    let (_data, store, repo) = test_store();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "claim status");
+    let claim = store
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "daemon-a:1:nonce-a",
+            60,
+        )
+        .unwrap()
+        .unwrap();
+    let status = store
+        .session_continuation_claim_status(&continuation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.owner_id.as_deref(), Some(claim.owner_id.as_str()));
+    assert!(status.live);
+    assert_eq!(status.delivery_attempt, 1);
+    let value = serde_json::to_value(&status).unwrap();
+    assert!(value.get("token").is_none());
+    assert!(!value.to_string().contains("lease_token"));
+    let public = serde_json::to_value(
+        &store
+            .list_session_continuations(&session_id, None, Some(10))
+            .unwrap()[0],
+    )
+    .unwrap();
+    assert!(public.get("lease_token").is_none());
+}
+
+#[test]
+fn continuation_legacy_delivering_rows_still_fail_closed_on_recovery() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "legacy crash");
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE session_continuations
+             SET status = 'delivering', lease_owner = NULL, lease_token = NULL,
+                 lease_expires_at = NULL
+             WHERE id = ?1",
+            params![continuation_id],
+        )
+        .unwrap();
+    }
+    let (_sessions, events) = store.recover_state().unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.continuation.failed"
+            && event.payload["reason"]
+                == "daemon restarted while delivering; not retried automatically"
+    }));
+    let rows = store
+        .list_session_continuations(&session_id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].run_count, 0);
+}
+
+#[test]
+fn runtime_lease_validation_rejects_unsafe_keys_and_caps_ttl() {
+    let (_data, store, _repo) = test_store();
+    for (key, owner, instance, kind) in [
+        ("", "owner", "instance:1", "session"),
+        ("bad\nkey", "owner", "instance:1", "session"),
+        ("session:s1", "", "instance:1", "session"),
+        ("session:s1", "owner", "", "session"),
+        ("session:s1", "owner", "instance:1", ""),
+    ] {
+        let error = store
+            .acquire_runtime_lease(key, owner, instance, kind, None, 60)
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeLeaseError::Internal(_)),
+            "{key} {owner} {instance} {kind}: {error}"
+        );
+    }
+    let long_key = format!("session:{}", "x".repeat(300));
+    assert!(
+        store
+            .acquire_runtime_lease(&long_key, "owner", "instance:1", "session", None, 60)
+            .is_err()
+    );
+    let lease = store
+        .acquire_runtime_lease(
+            "session:ttl",
+            "owner",
+            "instance:1",
+            "session",
+            Some("ttl"),
+            u64::MAX,
+        )
+        .unwrap();
+    let acquired = time::OffsetDateTime::parse(
+        &lease.lease.acquired_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let expires = time::OffsetDateTime::parse(
+        &lease.lease.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert_eq!(expires - acquired, time::Duration::seconds(86_400));
+}
+
+#[test]
+fn runtime_lease_list_hides_released_tombstones_but_audit_sees_them() {
+    let (_data, store, _repo) = test_store();
+    let first = store
+        .acquire_runtime_lease(
+            "integration:s1",
+            "daemon-a",
+            "instance-a:1",
+            "integration",
+            Some("s1"),
+            60,
+        )
+        .unwrap();
+    store
+        .release_runtime_lease("integration:s1", "daemon-a", first.token())
+        .unwrap();
+    assert!(store.list_runtime_leases().unwrap().is_empty());
+    let audit = store.list_runtime_leases_including_released().unwrap();
+    assert_eq!(audit.len(), 1);
+    assert!(audit[0].released_at.is_some());
+    assert_eq!(audit[0].state(), RuntimeLeaseState::Released);
+    assert_eq!(audit[0].fencing_token, 1);
+    store.clear_expired_runtime_leases().unwrap();
+    assert!(
+        store
+            .list_runtime_leases_including_released()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.runtime_lease_fencing_token("integration:s1").unwrap(),
+        Some(1)
+    );
+}
+
+#[test]
+fn release_after_expiry_is_safe_and_never_deletes_a_newer_generation() {
+    let (_data, store, _repo) = test_store();
+    let expired = store
+        .acquire_runtime_lease(
+            "session:s9",
+            "daemon-a",
+            "instance-a:1",
+            "session",
+            Some("s9"),
+            0,
+        )
+        .unwrap();
+    assert!(
+        store
+            .release_runtime_lease("session:s9", "daemon-a", expired.token())
+            .unwrap()
+    );
+    assert!(store.runtime_lease_owner("session:s9").unwrap().is_none());
+    let current = store
+        .acquire_runtime_lease(
+            "session:s9",
+            "daemon-b",
+            "instance-b:2",
+            "session",
+            Some("s9"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(current.fencing_token(), 2);
+    assert!(
+        store
+            .release_runtime_lease("session:s9", "daemon-a", expired.token())
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .runtime_lease_owner("session:s9")
+            .unwrap()
+            .unwrap()
+            .owner_id,
+        "daemon-b"
+    );
+}
+
+#[test]
+fn recovery_clears_own_runtime_leases_but_preserves_live_foreign_rows() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("recovery leases"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "recovery leases")
+        .unwrap();
+    let own_instance = store.process_owner_instance();
+    store
+        .acquire_runtime_lease(
+            &format!("session:{}", session.id),
+            "own-owner",
+            &own_instance,
+            "session",
+            Some(&session.id),
+            60,
+        )
+        .unwrap();
+    store
+        .acquire_runtime_lease(
+            &format!("integration:{}", session.id),
+            "foreign-owner",
+            "foreign-instance:999",
+            "integration",
+            Some(&session.id),
+            60,
+        )
+        .unwrap();
+    store.recover_state().unwrap();
+    assert!(
+        store
+            .runtime_lease_owner(&format!("session:{}", session.id))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .runtime_lease_owner(&format!("integration:{}", session.id))
+            .unwrap()
+            .is_some()
+    );
+    let audit = store
+        .list_runtime_lease_audit(Some(&format!("session:{}", session.id)), Some(10))
+        .unwrap();
+    assert!(audit.iter().any(|entry| entry.action == "startup_cleanup"));
+}
+
+#[test]
+fn migrates_legacy_runtime_lease_rows_and_initializes_fencing() {
+    let data = TempDir::new().unwrap();
+    {
+        let conn = rusqlite::Connection::open(data.path().join("verlinpark.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_meta (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE runtime_leases (
+                 lease_key     TEXT PRIMARY KEY,
+                 owner_id      TEXT NOT NULL,
+                 kind          TEXT NOT NULL,
+                 session_id    TEXT,
+                 acquired_at   TEXT NOT NULL,
+                 heartbeat_at  TEXT NOT NULL,
+                 expires_at    TEXT NOT NULL
+             );
+             INSERT INTO runtime_leases
+                 (lease_key, owner_id, kind, session_id, acquired_at, heartbeat_at, expires_at)
+             VALUES ('session:legacy', 'old-daemon', 'session', 'legacy',
+                     '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z',
+                     '2020-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(data.path()).unwrap();
+    let legacy = store
+        .runtime_lease_owner("session:legacy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(legacy.owner_instance, "");
+    assert_eq!(legacy.fencing_token, 0);
+    assert_eq!(legacy.state(), RuntimeLeaseState::Stale);
+    let replacement = store
+        .acquire_runtime_lease(
+            "session:legacy",
+            "new-daemon",
+            "new-instance:1",
+            "session",
+            Some("legacy"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(replacement.fencing_token(), 1);
+    assert_eq!(store.daemon_identity().pid, std::process::id());
+}
+
+#[test]
+fn stale_continuation_claim_can_be_reclaimed_only_once_under_contention() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let setup = Store::open(data.path()).unwrap();
+    let (_session_id, continuation_id) = ready_continuation(&setup, &repo, "reclaim race");
+    setup
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "stale-daemon:1:nonce",
+            0,
+        )
+        .unwrap()
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+    let mut handles = Vec::new();
+    for index in 0..6 {
+        let data = data.path().to_path_buf();
+        let barrier = barrier.clone();
+        let continuation_id = continuation_id.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&data).unwrap();
+            barrier.wait();
+            store
+                .claim_session_continuation_for_delivery_with_event(
+                    &continuation_id,
+                    &format!("reclaimer-{index}:{index}:nonce"),
+                    60,
+                )
+                .unwrap()
+                .is_some()
+        }));
+    }
+    let winners = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(|winner| *winner)
+        .count();
+    assert_eq!(winners, 1, "only one process may reclaim an expired claim");
+}
+
+#[test]
+fn recovery_preserves_approvals_questions_and_steering_for_live_foreign_sessions() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("foreign pending"))
+        .unwrap();
+    let foreign = store.create_session(&project.id, "foreign live").unwrap();
+    let own = store.create_session(&project.id, "own dead").unwrap();
+    store
+        .acquire_runtime_lease(
+            &format!("session:{}", foreign.id),
+            "foreign-owner",
+            "foreign-instance:999",
+            "session",
+            Some(&foreign.id),
+            60,
+        )
+        .unwrap();
+    let foreign_approval = store
+        .create_approval(
+            &foreign.id,
+            "call-foreign",
+            "write_file",
+            &serde_json::json!({"path": "README.md"}),
+            Some("workspace"),
+            Some("write"),
+        )
+        .unwrap();
+    let own_approval = store
+        .create_approval(
+            &own.id,
+            "call-own",
+            "write_file",
+            &serde_json::json!({"path": "README.md"}),
+            Some("workspace"),
+            Some("write"),
+        )
+        .unwrap();
+    let foreign_question = store
+        .create_question_with_event(
+            &foreign.id,
+            "agent-foreign",
+            "Foreign",
+            "continue?",
+            &["yes".into(), "no".into()],
+        )
+        .unwrap()
+        .0;
+    let own_question = store
+        .create_question_with_event(&own.id, "agent-own", "Own", "continue?", &[])
+        .unwrap()
+        .0;
+    let foreign_steering = store
+        .create_steering_with_event(&foreign.id, "agent-foreign", None, "keep going")
+        .unwrap()
+        .0;
+    let own_steering = store
+        .create_steering_with_event(&own.id, "agent-own", None, "stop")
+        .unwrap()
+        .0;
+
+    store.recover_state().unwrap();
+
+    let approvals = store.list_approvals(Some(foreign.id.as_str())).unwrap();
+    assert_eq!(
+        approvals
+            .iter()
+            .find(|approval| approval.id == foreign_approval.id)
+            .unwrap()
+            .status,
+        "pending"
+    );
+    let own_approvals = store.list_approvals(Some(own.id.as_str())).unwrap();
+    assert_eq!(
+        own_approvals
+            .iter()
+            .find(|approval| approval.id == own_approval.id)
+            .unwrap()
+            .status,
+        "denied"
+    );
+    let questions = store.list_questions(Some(foreign.id.as_str())).unwrap();
+    assert_eq!(
+        questions
+            .iter()
+            .find(|question| question.id == foreign_question.id)
+            .unwrap()
+            .status,
+        "pending"
+    );
+    let own_questions = store.list_questions(Some(own.id.as_str())).unwrap();
+    assert_eq!(
+        own_questions
+            .iter()
+            .find(|question| question.id == own_question.id)
+            .unwrap()
+            .status,
+        "expired"
+    );
+    let steering = store.list_steering(&foreign.id, None, None).unwrap();
+    assert_eq!(
+        steering
+            .iter()
+            .find(|message| message.id == foreign_steering.id)
+            .unwrap()
+            .status,
+        "pending"
+    );
+    let own_steering_rows = store.list_steering(&own.id, None, None).unwrap();
+    assert_eq!(
+        own_steering_rows
+            .iter()
+            .find(|message| message.id == own_steering.id)
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+}
+
+#[test]
+fn mixed_acquire_release_stress_keeps_ownership_exclusive() {
+    let data = TempDir::new().unwrap();
+    Store::open(data.path()).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+    let generations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+    for index in 0..6 {
+        let data = data.path().to_path_buf();
+        let barrier = barrier.clone();
+        let generations = generations.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&data).unwrap();
+            barrier.wait();
+            let mut wins = 0;
+            for _ in 0..12 {
+                match store.acquire_runtime_lease(
+                    "session:stress",
+                    &format!("owner-{index}"),
+                    &format!("instance-{index}:{index}"),
+                    "session",
+                    Some("stress"),
+                    30,
+                ) {
+                    Ok(acquisition) => {
+                        wins += 1;
+                        generations
+                            .lock()
+                            .unwrap()
+                            .push(acquisition.fencing_token());
+                        // The winner may immediately assert its own token.
+                        store
+                            .assert_runtime_lease(
+                                "session:stress",
+                                &format!("owner-{index}"),
+                                acquisition.token(),
+                            )
+                            .unwrap();
+                        let _ = store.release_runtime_lease(
+                            "session:stress",
+                            &format!("owner-{index}"),
+                            acquisition.token(),
+                        );
+                    }
+                    Err(RuntimeLeaseError::Busy { .. }) => {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("unexpected lease error: {error}"),
+                }
+            }
+            wins
+        }));
+    }
+    let total_wins: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .sum();
+    assert!(total_wins > 0);
+    let mut generations = generations.lock().unwrap().clone();
+    let original_len = generations.len();
+    generations.sort_unstable();
+    generations.dedup();
+    assert_eq!(
+        generations.len(),
+        original_len,
+        "generations must never repeat"
+    );
+    let store = Store::open(data.path()).unwrap();
+    assert!(store.list_runtime_leases().unwrap().len() <= 1);
+}
+
+#[test]
+fn concurrent_expiry_sweep_and_reacquisition_never_reuses_a_generation() {
+    let data = TempDir::new().unwrap();
+    Store::open(data.path()).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let data = data.path().to_path_buf();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&data).unwrap();
+            barrier.wait();
+            let mut observed = Vec::new();
+            for round in 0..8 {
+                let ttl = if round % 2 == 0 { 0 } else { 30 };
+                match store.acquire_runtime_lease(
+                    "lock:expiry-race",
+                    &format!("owner-{index}"),
+                    &format!("instance-{index}:{index}"),
+                    "lock",
+                    None,
+                    ttl,
+                ) {
+                    Ok(acquisition) => observed.push(acquisition.fencing_token()),
+                    Err(RuntimeLeaseError::Busy { .. }) => {}
+                    Err(error) => panic!("unexpected lease error: {error}"),
+                }
+                let _ = store.clear_expired_runtime_leases();
+            }
+            observed
+        }));
+    }
+    let mut observed = handles
+        .into_iter()
+        .flat_map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!observed.is_empty());
+    let original_len = observed.len();
+    observed.sort_unstable();
+    observed.dedup();
+    assert_eq!(observed.len(), original_len);
+}
+
+#[test]
+fn reclaim_and_delivery_race_has_one_terminal_writer() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let setup = Store::open(data.path()).unwrap();
+    let (session_id, continuation_id) = ready_continuation(&setup, &repo, "reclaim delivery race");
+    setup
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "stale-owner:1:nonce",
+            0,
+        )
+        .unwrap()
+        .unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+    let mut handles = Vec::new();
+    for index in 0..6 {
+        let data = data.path().to_path_buf();
+        let barrier = barrier.clone();
+        let continuation_id = continuation_id.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&data).unwrap();
+            barrier.wait();
+            store
+                .claim_session_continuation_for_delivery_with_event(
+                    &continuation_id,
+                    &format!("claimer-{index}:{index}:nonce"),
+                    0,
+                )
+                .unwrap()
+        }));
+    }
+    let stale_claims = handles
+        .into_iter()
+        .filter_map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!stale_claims.is_empty());
+
+    // A final live claim wins ownership; every earlier generation is stale.
+    let final_claim = setup
+        .claim_session_continuation_for_delivery_with_event(
+            &continuation_id,
+            "final-owner:99:nonce",
+            60,
+        )
+        .unwrap()
+        .expect("expired generations are reclaimable");
+    for stale in &stale_claims {
+        assert!(
+            setup
+                .mark_session_continuation_delivered_with_event(
+                    &continuation_id,
+                    &stale.owner_id,
+                    stale.token(),
+                )
+                .is_err(),
+            "an earlier generation must not write terminal state"
+        );
+    }
+    let delivery = setup
+        .mark_session_continuation_delivered_with_event(
+            &continuation_id,
+            &final_claim.owner_id,
+            final_claim.token(),
+        )
+        .unwrap()
+        .expect("current generation acknowledges");
+    assert_eq!(delivery.delivered.status, "delivered");
+    assert_eq!(
+        delivery.delivered.delivery_attempt,
+        stale_claims.len() as u32 + 2,
+        "stale claim + every contention winner + final live claim"
+    );
+    let events = setup.recent_events(&session_id, 200).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.delivered")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn lease_owner_and_kind_validation_never_partially_writes_a_row() {
+    let (_data, store, _repo) = test_store();
+    let too_long_owner = "o".repeat(400);
+    assert!(
+        store
+            .acquire_runtime_lease(
+                "session:validation",
+                &too_long_owner,
+                "instance:1",
+                "session",
+                None,
+                60,
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .runtime_lease_owner("session:validation")
+            .unwrap()
+            .is_none()
+    );
+    let too_long_instance = "i".repeat(200);
+    assert!(
+        store
+            .acquire_runtime_lease(
+                "session:validation",
+                "owner",
+                &too_long_instance,
+                "session",
+                None,
+                60,
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .runtime_lease_fencing_token("session:validation")
+            .unwrap()
+            .is_none(),
+        "validation failures must not consume a generation"
+    );
+}
+
+#[test]
+fn recovery_protects_plan_tasks_merge_queue_and_intake_for_live_foreign_owners() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("protected recovery"))
+        .unwrap();
+    let foreign = store.create_session(&project.id, "foreign plan").unwrap();
+    let own = store.create_session(&project.id, "own plan").unwrap();
+    store
+        .acquire_runtime_lease(
+            &format!("session:{}", foreign.id),
+            "foreign-owner",
+            "foreign-instance:999",
+            "session",
+            Some(&foreign.id),
+            60,
+        )
+        .unwrap();
+    store
+        .acquire_runtime_lease(
+            &format!("integration:{}", foreign.id),
+            "foreign-integrator",
+            "foreign-instance:999",
+            "integration",
+            Some(&foreign.id),
+            60,
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        for (session, status, task) in [
+            (&foreign.id, "running", "T-foreign"),
+            (&own.id, "running", "T-own"),
+        ] {
+            conn.execute(
+                "INSERT INTO plan_tasks
+                 (session_id, plan_seq, task_id, project_id, department, title, priority,
+                  status, deps, write_scope, attempts, enqueued_at, started_at, updated_at)
+                 VALUES (?1, 1, ?2, ?3, 'impl', 'task', 0, ?4, '[]', '[]', 1,
+                         '2026-11-11T00:00:00Z', '2026-11-11T00:00:00Z',
+                         '2026-11-11T00:00:00Z')",
+                params![session, task, project.id, status],
+            )
+            .unwrap();
+        }
+    }
+    let foreign_entry = store
+        .enqueue_merge_with_event(
+            &foreign.id,
+            "worker-foreign",
+            "Worker foreign",
+            Some("T-foreign"),
+            "verlinpark/foreign",
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            Some("verified"),
+        )
+        .unwrap()
+        .0;
+    let own_entry = store
+        .enqueue_merge_with_event(
+            &own.id,
+            "worker-own",
+            "Worker own",
+            Some("T-own"),
+            "verlinpark/own",
+            "3333333333333333333333333333333333333333",
+            "4444444444444444444444444444444444444444",
+            Some("verified"),
+        )
+        .unwrap()
+        .0;
+    let foreign_intake = store
+        .create_intake_task(&NewIntakeTask {
+            project_id: project.id.clone(),
+            title: "foreign intake".into(),
+            instructions: "do work".into(),
+            profile: "coding".into(),
+            kind: "feature".into(),
+            priority: 0,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: 1,
+            origin: "user".into(),
+            labels: Vec::new(),
+        })
+        .unwrap();
+    let own_intake = store
+        .create_intake_task(&NewIntakeTask {
+            project_id: project.id.clone(),
+            title: "own intake".into(),
+            instructions: "do work".into(),
+            profile: "coding".into(),
+            kind: "feature".into(),
+            priority: 0,
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: 1,
+            origin: "user".into(),
+            labels: Vec::new(),
+        })
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE intake_tasks SET status = 'running', session_id = ?1 WHERE id = ?2",
+            params![foreign.id, foreign_intake.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE intake_tasks SET status = 'running', session_id = ?1 WHERE id = ?2",
+            params![own.id, own_intake.id],
+        )
+        .unwrap();
+    }
+
+    store.recover_state().unwrap();
+
+    let foreign_tasks = store.list_plan_tasks(None, Some(&foreign.id)).unwrap();
+    assert_eq!(foreign_tasks[0].status, "running");
+    let own_tasks = store.list_plan_tasks(None, Some(&own.id)).unwrap();
+    assert_eq!(own_tasks[0].status, "interrupted");
+    let queue = store.list_merge_queue(&foreign.id).unwrap();
+    let foreign_entry = queue
+        .iter()
+        .find(|entry| entry.id == foreign_entry.id)
+        .unwrap();
+    assert_eq!(foreign_entry.status, "queued");
+    let own_queue = store.list_merge_queue(&own.id).unwrap();
+    let own_entry = own_queue
+        .iter()
+        .find(|entry| entry.id == own_entry.id)
+        .unwrap();
+    assert_eq!(own_entry.status, "interrupted");
+    let intake = store.list_intake_tasks(None, None, None).unwrap();
+    assert_eq!(
+        intake
+            .iter()
+            .find(|task| task.id == foreign_intake.id)
+            .unwrap()
+            .status,
+        "running"
+    );
+    assert_eq!(
+        intake
+            .iter()
+            .find(|task| task.id == own_intake.id)
+            .unwrap()
+            .status,
+        "failed"
+    );
+}
+
+#[test]
+fn runtime_lease_audit_records_token_free_ownership_transitions() {
+    let (_data, store, _repo) = test_store();
+    let first = store
+        .acquire_runtime_lease(
+            "integration:audit",
+            "owner-a",
+            "instance-a:1",
+            "integration",
+            Some("audit"),
+            60,
+        )
+        .unwrap();
+    let second = store
+        .acquire_runtime_lease(
+            "integration:audit",
+            "owner-a",
+            "instance-a:1",
+            "integration",
+            Some("audit"),
+            60,
+        )
+        .unwrap();
+    assert_eq!(second.fencing_token(), 2);
+    store
+        .release_runtime_lease("integration:audit", "owner-a", second.token())
+        .unwrap();
+    let third = store
+        .acquire_runtime_lease(
+            "integration:audit",
+            "owner-b",
+            "instance-b:2",
+            "integration",
+            Some("audit"),
+            0,
+        )
+        .unwrap();
+    store.clear_expired_runtime_leases().unwrap();
+
+    let entries = store.list_runtime_lease_audit(None, Some(20)).unwrap();
+    let actions = entries
+        .iter()
+        .map(|entry| entry.action.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actions,
+        vec![
+            "expired",
+            "reacquired",
+            "released",
+            "reacquired",
+            "acquired"
+        ]
+    );
+    assert_eq!(entries[0].owner_id, "owner-b");
+    assert_eq!(entries[0].fencing_token, third.fencing_token());
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.detail.as_deref() != Some(first.token().as_str())),
+        "audit detail must not contain an acquisition token"
+    );
+    for entry in &entries {
+        let value = serde_json::to_value(entry).unwrap();
+        assert!(value.get("lease_token").is_none());
+        assert!(value.get("token").is_none());
+    }
+
+    let filtered = store
+        .list_runtime_lease_audit(Some("integration:audit"), Some(2))
+        .unwrap();
+    assert_eq!(filtered.len(), 2);
+    assert_eq!(filtered[0].action, "expired");
+    assert!(
+        store
+            .list_runtime_lease_audit(Some("missing:key"), None)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn runtime_lease_audit_is_absent_from_live_lease_projection() {
+    let (_data, store, _repo) = test_store();
+    store
+        .acquire_runtime_lease(
+            "session:projection",
+            "owner-a",
+            "instance-a:1",
+            "session",
+            Some("projection"),
+            60,
+        )
+        .unwrap();
+    let projection = serde_json::to_value(store.list_runtime_leases().unwrap()).unwrap();
+    assert!(projection.to_string().contains("fencing_token"));
+    assert!(!projection.to_string().contains("audit"));
+    let audit = store.list_runtime_lease_audit(None, None).unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "acquired");
+}
+
+#[test]
+fn lease_audit_prune_removes_only_old_rows() {
+    let (_data, store, _repo) = test_store();
+    store
+        .acquire_runtime_lease(
+            "session:audit-prune",
+            "owner-a",
+            "instance-a:1",
+            "session",
+            Some("audit-prune"),
+            60,
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE runtime_lease_audit SET occurred_at = '2020-01-01T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+    }
+    assert_eq!(store.list_runtime_lease_audit(None, None).unwrap().len(), 1);
+    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+    assert_eq!(store.prune_runtime_lease_audit(cutoff).unwrap(), 1);
+    assert!(
+        store
+            .list_runtime_lease_audit(None, None)
+            .unwrap()
+            .is_empty()
+    );
+    // The live lease is operational state, not history.
+    assert!(
+        store
+            .runtime_lease_owner("session:audit-prune")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn deterministic_lease_state_machine_matches_the_model() {
+    struct Holder {
+        owner: String,
+        token: RuntimeLeaseToken,
+        generation: u64,
+        expires: time::OffsetDateTime,
+    }
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+
+    let (_data, store, _repo) = test_store();
+    let base = time::OffsetDateTime::parse(
+        "2026-11-11T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let mut now = base;
+    let mut random = 0x5eed_u64;
+    let mut holder: Option<Holder> = None;
+    let mut tombstone = false;
+    let mut stale_tokens: Vec<RuntimeLeaseToken> = Vec::new();
+    let mut last_generation = 0u64;
+    let owners = ["owner-a", "owner-b", "owner-c"];
+    let instances = ["instance-a:1", "instance-b:2", "instance-c:3"];
+
+    for step in 0..300 {
+        now += time::Duration::seconds((next_random(&mut random) % 12) as i64);
+        let actor = (next_random(&mut random) % 3) as usize;
+        let operation = next_random(&mut random) % 5;
+        match operation {
+            0 => {
+                let ttl = next_random(&mut random) % 25;
+                let result = store.acquire_runtime_lease_at(
+                    "session:model",
+                    owners[actor],
+                    instances[actor],
+                    "session",
+                    Some("model"),
+                    ttl,
+                    now,
+                );
+                let live_other = holder
+                    .as_ref()
+                    .is_some_and(|current| current.expires > now && current.owner != owners[actor]);
+                if live_other {
+                    assert!(
+                        matches!(result, Err(RuntimeLeaseError::Busy { .. })),
+                        "step {step}: live owner should reject {actor}, got {result:?}"
+                    );
+                } else {
+                    let acquisition = result.unwrap_or_else(|error| {
+                        panic!("step {step}: actor {actor} should acquire: {error}")
+                    });
+                    assert_eq!(
+                        acquisition.fencing_token(),
+                        last_generation + 1,
+                        "step {step}: generation must advance exactly once"
+                    );
+                    last_generation = acquisition.fencing_token();
+                    if let Some(previous) = holder.take() {
+                        stale_tokens.push(previous.token);
+                    }
+                    tombstone = false;
+                    holder = Some(Holder {
+                        owner: owners[actor].to_string(),
+                        token: acquisition.token().clone(),
+                        generation: acquisition.fencing_token(),
+                        expires: now + time::Duration::seconds(ttl.min(86_400) as i64),
+                    });
+                }
+            }
+            1 => {
+                let Some(current) = holder.as_ref() else {
+                    continue;
+                };
+                let stale = if next_random(&mut random).is_multiple_of(3) {
+                    stale_tokens.last().cloned()
+                } else {
+                    Some(current.token.clone())
+                };
+                let Some(token) = stale else {
+                    continue;
+                };
+                let result =
+                    store.renew_runtime_lease_at("session:model", &current.owner, &token, 30, now);
+                let current_holder = holder.as_ref().unwrap();
+                let owns_current =
+                    token.as_str() == current_holder.token.as_str() && current_holder.expires > now;
+                if owns_current {
+                    assert!(result.is_ok(), "step {step}: live renewal should succeed");
+                    holder.as_mut().unwrap().expires = now + time::Duration::seconds(30);
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "step {step}: stale renewal must fail for actor {actor}"
+                    );
+                }
+            }
+            2 => {
+                let Some(current) = holder.as_ref() else {
+                    continue;
+                };
+                let stale = if next_random(&mut random).is_multiple_of(3) {
+                    stale_tokens.last().cloned()
+                } else {
+                    Some(current.token.clone())
+                };
+                let Some(token) = stale else {
+                    continue;
+                };
+                let result =
+                    store.release_runtime_lease_at("session:model", &current.owner, &token, now);
+                let current_holder = holder.as_ref().unwrap();
+                let owns_current = token.as_str() == current_holder.token.as_str();
+                if owns_current {
+                    assert!(result.unwrap_or(false), "step {step}: release should apply");
+                    holder = None;
+                    tombstone = true;
+                    stale_tokens.push(token);
+                } else {
+                    assert!(result.is_err(), "step {step}: stale release must fail");
+                }
+            }
+            3 => {
+                let owns_current = holder
+                    .as_ref()
+                    .is_some_and(|current| current.owner == owners[actor] && current.expires > now);
+                let token = if owns_current {
+                    holder.as_ref().unwrap().token.clone()
+                } else {
+                    stale_tokens
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(RuntimeLeaseToken::generate)
+                };
+                let result =
+                    store.assert_runtime_lease_at("session:model", owners[actor], &token, now);
+                assert_eq!(
+                    result.is_ok(),
+                    owns_current,
+                    "step {step}: assert ownership mismatch"
+                );
+            }
+            _ => {
+                let removed = store.clear_expired_runtime_leases_at(now).unwrap();
+                let expired = holder
+                    .as_ref()
+                    .is_some_and(|current| current.expires <= now);
+                let expected = usize::from(expired || tombstone);
+                assert_eq!(removed, expected, "step {step}: sweep count mismatch");
+                if expired {
+                    holder = None;
+                }
+                if expired || tombstone {
+                    tombstone = false;
+                }
+            }
+        }
+
+        match &holder {
+            Some(current) => {
+                let row = store
+                    .runtime_lease_owner("session:model")
+                    .unwrap()
+                    .expect("model says a row exists");
+                assert_eq!(row.owner_id, current.owner, "step {step}");
+                assert_eq!(row.fencing_token, current.generation, "step {step}");
+                assert_eq!(
+                    row.state_at(now),
+                    if current.expires > now {
+                        RuntimeLeaseState::Live
+                    } else {
+                        RuntimeLeaseState::Stale
+                    },
+                    "step {step}"
+                );
+            }
+            None => assert!(
+                store
+                    .runtime_lease_owner("session:model")
+                    .unwrap()
+                    .is_none(),
+                "step {step}: model says no live row"
+            ),
+        }
+    }
+}
+
+#[test]
+fn lease_expiry_boundary_is_exclusive_for_renew_and_assert_but_release_is_safe() {
+    let (_data, store, _repo) = test_store();
+    let base = time::OffsetDateTime::parse(
+        "2026-11-11T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let acquisition = store
+        .acquire_runtime_lease_at(
+            "integration:boundary",
+            "owner-a",
+            "instance-a:1",
+            "integration",
+            Some("boundary"),
+            10,
+            base,
+        )
+        .unwrap();
+    let before = base + time::Duration::seconds(9);
+    let at_expiry = base + time::Duration::seconds(10);
+    // At the exact expiry instant the row is no longer renewable.
+    assert!(matches!(
+        store
+            .renew_runtime_lease_at(
+                "integration:boundary",
+                "owner-a",
+                acquisition.token(),
+                10,
+                at_expiry
+            )
+            .unwrap_err(),
+        RuntimeLeaseError::Lost { .. }
+    ));
+    assert!(
+        store
+            .assert_runtime_lease_at(
+                "integration:boundary",
+                "owner-a",
+                acquisition.token(),
+                before
+            )
+            .is_ok()
+    );
+    assert!(
+        store
+            .assert_runtime_lease_at(
+                "integration:boundary",
+                "owner-a",
+                acquisition.token(),
+                at_expiry
+            )
+            .is_err()
+    );
+    // Release ignores expiry but still requires the token.
+    assert!(
+        store
+            .release_runtime_lease_at(
+                "integration:boundary",
+                "owner-a",
+                acquisition.token(),
+                at_expiry
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn continuation_claim_expiry_boundary_is_inclusive_for_reclaim_and_exclusive_for_ack() {
+    let (_data, store, repo) = test_store();
+    let (_session_id, continuation_id) = ready_continuation(&store, &repo, "claim boundary");
+    let base = time::OffsetDateTime::parse(
+        "2026-11-11T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let claim = store
+        .claim_session_continuation_for_delivery_at(&continuation_id, "owner-a", 10, base)
+        .unwrap()
+        .unwrap();
+    let before = base + time::Duration::seconds(9);
+    let at_expiry = base + time::Duration::seconds(10);
+    assert!(
+        store
+            .reclaim_expired_session_continuation_at(&continuation_id, "too early", before)
+            .unwrap()
+            .is_none()
+    );
+    // Acknowledgement at expiry is stale by the strict `> now` rule.
+    assert!(matches!(
+        store
+            .mark_session_continuation_delivered_at(
+                &continuation_id,
+                &claim.owner_id,
+                claim.token(),
+                at_expiry
+            )
+            .unwrap_err(),
+        SessionContinuationAckError::Lost {
+            reason: ContinuationAckLostReason::Expired,
+            ..
+        }
+    ));
+    let (reclaimed, event) = store
+        .reclaim_expired_session_continuation_at(&continuation_id, "boundary", at_expiry)
+        .unwrap()
+        .expect("expiry is reclaimable at the boundary");
+    assert_eq!(reclaimed.status, "ready");
+    assert_eq!(event.kind, "session.continuation.reclaimed");
+}
+
+#[test]
+fn continuation_ack_before_expiry_uses_the_claim_generation() {
+    let (_data, store, repo) = test_store();
+    let (_session_id, continuation_id) = ready_continuation(&store, &repo, "claim before expiry");
+    let base = time::OffsetDateTime::parse(
+        "2026-11-11T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let claim = store
+        .claim_session_continuation_for_delivery_at(&continuation_id, "owner-a", 10, base)
+        .unwrap()
+        .unwrap();
+    let before = base + time::Duration::seconds(9);
+    let delivery = store
+        .mark_session_continuation_delivered_at(
+            &continuation_id,
+            &claim.owner_id,
+            claim.token(),
+            before,
+        )
+        .unwrap()
+        .expect("unexpired claim acknowledges");
+    assert_eq!(delivery.delivered.status, "delivered");
+    assert_eq!(delivery.delivered.run_count, 1);
+    assert!(delivery.delivered.lease_owner.is_none());
+}
+
+#[test]
+fn deterministic_continuation_claim_state_machine_matches_the_model() {
+    use std::collections::VecDeque;
+
+    struct ClaimModel {
+        owner: String,
+        token: ContinuationClaimToken,
+        expires: time::OffsetDateTime,
+    }
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(3_037_000_493);
+        *state
+    }
+
+    let (_data, store, repo) = test_store();
+    let (session_id, continuation_id) = ready_continuation(&store, &repo, "claim model");
+    let base = time::OffsetDateTime::parse(
+        "2026-11-11T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let mut now = base;
+    let mut random = 0x0dd_ba11_u64;
+    let mut status = "ready".to_string();
+    let mut current: Option<ClaimModel> = None;
+    let mut stale: VecDeque<ContinuationClaimToken> = VecDeque::new();
+    let mut delivery_attempt = 0u32;
+    let mut attempts = 0u32;
+    let owners = ["owner-a", "owner-b", "owner-c"];
+
+    for step in 0..200 {
+        now += time::Duration::seconds((next_random(&mut random) % 4) as i64);
+        let actor = (next_random(&mut random) % 3) as usize;
+        let operation = next_random(&mut random) % 4;
+        let live = current.as_ref().is_some_and(|claim| claim.expires > now);
+        match operation {
+            0 => {
+                let ttl = next_random(&mut random) % 7;
+                let claim = store
+                    .claim_session_continuation_for_delivery_at(
+                        &continuation_id,
+                        owners[actor],
+                        ttl,
+                        now,
+                    )
+                    .unwrap();
+                let eligible = status == "ready" || (status == "delivering" && !live);
+                if eligible {
+                    let claim = claim.unwrap_or_else(|| {
+                        panic!("step {step}: {status}/{live} should be claimable")
+                    });
+                    delivery_attempt += 1;
+                    assert_eq!(claim.delivery_attempt, delivery_attempt, "step {step}");
+                    if let Some(previous) = current.replace(ClaimModel {
+                        owner: claim.owner_id.clone(),
+                        token: claim.token().clone(),
+                        expires: now + time::Duration::seconds(ttl as i64),
+                    }) {
+                        stale.push_back(previous.token);
+                    }
+                    status = "delivering".to_string();
+                } else {
+                    assert!(
+                        claim.is_none(),
+                        "step {step}: live delivery claim must not be stealable"
+                    );
+                }
+            }
+            1 => {
+                let Some(claim) = current.as_ref() else {
+                    continue;
+                };
+                let token = if next_random(&mut random).is_multiple_of(4) {
+                    stale
+                        .front()
+                        .cloned()
+                        .unwrap_or_else(ContinuationClaimToken::generate)
+                } else {
+                    claim.token.clone()
+                };
+                let result = store.retry_session_continuation_at(
+                    &continuation_id,
+                    &claim.owner,
+                    &token,
+                    "model retry",
+                    "2999-01-01T00:00:00Z",
+                    now,
+                );
+                let owns_current = token.as_str() == claim.token.as_str() && claim.expires > now;
+                if owns_current {
+                    assert!(result.is_ok(), "step {step}: retry should apply");
+                    attempts += 1;
+                    status = "ready".to_string();
+                    current = None;
+                } else {
+                    assert!(result.is_err(), "step {step}: stale retry must fail");
+                }
+            }
+            2 => {
+                let result = store
+                    .reclaim_expired_session_continuation_at(&continuation_id, "model reclaim", now)
+                    .unwrap();
+                let expired = current.as_ref().is_some_and(|claim| claim.expires <= now);
+                if status == "delivering" && expired {
+                    assert!(result.is_some(), "step {step}: expired claim reclaimable");
+                    status = "ready".to_string();
+                    current = None;
+                } else {
+                    assert!(result.is_none(), "step {step}: live claim not reclaimable");
+                }
+            }
+            _ => {
+                let Some(claim) = current.as_ref() else {
+                    continue;
+                };
+                let token = if let Some(stale_token) = stale.front() {
+                    stale_token.clone()
+                } else {
+                    claim.token.clone()
+                };
+                let result = store.mark_session_continuation_delivered_at(
+                    &continuation_id,
+                    &claim.owner,
+                    &token,
+                    now,
+                );
+                let owns_current = token.as_str() == claim.token.as_str() && claim.expires > now;
+                if owns_current {
+                    assert!(
+                        result.unwrap().is_some(),
+                        "step {step}: delivery should apply"
+                    );
+                    status = "delivered".to_string();
+                    break;
+                }
+                assert!(result.is_err(), "step {step}: stale delivery must fail");
+            }
+        }
+
+        let rows = store
+            .list_session_continuations(&session_id, None, Some(10))
+            .unwrap();
+        assert_eq!(rows[0].status, status, "step {step}");
+        assert_eq!(rows[0].delivery_attempt, delivery_attempt, "step {step}");
+        assert_eq!(rows[0].attempts, attempts, "step {step}");
+        match &current {
+            Some(claim) if status == "delivering" => {
+                assert_eq!(
+                    rows[0].lease_owner.as_deref(),
+                    Some(claim.owner.as_str()),
+                    "step {step}"
+                );
+                assert!(rows[0].lease_expires_at.is_some(), "step {step}");
+            }
+            _ => assert!(rows[0].lease_owner.is_none(), "step {step}"),
+        }
+        if status == "delivered" {
+            assert_eq!(rows[0].run_count, 1);
+            break;
+        }
+    }
+    // Force the terminal transition if the random walk did not reach one.
+    if status != "delivered" {
+        if status == "delivering" && current.as_ref().is_some_and(|claim| claim.expires <= now) {
+            store
+                .reclaim_expired_session_continuation_at(&continuation_id, "final reclaim", now)
+                .unwrap()
+                .expect("expired model claim reclaims");
+            status = "ready".to_string();
+            current = None;
+            delivery_attempt = delivery_attempt.saturating_add(1);
+        }
+        if status == "delivering" {
+            let claim = current.as_ref().unwrap();
+            store
+                .mark_session_continuation_delivered_at(
+                    &continuation_id,
+                    &claim.owner,
+                    &claim.token,
+                    now,
+                )
+                .unwrap()
+                .expect("live final claim delivers");
+        } else {
+            let final_claim = store
+                .claim_session_continuation_for_delivery_at(
+                    &continuation_id,
+                    "final-owner",
+                    60,
+                    now,
+                )
+                .unwrap()
+                .expect("ready model row claims");
+            delivery_attempt = delivery_attempt.saturating_add(1);
+            store
+                .mark_session_continuation_delivered_at(
+                    &continuation_id,
+                    &final_claim.owner_id,
+                    final_claim.token(),
+                    now,
+                )
+                .unwrap()
+                .expect("final claim delivers");
+        }
+        status = "delivered".to_string();
+    }
+    let rows = store
+        .list_session_continuations(&session_id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows[0].status, status);
+    assert_eq!(rows[0].delivery_attempt, delivery_attempt);
+    assert_eq!(rows[0].run_count, 1);
+    assert!(delivery_attempt > 0);
+}
+
+#[test]
+fn migration_adds_cross_process_columns_and_creates_audit_table() {
+    let data = TempDir::new().unwrap();
+    {
+        let conn = rusqlite::Connection::open(data.path().join("verlinpark.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_meta (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE runtime_leases (
+                 lease_key     TEXT PRIMARY KEY,
+                 owner_id      TEXT NOT NULL,
+                 kind          TEXT NOT NULL,
+                 session_id    TEXT,
+                 acquired_at   TEXT NOT NULL,
+                 heartbeat_at  TEXT NOT NULL,
+                 expires_at    TEXT NOT NULL
+             );
+             CREATE TABLE session_continuations (
+                 id              TEXT PRIMARY KEY,
+                 session_id      TEXT NOT NULL,
+                 project_id      TEXT NOT NULL,
+                 body            TEXT NOT NULL,
+                 watch_task_ids  TEXT NOT NULL DEFAULT '[]',
+                 watch_mode      TEXT NOT NULL DEFAULT 'all',
+                 deadline_at     TEXT,
+                 status          TEXT NOT NULL,
+                 attempts        INTEGER NOT NULL DEFAULT 0,
+                 max_attempts    INTEGER NOT NULL DEFAULT 3,
+                 wake_reason     TEXT,
+                 outcomes        TEXT NOT NULL DEFAULT '[]',
+                 last_error      TEXT,
+                 next_attempt_at TEXT,
+                 created_at      TEXT NOT NULL,
+                 ready_at        TEXT,
+                 delivered_at    TEXT,
+                 updated_at      TEXT NOT NULL
+             );
+             INSERT INTO runtime_leases
+                 (lease_key, owner_id, kind, session_id, acquired_at, heartbeat_at, expires_at)
+             VALUES ('session:old', 'old-owner', 'session', 'old',
+                     '2026-11-11T00:00:00Z', '2026-11-11T00:00:00Z',
+                     '2999-11-11T00:00:00Z');
+             INSERT INTO session_continuations
+                 (id, session_id, project_id, body, status, created_at, updated_at)
+             VALUES ('cont-old', 'old-session', 'old-project', 'old', 'pending',
+                     '2026-11-11T00:00:00Z', '2026-11-11T00:00:00Z');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(data.path()).unwrap();
+    for (table, columns) in [
+        (
+            "runtime_leases",
+            vec![
+                "owner_instance",
+                "lease_token",
+                "fencing_token",
+                "renewed_at",
+                "released_at",
+            ],
+        ),
+        (
+            "session_continuations",
+            vec![
+                "lease_owner",
+                "lease_token",
+                "lease_expires_at",
+                "delivery_attempt",
+            ],
+        ),
+    ] {
+        let conn = store.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        for column in columns {
+            assert!(names.iter().any(|name| name == column), "{table}.{column}");
+        }
+    }
+    {
+        let conn = store.lock().unwrap();
+        let audit_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_lease_audit'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .unwrap()
+            .unwrap_or(false);
+        assert!(audit_exists);
+    }
+    let old_lease = store.runtime_lease_owner("session:old").unwrap().unwrap();
+    assert_eq!(old_lease.owner_id, "old-owner");
+    assert_eq!(old_lease.owner_instance, "");
+    assert_eq!(old_lease.fencing_token, 0);
+    let rows = store
+        .list_session_continuations("old-session", None, Some(10))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].delivery_attempt, 0);
+    assert!(rows[0].lease_owner.is_none());
+    assert!(rows[0].lease_expires_at.is_none());
+}
+
+#[test]
+fn malformed_daemon_identity_fails_closed() {
+    let data = TempDir::new().unwrap();
+    {
+        let conn = rusqlite::Connection::open(data.path().join("verlinpark.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO store_meta (key, value) VALUES
+                 ('daemon_instance', 'not-json');",
+        )
+        .unwrap();
+    }
+    let error = match Store::open(data.path()) {
+        Ok(_) => panic!("malformed identity opened"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("daemon identity"));
+}
+
+#[test]
+fn daemon_identity_rejects_colons_and_control_characters() {
+    let data = TempDir::new().unwrap();
+    {
+        let conn = rusqlite::Connection::open(data.path().join("verlinpark.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO store_meta (key, value) VALUES
+                 ('daemon_instance',
+                  '{\"instance_id\":\"bad:id\",\"pid\":1,\"started_at\":\"2026-11-11T00:00:00Z\"}');",
+        )
+        .unwrap();
+    }
+    let error = match Store::open(data.path()) {
+        Ok(_) => panic!("malformed identity opened"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("malformed"));
+}
+
+#[test]
+fn startup_cleanup_removes_legacy_unfenced_runtime_lease_rows() {
+    let data = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO runtime_leases
+             (lease_key, owner_id, owner_instance, kind, session_id, lease_token,
+              fencing_token, acquired_at, heartbeat_at, renewed_at, expires_at, released_at)
+             VALUES ('session:legacy-live', 'old', '', 'session', 'legacy-live', '', 0,
+                     '2026-11-11T00:00:00Z', '2026-11-11T00:00:00Z', '',
+                     '2999-11-11T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+    }
+    store.recover_state().unwrap();
+    assert!(
+        store
+            .runtime_lease_owner("session:legacy-live")
+            .unwrap()
+            .is_none()
+    );
+    let audit = store
+        .list_runtime_lease_audit(Some("session:legacy-live"), Some(10))
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "startup_cleanup");
+}
+
+#[test]
+fn lease_audit_preserves_action_ordering_under_concurrent_owners() {
+    let data = TempDir::new().unwrap();
+    Store::open(data.path()).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let mut handles = Vec::new();
+    for index in 0..4 {
+        let data = data.path().to_path_buf();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = Store::open(&data).unwrap();
+            barrier.wait();
+            for _ in 0..5 {
+                if let Ok(acquisition) = store.acquire_runtime_lease(
+                    "session:audit-race",
+                    &format!("owner-{index}"),
+                    &format!("instance-{index}:{index}"),
+                    "session",
+                    Some("audit-race"),
+                    30,
+                ) {
+                    let _ = store.release_runtime_lease(
+                        "session:audit-race",
+                        &format!("owner-{index}"),
+                        acquisition.token(),
+                    );
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let store = Store::open(data.path()).unwrap();
+    let audit = store
+        .list_runtime_lease_audit(Some("session:audit-race"), Some(500))
+        .unwrap();
+    assert!(!audit.is_empty());
+    for pair in audit.windows(2) {
+        assert!(pair[0].id > pair[1].id, "history is newest-first");
+        assert!(pair[0].fencing_token >= pair[1].fencing_token);
+    }
+    let acquired = audit
+        .iter()
+        .filter(|entry| matches!(entry.action.as_str(), "acquired" | "reacquired"))
+        .count();
+    let released = audit
+        .iter()
+        .filter(|entry| entry.action == "released")
+        .count();
+    assert_eq!(acquired, released);
+}
+
+#[test]
+fn lease_error_display_names_the_holder_and_lost_reason() {
+    let (_data, store, _repo) = test_store();
+    let holder = store
+        .acquire_runtime_lease(
+            "session:display",
+            "owner-a",
+            "instance-a:1",
+            "session",
+            Some("display"),
+            60,
+        )
+        .unwrap();
+    let busy = store
+        .acquire_runtime_lease(
+            "session:display",
+            "owner-b",
+            "instance-b:2",
+            "session",
+            Some("display"),
+            60,
+        )
+        .unwrap_err();
+    let text = busy.to_string();
+    assert!(text.contains("session:display"));
+    assert!(text.contains("owner-a"));
+    assert!(text.contains("instance-a:1"));
+    assert!(!text.contains("redacted"));
+    assert!(!text.contains("lease_token"));
+    store
+        .release_runtime_lease("session:display", "owner-a", holder.token())
+        .unwrap();
+    let lost = store
+        .renew_runtime_lease("session:display", "owner-a", holder.token(), 60)
+        .unwrap_err();
+    assert!(lost.to_string().contains("was lost"));
+    assert!(lost.to_string().contains("released"));
+}
+
+#[test]
+fn lease_audit_filter_limit_and_missing_key_are_bounded() {
+    let (_data, store, _repo) = test_store();
+    for index in 0..5 {
+        let acquisition = store
+            .acquire_runtime_lease(
+                &format!("session:audit-{index}"),
+                "owner",
+                "instance:1",
+                "session",
+                None,
+                60,
+            )
+            .unwrap();
+        store
+            .release_runtime_lease(
+                &format!("session:audit-{index}"),
+                "owner",
+                acquisition.token(),
+            )
+            .unwrap();
+    }
+    let all = store.list_runtime_lease_audit(None, Some(3)).unwrap();
+    assert_eq!(all.len(), 3);
+    let filtered = store
+        .list_runtime_lease_audit(Some("session:audit-2"), Some(100))
+        .unwrap();
+    assert_eq!(filtered.len(), 2);
+    assert!(
+        filtered
+            .iter()
+            .all(|entry| entry.lease_key == "session:audit-2")
+    );
+    assert!(
+        store
+            .list_runtime_lease_audit(Some("session:none"), None)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.list_runtime_lease_audit(None, Some(0)).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store
+            .list_runtime_lease_audit(None, Some(u32::MAX))
+            .unwrap()
+            .len(),
+        10
+    );
+}
+
+#[test]
+fn recovery_is_idempotent_for_continuations_and_runtime_leases() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("idempotent recovery"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "idempotent recovery")
+        .unwrap();
+    let (continuation, _) = store
+        .create_session_continuation_with_event(&NewSessionContinuation {
+            session_id: session.id.clone(),
+            project_id: project.id.clone(),
+            body: "recover twice".into(),
+            watch_task_ids: Vec::new(),
+            watch_mode: "all".into(),
+            deadline_at: None,
+            max_attempts: 3,
+            series_id: None,
+            parent_continuation_id: None,
+            recurrence_every_secs: None,
+            recurrence_max_runs: 1,
+            run_count: 0,
+        })
+        .unwrap();
+    store
+        .mark_session_continuation_ready_with_event(&continuation.id, "deadline", &[])
+        .unwrap()
+        .unwrap();
+    store
+        .claim_session_continuation_for_delivery_with_event(&continuation.id, "foreign:1:nonce", 0)
+        .unwrap()
+        .unwrap();
+    store
+        .acquire_runtime_lease(
+            &format!("session:{}", session.id),
+            "own",
+            &store.process_owner_instance(),
+            "session",
+            Some(&session.id),
+            60,
+        )
+        .unwrap();
+
+    let first = store.recover_state().unwrap();
+    let second = store.recover_state().unwrap();
+    assert!(
+        first
+            .1
+            .iter()
+            .any(|event| event.kind == "session.continuation.reclaimed")
+    );
+    assert!(
+        !second
+            .1
+            .iter()
+            .any(|event| event.kind == "session.continuation.reclaimed"),
+        "a second recovery must not reclaim the same claim twice"
+    );
+    let rows = store
+        .list_session_continuations(&session.id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows[0].status, "ready");
+    assert!(rows[0].lease_owner.is_none());
+    assert!(store.list_runtime_leases().unwrap().is_empty());
+}
+
+#[test]
+fn runtime_lease_owner_keeps_expired_rows_visible_for_operators() {
+    let (_data, store, _repo) = test_store();
+    store
+        .acquire_runtime_lease(
+            "session:expired-visible",
+            "owner",
+            "instance:1",
+            "session",
+            Some("expired-visible"),
+            0,
+        )
+        .unwrap();
+    let row = store
+        .runtime_lease_owner("session:expired-visible")
+        .unwrap()
+        .expect("expired row remains visible until sweep");
+    assert_eq!(row.state(), RuntimeLeaseState::Stale);
+    assert_eq!(store.list_runtime_leases().unwrap().len(), 1);
+    assert_eq!(store.clear_expired_runtime_leases().unwrap(), 1);
+    assert!(
+        store
+            .runtime_lease_owner("session:expired-visible")
+            .unwrap()
+            .is_none()
+    );
 }

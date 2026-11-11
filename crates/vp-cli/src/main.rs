@@ -512,6 +512,14 @@ enum Command {
     Leases,
     /// Remove expired runtime leases left by a crashed process.
     LeasesSweep,
+    /// Show token-free runtime-lease ownership history.
+    LeaseHistory {
+        /// Restrict to one lease key.
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
     /// Show daemon-wide computer browser/GUI leases; optionally sweep or release.
     Computer {
         /// Remove expired computer leases.
@@ -960,6 +968,15 @@ enum Command {
     },
     /// Cancel a pending or ready deferred continuation.
     ContinuationCancel { id: String },
+    /// Show the token-free delivery claim state for one continuation.
+    ContinuationStatus { id: String },
+    /// Reclaim an expired continuation delivery claim.
+    ContinuationReclaim {
+        id: String,
+        /// Audit reason recorded with the reclaimed event.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Show plan-task progress and stall observations for a session.
     TaskStalls { session: String },
     /// Show automatic stall recovery state for a session.
@@ -2305,6 +2322,14 @@ async fn main() -> Result<()> {
         }
         Command::Leases => rpc(&discovery, "runtime.leases", json!({})).await?,
         Command::LeasesSweep => rpc(&discovery, "runtime.leases.sweep", json!({})).await?,
+        Command::LeaseHistory { key, limit } => {
+            rpc(
+                &discovery,
+                "runtime.leases.history",
+                json!({"lease_key": key, "limit": limit}),
+            )
+            .await?
+        }
         Command::Computer {
             sweep,
             release,
@@ -3010,6 +3035,17 @@ async fn main() -> Result<()> {
         }
         Command::ContinuationCancel { id } => {
             rpc(&discovery, "session.continuation.cancel", json!({"id": id})).await?
+        }
+        Command::ContinuationStatus { id } => {
+            rpc(&discovery, "session.continuation.status", json!({"id": id})).await?
+        }
+        Command::ContinuationReclaim { id, reason } => {
+            rpc(
+                &discovery,
+                "session.continuation.reclaim",
+                json!({"id": id, "reason": reason}),
+            )
+            .await?
         }
         Command::TaskStalls { session } => {
             rpc(&discovery, "session.stalls", json!({"session_id": session})).await?
@@ -4620,14 +4656,56 @@ fn print_human(value: &Value) {
                 .unwrap_or("?"),
             leases.len()
         );
+        if let Some(instance) = value.get("daemon_instance") {
+            println!(
+                "  instance {}  pid {}  started {}",
+                instance
+                    .get("instance_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?"),
+                instance
+                    .get("pid")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                instance
+                    .get("started_at")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?")
+            );
+        }
         for lease in leases {
             println!(
-                "  {}  {}  {}  expires {}  owner {}",
+                "  {}  {}  {}  generation {}  {}  expires {}  owner {} ({})",
                 lease["kind"].as_str().unwrap_or("?"),
                 lease["lease_key"].as_str().unwrap_or("?"),
                 lease["session_id"].as_str().unwrap_or("-"),
+                lease["fencing_token"].as_u64().unwrap_or(0),
+                lease["state"].as_str().unwrap_or("?"),
                 lease["expires_at"].as_str().unwrap_or("?"),
-                lease["owner_id"].as_str().unwrap_or("?")
+                lease["owner_id"].as_str().unwrap_or("?"),
+                lease["owner_instance"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if let Some(entries) = value.get("entries").and_then(Value::as_array)
+        && entries
+            .iter()
+            .all(|entry| entry.get("action").is_some() && entry.get("lease_key").is_some())
+    {
+        if entries.is_empty() {
+            println!("No runtime lease history.");
+        }
+        for entry in entries {
+            println!(
+                "  {}  {}  {}  generation {}  {} ({})  {}",
+                entry["occurred_at"].as_str().unwrap_or("?"),
+                entry["action"].as_str().unwrap_or("?"),
+                entry["lease_key"].as_str().unwrap_or("?"),
+                entry["fencing_token"].as_u64().unwrap_or(0),
+                entry["owner_id"].as_str().unwrap_or("?"),
+                entry["owner_instance"].as_str().unwrap_or("?"),
+                entry["detail"].as_str().unwrap_or("")
             );
         }
         return;

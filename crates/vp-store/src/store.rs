@@ -31,28 +31,47 @@ use vp_protocol::remote::ExecutionHost;
 
 use crate::paths;
 
+/// A live or expired runtime-lease projection. The unpredictable lease token
+/// is deliberately absent: it is an internal fencing secret returned only to
+/// the acquiring guard. RPC, CLI, logs, and this public projection expose the
+/// owner, process instance, monotonic generation, and expiry instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeLease {
     pub lease_key: String,
     pub owner_id: String,
+    #[serde(default)]
+    pub owner_instance: String,
     pub kind: String,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub fencing_token: u64,
     pub acquired_at: String,
     pub heartbeat_at: String,
+    #[serde(default)]
+    pub renewed_at: String,
     pub expires_at: String,
+    #[serde(default)]
+    pub released_at: Option<String>,
 }
 
 fn map_runtime_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeLease> {
     Ok(RuntimeLease {
         lease_key: row.get(0)?,
         owner_id: row.get(1)?,
-        kind: row.get(2)?,
-        session_id: row.get(3)?,
-        acquired_at: row.get(4)?,
-        heartbeat_at: row.get(5)?,
-        expires_at: row.get(6)?,
+        owner_instance: row.get(2)?,
+        kind: row.get(3)?,
+        session_id: row.get(4)?,
+        fencing_token: row.get::<_, i64>(5)?.max(0) as u64,
+        acquired_at: row.get(6)?,
+        heartbeat_at: row.get(7)?,
+        renewed_at: row.get(8)?,
+        expires_at: row.get(9)?,
+        released_at: row.get(10)?,
     })
 }
+
+pub(crate) const RUNTIME_LEASE_COLUMNS: &str = "lease_key, owner_id, owner_instance, kind,
+    session_id, fencing_token, acquired_at, heartbeat_at, renewed_at, expires_at, released_at";
 
 /// A daemon-wide lease over an interactive computer surface (browser or GUI).
 /// It is deliberately separate from the worktree write-scope leases: a
@@ -720,6 +739,7 @@ pub struct Store {
     data_dir: PathBuf,
     mirror_lock: Arc<Mutex<()>>,
     manifest_lock: Arc<Mutex<()>>,
+    daemon_identity: DaemonIdentity,
 }
 
 /// Reject IDs that could escape the daemon's per-session storage paths or
@@ -1826,7 +1846,11 @@ impl Store {
                 parent_continuation_id TEXT,
                 recurrence_every_secs INTEGER,
                 recurrence_max_runs INTEGER NOT NULL DEFAULT 1,
-                run_count       INTEGER NOT NULL DEFAULT 0
+                run_count       INTEGER NOT NULL DEFAULT 0,
+                lease_owner     TEXT,
+                lease_token     TEXT,
+                lease_expires_at TEXT,
+                delivery_attempt INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_session_continuations_status
@@ -1935,19 +1959,49 @@ impl Store {
                 ON write_leases(project_id, acquired_at);
 
             CREATE TABLE IF NOT EXISTS runtime_leases (
-                lease_key     TEXT PRIMARY KEY,
-                owner_id      TEXT NOT NULL,
-                kind          TEXT NOT NULL,
-                session_id    TEXT,
-                acquired_at   TEXT NOT NULL,
-                heartbeat_at  TEXT NOT NULL,
-                expires_at    TEXT NOT NULL
+                lease_key      TEXT PRIMARY KEY,
+                owner_id       TEXT NOT NULL,
+                owner_instance TEXT NOT NULL DEFAULT '',
+                kind           TEXT NOT NULL,
+                session_id     TEXT,
+                lease_token    TEXT NOT NULL DEFAULT '',
+                fencing_token  INTEGER NOT NULL DEFAULT 0,
+                acquired_at    TEXT NOT NULL,
+                heartbeat_at   TEXT NOT NULL,
+                renewed_at     TEXT NOT NULL DEFAULT '',
+                expires_at     TEXT NOT NULL,
+                released_at    TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_runtime_leases_expiry
                 ON runtime_leases(expires_at);
             CREATE INDEX IF NOT EXISTS idx_runtime_leases_session
                 ON runtime_leases(session_id);
+            -- Fencing generations survive lease-row cleanup. A released or
+            -- expired row may be deleted, but the next acquisition for the key
+            -- must still advance monotonically.
+            CREATE TABLE IF NOT EXISTS runtime_lease_fences (
+                lease_key     TEXT PRIMARY KEY,
+                fencing_token INTEGER NOT NULL DEFAULT 0,
+                updated_at    TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS runtime_lease_audit (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                lease_key     TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                action        TEXT NOT NULL,
+                owner_id      TEXT NOT NULL,
+                owner_instance TEXT NOT NULL DEFAULT '',
+                fencing_token INTEGER NOT NULL DEFAULT 0,
+                detail        TEXT,
+                occurred_at   TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_runtime_lease_audit_key
+                ON runtime_lease_audit(lease_key, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_runtime_lease_audit_time
+                ON runtime_lease_audit(occurred_at);
 
             CREATE TABLE IF NOT EXISTS computer_leases (
                 lease_id      TEXT PRIMARY KEY,
@@ -2052,6 +2106,51 @@ impl Store {
             "session_continuations",
             "run_count",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "session_continuations", "lease_owner", "TEXT")?;
+        ensure_column(&conn, "session_continuations", "lease_token", "TEXT")?;
+        ensure_column(&conn, "session_continuations", "lease_expires_at", "TEXT")?;
+        ensure_column(
+            &conn,
+            "session_continuations",
+            "delivery_attempt",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "runtime_leases",
+            "owner_instance",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "runtime_leases",
+            "lease_token",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "runtime_leases",
+            "fencing_token",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "runtime_leases",
+            "renewed_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(&conn, "runtime_leases", "released_at", "TEXT")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_runtime_leases_instance
+                 ON runtime_leases(owner_instance, expires_at);
+             CREATE INDEX IF NOT EXISTS idx_session_continuations_claim
+                 ON session_continuations(status, lease_expires_at);
+             CREATE TABLE IF NOT EXISTS runtime_lease_fences (
+                 lease_key     TEXT PRIMARY KEY,
+                 fencing_token INTEGER NOT NULL DEFAULT 0,
+                 updated_at    TEXT NOT NULL
+             );",
         )?;
         ensure_column(&conn, "sources", "collection", "TEXT")?;
         ensure_column(
@@ -2251,12 +2350,14 @@ impl Store {
             "headers",
             "TEXT NOT NULL DEFAULT '{}'",
         )?;
+        let daemon_identity = crate::store::lease::load_or_create_daemon_identity(&conn)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             data_dir,
             mirror_lock: Arc::new(Mutex::new(())),
             manifest_lock: Arc::new(Mutex::new(())),
+            daemon_identity,
         })
     }
 
@@ -11427,6 +11528,9 @@ impl Store {
             recurrence_every_secs: new.recurrence_every_secs,
             recurrence_max_runs: new.recurrence_max_runs.max(1),
             run_count: new.run_count,
+            lease_owner: None,
+            lease_expires_at: None,
+            delivery_attempt: 0,
         };
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -11458,6 +11562,22 @@ impl Store {
         Ok((continuation, event))
     }
 
+    /// Read one continuation by id. This is an operational lookup used by the
+    /// status RPC; it does not change ownership.
+    pub fn get_session_continuation(&self, id: &str) -> Result<Option<SessionContinuation>> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {SESSION_CONTINUATION_COLUMNS}
+                     FROM session_continuations WHERE id = ?1"
+                ),
+                params![id],
+                map_session_continuation,
+            )
+            .optional()?)
+    }
+
     pub fn list_session_continuations(
         &self,
         session_id: &str,
@@ -11477,17 +11597,22 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// All pending and ready rows across sessions, ordered deterministically.
-    /// The scheduler tick evaluates this snapshot; it never sees terminal rows.
+    /// All pending and ready rows across sessions, plus delivering rows whose
+    /// claim has expired. The scheduler tick evaluates this snapshot; it never
+    /// sees terminal rows and never touches a live foreign delivery claim.
     pub fn list_open_session_continuations(&self) -> Result<Vec<SessionContinuation>> {
+        let now = now_rfc3339();
         let conn = self.lock()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {SESSION_CONTINUATION_COLUMNS}
              FROM session_continuations
              WHERE status IN ('pending', 'ready')
+                OR (status = 'delivering'
+                    AND lease_expires_at IS NOT NULL
+                    AND julianday(lease_expires_at) <= julianday(?1))
              ORDER BY created_at ASC, id ASC"
         ))?;
-        let rows = stmt.query_map([], map_session_continuation)?;
+        let rows = stmt.query_map(params![now], map_session_continuation)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -11503,7 +11628,8 @@ impl Store {
         let changed = tx.execute(
             "UPDATE session_continuations
              SET status = 'ready', wake_reason = ?1, outcomes = ?2, ready_at = ?3,
-                 next_attempt_at = NULL, updated_at = ?3
+                 next_attempt_at = NULL, updated_at = ?3,
+                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
              WHERE id = ?4 AND status = 'pending'",
             params![reason, serde_json::to_string(outcomes)?, now, id],
         )?;
@@ -11525,171 +11651,8 @@ impl Store {
         Ok(Some((continuation, event)))
     }
 
-    /// Atomically claim a ready row for one delivery attempt. Only the caller
-    /// whose claim commits may call `start`; a racing pass sees zero rows and
-    /// skips. A crash after this transition leaves `delivering`, which daemon
-    /// recovery fails closed instead of delivering again.
-    pub fn claim_session_continuation_with_event(
-        &self,
-        id: &str,
-    ) -> Result<Option<(SessionContinuation, Event)>> {
-        let now = now_rfc3339();
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            "UPDATE session_continuations
-             SET status = 'delivering', next_attempt_at = NULL, updated_at = ?1
-             WHERE id = ?2 AND status = 'ready'",
-            params![now, id],
-        )?;
-        if changed == 0 {
-            return Ok(None);
-        }
-        let continuation = query_session_continuation_tx(&tx, id)?
-            .ok_or_else(|| anyhow!("continuation disappeared during claim: {id}"))?;
-        let event = insert_event_tx(
-            &tx,
-            &continuation.session_id,
-            "session.continuation.delivering",
-            serde_json::to_value(&continuation)?,
-        )?;
-        tx.commit()?;
-        if let Err(error) = self.append_event_mirror(&event) {
-            tracing::warn!(%error, "failed to append event mirror");
-        }
-        Ok(Some((continuation, event)))
-    }
-
-    /// Atomically mark a claimed row delivered, increment its run count, and
-    /// schedule the next run when the series still has budget. Projection,
-    /// delivery event, and child event commit together. If inserting the child
-    /// fails the transaction rolls back, so the claimed row remains
-    /// `delivering`; daemon recovery then fails it closed and no duplicate
-    /// child can exist.
-    pub fn mark_session_continuation_delivered_with_event(
-        &self,
-        id: &str,
-    ) -> Result<Option<ContinuationDelivery>> {
-        let now = now_rfc3339();
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            "UPDATE session_continuations
-             SET status = 'delivered', run_count = run_count + 1, delivered_at = ?1,
-                 next_attempt_at = NULL, updated_at = ?1
-             WHERE id = ?2 AND status = 'delivering'",
-            params![now, id],
-        )?;
-        if changed == 0 {
-            return Ok(None);
-        }
-        let delivered = query_session_continuation_tx(&tx, id)?
-            .ok_or_else(|| anyhow!("continuation disappeared during delivery: {id}"))?;
-        let mut events = vec![insert_event_tx(
-            &tx,
-            &delivered.session_id,
-            "session.continuation.delivered",
-            serde_json::to_value(&delivered)?,
-        )?];
-        let scheduled = next_recurring_continuation(&delivered, &now)?;
-        if let Some(child) = &scheduled {
-            insert_session_continuation_tx(&tx, child)?;
-            events.push(insert_event_tx(
-                &tx,
-                &child.session_id,
-                "session.continuation.scheduled",
-                serde_json::to_value(child)?,
-            )?);
-        }
-        tx.commit()?;
-        for event in &events {
-            if let Err(error) = self.append_event_mirror(event) {
-                tracing::warn!(%error, "failed to append event mirror");
-            }
-        }
-        Ok(Some(ContinuationDelivery {
-            delivered,
-            scheduled,
-            events,
-        }))
-    }
-
-    /// Record a failed start attempt without exhausting the cap. The row stays
-    /// ready and the scheduler waits for `next_attempt_at`.
-    pub fn retry_session_continuation_with_event(
-        &self,
-        id: &str,
-        error: &str,
-        next_attempt_at: &str,
-    ) -> Result<Option<(SessionContinuation, Event)>> {
-        let now = now_rfc3339();
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            "UPDATE session_continuations
-             SET status = 'ready', attempts = attempts + 1, last_error = ?1,
-                 next_attempt_at = ?2, updated_at = ?3
-             WHERE id = ?4 AND status IN ('ready', 'delivering')",
-            params![error, next_attempt_at, now, id],
-        )?;
-        if changed == 0 {
-            return Ok(None);
-        }
-        let continuation = query_session_continuation_tx(&tx, id)?
-            .ok_or_else(|| anyhow!("continuation disappeared during retry: {id}"))?;
-        let mut payload = serde_json::to_value(&continuation)?;
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("error".into(), serde_json::json!(error));
-        }
-        let event = insert_event_tx(
-            &tx,
-            &continuation.session_id,
-            "session.continuation.retrying",
-            payload,
-        )?;
-        tx.commit()?;
-        if let Err(error) = self.append_event_mirror(&event) {
-            tracing::warn!(%error, "failed to append event mirror");
-        }
-        Ok(Some((continuation, event)))
-    }
-
-    pub fn fail_session_continuation_with_event(
-        &self,
-        id: &str,
-        error: &str,
-    ) -> Result<Option<(SessionContinuation, Event)>> {
-        let now = now_rfc3339();
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            "UPDATE session_continuations
-             SET status = 'failed', attempts = attempts + 1, last_error = ?1,
-                 next_attempt_at = NULL, updated_at = ?2
-             WHERE id = ?3 AND status IN ('pending', 'ready', 'delivering')",
-            params![error, now, id],
-        )?;
-        if changed == 0 {
-            return Ok(None);
-        }
-        let continuation = query_session_continuation_tx(&tx, id)?
-            .ok_or_else(|| anyhow!("continuation disappeared during failure: {id}"))?;
-        let mut payload = serde_json::to_value(&continuation)?;
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("error".into(), serde_json::json!(error));
-        }
-        let event = insert_event_tx(
-            &tx,
-            &continuation.session_id,
-            "session.continuation.failed",
-            payload,
-        )?;
-        tx.commit()?;
-        if let Err(error) = self.append_event_mirror(&event) {
-            tracing::warn!(%error, "failed to append event mirror");
-        }
-        Ok(Some((continuation, event)))
-    }
+    // Claim/ack/fail/retry transitions live in `store::continuation_lease`;
+    // they are token-fenced and require an explicit delivery owner.
 
     pub fn cancel_session_continuation_with_event(
         &self,
@@ -11701,7 +11664,8 @@ impl Store {
         let tx = conn.transaction()?;
         let changed = tx.execute(
             "UPDATE session_continuations
-             SET status = 'cancelled', last_error = ?1, next_attempt_at = NULL, updated_at = ?2
+             SET status = 'cancelled', last_error = ?1, next_attempt_at = NULL, updated_at = ?2,
+                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
              WHERE id = ?3 AND status IN ('pending', 'ready')",
             params![reason, now, id],
         )?;
@@ -13787,135 +13751,8 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Acquire or refresh a daemon-wide runtime lease. Leases are SQLite-backed
-    /// so two processes pointed at the same data directory cannot run the same
-    /// session or integration step concurrently. Expired leases are removable
-    /// without operator action.
-    pub fn try_acquire_runtime_lease(
-        &self,
-        lease_key: &str,
-        owner_id: &str,
-        kind: &str,
-        session_id: Option<&str>,
-        ttl_secs: u64,
-    ) -> Result<bool> {
-        let now = time::OffsetDateTime::now_utc();
-        let now_text = now
-            .format(&time::format_description::well_known::Rfc3339)
-            .context("formatting lease time")?;
-        let expires = now + time::Duration::seconds(ttl_secs.min(86_400) as i64);
-        let expires_text = expires
-            .format(&time::format_description::well_known::Rfc3339)
-            .context("formatting lease expiry")?;
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM runtime_leases WHERE julianday(expires_at) <= julianday(?1)",
-            params![now_text],
-        )?;
-        let existing = tx
-            .query_row(
-                "SELECT owner_id FROM runtime_leases WHERE lease_key = ?1",
-                params![lease_key],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        match existing {
-            Some(owner) if owner != owner_id => {
-                return Ok(false);
-            }
-            Some(_) => {
-                tx.execute(
-                    "UPDATE runtime_leases
-                     SET heartbeat_at = ?1, expires_at = ?2, kind = ?3, session_id = ?4
-                     WHERE lease_key = ?5",
-                    params![now_text, expires_text, kind, session_id, lease_key],
-                )?;
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO runtime_leases
-                     (lease_key, owner_id, kind, session_id, acquired_at, heartbeat_at, expires_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
-                    params![
-                        lease_key,
-                        owner_id,
-                        kind,
-                        session_id,
-                        now_text,
-                        expires_text
-                    ],
-                )?;
-            }
-        }
-        tx.commit()?;
-        Ok(true)
-    }
-
-    pub fn renew_runtime_lease(
-        &self,
-        lease_key: &str,
-        owner_id: &str,
-        ttl_secs: u64,
-    ) -> Result<bool> {
-        let now = time::OffsetDateTime::now_utc();
-        let now_text = now
-            .format(&time::format_description::well_known::Rfc3339)
-            .context("formatting lease time")?;
-        let expires = now + time::Duration::seconds(ttl_secs.min(86_400) as i64);
-        let expires_text = expires
-            .format(&time::format_description::well_known::Rfc3339)
-            .context("formatting lease expiry")?;
-        let conn = self.lock()?;
-        let changed = conn.execute(
-            "UPDATE runtime_leases
-             SET heartbeat_at = ?1, expires_at = ?2
-             WHERE lease_key = ?3 AND owner_id = ?4",
-            params![now_text, expires_text, lease_key, owner_id],
-        )?;
-        Ok(changed > 0)
-    }
-
-    pub fn release_runtime_lease(&self, lease_key: &str, owner_id: &str) -> Result<bool> {
-        let conn = self.lock()?;
-        let changed = conn.execute(
-            "DELETE FROM runtime_leases WHERE lease_key = ?1 AND owner_id = ?2",
-            params![lease_key, owner_id],
-        )?;
-        Ok(changed > 0)
-    }
-
-    pub fn runtime_lease_owner(&self, lease_key: &str) -> Result<Option<RuntimeLease>> {
-        let conn = self.lock()?;
-        conn.query_row(
-            "SELECT lease_key, owner_id, kind, session_id, acquired_at, heartbeat_at, expires_at
-             FROM runtime_leases WHERE lease_key = ?1",
-            params![lease_key],
-            map_runtime_lease,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    pub fn list_runtime_leases(&self) -> Result<Vec<RuntimeLease>> {
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT lease_key, owner_id, kind, session_id, acquired_at, heartbeat_at, expires_at
-             FROM runtime_leases ORDER BY acquired_at ASC, lease_key ASC",
-        )?;
-        let rows = stmt.query_map([], map_runtime_lease)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    pub fn clear_expired_runtime_leases(&self) -> Result<usize> {
-        let now = now_rfc3339();
-        let conn = self.lock()?;
-        let changed = conn.execute(
-            "DELETE FROM runtime_leases WHERE julianday(expires_at) <= julianday(?1)",
-            params![now],
-        )?;
-        Ok(changed)
-    }
+    // Runtime lease acquisition, fencing, renewal, release, and cleanup live in
+    // `store::lease` so the ownership state machine stays in one auditable module.
 
     /// Acquire the daemon-wide lease for an interactive surface. Expired
     /// leases are removed and audited in the same transaction; an unexpired
@@ -14371,12 +14208,13 @@ impl Store {
     /// the session ids plus the events that must be broadcast.
     pub fn recover_state(&self) -> Result<(Vec<String>, Vec<Event>)> {
         let now = now_rfc3339();
+        let process_instance = self.process_owner_instance();
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let sessions = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM sessions
-                 WHERE status IN ('running', 'paused', 'waiting_input')
+                 WHERE (status IN ('running', 'paused', 'waiting_input')
                     OR (status = 'queued' AND (
                         EXISTS (
                             SELECT 1 FROM session_runs r
@@ -14388,14 +14226,24 @@ impl Store {
                               AND e.type = 'agent.queued'
                               AND e.payload LIKE '%\"resumed_run_id\"%'
                         )
-                    ))",
+                    )))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM runtime_leases l
+                       WHERE l.lease_key = 'session:' || sessions.id
+                         AND l.released_at IS NULL
+                         AND l.owner_instance <> ''
+                         AND l.owner_instance <> ?1
+                         AND julianday(l.expires_at) > julianday(?2)
+                   )",
             )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let rows = stmt.query_map(params![process_instance, now], |row| {
+                row.get::<_, String>(0)
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
             "UPDATE sessions SET status = 'failed'
-             WHERE status IN ('running', 'paused', 'waiting_input')
+             WHERE (status IN ('running', 'paused', 'waiting_input')
                 OR (status = 'queued' AND (
                     EXISTS (
                         SELECT 1 FROM session_runs r
@@ -14407,55 +14255,126 @@ impl Store {
                           AND e.type = 'agent.queued'
                           AND e.payload LIKE '%\"resumed_run_id\"%'
                     )
-                ))",
-            [],
+                )))
+               AND NOT EXISTS (
+                   SELECT 1 FROM runtime_leases l
+                   WHERE l.lease_key = 'session:' || sessions.id
+                     AND l.released_at IS NULL
+                     AND l.owner_instance <> ''
+                     AND l.owner_instance <> ?1
+                     AND julianday(l.expires_at) > julianday(?2)
+               )",
+            params![process_instance, now],
         )?;
         let agents = {
             let mut stmt = tx.prepare(
                 "SELECT id, session_id FROM agents
-                     WHERE status IN ('running', 'waiting_input', 'queued')",
+                 WHERE status IN ('running', 'waiting_input', 'queued')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM runtime_leases l
+                       WHERE l.lease_key = 'session:' || agents.session_id
+                         AND l.released_at IS NULL
+                         AND l.owner_instance <> ''
+                         AND l.owner_instance <> ?1
+                         AND julianday(l.expires_at) > julianday(?2)
+                   )",
             )?;
-            let rows = stmt.query_map([], |row| {
+            let rows = stmt.query_map(params![process_instance, now], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
             "UPDATE agents SET status = 'failed'
-             WHERE status IN ('running', 'waiting_input', 'queued')",
-            [],
+             WHERE status IN ('running', 'waiting_input', 'queued')
+               AND NOT EXISTS (
+                   SELECT 1 FROM runtime_leases l
+                   WHERE l.lease_key = 'session:' || agents.session_id
+                     AND l.released_at IS NULL
+                     AND l.owner_instance <> ''
+                     AND l.owner_instance <> ?1
+                     AND julianday(l.expires_at) > julianday(?2)
+               )",
+            params![process_instance, now],
         )?;
         let approvals = {
-            let mut stmt =
-                tx.prepare("SELECT id, session_id FROM approvals WHERE status = 'pending'")?;
-            let rows = stmt.query_map([], |row| {
+            let mut stmt = tx.prepare(
+                "SELECT id, session_id FROM approvals
+                 WHERE status = 'pending'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM runtime_leases l
+                       WHERE l.lease_key = 'session:' || approvals.session_id
+                         AND l.released_at IS NULL
+                         AND l.owner_instance <> ''
+                         AND l.owner_instance <> ?1
+                         AND julianday(l.expires_at) > julianday(?2)
+                   )",
+            )?;
+            let rows = stmt.query_map(params![process_instance, now], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
             "UPDATE approvals SET status = 'denied', resolved_at = ?1
-             WHERE status = 'pending'",
-            params![now],
+             WHERE status = 'pending'
+               AND NOT EXISTS (
+                   SELECT 1 FROM runtime_leases l
+                   WHERE l.lease_key = 'session:' || approvals.session_id
+                     AND l.released_at IS NULL
+                     AND l.owner_instance <> ''
+                     AND l.owner_instance <> ?2
+                     AND julianday(l.expires_at) > julianday(?1)
+               )",
+            params![now, process_instance],
         )?;
         let expired_questions = {
-            let mut stmt =
-                tx.prepare("SELECT id, session_id FROM questions WHERE status = 'pending'")?;
-            let rows = stmt.query_map([], |row| {
+            let mut stmt = tx.prepare(
+                "SELECT id, session_id FROM questions
+                 WHERE status = 'pending'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM runtime_leases l
+                       WHERE l.lease_key = 'session:' || questions.session_id
+                         AND l.released_at IS NULL
+                         AND l.owner_instance <> ''
+                         AND l.owner_instance <> ?1
+                         AND julianday(l.expires_at) > julianday(?2)
+                   )",
+            )?;
+            let rows = stmt.query_map(params![process_instance, now], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
             "UPDATE questions SET status = 'expired', answered_at = ?1
-             WHERE status = 'pending'",
-            params![now],
+             WHERE status = 'pending'
+               AND NOT EXISTS (
+                   SELECT 1 FROM runtime_leases l
+                   WHERE l.lease_key = 'session:' || questions.session_id
+                     AND l.released_at IS NULL
+                     AND l.owner_instance <> ''
+                     AND l.owner_instance <> ?2
+                     AND julianday(l.expires_at) > julianday(?1)
+               )",
+            params![now, process_instance],
         )?;
         let queue_ids = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM merge_queue WHERE status IN ('queued', 'merging', 'checking')",
+                "SELECT id FROM merge_queue
+                 WHERE status IN ('queued', 'merging', 'checking')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM runtime_leases l
+                       WHERE l.lease_key = 'integration:' || merge_queue.session_id
+                         AND l.released_at IS NULL
+                         AND l.owner_instance <> ''
+                         AND l.owner_instance <> ?1
+                         AND julianday(l.expires_at) > julianday(?2)
+                   )",
             )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let rows = stmt.query_map(params![process_instance, now], |row| {
+                row.get::<_, String>(0)
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
@@ -14463,16 +14382,32 @@ impl Store {
              SET status = 'interrupted',
                  detail = 'daemon restarted during integration',
                  updated_at = ?1
-             WHERE status IN ('queued', 'merging', 'checking')",
-            params![now],
+             WHERE status IN ('queued', 'merging', 'checking')
+               AND NOT EXISTS (
+                   SELECT 1 FROM runtime_leases l
+                   WHERE l.lease_key = 'integration:' || merge_queue.session_id
+                     AND l.released_at IS NULL
+                     AND l.owner_instance <> ''
+                     AND l.owner_instance <> ?2
+                     AND julianday(l.expires_at) > julianday(?1)
+               )",
+            params![now, process_instance],
         )?;
         let interrupted_tasks = {
             let mut stmt = tx.prepare(
                 "SELECT session_id, task_id FROM plan_tasks
                  WHERE status IN ('running', 'claimed', 'cancelling', 'pausing', 'paused')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM runtime_leases l
+                       WHERE l.lease_key = 'session:' || plan_tasks.session_id
+                         AND l.released_at IS NULL
+                         AND l.owner_instance <> ''
+                         AND l.owner_instance <> ?1
+                         AND julianday(l.expires_at) > julianday(?2)
+                   )
                  ORDER BY session_id ASC, plan_seq ASC, task_id ASC",
             )?;
-            let rows = stmt.query_map([], |row| {
+            let rows = stmt.query_map(params![process_instance, now], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -14480,20 +14415,39 @@ impl Store {
         let interrupted_steering = {
             let mut stmt = tx.prepare(
                 "SELECT id, session_id, agent_id, task_id, body, status, created_at, delivered_at
-                 FROM steering_messages WHERE status = 'pending'
+                 FROM steering_messages
+                 WHERE status = 'pending'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM runtime_leases l
+                       WHERE l.lease_key = 'session:' || steering_messages.session_id
+                         AND l.released_at IS NULL
+                         AND l.owner_instance <> ''
+                         AND l.owner_instance <> ?1
+                         AND julianday(l.expires_at) > julianday(?2)
+                   )
                  ORDER BY created_at ASC, id ASC",
             )?;
-            let rows = stmt.query_map([], map_steering)?;
+            let rows = stmt.query_map(params![process_instance, now], map_steering)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         tx.execute(
-            "UPDATE steering_messages SET status = 'cancelled' WHERE status = 'pending'",
-            [],
+            "UPDATE steering_messages SET status = 'cancelled'
+             WHERE status = 'pending'
+               AND NOT EXISTS (
+                   SELECT 1 FROM runtime_leases l
+                   WHERE l.lease_key = 'session:' || steering_messages.session_id
+                     AND l.released_at IS NULL
+                     AND l.owner_instance <> ''
+                     AND l.owner_instance <> ?1
+                     AND julianday(l.expires_at) > julianday(?2)
+               )",
+            params![process_instance, now],
         )?;
-        let interrupted_continuations = {
+        let legacy_continuations = {
             let mut stmt = tx.prepare(&format!(
                 "SELECT {SESSION_CONTINUATION_COLUMNS}
-                 FROM session_continuations WHERE status = 'delivering'
+                 FROM session_continuations
+                 WHERE status = 'delivering' AND lease_expires_at IS NULL
                  ORDER BY created_at ASC, id ASC"
             ))?;
             let rows = stmt.query_map([], map_session_continuation)?;
@@ -14503,8 +14457,32 @@ impl Store {
             "UPDATE session_continuations
              SET status = 'failed',
                  last_error = 'daemon restarted while delivering; not retried automatically',
-                 next_attempt_at = NULL, updated_at = ?1
-             WHERE status = 'delivering'",
+                 next_attempt_at = NULL, updated_at = ?1,
+                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+             WHERE status = 'delivering' AND lease_expires_at IS NULL",
+            params![now],
+        )?;
+        let expired_continuations = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {SESSION_CONTINUATION_COLUMNS}
+                 FROM session_continuations
+                 WHERE status = 'delivering'
+                   AND lease_expires_at IS NOT NULL
+                   AND julianday(lease_expires_at) <= julianday(?1)
+                 ORDER BY created_at ASC, id ASC"
+            ))?;
+            let rows = stmt.query_map(params![now], map_session_continuation)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "UPDATE session_continuations
+             SET status = 'ready',
+                 last_error = 'delivery claim expired before acknowledgement; reclaimed',
+                 next_attempt_at = NULL, updated_at = ?1,
+                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+             WHERE status = 'delivering'
+               AND lease_expires_at IS NOT NULL
+               AND julianday(lease_expires_at) <= julianday(?1)",
             params![now],
         )?;
         tx.execute(
@@ -14512,19 +14490,67 @@ impl Store {
              SET status = 'interrupted',
                  last_error = 'daemon restarted while the task was active',
                  finished_at = ?1, updated_at = ?1
-             WHERE status IN ('running', 'claimed', 'cancelling', 'pausing', 'paused')",
-            params![now],
+             WHERE status IN ('running', 'claimed', 'cancelling', 'pausing', 'paused')
+               AND NOT EXISTS (
+                   SELECT 1 FROM runtime_leases l
+                   WHERE l.lease_key = 'session:' || plan_tasks.session_id
+                     AND l.released_at IS NULL
+                     AND l.owner_instance <> ''
+                     AND l.owner_instance <> ?2
+                     AND julianday(l.expires_at) > julianday(?1)
+               )",
+            params![now, process_instance],
         )?;
         tx.execute(
             "UPDATE intake_tasks
              SET status = 'failed',
                  last_error = 'daemon restarted while the intake task was active',
                  next_attempt_at = NULL, updated_at = ?1
-             WHERE status IN ('dispatching', 'running')",
-            params![now],
+             WHERE status IN ('dispatching', 'running')
+               AND (session_id IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM runtime_leases l
+                   WHERE l.lease_key = 'session:' || intake_tasks.session_id
+                     AND l.released_at IS NULL
+                     AND l.owner_instance <> ''
+                     AND l.owner_instance <> ?2
+                     AND julianday(l.expires_at) > julianday(?1)
+               ))",
+            params![now, process_instance],
         )?;
         tx.execute("DELETE FROM write_leases", [])?;
-        tx.execute("DELETE FROM runtime_leases", [])?;
+        // Only this process's leases (and pre-fencing legacy rows) are
+        // cleared. Another daemon sharing the data directory keeps its live
+        // ownership; its expired rows are swept later by the normal sweep.
+        // Record a token-free audit row for each so a restart does not erase
+        // the ownership trail.
+        let own_leases = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {RUNTIME_LEASE_COLUMNS}
+                 FROM runtime_leases
+                 WHERE owner_instance = ?1 OR owner_instance = ''
+                 ORDER BY lease_key ASC"
+            ))?;
+            let rows = stmt.query_map(params![process_instance], map_runtime_lease)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for lease in &own_leases {
+            crate::store::lease::insert_audit_tx(
+                &tx,
+                &lease.lease_key,
+                &lease.kind,
+                "startup_cleanup",
+                &lease.owner_id,
+                &lease.owner_instance,
+                lease.fencing_token,
+                Some("daemon restarted while the lease row was held"),
+                &now,
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM runtime_leases
+             WHERE owner_instance = ?1 OR owner_instance = ''",
+            params![process_instance],
+        )?;
         let interrupted_computer_leases = {
             let mut stmt = tx.prepare(
                 "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
@@ -14616,13 +14642,15 @@ impl Store {
                 payload,
             )?);
         }
-        for continuation in &interrupted_continuations {
+        for continuation in &legacy_continuations {
             let mut failed = continuation.clone();
             failed.status = "failed".to_string();
             failed.last_error =
                 Some("daemon restarted while delivering; not retried automatically".to_string());
             failed.next_attempt_at = None;
             failed.updated_at = now.clone();
+            failed.lease_owner = None;
+            failed.lease_expires_at = None;
             let mut payload = serde_json::to_value(&failed)?;
             if let Some(object) = payload.as_object_mut() {
                 object.insert(
@@ -14636,6 +14664,29 @@ impl Store {
                 &tx,
                 &failed.session_id,
                 "session.continuation.failed",
+                payload,
+            )?);
+        }
+        for continuation in &expired_continuations {
+            let mut reclaimed = continuation.clone();
+            reclaimed.status = "ready".to_string();
+            reclaimed.last_error =
+                Some("delivery claim expired before acknowledgement; reclaimed".to_string());
+            reclaimed.next_attempt_at = None;
+            reclaimed.updated_at = now.clone();
+            reclaimed.lease_owner = None;
+            reclaimed.lease_expires_at = None;
+            let mut payload = serde_json::to_value(&reclaimed)?;
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "reason".into(),
+                    serde_json::json!("delivery claim expired before acknowledgement"),
+                );
+            }
+            events.push(insert_event_tx(
+                &tx,
+                &reclaimed.session_id,
+                "session.continuation.reclaimed",
                 payload,
             )?);
         }
@@ -16142,7 +16193,8 @@ fn map_steering(row: &rusqlite::Row<'_>) -> rusqlite::Result<SteeringMessage> {
 const SESSION_CONTINUATION_COLUMNS: &str = "id, session_id, project_id, body, watch_task_ids,
     watch_mode, deadline_at, status, attempts, max_attempts, wake_reason, outcomes,
     last_error, next_attempt_at, created_at, ready_at, delivered_at, updated_at,
-    series_id, parent_continuation_id, recurrence_every_secs, recurrence_max_runs, run_count";
+    series_id, parent_continuation_id, recurrence_every_secs, recurrence_max_runs, run_count,
+    lease_owner, lease_expires_at, delivery_attempt";
 
 fn map_session_continuation(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionContinuation> {
     let watch_task_ids = row.get::<_, String>(4)?;
@@ -16173,6 +16225,9 @@ fn map_session_continuation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session
             .map(|value| value.max(0) as u64),
         recurrence_max_runs: row.get::<_, i64>(21)?.max(1) as u32,
         run_count: row.get::<_, i64>(22)?.max(0) as u32,
+        lease_owner: row.get(23)?,
+        lease_expires_at: row.get(24)?,
+        delivery_attempt: row.get::<_, i64>(25)?.max(0) as u32,
     })
 }
 
@@ -16223,6 +16278,9 @@ fn next_recurring_continuation(
         recurrence_every_secs: Some(every_secs),
         recurrence_max_runs: delivered.recurrence_max_runs.max(1),
         run_count: delivered.run_count,
+        lease_owner: None,
+        lease_expires_at: None,
+        delivery_attempt: 0,
     }))
 }
 
@@ -16251,9 +16309,9 @@ fn insert_session_continuation_tx(
           status, attempts, max_attempts, wake_reason, outcomes, last_error,
           next_attempt_at, created_at, ready_at, delivered_at, updated_at,
           series_id, parent_continuation_id, recurrence_every_secs, recurrence_max_runs,
-          run_count)
+          run_count, lease_owner, lease_expires_at, delivery_attempt)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         params![
             continuation.id,
             continuation.session_id,
@@ -16279,7 +16337,10 @@ fn insert_session_continuation_tx(
                 .recurrence_every_secs
                 .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
             i64::from(continuation.recurrence_max_runs),
-            i64::from(continuation.run_count)
+            i64::from(continuation.run_count),
+            continuation.lease_owner,
+            continuation.lease_expires_at,
+            i64::from(continuation.delivery_attempt)
         ],
     )?;
     Ok(())
@@ -17626,6 +17687,18 @@ fn search_snippet(text: &str, query: &str) -> String {
     }
     snippet
 }
+
+mod continuation_lease;
+mod lease;
+
+pub use continuation_lease::{
+    ContinuationAckLostReason, ContinuationClaimToken, SessionContinuationAckError,
+    SessionContinuationClaim, SessionContinuationClaimStatus,
+};
+pub use lease::{
+    DaemonIdentity, LeaseLostReason, MAX_RUNTIME_LEASE_TTL_SECS, RuntimeLeaseAcquisition,
+    RuntimeLeaseAuditEntry, RuntimeLeaseError, RuntimeLeaseState, RuntimeLeaseToken,
+};
 
 #[cfg(test)]
 #[path = "store/tests.rs"]

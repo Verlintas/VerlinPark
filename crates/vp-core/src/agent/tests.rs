@@ -10140,21 +10140,49 @@ async fn deferred_continuation_claim_has_one_winner_and_recovery_fails_closed() 
         .await
         .unwrap();
     assert_eq!(recovered.continuations[0].id, continuation.id);
-    assert_eq!(recovered.continuations[0].status, "failed");
-    assert_eq!(
-        recovered.continuations[0].last_error.as_deref(),
-        Some("daemon restarted while delivering; not retried automatically")
+    // A live claim is left alone. Recovery only reclaims once the claim TTL
+    // has elapsed; it never fails a claim that a live process may still own.
+    assert_eq!(recovered.continuations[0].status, "delivering");
+    assert!(recovered.continuations[0].lease_owner.is_some());
+    assert_eq!(service.reconcile_session_continuations().await.unwrap(), 0);
+
+    // Deterministically expire the claim, then reclaim it. The old owner can
+    // no longer acknowledge because its token belongs to the previous
+    // generation.
+    let expired_at = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let reclaimed = engine
+        .store()
+        .reclaim_expired_session_continuation_at(&continuation.id, "test expiry", expired_at)
+        .unwrap()
+        .expect("expired claim was reclaimable");
+    assert_eq!(reclaimed.0.status, "ready");
+    assert!(reclaimed.0.lease_owner.is_none());
+    assert!(
+        engine
+            .mark_session_continuation_delivered(&continuation.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a stale delivery token must not write a terminal state"
     );
+    let rows = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows[0].status, "ready");
     let events = engine
         .list_events(session.id.clone(), 0, 500)
         .await
         .unwrap();
     assert!(events.iter().any(|event| {
-        event.kind == "session.continuation.failed"
-            && event.payload["reason"]
-                == "daemon restarted while delivering; not retried automatically"
+        event.kind == "session.continuation.reclaimed" && event.payload["reason"] == "test expiry"
     }));
-    assert_eq!(service.reconcile_session_continuations().await.unwrap(), 0);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "session.continuation.delivered")
+    );
     let replay = engine.replay_session(&session.id).await.unwrap();
     assert!(replay.continuations_match, "{:?}", replay.mismatches);
     assert!(replay.consistent, "{:?}", replay.mismatches);
@@ -12628,4 +12656,269 @@ async fn a_new_prompt_supersedes_an_older_unresolved_run() {
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("superseded"));
+}
+
+#[tokio::test]
+async fn stale_integration_owner_aborts_before_touching_the_session_branch() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let other = Engine::new(Store::open(dir.path()).unwrap());
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "initial\n").unwrap();
+    init_repo(&repo);
+    let project = engine
+        .add_project(repo.to_string_lossy().to_string(), Some("fence".into()))
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "fenced merge".into(), None)
+        .await
+        .unwrap();
+    let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+    let session_branch = session.branch.clone().unwrap();
+    let session_head = worktree::head_commit(&session_worktree).unwrap();
+    let task = engine
+        .create_task_worktree(
+            &project.root,
+            &project.id,
+            &session.id,
+            "T1",
+            &session_branch,
+        )
+        .await
+        .unwrap();
+    std::fs::write(task.path.join("worker.txt"), "from stale worker\n").unwrap();
+    let commit = worktree::commit_all(&task.path, "worker change")
+        .unwrap()
+        .unwrap();
+    let entry = engine
+        .enqueue_merge(
+            &session.id,
+            "worker-stale",
+            "Worker stale",
+            Some("T1".into()),
+            &task.branch,
+            &commit,
+            &session_head,
+            Some("verified".into()),
+        )
+        .await
+        .unwrap();
+
+    // The first generation is already expired. A second process has taken
+    // over the key, so the old guard must fail its effect-boundary assertion.
+    let stale = engine
+        .acquire_runtime_lease_at_for_test(
+            "integration",
+            &session.id,
+            0,
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(300),
+        )
+        .await
+        .unwrap();
+    let current = other
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.generation(), stale.generation() + 1);
+
+    let spec = AgentSpec {
+        id: "worker-stale".into(),
+        role: AgentRole::Worker,
+        name: "Worker stale".into(),
+        depth: 2,
+        parent_name: Some("Manager".into()),
+        title: None,
+        task_id: Some("T1".into()),
+        department: Some("impl".into()),
+        profile: AgentProfile::Coding,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: task.path.clone(),
+        branch: task.branch.clone(),
+        session_worktree: session_worktree.clone(),
+        session_branch: session_branch.clone(),
+        write_scope: vec!["worker.txt".into()],
+        base_commit: task.base_commit.clone(),
+    };
+    let error = process_merge_entry_fenced(&engine, &session, &spec, &entry, None, &stale)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("lease lost before merge"),
+        "{error}"
+    );
+    assert_eq!(
+        worktree::head_commit(&session_worktree).unwrap(),
+        session_head,
+        "a stale integrator must not change the session branch"
+    );
+    assert!(!session_worktree.join("worker.txt").exists());
+    let queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].status, "failed");
+    assert!(
+        queue[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("lease lost before merge"))
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "integrator.finished" && event.payload["reason"] == "lease_lost_before_merge"
+    }));
+    // Dropping the stale guard must not delete the newer generation.
+    drop(stale);
+    let leases = other.list_runtime_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].owner_id, other.runtime_id());
+    current.release().await;
+}
+
+fn configured_service_for_test(
+    engine: Engine,
+    provider: Arc<dyn Provider>,
+    label: &str,
+) -> AgentService {
+    let config = AgentConfig {
+        provider,
+        provider_name: label.into(),
+        model: "test".into(),
+        role_models: RoleModels::default(),
+        base_url: None,
+        max_turns: 4,
+        max_tokens: Some(1024),
+        max_managers: 5,
+        max_workers: 10,
+        max_labour: 20,
+        auto_expand_workers: false,
+        integration_command: None,
+        tools: ToolRegistry::default_tools(),
+        max_active_sessions: 4,
+        scope_locks: Arc::new(ScopeLocks::with_store(engine.store().clone())),
+        capacity: Arc::new(CapacityController::new(
+            global_worker_cap(),
+            global_labour_cap(),
+        )),
+        provider_idle_timeout_secs: 300,
+        question_timeout_secs: 1800,
+        approval_mode: ApprovalMode::default(),
+        approval_timeout_secs: 600,
+        compact_after_tokens: 0,
+        compact_keep_messages: 8,
+        context_window: 0,
+    };
+    AgentService::configured(engine, config)
+}
+
+#[tokio::test]
+async fn two_continuation_reconcilers_deliver_one_child() {
+    let dir = TempDir::new().unwrap();
+    let provider_a: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("one delivery".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let provider_b: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service_a, project) = test_service_with_provider(&dir, provider_a);
+    let engine_b = Engine::new(Store::open(dir.path()).unwrap());
+    let service_b = configured_service_for_test(engine_b.clone(), provider_b, "queue-b");
+    let session = engine
+        .create_session(project.id, "two reconcilers".into(), None)
+        .await
+        .unwrap();
+    let continuation = engine
+        .defer_session(
+            &session.id,
+            "deliver exactly once",
+            Vec::new(),
+            None,
+            None,
+            Some(3_600),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .continuation;
+    engine
+        .mark_session_continuation_ready(&continuation.id, "deadline", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .update_session_status(&session.id, "idle")
+        .await
+        .unwrap();
+
+    // The claim primitive is independently race-tested. Here we verify the
+    // full reconciler path: the first pass delivers one child, and the second
+    // process (sharing the data directory) sees no open row.
+    assert_eq!(
+        service_a.reconcile_session_continuations().await.unwrap(),
+        1
+    );
+    assert_eq!(
+        service_b.reconcile_session_continuations().await.unwrap(),
+        0
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.delivering")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.delivered")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.scheduled")
+            .count(),
+        0
+    );
+    let rows = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "delivered");
+    assert_eq!(rows[0].run_count, 1);
+    let _ = wait_until_idle(&engine, &session).await;
+    assert_eq!(
+        service_a.reconcile_session_continuations().await.unwrap(),
+        0
+    );
+    assert_eq!(
+        service_b.reconcile_session_continuations().await.unwrap(),
+        0
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
 }

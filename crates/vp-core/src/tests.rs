@@ -8672,19 +8672,33 @@ async fn recurring_continuation_crash_before_delivery_fails_closed_without_child
         .unwrap()
         .continuations;
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].status, "delivering");
     assert_eq!(rows[0].run_count, 0);
+    assert!(rows[0].lease_owner.is_some());
+
+    let expired_at = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let reclaimed = engine
+        .store()
+        .reclaim_expired_session_continuation_at(&created.id, "test expiry", expired_at)
+        .unwrap()
+        .expect("expired claim was reclaimable");
+    assert_eq!(reclaimed.0.status, "ready");
+    assert!(reclaimed.0.lease_owner.is_none());
     assert!(
-        rows[0]
-            .last_error
-            .as_deref()
+        engine
+            .mark_session_continuation_delivered(&created.id)
+            .await
             .unwrap()
-            .contains("daemon restarted while delivering")
+            .is_none(),
+        "a stale delivery token must not write a terminal state"
     );
     let events = engine
         .list_events(session.id.clone(), 0, 200)
         .await
         .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.continuation.reclaimed" && event.payload["reason"] == "test expiry"
+    }));
     assert!(
         !events
             .iter()
@@ -9495,4 +9509,863 @@ async fn steering_operation_replays_and_retries_after_failure() {
         1,
         "replay must not create a duplicate steering event"
     );
+}
+
+#[tokio::test]
+async fn daemon_identity_is_shared_but_runtime_owners_are_distinct() {
+    let data = TempDir::new().unwrap();
+    let first = Engine::new(Store::open(data.path()).unwrap());
+    let second = Engine::new(Store::open(data.path()).unwrap());
+    assert_eq!(first.daemon_identity(), second.daemon_identity());
+    assert_ne!(first.runtime_id(), second.runtime_id());
+    assert!(
+        first
+            .runtime_id()
+            .starts_with(&format!("{}:", first.daemon_identity().instance_id))
+    );
+    assert!(
+        first
+            .runtime_id()
+            .ends_with(&first.owner_instance()[first.owner_instance().len()..])
+    );
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("identity".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "identity".into(), None)
+        .await
+        .unwrap();
+    let lease = first
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let listed = first.list_runtime_leases().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].owner_id, first.runtime_id());
+    assert_eq!(listed[0].owner_instance, first.owner_instance());
+    assert_eq!(listed[0].fencing_token, lease.generation());
+    lease.release().await;
+    assert!(first.list_runtime_leases().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn runtime_lease_guard_release_on_drop_removes_the_row() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("drop".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "drop".into(), None)
+        .await
+        .unwrap();
+    let lease = engine
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(engine.list_runtime_leases().await.unwrap().len(), 1);
+    drop(lease);
+    assert!(
+        engine.list_runtime_leases().await.unwrap().is_empty(),
+        "dropping a guard releases its fenced row"
+    );
+}
+
+#[tokio::test]
+async fn stale_runtime_guard_cannot_assert_or_delete_a_new_generation() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let first = Engine::new(Store::open(data.path()).unwrap());
+    let second = Engine::new(Store::open(data.path()).unwrap());
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("stale guard".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "stale guard".into(), None)
+        .await
+        .unwrap();
+    let old = first
+        .acquire_runtime_lease_at_for_test(
+            "integration",
+            &session.id,
+            0,
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(120),
+        )
+        .await
+        .unwrap();
+    assert!(old.assert_held().await.is_err());
+    assert!(old.is_lost());
+    let current = second
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.generation(), old.generation() + 1);
+    old.release().await;
+    let leases = second.list_runtime_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].owner_id, second.runtime_id());
+    assert_eq!(leases[0].fencing_token, current.generation());
+    current.release().await;
+}
+
+#[tokio::test]
+async fn runtime_lease_heartbeat_renews_an_unexpired_guard() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("heartbeat".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "heartbeat".into(), None)
+        .await
+        .unwrap();
+    let lease = engine
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    let first = engine.list_runtime_leases().await.unwrap()[0].clone();
+    tokio::time::sleep(std::time::Duration::from_millis(6_200)).await;
+    let renewed = engine.list_runtime_leases().await.unwrap()[0].clone();
+    assert_ne!(renewed.renewed_at, first.renewed_at);
+    assert!(renewed.expires_at > first.expires_at);
+    assert!(!lease.is_lost());
+    lease.release().await;
+}
+
+#[tokio::test]
+async fn two_engines_claim_one_continuation_and_only_the_winner_acknowledges() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let first = Engine::new(Store::open(data.path()).unwrap());
+    let second = Engine::new(Store::open(data.path()).unwrap());
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("claim race".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "claim race".into(), None)
+        .await
+        .unwrap();
+    let continuation = first
+        .defer_session(
+            &session.id,
+            "deliver once",
+            Vec::new(),
+            None,
+            None,
+            Some(3_600),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .continuation;
+    first
+        .mark_session_continuation_ready(&continuation.id, "deadline", &[])
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (left, right) = tokio::join!(
+        first.claim_session_continuation_for_delivery(&continuation.id, 60),
+        second.claim_session_continuation_for_delivery(&continuation.id, 60)
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert!(left.is_some() ^ right.is_some());
+    let winner = left.or(right).unwrap();
+    assert_eq!(winner.continuation.status, "delivering");
+    assert_eq!(winner.continuation.delivery_attempt, 1);
+    let session_id = winner.continuation.session_id.clone();
+    let delivered = first
+        .ack_session_continuation_delivered(&winner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered.status, "delivered");
+    let events = first.list_events(session_id, 0, 200).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.delivered")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.delivering")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_continuation_owner_cannot_write_terminal_state_after_reclaim() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let first = Engine::new(Store::open(data.path()).unwrap());
+    let second = Engine::new(Store::open(data.path()).unwrap());
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("stale continuation".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "stale continuation".into(), None)
+        .await
+        .unwrap();
+    let continuation = first
+        .defer_session(
+            &session.id,
+            "stale owner",
+            Vec::new(),
+            None,
+            None,
+            Some(3_600),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .continuation;
+    first
+        .mark_session_continuation_ready(&continuation.id, "deadline", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    let stale = first
+        .claim_session_continuation_for_delivery(&continuation.id, 0)
+        .await
+        .unwrap()
+        .expect("stale claimant owns the first generation");
+    let current = second
+        .claim_session_continuation_for_delivery(&continuation.id, 60)
+        .await
+        .unwrap()
+        .expect("expired claim is reclaimable");
+    assert!(current.reclaimed);
+    assert_eq!(current.delivery_attempt, 2);
+
+    let stale_ack = first
+        .ack_session_continuation_delivered(&stale)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_ack,
+        SessionContinuationAckError::Lost { .. }
+    ));
+    assert!(
+        first
+            .ack_session_continuation_failed(&stale, "stale failure")
+            .await
+            .is_err()
+    );
+    assert!(
+        first
+            .ack_session_continuation_retry(&stale, "stale retry", "2999-01-01T00:00:00Z")
+            .await
+            .is_err()
+    );
+    let rows = first
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows[0].status, "delivering");
+    assert_eq!(
+        rows[0].lease_owner.as_deref(),
+        Some(current.owner_id.as_str())
+    );
+    let delivered = second
+        .ack_session_continuation_delivered(&current)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered.status, "delivered");
+}
+
+#[tokio::test]
+async fn restart_recovery_leaves_live_foreign_continuation_claims_alone() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let first = Engine::new(Store::open(data.path()).unwrap());
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("live foreign claim".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "live foreign claim".into(), None)
+        .await
+        .unwrap();
+    let continuation = first
+        .defer_session(
+            &session.id,
+            "live foreign claim",
+            Vec::new(),
+            None,
+            None,
+            Some(3_600),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .continuation;
+    first
+        .mark_session_continuation_ready(&continuation.id, "deadline", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    let claim = first
+        .claim_session_continuation_for_delivery(&continuation.id, 60)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let restarted = Engine::new(Store::open(data.path()).unwrap());
+    restarted.recover_interrupted_sessions().await.unwrap();
+    let rows = restarted
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows[0].status, "delivering");
+    assert_eq!(
+        rows[0].lease_owner.as_deref(),
+        Some(claim.owner_id.as_str())
+    );
+    assert!(
+        restarted
+            .claim_session_continuation_for_delivery(&continuation.id, 60)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let replay = restarted.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+}
+
+#[tokio::test]
+async fn restart_recovery_reclaims_an_expired_continuation_claim() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let first = Engine::new(Store::open(data.path()).unwrap());
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("expired foreign claim".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "expired foreign claim".into(), None)
+        .await
+        .unwrap();
+    let continuation = first
+        .defer_session(
+            &session.id,
+            "expired foreign claim",
+            Vec::new(),
+            None,
+            None,
+            Some(3_600),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .continuation;
+    first
+        .mark_session_continuation_ready(&continuation.id, "deadline", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    let stale = first
+        .claim_session_continuation_for_delivery(&continuation.id, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    let restarted = Engine::new(Store::open(data.path()).unwrap());
+    restarted.recover_interrupted_sessions().await.unwrap();
+    let rows = restarted
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows[0].status, "ready");
+    assert!(rows[0].lease_owner.is_none());
+    assert!(
+        restarted
+            .ack_session_continuation_delivered(&stale)
+            .await
+            .is_err()
+    );
+    let events = restarted
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "session.continuation.reclaimed")
+    );
+}
+
+#[tokio::test]
+async fn restart_recovery_does_not_fail_a_session_with_a_live_foreign_lease() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let first = Engine::new(Store::open(data.path()).unwrap());
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("foreign session".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "foreign session".into(), None)
+        .await
+        .unwrap();
+    first
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    let store = first.store().clone();
+    let foreign = store
+        .acquire_runtime_lease(
+            &format!("session:{}", session.id),
+            "foreign-owner",
+            "foreign-instance:999",
+            "session",
+            Some(&session.id),
+            60,
+        )
+        .unwrap();
+    let restarted = Engine::new(Store::open(data.path()).unwrap());
+    restarted.recover_interrupted_sessions().await.unwrap();
+    let after = restarted.store().get_session(&session.id).unwrap().unwrap();
+    assert_eq!(after.status, "running");
+    assert!(
+        !restarted
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "agent.failed")
+    );
+    store
+        .release_runtime_lease(
+            &format!("session:{}", session.id),
+            "foreign-owner",
+            foreign.token(),
+        )
+        .unwrap();
+    restarted.recover_interrupted_sessions().await.unwrap();
+    let after = restarted.store().get_session(&session.id).unwrap().unwrap();
+    assert_eq!(after.status, "failed");
+}
+
+#[tokio::test]
+async fn continuation_claim_metadata_survives_replay_repair_bundle_and_rebuild() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("claim replay".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "claim replay".into(), None)
+        .await
+        .unwrap();
+    let continuation = engine
+        .defer_session(
+            &session.id,
+            "claim replay body",
+            Vec::new(),
+            None,
+            None,
+            Some(3_600),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .continuation;
+    engine
+        .mark_session_continuation_ready(&continuation.id, "deadline", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    let claim = engine
+        .claim_session_continuation_for_delivery(&continuation.id, 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.continuation.delivery_attempt, 1);
+
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    let delivering = events
+        .iter()
+        .find(|event| event.kind == "session.continuation.delivering")
+        .unwrap();
+    assert_eq!(
+        delivering.payload["lease_owner"].as_str(),
+        Some(claim.owner_id.as_str())
+    );
+    assert_eq!(delivering.payload["delivery_attempt"], 1);
+    assert!(delivering.payload.get("lease_token").is_none());
+    assert!(!delivering.payload.to_string().contains("lease_token"));
+
+    engine
+        .store()
+        .replace_session_continuations(&session.id, &[])
+        .unwrap();
+    let drifted = engine.replay_session(&session.id).await.unwrap();
+    assert!(!drifted.continuations_match);
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(repaired.continuations_match, "{:?}", repaired.mismatches);
+    let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
+    assert!(rebuilt.continuations_match, "{:?}", rebuilt.mismatches);
+
+    let bundle = engine.export_session(&session.id).await.unwrap();
+    assert_eq!(bundle.continuations.len(), 1);
+    assert_eq!(
+        bundle.continuations[0].lease_owner.as_deref(),
+        Some(claim.owner_id.as_str())
+    );
+    assert_eq!(bundle.continuations[0].delivery_attempt, 1);
+    assert!(bundle.continuations[0].lease_expires_at.is_some());
+
+    let import_data = TempDir::new().unwrap();
+    let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
+    imported_engine.import_session(bundle).await.unwrap();
+    let imported = imported_engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(imported.len(), 1);
+    assert_eq!(
+        imported[0].lease_owner.as_deref(),
+        Some(claim.owner_id.as_str())
+    );
+    assert_eq!(imported[0].delivery_attempt, 1);
+    let imported_replay = imported_engine.replay_session(&session.id).await.unwrap();
+    assert!(
+        imported_replay.continuations_match,
+        "{:?}",
+        imported_replay.mismatches
+    );
+
+    engine.record_project_manifest().await.unwrap();
+    let report = crate::rebuild::rebuild_database(data.path(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.sessions, 1);
+    let store = Store::open(data.path()).unwrap();
+    let rows = store
+        .list_session_continuations(&session.id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].delivery_attempt, 1);
+    assert_eq!(
+        rows[0].lease_owner.as_deref(),
+        Some(claim.owner_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn lost_runtime_guard_notifies_and_wakes_a_waiting_critical_section() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("lost signal".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "lost signal".into(), None)
+        .await
+        .unwrap();
+    let stale = engine
+        .acquire_runtime_lease_at_for_test(
+            "integration",
+            &session.id,
+            0,
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(60),
+        )
+        .await
+        .unwrap();
+    assert!(stale.assert_held().await.is_err());
+    tokio::time::timeout(std::time::Duration::from_millis(100), stale.lost_signal())
+        .await
+        .expect("lost guard wakes its waiter immediately");
+
+    let live = engine
+        .acquire_runtime_lease(
+            "integration",
+            &session.id,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), live.lost_signal())
+            .await
+            .is_err(),
+        "a live guard does not signal loss"
+    );
+    live.release().await;
+}
+
+#[tokio::test]
+async fn continuation_reclaim_retry_and_failure_events_replay_without_tokens() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("claim event replay".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "claim event replay".into(), None)
+        .await
+        .unwrap();
+    let first = engine
+        .defer_session(
+            &session.id,
+            "reclaim replay",
+            Vec::new(),
+            None,
+            None,
+            Some(3_600),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .continuation;
+    engine
+        .mark_session_continuation_ready(&first.id, "deadline", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    let stale = engine
+        .claim_session_continuation_for_delivery(&first.id, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .reclaim_session_continuation(&first.id, Some("reclaim for replay"))
+        .await
+        .unwrap();
+    let second = engine
+        .claim_session_continuation_for_delivery(&first.id, 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.delivery_attempt, 2);
+    assert!(
+        !second.reclaimed,
+        "an explicit reclaim resets the row to ready"
+    );
+    engine
+        .ack_session_continuation_retry(&second, "provider down", "2999-01-01T00:00:00Z")
+        .await
+        .unwrap()
+        .unwrap();
+    let third = engine
+        .claim_session_continuation_for_delivery(&first.id, 60)
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .ack_session_continuation_failed(&third, "model refused")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        engine
+            .ack_session_continuation_delivered(&stale)
+            .await
+            .is_err()
+    );
+
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+    let rows = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].delivery_attempt, 3);
+    assert_eq!(rows[0].attempts, 2);
+    assert!(rows[0].lease_owner.is_none());
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    for event in events
+        .iter()
+        .filter(|event| event.kind.starts_with("session.continuation."))
+    {
+        assert!(
+            event.payload.get("lease_token").is_none(),
+            "{} leaked a token",
+            event.kind
+        );
+        assert!(!event.payload.to_string().contains("lease_token"));
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.reclaimed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.retrying")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.failed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn session_lease_events_and_public_leases_never_carry_tokens() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("lease redaction".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "lease redaction".into(), None)
+        .await
+        .unwrap();
+    let lease = engine
+        .acquire_session_lease(&session.id, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let lease_text = serde_json::to_string(&engine.list_runtime_leases().await.unwrap()).unwrap();
+    assert!(!lease_text.contains("lease_token"));
+    assert!(!lease_text.contains("\"token\""));
+    lease.release().await;
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let acquired = events
+        .iter()
+        .find(|event| event.kind == "session.lease.acquired")
+        .unwrap();
+    assert!(acquired.payload.get("lease_token").is_none());
+    assert!(acquired.payload["fencing_token"].as_u64().is_some());
+    assert!(acquired.payload["owner_instance"].as_str().is_some());
+    let released = events
+        .iter()
+        .find(|event| event.kind == "session.lease.released")
+        .unwrap();
+    assert!(released.payload.get("lease_token").is_none());
+    assert_eq!(released.payload["lease_lost"], false);
 }

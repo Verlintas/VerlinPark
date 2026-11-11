@@ -59,7 +59,8 @@ use vp_protocol::types::{
     SessionCheckpointParams, SessionCheckpointPruneParams, SessionCheckpointRestoreParams,
     SessionCheckpointStatsParams, SessionCitationAuditParams, SessionCitationsParams,
     SessionCompactParams, SessionCompareParams, SessionContextParams,
-    SessionContinuationCancelParams, SessionContinuationsParams, SessionDeferParams,
+    SessionContinuationCancelParams, SessionContinuationReclaimParams,
+    SessionContinuationStatusParams, SessionContinuationsParams, SessionDeferParams,
     SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
     SessionImportParams, SessionLineageParams, SessionListResult, SessionLogParams,
     SessionMergeForkParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
@@ -86,7 +87,8 @@ use vp_protocol::types::{
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
-    ComputerLeaseReleaseResult, ComputerLeaseSweepResult, ComputerStatusParams, RuntimeLeaseInfo,
+    ComputerLeaseReleaseResult, ComputerLeaseSweepResult, ComputerStatusParams, DaemonInstanceInfo,
+    RuntimeLeaseAuditInfo, RuntimeLeaseHistoryParams, RuntimeLeaseHistoryResult, RuntimeLeaseInfo,
     RuntimeLeaseListResult, RuntimeLeaseSweepResult,
 };
 use vp_protocol::types::{
@@ -714,30 +716,73 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             }
         }
         "runtime.leases" => match state.engine.list_runtime_leases().await {
-            Ok(leases) => RpcResponse::success(
-                id,
-                RuntimeLeaseListResult {
+            Ok(leases) => {
+                let identity = state.engine.daemon_identity();
+                let result = RuntimeLeaseListResult {
                     runtime_id: state.engine.runtime_id().to_string(),
+                    daemon_instance: Some(DaemonInstanceInfo {
+                        instance_id: identity.instance_id.clone(),
+                        pid: identity.pid,
+                        started_at: identity.started_at.clone(),
+                    }),
                     leases: leases
                         .into_iter()
                         .map(|lease| RuntimeLeaseInfo {
+                            state: lease.state().as_str().to_string(),
                             lease_key: lease.lease_key,
                             owner_id: lease.owner_id,
+                            owner_instance: lease.owner_instance,
                             kind: lease.kind,
                             session_id: lease.session_id,
+                            fencing_token: lease.fencing_token,
                             acquired_at: lease.acquired_at,
                             heartbeat_at: lease.heartbeat_at,
+                            renewed_at: lease.renewed_at,
                             expires_at: lease.expires_at,
+                            released_at: lease.released_at,
                         })
                         .collect(),
-                },
-            ),
+                };
+                RpcResponse::success(id, result)
+            }
             Err(error) => internal_error(id, error),
         },
         "runtime.leases.sweep" => match state.engine.sweep_runtime_leases().await {
             Ok(removed) => RpcResponse::success(id, RuntimeLeaseSweepResult { removed }),
             Err(error) => internal_error(id, error),
         },
+        "runtime.leases.history" => {
+            match parse_params::<RuntimeLeaseHistoryParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .runtime_lease_audit(params.lease_key.as_deref(), params.limit)
+                    .await
+                {
+                    Ok(entries) => RpcResponse::success(
+                        id,
+                        RuntimeLeaseHistoryResult {
+                            lease_key: params.lease_key,
+                            entries: entries
+                                .into_iter()
+                                .map(|entry| RuntimeLeaseAuditInfo {
+                                    id: entry.id,
+                                    lease_key: entry.lease_key,
+                                    kind: entry.kind,
+                                    action: entry.action,
+                                    owner_id: entry.owner_id,
+                                    owner_instance: entry.owner_instance,
+                                    fencing_token: entry.fencing_token,
+                                    detail: entry.detail,
+                                    occurred_at: entry.occurred_at,
+                                })
+                                .collect(),
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "computer.leases" => match state.engine.list_computer_leases().await {
             Ok(leases) => RpcResponse::success(
                 id,
@@ -1946,6 +1991,28 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.continuation.cancel" => {
             match parse_params::<SessionContinuationCancelParams>(request.params) {
                 Ok(params) => match state.engine.cancel_session_continuation(&params.id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.continuation.status" => {
+            match parse_params::<SessionContinuationStatusParams>(request.params) {
+                Ok(params) => match state.engine.session_continuation_status(&params.id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.continuation.reclaim" => {
+            match parse_params::<SessionContinuationReclaimParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .reclaim_session_continuation(&params.id, params.reason.as_deref())
+                    .await
+                {
                     Ok(result) => RpcResponse::success(id, result),
                     Err(error) => internal_error(id, error),
                 },
@@ -3405,6 +3472,13 @@ fn spawn_orchestration_controller(engine: Engine) {
             }
             if let Err(error) = engine.sweep_runtime_leases().await {
                 tracing::warn!(%error, "runtime lease sweep failed");
+            }
+            let audit_retention_days = std::env::var("VERLINPARK_LEASE_AUDIT_DAYS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(30);
+            if let Err(error) = engine.prune_runtime_lease_audit(audit_retention_days).await {
+                tracing::warn!(%error, "runtime lease audit prune failed");
             }
             if let Err(error) = engine.sweep_computer_leases().await {
                 tracing::warn!(%error, "computer lease sweep failed");
